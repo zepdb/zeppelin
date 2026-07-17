@@ -11,6 +11,8 @@
 //! shape, then read [`crate::namespace::manager::NamespaceManager`] for the
 //! lifecycle operations.
 
+/// Lease-fenced, one-shot mutations of the authoritative source root map.
+pub(crate) mod branch_root;
 /// Namespace branching identities and fail-closed validation errors.
 pub mod branching;
 /// Namespace metadata and lifecycle implementation.
@@ -20,12 +22,17 @@ pub mod types;
 
 /// Public namespace manager used by startup, HTTP handlers, and maintenance.
 pub use manager::NamespaceManager;
-pub use types::{NamespaceId, NamespaceIncarnationId};
+pub use types::{
+    BranchId, BranchRoot, ForkViewDigest, ManifestDigest, ManifestGeneration, NamespaceId,
+    NamespaceIncarnationId, SourceDataPlaneConfigDigest,
+};
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::{NamespaceId, NamespaceIncarnationId};
+    use super::{
+        BranchId, ForkViewDigest, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
+    };
 
     #[test]
     fn identity_move_preserves_public_paths_and_wire_forms() {
@@ -54,5 +61,25 @@ mod tests {
         let decoded_incarnation: NamespaceIncarnationId =
             serde_json::from_str(&format!(r#""{uuid}""#)).unwrap();
         assert_eq!(decoded_incarnation, incarnation);
+    }
+
+    #[test]
+    fn branch_identity_types_preserve_domains_and_reject_zero_generation() {
+        let branch_id = BranchId::new();
+        let encoded = serde_json::to_string(&branch_id).unwrap();
+        let decoded: BranchId = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, branch_id);
+
+        assert!(ManifestGeneration::new(0).is_err());
+        assert_eq!(ManifestGeneration::new(7).unwrap().get(), 7);
+        assert!(serde_json::from_str::<ManifestGeneration>("0").is_err());
+
+        let digest = ForkViewDigest::new([0x5a; 32]);
+        let encoded = serde_json::to_string(&digest).unwrap();
+        let decoded: ForkViewDigest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, digest);
+        assert!(format!("{digest:?}").contains("[REDACTED]"));
+        assert!(!format!("{digest:?}").contains("90"));
+        assert!(serde_json::from_str::<ForkViewDigest>("[1,2,3]").is_err());
     }
 }

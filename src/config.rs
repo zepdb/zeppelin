@@ -181,8 +181,52 @@ pub struct Config {
     /// Garbage-collection safety horizons, history retention, and unsafe override.
     #[serde(default)]
     pub gc: GcConfig,
+    /// Disabled-by-default namespace-branching limits and admission switch.
+    #[serde(default)]
+    pub branching: BranchingConfig,
     /// Authentication, durable audit, bootstrap-key, and security refresh settings.
     pub security: SecurityConfig,
+}
+
+/// Base namespace-branching configuration.
+///
+/// Entitlement and policy checks land in later phases. This switch remains
+/// disabled by default and therefore exposes no public fork path on its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchingConfig {
+    /// Operator opt-in; Phase 08 combines this with licensed entitlement.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum number of direct child roots stored in one live manifest.
+    #[serde(default = "default_branching_max_children")]
+    pub max_children_per_namespace: usize,
+    /// Maximum admitted ancestry depth once graph admission lands.
+    #[serde(default = "default_branching_max_depth")]
+    pub max_depth: u16,
+}
+
+/// Hard manifest-size guard for direct child roots.
+pub const MAX_BRANCH_CHILDREN_PER_NAMESPACE: usize = 4_096;
+/// Hard graph-traversal guard for nested branch ancestry.
+pub const MAX_BRANCH_DEPTH: u16 = 64;
+
+const fn default_branching_max_children() -> usize {
+    256
+}
+
+const fn default_branching_max_depth() -> u16 {
+    16
+}
+
+impl Default for BranchingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_children_per_namespace: default_branching_max_children(),
+            max_depth: default_branching_max_depth(),
+        }
+    }
 }
 
 impl FromStr for Config {
@@ -733,6 +777,50 @@ mod tests {
 
         assert!(config.security.audit_s3);
         assert_eq!(config.security.audit_flush_secs, 2);
+    }
+
+    /// Branching remains inert until later entitlement/admission phases while
+    /// its manifest and graph bounds are already deterministic and validated.
+    #[test]
+    fn branching_defaults_and_hard_bounds_are_validated() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        let defaults = load_toml("").unwrap().branching;
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.max_children_per_namespace, 256);
+        assert_eq!(defaults.max_depth, 16);
+
+        let explicit = load_toml(
+            r#"
+            [branching]
+            enabled = true
+            max_children_per_namespace = 32
+            max_depth = 8
+            "#,
+        )
+        .unwrap()
+        .branching;
+        assert!(explicit.enabled);
+        assert_eq!(explicit.max_children_per_namespace, 32);
+        assert_eq!(explicit.max_depth, 8);
+
+        for (children, depth, needle) in [
+            (0, 1, "branching.max_children_per_namespace"),
+            (MAX_BRANCH_CHILDREN_PER_NAMESPACE + 1, 1, "must be <= 4096"),
+            (1, 0, "branching.max_depth"),
+            (1, MAX_BRANCH_DEPTH + 1, "must be <= 64"),
+        ] {
+            let mut config = Config::default();
+            config.security.mode = SecurityMode::OpenUnsafe;
+            config.branching.max_children_per_namespace = children;
+            config.branching.max_depth = depth;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains(needle),
+                "expected {error:?} to contain {needle:?}"
+            );
+        }
     }
 
     /// Enforced mode cannot boot without durable audit, and every mode needs a live timer.
@@ -2600,6 +2688,24 @@ impl Config {
     /// diagnostic.
     pub fn validate(&self) -> Result<()> {
         let mut violations = Vec::new();
+
+        if self.branching.max_children_per_namespace == 0 {
+            violations
+                .push("branching.max_children_per_namespace must be greater than zero".to_string());
+        } else if self.branching.max_children_per_namespace > MAX_BRANCH_CHILDREN_PER_NAMESPACE {
+            violations.push(format!(
+                "branching.max_children_per_namespace ({}) must be <= {}",
+                self.branching.max_children_per_namespace, MAX_BRANCH_CHILDREN_PER_NAMESPACE
+            ));
+        }
+        if self.branching.max_depth == 0 {
+            violations.push("branching.max_depth must be greater than zero".to_string());
+        } else if self.branching.max_depth > MAX_BRANCH_DEPTH {
+            violations.push(format!(
+                "branching.max_depth ({}) must be <= {}",
+                self.branching.max_depth, MAX_BRANCH_DEPTH
+            ));
+        }
 
         if self.security.policy_refresh_secs == 0 {
             violations.push("security.policy_refresh_secs must be greater than zero".to_string());

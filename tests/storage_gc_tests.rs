@@ -48,6 +48,22 @@ fn unsafe_short_gc(horizon_secs: u64) -> GcConfig {
     }
 }
 
+fn gc_manifest() -> Manifest {
+    let mut manifest = Manifest::new();
+    manifest
+        .bind_namespace_incarnation(uuid::Uuid::from_u128(0x6c69_7665_2d67_632d_7465_7374))
+        .expect("GC fixture incarnation must be valid");
+    manifest
+}
+
+fn gc_manifest_at(now: DateTime<Utc>) -> Manifest {
+    let mut manifest = Manifest::new_at(now);
+    manifest
+        .bind_namespace_incarnation(uuid::Uuid::from_u128(0x6c69_7665_2d67_632d_7465_7374))
+        .expect("GC fixture incarnation must be valid");
+    manifest
+}
+
 fn old_ulid(seconds_ago: i64, entropy: u128) -> Ulid {
     let ts = (Utc::now() - chrono::Duration::seconds(seconds_ago))
         .timestamp_millis()
@@ -1105,7 +1121,7 @@ fn memo_gc() -> GcConfig {
 
 async fn seed_manifest_history(store: &ZeppelinStore, namespace: &str, generations: u64) {
     assert!(generations > 0, "history fixture must contain a generation");
-    Manifest::new().write(store, namespace).await.unwrap();
+    gc_manifest().write(store, namespace).await.unwrap();
     for generation in 2..=generations {
         let (mut manifest, etag) = Manifest::read_versioned(store, namespace)
             .await
@@ -1126,7 +1142,7 @@ async fn seed_pending_delete_manifest(
     count: usize,
     now: DateTime<Utc>,
 ) -> Vec<String> {
-    Manifest::new_at(now).write(store, namespace).await.unwrap();
+    gc_manifest_at(now).write(store, namespace).await.unwrap();
     let keys = (0..count)
         .map(|index| {
             WalFragment::s3_key(
@@ -1161,7 +1177,7 @@ async fn seed_pending_delete_manifest(
 async fn put_history_revision(store: &ZeppelinStore, namespace: &str, version: u64, revision: i64) {
     let updated_at = DateTime::<Utc>::from_timestamp(1_710_000_000 + revision, 0)
         .expect("fixed history revision timestamp must be valid");
-    let manifest = Manifest::new_at(updated_at);
+    let manifest = gc_manifest_at(updated_at);
     store
         .put(
             &Manifest::history_key(namespace, version),
@@ -1269,7 +1285,7 @@ fn ulid_at(now: DateTime<Utc>, entropy: u128) -> Ulid {
 #[tokio::test]
 async fn gc_cycle_deletes_then_prunes_pending_deletes() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("storage-gc-pending");
+    let ns = harness.artifact_origin_namespace("storage-gc-pending");
     let store = harness.store.clone();
     let pending_id = old_ulid(60, 19);
     let pending_key = WalFragment::s3_key(&ns, &pending_id);
@@ -1278,7 +1294,7 @@ async fn gc_cycle_deletes_then_prunes_pending_deletes() {
         .put(&pending_key, Bytes::from_static(b"pending delete body"))
         .await
         .unwrap();
-    let mut manifest = Manifest::new();
+    let mut manifest = gc_manifest();
     manifest.pending_deletes.push(pending_key.clone());
     manifest.write(&store, &ns).await.unwrap();
     // Legacy namespaces created before manifest history have no retained
@@ -1302,11 +1318,11 @@ async fn gc_cycle_deletes_then_prunes_pending_deletes() {
 #[tokio::test]
 async fn gc_cycle_keeps_pending_delete_entry_when_delete_fails() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("storage-gc-pending-failure");
+    let ns = harness.artifact_origin_namespace("storage-gc-pending-failure");
     let store = harness.store.clone();
     let invalid_key = format!("{ns}/wal//invalid.wal");
 
-    let mut manifest = Manifest::new();
+    let mut manifest = gc_manifest();
     manifest.pending_deletes.push(invalid_key.clone());
     manifest.write(&store, &ns).await.unwrap();
 
@@ -1329,7 +1345,7 @@ async fn gc_cycle_keeps_pending_delete_entry_when_delete_fails() {
 #[tokio::test]
 async fn gc_cycle_retains_pending_deletes_inside_horizon() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("storage-gc-pending-horizon");
+    let ns = harness.artifact_origin_namespace("storage-gc-pending-horizon");
     let store = harness.store.clone();
     let pending_id = old_ulid(60, 39);
     let pending_key = WalFragment::s3_key(&ns, &pending_id);
@@ -1338,7 +1354,7 @@ async fn gc_cycle_retains_pending_deletes_inside_horizon() {
         .put(&pending_key, Bytes::from_static(b"pending delete body"))
         .await
         .unwrap();
-    let mut manifest = Manifest::new();
+    let mut manifest = gc_manifest();
     manifest.pending_deletes.push(pending_key.clone());
     manifest.write(&store, &ns).await.unwrap();
 
@@ -1363,7 +1379,8 @@ async fn pending_delete_drain_chunks_zero_one_thousand_and_one_thousand_one() {
     let now = Utc::now();
 
     for count in [0usize, 1, 1_000, 1_001] {
-        let namespace = harness.key(&format!("storage-gc-pending-batch-{count}"));
+        let namespace =
+            harness.artifact_origin_namespace(&format!("storage-gc-pending-batch-{count}"));
         let keys = seed_pending_delete_manifest(&store, &namespace, count, now).await;
         let (controlled_store, control) =
             HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
@@ -1411,7 +1428,7 @@ async fn pending_delete_drain_1001_retains_only_the_uncertain_batch() {
     let harness = TestHarness::new().await;
     let store = harness.store.clone();
     let now = Utc::now();
-    let namespace = harness.key("storage-gc-pending-batch-partial-progress");
+    let namespace = harness.artifact_origin_namespace("storage-gc-pending-batch-partial-progress");
     let keys = seed_pending_delete_manifest(&store, &namespace, 1_001, now).await;
     let (controlled_store, control) =
         HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
@@ -1498,7 +1515,7 @@ async fn pending_delete_drain_accepts_matching_not_found_batch_members() {
     let harness = TestHarness::new().await;
     let store = harness.store.clone();
     let now = Utc::now();
-    let namespace = harness.key("storage-gc-pending-batch-not-found");
+    let namespace = harness.artifact_origin_namespace("storage-gc-pending-batch-not-found");
     let keys = seed_pending_delete_manifest(&store, &namespace, 2, now).await;
     for key in &keys {
         store
@@ -1544,7 +1561,8 @@ async fn pending_delete_drain_retains_every_member_of_uncertain_batches() {
             DeleteBatchFault::OverallResponseLostAfterApply,
         ),
     ] {
-        let namespace = harness.key(&format!("storage-gc-pending-batch-{suffix}"));
+        let namespace =
+            harness.artifact_origin_namespace(&format!("storage-gc-pending-batch-{suffix}"));
         let keys = seed_pending_delete_manifest(&store, &namespace, 3, now).await;
         for key in &keys {
             store
@@ -1597,17 +1615,15 @@ async fn pending_delete_drain_retains_every_member_of_uncertain_batches() {
 async fn standalone_pending_delete_validates_every_live_overlap_before_batching() {
     let harness = TestHarness::new().await;
     let store = harness.store.clone();
-    let namespace = harness.key("storage-gc-standalone-pending-live-overlap-barrier");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-standalone-pending-live-overlap-barrier");
     let now = Utc::now();
     let safe_id = ulid_at(now - chrono::Duration::seconds(120), 1);
     let live_id = ulid_at(now - chrono::Duration::seconds(120), 2);
     let safe_key = WalFragment::s3_key(&namespace, &safe_id);
     let live_key = WalFragment::s3_key(&namespace, &live_id);
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     for key in [&safe_key, &live_key] {
         store
             .put(key, Bytes::from_static(b"pending live-overlap fixture"))
@@ -1656,17 +1672,14 @@ async fn standalone_pending_delete_validates_every_live_overlap_before_batching(
 async fn warm_pending_delete_validates_every_live_overlap_before_batching() {
     let harness = TestHarness::new().await;
     let store = harness.store.clone();
-    let namespace = harness.key("storage-gc-pending-live-overlap-barrier");
+    let namespace = harness.artifact_origin_namespace("storage-gc-pending-live-overlap-barrier");
     let now = Utc::now();
     let safe_id = ulid_at(now - chrono::Duration::seconds(120), 1);
     let live_id = ulid_at(now - chrono::Duration::seconds(120), 2);
     let safe_key = WalFragment::s3_key(&namespace, &safe_id);
     let live_key = WalFragment::s3_key(&namespace, &live_id);
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     let (controlled_store, control) =
         HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
     let incarnation = GcNamespaceIncarnation::new(namespace.clone(), now);
@@ -1725,7 +1738,7 @@ async fn warm_pending_delete_validates_every_live_overlap_before_batching() {
 #[tokio::test]
 async fn gc_cycle_retains_objects_referenced_only_by_manifest_history() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("storage-gc-history-mark-sweep");
+    let ns = harness.artifact_origin_namespace("storage-gc-history-mark-sweep");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 49);
     let old_key = WalFragment::s3_key(&ns, &old_id);
@@ -1734,7 +1747,7 @@ async fn gc_cycle_retains_objects_referenced_only_by_manifest_history() {
         .put(&old_key, Bytes::from_static(b"history-only fragment body"))
         .await
         .unwrap();
-    let mut manifest = Manifest::new();
+    let mut manifest = gc_manifest();
     manifest.add_fragment(FragmentRef {
         id: old_id,
         vector_count: 1,
@@ -1776,7 +1789,7 @@ async fn gc_cycle_retains_objects_referenced_only_by_manifest_history() {
 #[tokio::test]
 async fn gc_sweep_rereads_retained_history_before_deleting_candidate() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("storage-gc-history-sweep-race");
+    let ns = harness.artifact_origin_namespace("storage-gc-history-sweep-race");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 129);
     let old_key = WalFragment::s3_key(&ns, &old_id);
@@ -1786,7 +1799,7 @@ async fn gc_sweep_rereads_retained_history_before_deleting_candidate() {
         .await
         .unwrap();
 
-    let mut history_manifest = Manifest::new();
+    let mut history_manifest = gc_manifest();
     history_manifest.add_fragment(FragmentRef {
         id: old_id,
         vector_count: 1,
@@ -1852,7 +1865,7 @@ async fn gc_sweep_rereads_retained_history_before_deleting_candidate() {
 #[tokio::test]
 async fn gc_pending_delete_drain_rereads_retained_history_before_deleting() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("storage-gc-history-drain-race");
+    let ns = harness.artifact_origin_namespace("storage-gc-history-drain-race");
     let store = harness.store.clone();
     let pending_id = old_ulid(60, 139);
     let pending_key = WalFragment::s3_key(&ns, &pending_id);
@@ -1865,7 +1878,7 @@ async fn gc_pending_delete_drain_rereads_retained_history_before_deleting() {
         .await
         .unwrap();
 
-    Manifest::new().write(&store, &ns).await.unwrap();
+    gc_manifest().write(&store, &ns).await.unwrap();
     let (mut second, etag) = Manifest::read_versioned(&store, &ns)
         .await
         .unwrap()
@@ -1884,7 +1897,7 @@ async fn gc_pending_delete_drain_rereads_retained_history_before_deleting() {
         .await
         .unwrap();
 
-    let mut injected_history = Manifest::new();
+    let mut injected_history = gc_manifest();
     injected_history.pending_deletes.push(pending_key.clone());
     let injected_history_version = current.version() + 1;
     let injected_history_key = Manifest::history_key(&ns, injected_history_version);
@@ -1935,7 +1948,7 @@ async fn gc_pending_delete_drain_rereads_retained_history_before_deleting() {
 #[tokio::test]
 async fn gc_pitr_time_retention_keeps_old_generation_and_artifacts() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("storage-gc-pitr-time");
+    let ns = harness.artifact_origin_namespace("storage-gc-pitr-time");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 89);
     let old_key = WalFragment::s3_key(&ns, &old_id);
@@ -1944,7 +1957,7 @@ async fn gc_pitr_time_retention_keeps_old_generation_and_artifacts() {
         .put(&old_key, Bytes::from_static(b"time retained body"))
         .await
         .unwrap();
-    let mut manifest = Manifest::new();
+    let mut manifest = gc_manifest();
     manifest.add_fragment(FragmentRef {
         id: old_id,
         vector_count: 1,
@@ -2003,7 +2016,7 @@ async fn gc_pitr_time_retention_keeps_old_generation_and_artifacts() {
 #[tokio::test]
 async fn gc_prunes_expired_history_and_collects_artifacts_after_horizon() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("storage-gc-pitr-expired");
+    let ns = harness.artifact_origin_namespace("storage-gc-pitr-expired");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 99);
     let old_key = WalFragment::s3_key(&ns, &old_id);
@@ -2012,7 +2025,7 @@ async fn gc_prunes_expired_history_and_collects_artifacts_after_horizon() {
         .put(&old_key, Bytes::from_static(b"expired history body"))
         .await
         .unwrap();
-    let mut manifest = Manifest::new();
+    let mut manifest = gc_manifest();
     manifest.updated_at = Utc::now() - chrono::Duration::seconds(60);
     manifest.add_fragment(FragmentRef {
         id: old_id,
@@ -2058,7 +2071,7 @@ async fn gc_prunes_expired_history_and_collects_artifacts_after_horizon() {
 #[tokio::test]
 async fn gc_named_snapshot_pin_keeps_generation_until_released() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("storage-gc-pitr-pin");
+    let ns = harness.artifact_origin_namespace("storage-gc-pitr-pin");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 109);
     let old_key = WalFragment::s3_key(&ns, &old_id);
@@ -2067,7 +2080,7 @@ async fn gc_named_snapshot_pin_keeps_generation_until_released() {
         .put(&old_key, Bytes::from_static(b"snapshot pinned body"))
         .await
         .unwrap();
-    let mut manifest = Manifest::new();
+    let mut manifest = gc_manifest();
     manifest.updated_at = Utc::now() - chrono::Duration::seconds(60);
     manifest.add_fragment(FragmentRef {
         id: old_id,
@@ -2123,7 +2136,7 @@ async fn gc_named_snapshot_pin_keeps_generation_until_released() {
 #[tokio::test]
 async fn gc_snapshot_pin_does_not_retain_unreferenced_pending_delete() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("storage-gc-pitr-pin-pending");
+    let ns = harness.artifact_origin_namespace("storage-gc-pitr-pin-pending");
     let store = harness.store.clone();
     let pending_id = old_ulid(60, 119);
     let pending_key = WalFragment::s3_key(&ns, &pending_id);
@@ -2135,7 +2148,7 @@ async fn gc_snapshot_pin_does_not_retain_unreferenced_pending_delete() {
         )
         .await
         .unwrap();
-    Manifest::new().write(&store, &ns).await.unwrap();
+    gc_manifest().write(&store, &ns).await.unwrap();
     NamedSnapshot::create(&store, &ns, "empty", 1)
         .await
         .unwrap();
@@ -2174,7 +2187,7 @@ async fn gc_snapshot_pin_does_not_retain_unreferenced_pending_delete() {
 #[tokio::test]
 async fn gc_cycle_retains_pending_deletes_referenced_by_manifest_history() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("storage-gc-history-pending");
+    let ns = harness.artifact_origin_namespace("storage-gc-history-pending");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 59);
     let old_key = WalFragment::s3_key(&ns, &old_id);
@@ -2183,7 +2196,7 @@ async fn gc_cycle_retains_pending_deletes_referenced_by_manifest_history() {
         .put(&old_key, Bytes::from_static(b"history pending-delete body"))
         .await
         .unwrap();
-    let mut manifest = Manifest::new();
+    let mut manifest = gc_manifest();
     manifest.add_fragment(FragmentRef {
         id: old_id,
         vector_count: 1,
@@ -2220,7 +2233,7 @@ async fn gc_cycle_retains_pending_deletes_referenced_by_manifest_history() {
 #[tokio::test]
 async fn gc_cycle_rereads_retained_manifest_history_before_sweep() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("storage-gc-history-cost");
+    let ns = harness.artifact_origin_namespace("storage-gc-history-cost");
     let store = harness.store.clone();
     let history_snapshots = 4;
     let history_prefix = Manifest::history_prefix(&ns);
@@ -2238,7 +2251,7 @@ async fn gc_cycle_rereads_retained_manifest_history_before_sweep() {
         .await
         .unwrap();
 
-    let mut manifest = Manifest::new();
+    let mut manifest = gc_manifest();
     manifest.add_fragment(FragmentRef {
         id: old_id,
         vector_count: 1,
@@ -2297,7 +2310,7 @@ async fn gc_cycle_rereads_retained_manifest_history_before_sweep() {
 #[tokio::test]
 async fn gc_runner_history_memo_tracks_etags_and_lifecycle() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-history-memo");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-history-memo");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     seed_manifest_history(&store, &namespace, 3).await;
@@ -2420,7 +2433,8 @@ async fn gc_runner_history_memo_tracks_etags_and_lifecycle() {
 #[tokio::test]
 async fn gc_runner_warm_empty_pending_reuses_prune_history_roots() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-prune-roots-empty-pending");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-prune-roots-empty-pending");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     seed_manifest_history(&store, &namespace, 3).await;
@@ -2475,7 +2489,8 @@ async fn gc_runner_warm_empty_pending_reuses_prune_history_roots() {
 #[tokio::test]
 async fn gc_runner_warm_all_young_pending_reuses_prune_history_roots() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-prune-roots-young-pending");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-prune-roots-young-pending");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     let now = Utc::now();
@@ -2544,7 +2559,8 @@ async fn gc_runner_warm_all_young_pending_reuses_prune_history_roots() {
 #[tokio::test]
 async fn gc_runner_warm_prune_roots_protect_every_pending_delete_without_refresh() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-prune-roots-protected-pending");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-prune-roots-protected-pending");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     let now = Utc::now();
@@ -2558,7 +2574,7 @@ async fn gc_runner_warm_prune_roots_protect_every_pending_delete_without_refresh
         .await
         .unwrap();
 
-    let mut retained = Manifest::new_at(now - chrono::Duration::seconds(30));
+    let mut retained = gc_manifest_at(now - chrono::Duration::seconds(30));
     retained.add_fragment(FragmentRef {
         id: pending_id,
         vector_count: 1,
@@ -2618,7 +2634,8 @@ async fn gc_runner_warm_prune_roots_protect_every_pending_delete_without_refresh
 #[tokio::test]
 async fn gc_runner_warm_eligible_pending_refresh_sees_new_history_root_before_delete() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-eligible-pending-history-race");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-eligible-pending-history-race");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     let now = Utc::now();
@@ -2626,7 +2643,7 @@ async fn gc_runner_warm_eligible_pending_refresh_sees_new_history_root_before_de
     let pending_key = WalFragment::s3_key(&namespace, &pending_id);
     seed_manifest_history(&store, &namespace, 2).await;
 
-    let mut injected_history = Manifest::new_at(now);
+    let mut injected_history = gc_manifest_at(now);
     injected_history.add_fragment(FragmentRef {
         id: pending_id,
         vector_count: 1,
@@ -2723,7 +2740,7 @@ async fn gc_runner_warm_eligible_pending_refresh_sees_new_history_root_before_de
 #[tokio::test]
 async fn gc_runner_warm_prune_root_reuse_keeps_final_sweep_history_fresh() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-prune-roots-fresh-sweep");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-prune-roots-fresh-sweep");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     let now = Utc::now();
@@ -2731,7 +2748,7 @@ async fn gc_runner_warm_prune_root_reuse_keeps_final_sweep_history_fresh() {
     let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
     seed_manifest_history(&store, &namespace, 1).await;
 
-    let mut injected_history = Manifest::new_at(now);
+    let mut injected_history = gc_manifest_at(now);
     injected_history.add_fragment(FragmentRef {
         id: orphan_id,
         vector_count: 1,
@@ -2795,7 +2812,7 @@ async fn gc_runner_warm_prune_root_reuse_keeps_final_sweep_history_fresh() {
 #[tokio::test]
 async fn gc_runner_failed_eligible_pending_history_refresh_cannot_authorize_idle() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-pending-refresh-failure");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-pending-refresh-failure");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     let now = Utc::now();
@@ -2803,7 +2820,7 @@ async fn gc_runner_failed_eligible_pending_history_refresh_cannot_authorize_idle
     let pending_key = WalFragment::s3_key(&namespace, &pending_id);
     seed_manifest_history(&store, &namespace, 2).await;
 
-    let mut injected_history = Manifest::new_at(now);
+    let mut injected_history = gc_manifest_at(now);
     injected_history.add_fragment(FragmentRef {
         id: pending_id,
         vector_count: 1,
@@ -2896,7 +2913,7 @@ async fn gc_runner_failed_eligible_pending_history_refresh_cannot_authorize_idle
 #[tokio::test]
 async fn gc_runner_pending_cas_retry_refreshes_history_and_invalidates_idle_on_transient_root() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-pending-cas-retry-root");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-pending-cas-retry-root");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     let now = Utc::now();
@@ -2906,7 +2923,7 @@ async fn gc_runner_pending_cas_retry_refreshes_history_and_invalidates_idle_on_t
     let concurrent_key = WalFragment::s3_key(&namespace, &concurrent_id);
     seed_manifest_history(&store, &namespace, 2).await;
 
-    let mut concurrent = Manifest::new_at(now);
+    let mut concurrent = gc_manifest_at(now);
     concurrent.pending_deletes.push(concurrent_key.clone());
     let concurrent_body = manifest_json_bytes_with_version(&concurrent, 4);
     let missing_predecessor_history = Manifest::history_key(&namespace, 3);
@@ -3031,14 +3048,15 @@ async fn gc_runner_pending_cas_retry_skips_history_refresh_for_empty_or_young_qu
     let now = Utc::now();
 
     for (suffix, publish_young, entropy) in [("empty", false, 208), ("young", true, 209)] {
-        let namespace = harness.key(&format!("storage-gc-runner-pending-cas-{suffix}"));
+        let namespace =
+            harness.artifact_origin_namespace(&format!("storage-gc-runner-pending-cas-{suffix}"));
         let history_prefix = Manifest::history_prefix(&namespace);
         let first_id = ulid_at(now - chrono::Duration::seconds(120), entropy);
         let first_key = WalFragment::s3_key(&namespace, &first_id);
         let young_key = WalFragment::s3_key(&namespace, &ulid_at(now, entropy + 10));
         seed_manifest_history(&store, &namespace, 2).await;
 
-        let mut concurrent = Manifest::new_at(now);
+        let mut concurrent = gc_manifest_at(now);
         if publish_young {
             concurrent.pending_deletes.push(young_key.clone());
         }
@@ -3130,7 +3148,7 @@ async fn gc_runner_pending_cas_retry_skips_history_refresh_for_empty_or_young_qu
 #[tokio::test]
 async fn gc_runner_missing_history_etag_is_never_cacheable() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-history-unversioned");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-history-unversioned");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     seed_manifest_history(&store, &namespace, 3).await;
@@ -3138,7 +3156,10 @@ async fn gc_runner_missing_history_etag_is_never_cacheable() {
     let (controlled_store, control) =
         HistoryMetadataControlStore::wrap(&store, history_prefix.clone());
     control.set_strip_list_versions(true);
-    control.set_strip_list_versions_for(&format!("{namespace}/"), true);
+    for generation in 1..=3 {
+        control
+            .set_strip_list_version_for_key(&Manifest::history_key(&namespace, generation), true);
+    }
     let (counted_store, counter) = counting_store(&controlled_store);
     let mut runner = GcRunner::new(counted_store, memo_gc());
     let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
@@ -3166,7 +3187,7 @@ async fn gc_runner_missing_history_etag_is_never_cacheable() {
 #[tokio::test]
 async fn gc_runner_failed_refresh_does_not_commit_partial_memo() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-history-refresh-failure");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-history-refresh-failure");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     let first_key = Manifest::history_key(&namespace, 1);
@@ -3253,7 +3274,8 @@ async fn assert_late_history_body_failure_prevents_prune_deletes(failure: LateHi
         LateHistoryBodyFailure::Corrupt => "corrupt",
         LateHistoryBodyFailure::Missing => "missing",
     };
-    let namespace = harness.key(&format!("storage-gc-runner-prune-barrier-{suffix}"));
+    let namespace =
+        harness.artifact_origin_namespace(&format!("storage-gc-runner-prune-barrier-{suffix}"));
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     let first_key = Manifest::history_key(&namespace, 1);
@@ -3327,7 +3349,7 @@ async fn gc_runner_warm_missing_history_aborts_before_any_prune_delete() {
 async fn manifest_history_prune_batches_only_after_every_body_validates() {
     let harness = TestHarness::new().await;
     let store = harness.store.clone();
-    let namespace = harness.key("storage-gc-direct-history-batch");
+    let namespace = harness.artifact_origin_namespace("storage-gc-direct-history-batch");
     seed_manifest_history(&store, &namespace, 3).await;
     let old_keys = vec![
         Manifest::history_key(&namespace, 1),
@@ -3355,7 +3377,8 @@ async fn manifest_history_prune_batches_only_after_every_body_validates() {
 async fn manifest_history_prune_corrupt_late_body_prevents_every_batch() {
     let harness = TestHarness::new().await;
     let store = harness.store.clone();
-    let namespace = harness.key("storage-gc-direct-history-validation-barrier");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-direct-history-validation-barrier");
     seed_manifest_history(&store, &namespace, 3).await;
     let history_keys = (1..=3)
         .map(|version| Manifest::history_key(&namespace, version))
@@ -3387,7 +3410,8 @@ async fn manifest_history_prune_corrupt_late_body_prevents_every_batch() {
 async fn stateless_gc_history_prune_corrupt_late_body_prevents_every_batch() {
     let harness = TestHarness::new().await;
     let store = harness.store.clone();
-    let namespace = harness.key("storage-gc-stateless-history-validation-barrier");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-stateless-history-validation-barrier");
     seed_manifest_history(&store, &namespace, 3).await;
     let history_keys = (1..=3)
         .map(|version| Manifest::history_key(&namespace, version))
@@ -3439,7 +3463,8 @@ async fn manifest_history_prune_fails_loud_on_uncertain_delete_batches() {
             DeleteBatchFault::OverallResponseLostAfterApply,
         ),
     ] {
-        let namespace = harness.key(&format!("storage-gc-direct-history-{suffix}"));
+        let namespace =
+            harness.artifact_origin_namespace(&format!("storage-gc-direct-history-{suffix}"));
         seed_manifest_history(&store, &namespace, 3).await;
         let old_keys = vec![
             Manifest::history_key(&namespace, 1),
@@ -3481,7 +3506,8 @@ async fn stateless_and_warm_gc_history_prune_use_one_bounded_batch() {
         ..unsafe_short_gc(0)
     };
 
-    let stateless_namespace = harness.key("storage-gc-stateless-history-batch");
+    let stateless_namespace =
+        harness.artifact_origin_namespace("storage-gc-stateless-history-batch");
     seed_manifest_history(&store, &stateless_namespace, 3).await;
     let (stateless_store, stateless_control) =
         HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&stateless_namespace));
@@ -3496,7 +3522,7 @@ async fn stateless_and_warm_gc_history_prune_use_one_bounded_batch() {
         ]]
     );
 
-    let warm_namespace = harness.key("storage-gc-warm-history-batch");
+    let warm_namespace = harness.artifact_origin_namespace("storage-gc-warm-history-batch");
     seed_manifest_history(&store, &warm_namespace, 3).await;
     let (warm_store, warm_control) =
         HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&warm_namespace));
@@ -3523,7 +3549,7 @@ async fn stateless_and_warm_gc_history_prune_use_one_bounded_batch() {
 #[tokio::test]
 async fn gc_runner_idle_gate_skips_unchanged_and_wakes_on_inventory_change() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-idle-inventory");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-idle-inventory");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     seed_manifest_history(&store, &namespace, 2).await;
@@ -3605,16 +3631,13 @@ async fn gc_runner_idle_gate_skips_unchanged_and_wakes_on_inventory_change() {
 #[tokio::test]
 async fn gc_runner_warm_due_non_delete_uses_one_full_namespace_inventory() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-one-inventory-non-delete");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-one-inventory-non-delete");
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 301);
     let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
         .put(
             &orphan_key,
@@ -3674,16 +3697,13 @@ async fn gc_runner_warm_due_non_delete_uses_one_full_namespace_inventory() {
 #[tokio::test]
 async fn gc_runner_mature_candidate_delete_uses_two_full_namespace_inventories() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-two-inventories-delete");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-two-inventories-delete");
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 302);
     let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
         .put(&orphan_key, Bytes::from_static(b"mature candidate delete"))
         .await
@@ -3735,7 +3755,8 @@ async fn gc_runner_mature_candidate_delete_uses_two_full_namespace_inventories()
 #[tokio::test]
 async fn gc_sweep_retains_every_candidate_when_batch_response_is_lost() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-sweep-batch-response-lost");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-sweep-batch-response-lost");
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_keys = (0..3)
@@ -3747,10 +3768,7 @@ async fn gc_sweep_retains_every_candidate_when_batch_response_is_lost() {
         })
         .collect::<Vec<_>>();
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     for key in &orphan_keys {
         store
             .put(key, Bytes::from_static(b"uncertain sweep candidate"))
@@ -3812,17 +3830,15 @@ async fn gc_sweep_retains_every_candidate_when_batch_response_is_lost() {
 #[tokio::test]
 async fn gc_runner_changed_candidate_ledger_after_mark_prevents_sweep() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-ledger-changed-before-sweep");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-ledger-changed-before-sweep");
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 318);
     let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
     let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
         .put(
             &orphan_key,
@@ -3888,17 +3904,14 @@ async fn gc_runner_changed_candidate_ledger_after_mark_prevents_sweep() {
 #[tokio::test]
 async fn gc_runner_warm_new_immature_candidate_is_persisted_once_and_survives() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-new-candidate-one-put");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-new-candidate-one-put");
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 314);
     let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
     let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
 
     let (controlled_store, control) =
         HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
@@ -3954,7 +3967,7 @@ async fn gc_runner_warm_new_immature_candidate_is_persisted_once_and_survives() 
 #[tokio::test]
 async fn gc_runner_warm_equal_legacy_candidate_ledger_migrates_once() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-legacy-candidate-one-put");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-legacy-candidate-one-put");
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(120), 315);
@@ -3966,10 +3979,7 @@ async fn gc_runner_warm_equal_legacy_candidate_ledger_migrates_once() {
         unreachable_since_manifest_version: 1,
     };
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
         .put(&orphan_key, Bytes::from_static(b"legacy candidate"))
         .await
@@ -4030,17 +4040,15 @@ async fn gc_runner_warm_equal_legacy_candidate_ledger_migrates_once() {
 #[tokio::test]
 async fn gc_runner_required_mark_put_failure_prevents_candidate_delete() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-required-mark-put-failure");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-required-mark-put-failure");
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 316);
     let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
     let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     let (controlled_store, control) =
         HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
     let (counted_store, counter) = counting_store(&controlled_store);
@@ -4087,15 +4095,12 @@ async fn gc_runner_required_mark_put_failure_prevents_candidate_delete() {
 #[tokio::test]
 async fn cold_one_shot_gc_preserves_two_exact_candidate_ledger_puts() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-cold-ledger-two-puts");
+    let namespace = harness.artifact_origin_namespace("storage-gc-cold-ledger-two-puts");
     let store = harness.store.clone();
     let now = Utc::now();
     let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     let (counted_store, counter) = counting_store(&store);
     counter.reset();
 
@@ -4121,17 +4126,15 @@ async fn cold_one_shot_gc_preserves_two_exact_candidate_ledger_puts() {
 #[tokio::test]
 async fn gc_runner_unversioned_sibling_cannot_hide_candidate_replacement_before_delete() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-unversioned-sibling-replacement");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-unversioned-sibling-replacement");
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 306);
     let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
     let unversioned_sibling_key = format!("{namespace}/ordinary-unversioned.bin");
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
         .put(
             &orphan_key,
@@ -4210,7 +4213,8 @@ async fn gc_runner_unversioned_sibling_cannot_hide_candidate_replacement_before_
 #[tokio::test]
 async fn gc_runner_pending_predelete_inventory_cannot_hide_candidate_replacement() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-pending-inventory-replacement");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-pending-inventory-replacement");
     let store = harness.store.clone();
     let now = Utc::now();
     let candidate_id = ulid_at(now - chrono::Duration::seconds(60), 311);
@@ -4218,10 +4222,7 @@ async fn gc_runner_pending_predelete_inventory_cannot_hide_candidate_replacement
     let pending_id = ulid_at(now - chrono::Duration::seconds(60), 312);
     let pending_key = WalFragment::s3_key(&namespace, &pending_id);
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
         .put(
             &candidate_key,
@@ -4269,7 +4270,7 @@ async fn gc_runner_pending_predelete_inventory_cannot_hide_candidate_replacement
         .unwrap();
 
     let late_history_generation = live.version() + 1;
-    let mut late_history = Manifest::new_at(now + chrono::Duration::seconds(1));
+    let mut late_history = gc_manifest_at(now + chrono::Duration::seconds(1));
     late_history.add_fragment(FragmentRef {
         id: pending_id,
         vector_count: 1,
@@ -4352,17 +4353,14 @@ async fn gc_runner_pending_predelete_inventory_cannot_hide_candidate_replacement
 #[tokio::test]
 async fn gc_runner_replacement_horizon_survives_candidate_cleanup_put_failure() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-replacement-put-failure");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-replacement-put-failure");
     let store = harness.store.clone();
     let now = Utc::now() - chrono::Duration::seconds(30);
     let candidate_id = ulid_at(now - chrono::Duration::seconds(60), 313);
     let candidate_key = WalFragment::s3_key(&namespace, &candidate_id);
     let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
         .put(
             &candidate_key,
@@ -4432,16 +4430,14 @@ async fn cold_and_stateless_candidate_replacement_requires_fresh_predelete_inven
         .expect("fixed cold replacement timestamp must be valid");
 
     for (suffix, use_runner, entropy) in [("runner", true, 316), ("stateless", false, 317)] {
-        let namespace = harness.key(&format!("storage-gc-cold-replacement-{suffix}"));
+        let namespace =
+            harness.artifact_origin_namespace(&format!("storage-gc-cold-replacement-{suffix}"));
         let candidate_key = WalFragment::s3_key(
             &namespace,
             &ulid_at(now - chrono::Duration::seconds(60), entropy),
         );
         let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
-        Manifest::new_at(now)
-            .write(&store, &namespace)
-            .await
-            .unwrap();
+        gc_manifest_at(now).write(&store, &namespace).await.unwrap();
         store
             .put(
                 &candidate_key,
@@ -4500,16 +4496,13 @@ async fn cold_and_stateless_candidate_replacement_requires_fresh_predelete_inven
 #[tokio::test]
 async fn gc_runner_malformed_reserved_inventory_key_aborts_before_delete() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-malformed-control-key");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-malformed-control-key");
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 303);
     let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
         .put(
             &orphan_key,
@@ -4565,13 +4558,10 @@ async fn gc_runner_malformed_reserved_inventory_key_aborts_before_delete() {
 #[tokio::test]
 async fn malformed_reserved_inventory_key_fails_loud_on_cold_and_stateless_paths() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-cold-malformed-control-key");
+    let namespace = harness.artifact_origin_namespace("storage-gc-cold-malformed-control-key");
     let store = harness.store.clone();
     let now = Utc::now();
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     let malformed_key = format!("{namespace}/_staging/not-a-token.json");
     store
         .put(
@@ -4608,13 +4598,11 @@ async fn malformed_reserved_inventory_key_fails_loud_on_cold_and_stateless_paths
 #[tokio::test]
 async fn malformed_reserved_inventory_key_precedes_cold_candidate_ledger_decode_failure() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-cold-malformed-key-corrupt-candidates");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-cold-malformed-key-corrupt-candidates");
     let store = harness.store.clone();
     let now = Utc::now();
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     let malformed_key = format!("{namespace}/_staging/not-a-token.json");
     store
         .put(
@@ -4677,13 +4665,14 @@ async fn malformed_reserved_inventory_key_precedes_cold_pending_delete() {
     let now = Utc::now();
 
     for (suffix, use_runner, entropy) in [("runner", true, 314), ("stateless", false, 315)] {
-        let namespace = harness.key(&format!("storage-gc-cold-pending-malformed-{suffix}"));
+        let namespace = harness
+            .artifact_origin_namespace(&format!("storage-gc-cold-pending-malformed-{suffix}"));
         let pending_key = WalFragment::s3_key(
             &namespace,
             &ulid_at(now - chrono::Duration::seconds(60), entropy),
         );
         let malformed_key = format!("{namespace}/_staging/not-a-token.json");
-        let mut manifest = Manifest::new_at(now);
+        let mut manifest = gc_manifest_at(now);
         manifest.pending_deletes.push(pending_key.clone());
         manifest.write(&store, &namespace).await.unwrap();
         store
@@ -4736,13 +4725,10 @@ async fn malformed_reserved_inventory_key_precedes_cold_pending_delete() {
 #[tokio::test]
 async fn gc_runner_cold_retained_history_reread_fails_loud_on_late_malformed_key() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-cold-late-malformed-history-key");
+    let namespace = harness.artifact_origin_namespace("storage-gc-cold-late-malformed-history-key");
     let store = harness.store.clone();
     let now = Utc::now();
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
 
     let history_prefix = Manifest::history_prefix(&namespace);
     let malformed_key = format!("{history_prefix}not-a-generation.msgpack");
@@ -4783,16 +4769,14 @@ async fn gc_runner_cold_retained_history_reread_fails_loud_on_late_malformed_key
 #[tokio::test]
 async fn gc_runner_second_namespace_inventory_sees_new_history_root_before_delete() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-second-inventory-history-root");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-second-inventory-history-root");
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 304);
     let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
         .put(
             &orphan_key,
@@ -4816,7 +4800,7 @@ async fn gc_runner_second_namespace_inventory_sees_new_history_root_before_delet
     let marked = run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
     assert_eq!(marked.candidates_marked, 1);
 
-    let mut late_history = Manifest::new_at(now + chrono::Duration::seconds(1));
+    let mut late_history = gc_manifest_at(now + chrono::Duration::seconds(1));
     late_history.add_fragment(FragmentRef {
         id: orphan_id,
         vector_count: 1,
@@ -4862,7 +4846,7 @@ async fn gc_runner_second_namespace_inventory_sees_new_history_root_before_delet
 #[tokio::test]
 async fn gc_runner_same_token_staging_published_after_predelete_list_protects_candidate() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-late-active-staging");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-late-active-staging");
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 305);
@@ -4871,10 +4855,7 @@ async fn gc_runner_same_token_staging_published_after_predelete_list_protects_ca
     let fencing_token = 57;
     let staging_key = format!("{namespace}/_staging/{fencing_token}.json");
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
         .put(
             &orphan_key,
@@ -4954,7 +4935,8 @@ async fn gc_runner_eligible_pending_delete_requires_history_and_manifest_list_et
     let now = Utc::now();
 
     for (case, strip_history) in [("history", true), ("manifest", false)] {
-        let namespace = harness.key(&format!("storage-gc-runner-pending-{case}-etag"));
+        let namespace =
+            harness.artifact_origin_namespace(&format!("storage-gc-runner-pending-{case}-etag"));
         let pending_id = ulid_at(now, if strip_history { 306 } else { 307 });
         let pending_key = WalFragment::s3_key(&namespace, &pending_id);
         store
@@ -4964,10 +4946,7 @@ async fn gc_runner_eligible_pending_delete_requires_history_and_manifest_list_et
             )
             .await
             .unwrap();
-        Manifest::new_at(now)
-            .write(&store, &namespace)
-            .await
-            .unwrap();
+        gc_manifest_at(now).write(&store, &namespace).await.unwrap();
         let (mut manifest, version) = Manifest::read_versioned(&store, &namespace)
             .await
             .unwrap()
@@ -5032,7 +5011,16 @@ async fn gc_runner_eligible_pending_delete_requires_history_and_manifest_list_et
             vec![pending_key],
             "the pending entry must remain queued when {case} authority is unversioned"
         );
-        assert_only_full_namespace_inventory_lists(&namespace, &counter, &control, 2);
+        assert_at_most_two_full_namespace_inventory_lists(&namespace, &counter);
+        let namespace_prefix = Path::parse(format!("{namespace}/"))
+            .expect("namespace prefix must be a valid object path")
+            .to_string();
+        assert_eq!(
+            control.list_calls(),
+            usize::try_from(counter.list_calls_for_prefix(&namespace_prefix))
+                .expect("observed LIST count must fit usize"),
+            "GC must not issue history, snapshot, staging, or other sub-prefix LISTs"
+        );
     }
 
     harness.cleanup().await;
@@ -5041,14 +5029,11 @@ async fn gc_runner_eligible_pending_delete_requires_history_and_manifest_list_et
 #[tokio::test]
 async fn gc_runner_candidate_phase_progresses_during_pending_delete_churn() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-pending-fairness");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-pending-fairness");
     let store = harness.store.clone();
     let now = Utc::now();
 
-    Manifest::new_at(now)
-        .write(&store, &namespace)
-        .await
-        .unwrap();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     let (controlled_store, control) =
         HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
     let (counted_store, counter) = counting_store(&controlled_store);
@@ -5171,13 +5156,13 @@ async fn gc_runner_candidate_phase_progresses_during_pending_delete_churn() {
 #[tokio::test]
 async fn gc_runner_idle_gate_reconciles_history_published_during_late_inventory_list() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-idle-late-history");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-idle-late-history");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     seed_manifest_history(&store, &namespace, 2).await;
 
     let late_history_key = Manifest::history_key(&namespace, 3);
-    let late_history = Manifest::new_at(
+    let late_history = gc_manifest_at(
         DateTime::<Utc>::from_timestamp(1_720_000_003, 0)
             .expect("fixed late-history timestamp must be valid"),
     );
@@ -5251,14 +5236,14 @@ async fn gc_runner_idle_gate_reconciles_history_published_during_late_inventory_
 #[tokio::test]
 async fn gc_runner_idle_gate_reconciles_history_published_after_prune_observation() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-idle-mid-prune-history");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-idle-mid-prune-history");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     seed_manifest_history(&store, &namespace, 2).await;
 
     let pruned_history_key = Manifest::history_key(&namespace, 1);
     let injected_history_key = Manifest::history_key(&namespace, 3);
-    let injected_history = Manifest::new_at(
+    let injected_history = gc_manifest_at(
         DateTime::<Utc>::from_timestamp(1_720_000_013, 0)
             .expect("fixed mid-prune history timestamp must be valid"),
     );
@@ -5334,7 +5319,8 @@ async fn gc_runner_idle_gate_reconciles_history_published_after_prune_observatio
 #[tokio::test]
 async fn gc_runner_idle_gate_reconciles_snapshot_recreated_during_late_inventory_list() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-idle-late-snapshot-recreate");
+    let namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-idle-late-snapshot-recreate");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     seed_manifest_history(&store, &namespace, 2).await;
@@ -5417,7 +5403,7 @@ async fn gc_runner_idle_gate_reconciles_snapshot_recreated_during_late_inventory
 #[tokio::test]
 async fn gc_runner_idle_gate_reconciles_mature_pending_delete_published_after_cold_inventory() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-idle-late-pending");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-idle-late-pending");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     let now = Utc::now();
@@ -5431,7 +5417,7 @@ async fn gc_runner_idle_gate_reconciles_mature_pending_delete_published_after_co
         .await
         .unwrap();
 
-    let mut manifest = Manifest::new_at(now);
+    let mut manifest = gc_manifest_at(now);
     manifest.write(&store, &namespace).await.unwrap();
     let mut late_manifest = manifest;
     late_manifest.pending_deletes.push(pending_key.clone());
@@ -5511,7 +5497,7 @@ async fn gc_runner_idle_gate_reconciles_mature_pending_delete_published_after_co
 #[tokio::test]
 async fn gc_runner_idle_gate_requires_versioned_namespace_inventory() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-idle-unversioned");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-idle-unversioned");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     seed_manifest_history(&store, &namespace, 2).await;
@@ -5547,8 +5533,9 @@ async fn gc_runner_idle_gate_wakes_at_candidate_pending_pitr_and_lease_deadlines
     let now = DateTime::<Utc>::from_timestamp(1_900_000_000, 0)
         .expect("fixed idle-gate timestamp must be valid");
 
-    let candidate_namespace = harness.key("storage-gc-runner-idle-candidate-deadline");
-    let mut candidate_manifest = Manifest::new_at(now);
+    let candidate_namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-idle-candidate-deadline");
+    let mut candidate_manifest = gc_manifest_at(now);
     candidate_manifest
         .write(&store, &candidate_namespace)
         .await
@@ -5620,13 +5607,14 @@ async fn gc_runner_idle_gate_wakes_at_candidate_pending_pitr_and_lease_deadlines
         &candidate_control,
     );
 
-    let pending_namespace = harness.key("storage-gc-runner-idle-pending-deadline");
+    let pending_namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-idle-pending-deadline");
     let pending_key = WalFragment::s3_key(&pending_namespace, &ulid_at(now, 102));
     store
         .put(&pending_key, Bytes::from_static(b"pending deadline"))
         .await
         .unwrap();
-    let mut pending_manifest = Manifest::new_at(now);
+    let mut pending_manifest = gc_manifest_at(now);
     pending_manifest.pending_deletes.push(pending_key.clone());
     pending_manifest
         .write(&store, &pending_namespace)
@@ -5677,8 +5665,8 @@ async fn gc_runner_idle_gate_wakes_at_candidate_pending_pitr_and_lease_deadlines
     assert!(pending_counter.total_gets() > 0);
     assert_s3_object_not_exists(&store, &pending_key).await;
 
-    let pitr_namespace = harness.key("storage-gc-runner-idle-pitr-deadline");
-    let mut pitr_manifest = Manifest::new_at(now);
+    let pitr_namespace = harness.artifact_origin_namespace("storage-gc-runner-idle-pitr-deadline");
+    let mut pitr_manifest = gc_manifest_at(now);
     pitr_manifest.write(&store, &pitr_namespace).await.unwrap();
     let (mut pitr_manifest, pitr_version) = Manifest::read_versioned(&store, &pitr_namespace)
         .await
@@ -5733,8 +5721,9 @@ async fn gc_runner_idle_gate_wakes_at_candidate_pending_pitr_and_lease_deadlines
     );
     assert_s3_object_not_exists(&store, &pitr_history_one).await;
 
-    let lease_namespace = harness.key("storage-gc-runner-idle-lease-deadline");
-    let mut lease_manifest = Manifest::new_at(now);
+    let lease_namespace =
+        harness.artifact_origin_namespace("storage-gc-runner-idle-lease-deadline");
+    let mut lease_manifest = gc_manifest_at(now);
     lease_manifest
         .write(&store, &lease_namespace)
         .await
@@ -5809,7 +5798,7 @@ async fn gc_runner_idle_gate_wakes_at_candidate_pending_pitr_and_lease_deadlines
 #[tokio::test]
 async fn gc_runner_idle_gate_rejects_backward_clock_config_change_and_partial_failure() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-idle-invalidations");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-idle-invalidations");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
     let first_history = Manifest::history_key(&namespace, 1);
@@ -5928,11 +5917,11 @@ async fn gc_runner_idle_gate_rejects_backward_clock_config_change_and_partial_fa
 #[tokio::test]
 async fn gc_runner_pending_delete_failure_does_not_publish_history_memo() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("storage-gc-runner-pending-delete-failure");
+    let namespace = harness.artifact_origin_namespace("storage-gc-runner-pending-delete-failure");
     let store = harness.store.clone();
     let history_prefix = Manifest::history_prefix(&namespace);
 
-    Manifest::new().write(&store, &namespace).await.unwrap();
+    gc_manifest().write(&store, &namespace).await.unwrap();
     let (mut live, etag) = Manifest::read_versioned(&store, &namespace)
         .await
         .unwrap()

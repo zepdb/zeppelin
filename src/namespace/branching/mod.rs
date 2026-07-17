@@ -1,12 +1,17 @@
 //! Persisted identities and validation errors for namespace branching.
 //!
-//! Phase 02 intentionally exposes no lifecycle coordinator. This module only
-//! owns the strong physical-origin vocabulary shared by manifests and the
-//! later namespace graph.
+//! This module owns the physical-origin and branch-root vocabulary shared by
+//! manifests and the later namespace graph. Phase 04 still exposes no public
+//! fork lifecycle coordinator; its source-root mutation primitive remains
+//! crate-private.
 
 mod error;
 mod types;
 
+pub use crate::namespace::types::{
+    BranchId, BranchRoot, ForkViewDigest, ManifestDigest, ManifestGeneration,
+    SourceDataPlaneConfigDigest,
+};
 pub use error::BranchError;
 pub(crate) use types::ArtifactOriginSetBuilder;
 pub use types::{ArtifactOrigin, ArtifactOriginIndex};

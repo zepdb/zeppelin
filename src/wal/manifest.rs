@@ -141,7 +141,9 @@ use crate::error::{Result, ZeppelinError};
 use crate::namespace::branching::{
     ArtifactOrigin, ArtifactOriginIndex, ArtifactOriginSetBuilder, BranchError,
 };
-use crate::namespace::{NamespaceId, NamespaceIncarnationId};
+use crate::namespace::{
+    BranchId, BranchRoot, ManifestDigest, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
+};
 use crate::storage::store::DELETE_MANY_MAX_KEYS;
 use crate::storage::{CreateOnlyOutcome, ListedObject, StorageVersion, ZeppelinStore};
 
@@ -873,6 +875,13 @@ pub struct Manifest {
     /// Phase 02 reserves this trailing seam. V1 and V2 require it to be absent.
     #[serde(default)]
     control_state_digest: Option<[u8; 32]>,
+    /// Exact source-generation retention roots for direct child namespaces.
+    ///
+    /// This is the final trailing field in the positional MessagePack schema.
+    /// Old manifests decode with no roots. The ordered map participates in the
+    /// V3 control projection, so its serialization is deterministic.
+    #[serde(default)]
+    branch_roots: BTreeMap<BranchId, BranchRoot>,
 }
 
 /// Stable manifest execution projection version used by signed receipts.
@@ -1004,6 +1013,31 @@ struct ManifestExecutionBindingV2<'a> {
     artifact_origins: Vec<ArtifactOriginExecutionBindingV2<'a>>,
 }
 
+/// Exact retention/control projection introduced by receipt binding V3.
+#[derive(Serialize)]
+struct ControlRootsV1<'a> {
+    namespace: &'a str,
+    incarnation: Option<[u8; 16]>,
+    deletion_fence: Option<&'a ManifestDeletionFence>,
+    branch_roots: &'a BTreeMap<BranchId, BranchRoot>,
+}
+
+/// Fixed root-signing envelope shared by V2 origins and later control bindings.
+///
+/// Field order and the domain string are frozen by the V2 byte fixture. Moving
+/// this type out of the match arm lets V3 add a control digest without changing
+/// one byte of existing V2 signatures.
+#[derive(Serialize)]
+struct ManifestRootEnvelopeV2 {
+    domain: &'static str,
+    merkle_root: [u8; 32],
+    manifest_generation: u64,
+    fencing_token: u64,
+    binding_version: ReceiptBindingVersion,
+    execution_digest: [u8; 32],
+    control_digest: Option<[u8; 32]>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ManifestDeletionFence {
     destruction_record_key: String,
@@ -1076,15 +1110,16 @@ pub(crate) struct NamedSnapshotObservation {
 pub struct ManifestHistoryPruneResult {
     /// Number of history snapshots deleted.
     pub pruned: usize,
-    /// Decoded manifests kept by count, time window, or named pin, in ascending
-    /// generation order.
+    /// Decoded manifests kept by count, time window, named pin, or current live
+    /// branch root, in ascending generation order.
     pub retained_manifests: Vec<Manifest>,
 }
 
 /// Union-of-rules policy controlling manifest-history retention.
 ///
 /// A generation is retained when *any* configured rule keeps it: recent count,
-/// PITR age window (including skew slop), or a [`NamedSnapshot`] pin.
+/// PITR age window (including skew slop), a [`NamedSnapshot`] pin, or a root in
+/// the current authoritative live manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManifestHistoryRetention {
     /// Number of newest generations to retain; must be greater than zero.
@@ -1150,17 +1185,6 @@ pub(crate) fn manifest_root_signing_bytes(
                 ));
             }
 
-            #[derive(Serialize)]
-            struct ManifestRootEnvelopeV2 {
-                domain: &'static str,
-                merkle_root: [u8; 32],
-                manifest_generation: u64,
-                fencing_token: u64,
-                binding_version: ReceiptBindingVersion,
-                execution_digest: [u8; 32],
-                control_digest: Option<[u8; 32]>,
-            }
-
             serde_json::to_vec(&ManifestRootEnvelopeV2 {
                 domain: "zeppelin-manifest-root-envelope-v2",
                 merkle_root,
@@ -1174,10 +1198,25 @@ pub(crate) fn manifest_root_signing_bytes(
                 ZeppelinError::Serialization(format!("manifest root signing failed: {error}"))
             })
         }
-        ReceiptBindingVersion::V3Roots => Err(BranchError::BranchingNotReady {
-            feature: "receipt binding v3_roots signing",
+        ReceiptBindingVersion::V3Roots => {
+            let control_digest = control_state_digest.ok_or_else(|| {
+                ZeppelinError::Serialization(
+                    "receipt binding v3_roots requires a control digest".to_string(),
+                )
+            })?;
+            serde_json::to_vec(&ManifestRootEnvelopeV2 {
+                domain: "zeppelin-manifest-root-envelope-v2",
+                merkle_root,
+                manifest_generation: manifest_version,
+                fencing_token,
+                binding_version,
+                execution_digest: state_digest,
+                control_digest: Some(control_digest),
+            })
+            .map_err(|error| {
+                ZeppelinError::Serialization(format!("manifest root signing failed: {error}"))
+            })
         }
-        .into()),
         ReceiptBindingVersion::V4Lineage => Err(BranchError::BranchingNotReady {
             feature: "receipt binding v4_lineage signing",
         }
@@ -1227,6 +1266,7 @@ impl Manifest {
             receipt_binding_version: None,
             artifact_origins: Vec::new(),
             control_state_digest: None,
+            branch_roots: BTreeMap::new(),
         }
     }
 
@@ -1895,6 +1935,169 @@ impl Manifest {
         self.version
     }
 
+    /// Borrow the authoritative direct-child root map.
+    #[must_use]
+    pub(crate) fn branch_roots(&self) -> &BTreeMap<BranchId, BranchRoot> {
+        &self.branch_roots
+    }
+
+    /// Return the distinct generations pinned by current live roots.
+    ///
+    /// Multiple children may pin one generation. Their exact source-manifest
+    /// digest must agree; disagreement is persisted corruption, not a choice of
+    /// one child over another.
+    pub(crate) fn rooted_generations(
+        &self,
+    ) -> Result<BTreeMap<ManifestGeneration, ManifestDigest>> {
+        let namespace = self
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "<unbound>".to_string());
+        self.validate_branch_root_state(&namespace)?;
+        let mut rooted = BTreeMap::new();
+        for root in self.branch_roots.values() {
+            match rooted.insert(root.source_generation, root.source_manifest_sha256) {
+                Some(existing) if existing != root.source_manifest_sha256 => {
+                    return Err(BranchError::ManifestDigestMismatch {
+                        generation: root.source_generation,
+                    }
+                    .into());
+                }
+                Some(_) | None => {}
+            }
+        }
+        Ok(rooted)
+    }
+
+    /// Verify one rooted history object against its exact stored bytes.
+    ///
+    /// This validates namespace, incarnation, persisted generation, and the
+    /// SHA-256 named by every current root for that generation. It never hashes
+    /// a decoded-and-reserialized manifest.
+    pub(crate) fn validate_rooted_history_bytes(
+        &self,
+        generation: ManifestGeneration,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let expected = self
+            .rooted_generations()?
+            .get(&generation)
+            .copied()
+            .ok_or_else(|| BranchError::BranchRootInvalid {
+                branch_id: None,
+                reason: format!(
+                    "generation {} is not named by the current live root map",
+                    generation.get()
+                ),
+            })?;
+        let namespace =
+            self.namespace
+                .as_deref()
+                .ok_or_else(|| BranchError::BranchRootInvalid {
+                    branch_id: None,
+                    reason: "root-bearing manifest has no namespace binding".to_string(),
+                })?;
+        let history = ManifestHistoryRef {
+            version: generation.get(),
+            key: Self::history_key(namespace, generation.get()),
+        };
+        let decoded = Self::decode_history_body(bytes, namespace, &history)?;
+        if decoded.namespace_incarnation != self.namespace_incarnation {
+            return Err(BranchError::BranchRootInvalid {
+                branch_id: None,
+                reason: format!(
+                    "rooted history generation {} belongs to a different namespace incarnation",
+                    generation.get()
+                ),
+            }
+            .into());
+        }
+        let actual = ManifestDigest::new(Sha256::digest(bytes).into());
+        if actual != expected {
+            return Err(BranchError::ManifestDigestMismatch { generation }.into());
+        }
+        Ok(())
+    }
+
+    /// Insert one exact live-head root candidate.
+    ///
+    /// Returns `false` for an exact idempotent retry and `true` when the map was
+    /// changed. A caller must still publish this candidate with the ETag and
+    /// fencing token bound to the same source-head observation.
+    #[allow(dead_code)] // Phase 04 root primitive is the first production caller.
+    pub(crate) fn insert_branch_root_candidate(
+        &mut self,
+        root: BranchRoot,
+        max_children: usize,
+    ) -> Result<bool> {
+        let namespace = self
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "<unbound>".to_string());
+        self.validate_branch_root_state(&namespace)?;
+        if let Some(existing) = self.branch_roots.get(&root.branch_id) {
+            if existing == &root {
+                return Ok(false);
+            }
+            return Err(BranchError::BranchRootConflict {
+                branch_id: root.branch_id,
+            }
+            .into());
+        }
+        if self.version == 0 || root.source_generation.get() != self.version {
+            return Err(BranchError::BranchRootInvalid {
+                branch_id: Some(root.branch_id),
+                reason: format!(
+                    "source generation {} does not equal live generation {}",
+                    root.source_generation.get(),
+                    self.version
+                ),
+            }
+            .into());
+        }
+        if self.branch_roots.len() >= max_children {
+            return Err(BranchError::BranchRootLimitExceeded {
+                limit: max_children,
+            }
+            .into());
+        }
+
+        let branch_id = root.branch_id;
+        self.branch_roots.insert(branch_id, root);
+        if let Err(error) = self.validate_branch_root_state(&namespace) {
+            self.branch_roots.remove(&branch_id);
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// Remove only one exact root body from this candidate.
+    #[allow(dead_code)] // Phase 07 lifecycle removal is the first production caller.
+    pub(crate) fn remove_branch_root_candidate(&mut self, expected: &BranchRoot) -> Result<()> {
+        let namespace = self
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "<unbound>".to_string());
+        self.validate_branch_root_state(&namespace)?;
+        match self.branch_roots.get(&expected.branch_id) {
+            Some(actual) if actual == expected => {}
+            Some(_) => {
+                return Err(BranchError::BranchRootConflict {
+                    branch_id: expected.branch_id,
+                }
+                .into());
+            }
+            None => {
+                return Err(BranchError::BranchRootMissing {
+                    branch_id: expected.branch_id,
+                }
+                .into());
+            }
+        }
+        self.branch_roots.remove(&expected.branch_id);
+        self.validate_branch_root_state(&namespace)
+    }
+
     /// Return the writer-fencing generation bound into the signed root.
     #[must_use]
     pub const fn fencing_token(&self) -> u64 {
@@ -1933,6 +2136,8 @@ impl Manifest {
             || self.root_signer_node.is_none()
             || self.receipt_binding_version.is_none()
             || self.recompute_receipt_state_digest(namespace).ok() != self.receipt_state_digest
+            || (self.receipt_binding_version == Some(ReceiptBindingVersion::V3Roots)
+                && self.recompute_control_state_digest(namespace).ok() != self.control_state_digest)
     }
 
     /// Read and hash every currently reachable immutable artifact missing from
@@ -2076,6 +2281,16 @@ impl Manifest {
         self.compute_receipt_state_digest(namespace, binding_version)
     }
 
+    /// Recompute the exact V3 roots/fence control digest.
+    pub(crate) fn recompute_control_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
+        if self.receipt_binding_version != Some(ReceiptBindingVersion::V3Roots) {
+            return Err(ZeppelinError::Serialization(
+                "manifest control digest requires receipt binding v3_roots".to_string(),
+            ));
+        }
+        self.compute_control_roots_digest(namespace)
+    }
+
     /// Seal a feature-only synthetic foreign view with a valid v2 projection.
     ///
     /// This only makes integration-fixture bytes structurally well-formed so
@@ -2100,11 +2315,11 @@ impl Manifest {
         self.validate_namespace_binding(namespace)?;
         let bytes = match binding_version {
             ReceiptBindingVersion::V1 => serde_json::to_vec(&self.execution_binding_v1(namespace)),
-            ReceiptBindingVersion::V2Origins => {
+            ReceiptBindingVersion::V2Origins | ReceiptBindingVersion::V3Roots => {
                 self.validate_artifact_origins()?;
                 serde_json::to_vec(&self.execution_binding_v2(namespace))
             }
-            ReceiptBindingVersion::V3Roots | ReceiptBindingVersion::V4Lineage => {
+            ReceiptBindingVersion::V4Lineage => {
                 return Err(
                     crate::namespace::branching::BranchError::BranchingNotReady {
                         feature: "reserved receipt binding projection",
@@ -2116,6 +2331,23 @@ impl Manifest {
         let bytes = bytes.map_err(|error| {
             ZeppelinError::Serialization(format!(
                 "manifest execution binding serialization failed: {error}"
+            ))
+        })?;
+        Ok(Sha256::digest(bytes).into())
+    }
+
+    fn compute_control_roots_digest(&self, namespace: &str) -> Result<[u8; 32]> {
+        self.validate_namespace_binding(namespace)?;
+        self.validate_branch_root_state(namespace)?;
+        let bytes = serde_json::to_vec(&ControlRootsV1 {
+            namespace,
+            incarnation: self.namespace_incarnation.map(|incarnation| incarnation.0),
+            deletion_fence: self.deletion_fence.as_ref(),
+            branch_roots: &self.branch_roots,
+        })
+        .map_err(|error| {
+            ZeppelinError::Serialization(format!(
+                "manifest roots control binding serialization failed: {error}"
             ))
         })?;
         Ok(Sha256::digest(bytes).into())
@@ -2446,6 +2678,7 @@ impl Manifest {
     }
 
     fn finalize_receipt_root(&mut self, store: &ZeppelinStore, namespace: &str) -> Result<()> {
+        self.validate_branch_root_state(namespace)?;
         self.canonicalize_explicit_artifact_origins()?;
         self.validate_artifact_origins()?;
         self.validate_foreign_origin_admission()?;
@@ -2460,20 +2693,17 @@ impl Manifest {
             }
         }
 
+        let has_roots_control = self.deletion_fence.is_some() || !self.branch_roots.is_empty();
         let binding_version = match self.receipt_binding_version {
-            Some(ReceiptBindingVersion::V2Origins) => ReceiptBindingVersion::V2Origins,
-            Some(ReceiptBindingVersion::V3Roots) => {
-                return Err(BranchError::BranchingNotReady {
-                    feature: "receipt binding v3_roots publication",
-                }
-                .into());
-            }
             Some(ReceiptBindingVersion::V4Lineage) => {
                 return Err(BranchError::BranchingNotReady {
                     feature: "receipt binding v4_lineage publication",
                 }
                 .into());
             }
+            Some(ReceiptBindingVersion::V3Roots) => ReceiptBindingVersion::V3Roots,
+            _ if has_roots_control => ReceiptBindingVersion::V3Roots,
+            Some(ReceiptBindingVersion::V2Origins) => ReceiptBindingVersion::V2Origins,
             Some(ReceiptBindingVersion::V1) | None if self.has_explicit_artifact_origins() => {
                 ReceiptBindingVersion::V2Origins
             }
@@ -2482,6 +2712,11 @@ impl Manifest {
         let state_digest = self.compute_receipt_state_digest(namespace, binding_version)?;
         self.receipt_state_digest = Some(state_digest);
         self.receipt_binding_version = Some(binding_version);
+        self.control_state_digest = match binding_version {
+            ReceiptBindingVersion::V3Roots => Some(self.compute_control_roots_digest(namespace)?),
+            ReceiptBindingVersion::V1 | ReceiptBindingVersion::V2Origins => None,
+            ReceiptBindingVersion::V4Lineage => unreachable!("V4 publication returned above"),
+        };
 
         if reachable
             .iter()
@@ -2532,7 +2767,27 @@ impl Manifest {
         self.version = 0;
         self.namespace = None;
         self.namespace_incarnation = None;
+        self.clear_branch_control_for_new_namespace();
+    }
+
+    /// Clear source-owned branch control before binding a different namespace.
+    ///
+    /// This is the only intentional root-map clearing path outside exact root
+    /// removal. A clone starts a fresh namespace lifetime, so retaining V3's
+    /// control binding would incorrectly pin or sign the source's child graph.
+    pub(crate) fn clear_branch_control_for_new_namespace(&mut self) {
         self.deletion_fence = None;
+        self.branch_roots.clear();
+        self.control_state_digest = None;
+        if matches!(
+            self.receipt_binding_version,
+            Some(ReceiptBindingVersion::V3Roots | ReceiptBindingVersion::V4Lineage)
+        ) {
+            self.receipt_binding_version = None;
+            self.receipt_state_digest = None;
+            self.root_signature = None;
+            self.root_signer_node = None;
+        }
     }
 
     /// Adopts the exact empty target generation used as a clone-publication CAS base.
@@ -2566,6 +2821,7 @@ impl Manifest {
             || target_base.active_segment.is_some()
             || !target_base.pending_deletes.is_empty()
             || target_base.deletion_fence.is_some()
+            || !target_base.branch_roots.is_empty()
         {
             return Err(ZeppelinError::ManifestConflict {
                 namespace: target_namespace.to_string(),
@@ -3101,8 +3357,9 @@ impl Manifest {
     pub(crate) fn from_bytes_for_namespace(data: &[u8], namespace: &str) -> Result<Self> {
         let manifest = Self::from_bytes(data)?;
         manifest.validate_namespace_binding(namespace)?;
+        manifest.validate_branch_root_state(namespace)?;
         manifest.validate_artifact_origins()?;
-        manifest.validate_receipt_binding_state()?;
+        manifest.validate_receipt_binding_state(namespace)?;
         manifest.validate_foreign_origin_admission()?;
         Ok(manifest)
     }
@@ -3119,7 +3376,7 @@ impl Manifest {
                 .any(|segment| segment.artifact_origin.is_some())
     }
 
-    fn validate_receipt_binding_state(&self) -> Result<()> {
+    fn validate_receipt_binding_state(&self, namespace: &str) -> Result<()> {
         match self.receipt_binding_version {
             None => {
                 if self.receipt_state_digest.is_some() || self.control_state_digest.is_some() {
@@ -3130,6 +3387,11 @@ impl Manifest {
                 if self.has_explicit_artifact_origins() {
                     return Err(ZeppelinError::Serialization(
                         "explicit artifact origins require receipt binding v2_origins".to_string(),
+                    ));
+                }
+                if !self.branch_roots.is_empty() {
+                    return Err(ZeppelinError::Serialization(
+                        "branch roots require receipt binding v3_roots".to_string(),
                     ));
                 }
             }
@@ -3149,6 +3411,11 @@ impl Manifest {
                         "explicit artifact origins require receipt binding v2_origins".to_string(),
                     ));
                 }
+                if !self.branch_roots.is_empty() {
+                    return Err(ZeppelinError::Serialization(
+                        "branch roots require receipt binding v3_roots".to_string(),
+                    ));
+                }
             }
             Some(ReceiptBindingVersion::V2Origins) => {
                 if self.receipt_state_digest.is_none() {
@@ -3161,12 +3428,35 @@ impl Manifest {
                         "receipt binding v2_origins forbids a control digest".to_string(),
                     ));
                 }
+                if !self.branch_roots.is_empty() {
+                    return Err(ZeppelinError::Serialization(
+                        "branch roots require receipt binding v3_roots".to_string(),
+                    ));
+                }
             }
             Some(ReceiptBindingVersion::V3Roots) => {
-                return Err(BranchError::BranchingNotReady {
-                    feature: "receipt binding v3_roots",
+                let execution = self.receipt_state_digest.ok_or_else(|| {
+                    ZeppelinError::Serialization(
+                        "receipt binding v3_roots requires an execution digest".to_string(),
+                    )
+                })?;
+                let control = self.control_state_digest.ok_or_else(|| {
+                    ZeppelinError::Serialization(
+                        "receipt binding v3_roots requires a control digest".to_string(),
+                    )
+                })?;
+                if self.compute_receipt_state_digest(namespace, ReceiptBindingVersion::V3Roots)?
+                    != execution
+                {
+                    return Err(ZeppelinError::Serialization(
+                        "receipt binding v3_roots execution digest mismatch".to_string(),
+                    ));
                 }
-                .into());
+                if self.compute_control_roots_digest(namespace)? != control {
+                    return Err(ZeppelinError::Serialization(
+                        "receipt binding v3_roots control digest mismatch".to_string(),
+                    ));
+                }
             }
             Some(ReceiptBindingVersion::V4Lineage) => {
                 return Err(BranchError::BranchingNotReady {
@@ -3190,6 +3480,80 @@ impl Manifest {
             validate_destruction_record_key(&fence.destruction_record_key).map_err(|error| {
                 ZeppelinError::Serialization(format!("manifest deletion fence is invalid: {error}"))
             })?;
+        }
+        Ok(())
+    }
+
+    /// Validate the complete live branch-root/control state as one domain.
+    fn validate_branch_root_state(&self, namespace: &str) -> Result<()> {
+        if self.deletion_fence.is_some() && !self.branch_roots.is_empty() {
+            return Err(BranchError::NamespaceHasLiveBranches {
+                namespace: namespace.to_string(),
+            }
+            .into());
+        }
+        if !self.branch_roots.is_empty() {
+            if self.namespace.as_deref() != Some(namespace) {
+                return Err(BranchError::BranchRootInvalid {
+                    branch_id: None,
+                    reason: "root-bearing manifest is not bound to its authoritative namespace"
+                        .to_string(),
+                }
+                .into());
+            }
+            if self
+                .namespace_incarnation
+                .is_none_or(|incarnation| incarnation.as_uuid().is_nil())
+            {
+                return Err(BranchError::BranchRootInvalid {
+                    branch_id: None,
+                    reason: "root-bearing manifest has no non-nil source incarnation".to_string(),
+                }
+                .into());
+            }
+        }
+
+        let mut target_incarnations = BTreeSet::new();
+        for (branch_id, root) in &self.branch_roots {
+            if branch_id != &root.branch_id {
+                return Err(BranchError::BranchRootInvalid {
+                    branch_id: Some(*branch_id),
+                    reason: "branch root map key does not match its body".to_string(),
+                }
+                .into());
+            }
+            if root.source_generation.get() == 0 {
+                return Err(BranchError::BranchRootInvalid {
+                    branch_id: Some(*branch_id),
+                    reason: "source generation must be greater than zero".to_string(),
+                }
+                .into());
+            }
+            if !crate::namespace::types::is_valid_namespace_name(root.target_namespace.as_str()) {
+                return Err(BranchError::BranchRootInvalid {
+                    branch_id: Some(*branch_id),
+                    reason: "target namespace violates the namespace grammar".to_string(),
+                }
+                .into());
+            }
+            if root.target_incarnation.is_nil() {
+                return Err(BranchError::BranchRootInvalid {
+                    branch_id: Some(*branch_id),
+                    reason: "target namespace incarnation is nil".to_string(),
+                }
+                .into());
+            }
+            if !target_incarnations.insert((
+                root.target_namespace.clone(),
+                root.target_incarnation.clone(),
+            )) {
+                return Err(BranchError::BranchRootInvalid {
+                    branch_id: Some(*branch_id),
+                    reason: "target namespace incarnation has more than one direct-parent root"
+                        .to_string(),
+                }
+                .into());
+            }
         }
         Ok(())
     }
@@ -3257,9 +3621,10 @@ impl Manifest {
     /// # Errors
     ///
     /// Returns on read, missing ETag, generation overflow, serialization,
-    /// predecessor-history, live PUT, or concurrent-publication conflict. A
-    /// failed live PUT cannot reserve the speculative generation;
-    /// `self.version` remains unchanged and a divergent retry stays possible.
+    /// predecessor-history, live PUT, concurrent-publication conflict, or a
+    /// candidate/live branch-control mismatch. A failed live PUT cannot reserve
+    /// the speculative generation; `self.version` remains unchanged and a
+    /// divergent retry stays possible.
     ///
     /// # Side Effects
     ///
@@ -3271,6 +3636,9 @@ impl Manifest {
     ///
     /// A concurrent fence, deletion, or publication after the discovery GET
     /// makes the final PUT fail instead of overwriting or resurrecting state.
+    /// Candidates crossing a V3 branch-control epoch fail before predecessor
+    /// history or live publication, even when the discovery read obtained a
+    /// fresh ETag.
     ///
     /// # Examples
     ///
@@ -3292,6 +3660,9 @@ impl Manifest {
             return Err(ZeppelinError::NamespaceDeleting {
                 namespace: namespace.to_string(),
             });
+        }
+        if let Some((live, _)) = &current {
+            self.require_matching_branch_control_for_recovery_write(live, namespace)?;
         }
         let current_version = current
             .as_ref()
@@ -3328,6 +3699,40 @@ impl Manifest {
         Self::write_immutable_history_snapshot(store, namespace, committed.version(), data).await?;
         store.forget_known_content_hashes(committed.artifact_hashes.keys());
         *self = committed;
+        Ok(())
+    }
+
+    /// Reject a generic recovery write that would cross a branch-control epoch.
+    ///
+    /// `write` deliberately discovers a fresh ETag for recovery-style callers,
+    /// so its candidate may predate the authoritative manifest observation.
+    /// Once either side has entered the V3 branch-control domain, rebasing is
+    /// safe only when the candidate carries the exact current root map,
+    /// incarnation, binding version, and control digest. Root insertion and
+    /// removal use their narrower versioned CAS primitives instead.
+    fn require_matching_branch_control_for_recovery_write(
+        &self,
+        live: &Self,
+        namespace: &str,
+    ) -> Result<()> {
+        let is_branch_bound = |manifest: &Self| {
+            !manifest.branch_roots.is_empty()
+                || manifest.control_state_digest.is_some()
+                || matches!(
+                    manifest.receipt_binding_version,
+                    Some(ReceiptBindingVersion::V3Roots | ReceiptBindingVersion::V4Lineage)
+                )
+        };
+        if (is_branch_bound(self) || is_branch_bound(live))
+            && (self.branch_roots != live.branch_roots
+                || self.namespace_incarnation != live.namespace_incarnation
+                || self.receipt_binding_version != live.receipt_binding_version
+                || self.control_state_digest != live.control_state_digest)
+        {
+            return Err(ZeppelinError::ManifestConflict {
+                namespace: namespace.to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -3574,6 +3979,12 @@ impl Manifest {
         for _ in 0..MAX_FENCE_ATTEMPTS {
             let (mut manifest, version) = Self::read_versioned_required(store, namespace).await?;
             version.require_etag(namespace, "governed destruction fence")?;
+            if !manifest.branch_roots.is_empty() {
+                return Err(BranchError::NamespaceHasLiveBranches {
+                    namespace: namespace.to_string(),
+                }
+                .into());
+            }
             match &manifest.deletion_fence {
                 Some(existing) if existing.destruction_record_key == destruction_record_key => {
                     return Ok(manifest);
@@ -3798,7 +4209,8 @@ impl Manifest {
     /// # Examples
     ///
     /// With generations 1 through 4 and `keep_count = 2`, this deletes 1 and 2,
-    /// unless a named snapshot pin protects either generation.
+    /// unless a named snapshot or current live branch root protects either
+    /// generation.
     pub async fn prune_history(
         store: &ZeppelinStore,
         namespace: &str,
@@ -3817,7 +4229,7 @@ impl Manifest {
         .pruned)
     }
 
-    /// Prunes history while retaining the union of count, time, and named-pin rules.
+    /// Prunes history while retaining count, time, named-pin, and live-root union.
     ///
     /// ```text
     /// history generation
@@ -3825,6 +4237,7 @@ impl Manifest {
     ///       +-- among newest keep_count? -------- keep
     ///       +-- inside PITR window + skew? ------ keep
     ///       +-- named snapshot pins it? --------- keep
+    ///       +-- current live branch root? ------- keep
     ///       `-- none apply ---------------------- delete
     /// ```
     ///
@@ -3851,29 +4264,32 @@ impl Manifest {
     ///
     /// # Side Effects
     ///
-    /// Lists history and named pins, GETs every history manifest, and DELETEs
-    /// generations kept by no rule. It does not modify the live manifest.
+    /// GETs the live manifest, lists history and named pins, GETs every history
+    /// manifest, revalidates the live manifest before destructive work, and
+    /// DELETEs generations kept by no rule. It does not modify the live manifest.
     ///
     /// # Consistency
     ///
     /// Retention is an OR, not an AND. `skew_slop_secs` extends only an enabled
     /// PITR time window. Named pins are read before pruning so a generation
-    /// observed as pinned in this pass is not deleted. The pin LIST and history
-    /// DELETEs are not one object-store transaction; a pin created concurrently
-    /// after the LIST can race this pass, so higher layers must serialize those
-    /// operations when they require a stronger creation-versus-prune guarantee.
+    /// observed as pinned in this pass is not deleted. Current roots and their
+    /// ETag-bound manifest identity are revalidated before a history DELETE.
+    /// The pin LIST and history DELETEs are not one object-store transaction; a
+    /// pin created concurrently after the LIST can race this pass, so higher
+    /// layers must serialize those operations when they require a stronger
+    /// creation-versus-prune guarantee.
     ///
     /// # Performance
     ///
-    /// Performs one history LIST, one snapshot LIST plus a GET per pin, one GET
-    /// per history entry, and at most one DELETE request per 1,000 pruned
-    /// generations.
+    /// Performs two live-manifest GETs when deletion is possible, one history
+    /// LIST, one snapshot LIST plus a GET per pin, one GET per history entry,
+    /// and at most one DELETE request per 1,000 pruned generations.
     ///
     /// # Examples
     ///
-    /// If generation 2 is pinned, generation 3 is within the time window, and
-    /// generation 5 is the newest count-retained value, all three survive while
-    /// unprotected generations 1 and 4 are deleted.
+    /// If generation 2 is pinned, generation 3 is within the time window,
+    /// generation 4 is rooted by a current child, and generation 5 is newest,
+    /// all four survive while an unprotected generation 1 is deleted.
     pub async fn prune_history_with_retention(
         store: &ZeppelinStore,
         namespace: &str,
@@ -3894,29 +4310,60 @@ impl Manifest {
                 "gc.manifest_history_keep_count must be greater than zero".to_string(),
             ));
         }
+        let (live, live_version) = Self::read_versioned_required(store, namespace).await?;
+        let observed_etag = live_version
+            .require_etag(namespace, "branch-root history retention")?
+            .to_string();
+        let rooted_generations = live.rooted_generations()?;
         let history = Self::list_history(store, namespace).await?;
         let keep_from = history.len().saturating_sub(retention.keep_count);
         let pinned_generations = NamedSnapshot::pinned_generations(store, namespace).await?;
         let mut retained_manifests = Vec::new();
         let mut prunable = Vec::new();
+        let mut observed_rooted_generations = BTreeSet::new();
         for (index, entry) in history.iter().enumerate() {
-            let manifest = Self::read_history(store, namespace, entry.version)
-                .await?
-                .ok_or_else(|| ZeppelinError::NotFound {
-                    key: entry.key.clone(),
-                })?;
+            let bytes = store.get(&entry.key).await?;
+            let manifest = Self::decode_history_body(&bytes, namespace, entry)?;
             let keep_by_count = index >= keep_from;
             let keep_by_pin = pinned_generations.contains(&entry.version);
+            let generation = ManifestGeneration::new(entry.version)?;
+            let keep_by_root = rooted_generations.contains_key(&generation);
+            if keep_by_root {
+                live.validate_rooted_history_bytes(generation, &bytes)?;
+                observed_rooted_generations.insert(generation);
+            }
             let retention_window = retention
                 .pitr_retention_secs
                 .saturating_add(retention.skew_slop_secs);
             let keep_by_time = retention.pitr_retention_secs > 0
                 && now.signed_duration_since(manifest.updated_at).num_seconds()
                     <= retention_window as i64;
-            if keep_by_count || keep_by_time || keep_by_pin {
+            if keep_by_count || keep_by_time || keep_by_pin || keep_by_root {
                 retained_manifests.push(manifest);
             } else {
                 prunable.push(entry.key.clone());
+            }
+        }
+        if let Some(missing) = rooted_generations
+            .keys()
+            .find(|generation| !observed_rooted_generations.contains(generation))
+        {
+            return Err(ZeppelinError::NotFound {
+                key: Self::history_key(namespace, missing.get()),
+            });
+        }
+        if !prunable.is_empty() {
+            let (revalidated, revalidated_version) =
+                Self::read_versioned_required(store, namespace).await?;
+            let revalidated_etag = revalidated_version
+                .require_etag(namespace, "branch-root history retention revalidation")?;
+            if revalidated_etag != observed_etag
+                || revalidated.namespace_incarnation != live.namespace_incarnation
+                || revalidated.branch_roots != live.branch_roots
+            {
+                return Err(ZeppelinError::ManifestConflict {
+                    namespace: namespace.to_string(),
+                });
             }
         }
         for batch in prunable.chunks(DELETE_MANY_MAX_KEYS) {
@@ -4701,6 +5148,24 @@ impl ManifestVersion {
         Ok(data)
     }
 
+    /// Return the exact authoritative live bytes paired with this observation.
+    #[allow(dead_code)] // Phase 04 root publication consumes the exact ETag-bound bytes.
+    pub(crate) fn exact_manifest_bytes(&self) -> Result<Bytes> {
+        self.history_snapshot.clone().ok_or_else(|| {
+            ZeppelinError::Serialization(
+                "manifest version has no exact authoritative bytes".to_string(),
+            )
+        })
+    }
+
+    /// Hash the exact authoritative live bytes paired with this observation.
+    #[allow(dead_code)] // Phase 04 root publication consumes the exact ETag-bound digest.
+    pub(crate) fn exact_manifest_digest(&self) -> Result<ManifestDigest> {
+        Ok(ManifestDigest::new(
+            Sha256::digest(self.exact_manifest_bytes()?).into(),
+        ))
+    }
+
     /// Borrow the backend ETag carried by this observation, when available.
     #[must_use]
     pub fn e_tag(&self) -> Option<&str> {
@@ -4713,6 +5178,13 @@ impl ManifestVersion {
 
     pub(crate) fn has_e_tag(&self) -> bool {
         self.e_tag.is_some()
+    }
+
+    /// Return whether the same authoritative read observed a deletion fence.
+    #[must_use]
+    #[allow(dead_code)] // Phase 04 root publication maps a fenced base before mutation.
+    pub(crate) const fn is_deletion_fenced(&self) -> bool {
+        self.deletion_fenced
     }
 
     /// Returns the backend version required to replace an existing manifest.
@@ -4818,6 +5290,29 @@ mod tests {
             incarnation: crate::namespace::NamespaceIncarnationId::from_uuid(
                 uuid::Uuid::from_u128(incarnation),
             ),
+        }
+    }
+
+    fn branch_root(
+        branch_id: BranchId,
+        generation: u64,
+        source_manifest_sha256: ManifestDigest,
+        target: &str,
+        target_incarnation: u128,
+    ) -> BranchRoot {
+        BranchRoot {
+            branch_id,
+            source_generation: ManifestGeneration::new(generation)
+                .expect("root generation must be nonzero"),
+            source_manifest_sha256,
+            fork_view_sha256: crate::namespace::ForkViewDigest::new([2; 32]),
+            source_config_sha256: crate::namespace::SourceDataPlaneConfigDigest::new([3; 32]),
+            target_namespace: NamespaceId::parse(target)
+                .expect("branch target fixture must be valid"),
+            target_incarnation: NamespaceIncarnationId::from_uuid(uuid::Uuid::from_u128(
+                target_incarnation,
+            )),
+            created_at: Utc::now(),
         }
     }
 
@@ -5524,6 +6019,348 @@ mod tests {
     }
 
     #[test]
+    fn branch_root_candidates_are_exact_idempotent_bounded_and_removable() {
+        let mut manifest = Manifest::new();
+        manifest.namespace = Some("root-source".to_string());
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(10))
+            .unwrap();
+        manifest.version = 7;
+        let predecessor_bytes = manifest.to_bytes().unwrap();
+        let digest = ManifestDigest::new(Sha256::digest(&predecessor_bytes).into());
+        let branch_id = BranchId::from_ulid(Ulid::from(11_u128));
+        let root = branch_root(branch_id, 7, digest, "child-a", 12);
+
+        assert!(manifest
+            .insert_branch_root_candidate(root.clone(), 1)
+            .unwrap());
+        assert!(!manifest
+            .insert_branch_root_candidate(root.clone(), 1)
+            .unwrap());
+        assert_eq!(manifest.branch_roots().get(&branch_id), Some(&root));
+        assert_eq!(
+            manifest
+                .rooted_generations()
+                .unwrap()
+                .get(&root.source_generation),
+            Some(&digest)
+        );
+        manifest
+            .validate_rooted_history_bytes(root.source_generation, &predecessor_bytes)
+            .unwrap();
+
+        let conflicting = BranchRoot {
+            source_config_sha256: crate::namespace::SourceDataPlaneConfigDigest::new([9; 32]),
+            ..root.clone()
+        };
+        assert!(matches!(
+            manifest.insert_branch_root_candidate(conflicting, 1),
+            Err(ZeppelinError::Branch(error))
+                if matches!(error.as_ref(), BranchError::BranchRootConflict { branch_id: id } if *id == branch_id)
+        ));
+
+        let second = branch_root(
+            BranchId::from_ulid(Ulid::from(13_u128)),
+            7,
+            digest,
+            "child-b",
+            14,
+        );
+        assert!(matches!(
+            manifest.insert_branch_root_candidate(second, 1),
+            Err(ZeppelinError::Branch(error))
+                if matches!(error.as_ref(), BranchError::BranchRootLimitExceeded { limit: 1 })
+        ));
+
+        manifest.remove_branch_root_candidate(&root).unwrap();
+        assert!(manifest.branch_roots().is_empty());
+        assert!(matches!(
+            manifest.remove_branch_root_candidate(&root),
+            Err(ZeppelinError::Branch(error))
+                if matches!(error.as_ref(), BranchError::BranchRootMissing { branch_id: id } if *id == branch_id)
+        ));
+    }
+
+    #[test]
+    fn branch_root_validation_rejects_malformed_identity_and_fence_overlap() {
+        let mut manifest = Manifest::new();
+        manifest.namespace = Some("root-validation".to_string());
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(20))
+            .unwrap();
+        manifest.version = 3;
+        let bytes = manifest.to_bytes().unwrap();
+        let digest = ManifestDigest::new(Sha256::digest(bytes).into());
+
+        let branch_id = BranchId::from_ulid(Ulid::from(21_u128));
+        let nil_target = branch_root(branch_id, 3, digest, "child", 0);
+        assert!(matches!(
+            manifest.insert_branch_root_candidate(nil_target, 4),
+            Err(ZeppelinError::Branch(error))
+                if matches!(error.as_ref(), BranchError::BranchRootInvalid { .. })
+        ));
+
+        let root = branch_root(branch_id, 3, digest, "child", 22);
+        manifest
+            .insert_branch_root_candidate(root.clone(), 4)
+            .unwrap();
+        manifest.deletion_fence = Some(ManifestDeletionFence {
+            destruction_record_key: "_audit/destruction/root-validation.json".to_string(),
+        });
+        assert!(matches!(
+            manifest.validate_branch_root_state("root-validation"),
+            Err(ZeppelinError::Branch(error))
+                if matches!(error.as_ref(), BranchError::NamespaceHasLiveBranches { .. })
+        ));
+
+        manifest.deletion_fence = None;
+        manifest.branch_roots.clear();
+        let mut mismatched = root;
+        mismatched.branch_id = BranchId::from_ulid(Ulid::from(23_u128));
+        manifest.branch_roots.insert(branch_id, mismatched);
+        assert!(matches!(
+            manifest.validate_branch_root_state("root-validation"),
+            Err(ZeppelinError::Branch(error))
+                if matches!(error.as_ref(), BranchError::BranchRootInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn v3_roots_reuses_v2_execution_and_never_downgrades() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let mut manifest = Manifest::new();
+        manifest.namespace = Some("v3-roots".to_string());
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(30))
+            .unwrap();
+        manifest.version = 5;
+        let predecessor_bytes = manifest.to_bytes().unwrap();
+        let digest = ManifestDigest::new(Sha256::digest(&predecessor_bytes).into());
+        let v2_execution = manifest
+            .compute_receipt_state_digest("v3-roots", ReceiptBindingVersion::V2Origins)
+            .unwrap();
+        let root = branch_root(
+            BranchId::from_ulid(Ulid::from(31_u128)),
+            5,
+            digest,
+            "v3-child",
+            32,
+        );
+        manifest
+            .insert_branch_root_candidate(root.clone(), 4)
+            .unwrap();
+        manifest.finalize_receipt_root(&store, "v3-roots").unwrap();
+
+        assert_eq!(
+            manifest.receipt_binding_version(),
+            Some(ReceiptBindingVersion::V3Roots)
+        );
+        assert_eq!(manifest.receipt_state_digest(), Some(v2_execution));
+        let control = manifest.control_state_digest().unwrap();
+        assert_eq!(
+            manifest.recompute_control_state_digest("v3-roots").unwrap(),
+            control
+        );
+        let mut changed_view = manifest.clone();
+        let changed_root = BranchRoot {
+            fork_view_sha256: crate::namespace::ForkViewDigest::new([0xa5; 32]),
+            ..root.clone()
+        };
+        changed_view
+            .branch_roots
+            .insert(root.branch_id, changed_root);
+        changed_view
+            .finalize_receipt_root(&store, "v3-roots")
+            .unwrap();
+        let changed_control = changed_view.control_state_digest().unwrap();
+        assert_eq!(changed_view.receipt_state_digest(), Some(v2_execution));
+        assert_ne!(changed_control, control);
+        assert_ne!(
+            manifest_root_signing_bytes(
+                [1; 32],
+                6,
+                7,
+                ReceiptBindingVersion::V3Roots,
+                [2; 32],
+                Some(control),
+            )
+            .unwrap(),
+            manifest_root_signing_bytes(
+                [1; 32],
+                6,
+                7,
+                ReceiptBindingVersion::V3Roots,
+                [2; 32],
+                Some(changed_control),
+            )
+            .unwrap(),
+            "fork-view identity must change V3 signing bytes without changing V2 execution"
+        );
+        let signing = manifest_root_signing_bytes(
+            [1; 32],
+            6,
+            7,
+            ReceiptBindingVersion::V3Roots,
+            [2; 32],
+            Some([3; 32]),
+        )
+        .unwrap();
+        let signing = String::from_utf8(signing).unwrap();
+        assert!(signing
+            .starts_with(r#"{"domain":"zeppelin-manifest-root-envelope-v2","merkle_root":[1,1"#));
+        assert!(signing.contains(r#""binding_version":"v3_roots""#));
+        assert!(signing.ends_with(
+            r#""control_digest":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3]}"#
+        ));
+
+        manifest.remove_branch_root_candidate(&root).unwrap();
+        manifest.finalize_receipt_root(&store, "v3-roots").unwrap();
+        assert_eq!(
+            manifest.receipt_binding_version(),
+            Some(ReceiptBindingVersion::V3Roots),
+            "removing the final root must not downgrade this namespace lifetime"
+        );
+        assert!(manifest.control_state_digest().is_some());
+    }
+
+    #[tokio::test]
+    async fn manifest_write_cannot_erase_resurrect_or_downgrade_branch_control() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let namespace = "branch-control-write-rebase";
+        let incarnation = uuid::Uuid::from_u128(0x41);
+        let mut initial = Manifest::new();
+        initial.bind_namespace_incarnation(incarnation).unwrap();
+        initial.write(&store, namespace).await.unwrap();
+        let mut stale_pre_v3 = Manifest::read(&store, namespace).await.unwrap().unwrap();
+
+        let (mut rooted, root_base) = Manifest::read_versioned(&store, namespace)
+            .await
+            .unwrap()
+            .unwrap();
+        let root = branch_root(
+            BranchId::from_ulid(Ulid::from(0x42_u128)),
+            rooted.version(),
+            root_base.exact_manifest_digest().unwrap(),
+            "branch-control-write-child",
+            0x43,
+        );
+        rooted
+            .insert_branch_root_candidate(root.clone(), 4)
+            .unwrap();
+        rooted
+            .write_conditional(&store, namespace, &root_base)
+            .await
+            .unwrap();
+        let mut stale_rooted = rooted.clone();
+
+        assert!(matches!(
+            stale_pre_v3.write(&store, namespace).await,
+            Err(ZeppelinError::ManifestConflict { .. })
+        ));
+        let after_erase_attempt = Manifest::read(&store, namespace).await.unwrap().unwrap();
+        assert_eq!(
+            after_erase_attempt.branch_roots().get(&root.branch_id),
+            Some(&root)
+        );
+        assert_eq!(
+            after_erase_attempt.receipt_binding_version(),
+            Some(ReceiptBindingVersion::V3Roots)
+        );
+
+        let (mut rootless_v3, rooted_version) = Manifest::read_versioned(&store, namespace)
+            .await
+            .unwrap()
+            .unwrap();
+        rootless_v3.remove_branch_root_candidate(&root).unwrap();
+        rootless_v3
+            .write_conditional(&store, namespace, &rooted_version)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            stale_rooted.write(&store, namespace).await,
+            Err(ZeppelinError::ManifestConflict { .. })
+        ));
+        assert!(matches!(
+            stale_pre_v3.write(&store, namespace).await,
+            Err(ZeppelinError::ManifestConflict { .. })
+        ));
+        let after_resurrection_attempts = Manifest::read(&store, namespace).await.unwrap().unwrap();
+        assert!(after_resurrection_attempts.branch_roots().is_empty());
+        assert_eq!(
+            after_resurrection_attempts.receipt_binding_version(),
+            Some(ReceiptBindingVersion::V3Roots)
+        );
+    }
+
+    #[test]
+    fn v3_root_tampering_fails_decode_and_clone_reset_clears_control() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let mut manifest = Manifest::new();
+        manifest.namespace = Some("v3-tamper".to_string());
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(40))
+            .unwrap();
+        manifest.version = 2;
+        let digest = ManifestDigest::new(Sha256::digest(manifest.to_bytes().unwrap()).into());
+        let root = branch_root(
+            BranchId::from_ulid(Ulid::from(41_u128)),
+            2,
+            digest,
+            "tamper-child",
+            42,
+        );
+        manifest
+            .insert_branch_root_candidate(root.clone(), 4)
+            .unwrap();
+        manifest.finalize_receipt_root(&store, "v3-tamper").unwrap();
+
+        let mut tampered = manifest.clone();
+        tampered
+            .branch_roots
+            .get_mut(&root.branch_id)
+            .unwrap()
+            .fork_view_sha256 = crate::namespace::ForkViewDigest::new([99; 32]);
+        assert!(matches!(
+            Manifest::from_bytes_for_namespace(&tampered.to_bytes().unwrap(), "v3-tamper"),
+            Err(ZeppelinError::Serialization(_))
+        ));
+
+        let mut missing_control = manifest.clone();
+        missing_control.control_state_digest = None;
+        assert!(matches!(
+            Manifest::from_bytes_for_namespace(&missing_control.to_bytes().unwrap(), "v3-tamper"),
+            Err(ZeppelinError::Serialization(_))
+        ));
+
+        let mut fenced = manifest.clone();
+        fenced.branch_roots.clear();
+        fenced.deletion_fence = Some(ManifestDeletionFence {
+            destruction_record_key: "_audit/destruction/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"
+                .to_string(),
+        });
+        fenced.finalize_receipt_root(&store, "v3-tamper").unwrap();
+        Manifest::from_bytes_for_namespace(&fenced.to_bytes().unwrap(), "v3-tamper").unwrap();
+
+        let mut tampered_fence = fenced;
+        tampered_fence
+            .deletion_fence
+            .as_mut()
+            .unwrap()
+            .destruction_record_key =
+            "_audit/destruction/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json".to_string();
+        assert!(matches!(
+            Manifest::from_bytes_for_namespace(&tampered_fence.to_bytes().unwrap(), "v3-tamper"),
+            Err(ZeppelinError::Serialization(_))
+        ));
+
+        manifest.reset_version_for_clone();
+        assert!(manifest.branch_roots().is_empty());
+        assert_eq!(manifest.control_state_digest(), None);
+        assert_eq!(manifest.receipt_binding_version(), None);
+    }
+
+    #[test]
     fn receipt_binding_version_never_downgrades_within_one_namespace_lifetime() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         let mut manifest = Manifest::new();
@@ -5671,40 +6508,42 @@ mod tests {
     }
 
     #[test]
-    fn reserved_v3_v4_bindings_deserialize_but_fail_closed() {
-        for version in [
-            ReceiptBindingVersion::V3Roots,
+    fn reserved_v4_binding_deserializes_but_fails_closed() {
+        let mut manifest = Manifest::new();
+        manifest.namespace = Some("reserved-binding".to_string());
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .unwrap();
+        manifest.receipt_binding_version = Some(ReceiptBindingVersion::V4Lineage);
+        manifest.receipt_state_digest = Some([1; 32]);
+
+        let error = Manifest::from_bytes_for_namespace(
+            &manifest
+                .to_bytes()
+                .expect("reserved version must serialize"),
+            "reserved-binding",
+        )
+        .expect_err("reserved version must not become authority");
+        assert!(matches!(
+            error,
+            ZeppelinError::Branch(error)
+                if matches!(error.as_ref(), BranchError::BranchingNotReady { .. })
+        ));
+
+        let error = manifest_root_signing_bytes(
+            [1; 32],
+            1,
+            1,
             ReceiptBindingVersion::V4Lineage,
-        ] {
-            let mut manifest = Manifest::new();
-            manifest.namespace = Some("reserved-binding".to_string());
-            manifest
-                .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
-                .unwrap();
-            manifest.receipt_binding_version = Some(version);
-            manifest.receipt_state_digest = Some([1; 32]);
-
-            let error = Manifest::from_bytes_for_namespace(
-                &manifest
-                    .to_bytes()
-                    .expect("reserved version must serialize"),
-                "reserved-binding",
-            )
-            .expect_err("reserved version must not become authority");
-            assert!(matches!(
-                error,
-                ZeppelinError::Branch(error)
-                    if matches!(error.as_ref(), BranchError::BranchingNotReady { .. })
-            ));
-
-            let error = manifest_root_signing_bytes([1; 32], 1, 1, version, [2; 32], None)
-                .expect_err("reserved root projection must not sign");
-            assert!(matches!(
-                error,
-                ZeppelinError::Branch(error)
-                    if matches!(error.as_ref(), BranchError::BranchingNotReady { .. })
-            ));
-        }
+            [2; 32],
+            None,
+        )
+        .expect_err("reserved root projection must not sign");
+        assert!(matches!(
+            error,
+            ZeppelinError::Branch(error)
+                if matches!(error.as_ref(), BranchError::BranchingNotReady { .. })
+        ));
     }
 
     /// Sketch refs written before v4 decode with no invented rotation seed.
@@ -6003,6 +6842,70 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn manifest_history_prune_retains_exact_current_branch_root_generation() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let ns = "manifest_history_branch_root";
+
+        let mut initial = Manifest::new();
+        initial
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(0x500))
+            .unwrap();
+        initial.write(&store, ns).await.unwrap();
+        for _ in 2..=4 {
+            let (mut manifest, version) =
+                Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
+            manifest.updated_at += chrono::Duration::seconds(1);
+            manifest
+                .write_conditional(&store, ns, &version)
+                .await
+                .unwrap();
+        }
+
+        let (mut rooted, rooted_version) =
+            Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
+        assert_eq!(rooted.version(), 4);
+        let root = branch_root(
+            BranchId::from_ulid(Ulid::from(0x501_u128)),
+            4,
+            rooted_version.exact_manifest_digest().unwrap(),
+            "retained-child",
+            0x502,
+        );
+        rooted.insert_branch_root_candidate(root, 4).unwrap();
+        rooted
+            .write_conditional(&store, ns, &rooted_version)
+            .await
+            .unwrap();
+        NamedSnapshot::create(&store, ns, "beside-root", 3)
+            .await
+            .unwrap();
+
+        for _ in 0..4 {
+            let (mut manifest, version) =
+                Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
+            manifest.updated_at += chrono::Duration::seconds(1);
+            manifest
+                .write_conditional(&store, ns, &version)
+                .await
+                .unwrap();
+        }
+
+        let result = Manifest::prune_history(&store, ns, 1).await.unwrap();
+        assert!(result > 0);
+        assert!(Manifest::read_history(&store, ns, 4)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(Manifest::read_history(&store, ns, 3)
+            .await
+            .unwrap()
+            .is_some());
+        let retained = Manifest::list_history(&store, ns).await.unwrap();
+        assert!(retained.iter().any(|history| history.version == 3));
+        assert!(retained.iter().any(|history| history.version == 4));
     }
 
     /// Protects union retention: count, PITR age, and a named snapshot each keep
@@ -6595,6 +7498,7 @@ mod tests {
             .expect("the immediately pre-origin positional shape must decode locally");
 
         assert!(decoded.artifact_origins.is_empty());
+        assert!(decoded.branch_roots().is_empty());
         assert_eq!(decoded.fragments[0].artifact_origin, None);
         assert_eq!(decoded.segments[0].artifact_origin, None);
         let expected = ArtifactOrigin {
@@ -6681,6 +7585,7 @@ mod tests {
         assert_eq!(decoded.fragments[0].sequence_number, 7);
         assert_eq!(decoded.fragments[0].artifact_origin, None);
         assert!(decoded.artifact_origins.is_empty());
+        assert!(decoded.branch_roots().is_empty());
         assert_eq!(
             decoded.fragments[0].size_bytes, 0,
             "missing size_bytes decodes to the serde default (0)"

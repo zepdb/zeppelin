@@ -200,7 +200,6 @@ impl TestHarness {
     }
 
     /// Build a URL-safe namespace owned by this fixture's random identity.
-    #[cfg(feature = "branching-test-support")]
     pub fn artifact_origin_namespace(&self, suffix: &str) -> String {
         format!("{}-{suffix}", self.prefix)
     }
@@ -223,7 +222,6 @@ impl TestHarness {
     }
 
     /// Remove one URL-safe namespace created by an artifact-origin fixture.
-    #[cfg(feature = "branching-test-support")]
     pub async fn cleanup_artifact_origin_namespace(&self, namespace: &str) {
         let deleted = self
             .store
@@ -261,6 +259,17 @@ impl TestHarness {
             Err(e) => {
                 cleanup_errors.push(format!("domain prefix cleanup failed for {prefix}: {e}"));
             }
+        }
+        let url_safe_prefix = format!("{}-", self.prefix);
+        match self.store.delete_prefix(&url_safe_prefix).await {
+            Ok(count) => {
+                if count > 0 {
+                    eprintln!("[test harness] cleaned up {count} objects under {url_safe_prefix}");
+                }
+            }
+            Err(error) => cleanup_errors.push(format!(
+                "URL-safe namespace cleanup failed for {url_safe_prefix}: {error}"
+            )),
         }
         if let Err(error) = cleanup_audit_scope(&self.store, &self.prefix).await {
             cleanup_errors.push(error);

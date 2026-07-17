@@ -1,13 +1,16 @@
 //! Feature-gated synthetic foreign-origin fixtures for external integration tests.
 //!
-//! This module deliberately exposes no publication or HTTP admission path. It
-//! creates one target-bound manifest only in memory and hands that snapshot to
-//! the same supplied-manifest query function used by production batch and
-//! historical execution. Persisting the bytes still passes through normal
-//! manifest admission and is rejected until lineage authorization lands.
+//! This module exposes feature-only adapters for exercising private branch-root
+//! and deletion-fence publication primitives. Its synthetic foreign-origin
+//! query fixtures still create target-bound manifests only in memory and hand
+//! those snapshots to the same supplied-manifest paths used by production batch
+//! and historical execution. Persisting synthetic target bytes still passes
+//! through normal manifest admission and is rejected until lineage authorization
+//! lands.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::cache::hydration::HydrationTarget;
 use crate::cache::DiskCache;
@@ -23,11 +26,18 @@ use crate::storage::ZeppelinStore;
 use crate::types::{
     AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult, VectorId,
 };
-use crate::wal::manifest::Manifest;
-use crate::wal::WalReader;
+use crate::wal::manifest::{Manifest, ReceiptBindingVersion};
+use crate::wal::{LeaseManager, WalReader};
+use chrono::{DateTime, Utc};
 
-use super::{ArtifactOrigin, ArtifactOriginIndex};
-use crate::namespace::{NamespaceId, NamespaceIncarnationId};
+use super::{
+    ArtifactOrigin, ArtifactOriginIndex, BranchId, BranchRoot, ForkViewDigest, ManifestGeneration,
+};
+use crate::namespace::branch_root::{
+    insert_branch_root, remove_branch_root, source_data_plane_config_digest,
+    InsertBranchRootRequest, RemoveBranchRootRequest,
+};
+use crate::namespace::{NamespaceId, NamespaceIncarnationId, NamespaceManager};
 
 /// Observable result of one ANN query through a synthetic target manifest.
 #[derive(Debug, Clone)]
@@ -70,6 +80,179 @@ pub struct SyntheticForeignFetchResult {
     pub missing: Vec<VectorId>,
     /// Exact immutable segment keys consumed by lookup.
     pub touched_artifact_keys: Vec<String>,
+}
+
+/// Test-only observation of one live manifest's branch-control state.
+#[derive(Debug, Clone)]
+pub struct BranchControlSnapshot {
+    /// Exact direct-child roots in deterministic key order.
+    pub roots: Vec<BranchRoot>,
+    /// Whether the same authoritative manifest observation carried a delete fence.
+    pub deletion_fenced: bool,
+    /// Receipt/control projection version bound to the live generation.
+    pub binding_version: Option<ReceiptBindingVersion>,
+    /// Exact live manifest generation from the same observation.
+    pub manifest_generation: u64,
+    /// Writer fencing token from the same observation.
+    pub fencing_token: u64,
+}
+
+/// Build the exact root body for the currently authoritative source head.
+///
+/// This feature-only adapter performs no mutation. It lets external MinIO
+/// tests prepare one body and retry that identical body through the private
+/// one-shot primitive, matching the Phase-05 orchestrator contract.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_head_branch_root(
+    store: ZeppelinStore,
+    source_namespace: &str,
+    branch_id: BranchId,
+    target_namespace: &str,
+    target_incarnation: uuid::Uuid,
+    fork_view_sha256: ForkViewDigest,
+    created_at: DateTime<Utc>,
+) -> Result<BranchRoot> {
+    let manager = NamespaceManager::new(store.clone());
+    let metadata = manager
+        .get_active_metadata_for_guarded_write(source_namespace)
+        .await?;
+    let source_incarnation = metadata.incarnation_id.as_ref().ok_or_else(|| {
+        ZeppelinError::Serialization(format!(
+            "active namespace {source_namespace} has no authoritative incarnation"
+        ))
+    })?;
+    let (manifest, version) = Manifest::read_versioned_required_for_incarnation(
+        &store,
+        source_namespace,
+        source_incarnation.as_uuid(),
+    )
+    .await?;
+    if version.is_deletion_fenced() {
+        return Err(ZeppelinError::NamespaceDeleting {
+            namespace: source_namespace.to_string(),
+        });
+    }
+    let target_namespace = NamespaceId::parse(target_namespace.to_string()).map_err(|_| {
+        ZeppelinError::Validation(format!(
+            "invalid branch target namespace: {target_namespace}"
+        ))
+    })?;
+    Ok(BranchRoot {
+        branch_id,
+        source_generation: ManifestGeneration::new(manifest.version())?,
+        source_manifest_sha256: version.exact_manifest_digest()?,
+        fork_view_sha256,
+        source_config_sha256: source_data_plane_config_digest(&metadata)?,
+        target_namespace,
+        target_incarnation: NamespaceIncarnationId::from_uuid(target_incarnation),
+        created_at,
+    })
+}
+
+/// Publish one already-prepared exact root through the private production primitive.
+pub async fn insert_prepared_branch_root(
+    store: ZeppelinStore,
+    source_namespace: &str,
+    root: BranchRoot,
+    max_children: usize,
+) -> Result<BranchRoot> {
+    let source_namespace = NamespaceId::parse(source_namespace.to_string()).map_err(|_| {
+        ZeppelinError::Validation(format!(
+            "invalid branch source namespace: {source_namespace}"
+        ))
+    })?;
+    let namespace_manager = NamespaceManager::new(store.clone());
+    let lease_manager = LeaseManager::new(
+        store.clone(),
+        format!("branch-test-{}", ulid::Ulid::new()),
+        Duration::from_secs(30),
+    );
+    insert_branch_root(
+        &store,
+        &namespace_manager,
+        &lease_manager,
+        InsertBranchRootRequest {
+            source_namespace,
+            root,
+            max_children,
+        },
+    )
+    .await
+}
+
+/// Remove one exact root through the private production primitive.
+pub async fn remove_prepared_branch_root(
+    store: ZeppelinStore,
+    source_namespace: &str,
+    expected_root: BranchRoot,
+) -> Result<()> {
+    let source_namespace = NamespaceId::parse(source_namespace.to_string()).map_err(|_| {
+        ZeppelinError::Validation(format!(
+            "invalid branch source namespace: {source_namespace}"
+        ))
+    })?;
+    let namespace_manager = NamespaceManager::new(store.clone());
+    let lease_manager = LeaseManager::new(
+        store.clone(),
+        format!("branch-test-remove-{}", ulid::Ulid::new()),
+        Duration::from_secs(30),
+    );
+    remove_branch_root(
+        &store,
+        &namespace_manager,
+        &lease_manager,
+        RemoveBranchRootRequest {
+            source_namespace,
+            expected_root,
+        },
+    )
+    .await
+}
+
+/// Publish the normal governed-destruction fence through a feature-only adapter.
+pub async fn publish_deletion_fence(
+    store: ZeppelinStore,
+    namespace: &str,
+    destruction_record_key: &str,
+) -> Result<()> {
+    Manifest::fence_for_destruction(&store, namespace, destruction_record_key)
+        .await
+        .map(|_| ())
+}
+
+/// Read one exact live branch-control observation for external assertions.
+pub async fn branch_control_snapshot(
+    store: &ZeppelinStore,
+    namespace: &str,
+) -> Result<BranchControlSnapshot> {
+    let (manifest, version) = Manifest::read_versioned_required(store, namespace).await?;
+    Ok(BranchControlSnapshot {
+        roots: manifest.branch_roots().values().cloned().collect(),
+        deletion_fenced: version.is_deletion_fenced(),
+        binding_version: manifest.receipt_binding_version(),
+        manifest_generation: manifest.version(),
+        fencing_token: manifest.fencing_token(),
+    })
+}
+
+/// Publish a higher manifest fencing token for a stale-writer regression.
+pub async fn publish_manifest_fencing_token(
+    store: &ZeppelinStore,
+    namespace: &str,
+    fencing_token: u64,
+) -> Result<()> {
+    let (mut manifest, version) = Manifest::read_versioned_required(store, namespace).await?;
+    if fencing_token <= manifest.fencing_token() {
+        return Err(ZeppelinError::Validation(format!(
+            "test fencing token {fencing_token} must exceed live token {}",
+            manifest.fencing_token()
+        )));
+    }
+    manifest.fencing_token = fencing_token;
+    manifest
+        .write_conditional(store, namespace, &version)
+        .await
+        .map(|_| ())
 }
 
 /// One positional query request executed against a shared synthetic manifest.

@@ -9,8 +9,9 @@ use zeppelin::compaction::gc::{load_gc_candidates, run_gc_cycle};
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, GcConfig, IndexingConfig};
 use zeppelin::error::ZeppelinError;
+use zeppelin::namespace::NamespaceManager;
 use zeppelin::storage::ZeppelinStore;
-use zeppelin::types::VectorEntry;
+use zeppelin::types::{DistanceMetric, VectorEntry};
 use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::manifest::{FragmentRef, Manifest};
 use zeppelin::wal::{WalReader, WalWriter};
@@ -78,7 +79,7 @@ async fn orphan_segment_keys_after_upload_abort(
         .unwrap();
     assert!(
         !keys.is_empty(),
-        "test setup must leave uploaded segment objects orphaned"
+        "test setup must leave uploaded segment objects orphaned; compaction returned {result:?}"
     );
     keys
 }
@@ -104,16 +105,12 @@ async fn wait_for_segment_uploads(store: &ZeppelinStore, namespace: &str) -> Vec
 #[tokio::test]
 async fn gc_reclaims_orphaned_segment_objects_only_after_horizon() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("gc-19d-orphan-segment");
+    let ns = harness.artifact_origin_namespace("gc-19d-orphan-segment");
     let store = harness.store.clone();
-    common::write_active_namespace_metadata(
-        &store,
-        &ns,
-        16,
-        zeppelin::types::DistanceMetric::Euclidean,
-    )
-    .await;
-    Manifest::new().write(&store, &ns).await.unwrap();
+    NamespaceManager::new(store.clone())
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
     WalWriter::new(store.clone())
         .append(&ns, prefixed_vectors("segment_orphan", 24, 16), vec![])
         .await
@@ -142,22 +139,19 @@ async fn gc_reclaims_orphaned_segment_objects_only_after_horizon() {
         assert_s3_object_not_exists(&store, key).await;
     }
 
+    harness.cleanup_artifact_origin_namespace(&ns).await;
     harness.cleanup().await;
 }
 
 #[tokio::test]
 async fn gc_reclaims_full_segment_orphan_after_compaction_manifest_bump() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("gc-19d-compaction-bump");
+    let ns = harness.artifact_origin_namespace("gc-19d-compaction-bump");
     let store = harness.store.clone();
-    common::write_active_namespace_metadata(
-        &store,
-        &ns,
-        16,
-        zeppelin::types::DistanceMetric::Euclidean,
-    )
-    .await;
-    Manifest::new().write(&store, &ns).await.unwrap();
+    NamespaceManager::new(store.clone())
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
     WalWriter::new(store.clone())
         .append(&ns, prefixed_vectors("manifest_bump", 24, 16), vec![])
         .await
@@ -211,13 +205,14 @@ async fn gc_reclaims_full_segment_orphan_after_compaction_manifest_bump() {
         assert_s3_object_not_exists(&store, key).await;
     }
 
+    harness.cleanup_artifact_origin_namespace(&ns).await;
     harness.cleanup().await;
 }
 
 #[tokio::test]
 async fn gc_reclaims_orphaned_fragment_from_failed_write_cas() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("gc-19d-orphan-fragment");
+    let ns = harness.artifact_origin_namespace("gc-19d-orphan-fragment");
     let store = harness.store.clone();
     Manifest::new().write(&store, &ns).await.unwrap();
 
@@ -237,13 +232,14 @@ async fn gc_reclaims_orphaned_fragment_from_failed_write_cas() {
     assert_eq!(report.objects_deleted, 1);
     assert_s3_object_not_exists(&store, &orphan_key).await;
 
+    harness.cleanup_artifact_origin_namespace(&ns).await;
     harness.cleanup().await;
 }
 
 #[tokio::test]
 async fn old_fragment_that_just_left_manifest_is_not_collected_before_horizon() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("gc-19d-break-a");
+    let ns = harness.artifact_origin_namespace("gc-19d-break-a");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 77);
     let old_key = WalFragment::s3_key(&ns, &old_id);
@@ -273,5 +269,6 @@ async fn old_fragment_that_just_left_manifest_is_not_collected_before_horizon() 
     run_gc_cycle(&store, &ns, &config).await.unwrap();
     assert_s3_object_exists(&store, &old_key).await;
 
+    harness.cleanup_artifact_origin_namespace(&ns).await;
     harness.cleanup().await;
 }

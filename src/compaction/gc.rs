@@ -122,8 +122,9 @@ use crate::index::ivf_flat::build::{attrs_key, centroids_key, cluster_key};
 use crate::index::quantization::pq::{pq_cluster_key, pq_codebook_key};
 use crate::index::quantization::sq::{sq_calibration_key, sq_cluster_key};
 use crate::index::quantization::QuantizationType;
-use crate::namespace::branching::ArtifactOrigin;
+use crate::namespace::branching::{ArtifactOrigin, BranchError};
 use crate::namespace::manager::{NamespaceIncarnationId, NamespaceMetadata};
+use crate::namespace::{BranchId, BranchRoot, ManifestDigest, ManifestGeneration};
 use crate::security::{NamespaceId, PreservationService};
 use crate::storage::store::DELETE_MANY_MAX_KEYS;
 use crate::storage::{ListedObject, StorageVersion, ZeppelinStore};
@@ -282,6 +283,7 @@ struct NamespaceGcMemo {
     incarnation: GcNamespaceIncarnation,
     history: BTreeMap<String, CachedHistory>,
     inventory: Option<InventoryFingerprint>,
+    live_root_identity: LiveRootIdentity,
     next_due_at: Option<DateTime<Utc>>,
     last_now: DateTime<Utc>,
     last_cycle_complete: bool,
@@ -322,13 +324,36 @@ struct GcConfigFingerprint {
 struct CachedHistory {
     storage_version: StorageVersion,
     manifest: Manifest,
+    stored_bytes: Bytes,
     reachable_keys: BTreeSet<String>,
 }
 
 #[derive(Debug)]
 struct HistorySnapshot {
-    entries: Vec<(ManifestHistoryObservation, Manifest)>,
+    entries: Vec<(ManifestHistoryObservation, Manifest, Bytes)>,
     cacheable: BTreeMap<String, CachedHistory>,
+}
+
+/// Exact authoritative live-manifest identity that supplied branch roots.
+///
+/// Root retention decisions are useful only while this complete observation
+/// remains current. The ETag binds the stored bytes, while generation,
+/// incarnation, and the root map make the safety-relevant state explicit for
+/// review and memo invalidation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveRootIdentity {
+    storage_etag: String,
+    manifest_generation: u64,
+    namespace_incarnation: Option<uuid::Uuid>,
+    branch_roots: BTreeMap<BranchId, BranchRoot>,
+}
+
+/// One live-root observation plus the manifest used to validate rooted history.
+#[derive(Debug, Clone)]
+struct LiveRootObservation {
+    identity: LiveRootIdentity,
+    manifest: Manifest,
+    rooted_generations: BTreeMap<ManifestGeneration, ManifestDigest>,
 }
 
 struct MemoizedHistoryPruneResult {
@@ -346,6 +371,7 @@ struct GcCycleOutcome {
 struct CompletedGcState {
     history: BTreeMap<String, CachedHistory>,
     inventory: Option<InventoryFingerprint>,
+    live_root_identity: LiveRootIdentity,
     next_due_at: Option<DateTime<Utc>>,
 }
 
@@ -373,6 +399,77 @@ impl GcCycleOutcome {
             candidate_phase_due: false,
         }
     }
+}
+
+impl LiveRootObservation {
+    fn from_authority(
+        namespace: &str,
+        manifest: Manifest,
+        version: ManifestVersion,
+    ) -> Result<Self> {
+        let storage_etag = version
+            .require_etag(namespace, "GC live branch-root observation")?
+            .to_string();
+        let rooted_generations = manifest.rooted_generations()?;
+        let identity = LiveRootIdentity {
+            storage_etag,
+            manifest_generation: manifest.version(),
+            namespace_incarnation: manifest.namespace_incarnation(),
+            branch_roots: manifest.branch_roots().clone(),
+        };
+        Ok(Self {
+            identity,
+            manifest,
+            rooted_generations,
+        })
+    }
+}
+
+impl LiveRootIdentity {
+    fn matches_inventory(&self, namespace: &str, inventory: &NamespaceInventory) -> bool {
+        inventory
+            .object(&Manifest::s3_key(namespace))
+            .and_then(|object| object.version.as_ref())
+            .and_then(StorageVersion::etag)
+            == Some(self.storage_etag.as_str())
+    }
+}
+
+async fn load_live_root_observation(
+    store: &ZeppelinStore,
+    namespace: &str,
+    inventory: Option<&NamespaceInventory>,
+) -> Result<Option<LiveRootObservation>> {
+    let observed = match inventory {
+        Some(inventory) => {
+            read_versioned_manifest_from_inventory(store, namespace, inventory).await?
+        }
+        None => Manifest::read_versioned(store, namespace).await?,
+    };
+    observed
+        .map(|(manifest, version)| {
+            LiveRootObservation::from_authority(namespace, manifest, version)
+        })
+        .transpose()
+}
+
+async fn revalidate_live_root_observation(
+    store: &ZeppelinStore,
+    namespace: &str,
+    expected: &LiveRootObservation,
+) -> Result<()> {
+    let Some((manifest, version)) = Manifest::read_versioned(store, namespace).await? else {
+        return Err(ZeppelinError::Serialization(format!(
+            "namespace {namespace} live manifest disappeared during GC root observation"
+        )));
+    };
+    let actual = LiveRootObservation::from_authority(namespace, manifest, version)?;
+    if actual.identity != expected.identity {
+        return Err(ZeppelinError::ManifestConflict {
+            namespace: namespace.to_string(),
+        });
+    }
+    Ok(())
 }
 
 impl InventoryFingerprint {
@@ -1538,12 +1635,22 @@ pub async fn drain_pending_deletes_at(
     gc: &GcConfig,
     now: DateTime<Utc>,
 ) -> Result<PendingDeleteDrainReport> {
-    let history_reachable = retained_manifest_history_reachable_keys(store, namespace).await?;
-    Ok(
-        drain_pending_deletes_with_retained_history(store, namespace, gc, &history_reachable, now)
-            .await?
-            .report,
+    let Some(live_roots) = load_live_root_observation(store, namespace, None).await? else {
+        return Ok(PendingDeleteDrainReport::default());
+    };
+    let history = load_history_snapshot(store, namespace, None).await?;
+    validate_rooted_history_snapshot(&live_roots, &history)?;
+    let history_reachable = history_snapshot_reachable_keys(namespace, &history)?;
+    Ok(drain_pending_deletes_with_retained_history(
+        store,
+        namespace,
+        gc,
+        &history_reachable,
+        now,
+        Some(&live_roots),
     )
+    .await?
+    .report)
 }
 
 /// Drains pending deletes using a retained-history union already loaded by the caller.
@@ -1581,6 +1688,7 @@ async fn drain_pending_deletes_with_retained_history(
     gc: &GcConfig,
     retained_history: &BTreeSet<String>,
     now: DateTime<Utc>,
+    live_roots: Option<&LiveRootObservation>,
 ) -> Result<PendingDeleteDrainOutcome> {
     drain_pending_deletes_with_retained_history_from(
         store,
@@ -1590,11 +1698,13 @@ async fn drain_pending_deletes_with_retained_history(
         now,
         None,
         None,
+        live_roots,
     )
     .await
     .map(|(outcome, _)| outcome)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drain_pending_deletes_with_retained_history_from(
     store: &ZeppelinStore,
     namespace: &str,
@@ -1603,6 +1713,7 @@ async fn drain_pending_deletes_with_retained_history_from(
     now: DateTime<Utc>,
     mut initial_manifest: Option<(Manifest, ManifestVersion)>,
     retry_history: Option<&BTreeMap<String, CachedHistory>>,
+    live_roots: Option<&LiveRootObservation>,
 ) -> Result<(PendingDeleteDrainOutcome, Vec<HistorySnapshot>)> {
     let mut deleted_keys = BTreeSet::new();
     let mut complete = true;
@@ -1648,6 +1759,9 @@ async fn drain_pending_deletes_with_retained_history_from(
             });
         let retry_roots = if retry_may_delete {
             let snapshot = load_history_snapshot(store, namespace, retry_history).await?;
+            if let Some(live_roots) = live_roots {
+                validate_rooted_history_snapshot(live_roots, &snapshot)?;
+            }
             let roots = history_snapshot_reachable_keys(namespace, &snapshot)?;
             refreshed_history.push(snapshot);
             Some(roots)
@@ -1685,6 +1799,9 @@ async fn drain_pending_deletes_with_retained_history_from(
 
         let eligible = eligible.into_iter().collect::<Vec<_>>();
         for batch in eligible.chunks(DELETE_MANY_MAX_KEYS) {
+            if let Some(live_roots) = live_roots {
+                revalidate_live_root_observation(store, namespace, live_roots).await?;
+            }
             match delete_target_owned_many(store, batch).await {
                 Ok(deleted) => {
                     debug_assert_eq!(deleted, batch.len());
@@ -1774,6 +1891,7 @@ async fn drain_pending_deletes_with_inventory_authority_from(
     retained_history: &BTreeSet<String>,
     now: DateTime<Utc>,
     initial_manifest: (Manifest, ManifestVersion),
+    live_roots: Option<&LiveRootObservation>,
 ) -> Result<PendingDeleteDrainOutcome> {
     let mut observed = Some(initial_manifest);
     let mut confirmed_absent = BTreeSet::new();
@@ -1823,6 +1941,9 @@ async fn drain_pending_deletes_with_inventory_authority_from(
             }
             let eligible = eligible.into_iter().collect::<Vec<_>>();
             for batch in eligible.chunks(DELETE_MANY_MAX_KEYS) {
+                if let Some(live_roots) = live_roots {
+                    revalidate_live_root_observation(store, namespace, live_roots).await?;
+                }
                 match delete_target_owned_many(store, batch).await {
                     Ok(deleted) => {
                         debug_assert_eq!(deleted, batch.len());
@@ -1935,6 +2056,7 @@ async fn prepare_warm_pending_delete_drain(
     prune_reachable: &BTreeSet<String>,
     prior_history: &BTreeMap<String, CachedHistory>,
     now: DateTime<Utc>,
+    live_roots: &LiveRootObservation,
 ) -> Result<PreparedPendingDeleteDrain> {
     let Some((manifest, _)) = Manifest::read_versioned(store, namespace).await? else {
         return Ok(PreparedPendingDeleteDrain {
@@ -1992,6 +2114,7 @@ async fn prepare_warm_pending_delete_drain(
         Some(prior_history),
     )
     .await?;
+    validate_rooted_history_snapshot(live_roots, &history)?;
     let retained_history = history_snapshot_reachable_keys(namespace, &history)?;
     let observed = read_versioned_manifest_from_inventory(store, namespace, &predelete_inventory)
         .await?
@@ -2005,6 +2128,7 @@ async fn prepare_warm_pending_delete_drain(
         &retained_history,
         now,
         observed,
+        Some(live_roots),
     )
     .await?;
     Ok(PreparedPendingDeleteDrain {
@@ -2406,12 +2530,16 @@ impl GcRunner {
             let inventory_matches = fingerprint
                 .as_ref()
                 .is_some_and(|inventory| memo.inventory.as_ref() == Some(inventory));
+            let live_root_identity_matches = memo
+                .live_root_identity
+                .matches_inventory(incarnation.name(), &inventory);
             if memo.last_cycle_complete
                 && !memo.candidate_phase_due
                 && memo.config == config
                 && now >= memo.last_now
                 && before_deadline
                 && inventory_matches
+                && live_root_identity_matches
             {
                 memo.last_now = now;
                 debug!(
@@ -2445,6 +2573,7 @@ impl GcRunner {
                             incarnation,
                             history: completed.history,
                             inventory: completed.inventory,
+                            live_root_identity: completed.live_root_identity,
                             next_due_at: completed.next_due_at,
                             last_now: now,
                             last_cycle_complete: true,
@@ -2490,7 +2619,7 @@ async fn load_history_observation(
     namespace: &str,
     observation: &ManifestHistoryObservation,
     prior: Option<&BTreeMap<String, CachedHistory>>,
-) -> Result<(Manifest, Option<CachedHistory>)> {
+) -> Result<(Manifest, Bytes, Option<CachedHistory>)> {
     let cached = matching_cached_history(observation, prior);
     load_history_observation_owned(store, namespace, observation, cached).await
 }
@@ -2512,9 +2641,13 @@ async fn load_history_observation_owned(
     namespace: &str,
     observation: &ManifestHistoryObservation,
     cached: Option<CachedHistory>,
-) -> Result<(Manifest, Option<CachedHistory>)> {
+) -> Result<(Manifest, Bytes, Option<CachedHistory>)> {
     if let Some(cached) = cached {
-        return Ok((cached.manifest.clone(), Some(cached)));
+        return Ok((
+            cached.manifest.clone(),
+            cached.stored_bytes.clone(),
+            Some(cached),
+        ));
     }
 
     let (bytes, get_etag) = store.get_with_meta(&observation.history.key).await?;
@@ -2530,12 +2663,13 @@ async fn load_history_observation_owned(
             Some(CachedHistory {
                 storage_version: StorageVersion::Etag(list_etag.clone()),
                 manifest: manifest.clone(),
+                stored_bytes: bytes.clone(),
                 reachable_keys: reachable_keys(namespace, &manifest)?,
             })
         }
         Some(StorageVersion::BackendVersion(_)) | None => None,
     };
-    Ok((manifest, cacheable))
+    Ok((manifest, bytes, cacheable))
 }
 
 async fn collect_bounded_ordered<T>(futures: Vec<BoxFuture<'static, Result<T>>>) -> Vec<Result<T>> {
@@ -2550,7 +2684,7 @@ async fn load_history_observations_bounded(
     namespace: &str,
     observations: &[ManifestHistoryObservation],
     prior: Option<&BTreeMap<String, CachedHistory>>,
-) -> Vec<Result<(Manifest, Option<CachedHistory>)>> {
+) -> Vec<Result<(Manifest, Bytes, Option<CachedHistory>)>> {
     let futures = observations
         .iter()
         .map(|observation| {
@@ -2606,23 +2740,65 @@ async fn load_history_snapshot_from_observations(
         let loaded =
             load_history_observations_bounded(store, namespace, &observations, prior).await;
         for (observation, result) in observations.into_iter().zip(loaded) {
-            let (manifest, cached) = result?;
+            let (manifest, bytes, cached) = result?;
             if let Some(cached) = cached {
                 cacheable.insert(observation.history.key.clone(), cached);
             }
-            entries.push((observation, manifest));
+            entries.push((observation, manifest, bytes));
         }
     } else {
         for observation in observations {
-            let (manifest, cached) =
+            let (manifest, bytes, cached) =
                 load_history_observation(store, namespace, &observation, prior).await?;
             if let Some(cached) = cached {
                 cacheable.insert(observation.history.key.clone(), cached);
             }
-            entries.push((observation, manifest));
+            entries.push((observation, manifest, bytes));
         }
     }
     Ok(HistorySnapshot { entries, cacheable })
+}
+
+fn require_every_rooted_generation_observed(
+    live_roots: &LiveRootObservation,
+    observed: &BTreeSet<ManifestGeneration>,
+) -> Result<()> {
+    if let Some(missing) = live_roots
+        .rooted_generations
+        .keys()
+        .find(|generation| !observed.contains(*generation))
+    {
+        return Err(BranchError::BranchRootInvalid {
+            branch_id: None,
+            reason: format!(
+                "live branch root references missing manifest history generation {}",
+                missing.get()
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_rooted_history_snapshot(
+    live_roots: &LiveRootObservation,
+    snapshot: &HistorySnapshot,
+) -> Result<()> {
+    let mut observed = BTreeSet::new();
+    for (observation, _, stored_bytes) in &snapshot.entries {
+        if let Some(generation) = live_roots
+            .rooted_generations
+            .keys()
+            .copied()
+            .find(|generation| generation.get() == observation.history.version)
+        {
+            live_roots
+                .manifest
+                .validate_rooted_history_bytes(generation, stored_bytes)?;
+            observed.insert(generation);
+        }
+    }
+    require_every_rooted_generation_observed(live_roots, &observed)
 }
 
 async fn prune_history_with_memo_at(
@@ -2631,6 +2807,7 @@ async fn prune_history_with_memo_at(
     retention: ManifestHistoryRetention,
     now: DateTime<Utc>,
     prior: Option<&BTreeMap<String, CachedHistory>>,
+    live_roots: &LiveRootObservation,
 ) -> Result<MemoizedHistoryPruneResult> {
     if retention.keep_count == 0 {
         return Err(ZeppelinError::Config(
@@ -2638,7 +2815,10 @@ async fn prune_history_with_memo_at(
         ));
     }
     if prior.is_some() {
-        return prune_history_with_memo_parallel_at(store, namespace, retention, now, prior).await;
+        return prune_history_with_memo_parallel_at(
+            store, namespace, retention, now, prior, live_roots,
+        )
+        .await;
     }
 
     let observations = Manifest::list_history_observations(store, namespace).await?;
@@ -2654,15 +2834,29 @@ async fn prune_history_with_memo_at(
     let mut retained_manifests = Vec::new();
     let mut retained_history_observations = Vec::new();
     let mut prunable = Vec::new();
+    let mut observed_rooted_generations = BTreeSet::new();
 
     for (index, observation) in observations.into_iter().enumerate() {
-        let (manifest, _) = load_history_observation(store, namespace, &observation, prior).await?;
+        let (manifest, stored_bytes, _) =
+            load_history_observation(store, namespace, &observation, prior).await?;
         let keep_by_count = index >= keep_from;
         let keep_by_pin = pinned_generations.contains(&observation.history.version);
+        let rooted_generation = live_roots
+            .rooted_generations
+            .keys()
+            .copied()
+            .find(|generation| generation.get() == observation.history.version);
+        if let Some(generation) = rooted_generation {
+            live_roots
+                .manifest
+                .validate_rooted_history_bytes(generation, &stored_bytes)?;
+            observed_rooted_generations.insert(generation);
+        }
+        let keep_by_root = rooted_generation.is_some();
         let keep_by_time = retention.pitr_retention_secs > 0
             && now.signed_duration_since(manifest.updated_at).num_seconds()
                 <= retention_window as i64;
-        if keep_by_count || keep_by_time || keep_by_pin {
+        if keep_by_count || keep_by_time || keep_by_pin || keep_by_root {
             retained_history_observations.push(observation.clone());
             retained_manifests.push(manifest.clone());
         } else {
@@ -2670,12 +2864,15 @@ async fn prune_history_with_memo_at(
         }
     }
 
+    require_every_rooted_generation_observed(live_roots, &observed_rooted_generations)?;
+
     let deletion_keys = prunable
         .iter()
         .cloned()
         .map(|key| TargetOwnedDeletionKey::classify(namespace, key))
         .collect::<Result<Vec<_>>>()?;
     for batch in deletion_keys.chunks(DELETE_MANY_MAX_KEYS) {
+        revalidate_live_root_observation(store, namespace, live_roots).await?;
         delete_target_owned_many(store, batch).await?;
     }
 
@@ -2695,6 +2892,7 @@ async fn prune_history_with_memo_parallel_at(
     retention: ManifestHistoryRetention,
     now: DateTime<Utc>,
     prior: Option<&BTreeMap<String, CachedHistory>>,
+    live_roots: &LiveRootObservation,
 ) -> Result<MemoizedHistoryPruneResult> {
     let snapshot_prefix = NamedSnapshot::prefix(namespace);
     let (history_result, snapshot_result) = tokio::join!(
@@ -2712,6 +2910,7 @@ async fn prune_history_with_memo_parallel_at(
         observations,
         snapshot_objects,
         None,
+        live_roots,
     )
     .await
 }
@@ -2723,6 +2922,7 @@ async fn prune_history_with_inventory_at(
     now: DateTime<Utc>,
     prior: Option<&BTreeMap<String, CachedHistory>>,
     inventory: &mut NamespaceInventory,
+    live_roots: &LiveRootObservation,
 ) -> Result<MemoizedHistoryPruneResult> {
     if retention.keep_count == 0 {
         return Err(ZeppelinError::Config(
@@ -2740,6 +2940,7 @@ async fn prune_history_with_inventory_at(
         observations,
         snapshot_objects,
         Some(inventory),
+        live_roots,
     )
     .await
 }
@@ -2754,6 +2955,7 @@ async fn prune_history_with_memo_parallel_from_observations(
     observations: Vec<ManifestHistoryObservation>,
     snapshot_objects: Vec<ListedObject>,
     mut inventory: Option<&mut NamespaceInventory>,
+    live_roots: &LiveRootObservation,
 ) -> Result<MemoizedHistoryPruneResult> {
     let keep_from = observations.len().saturating_sub(retention.keep_count);
 
@@ -2774,16 +2976,29 @@ async fn prune_history_with_memo_parallel_from_observations(
     let mut retained_manifests = Vec::new();
     let mut retained_history_observations = Vec::new();
     let mut prunable = Vec::new();
+    let mut observed_rooted_generations = BTreeSet::new();
 
-    for (index, (observation, (manifest, _))) in
+    for (index, (observation, (manifest, stored_bytes, _))) in
         observations.into_iter().zip(history_entries).enumerate()
     {
         let keep_by_count = index >= keep_from;
         let keep_by_pin = pinned_generations.contains(&observation.history.version);
+        let rooted_generation = live_roots
+            .rooted_generations
+            .keys()
+            .copied()
+            .find(|generation| generation.get() == observation.history.version);
+        if let Some(generation) = rooted_generation {
+            live_roots
+                .manifest
+                .validate_rooted_history_bytes(generation, &stored_bytes)?;
+            observed_rooted_generations.insert(generation);
+        }
+        let keep_by_root = rooted_generation.is_some();
         let keep_by_time = retention.pitr_retention_secs > 0
             && now.signed_duration_since(manifest.updated_at).num_seconds()
                 <= retention_window as i64;
-        if keep_by_count || keep_by_time || keep_by_pin {
+        if keep_by_count || keep_by_time || keep_by_pin || keep_by_root {
             retained_history_observations.push(observation);
             retained_manifests.push(manifest);
         } else {
@@ -2791,12 +3006,15 @@ async fn prune_history_with_memo_parallel_from_observations(
         }
     }
 
+    require_every_rooted_generation_observed(live_roots, &observed_rooted_generations)?;
+
     let deletion_keys = prunable
         .iter()
         .cloned()
         .map(|key| TargetOwnedDeletionKey::classify(namespace, key))
         .collect::<Result<Vec<_>>>()?;
     for batch in deletion_keys.chunks(DELETE_MANY_MAX_KEYS) {
+        revalidate_live_root_observation(store, namespace, live_roots).await?;
         delete_target_owned_many(store, batch).await?;
         if let Some(inventory) = inventory.as_deref_mut() {
             for key in batch {
@@ -2820,7 +3038,7 @@ fn history_snapshot_reachable_keys(
     snapshot: &HistorySnapshot,
 ) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
-    for (observation, manifest) in &snapshot.entries {
+    for (observation, manifest, _) in &snapshot.entries {
         if let Some(cached) = snapshot.cacheable.get(&observation.history.key) {
             keys.extend(cached.reachable_keys.iter().cloned());
         } else {
@@ -2836,7 +3054,7 @@ fn history_observations_match_snapshot(
 ) -> bool {
     expected
         .iter()
-        .eq(actual.entries.iter().map(|(observation, _)| observation))
+        .eq(actual.entries.iter().map(|(observation, _, _)| observation))
 }
 
 enum NextGcDeadlineError {
@@ -2929,7 +3147,7 @@ fn next_gc_deadline(
             .checked_add(gc.skew_slop_secs)
             .and_then(|seconds| seconds.checked_add(1))
             .ok_or(NextGcDeadlineError::InvalidSchedule)?;
-        for (_, manifest) in &history.entries {
+        for (_, manifest, _) in &history.entries {
             consider_deadline(
                 deadline_after_secs(manifest.updated_at, retention)
                     .map_err(|()| NextGcDeadlineError::InvalidSchedule)?,
@@ -2958,6 +3176,7 @@ struct MarkReadInputs {
     listed_objects: Vec<ListedObject>,
     persisted_ledger: LoadedCandidateLedger,
     manifest: Manifest,
+    manifest_version: ManifestVersion,
     staging: ActiveStagingObservation,
 }
 
@@ -3007,19 +3226,6 @@ async fn load_candidates_from_inventory(
         Some(bytes) => decode_candidate_ledger(&bytes),
         None => Ok(LoadedCandidateLedger::missing()),
     }
-}
-
-async fn read_manifest_from_inventory(
-    store: &ZeppelinStore,
-    namespace: &str,
-    inventory: &NamespaceInventory,
-    require_etag: bool,
-) -> Result<Option<Manifest>> {
-    let key = Manifest::s3_key(namespace);
-    read_inventory_object(store, &key, inventory.object(&key), require_etag)
-        .await?
-        .map(|bytes| Manifest::from_bytes_for_namespace(&bytes, namespace))
-        .transpose()
 }
 
 async fn read_versioned_manifest_from_inventory(
@@ -3153,12 +3359,12 @@ enum MarkReadFailure {
 fn assemble_mark_read_inputs(
     listed_objects: Result<Vec<ListedObject>>,
     persisted_ledger: Result<LoadedCandidateLedger>,
-    manifest: Result<Option<Manifest>>,
+    manifest: Result<Option<(Manifest, ManifestVersion)>>,
     staging: Result<ActiveStagingObservation>,
 ) -> std::result::Result<MarkReadInputs, MarkReadFailure> {
     let listed_objects = listed_objects.map_err(MarkReadFailure::NamespaceList)?;
     let persisted_ledger = persisted_ledger.map_err(MarkReadFailure::CandidateLedger)?;
-    let manifest = manifest
+    let (manifest, manifest_version) = manifest
         .map_err(MarkReadFailure::Manifest)?
         .ok_or(MarkReadFailure::ManifestMissing)?;
     let staging = staging.map_err(MarkReadFailure::Staging)?;
@@ -3166,6 +3372,7 @@ fn assemble_mark_read_inputs(
         listed_objects,
         persisted_ledger,
         manifest,
+        manifest_version,
         staging,
     })
 }
@@ -3181,7 +3388,7 @@ async fn load_mark_read_inputs(
         let (listed, candidates, manifest, staging) = tokio::join!(
             store.list_prefix_meta(&prefix),
             load_candidate_ledger(store, namespace),
-            read_manifest_for_gc(store, namespace),
+            Manifest::read_versioned(store, namespace),
             active_staging_observation_at_with_mode(store, namespace, now, GcReadMode::WarmBounded,),
         );
         assemble_mark_read_inputs(listed, candidates, manifest, staging)
@@ -3197,7 +3404,7 @@ async fn load_mark_read_inputs(
         let candidates = load_candidate_ledger(store, namespace)
             .await
             .map_err(MarkReadFailure::CandidateLedger)?;
-        let manifest = read_manifest_for_gc(store, namespace)
+        let (manifest, manifest_version) = Manifest::read_versioned(store, namespace)
             .await
             .map_err(MarkReadFailure::Manifest)?
             .ok_or(MarkReadFailure::ManifestMissing)?;
@@ -3209,6 +3416,7 @@ async fn load_mark_read_inputs(
             listed_objects: listed,
             persisted_ledger: candidates,
             manifest,
+            manifest_version,
             staging,
         })
     }
@@ -3222,7 +3430,7 @@ async fn load_mark_read_inputs_from_inventory(
 ) -> std::result::Result<MarkReadInputs, MarkReadFailure> {
     let (candidates, manifest, staging) = tokio::join!(
         load_candidates_from_inventory(store, namespace, inventory, false),
-        read_manifest_from_inventory(store, namespace, inventory, false),
+        read_versioned_manifest_from_inventory(store, namespace, inventory),
         active_staging_from_inventory(store, namespace, now, inventory, false),
     );
     assemble_mark_read_inputs(Ok(inventory.all_objects()), candidates, manifest, staging)
@@ -3237,7 +3445,7 @@ async fn load_sequential_mark_reads_from_inventory(
     let candidates = load_candidate_ledger(store, namespace)
         .await
         .map_err(MarkReadFailure::CandidateLedger)?;
-    let manifest = read_manifest_for_gc(store, namespace)
+    let (manifest, manifest_version) = Manifest::read_versioned(store, namespace)
         .await
         .map_err(MarkReadFailure::Manifest)?
         .ok_or(MarkReadFailure::ManifestMissing)?;
@@ -3249,12 +3457,14 @@ async fn load_sequential_mark_reads_from_inventory(
         listed_objects: inventory.all_objects(),
         persisted_ledger: candidates,
         manifest,
+        manifest_version,
         staging,
     })
 }
 
 struct SweepReadInputs {
     manifest: Manifest,
+    manifest_version: ManifestVersion,
     staging: ActiveStagingObservation,
 }
 
@@ -3265,14 +3475,18 @@ enum SweepReadFailure {
 }
 
 fn assemble_sweep_read_inputs(
-    manifest: Result<Option<Manifest>>,
+    manifest: Result<Option<(Manifest, ManifestVersion)>>,
     staging: Result<ActiveStagingObservation>,
 ) -> std::result::Result<SweepReadInputs, SweepReadFailure> {
-    let manifest = manifest
+    let (manifest, manifest_version) = manifest
         .map_err(SweepReadFailure::Manifest)?
         .ok_or(SweepReadFailure::ManifestMissing)?;
     let staging = staging.map_err(SweepReadFailure::Staging)?;
-    Ok(SweepReadInputs { manifest, staging })
+    Ok(SweepReadInputs {
+        manifest,
+        manifest_version,
+        staging,
+    })
 }
 
 async fn load_sweep_read_inputs(
@@ -3283,12 +3497,12 @@ async fn load_sweep_read_inputs(
 ) -> std::result::Result<SweepReadInputs, SweepReadFailure> {
     if read_mode.is_bounded() {
         let (manifest, staging) = tokio::join!(
-            read_manifest_for_gc(store, namespace),
+            Manifest::read_versioned(store, namespace),
             active_staging_observation_at_with_mode(store, namespace, now, GcReadMode::WarmBounded,),
         );
         assemble_sweep_read_inputs(manifest, staging)
     } else {
-        let manifest = read_manifest_for_gc(store, namespace)
+        let (manifest, manifest_version) = Manifest::read_versioned(store, namespace)
             .await
             .map_err(SweepReadFailure::Manifest)?
             .ok_or(SweepReadFailure::ManifestMissing)?;
@@ -3296,7 +3510,11 @@ async fn load_sweep_read_inputs(
             active_staging_observation_at_with_mode(store, namespace, now, GcReadMode::Sequential)
                 .await
                 .map_err(SweepReadFailure::Staging)?;
-        Ok(SweepReadInputs { manifest, staging })
+        Ok(SweepReadInputs {
+            manifest,
+            manifest_version,
+            staging,
+        })
     }
 }
 
@@ -3308,7 +3526,7 @@ async fn load_sweep_read_inputs_from_inventory(
     require_etag: bool,
 ) -> std::result::Result<SweepReadInputs, SweepReadFailure> {
     let (manifest, staging) = tokio::join!(
-        read_manifest_from_inventory(store, namespace, inventory, require_etag),
+        read_versioned_manifest_from_inventory(store, namespace, inventory),
         active_staging_from_inventory(store, namespace, now, inventory, require_etag),
     );
     assemble_sweep_read_inputs(manifest, staging)
@@ -3347,6 +3565,20 @@ async fn run_gc_cycle_at_inner(
     let cycle_opening_inventory_objects = initial_inventory
         .as_ref()
         .map(|inventory| inventory.objects.clone());
+    let live_roots =
+        match load_live_root_observation(store, namespace, initial_inventory.as_ref()).await {
+            Ok(Some(observation)) => observation,
+            Ok(None) => {
+                warn!(namespace, "gc manifest missing before root observation");
+                return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
+            }
+            Err(error @ ZeppelinError::MalformedControlKey { .. })
+            | Err(error @ ZeppelinError::Branch(_)) => return Err(error),
+            Err(error) => {
+                warn!(namespace, error = %error, "gc live branch-root observation failed");
+                return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
+            }
+        };
     let prior_entries = prior_history.map(|memo| &memo.history);
     let retention = ManifestHistoryRetention {
         keep_count: gc.manifest_history_keep_count,
@@ -3362,14 +3594,19 @@ async fn run_gc_cycle_at_inner(
                 now,
                 prior_entries,
                 inventory,
+                &live_roots,
             )
             .await
         }
-        None => prune_history_with_memo_at(store, namespace, retention, now, prior_entries).await,
+        None => {
+            prune_history_with_memo_at(store, namespace, retention, now, prior_entries, &live_roots)
+                .await
+        }
     };
     let history_prune = match history_prune {
         Ok(result) => result,
-        Err(error @ ZeppelinError::MalformedControlKey { .. }) => return Err(error),
+        Err(error @ ZeppelinError::MalformedControlKey { .. })
+        | Err(error @ ZeppelinError::Branch(_)) => return Err(error),
         Err(e) => {
             warn!(
                 namespace,
@@ -3423,6 +3660,7 @@ async fn run_gc_cycle_at_inner(
                 &prune_reachable,
                 prior_entries,
                 now,
+                &live_roots,
             )
             .await
             {
@@ -3469,6 +3707,7 @@ async fn run_gc_cycle_at_inner(
                     now,
                     None,
                     None,
+                    Some(&live_roots),
                 )
                 .await
                 {
@@ -3544,6 +3783,7 @@ async fn run_gc_cycle_at_inner(
         listed_objects,
         persisted_ledger,
         manifest: mark_manifest,
+        manifest_version: mark_manifest_version,
         staging: mark_staging,
     } = match mark_inputs {
         Ok(inputs) => inputs,
@@ -3571,6 +3811,25 @@ async fn run_gc_cycle_at_inner(
             return Ok(GcCycleOutcome::incomplete(base_report));
         }
     };
+    let mark_live_roots = match LiveRootObservation::from_authority(
+        namespace,
+        mark_manifest.clone(),
+        mark_manifest_version,
+    ) {
+        Ok(observation) => observation,
+        Err(error @ ZeppelinError::Branch(_)) => return Err(error),
+        Err(error) => {
+            warn!(namespace, error = %error, "gc mark root revalidation failed");
+            return Ok(GcCycleOutcome::incomplete(base_report));
+        }
+    };
+    if mark_live_roots.identity != live_roots.identity {
+        warn!(
+            namespace,
+            "gc live branch-root observation changed before mark"
+        );
+        return Ok(GcCycleOutcome::incomplete(base_report));
+    }
     let persisted_is_canonical = persisted_ledger.is_canonical();
     let persisted = persisted_ledger.candidates;
     if force_candidate_phase {
@@ -3762,6 +4021,7 @@ async fn run_gc_cycle_at_inner(
     };
     let SweepReadInputs {
         manifest: sweep_manifest,
+        manifest_version: sweep_manifest_version,
         staging: sweep_staging,
     } = match sweep_inputs {
         Ok(inputs) => inputs,
@@ -3790,6 +4050,31 @@ async fn run_gc_cycle_at_inner(
             return Ok(GcCycleOutcome::incomplete(report));
         }
     };
+    let sweep_live_roots = match LiveRootObservation::from_authority(
+        namespace,
+        sweep_manifest.clone(),
+        sweep_manifest_version,
+    ) {
+        Ok(observation) => observation,
+        Err(error @ ZeppelinError::Branch(_)) => return Err(error),
+        Err(error) => {
+            warn!(namespace, error = %error, "gc sweep root revalidation failed");
+            let mut report = base_report;
+            report.candidates_marked = candidates_marked;
+            report.candidates_skipped = unknown_shape_skips;
+            return Ok(GcCycleOutcome::incomplete(report));
+        }
+    };
+    if sweep_live_roots.identity != live_roots.identity {
+        warn!(
+            namespace,
+            "gc live branch-root observation changed before sweep"
+        );
+        let mut report = base_report;
+        report.candidates_marked = candidates_marked;
+        report.candidates_skipped = unknown_shape_skips;
+        return Ok(GcCycleOutcome::incomplete(report));
+    }
     let sweep_history = match completed_inventory
         .as_ref()
         .filter(|_| read_mode.is_bounded())
@@ -3829,6 +4114,7 @@ async fn run_gc_cycle_at_inner(
             return Ok(GcCycleOutcome::incomplete(report));
         }
     };
+    validate_rooted_history_snapshot(&sweep_live_roots, &sweep_history_snapshot)?;
     let sweep_retained_history =
         history_snapshot_reachable_keys(namespace, &sweep_history_snapshot)?;
     let sweep_listed_keys = completed_inventory
@@ -3937,6 +4223,7 @@ async fn run_gc_cycle_at_inner(
         })
         .collect::<Result<Vec<_>>>()?;
     for batch in deletable.chunks(DELETE_MANY_MAX_KEYS) {
+        revalidate_live_root_observation(store, namespace, &sweep_live_roots).await?;
         let keys = batch
             .iter()
             .map(|(_, _, key)| key.clone())
@@ -4095,40 +4382,13 @@ async fn run_gc_cycle_at_inner(
             CompletedGcState {
                 history: sweep_history_snapshot.cacheable,
                 inventory: completed_inventory.and_then(|inventory| inventory.fingerprint()),
+                live_root_identity: sweep_live_roots.identity,
                 next_due_at,
             },
         ))
     } else {
         Ok(GcCycleOutcome::incomplete(report))
     }
-}
-
-/// Reads the current authoritative manifest without consulting a cache.
-///
-/// # Parameters
-///
-/// - `store`: Borrowed object-store gateway.
-/// - `namespace`: Namespace whose live manifest key is loaded.
-///
-/// # Returns
-///
-/// `Some(manifest)` when present or `None` when the manifest object is absent.
-///
-/// # Errors
-///
-/// Propagates object-store and manifest decoding errors to the enclosing phase,
-/// which logs them and skips unsafe deletion work.
-///
-/// # Performance
-///
-/// Performs one full live-manifest GET.
-///
-/// # Examples
-///
-/// Both mark and sweep call this separately so a publication between phases is
-/// visible to the sweep check.
-async fn read_manifest_for_gc(store: &ZeppelinStore, namespace: &str) -> Result<Option<Manifest>> {
-    Manifest::read(store, namespace).await
 }
 
 /// Records one fail-closed candidate skip in metrics and structured logs.
@@ -4927,6 +5187,257 @@ mod tests {
     /// Stable namespace prefix used to make expected artifact keys readable.
     const NS: &str = "gc_ns";
 
+    fn test_branch_root(
+        branch_entropy: u128,
+        generation: ManifestGeneration,
+        source_manifest_sha256: ManifestDigest,
+    ) -> BranchRoot {
+        BranchRoot {
+            branch_id: BranchId::from_ulid(Ulid::from_parts(1, branch_entropy)),
+            source_generation: generation,
+            source_manifest_sha256,
+            fork_view_sha256: crate::namespace::ForkViewDigest::new([0x41; 32]),
+            source_config_sha256: crate::namespace::SourceDataPlaneConfigDigest::new([0x42; 32]),
+            target_namespace: NamespaceId::parse(format!("gc_child_{branch_entropy}"))
+                .expect("test branch target must be valid"),
+            target_incarnation: NamespaceIncarnationId::from_uuid(uuid::Uuid::from_u128(
+                branch_entropy + 100,
+            )),
+            created_at: Utc::now(),
+        }
+    }
+
+    async fn write_test_manifest(store: &ZeppelinStore, incarnation: uuid::Uuid) {
+        let mut manifest = Manifest::new();
+        manifest
+            .bind_namespace_incarnation(incarnation)
+            .expect("test manifest must bind one incarnation");
+        manifest
+            .write(store, NS)
+            .await
+            .expect("test manifest must publish");
+    }
+
+    async fn insert_test_branch_roots(
+        store: &ZeppelinStore,
+        count: usize,
+    ) -> (ManifestGeneration, Vec<BranchRoot>) {
+        let (mut manifest, version) = Manifest::read_versioned(store, NS)
+            .await
+            .expect("test manifest read must succeed")
+            .expect("test manifest must exist");
+        let generation = ManifestGeneration::new(manifest.version())
+            .expect("published manifest generation must be nonzero");
+        let digest = version
+            .exact_manifest_digest()
+            .expect("versioned read must retain exact bytes");
+        let roots = (1..=count)
+            .map(|entropy| test_branch_root(entropy as u128, generation, digest))
+            .collect::<Vec<_>>();
+        for root in &roots {
+            manifest
+                .insert_branch_root_candidate(root.clone(), count.max(1))
+                .expect("test root must be valid");
+        }
+        manifest
+            .write_conditional(store, NS, &version)
+            .await
+            .expect("root-bearing manifest must publish");
+        (generation, roots)
+    }
+
+    async fn advance_test_manifest(store: &ZeppelinStore, writes: usize) {
+        for offset in 0..writes {
+            let (mut manifest, version) = Manifest::read_versioned(store, NS)
+                .await
+                .expect("test manifest read must succeed")
+                .expect("test manifest must exist");
+            manifest.updated_at += chrono::Duration::seconds((offset + 1) as i64);
+            manifest
+                .write_conditional(store, NS, &version)
+                .await
+                .expect("test manifest successor must publish");
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_roots_retain_history_after_one_of_two_shared_generation_roots_is_removed() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        write_test_manifest(&store, uuid::Uuid::from_u128(700)).await;
+        let (rooted_generation, roots) = insert_test_branch_roots(&store, 2).await;
+        advance_test_manifest(&store, 3).await;
+
+        let (mut manifest, version) = Manifest::read_versioned(&store, NS).await.unwrap().unwrap();
+        manifest
+            .remove_branch_root_candidate(&roots[0])
+            .expect("one exact root must be removable");
+        manifest
+            .write_conditional(&store, NS, &version)
+            .await
+            .expect("single-root successor must publish");
+
+        let live_roots = load_live_root_observation(&store, NS, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = prune_history_with_memo_at(
+            &store,
+            NS,
+            ManifestHistoryRetention {
+                keep_count: 1,
+                pitr_retention_secs: 0,
+                skew_slop_secs: 0,
+            },
+            Utc::now() + chrono::Duration::hours(1),
+            None,
+            &live_roots,
+        )
+        .await
+        .expect("the remaining shared-generation root must authorize retention");
+
+        assert_eq!(live_roots.identity.branch_roots.len(), 1);
+        assert!(result
+            .retained_history_observations
+            .iter()
+            .any(|observation| observation.history.version == rooted_generation.get()));
+        assert!(store
+            .exists(&Manifest::history_key(NS, rooted_generation.get()))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn missing_rooted_history_fails_before_pruning_any_generation() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        write_test_manifest(&store, uuid::Uuid::from_u128(701)).await;
+        let (rooted_generation, _) = insert_test_branch_roots(&store, 1).await;
+        advance_test_manifest(&store, 2).await;
+        let survivor = Manifest::history_key(NS, rooted_generation.get() + 1);
+        store
+            .delete(&Manifest::history_key(NS, rooted_generation.get()))
+            .await
+            .unwrap();
+        let live_roots = load_live_root_observation(&store, NS, None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = match prune_history_with_memo_at(
+            &store,
+            NS,
+            ManifestHistoryRetention {
+                keep_count: 1,
+                pitr_retention_secs: 0,
+                skew_slop_secs: 0,
+            },
+            Utc::now() + chrono::Duration::hours(1),
+            None,
+            &live_roots,
+        )
+        .await
+        {
+            Ok(_) => panic!("missing rooted history must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ZeppelinError::Branch(error)
+                if matches!(*error, BranchError::BranchRootInvalid { .. })
+        ));
+        assert!(store.exists(&survivor).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn rooted_history_digest_mismatch_fails_before_pruning_any_generation() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        write_test_manifest(&store, uuid::Uuid::from_u128(702)).await;
+        let (rooted_generation, _) = insert_test_branch_roots(&store, 1).await;
+        advance_test_manifest(&store, 2).await;
+        let survivor = Manifest::history_key(NS, rooted_generation.get() + 1);
+        let rooted_key = Manifest::history_key(NS, rooted_generation.get());
+        let mut rooted = Manifest::read_history(&store, NS, rooted_generation.get())
+            .await
+            .unwrap()
+            .unwrap();
+        rooted.updated_at += chrono::Duration::seconds(1);
+        store
+            .put(&rooted_key, rooted.to_bytes().unwrap())
+            .await
+            .unwrap();
+        let live_roots = load_live_root_observation(&store, NS, None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = match prune_history_with_memo_at(
+            &store,
+            NS,
+            ManifestHistoryRetention {
+                keep_count: 1,
+                pitr_retention_secs: 0,
+                skew_slop_secs: 0,
+            },
+            Utc::now() + chrono::Duration::hours(1),
+            None,
+            &live_roots,
+        )
+        .await
+        {
+            Ok(_) => panic!("digest-mismatched rooted history must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ZeppelinError::Branch(error)
+                if matches!(*error, BranchError::ManifestDigestMismatch { .. })
+        ));
+        assert!(store.exists(&survivor).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn live_root_map_growth_invalidates_root_observation_and_idle_memo() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let incarnation_uuid = uuid::Uuid::from_u128(703);
+        write_test_manifest(&store, incarnation_uuid).await;
+        let opening = load_live_root_observation(&store, NS, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let gc = GcConfig::default();
+        let now = Utc::now();
+        let incarnation = GcNamespaceIncarnation::with_incarnation_id(
+            NS.to_string(),
+            now,
+            NamespaceIncarnationId::from_uuid(incarnation_uuid),
+        );
+        let mut runner = GcRunner::new(store.clone(), gc);
+        runner
+            .run_cycle_at(incarnation.clone(), now)
+            .await
+            .expect("opening GC cycle must complete");
+        assert!(runner.namespaces[NS]
+            .live_root_identity
+            .branch_roots
+            .is_empty());
+
+        insert_test_branch_roots(&store, 1).await;
+        let error = revalidate_live_root_observation(&store, NS, &opening)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ZeppelinError::ManifestConflict { .. }));
+
+        runner
+            .run_cycle_at(incarnation, now + chrono::Duration::seconds(1))
+            .await
+            .expect("root-map change must force an authoritative GC cycle");
+        assert_eq!(
+            runner.namespaces[NS].live_root_identity.branch_roots.len(),
+            1
+        );
+    }
+
     #[test]
     fn gc_runner_drops_memo_for_same_timestamp_new_incarnation() {
         let now = Utc::now();
@@ -4948,6 +5459,12 @@ mod tests {
                 incarnation: old,
                 history: BTreeMap::new(),
                 inventory: None,
+                live_root_identity: LiveRootIdentity {
+                    storage_etag: "old-live-manifest-etag".to_string(),
+                    manifest_generation: 1,
+                    namespace_incarnation: None,
+                    branch_roots: BTreeMap::new(),
+                },
                 next_due_at: None,
                 last_now: now,
                 last_cycle_complete: true,

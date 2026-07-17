@@ -7,9 +7,165 @@
 
 use std::fmt;
 
+use chrono::{DateTime, Utc};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use ulid::Ulid;
 
 use crate::error::{Result, ZeppelinError};
+
+/// Collision-resistant identity of one direct parent-to-child branch edge.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BranchId(Ulid);
+
+impl BranchId {
+    /// Mint a new branch-edge identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Ulid::new())
+    }
+
+    /// Wrap an already validated ULID.
+    #[must_use]
+    pub const fn from_ulid(value: Ulid) -> Self {
+        Self(value)
+    }
+
+    /// Return the stable ULID value.
+    #[must_use]
+    pub const fn get(self) -> Ulid {
+        self.0
+    }
+}
+
+impl Default for BranchId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for BranchId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("BranchId").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for BranchId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+/// Nonzero immutable manifest generation named by a branch root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ManifestGeneration(u64);
+
+impl ManifestGeneration {
+    /// Construct a persisted generation, rejecting the unpublished zero value.
+    pub fn new(value: u64) -> Result<Self> {
+        if value == 0 {
+            Err(ZeppelinError::Serialization(
+                "branch-root manifest generation must be greater than zero".to_string(),
+            ))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Return the persisted numeric generation.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ManifestGeneration {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        Self::new(value).map_err(de::Error::custom)
+    }
+}
+
+macro_rules! digest_newtype {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name([u8; 32]);
+
+        impl $name {
+            /// Wrap one exact SHA-256 digest.
+            #[must_use]
+            pub const fn new(value: [u8; 32]) -> Self {
+                Self(value)
+            }
+
+            /// Borrow the exact digest bytes.
+            #[must_use]
+            pub const fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+
+            /// Return the exact digest bytes.
+            #[must_use]
+            pub const fn into_bytes(self) -> [u8; 32] {
+                self.0
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(concat!(stringify!($name), "([REDACTED])"))
+            }
+        }
+    };
+}
+
+digest_newtype!(
+    ManifestDigest,
+    "SHA-256 over the exact authoritative source-manifest bytes."
+);
+digest_newtype!(
+    ForkViewDigest,
+    "SHA-256 over the canonical normalized artifact-origin fork view."
+);
+digest_newtype!(
+    SourceDataPlaneConfigDigest,
+    "SHA-256 over the source data-plane configuration bound to a fork."
+);
+
+/// Exact source-generation retention root for one direct child namespace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BranchRoot {
+    /// Stable identity used as the deterministic manifest-map key.
+    pub branch_id: BranchId,
+    /// Exact source predecessor generation retained by the root-publishing CAS.
+    pub source_generation: ManifestGeneration,
+    /// Digest of the exact predecessor bytes carried by its manifest version.
+    pub source_manifest_sha256: ManifestDigest,
+    /// Digest of the normalized target view prepared from that predecessor.
+    pub fork_view_sha256: ForkViewDigest,
+    /// Digest of the source configuration that determines data interpretation.
+    pub source_config_sha256: SourceDataPlaneConfigDigest,
+    /// Direct child namespace name.
+    pub target_namespace: NamespaceId,
+    /// Exact lifetime of the direct child namespace.
+    pub target_incarnation: NamespaceIncarnationId,
+    /// Audit timestamp only; never a retention or ordering clock.
+    pub created_at: DateTime<Utc>,
+}
+
+impl BranchRoot {
+    /// Return the exact generation pinned by this root.
+    #[must_use]
+    pub const fn source_generation(&self) -> ManifestGeneration {
+        self.source_generation
+    }
+}
 
 /// Validated namespace identifier shared by storage and security policy.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
