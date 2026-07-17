@@ -3712,6 +3712,41 @@ impl Manifest {
         &self.fragments
     }
 
+    /// Returns whether any currently visible segment or WAL fragment is
+    /// owned by another namespace incarnation.
+    pub fn has_foreign_visible_artifacts(&self) -> Result<bool> {
+        self.validate_artifact_origins()?;
+        let foreign_segment = self.active_segment.as_deref().is_some_and(|active| {
+            self.segments
+                .iter()
+                .find(|segment| segment.id == active)
+                .is_some_and(|segment| segment.artifact_origin.is_some())
+        });
+        Ok(foreign_segment
+            || self
+                .fragments
+                .iter()
+                .any(|fragment| fragment.artifact_origin.is_some()))
+    }
+
+    /// Returns true when every visible artifact is target-local.
+    pub fn visible_refs_are_local(&self) -> Result<bool> {
+        Ok(!self.has_foreign_visible_artifacts()?)
+    }
+
+    /// Rejects deferred-delete entries that are not owned by `namespace`.
+    pub fn validate_pending_deletes_are_local(&self, namespace: &str) -> Result<()> {
+        let prefix = format!("{namespace}/");
+        for key in &self.pending_deletes {
+            if !key.starts_with(&prefix) {
+                return Err(ZeppelinError::Validation(format!(
+                    "pending delete is not local to namespace {namespace}: {key}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Sums vector entries recorded across all retained segment descriptors.
     ///
     /// # Returns
@@ -9253,5 +9288,20 @@ mod tests {
             manifest.hierarchical_routing_nodes("seg_third"),
             ["node-third".to_string()]
         );
+    }
+
+    #[test]
+    fn pending_deletes_must_be_target_local() {
+        let mut manifest = Manifest::new();
+        manifest.pending_deletes = vec!["target/wal/fragment".to_string()];
+        manifest
+            .validate_pending_deletes_are_local("target")
+            .unwrap();
+        manifest
+            .pending_deletes
+            .push("source/segment/object".to_string());
+        assert!(manifest
+            .validate_pending_deletes_are_local("target")
+            .is_err());
     }
 }

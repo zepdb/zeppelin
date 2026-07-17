@@ -1485,6 +1485,8 @@ impl Compactor {
                     &compacted_fragments,
                     manifest_stamp,
                 )?;
+                fresh_manifest.validate_pending_deletes_are_local(namespace)?;
+                validate_deferred_deletes_are_local(namespace, &deferred_deletes)?;
                 merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
 
                 // Layer 2: CAS.
@@ -2066,6 +2068,8 @@ impl Compactor {
                 &compacted_fragments,
                 manifest_stamp,
             )?;
+            fresh_manifest.validate_pending_deletes_are_local(namespace)?;
+            validate_deferred_deletes_are_local(namespace, &deferred_deletes)?;
             merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
 
             // A legacy generation may retain old immutable segments alongside
@@ -3805,6 +3809,16 @@ fn check_lease_lost(
 /// in the future reports zero rather than wrapping to a huge age.
 fn fragment_age_secs(id: &Ulid, now_ms: u64) -> u64 {
     now_ms.saturating_sub(id.timestamp_ms()) / 1000
+}
+
+fn validate_deferred_deletes_are_local(namespace: &str, keys: &[String]) -> Result<()> {
+    let prefix = format!("{namespace}/");
+    if let Some(key) = keys.iter().find(|key| !key.starts_with(&prefix)) {
+        return Err(ZeppelinError::Validation(format!(
+            "deferred delete is not local to namespace {namespace}: {key}"
+        )));
+    }
+    Ok(())
 }
 
 /// Merge this cycle's deferred-delete keys into the manifest.
