@@ -6,6 +6,7 @@
 //! crate-private.
 
 mod error;
+pub mod http;
 mod lifecycle;
 mod types;
 
