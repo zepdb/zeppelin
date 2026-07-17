@@ -904,6 +904,50 @@ paths:
         "503":
           $ref: "#/components/responses/PreservationStateUnavailable"
 
+  /v1/namespaces/{ns}/branches:
+    parameters:
+      - $ref: "#/components/parameters/NamespacePath"
+
+    get:
+      operationId: listNamespaceBranches
+      summary: List direct namespace branches
+      tags: [Namespaces]
+      responses:
+        "401": { $ref: "#/components/responses/UnauthorizedError" }
+        "403": { $ref: "#/components/responses/ForbiddenError" }
+        "200":
+          description: Direct branch descriptors
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BranchListResponse" }
+        "404": { $ref: "#/components/responses/NotFoundError" }
+
+    post:
+      operationId: createNamespaceBranch
+      summary: Create a live-head copy-on-write branch
+      tags: [Namespaces]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ForkNamespaceRequest" }
+      responses:
+        "201":
+          description: Branch created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ForkNamespaceResponse" }
+        "200":
+          description: Existing exact branch intent
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ForkNamespaceResponse" }
+        "400": { $ref: "#/components/responses/BadRequestError" }
+        "401": { $ref: "#/components/responses/UnauthorizedError" }
+        "403": { $ref: "#/components/responses/ForbiddenError" }
+        "404": { $ref: "#/components/responses/NotFoundError" }
+        "409": { $ref: "#/components/responses/ConflictError" }
+
   /v1/namespaces/{ns}/clone:
     parameters:
       - $ref: "#/components/parameters/NamespacePath"
@@ -1665,6 +1709,47 @@ components:
             example: "Failed to deserialize the JSON body into the target type: missing field `dimensions`"
 
   schemas:
+    ForkNamespaceRequest:
+      type: object
+      additionalProperties: false
+      required: [target]
+      properties:
+        target: { type: string }
+
+    ForkNamespaceResponse:
+      type: object
+      required: [branch_id, created, target]
+      properties:
+        branch_id: { type: string }
+        created: { type: boolean }
+        target: { type: string }
+
+    BranchListResponse:
+      type: object
+      required: [branches]
+      properties:
+        branches:
+          type: array
+          items: { $ref: "#/components/schemas/BranchDescriptor" }
+
+    BranchDescriptor:
+      type: object
+      required: [branch_id, target, mode, depth, lifecycle, health, materialized, created_at]
+      properties:
+        branch_id: { type: string }
+        target:
+          type: object
+          required: [namespace, incarnation]
+          properties:
+            namespace: { type: string }
+            incarnation: { type: string }
+        mode: { type: string, enum: [copy_on_write] }
+        depth: { type: integer, minimum: 1 }
+        lifecycle: { type: string, enum: [preparing, active, deleting] }
+        health: { type: string, enum: [awaiting_authenticated_retry, ready, deletion_in_progress] }
+        materialized: { type: boolean }
+        created_at: { type: string, format: date-time }
+
     ErrorResponse:
       type: object
       required: [code, error, status, retryable]
