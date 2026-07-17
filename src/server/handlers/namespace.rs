@@ -2377,7 +2377,7 @@ pub async fn patch_index_config(
     });
     let updated = state
         .namespace_manager
-        .update_index_config(&ns, next)
+        .update_index_config(state.lease_manager.as_ref(), &ns, next)
         .await
         .map_err(ApiError::from)?;
     let index_config = updated.index_config.ok_or_else(|| {

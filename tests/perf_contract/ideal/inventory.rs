@@ -522,10 +522,17 @@ const PRODUCTION_PATHS: &[ProductionPath] = &[
         "namespace.patch_index_config",
         "src/namespace/manager.rs:NamespaceManager::update_index_config",
         &[
+            StoreMethod::GetWithMeta,
+            StoreMethod::Put,
+            StoreMethod::PutIfMatch,
             StoreMethod::GetWithObjectMetadata,
             StoreMethod::PutIfMatchWithUserMetadata,
         ],
-        &[PhysicalVariant::GetFull, PhysicalVariant::PutUpdate],
+        &[
+            PhysicalVariant::GetFull,
+            PhysicalVariant::PutOverwrite,
+            PhysicalVariant::PutUpdate,
+        ],
         PathCoverage::IdealScenario {
             scenario: "namespace.patch_index_config",
         },

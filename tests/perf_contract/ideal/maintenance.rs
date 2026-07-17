@@ -350,8 +350,9 @@ async fn execute_layout_rewrite(case: &IdealCase) -> IdealSample {
     assert!(initial.segment_id.is_some());
     let mut desired = NamespaceIndexConfig::from_indexing_config(&initial_indexing);
     desired.quantization = QuantizationType::None;
+    let lease_manager = maintenance_lease_manager(&world, "ideal-layout-config");
     manager
-        .update_index_config(&namespace, desired)
+        .update_index_config(lease_manager.as_ref(), &namespace, desired)
         .await
         .expect("ideal layout-rewrite config setup failed");
 
@@ -808,8 +809,9 @@ async fn execute_trigger_layout_change(case: &IdealCase) -> IdealSample {
         .expect("ideal layout-trigger manifest prime failed");
     let mut changed = NamespaceIndexConfig::from_indexing_config(&indexing);
     changed.nlist = 4;
+    let lease_manager = maintenance_lease_manager(&world, "ideal-layout-trigger-config");
     publishing_manager
-        .update_index_config(&namespace, changed)
+        .update_index_config(lease_manager.as_ref(), &namespace, changed)
         .await
         .expect("ideal layout-trigger metadata update failed");
     let stale = discovery_manager

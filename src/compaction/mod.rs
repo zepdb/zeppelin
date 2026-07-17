@@ -4456,6 +4456,9 @@ mod tests {
             full_text_search: HashMap::new(),
             index_config: None,
             compaction_health: CompactionHealth::default(),
+            creation_kind: crate::namespace::branching::NamespaceCreationKind::Root,
+            branch_identity: None,
+            branch_prepare: None,
             incarnation_id: None,
         }
     }

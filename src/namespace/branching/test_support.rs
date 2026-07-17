@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cache::hydration::HydrationTarget;
+use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
-use crate::config::DEFAULT_RERANK_COALESCE_GAP_BYTES;
+use crate::config::{BranchingConfig, IndexingConfig, DEFAULT_RERANK_COALESCE_GAP_BYTES};
 use crate::error::{Result, ZeppelinError};
 use crate::fts::rank_by::RankBy;
 use crate::fts::FtsFieldConfig;
@@ -23,6 +24,7 @@ use crate::query::{
     execute_query_with_manifest, execute_query_with_manifest_debug, QueryParams,
 };
 use crate::storage::ZeppelinStore;
+use crate::time::Clock;
 use crate::types::{
     AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult, VectorId,
 };
@@ -31,12 +33,16 @@ use crate::wal::{LeaseManager, WalReader};
 use chrono::{DateTime, Utc};
 
 use super::{
-    ArtifactOrigin, ArtifactOriginIndex, BranchId, BranchRoot, ForkViewDigest, ManifestGeneration,
+    ArtifactOrigin, ArtifactOriginIndex, BranchId, BranchLineage, BranchMaintenanceReport,
+    BranchPrepareStage, BranchRoot, ForkIdentity, ForkReservationIdentity, ForkViewDigest,
+    ManifestGeneration, NamespaceCreationKind, PrepareForkOutcome, PrepareForkRequest,
 };
 use crate::namespace::branch_root::{
     insert_branch_root, remove_branch_root, source_data_plane_config_digest,
     InsertBranchRootRequest, RemoveBranchRootRequest,
 };
+use crate::namespace::graph::NamespaceGraph;
+use crate::namespace::manager::NamespaceIndexConfig;
 use crate::namespace::{NamespaceId, NamespaceIncarnationId, NamespaceManager};
 
 /// Observable result of one ANN query through a synthetic target manifest.
@@ -97,6 +103,172 @@ pub struct BranchControlSnapshot {
     pub fencing_token: u64,
 }
 
+/// Test-only observation of one non-visible fork reservation.
+#[derive(Debug, Clone)]
+pub struct BranchMetadataSnapshot {
+    /// Persisted namespace visibility state.
+    pub state: &'static str,
+    /// Monotonic preparation milestone.
+    pub prepare_stage: Option<BranchPrepareStage>,
+    /// Immutable identity installed after the source root wins.
+    pub branch_identity: Option<ForkIdentity>,
+    /// Stable create-only reservation identity.
+    pub reservation: ForkReservationIdentity,
+}
+
+/// Test-only logical view of one prepared target manifest.
+#[derive(Debug, Clone)]
+pub struct PreparedManifestSnapshot {
+    /// Exact target manifest generation.
+    pub generation: u64,
+    /// Immutable target lineage.
+    pub lineage: BranchLineage,
+    /// Logical target namespace binding.
+    pub target_namespace: String,
+    /// Target lifetime binding.
+    pub target_incarnation: NamespaceIncarnationId,
+    /// Resolved physical owners of retained segments.
+    pub segment_origins: Vec<ArtifactOrigin>,
+    /// Resolved physical owners of retained WAL fragments.
+    pub fragment_origins: Vec<ArtifactOrigin>,
+}
+
+fn graph_for_test(
+    store: ZeppelinStore,
+    indexing: IndexingConfig,
+    branching: BranchingConfig,
+) -> NamespaceGraph {
+    let clock = Clock::system();
+    let namespace_manager = Arc::new(NamespaceManager::new(store.clone()));
+    let lease_manager = Arc::new(LeaseManager::with_clock(
+        store.clone(),
+        format!("branch-prepare-test-{}", ulid::Ulid::new()),
+        Duration::from_secs(30),
+        clock.clone(),
+    ));
+    NamespaceGraph::new(
+        store,
+        namespace_manager,
+        lease_manager,
+        clock,
+        Arc::new(ManifestCache::new(Duration::ZERO)),
+        branching,
+        indexing,
+    )
+}
+
+/// Run the private prepare-only graph protocol through its production seam.
+pub async fn prepare_fork_for_test(
+    store: ZeppelinStore,
+    source: NamespaceId,
+    target: NamespaceId,
+    indexing: IndexingConfig,
+    branching: BranchingConfig,
+) -> Result<PrepareForkOutcome> {
+    graph_for_test(store, indexing, branching)
+        .prepare_fork(PrepareForkRequest { source, target })
+        .await
+}
+
+/// Stop deterministically after the exact source root CAS.
+pub async fn prepare_fork_until_root_for_test(
+    store: ZeppelinStore,
+    source: NamespaceId,
+    target: NamespaceId,
+    indexing: IndexingConfig,
+    branching: BranchingConfig,
+) -> Result<()> {
+    graph_for_test(store, indexing, branching)
+        .prepare_fork_until_root_for_test(PrepareForkRequest { source, target })
+        .await
+}
+
+/// Stop deterministically after the create-only target reservation.
+pub async fn prepare_fork_until_reserved_for_test(
+    store: ZeppelinStore,
+    source: NamespaceId,
+    target: NamespaceId,
+    indexing: IndexingConfig,
+    branching: BranchingConfig,
+) -> Result<()> {
+    graph_for_test(store, indexing, branching)
+        .prepare_fork_until_reserved_for_test(PrepareForkRequest { source, target })
+        .await
+}
+
+/// Run one bounded non-visible branch maintenance pass.
+pub async fn maintain_branches_for_test(
+    store: ZeppelinStore,
+    indexing: IndexingConfig,
+    branching: BranchingConfig,
+    budget: Duration,
+) -> Result<BranchMaintenanceReport> {
+    graph_for_test(store, indexing, branching)
+        .maintain(budget)
+        .await
+}
+
+/// Read one authoritative non-visible metadata reservation for assertions.
+pub async fn branch_metadata_snapshot(
+    store: &ZeppelinStore,
+    target: &str,
+) -> Result<BranchMetadataSnapshot> {
+    let manager = NamespaceManager::new(store.clone());
+    let (metadata, _) = manager.read_creating_intent_strong(target).await?;
+    let NamespaceCreationKind::Fork(reservation) = metadata.creation_kind else {
+        return Err(ZeppelinError::Serialization(format!(
+            "test branch target {target} is not a fork reservation"
+        )));
+    };
+    Ok(BranchMetadataSnapshot {
+        state: metadata.state.as_str(),
+        prepare_stage: metadata.branch_prepare.map(|prepare| prepare.stage),
+        branch_identity: metadata.branch_identity,
+        reservation,
+    })
+}
+
+/// Resolve every visible descriptor to its exact physical namespace lifetime.
+pub async fn prepared_manifest_snapshot(
+    store: &ZeppelinStore,
+    target: &str,
+) -> Result<PreparedManifestSnapshot> {
+    let manager = NamespaceManager::new(store.clone());
+    let (metadata, _) = manager.read_creating_intent_strong(target).await?;
+    let target_incarnation = metadata.incarnation_id.ok_or_else(|| {
+        ZeppelinError::Serialization(format!(
+            "prepared branch target {target} has no incarnation"
+        ))
+    })?;
+    let (manifest, _) = Manifest::read_versioned_required_for_incarnation(
+        store,
+        target,
+        target_incarnation.as_uuid(),
+    )
+    .await?;
+    let lineage = manifest.branch_lineage().cloned().ok_or_else(|| {
+        ZeppelinError::Serialization(format!("prepared branch target {target} has no lineage"))
+    })?;
+    let segment_origins = manifest
+        .segments
+        .iter()
+        .map(|segment| manifest.segment_origin(segment))
+        .collect::<Result<Vec<_>>>()?;
+    let fragment_origins = manifest
+        .fragments
+        .iter()
+        .map(|fragment| manifest.fragment_origin(fragment))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PreparedManifestSnapshot {
+        generation: manifest.version(),
+        lineage,
+        target_namespace: target.to_string(),
+        target_incarnation,
+        segment_origins,
+        fragment_origins,
+    })
+}
+
 /// Build the exact root body for the currently authoritative source head.
 ///
 /// This feature-only adapter performs no mutation. It lets external MinIO
@@ -137,12 +309,16 @@ pub async fn prepare_head_branch_root(
             "invalid branch target namespace: {target_namespace}"
         ))
     })?;
+    let resolved_index_config = metadata
+        .index_config
+        .clone()
+        .unwrap_or_else(|| NamespaceIndexConfig::from_indexing_config(&IndexingConfig::default()));
     Ok(BranchRoot {
         branch_id,
         source_generation: ManifestGeneration::new(manifest.version())?,
         source_manifest_sha256: version.exact_manifest_digest()?,
         fork_view_sha256,
-        source_config_sha256: source_data_plane_config_digest(&metadata)?,
+        source_config_sha256: source_data_plane_config_digest(&metadata, &resolved_index_config)?,
         target_namespace,
         target_incarnation: NamespaceIncarnationId::from_uuid(target_incarnation),
         created_at,

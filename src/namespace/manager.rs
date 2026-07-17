@@ -77,7 +77,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::config::IndexingConfig;
 use crate::error::{Result, ZeppelinError};
@@ -87,8 +87,12 @@ use crate::security::{DecisionId, PreservationService, PrincipalId, SecurityErro
 use crate::storage::{ObjectUserMetadata, ZeppelinStore};
 use crate::time::Clock;
 use crate::types::{DistanceMetric, IndexType};
+use crate::wal::LeaseManager;
 
-use super::branching::ArtifactOrigin;
+use super::branching::{
+    ArtifactOrigin, BranchError, BranchPrepareStage, ForkIdentity, ForkPrepareIntent,
+    NamespaceCreationKind,
+};
 pub use super::types::{is_valid_namespace_name, NamespaceIncarnationId};
 use super::NamespaceId;
 
@@ -361,6 +365,15 @@ pub struct NamespaceMetadata {
     /// Compaction/index health surfaced through namespace reads.
     #[serde(default)]
     pub compaction_health: CompactionHealth,
+    /// Create-only recovery family. Old metadata defaults to an ordinary root.
+    #[serde(default)]
+    pub creation_kind: NamespaceCreationKind,
+    /// Immutable final fork proof, absent until the direct-parent root wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_identity: Option<ForkIdentity>,
+    /// Non-visible monotonic prepare milestone, valid only while `creating`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_prepare: Option<ForkPrepareIntent>,
     /// Runtime identity read from S3 user metadata, absent only for legacy
     /// objects written before incarnation IDs were introduced.
     #[serde(skip)]
@@ -409,6 +422,133 @@ impl NamespaceDestructionRecord {
 }
 
 impl NamespaceMetadata {
+    /// Validate the persisted namespace-creation lifecycle as one domain.
+    pub(crate) fn validate_creation_lifecycle(&self) -> Result<()> {
+        match &self.creation_kind {
+            NamespaceCreationKind::Root => {
+                if self.branch_identity.is_some() || self.branch_prepare.is_some() {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "root namespace {} carries branch-only metadata",
+                        self.name
+                    )));
+                }
+            }
+            NamespaceCreationKind::Fork(reservation) => {
+                if reservation.target_namespace.as_str() != self.name {
+                    return Err(BranchError::IntentMismatch {
+                        target: reservation.target_namespace.clone(),
+                    }
+                    .into());
+                }
+                if reservation.depth == 0 {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "fork reservation {} has zero ancestry depth",
+                        self.name
+                    )));
+                }
+                if reservation.target_incarnation.is_nil()
+                    || reservation.source_incarnation.is_nil()
+                {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "fork reservation {} contains a nil namespace incarnation",
+                        self.name
+                    )));
+                }
+                if let Some(incarnation) = self.incarnation_id.as_ref() {
+                    if incarnation != &reservation.target_incarnation {
+                        return Err(BranchError::IntentMismatch {
+                            target: reservation.target_namespace.clone(),
+                        }
+                        .into());
+                    }
+                }
+                if let Some(identity) = self.branch_identity.as_ref() {
+                    if !identity.matches_reservation(reservation) {
+                        return Err(BranchError::IntentMismatch {
+                            target: reservation.target_namespace.clone(),
+                        }
+                        .into());
+                    }
+                }
+
+                match self.state {
+                    NamespaceState::Creating => {
+                        let prepare = self.branch_prepare.as_ref().ok_or_else(|| {
+                            ZeppelinError::Serialization(format!(
+                                "creating fork {} has no preparation intent",
+                                self.name
+                            ))
+                        })?;
+                        if prepare.branch_id != reservation.branch_id
+                            || prepare.target_incarnation != reservation.target_incarnation
+                        {
+                            return Err(BranchError::IntentMismatch {
+                                target: reservation.target_namespace.clone(),
+                            }
+                            .into());
+                        }
+                        match prepare.stage {
+                            BranchPrepareStage::Reserved => {
+                                if self.branch_identity.is_some() || prepare.provisional.is_none() {
+                                    return Err(ZeppelinError::Serialization(format!(
+                                        "reserved fork {} must carry only provisional data-plane state",
+                                        self.name
+                                    )));
+                                }
+                                let provisional =
+                                    prepare.provisional.as_ref().ok_or_else(|| {
+                                        ZeppelinError::Serialization(format!(
+                                            "reserved fork {} has no provisional data-plane state",
+                                            self.name
+                                        ))
+                                    })?;
+                                let full_text_search = self
+                                    .full_text_search
+                                    .iter()
+                                    .map(|(field, config)| {
+                                        serde_json::to_value(config)
+                                            .map(|value| (field.clone(), value))
+                                    })
+                                    .collect::<std::result::Result<
+                                        std::collections::BTreeMap<_, _>,
+                                        _,
+                                    >>()?;
+                                if provisional.dimensions != self.dimensions
+                                    || provisional.distance_metric != self.distance_metric
+                                    || provisional.index_type != self.index_type
+                                    || provisional.full_text_search != full_text_search
+                                    || self.index_config.as_ref() != Some(&provisional.index_config)
+                                {
+                                    return Err(BranchError::IntentMismatch {
+                                        target: reservation.target_namespace.clone(),
+                                    }
+                                    .into());
+                                }
+                            }
+                            BranchPrepareStage::Rooted | BranchPrepareStage::ManifestPublished => {
+                                if self.branch_identity.is_none() || prepare.provisional.is_some() {
+                                    return Err(ZeppelinError::Serialization(format!(
+                                        "rooted fork {} must retain one final identity and no provisional state",
+                                        self.name
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    NamespaceState::Active | NamespaceState::Deleting => {
+                        if self.branch_prepare.is_some() || self.branch_identity.is_none() {
+                            return Err(ZeppelinError::Serialization(format!(
+                                "visible or deleting fork {} must retain identity and clear preparation state",
+                                self.name
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Return the authoritative namespace lifetime carried by object metadata.
     ///
     /// Legacy metadata can legitimately omit the incarnation. Callers may then
@@ -478,6 +618,7 @@ impl NamespaceMetadata {
     /// reference-counted read-only byte array than a C pointer-length pair;
     /// cloning it does not necessarily copy the underlying allocation.
     pub fn to_bytes(&self) -> Result<Bytes> {
+        self.validate_creation_lifecycle()?;
         let json = serde_json::to_vec_pretty(self)?;
         Ok(Bytes::from(json))
     }
@@ -504,7 +645,9 @@ impl NamespaceMetadata {
     /// Metadata written before `compaction_health` existed decodes with a
     /// default “never compacted” health record.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        Ok(serde_json::from_slice(data)?)
+        let metadata: Self = serde_json::from_slice(data)?;
+        metadata.validate_creation_lifecycle()?;
+        Ok(metadata)
     }
 
     fn user_metadata(&self) -> ObjectUserMetadata {
@@ -523,6 +666,7 @@ impl NamespaceMetadata {
             .get(NAMESPACE_INCARNATION_METADATA_KEY)
             .map(NamespaceIncarnationId::parse)
             .transpose()?;
+        self.validate_creation_lifecycle()?;
         Ok(self)
     }
 }
@@ -552,6 +696,15 @@ pub enum CreateNamespaceOutcome {
     /// The namespace did not exist and was created by this request.
     Created(NamespaceMetadata),
     /// The namespace already existed with the same immutable configuration.
+    Existing(NamespaceMetadata),
+}
+
+/// Result of create-only reservation of a non-visible metadata record.
+#[derive(Debug, Clone)]
+pub(crate) enum ReserveMetadataOutcome {
+    /// This caller created the reservation.
+    Reserved(NamespaceMetadata),
+    /// The name already had authoritative metadata; the caller must compare it.
     Existing(NamespaceMetadata),
 }
 
@@ -849,6 +1002,9 @@ impl NamespaceManager {
             full_text_search,
             index_config,
             compaction_health: CompactionHealth::default(),
+            creation_kind: NamespaceCreationKind::Root,
+            branch_identity: None,
+            branch_prepare: None,
             incarnation_id: Some(NamespaceIncarnationId::new()),
         };
 
@@ -909,6 +1065,19 @@ impl NamespaceManager {
         mut meta: NamespaceMetadata,
     ) -> Result<NamespaceMetadata> {
         if meta.state != NamespaceState::Creating {
+            return Ok(meta);
+        }
+
+        if let NamespaceCreationKind::Fork(reservation) = &meta.creation_kind {
+            if meta.incarnation_id.as_ref() != Some(&reservation.target_incarnation) {
+                return Err(BranchError::IntentMismatch {
+                    target: reservation.target_namespace.clone(),
+                }
+                .into());
+            }
+            // Fork reservations are never bootstrapped as empty roots and never
+            // activated by generic namespace recovery. NamespaceGraph owns all
+            // non-visible preparation milestones.
             return Ok(meta);
         }
 
@@ -1011,12 +1180,62 @@ impl NamespaceManager {
     /// Re-reading metadata on every retry preserves a concurrent deletion, and
     /// observing `active` makes the operation idempotent after a lost response.
     async fn activate_created_namespace(&self, name: &str) -> Result<NamespaceMetadata> {
+        self.activate_reserved_namespace(name, None).await
+    }
+
+    /// CAS-activates one initialized reservation after exact lifecycle checks.
+    ///
+    /// Phase 05 calls this only through ordinary root creation (`None`). The
+    /// branch identity form is extracted for Phase 08, which supplies fresh
+    /// authorization and prepared-branch proof before invoking it.
+    pub(crate) async fn activate_reserved_namespace(
+        &self,
+        name: &str,
+        expected_branch_identity: Option<&ForkIdentity>,
+    ) -> Result<NamespaceMetadata> {
         let key = NamespaceMetadata::s3_key(name);
         for _ in 0..10 {
             let (mut meta, etag) = self.read_metadata_versioned(name).await?;
             match meta.state {
-                NamespaceState::Active | NamespaceState::Deleting => return Ok(meta),
+                NamespaceState::Active => {
+                    if expected_branch_identity
+                        .is_none_or(|expected| meta.branch_identity.as_ref() == Some(expected))
+                    {
+                        return Ok(meta);
+                    }
+                    return Err(BranchError::IntentMismatch {
+                        target: NamespaceId::parse(name.to_string()).map_err(|_| {
+                            ZeppelinError::Validation(format!(
+                                "invalid namespace name for activation: {name}"
+                            ))
+                        })?,
+                    }
+                    .into());
+                }
+                NamespaceState::Deleting => return Ok(meta),
                 NamespaceState::Creating => {}
+            }
+
+            match (&meta.creation_kind, expected_branch_identity) {
+                (NamespaceCreationKind::Root, None) => {}
+                (NamespaceCreationKind::Fork(_), Some(expected))
+                    if meta.branch_identity.as_ref() == Some(expected)
+                        && meta.branch_prepare.as_ref().is_some_and(|prepare| {
+                            prepare.stage == BranchPrepareStage::ManifestPublished
+                        }) =>
+                {
+                    meta.branch_prepare = None;
+                }
+                _ => {
+                    return Err(BranchError::CreatingRecoveryRequired {
+                        target: NamespaceId::parse(name.to_string()).map_err(|_| {
+                            ZeppelinError::Validation(format!(
+                                "invalid namespace name for activation: {name}"
+                            ))
+                        })?,
+                    }
+                    .into())
+                }
             }
 
             meta.state = NamespaceState::Active;
@@ -1035,6 +1254,86 @@ impl NamespaceManager {
         Err(ZeppelinError::ManifestConflict {
             namespace: name.to_string(),
         })
+    }
+
+    /// Create-only reserve one complete `creating` metadata object.
+    pub(crate) async fn reserve_metadata_creating(
+        &self,
+        meta: NamespaceMetadata,
+    ) -> Result<ReserveMetadataOutcome> {
+        if meta.state != NamespaceState::Creating {
+            return Err(ZeppelinError::Serialization(format!(
+                "namespace reservation {} is not creating",
+                meta.name
+            )));
+        }
+        meta.validate_creation_lifecycle()?;
+        let key = NamespaceMetadata::s3_key(&meta.name);
+        let user_metadata = meta.user_metadata();
+        match self
+            .store
+            .put_if_not_exists_with_user_metadata(
+                &key,
+                meta.to_bytes()?,
+                &meta.name,
+                &user_metadata,
+            )
+            .await
+        {
+            Ok(()) => {
+                self.insert_registry(meta.clone());
+                Ok(ReserveMetadataOutcome::Reserved(meta))
+            }
+            Err(ZeppelinError::NamespaceAlreadyExists { .. }) => Ok(
+                ReserveMetadataOutcome::Existing(self.read_metadata_versioned(&meta.name).await?.0),
+            ),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Strongly read one exact creating fork intent and its non-empty CAS ETag.
+    pub(crate) async fn read_creating_intent_strong(
+        &self,
+        name: &str,
+    ) -> Result<(NamespaceMetadata, String)> {
+        let (meta, etag) = self.read_metadata_versioned(name).await?;
+        if meta.state != NamespaceState::Creating
+            || !matches!(meta.creation_kind, NamespaceCreationKind::Fork(_))
+        {
+            let target = NamespaceId::parse(name.to_string()).map_err(|_| {
+                ZeppelinError::Validation(format!("invalid branch target name: {name}"))
+            })?;
+            return Err(BranchError::TargetAlreadyExists { target }.into());
+        }
+        let etag = etag.filter(|etag| !etag.is_empty()).ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "authoritative creating metadata {name} has no non-empty ETag"
+            ))
+        })?;
+        Ok((meta, etag))
+    }
+
+    /// CAS-publish one monotonic update to an existing creating fork intent.
+    pub(crate) async fn cas_update_creating_intent(
+        &self,
+        meta: &NamespaceMetadata,
+        etag: &str,
+    ) -> Result<Option<String>> {
+        if meta.state != NamespaceState::Creating
+            || !matches!(meta.creation_kind, NamespaceCreationKind::Fork(_))
+        {
+            return Err(ZeppelinError::Serialization(format!(
+                "namespace {} is not a creating fork intent",
+                meta.name
+            )));
+        }
+        meta.validate_creation_lifecycle()?;
+        let key = NamespaceMetadata::s3_key(&meta.name);
+        let next = self
+            .put_metadata_if_match(&key, meta, etag, &meta.name)
+            .await?;
+        self.insert_registry(meta.clone());
+        Ok(next)
     }
 
     /// Idempotently creates a named namespace with optional FTS settings.
@@ -1426,7 +1725,7 @@ impl NamespaceManager {
     ///
     /// An index-config update reads metadata at ETag `v12`, edits an owned clone,
     /// and publishes only if `v12` remains current.
-    async fn read_metadata_versioned(
+    pub(crate) async fn read_metadata_versioned(
         &self,
         name: &str,
     ) -> Result<(NamespaceMetadata, Option<String>)> {
@@ -1618,7 +1917,15 @@ impl NamespaceManager {
                 match self.read_metadata_from_s3(ns_name).await {
                     Ok(meta) => {
                         let meta = self.recover_creating_namespace(meta).await?;
+                        // Keep non-visible fork reservations discoverable by
+                        // graph maintenance without returning them from the
+                        // active namespace listing.
                         found.insert(meta.name.clone());
+                        if meta.state == NamespaceState::Creating
+                            && matches!(meta.creation_kind, NamespaceCreationKind::Fork(_))
+                        {
+                            continue;
+                        }
                         namespaces.push(meta);
                     }
                     Err(ZeppelinError::NamespaceNotFound { .. }) => continue,
@@ -1961,6 +2268,8 @@ impl NamespaceManager {
     ///
     /// # Parameters
     ///
+    /// - `lease_manager`: The same namespace-writer lease domain used by WAL,
+    ///   compaction, and branch-root publication.
     /// - `name`: Active namespace whose desired build settings should change.
     /// - `index_config`: Fully resolved replacement configuration.
     ///
@@ -1976,50 +2285,77 @@ impl NamespaceManager {
     ///
     /// # Side Effects
     ///
-    /// Performs at least one metadata GET and conditional PUT, updates
-    /// `updated_at`, and refreshes the registry on success.
+    /// Acquires and renews the namespace writer lease, performs at least one
+    /// metadata GET and conditional PUT, updates `updated_at`, refreshes the
+    /// registry on success, and releases the lease best-effort.
     ///
     /// # Consistency
     ///
-    /// Every retry reloads metadata and its ETag. A stale writer cannot
-    /// overwrite a concurrent lifecycle or health update.
+    /// The writer lease is acquired before the first authoritative metadata
+    /// read and renewed immediately before each metadata CAS. Every CAS retry
+    /// reloads metadata and its ETag. This linearizes mutable index config with
+    /// fork preparation while preserving ETag exclusion against lifecycle and
+    /// health updates.
     ///
     /// # Examples
     ///
     /// Changing `nlist` from 128 to 256 affects the next segment build; segments
     /// already referenced by the manifest retain their original layout.
-    #[instrument(skip(self, index_config), fields(namespace = name))]
+    #[instrument(skip(self, lease_manager, index_config), fields(namespace = name))]
     pub async fn update_index_config(
         &self,
+        lease_manager: &LeaseManager,
         name: &str,
         index_config: NamespaceIndexConfig,
     ) -> Result<NamespaceMetadata> {
-        let key = NamespaceMetadata::s3_key(name);
-        for _ in 0..10 {
-            let (mut meta, etag) = self.read_metadata_versioned(name).await?;
-            let meta_name = meta.name.clone();
-            self.ensure_active(meta.clone())?;
-            index_config.validate(meta.dimensions)?;
+        let mut lease = lease_manager.acquire(name).await?;
+        let result = async {
+            let key = NamespaceMetadata::s3_key(name);
+            for _ in 0..10 {
+                let (mut meta, etag) = self.read_metadata_versioned(name).await?;
+                let meta_name = meta.name.clone();
+                self.ensure_active(meta.clone())?;
+                index_config.validate(meta.dimensions)?;
 
-            meta.index_config = Some(index_config.clone());
-            meta.updated_at = self.clock.now();
-            let etag = etag.unwrap_or_default();
-            match self
-                .put_metadata_if_match(&key, &meta, &etag, &meta_name)
-                .await
-            {
-                Ok(_) => {
-                    self.insert_registry(meta.clone());
-                    return Ok(meta);
+                meta.index_config = Some(index_config.clone());
+                meta.updated_at = self.clock.now();
+
+                let renewed = lease_manager.renew(name, &lease).await?;
+                if !lease_manager.validate(&renewed) {
+                    return Err(ZeppelinError::LeaseExpired {
+                        namespace: name.to_string(),
+                    });
                 }
-                Err(ZeppelinError::ManifestConflict { .. }) => continue,
-                Err(e) => return Err(e),
-            }
-        }
+                lease = renewed;
 
-        Err(ZeppelinError::ManifestConflict {
-            namespace: name.to_string(),
-        })
+                let etag = etag.unwrap_or_default();
+                match self
+                    .put_metadata_if_match(&key, &meta, &etag, &meta_name)
+                    .await
+                {
+                    Ok(_) => {
+                        self.insert_registry(meta.clone());
+                        return Ok(meta);
+                    }
+                    Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+
+            Err(ZeppelinError::ManifestConflict {
+                namespace: name.to_string(),
+            })
+        }
+        .await;
+
+        if let Err(error) = lease_manager.release(name, &lease).await {
+            warn!(
+                namespace = name,
+                error = %error,
+                "index-config update lease release failed (best-effort)"
+            );
+        }
+        result
     }
 
     /// Records a successful compaction and clears accumulated failure state.
@@ -2437,6 +2773,9 @@ mod tests {
             full_text_search: std::collections::HashMap::new(),
             index_config: None,
             compaction_health: CompactionHealth::default(),
+            creation_kind: NamespaceCreationKind::Root,
+            branch_identity: None,
+            branch_prepare: None,
             incarnation_id: None,
         };
         let mut user_metadata = ObjectUserMetadata::new();

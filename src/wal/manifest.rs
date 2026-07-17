@@ -139,10 +139,11 @@ use ulid::Ulid;
 
 use crate::error::{Result, ZeppelinError};
 use crate::namespace::branching::{
-    ArtifactOrigin, ArtifactOriginIndex, ArtifactOriginSetBuilder, BranchError,
+    ArtifactOrigin, ArtifactOriginIndex, ArtifactOriginSetBuilder, BranchError, BranchLineage,
 };
 use crate::namespace::{
-    BranchId, BranchRoot, ManifestDigest, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
+    BranchId, BranchRoot, ForkViewDigest, ManifestDigest, ManifestGeneration, NamespaceId,
+    NamespaceIncarnationId, SourceDataPlaneConfigDigest,
 };
 use crate::storage::store::DELETE_MANY_MAX_KEYS;
 use crate::storage::{CreateOnlyOutcome, ListedObject, StorageVersion, ZeppelinStore};
@@ -877,11 +878,17 @@ pub struct Manifest {
     control_state_digest: Option<[u8; 32]>,
     /// Exact source-generation retention roots for direct child namespaces.
     ///
-    /// This is the final trailing field in the positional MessagePack schema.
     /// Old manifests decode with no roots. The ordered map participates in the
-    /// V3 control projection, so its serialization is deterministic.
+    /// V3 control projection, so its serialization is deterministic. New
+    /// persisted fields must remain after this frozen position.
     #[serde(default)]
     branch_roots: BTreeMap<BranchId, BranchRoot>,
+    /// Immutable direct-parent ancestry retained for this namespace lifetime.
+    ///
+    /// This field is appended after the frozen V3 root map. A branch remains
+    /// V4-bound even after all inherited artifacts have been materialized.
+    #[serde(default)]
+    branch_lineage: Option<BranchLineage>,
 }
 
 /// Stable manifest execution projection version used by signed receipts.
@@ -896,7 +903,7 @@ pub enum ReceiptBindingVersion {
     /// Reserved root-control projection owned by phase 04.
     #[serde(rename = "v3_roots")]
     V3Roots,
-    /// Reserved branch-lineage projection owned by phase 05.
+    /// Origin-aware execution plus immutable lineage/roots control projection.
     #[serde(rename = "v4_lineage")]
     V4Lineage,
 }
@@ -1020,6 +1027,110 @@ struct ControlRootsV1<'a> {
     incarnation: Option<[u8; 16]>,
     deletion_fence: Option<&'a ManifestDeletionFence>,
     branch_roots: &'a BTreeMap<BranchId, BranchRoot>,
+}
+
+/// Exact lineage/control projection introduced by receipt binding V4.
+#[derive(Serialize)]
+struct ControlBranchV2<'a> {
+    namespace: &'a str,
+    incarnation: Option<[u8; 16]>,
+    deletion_fence: Option<&'a ManifestDeletionFence>,
+    branch_roots: &'a BTreeMap<BranchId, BranchRoot>,
+    branch_lineage: &'a BranchLineage,
+}
+
+/// Non-circular immutable inputs used to construct a target branch lineage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchLineageSeed {
+    pub(crate) branch_id: BranchId,
+    pub(crate) parent_namespace: NamespaceId,
+    pub(crate) parent_incarnation: NamespaceIncarnationId,
+    pub(crate) fork_generation: ManifestGeneration,
+    pub(crate) fork_manifest_sha256: ManifestDigest,
+    pub(crate) source_config_sha256: SourceDataPlaneConfigDigest,
+    pub(crate) depth: u16,
+    pub(crate) created_at: DateTime<Utc>,
+}
+
+impl BranchLineageSeed {
+    fn with_fork_view(&self, fork_view_sha256: ForkViewDigest) -> BranchLineage {
+        BranchLineage {
+            branch_id: self.branch_id,
+            parent_namespace: self.parent_namespace.clone(),
+            parent_incarnation: self.parent_incarnation.clone(),
+            fork_generation: self.fork_generation,
+            fork_manifest_sha256: self.fork_manifest_sha256,
+            fork_view_sha256,
+            source_config_sha256: self.source_config_sha256,
+            depth: self.depth,
+            created_at: self.created_at,
+        }
+    }
+}
+
+impl From<&BranchLineage> for BranchLineageSeed {
+    fn from(lineage: &BranchLineage) -> Self {
+        Self {
+            branch_id: lineage.branch_id,
+            parent_namespace: lineage.parent_namespace.clone(),
+            parent_incarnation: lineage.parent_incarnation.clone(),
+            fork_generation: lineage.fork_generation,
+            fork_manifest_sha256: lineage.fork_manifest_sha256,
+            source_config_sha256: lineage.source_config_sha256,
+            depth: lineage.depth,
+            created_at: lineage.created_at,
+        }
+    }
+}
+
+/// Canonical normalized target view and its computed immutable lineage.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedZeroCopyFork {
+    pub(crate) manifest: Manifest,
+    pub(crate) lineage: BranchLineage,
+}
+
+/// One finalized generation-one manifest and the only bytes it may publish.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedManifestPublication {
+    manifest: Manifest,
+    bytes: Bytes,
+    digest: ManifestDigest,
+}
+
+impl PreparedManifestPublication {
+    #[must_use]
+    pub(crate) fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    #[must_use]
+    pub(crate) fn exact_bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub(crate) const fn digest(&self) -> ManifestDigest {
+        self.digest
+    }
+}
+
+/// Frozen canonical initial-view projection. The lineage digest itself,
+/// generation/timestamps, signatures, roots, and pending deletes are excluded.
+#[derive(Serialize)]
+struct ForkViewProjectionV1<'a> {
+    domain: &'static str,
+    target_namespace: &'a str,
+    target_incarnation: [u8; 16],
+    source_namespace: &'a str,
+    source_incarnation: [u8; 16],
+    branch_id: BranchId,
+    source_generation: ManifestGeneration,
+    source_manifest_sha256: ManifestDigest,
+    source_config_sha256: SourceDataPlaneConfigDigest,
+    depth: u16,
+    execution: ManifestExecutionBindingV2<'a>,
+    artifact_hashes: &'a BTreeMap<String, [u8; 32]>,
 }
 
 /// Fixed root-signing envelope shared by V2 origins and later control bindings.
@@ -1198,11 +1309,11 @@ pub(crate) fn manifest_root_signing_bytes(
                 ZeppelinError::Serialization(format!("manifest root signing failed: {error}"))
             })
         }
-        ReceiptBindingVersion::V3Roots => {
+        ReceiptBindingVersion::V3Roots | ReceiptBindingVersion::V4Lineage => {
             let control_digest = control_state_digest.ok_or_else(|| {
-                ZeppelinError::Serialization(
-                    "receipt binding v3_roots requires a control digest".to_string(),
-                )
+                ZeppelinError::Serialization(format!(
+                    "receipt binding {binding_version:?} requires a control digest"
+                ))
             })?;
             serde_json::to_vec(&ManifestRootEnvelopeV2 {
                 domain: "zeppelin-manifest-root-envelope-v2",
@@ -1217,10 +1328,6 @@ pub(crate) fn manifest_root_signing_bytes(
                 ZeppelinError::Serialization(format!("manifest root signing failed: {error}"))
             })
         }
-        ReceiptBindingVersion::V4Lineage => Err(BranchError::BranchingNotReady {
-            feature: "receipt binding v4_lineage signing",
-        }
-        .into()),
     }
 }
 
@@ -1267,6 +1374,7 @@ impl Manifest {
             artifact_origins: Vec::new(),
             control_state_digest: None,
             branch_roots: BTreeMap::new(),
+            branch_lineage: None,
         }
     }
 
@@ -1694,6 +1802,75 @@ impl Manifest {
         self.validate_artifact_origins_structural(true)
     }
 
+    fn validate_branch_lineage_state(&self, namespace: &str) -> Result<()> {
+        let Some(lineage) = &self.branch_lineage else {
+            return Ok(());
+        };
+        if self.namespace.as_deref() != Some(namespace) {
+            return Err(BranchError::BranchRootInvalid {
+                branch_id: Some(lineage.branch_id),
+                reason: "lineage-bearing manifest is not bound to its target namespace".to_string(),
+            }
+            .into());
+        }
+        let Some(target_incarnation) = self.namespace_incarnation() else {
+            return Err(BranchError::BranchRootInvalid {
+                branch_id: Some(lineage.branch_id),
+                reason: "lineage-bearing manifest has no target incarnation".to_string(),
+            }
+            .into());
+        };
+        if target_incarnation.is_nil() || lineage.parent_incarnation.is_nil() {
+            return Err(BranchError::BranchRootInvalid {
+                branch_id: Some(lineage.branch_id),
+                reason: "branch lineage contains a nil namespace incarnation".to_string(),
+            }
+            .into());
+        }
+        if lineage.parent_namespace.as_str() == namespace {
+            return Err(BranchError::BranchRootInvalid {
+                branch_id: Some(lineage.branch_id),
+                reason: "branch parent and target namespaces must be distinct".to_string(),
+            }
+            .into());
+        }
+        if lineage.depth == 0 {
+            return Err(BranchError::BranchRootInvalid {
+                branch_id: Some(lineage.branch_id),
+                reason: "branch lineage depth must be greater than zero".to_string(),
+            }
+            .into());
+        }
+
+        let mut referenced = BTreeSet::new();
+        for fragment in &self.fragments {
+            if let Some(index) = fragment.artifact_origin {
+                referenced.insert(index);
+            }
+        }
+        for segment in &self.segments {
+            if let Some(index) = segment.artifact_origin {
+                referenced.insert(index);
+            }
+        }
+        if self.artifact_origins.iter().enumerate().any(|(index, _)| {
+            u32::try_from(index)
+                .ok()
+                .map(ArtifactOriginIndex::new)
+                .is_none_or(|index| !referenced.contains(&index))
+        }) {
+            return Err(self.artifact_origin_error(
+                "manifest",
+                "artifact_origins",
+                None,
+                None,
+                None,
+                "branch origin table contains an owner unused by the visible view",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_foreign_origin_admission(&self) -> Result<()> {
         if !self
             .fragments
@@ -1723,10 +1900,12 @@ impl Manifest {
             })
         });
         if foreign_fragment.is_some() || foreign_segment.is_some() {
-            return Err(BranchError::BranchingNotReady {
-                feature: "foreign artifact origin admission",
+            if self.branch_lineage.is_none() {
+                return Err(BranchError::BranchingNotReady {
+                    feature: "foreign artifact origin admission",
+                }
+                .into());
             }
-            .into());
         }
         Ok(())
     }
@@ -1941,6 +2120,12 @@ impl Manifest {
         &self.branch_roots
     }
 
+    /// Borrow the immutable direct-parent lineage carried by this namespace.
+    #[must_use]
+    pub(crate) fn branch_lineage(&self) -> Option<&BranchLineage> {
+        self.branch_lineage.as_ref()
+    }
+
     /// Return the distinct generations pinned by current live roots.
     ///
     /// Multiple children may pin one generation. Their exact source-manifest
@@ -2136,8 +2321,11 @@ impl Manifest {
             || self.root_signer_node.is_none()
             || self.receipt_binding_version.is_none()
             || self.recompute_receipt_state_digest(namespace).ok() != self.receipt_state_digest
-            || (self.receipt_binding_version == Some(ReceiptBindingVersion::V3Roots)
-                && self.recompute_control_state_digest(namespace).ok() != self.control_state_digest)
+            || (matches!(
+                self.receipt_binding_version,
+                Some(ReceiptBindingVersion::V3Roots | ReceiptBindingVersion::V4Lineage)
+            ) && self.recompute_control_state_digest(namespace).ok()
+                != self.control_state_digest)
     }
 
     /// Read and hash every currently reachable immutable artifact missing from
@@ -2283,12 +2471,14 @@ impl Manifest {
 
     /// Recompute the exact V3 roots/fence control digest.
     pub(crate) fn recompute_control_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
-        if self.receipt_binding_version != Some(ReceiptBindingVersion::V3Roots) {
-            return Err(ZeppelinError::Serialization(
-                "manifest control digest requires receipt binding v3_roots".to_string(),
-            ));
+        match self.receipt_binding_version {
+            Some(ReceiptBindingVersion::V3Roots) => self.compute_control_roots_digest(namespace),
+            Some(ReceiptBindingVersion::V4Lineage) => self.compute_control_branch_digest(namespace),
+            _ => Err(ZeppelinError::Serialization(
+                "manifest control digest requires receipt binding v3_roots or v4_lineage"
+                    .to_string(),
+            )),
         }
-        self.compute_control_roots_digest(namespace)
     }
 
     /// Seal a feature-only synthetic foreign view with a valid v2 projection.
@@ -2315,17 +2505,11 @@ impl Manifest {
         self.validate_namespace_binding(namespace)?;
         let bytes = match binding_version {
             ReceiptBindingVersion::V1 => serde_json::to_vec(&self.execution_binding_v1(namespace)),
-            ReceiptBindingVersion::V2Origins | ReceiptBindingVersion::V3Roots => {
+            ReceiptBindingVersion::V2Origins
+            | ReceiptBindingVersion::V3Roots
+            | ReceiptBindingVersion::V4Lineage => {
                 self.validate_artifact_origins()?;
                 serde_json::to_vec(&self.execution_binding_v2(namespace))
-            }
-            ReceiptBindingVersion::V4Lineage => {
-                return Err(
-                    crate::namespace::branching::BranchError::BranchingNotReady {
-                        feature: "reserved receipt binding projection",
-                    }
-                    .into(),
-                );
             }
         };
         let bytes = bytes.map_err(|error| {
@@ -2348,6 +2532,30 @@ impl Manifest {
         .map_err(|error| {
             ZeppelinError::Serialization(format!(
                 "manifest roots control binding serialization failed: {error}"
+            ))
+        })?;
+        Ok(Sha256::digest(bytes).into())
+    }
+
+    fn compute_control_branch_digest(&self, namespace: &str) -> Result<[u8; 32]> {
+        self.validate_namespace_binding(namespace)?;
+        self.validate_branch_root_state(namespace)?;
+        self.validate_branch_lineage_state(namespace)?;
+        let lineage = self.branch_lineage.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(
+                "receipt binding v4_lineage requires immutable branch lineage".to_string(),
+            )
+        })?;
+        let bytes = serde_json::to_vec(&ControlBranchV2 {
+            namespace,
+            incarnation: self.namespace_incarnation.map(|incarnation| incarnation.0),
+            deletion_fence: self.deletion_fence.as_ref(),
+            branch_roots: &self.branch_roots,
+            branch_lineage: lineage,
+        })
+        .map_err(|error| {
+            ZeppelinError::Serialization(format!(
+                "manifest branch control binding serialization failed: {error}"
             ))
         })?;
         Ok(Sha256::digest(bytes).into())
@@ -2681,6 +2889,7 @@ impl Manifest {
         self.validate_branch_root_state(namespace)?;
         self.canonicalize_explicit_artifact_origins()?;
         self.validate_artifact_origins()?;
+        self.validate_branch_lineage_state(namespace)?;
         self.validate_foreign_origin_admission()?;
         let reachable = self.receipt_reachable_keys(namespace)?;
         self.artifact_hashes
@@ -2694,13 +2903,10 @@ impl Manifest {
         }
 
         let has_roots_control = self.deletion_fence.is_some() || !self.branch_roots.is_empty();
+        let has_lineage_control = self.branch_lineage.is_some();
         let binding_version = match self.receipt_binding_version {
-            Some(ReceiptBindingVersion::V4Lineage) => {
-                return Err(BranchError::BranchingNotReady {
-                    feature: "receipt binding v4_lineage publication",
-                }
-                .into());
-            }
+            Some(ReceiptBindingVersion::V4Lineage) => ReceiptBindingVersion::V4Lineage,
+            _ if has_lineage_control => ReceiptBindingVersion::V4Lineage,
             Some(ReceiptBindingVersion::V3Roots) => ReceiptBindingVersion::V3Roots,
             _ if has_roots_control => ReceiptBindingVersion::V3Roots,
             Some(ReceiptBindingVersion::V2Origins) => ReceiptBindingVersion::V2Origins,
@@ -2714,8 +2920,10 @@ impl Manifest {
         self.receipt_binding_version = Some(binding_version);
         self.control_state_digest = match binding_version {
             ReceiptBindingVersion::V3Roots => Some(self.compute_control_roots_digest(namespace)?),
+            ReceiptBindingVersion::V4Lineage => {
+                Some(self.compute_control_branch_digest(namespace)?)
+            }
             ReceiptBindingVersion::V1 | ReceiptBindingVersion::V2Origins => None,
-            ReceiptBindingVersion::V4Lineage => unreachable!("V4 publication returned above"),
         };
 
         if reachable
@@ -2778,6 +2986,7 @@ impl Manifest {
     pub(crate) fn clear_branch_control_for_new_namespace(&mut self) {
         self.deletion_fence = None;
         self.branch_roots.clear();
+        self.branch_lineage = None;
         self.control_state_digest = None;
         if matches!(
             self.receipt_binding_version,
@@ -2788,6 +2997,334 @@ impl Manifest {
             self.root_signature = None;
             self.root_signer_node = None;
         }
+    }
+
+    /// Normalize one exact source head into an unpublished zero-copy target.
+    pub(crate) fn prepare_zero_copy_fork(
+        source: &Manifest,
+        source_identity: &ArtifactOrigin,
+        target_identity: &ArtifactOrigin,
+        lineage_seed: BranchLineageSeed,
+        now: DateTime<Utc>,
+    ) -> Result<PreparedZeroCopyFork> {
+        source.validate_namespace_binding(source_identity.namespace.as_str())?;
+        source.validate_branch_root_state(source_identity.namespace.as_str())?;
+        source.validate_branch_lineage_state(source_identity.namespace.as_str())?;
+        source.validate_artifact_origins()?;
+        source.validate_receipt_binding_state(source_identity.namespace.as_str())?;
+        source.validate_foreign_origin_admission()?;
+        if source.namespace.as_deref() != Some(source_identity.namespace.as_str())
+            || source.namespace_incarnation() != Some(source_identity.incarnation.as_uuid())
+        {
+            return Err(BranchError::ArtifactOriginInvalid {
+                manifest_namespace: source_identity.namespace.to_string(),
+                manifest_incarnation: source
+                    .namespace_incarnation()
+                    .map(NamespaceIncarnationId::from_uuid),
+                descriptor_kind: "manifest",
+                descriptor_id: "source_identity".to_string(),
+                offending_index: None,
+                offending_key: None,
+                expected_origin: Some(source_identity.clone()),
+                reason: "fork source manifest is not bound to the authoritative source identity"
+                    .to_string(),
+            }
+            .into());
+        }
+        if source.version == 0
+            || source.version != lineage_seed.fork_generation.get()
+            || lineage_seed.parent_namespace != source_identity.namespace
+            || lineage_seed.parent_incarnation != source_identity.incarnation
+        {
+            return Err(BranchError::BranchRootInvalid {
+                branch_id: Some(lineage_seed.branch_id),
+                reason: "fork lineage seed does not name the exact source manifest head"
+                    .to_string(),
+            }
+            .into());
+        }
+        if source.deletion_fence.is_some() {
+            return Err(ZeppelinError::NamespaceDeleting {
+                namespace: source_identity.namespace.to_string(),
+            });
+        }
+        if source_identity.namespace == target_identity.namespace
+            || source_identity.incarnation.is_nil()
+            || target_identity.incarnation.is_nil()
+            || lineage_seed.depth == 0
+        {
+            return Err(BranchError::BranchRootInvalid {
+                branch_id: Some(lineage_seed.branch_id),
+                reason: "fork source, target, depth, or incarnation is invalid".to_string(),
+            }
+            .into());
+        }
+
+        let resolver = source.artifact_origin_resolver(source_identity)?;
+        let mut fragments = resolver
+            .located_fragments()?
+            .into_iter()
+            .map(|located| {
+                (
+                    located.fragment.clone(),
+                    located.physical_origin.as_origin().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        fragments.sort_by_key(|(fragment, _)| fragment.sequence_number);
+
+        let active = resolver.active_located_segment()?.map(|located| {
+            (
+                located.segment.clone(),
+                located.physical_origin.as_origin().clone(),
+            )
+        });
+        let mut origins = ArtifactOriginSetBuilder::default();
+        for (_, origin) in &fragments {
+            origins.collect(origin.clone())?;
+        }
+        if let Some((_, origin)) = &active {
+            origins.collect(origin.clone())?;
+        }
+        let origins = origins.finish()?;
+
+        let mut target = Manifest::new_at(now);
+        target.fragments = fragments
+            .into_iter()
+            .map(|(mut fragment, origin)| {
+                fragment.artifact_origin =
+                    Some(origins.indices.get(&origin).copied().ok_or_else(|| {
+                        BranchError::ArtifactOriginInvalid {
+                            manifest_namespace: target_identity.namespace.to_string(),
+                            manifest_incarnation: Some(target_identity.incarnation.clone()),
+                            descriptor_kind: "fragment",
+                            descriptor_id: fragment.id.to_string(),
+                            offending_index: None,
+                            offending_key: None,
+                            expected_origin: Some(origin),
+                            reason: "canonical fork origin table omitted a visible fragment owner"
+                                .to_string(),
+                        }
+                    })?);
+                Ok(fragment)
+            })
+            .collect::<std::result::Result<Vec<_>, BranchError>>()?;
+        if let Some((mut segment, origin)) = active {
+            segment.artifact_origin =
+                Some(origins.indices.get(&origin).copied().ok_or_else(|| {
+                    BranchError::ArtifactOriginInvalid {
+                        manifest_namespace: target_identity.namespace.to_string(),
+                        manifest_incarnation: Some(target_identity.incarnation.clone()),
+                        descriptor_kind: "segment",
+                        descriptor_id: segment.id.clone(),
+                        offending_index: None,
+                        offending_key: None,
+                        expected_origin: Some(origin),
+                        reason: "canonical fork origin table omitted the active segment owner"
+                            .to_string(),
+                    }
+                })?);
+            target.active_segment = Some(segment.id.clone());
+            if let Some(nodes) = source.hierarchical_routing_nodes.get(&segment.id) {
+                target
+                    .hierarchical_routing_nodes
+                    .insert(segment.id.clone(), nodes.clone());
+            }
+            target.segments.push(segment);
+        }
+        target.next_sequence = source.next_sequence;
+        target.namespace = Some(target_identity.namespace.to_string());
+        target.bind_namespace_incarnation(target_identity.incarnation.as_uuid())?;
+        target.artifact_origins = origins.table;
+        target.artifact_hashes = source.artifact_hashes.clone();
+        target.validate_artifact_origins()?;
+        let reachable = target.receipt_reachable_keys(target_identity.namespace.as_str())?;
+        target
+            .artifact_hashes
+            .retain(|key, _| reachable.contains(key));
+        if reachable
+            .iter()
+            .any(|key| !target.artifact_hashes.contains_key(key))
+        {
+            return Err(ZeppelinError::Serialization(
+                "zero-copy fork source is missing a reachable artifact hash".to_string(),
+            ));
+        }
+
+        let fork_view_sha256 = target.compute_initial_fork_view_digest(
+            source_identity,
+            target_identity,
+            &lineage_seed,
+        )?;
+        let lineage = lineage_seed.with_fork_view(fork_view_sha256);
+        target.branch_lineage = Some(lineage.clone());
+        target.validate_branch_lineage_state(target_identity.namespace.as_str())?;
+        target.validate_foreign_origin_admission()?;
+        target.validate_initial_fork_view()?;
+        Ok(PreparedZeroCopyFork {
+            manifest: target,
+            lineage,
+        })
+    }
+
+    fn compute_initial_fork_view_digest(
+        &self,
+        source_identity: &ArtifactOrigin,
+        target_identity: &ArtifactOrigin,
+        lineage_seed: &BranchLineageSeed,
+    ) -> Result<ForkViewDigest> {
+        self.validate_namespace_binding(target_identity.namespace.as_str())?;
+        if self.namespace_incarnation() != Some(target_identity.incarnation.as_uuid())
+            || lineage_seed.parent_namespace != source_identity.namespace
+            || lineage_seed.parent_incarnation != source_identity.incarnation
+        {
+            return Err(BranchError::BranchRootInvalid {
+                branch_id: Some(lineage_seed.branch_id),
+                reason: "fork-view projection identities do not match manifest bindings"
+                    .to_string(),
+            }
+            .into());
+        }
+        self.validate_artifact_origins()?;
+        let bytes = serde_json::to_vec(&ForkViewProjectionV1 {
+            domain: "zeppelin-fork-view-projection-v1",
+            target_namespace: target_identity.namespace.as_str(),
+            target_incarnation: *target_identity.incarnation.as_uuid().as_bytes(),
+            source_namespace: source_identity.namespace.as_str(),
+            source_incarnation: *source_identity.incarnation.as_uuid().as_bytes(),
+            branch_id: lineage_seed.branch_id,
+            source_generation: lineage_seed.fork_generation,
+            source_manifest_sha256: lineage_seed.fork_manifest_sha256,
+            source_config_sha256: lineage_seed.source_config_sha256,
+            depth: lineage_seed.depth,
+            execution: self.execution_binding_v2(target_identity.namespace.as_str()),
+            artifact_hashes: &self.artifact_hashes,
+        })
+        .map_err(|error| {
+            ZeppelinError::Serialization(format!(
+                "fork-view projection serialization failed: {error}"
+            ))
+        })?;
+        Ok(ForkViewDigest::new(Sha256::digest(bytes).into()))
+    }
+
+    /// Verify the canonical initial view against the immutable lineage digest.
+    pub(crate) fn validate_initial_fork_view(&self) -> Result<()> {
+        let lineage = self.branch_lineage.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(
+                "initial fork-view validation requires branch lineage".to_string(),
+            )
+        })?;
+        let target_identity = self.local_origin()?;
+        let source_identity = ArtifactOrigin {
+            namespace: lineage.parent_namespace.clone(),
+            incarnation: lineage.parent_incarnation.clone(),
+        };
+        let actual = self.compute_initial_fork_view_digest(
+            &source_identity,
+            &target_identity,
+            &BranchLineageSeed::from(lineage),
+        )?;
+        if actual != lineage.fork_view_sha256 {
+            return Err(BranchError::BranchRootInvalid {
+                branch_id: Some(lineage.branch_id),
+                reason: "canonical initial fork-view digest does not match branch lineage"
+                    .to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Finalize an unpublished normalized fork exactly once as generation one.
+    pub(crate) fn preseal_generation_one(
+        &self,
+        store: &ZeppelinStore,
+        target_identity: &ArtifactOrigin,
+    ) -> Result<PreparedManifestPublication> {
+        if self.version != 0
+            || self.namespace.as_deref() != Some(target_identity.namespace.as_str())
+            || self.namespace_incarnation() != Some(target_identity.incarnation.as_uuid())
+            || self.fencing_token != 0
+            || self.deletion_fence.is_some()
+            || !self.branch_roots.is_empty()
+        {
+            return Err(ZeppelinError::Serialization(
+                "fork generation-one preseal requires one unpublished target-bound manifest"
+                    .to_string(),
+            ));
+        }
+        self.validate_initial_fork_view()?;
+        let mut manifest = self.clone();
+        manifest.version = 1;
+        manifest.finalize_receipt_root(store, target_identity.namespace.as_str())?;
+        if manifest.receipt_binding_version != Some(ReceiptBindingVersion::V4Lineage) {
+            return Err(ZeppelinError::Serialization(
+                "fork generation one did not select receipt binding v4_lineage".to_string(),
+            ));
+        }
+        let bytes = manifest.to_bytes()?;
+        let digest = ManifestDigest::new(Sha256::digest(&bytes).into());
+        Ok(PreparedManifestPublication {
+            manifest,
+            bytes,
+            digest,
+        })
+    }
+
+    /// Create or byte-verify the exact presealed live and history generation one.
+    pub(crate) async fn create_or_verify_generation_one(
+        store: &ZeppelinStore,
+        target_identity: &ArtifactOrigin,
+        prepared: &PreparedManifestPublication,
+    ) -> Result<Manifest> {
+        let generation_one = ManifestGeneration::new(1)?;
+        if prepared.manifest.version != 1
+            || prepared.manifest.namespace.as_deref() != Some(target_identity.namespace.as_str())
+            || prepared.manifest.namespace_incarnation()
+                != Some(target_identity.incarnation.as_uuid())
+            || prepared.manifest.to_bytes()? != prepared.bytes
+            || ManifestDigest::new(Sha256::digest(&prepared.bytes).into()) != prepared.digest
+        {
+            return Err(BranchError::ManifestDigestMismatch {
+                generation: generation_one,
+            }
+            .into());
+        }
+        let decoded =
+            Self::from_bytes_for_namespace(&prepared.bytes, target_identity.namespace.as_str())?;
+        if decoded.namespace_incarnation() != Some(target_identity.incarnation.as_uuid()) {
+            return Err(BranchError::ManifestDigestMismatch {
+                generation: generation_one,
+            }
+            .into());
+        }
+        decoded.validate_initial_fork_view()?;
+
+        let live_key = Self::s3_key(target_identity.namespace.as_str());
+        match store
+            .put_create_outcome(&live_key, prepared.bytes.clone())
+            .await?
+        {
+            CreateOnlyOutcome::Created { .. } => {}
+            CreateOnlyOutcome::AlreadyExists => {
+                let existing = store.get(&live_key).await?;
+                if existing != prepared.bytes {
+                    return Err(BranchError::ManifestDigestMismatch {
+                        generation: generation_one,
+                    }
+                    .into());
+                }
+            }
+        }
+        Self::write_immutable_history_snapshot(
+            store,
+            target_identity.namespace.as_str(),
+            1,
+            prepared.bytes.clone(),
+        )
+        .await?;
+        Ok(prepared.manifest.clone())
     }
 
     /// Adopts the exact empty target generation used as a clone-publication CAS base.
@@ -3359,6 +3896,7 @@ impl Manifest {
         manifest.validate_namespace_binding(namespace)?;
         manifest.validate_branch_root_state(namespace)?;
         manifest.validate_artifact_origins()?;
+        manifest.validate_branch_lineage_state(namespace)?;
         manifest.validate_receipt_binding_state(namespace)?;
         manifest.validate_foreign_origin_admission()?;
         Ok(manifest)
@@ -3394,6 +3932,11 @@ impl Manifest {
                         "branch roots require receipt binding v3_roots".to_string(),
                     ));
                 }
+                if self.branch_lineage.is_some() {
+                    return Err(ZeppelinError::Serialization(
+                        "branch lineage requires receipt binding v4_lineage".to_string(),
+                    ));
+                }
             }
             Some(ReceiptBindingVersion::V1) => {
                 if self.receipt_state_digest.is_none() {
@@ -3416,6 +3959,11 @@ impl Manifest {
                         "branch roots require receipt binding v3_roots".to_string(),
                     ));
                 }
+                if self.branch_lineage.is_some() {
+                    return Err(ZeppelinError::Serialization(
+                        "branch lineage requires receipt binding v4_lineage".to_string(),
+                    ));
+                }
             }
             Some(ReceiptBindingVersion::V2Origins) => {
                 if self.receipt_state_digest.is_none() {
@@ -3433,8 +3981,18 @@ impl Manifest {
                         "branch roots require receipt binding v3_roots".to_string(),
                     ));
                 }
+                if self.branch_lineage.is_some() {
+                    return Err(ZeppelinError::Serialization(
+                        "branch lineage requires receipt binding v4_lineage".to_string(),
+                    ));
+                }
             }
             Some(ReceiptBindingVersion::V3Roots) => {
+                if self.branch_lineage.is_some() {
+                    return Err(ZeppelinError::Serialization(
+                        "branch lineage requires receipt binding v4_lineage".to_string(),
+                    ));
+                }
                 let execution = self.receipt_state_digest.ok_or_else(|| {
                     ZeppelinError::Serialization(
                         "receipt binding v3_roots requires an execution digest".to_string(),
@@ -3459,10 +4017,33 @@ impl Manifest {
                 }
             }
             Some(ReceiptBindingVersion::V4Lineage) => {
-                return Err(BranchError::BranchingNotReady {
-                    feature: "receipt binding v4_lineage",
+                let execution = self.receipt_state_digest.ok_or_else(|| {
+                    ZeppelinError::Serialization(
+                        "receipt binding v4_lineage requires an execution digest".to_string(),
+                    )
+                })?;
+                let control = self.control_state_digest.ok_or_else(|| {
+                    ZeppelinError::Serialization(
+                        "receipt binding v4_lineage requires a control digest".to_string(),
+                    )
+                })?;
+                if self.branch_lineage.is_none() {
+                    return Err(ZeppelinError::Serialization(
+                        "receipt binding v4_lineage requires immutable branch lineage".to_string(),
+                    ));
                 }
-                .into());
+                if self.compute_receipt_state_digest(namespace, ReceiptBindingVersion::V4Lineage)?
+                    != execution
+                {
+                    return Err(ZeppelinError::Serialization(
+                        "receipt binding v4_lineage execution digest mismatch".to_string(),
+                    ));
+                }
+                if self.compute_control_branch_digest(namespace)? != control {
+                    return Err(ZeppelinError::Serialization(
+                        "receipt binding v4_lineage control digest mismatch".to_string(),
+                    ));
+                }
             }
         }
         Ok(())
@@ -3663,6 +4244,7 @@ impl Manifest {
         }
         if let Some((live, _)) = &current {
             self.require_matching_branch_control_for_recovery_write(live, namespace)?;
+            self.require_valid_branch_successor(live, namespace)?;
         }
         let current_version = current
             .as_ref()
@@ -3717,6 +4299,7 @@ impl Manifest {
     ) -> Result<()> {
         let is_branch_bound = |manifest: &Self| {
             !manifest.branch_roots.is_empty()
+                || manifest.branch_lineage.is_some()
                 || manifest.control_state_digest.is_some()
                 || matches!(
                     manifest.receipt_binding_version,
@@ -3725,10 +4308,94 @@ impl Manifest {
         };
         if (is_branch_bound(self) || is_branch_bound(live))
             && (self.branch_roots != live.branch_roots
+                || self.branch_lineage != live.branch_lineage
                 || self.namespace_incarnation != live.namespace_incarnation
                 || self.receipt_binding_version != live.receipt_binding_version
                 || self.control_state_digest != live.control_state_digest)
         {
+            return Err(ZeppelinError::ManifestConflict {
+                namespace: namespace.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn foreign_descriptor_closure(&self) -> Result<BTreeSet<Vec<u8>>> {
+        #[derive(Serialize)]
+        struct ForeignFragment<'a> {
+            kind: &'static str,
+            origin: &'a ArtifactOrigin,
+            descriptor: FragmentRef,
+        }
+
+        #[derive(Serialize)]
+        struct ForeignSegment<'a> {
+            kind: &'static str,
+            origin: &'a ArtifactOrigin,
+            descriptor: SegmentRef,
+        }
+
+        let local = self.local_origin()?;
+        let resolver = self.artifact_origin_resolver(&local)?;
+        let mut closure = BTreeSet::new();
+        for located in resolver.located_fragments()? {
+            if located.physical_origin.as_origin() == &local {
+                continue;
+            }
+            let mut descriptor = located.fragment.clone();
+            descriptor.artifact_origin = None;
+            let bytes = serde_json::to_vec(&ForeignFragment {
+                kind: "fragment",
+                origin: located.physical_origin.as_origin(),
+                descriptor,
+            })
+            .map_err(|error| {
+                ZeppelinError::Serialization(format!(
+                    "foreign fragment closure serialization failed: {error}"
+                ))
+            })?;
+            closure.insert(bytes);
+        }
+        for located in resolver.located_segments()? {
+            if located.physical_origin.as_origin() == &local {
+                continue;
+            }
+            let mut descriptor = located.segment.clone();
+            descriptor.artifact_origin = None;
+            let bytes = serde_json::to_vec(&ForeignSegment {
+                kind: "segment",
+                origin: located.physical_origin.as_origin(),
+                descriptor,
+            })
+            .map_err(|error| {
+                ZeppelinError::Serialization(format!(
+                    "foreign segment closure serialization failed: {error}"
+                ))
+            })?;
+            closure.insert(bytes);
+        }
+        Ok(closure)
+    }
+
+    /// A branch successor may retain or remove inherited descriptors, but it
+    /// cannot mutate lineage or introduce a new foreign descriptor.
+    fn require_valid_branch_successor(&self, predecessor: &Self, namespace: &str) -> Result<()> {
+        if self.branch_lineage != predecessor.branch_lineage {
+            if self.branch_lineage.is_some() || predecessor.branch_lineage.is_some() {
+                return Err(ZeppelinError::ManifestConflict {
+                    namespace: namespace.to_string(),
+                });
+            }
+            return Ok(());
+        }
+        if predecessor.branch_lineage.is_none() {
+            return Ok(());
+        }
+        predecessor.validate_branch_lineage_state(namespace)?;
+        self.validate_branch_lineage_state(namespace)?;
+        let predecessor_foreign = predecessor.foreign_descriptor_closure()?;
+        let successor_foreign = self.foreign_descriptor_closure()?;
+        if !successor_foreign.is_subset(&predecessor_foreign) {
             return Err(ZeppelinError::ManifestConflict {
                 namespace: namespace.to_string(),
             });
@@ -3935,6 +4602,16 @@ impl Manifest {
         version: &ManifestVersion,
     ) -> Result<ManifestVersion> {
         let key = Self::s3_key(namespace);
+        if version.has_e_tag() {
+            let predecessor_bytes = version.exact_manifest_bytes()?;
+            let predecessor = Self::from_bytes_for_namespace(&predecessor_bytes, namespace)?;
+            if predecessor.version != self.version {
+                return Err(ZeppelinError::ManifestConflict {
+                    namespace: namespace.to_string(),
+                });
+            }
+            self.require_valid_branch_successor(&predecessor, namespace)?;
+        }
         if self.version() > 0 && !version.history_confirmed {
             let data = version.history_snapshot_bytes(namespace, self.version())?;
             Self::write_immutable_history_snapshot(store, namespace, self.version(), data).await?;
@@ -5316,6 +5993,34 @@ mod tests {
         }
     }
 
+    fn lineage_seed(
+        source: &ArtifactOrigin,
+        generation: u64,
+        branch_id: u128,
+        depth: u16,
+    ) -> BranchLineageSeed {
+        BranchLineageSeed {
+            branch_id: BranchId::from_ulid(Ulid::from(branch_id)),
+            parent_namespace: source.namespace.clone(),
+            parent_incarnation: source.incarnation.clone(),
+            fork_generation: ManifestGeneration::new(generation).unwrap(),
+            fork_manifest_sha256: ManifestDigest::new([0x41; 32]),
+            source_config_sha256: SourceDataPlaneConfigDigest::new([0x42; 32]),
+            depth,
+            created_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        }
+    }
+
+    fn bound_manifest(identity: &ArtifactOrigin, generation: u64) -> Manifest {
+        let mut manifest = Manifest::new_at(DateTime::from_timestamp(1_700_000_000, 0).unwrap());
+        manifest.namespace = Some(identity.namespace.to_string());
+        manifest
+            .bind_namespace_incarnation(identity.incarnation.as_uuid())
+            .unwrap();
+        manifest.version = generation;
+        manifest
+    }
+
     #[test]
     fn receipt_v2_digest_binds_segment_origin_index() {
         let mut manifest = Manifest::new();
@@ -6508,7 +7213,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_v4_binding_deserializes_but_fails_closed() {
+    fn v4_binding_without_lineage_fails_closed() {
         let mut manifest = Manifest::new();
         manifest.namespace = Some("reserved-binding".to_string());
         manifest
@@ -6524,11 +7229,7 @@ mod tests {
             "reserved-binding",
         )
         .expect_err("reserved version must not become authority");
-        assert!(matches!(
-            error,
-            ZeppelinError::Branch(error)
-                if matches!(error.as_ref(), BranchError::BranchingNotReady { .. })
-        ));
+        assert!(matches!(error, ZeppelinError::Serialization(_)));
 
         let error = manifest_root_signing_bytes(
             [1; 32],
@@ -6538,12 +7239,397 @@ mod tests {
             [2; 32],
             None,
         )
-        .expect_err("reserved root projection must not sign");
+        .expect_err("V4 root projection requires its control digest");
+        assert!(matches!(error, ZeppelinError::Serialization(_)));
+
+        let bytes = manifest_root_signing_bytes(
+            [1; 32],
+            1,
+            1,
+            ReceiptBindingVersion::V4Lineage,
+            [2; 32],
+            Some([3; 32]),
+        )
+        .expect("V4 must use the frozen V2 root envelope");
+        let bytes = String::from_utf8(bytes).unwrap();
+        assert!(bytes.contains(r#""binding_version":"v4_lineage""#));
+        assert!(bytes.starts_with(r#"{"domain":"zeppelin-manifest-root-envelope-v2""#));
+    }
+
+    #[test]
+    fn zero_copy_fork_keeps_only_visible_state_and_canonical_origins() {
+        let source_identity = origin("fork-source-z", 0x101);
+        let target_identity = origin("fork-target", 0x102);
+        let mut source = bound_manifest(&source_identity, 7);
+        source.next_sequence = 9;
+        source.compaction_watermark = Some(Ulid::from(0x33_u128));
+        source.pending_deletes = vec!["fork-source-z/obsolete".to_string()];
+        source.fencing_token = 99;
+
+        let fragment_id = Ulid::from(0x44_u128);
+        source.fragments.push(FragmentRef {
+            id: fragment_id,
+            vector_count: 2,
+            delete_count: 0,
+            sequence_number: 8,
+            size_bytes: 12,
+            artifact_origin: None,
+        });
+        let mut active = make_segment("active");
+        active.cluster_count = 0;
+        source.active_segment = Some(active.id.clone());
+        source.segments.push(make_segment("inactive"));
+        source.segments.push(active);
+        let fragment_key = crate::wal::WalFragment::s3_key("fork-source-z", &fragment_id);
+        let active_key = crate::index::ivf_flat::build::centroids_key("fork-source-z", "active");
+        let inactive_key =
+            crate::index::ivf_flat::build::centroids_key("fork-source-z", "inactive");
+        source.artifact_hashes.insert(fragment_key.clone(), [1; 32]);
+        source.artifact_hashes.insert(active_key.clone(), [2; 32]);
+        source.artifact_hashes.insert(inactive_key, [3; 32]);
+
+        let prepared = Manifest::prepare_zero_copy_fork(
+            &source,
+            &source_identity,
+            &target_identity,
+            lineage_seed(&source_identity, 7, 0x103, 1),
+            DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
+        )
+        .unwrap();
+        let target = prepared.manifest;
+
+        assert_eq!(target.version(), 0);
+        assert_eq!(
+            target.namespace_incarnation(),
+            Some(uuid::Uuid::from_u128(0x102))
+        );
+        assert_eq!(target.next_sequence, 9);
+        assert_eq!(target.fragments.len(), 1);
+        assert_eq!(target.segments.len(), 1);
+        assert_eq!(target.segments[0].id, "active");
+        assert_eq!(target.compaction_watermark, None);
+        assert!(target.pending_deletes.is_empty());
+        assert_eq!(target.fencing_token, 0);
+        assert!(target.branch_roots.is_empty());
+        assert_eq!(target.artifact_origins, vec![source_identity.clone()]);
+        assert_eq!(
+            target.fragment_origin(&target.fragments[0]).unwrap(),
+            source_identity
+        );
+        assert_eq!(
+            target.segment_origin(&target.segments[0]).unwrap(),
+            origin("fork-source-z", 0x101)
+        );
+        assert_eq!(
+            target
+                .artifact_hashes
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([fragment_key, active_key])
+        );
+        assert_eq!(target.branch_lineage(), Some(&prepared.lineage));
+        target.validate_initial_fork_view().unwrap();
+    }
+
+    #[test]
+    fn nested_inherited_only_fork_does_not_add_its_direct_parent_origin() {
+        let root_identity = origin("nested-root", 0x201);
+        let parent_identity = origin("nested-parent", 0x202);
+        let target_identity = origin("nested-target", 0x203);
+        let mut root = bound_manifest(&root_identity, 3);
+        let fragment_id = Ulid::from(0x204_u128);
+        root.fragments.push(FragmentRef {
+            id: fragment_id,
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 4,
+            artifact_origin: None,
+        });
+        root.next_sequence = 1;
+        root.artifact_hashes.insert(
+            crate::wal::WalFragment::s3_key(root_identity.namespace.as_str(), &fragment_id),
+            [4; 32],
+        );
+        let parent = Manifest::prepare_zero_copy_fork(
+            &root,
+            &root_identity,
+            &parent_identity,
+            lineage_seed(&root_identity, 3, 0x205, 1),
+            Utc::now(),
+        )
+        .unwrap();
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let parent = parent
+            .manifest
+            .preseal_generation_one(&store, &parent_identity)
+            .unwrap();
+        let nested = Manifest::prepare_zero_copy_fork(
+            parent.manifest(),
+            &parent_identity,
+            &target_identity,
+            lineage_seed(&parent_identity, 1, 0x206, 2),
+            Utc::now(),
+        )
+        .unwrap();
+
+        assert_eq!(nested.manifest.artifact_origins, vec![root_identity]);
+        assert!(!nested.manifest.artifact_origins.contains(&parent_identity));
+        nested.manifest.validate_initial_fork_view().unwrap();
+    }
+
+    #[test]
+    fn nested_fork_remaps_direct_parent_before_and_after_inherited_origins() {
+        for (root_name, parent_name, ordinal) in [
+            ("zzz-inherited", "aaa-direct-parent", 0x211_u128),
+            ("aaa-inherited", "zzz-direct-parent", 0x221_u128),
+        ] {
+            let root_identity = origin(root_name, ordinal);
+            let parent_identity = origin(parent_name, ordinal + 1);
+            let target_identity = origin(&format!("nested-target-{ordinal:x}"), ordinal + 2);
+            let mut root = bound_manifest(&root_identity, 3);
+            let inherited_id = Ulid::from(ordinal + 3);
+            root.fragments.push(FragmentRef {
+                id: inherited_id,
+                vector_count: 1,
+                delete_count: 0,
+                sequence_number: 0,
+                size_bytes: 4,
+                artifact_origin: None,
+            });
+            root.next_sequence = 1;
+            root.artifact_hashes.insert(
+                crate::wal::WalFragment::s3_key(root_name, &inherited_id),
+                [5; 32],
+            );
+            let parent = Manifest::prepare_zero_copy_fork(
+                &root,
+                &root_identity,
+                &parent_identity,
+                lineage_seed(&root_identity, 3, ordinal + 4, 1),
+                Utc::now(),
+            )
+            .unwrap();
+            let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+            let mut parent = parent
+                .manifest
+                .preseal_generation_one(&store, &parent_identity)
+                .unwrap()
+                .manifest()
+                .clone();
+            let local_id = Ulid::from(ordinal + 5);
+            parent.add_fragment_at(
+                FragmentRef {
+                    id: local_id,
+                    vector_count: 1,
+                    delete_count: 0,
+                    sequence_number: 0,
+                    size_bytes: 4,
+                    artifact_origin: None,
+                },
+                Utc::now(),
+            );
+            parent.artifact_hashes.insert(
+                crate::wal::WalFragment::s3_key(parent_name, &local_id),
+                [6; 32],
+            );
+            parent.version = 2;
+            parent
+                .finalize_receipt_root(&store, parent_identity.namespace.as_str())
+                .unwrap();
+
+            let nested = Manifest::prepare_zero_copy_fork(
+                &parent,
+                &parent_identity,
+                &target_identity,
+                lineage_seed(&parent_identity, 2, ordinal + 6, 2),
+                Utc::now(),
+            )
+            .unwrap();
+            let expected = BTreeSet::from([root_identity.clone(), parent_identity.clone()]);
+            assert_eq!(
+                nested
+                    .manifest
+                    .artifact_origins
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                expected
+            );
+            let inherited = nested
+                .manifest
+                .fragments
+                .iter()
+                .find(|fragment| fragment.id == inherited_id)
+                .unwrap();
+            let local = nested
+                .manifest
+                .fragments
+                .iter()
+                .find(|fragment| fragment.id == local_id)
+                .unwrap();
+            assert_eq!(
+                nested.manifest.fragment_origin(inherited).unwrap(),
+                root_identity
+            );
+            assert_eq!(
+                nested.manifest.fragment_origin(local).unwrap(),
+                parent_identity
+            );
+        }
+    }
+
+    #[test]
+    fn v4_control_and_execution_tampering_fail_decode() {
+        let source_identity = origin("v4-source", 0x301);
+        let target_identity = origin("v4-target", 0x302);
+        let source = bound_manifest(&source_identity, 4);
+        let prepared = Manifest::prepare_zero_copy_fork(
+            &source,
+            &source_identity,
+            &target_identity,
+            lineage_seed(&source_identity, 4, 0x303, 1),
+            Utc::now(),
+        )
+        .unwrap();
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let sealed = prepared
+            .manifest
+            .preseal_generation_one(&store, &target_identity)
+            .unwrap();
+        assert_eq!(
+            sealed.manifest().receipt_binding_version(),
+            Some(ReceiptBindingVersion::V4Lineage)
+        );
+        assert_eq!(
+            sealed
+                .manifest()
+                .recompute_receipt_state_digest("v4-target")
+                .unwrap(),
+            sealed.manifest().receipt_state_digest().unwrap()
+        );
+        assert_eq!(
+            sealed
+                .manifest()
+                .recompute_control_state_digest("v4-target")
+                .unwrap(),
+            sealed.manifest().control_state_digest().unwrap()
+        );
+
+        let mut lineage_tamper = sealed.manifest().clone();
+        lineage_tamper.branch_lineage.as_mut().unwrap().depth += 1;
+        assert!(Manifest::from_bytes_for_namespace(
+            &lineage_tamper.to_bytes().unwrap(),
+            "v4-target"
+        )
+        .is_err());
+
+        let mut extra_origin = sealed.manifest().clone();
+        extra_origin
+            .artifact_origins
+            .push(origin("unused-origin", 0x304));
+        assert!(
+            Manifest::from_bytes_for_namespace(&extra_origin.to_bytes().unwrap(), "v4-target")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn branch_successor_cannot_mutate_lineage_or_expand_foreign_closure() {
+        let source_identity = origin("closure-source", 0x401);
+        let target_identity = origin("closure-target", 0x402);
+        let source = bound_manifest(&source_identity, 2);
+        let prepared = Manifest::prepare_zero_copy_fork(
+            &source,
+            &source_identity,
+            &target_identity,
+            lineage_seed(&source_identity, 2, 0x403, 1),
+            Utc::now(),
+        )
+        .unwrap();
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let predecessor = prepared
+            .manifest
+            .preseal_generation_one(&store, &target_identity)
+            .unwrap()
+            .manifest()
+            .clone();
+
+        let mut lineage_tamper = predecessor.clone();
+        lineage_tamper.branch_lineage.as_mut().unwrap().depth += 1;
         assert!(matches!(
-            error,
-            ZeppelinError::Branch(error)
-                if matches!(error.as_ref(), BranchError::BranchingNotReady { .. })
+            lineage_tamper.require_valid_branch_successor(&predecessor, "closure-target"),
+            Err(ZeppelinError::ManifestConflict { .. })
         ));
+
+        let mut widened = predecessor.clone();
+        let new_origin = origin("closure-foreign", 0x404);
+        widened.artifact_origins.push(new_origin);
+        widened.fragments.push(FragmentRef {
+            id: Ulid::from(0x405_u128),
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 1,
+            artifact_origin: Some(ArtifactOriginIndex::new(0)),
+        });
+        assert!(matches!(
+            widened.require_valid_branch_successor(&predecessor, "closure-target"),
+            Err(ZeppelinError::ManifestConflict { .. })
+        ));
+
+        let materialized = predecessor.clone();
+        materialized
+            .require_valid_branch_successor(&predecessor, "closure-target")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn generation_one_publication_is_exact_and_idempotent() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let source_identity = origin("publish-source", 0x501);
+        let target_identity = origin("publish-target", 0x502);
+        let source = bound_manifest(&source_identity, 11);
+        let prepared = Manifest::prepare_zero_copy_fork(
+            &source,
+            &source_identity,
+            &target_identity,
+            lineage_seed(&source_identity, 11, 0x503, 1),
+            Utc::now(),
+        )
+        .unwrap();
+        let sealed = prepared
+            .manifest
+            .preseal_generation_one(&store, &target_identity)
+            .unwrap();
+
+        let first = Manifest::create_or_verify_generation_one(&store, &target_identity, &sealed)
+            .await
+            .unwrap();
+        let retry = Manifest::create_or_verify_generation_one(&store, &target_identity, &sealed)
+            .await
+            .unwrap();
+        assert_eq!(first.to_bytes().unwrap(), *sealed.exact_bytes());
+        assert_eq!(retry.to_bytes().unwrap(), *sealed.exact_bytes());
+        assert_eq!(
+            store
+                .get(&Manifest::s3_key("publish-target"))
+                .await
+                .unwrap(),
+            *sealed.exact_bytes()
+        );
+        assert_eq!(
+            store
+                .get(&Manifest::history_key("publish-target", 1))
+                .await
+                .unwrap(),
+            *sealed.exact_bytes()
+        );
+        assert_eq!(
+            sealed.digest(),
+            ManifestDigest::new(Sha256::digest(sealed.exact_bytes()).into())
+        );
     }
 
     /// Sketch refs written before v4 decode with no invented rotation seed.
@@ -7499,6 +8585,7 @@ mod tests {
 
         assert!(decoded.artifact_origins.is_empty());
         assert!(decoded.branch_roots().is_empty());
+        assert!(decoded.branch_lineage().is_none());
         assert_eq!(decoded.fragments[0].artifact_origin, None);
         assert_eq!(decoded.segments[0].artifact_origin, None);
         let expected = ArtifactOrigin {

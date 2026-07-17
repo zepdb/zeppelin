@@ -15,6 +15,8 @@
 pub(crate) mod branch_root;
 /// Namespace branching identities and fail-closed validation errors.
 pub mod branching;
+/// Deep prepare/recovery coordinator for namespace graph mutations.
+pub(crate) mod graph;
 /// Namespace metadata and lifecycle implementation.
 pub mod manager;
 /// Strong namespace identities shared by metadata, security, and manifests.

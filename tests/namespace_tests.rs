@@ -13,7 +13,7 @@ use zeppelin::namespace::NamespaceManager;
 use zeppelin::storage::ObjectUserMetadata;
 use zeppelin::types::DistanceMetric;
 use zeppelin::types::IndexType;
-use zeppelin::wal::Manifest;
+use zeppelin::wal::{LeaseManager, Manifest};
 
 /// Create a URL-safe namespace name scoped to this test's prefix (no slashes).
 fn ns(harness: &TestHarness, suffix: &str) -> String {
@@ -77,6 +77,11 @@ async fn test_namespace_incarnation_survives_metadata_cas_updates() {
 
     let configured = manager
         .update_index_config(
+            &LeaseManager::new(
+                harness.store.clone(),
+                "incarnation-config-update".to_string(),
+                std::time::Duration::from_secs(30),
+            ),
             &name,
             NamespaceIndexConfig::from_indexing_config(&IndexingConfig::default()),
         )
@@ -106,6 +111,46 @@ async fn test_namespace_incarnation_survives_metadata_cas_updates() {
         .finish_delete(&name, std::time::Duration::MAX)
         .await
         .unwrap();
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_index_config_update_waits_for_the_namespace_writer_lease() {
+    let harness = TestHarness::new().await;
+    let name = ns(&harness, "index-config-writer-lease");
+    let manager = NamespaceManager::new(harness.store.clone());
+    manager
+        .create(&name, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+
+    let blocker = LeaseManager::new(
+        harness.store.clone(),
+        "index-config-blocker".to_string(),
+        std::time::Duration::from_secs(30),
+    );
+    let held = blocker.acquire(&name).await.unwrap();
+    let updater = LeaseManager::new(
+        harness.store.clone(),
+        "index-config-updater".to_string(),
+        std::time::Duration::from_secs(30),
+    );
+    let desired = NamespaceIndexConfig::from_indexing_config(&IndexingConfig::default());
+
+    let error = manager
+        .update_index_config(&updater, &name, desired.clone())
+        .await
+        .expect_err("index config must not publish while another writer owns the lease");
+    assert!(matches!(error, ZeppelinError::LeaseHeld { .. }));
+
+    blocker.release(&name, &held).await.unwrap();
+    let updated = manager
+        .update_index_config(&updater, &name, desired.clone())
+        .await
+        .unwrap();
+    assert_eq!(updated.index_config.as_ref(), Some(&desired));
+
+    cleanup_ns(&harness.store, &name).await;
     harness.cleanup().await;
 }
 
@@ -566,6 +611,9 @@ async fn test_list_namespaces_ignores_nested_meta_objects() {
         full_text_search: std::collections::HashMap::new(),
         index_config: None,
         compaction_health: CompactionHealth::default(),
+        creation_kind: zeppelin::namespace::branching::NamespaceCreationKind::Root,
+        branch_identity: None,
+        branch_prepare: None,
         incarnation_id: None,
     };
     harness

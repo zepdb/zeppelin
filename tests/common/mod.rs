@@ -56,6 +56,9 @@ pub async fn write_active_namespace_metadata_with_fts(
         full_text_search,
         index_config: None,
         compaction_health: zeppelin::namespace::manager::CompactionHealth::default(),
+        creation_kind: zeppelin::namespace::branching::NamespaceCreationKind::Root,
+        branch_identity: None,
+        branch_prepare: None,
         incarnation_id: None,
     };
     store

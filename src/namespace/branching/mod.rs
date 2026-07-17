@@ -6,6 +6,7 @@
 //! crate-private.
 
 mod error;
+mod lifecycle;
 mod types;
 
 pub use crate::namespace::types::{
@@ -13,6 +14,11 @@ pub use crate::namespace::types::{
     SourceDataPlaneConfigDigest,
 };
 pub use error::BranchError;
+pub use lifecycle::{
+    BranchLineage, BranchMaintenanceReport, BranchPrepareStage, ForkDataPlaneConfig, ForkIdentity,
+    ForkPrepareIntent, ForkReservationIdentity, NamespaceCreationKind, PrepareForkOutcome,
+    PrepareForkRequest, PreparedBranch,
+};
 pub(crate) use types::ArtifactOriginSetBuilder;
 pub use types::{ArtifactOrigin, ArtifactOriginIndex};
 

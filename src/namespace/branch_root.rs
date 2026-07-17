@@ -18,6 +18,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
+use crate::config::IndexingConfig;
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
 use crate::namespace::branching::BranchError;
@@ -25,7 +26,7 @@ use crate::namespace::manager::{NamespaceIndexConfig, NamespaceManager, Namespac
 use crate::namespace::{BranchRoot, ManifestGeneration, NamespaceId, SourceDataPlaneConfigDigest};
 use crate::storage::ZeppelinStore;
 use crate::types::{DistanceMetric, IndexType};
-use crate::wal::{LeaseManager, Manifest};
+use crate::wal::{Lease, LeaseManager, Manifest};
 
 const SOURCE_DATA_PLANE_CONFIG_DOMAIN: &str = "zeppelin.source-data-plane-config.v1";
 
@@ -59,7 +60,7 @@ struct SourceDataPlaneConfigBindingV1<'a> {
     distance_metric: DistanceMetric,
     index_type: IndexType,
     full_text_search: BTreeMap<&'a str, &'a FtsFieldConfig>,
-    index_config: &'a Option<NamespaceIndexConfig>,
+    index_config: &'a NamespaceIndexConfig,
 }
 
 /// Compute the canonical interpretation-config digest used by roots and forks.
@@ -69,6 +70,7 @@ struct SourceDataPlaneConfigBindingV1<'a> {
 /// independent of randomized map iteration order.
 pub(crate) fn source_data_plane_config_digest(
     metadata: &NamespaceMetadata,
+    resolved_index_config: &NamespaceIndexConfig,
 ) -> Result<SourceDataPlaneConfigDigest> {
     let full_text_search = metadata
         .full_text_search
@@ -81,7 +83,7 @@ pub(crate) fn source_data_plane_config_digest(
         distance_metric: metadata.distance_metric,
         index_type: metadata.index_type,
         full_text_search,
-        index_config: &metadata.index_config,
+        index_config: resolved_index_config,
     };
     let bytes = serde_json::to_vec(&binding)?;
     Ok(SourceDataPlaneConfigDigest::new(
@@ -102,10 +104,25 @@ pub(crate) async fn insert_branch_root(
     request: InsertBranchRootRequest,
 ) -> Result<BranchRoot> {
     let namespace = request.source_namespace.to_string();
-    let lease = lease_manager.acquire(&namespace).await?;
-    let result =
-        insert_branch_root_with_lease(store, namespace_manager, lease_manager, &lease, request)
-            .await;
+    let mut lease = lease_manager.acquire(&namespace).await?;
+    let result = async {
+        let metadata = namespace_manager
+            .get_active_metadata_for_guarded_write(&namespace)
+            .await?;
+        let resolved_index_config = metadata.index_config.clone().unwrap_or_else(|| {
+            NamespaceIndexConfig::from_indexing_config(&IndexingConfig::default())
+        });
+        insert_branch_root_with_lease(
+            store,
+            namespace_manager,
+            lease_manager,
+            &mut lease,
+            &resolved_index_config,
+            request,
+        )
+        .await
+    }
+    .await;
     if let Err(error) = lease_manager.release(&namespace, &lease).await {
         warn!(
             namespace,
@@ -116,11 +133,12 @@ pub(crate) async fn insert_branch_root(
     result
 }
 
-async fn insert_branch_root_with_lease(
+pub(crate) async fn insert_branch_root_with_lease(
     store: &ZeppelinStore,
     namespace_manager: &NamespaceManager,
     lease_manager: &LeaseManager,
-    lease: &crate::wal::Lease,
+    lease: &mut Lease,
+    resolved_index_config: &NamespaceIndexConfig,
     request: InsertBranchRootRequest,
 ) -> Result<BranchRoot> {
     let namespace = request.source_namespace.as_str();
@@ -149,7 +167,20 @@ async fn insert_branch_root_with_lease(
         };
     }
 
-    let config_digest = source_data_plane_config_digest(&metadata)?;
+    resolved_index_config.validate(metadata.dimensions)?;
+    if metadata
+        .index_config
+        .as_ref()
+        .is_some_and(|authoritative| authoritative != resolved_index_config)
+    {
+        return Err(BranchError::BranchRootInvalid {
+            branch_id: Some(request.root.branch_id),
+            reason: "resolved source index config does not match authoritative metadata"
+                .to_string(),
+        }
+        .into());
+    }
+    let config_digest = source_data_plane_config_digest(&metadata, resolved_index_config)?;
     if config_digest != request.root.source_config_sha256 {
         return Err(BranchError::BranchRootInvalid {
             branch_id: Some(request.root.branch_id),
@@ -196,6 +227,7 @@ async fn insert_branch_root_with_lease(
         });
     }
     manifest.fencing_token = renewed.fencing_token;
+    *lease = renewed;
     manifest
         .write_conditional(store, namespace, &version)
         .await?;

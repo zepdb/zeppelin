@@ -3,11 +3,73 @@
 use thiserror::Error;
 
 use super::types::{ArtifactOrigin, ArtifactOriginIndex};
-use crate::namespace::{BranchId, ManifestGeneration, NamespaceIncarnationId};
+use crate::namespace::{BranchId, ManifestGeneration, NamespaceId, NamespaceIncarnationId};
 
 /// Failures produced while validating or coordinating namespace branches.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum BranchError {
+    /// The target name belongs to another namespace creation intent.
+    #[error("branch target {target} already exists")]
+    TargetAlreadyExists {
+        /// Conflicting target namespace.
+        target: NamespaceId,
+    },
+
+    /// Persisted reservation fields do not match the retry request.
+    #[error("branch intent for target {target} does not match this request")]
+    IntentMismatch {
+        /// Reserved target namespace.
+        target: NamespaceId,
+    },
+
+    /// The source name now identifies a different namespace lifetime.
+    #[error("branch source {namespace} incarnation changed")]
+    SourceIncarnationChanged {
+        /// Source namespace whose lifetime changed.
+        namespace: NamespaceId,
+    },
+
+    /// The source entered deletion before a first root could be published.
+    #[error("branch source {namespace} is deleting")]
+    SourceDeleting {
+        /// Source namespace being deleted or fenced.
+        namespace: NamespaceId,
+    },
+
+    /// A fork would exceed the configured ancestry bound.
+    #[error("branch depth {depth} exceeds configured limit {limit}")]
+    BranchDepthExceeded {
+        /// Proposed target depth.
+        depth: u16,
+        /// Configured maximum depth.
+        limit: u16,
+    },
+
+    /// The source already has the configured number of direct children.
+    #[error("branch child limit {limit} would be exceeded")]
+    BranchLimitExceeded {
+        /// Configured maximum direct children.
+        limit: usize,
+    },
+
+    /// A persisted root exists for the branch ID but not the exact final identity.
+    #[error("branch root {branch_id} does not match the prepared branch identity")]
+    BranchRootMismatch {
+        /// Mismatched direct-edge identity.
+        branch_id: BranchId,
+    },
+
+    /// A non-visible reservation requires graph recovery rather than root recovery.
+    #[error("creating branch target {target} requires namespace-graph recovery")]
+    CreatingRecoveryRequired {
+        /// Reserved branch target.
+        target: NamespaceId,
+    },
+
+    /// Authorization would make the target less restrictive than its source.
+    #[error("branch security policy would widen source access")]
+    SecurityWouldWiden,
+
     /// A persisted descriptor cannot resolve to one valid physical owner.
     #[error(
         "artifact origin invalid for {manifest_namespace}/{manifest_incarnation:?} \
