@@ -99,6 +99,189 @@ manifest generation, and `PitrHistoryRetention` includes that invariant.
 | `IncrementalArtifactClosure` | PASS: 284 generated; 72 distinct; depth 9 | `AllowBuggyPrefixGc = TRUE` violates `ManifestReachableArtifactsExist` |
 | `GroupCommitWalWriter` | PASS: 9,883 generated; 3,523 distinct; depth 16 | `AllowBuggyMixedTokenDeadlock = TRUE` violates `NoMixedTokenLeaderDeadlock`; adding strict `StrictFailedAppendLeavesNoOrphan` violates under best-effort cleanup failure |
 
+### Namespace branching lifecycle and GC
+
+The branching packet is split deliberately:
+
+- [`NamespaceBranching.tla`](tla/NamespaceBranching.tla) with
+  [`NamespaceBranching.cfg`](tla/NamespaceBranching.cfg) checks the namespace
+  graph, split history/live publication, policy activation guard, preservation
+  rechecks, crash recovery, and ordered deletion lifecycle.
+- [`NamespaceBranchingGc.tla`](tla/NamespaceBranchingGc.tla) with
+  [`NamespaceBranchingGc.cfg`](tla/NamespaceBranchingGc.cfg) checks retained
+  generations, two-pass source GC, target-owned pending deletes, admitted reads,
+  durable reader grace, nested children, sibling roots, and source deletion.
+
+The acceptance checklist in the originating plan still says “all eight”
+negative variants. That wording is stale: the packet has twelve one-hot
+negative controls, and all twelve are required below.
+
+#### RED-first evidence
+
+Before the full packet, the lifecycle file contained only `Creating`, target
+manifest visibility, and source-root presence. Its deliberately unsafe
+`PublishTargetManifest` action set visibility without a root; activation was the
+next enabled lifecycle action. This exact command produced the required RED:
+
+```bash
+cd formal-verifications/tla
+JAVA="${JAVA:-/opt/homebrew/opt/openjdk/bin/java}"
+"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
+  -config NamespaceBranching.cfg NamespaceBranching.tla
+```
+
+TLC exited `12` at `PublishTargetManifest` with
+`targetManifestVisible = TRUE` and `sourceRootPresent = FALSE`:
+
+```text
+Error: Invariant VisibleManifestRequiresRoot is violated.
+2 states generated, 2 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 2.
+```
+
+The complete lifecycle model retains the same negative path behind
+`AllowPublishWithoutRoot`, but now the trace performs target reservation and the
+generation-one history write before the unsafe live-manifest publication.
+
+#### Default GREEN commands and results
+
+These are the exact exhaustive commands used from `formal-verifications/tla`:
+
+```bash
+JAVA="${JAVA:-/opt/homebrew/opt/openjdk/bin/java}"
+
+"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
+  -workers auto -config NamespaceBranching.cfg NamespaceBranching.tla
+
+"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
+  -workers auto -config NamespaceBranchingGc.cfg NamespaceBranchingGc.tla
+```
+
+| Model | Result | Generated | Distinct | Queue | Depth |
+|-------|--------|----------:|---------:|------:|------:|
+| `NamespaceBranching` | PASS | 14,944 | 3,775 | 0 | 33 |
+| `NamespaceBranchingGc` | PASS | 470 | 171 | 0 | 19 |
+
+Both completed without an invariant, deadlock, parser, or configuration error.
+Each includes a stuttering action, so terminal protocol states are intentional
+rather than TLC deadlocks.
+
+#### Reproducing all twelve negative runs
+
+The negative runs use a temporary directory, set exactly one control to
+`TRUE`, and check `TypeOK` plus only the intended invariant. Restricting the
+temporary config to that invariant prevents a related, overlapping invariant
+from masking the expected counterexample name. Run this exact shell block from
+`formal-verifications/tla`:
+
+```bash
+JAVA="${JAVA:-/opt/homebrew/opt/openjdk/bin/java}"
+
+run_negative() {
+  model="$1"
+  base_cfg="$2"
+  number="$3"
+  toggle="$4"
+  invariant="$5"
+  dir="$(mktemp -d "/tmp/${model}-${number}.XXXXXX")"
+  cfg="$dir/negative.cfg"
+
+  awk -v toggle="$toggle" -v invariant="$invariant" '
+    /^INVARIANT / { next }
+    {
+      if ($1 == toggle) sub(/= FALSE/, "= TRUE")
+      print
+    }
+    END {
+      print ""
+      print "INVARIANT TypeOK"
+      print "INVARIANT " invariant
+    }
+  ' "$base_cfg" > "$cfg"
+
+  "$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
+    -workers auto -config "$cfg" "$model.tla"
+  rc=$?
+  rm -f "$cfg"
+  rmdir "$dir"
+  test "$rc" -eq 12
+}
+
+run_negative NamespaceBranching NamespaceBranching.cfg 01 \
+  AllowPublishWithoutRoot VisibleManifestRequiresRoot
+run_negative NamespaceBranching NamespaceBranching.cfg 02 \
+  AllowDeleteWithRoots SourceFenceExcludesRoots
+run_negative NamespaceBranching NamespaceBranching.cfg 03 \
+  AllowRootRemovalBeforeVisibilityGone RootRemovalRequiresTargetVisibilityGone
+run_negative NamespaceBranching NamespaceBranching.cfg 04 \
+  AllowRootRemovalBeforeReaderGrace RootRemovalRequiresReaderGrace
+run_negative NamespaceBranching NamespaceBranching.cfg 05 \
+  AllowActivateBeforeSubsystems ActivationRequiresBranchSafeSubsystems
+run_negative NamespaceBranching NamespaceBranching.cfg 06 \
+  AllowVisibilityRemovalWithoutEvidence VisibilityRemovalRequiresDestructionEvidence
+run_negative NamespaceBranchingGc NamespaceBranchingGc.cfg 07 \
+  AllowIgnoreBranchPin BranchPinnedGenerationRetained
+run_negative NamespaceBranchingGc NamespaceBranchingGc.cfg 08 \
+  AllowDeleteForeignPendingKey TargetGcDeletesOnlyTargetOwnedKeys
+run_negative NamespaceBranching NamespaceBranching.cfg 09 \
+  AllowActivationWithoutPolicyGuard ActivationUsesOneFencedPolicyHead
+run_negative NamespaceBranching NamespaceBranching.cfg 10 \
+  AllowPolicyWritePastActivationGuard PolicyMutationCannotPassActivationGuard
+run_negative NamespaceBranching NamespaceBranching.cfg 11 \
+  AllowGuardRemovalBeforeNonceRevocation GuardRemovalRevokesStaleActivationOrObservesActive
+run_negative NamespaceBranching NamespaceBranching.cfg 12 \
+  AllowDestructionWithStalePreservation EachDestructiveBoundaryUsesFreshPreservationHead
+```
+
+Observed counterexamples:
+
+| # | One-hot control | Intended violated invariant | Generated | Distinct | Queue | Depth |
+|--:|-----------------|-----------------------------|----------:|---------:|------:|------:|
+| 01 | `AllowPublishWithoutRoot` | `VisibleManifestRequiresRoot` | 277 | 173 | 101 | 5 |
+| 02 | `AllowDeleteWithRoots` | `SourceFenceExcludesRoots` | 2,700 | 977 | 354 | 9 |
+| 03 | `AllowRootRemovalBeforeVisibilityGone` | `RootRemovalRequiresTargetVisibilityGone` | 15,148 | 3,835 | 0 | 33 |
+| 04 | `AllowRootRemovalBeforeReaderGrace` | `RootRemovalRequiresReaderGrace` | 14,111 | 3,600 | 16 | 23 |
+| 05 | `AllowActivateBeforeSubsystems` | `ActivationRequiresBranchSafeSubsystems` | 5,257 | 1,675 | 397 | 11 |
+| 06 | `AllowVisibilityRemovalWithoutEvidence` | `VisibilityRemovalRequiresDestructionEvidence` | 1,288 | 556 | 262 | 8 |
+| 07 | `AllowIgnoreBranchPin` | `BranchPinnedGenerationRetained` | 99 | 66 | 16 | 6 |
+| 08 | `AllowDeleteForeignPendingKey` | `TargetGcDeletesOnlyTargetOwnedKeys` | 155 | 89 | 18 | 8 |
+| 09 | `AllowActivationWithoutPolicyGuard` | `ActivationUsesOneFencedPolicyHead` | 6,456 | 1,965 | 399 | 12 |
+| 10 | `AllowPolicyWritePastActivationGuard` | `PolicyMutationCannotPassActivationGuard` | 8,158 | 2,377 | 390 | 13 |
+| 11 | `AllowGuardRemovalBeforeNonceRevocation` | `GuardRemovalRevokesStaleActivationOrObservesActive` | 7,007 | 2,093 | 384 | 12 |
+| 12 | `AllowDestructionWithStalePreservation` | `EachDestructiveBoundaryUsesFreshPreservationHead` | 207 | 130 | 72 | 5 |
+
+Every negative run exited `12` for its intended invariant. No temporary config
+is retained in the repository.
+
+#### Model bounds and limitations
+
+- Both models use three incarnations: `root`, `branch`, and `child`. The
+  lifecycle model explores the concrete nested `root -> branch -> child` path;
+  the GC model also has a sibling-root scenario so dropping one root cannot
+  release another branch.
+- To avoid a meaningless Cartesian state explosion, lifecycle concerns are
+  partitioned into six initial scenario modes (`fork`, `nested`, `delete`,
+  `policy`, `preservation`, and `cancel`), while GC uses four (`nested`,
+  `siblings`, `reader`, and `gc`). TLC exhausts the union of those finite modes,
+  but it does not prove arbitrary graph size or every cross-product of unrelated
+  administrative operations.
+- Generation digests are abstracted as an injective finite identity
+  (`Digest(g) = g`); exact MessagePack/JSON bytes, SHA-256, and S3 ETag strings
+  remain Rust-test obligations. The lifecycle still stores the selected
+  generation/digest separately from the pre-CAS current head and splits the
+  source history PUT from the live root CAS.
+- Target generation-one history and live publication are separate actions.
+  Vector contents, IVF math, HTTP JSON, cache bodies, and object-copy mechanics
+  are intentionally outside this packet.
+- `ReaderGrace = 2` is a finite abstraction of the configured
+  cache-TTL + request-lifetime + compaction-upload-window + skew floor. Time
+  decrements admitted-read lifetime, but root release and grace reachability use
+  only the durable deadline; no deletion action consults an in-flight-reader
+  oracle.
+- Object keys are finite representatives of source-owned, target-owned, live,
+  historical, and pending-delete artifacts. Rust/MinIO integration tests must
+  enumerate every concrete artifact family and verify origin-aware key routing.
+
 The `.tlc.log` files in `formal-verifications/tla/` contain the raw run
 summaries. They are generated artifacts; commit the specs/configs and summarize
 the logs unless a workflow explicitly asks to preserve the raw logs.
