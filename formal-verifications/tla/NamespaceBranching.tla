@@ -3,12 +3,11 @@
 \*
 \* Protocol:
 \* 1. Reserve a fresh target incarnation in Creating.
-\* 2. Acquire the source writer lease and select either the current head or an
-\*    already-retained historical generation, including its exact digest.
+\* 2. Acquire the source writer lease and strongly read the current head,
+\*    including its exact digest.
 \* 3. Write the pre-CAS current source head to immutable history.
 \* 4. CAS the source live manifest to its next generation and add the root. The
-\*    root pins the selected identity; the history write preserves the distinct
-\*    pre-CAS current head even when the selected generation is historical.
+\*    root pins that exact predecessor identity preserved by the history write.
 \* 5. Write target generation-one history, publish target live generation one,
 \*    install the policy guard, and activate only after every subsystem is safe.
 \* 6. Source deletion fences only a root-free head.
@@ -220,7 +219,8 @@ ReserveTarget ==
             !.baseDigestByChild[child] = Digest(graph.generationByIncarnation[parent])]
         /\ UNCHANGED <<policy, preservation, now, crashed>>
 
-\* Lease acquisition is also the authoritative selected-generation/config read.
+\* Lease acquisition is also the authoritative live-head/config read. Any
+\* provisional reservation identity is refreshed to the head observed here.
 AcquireSourceLease ==
     \E child \in Incarnations :
         /\ ~crashed
@@ -228,19 +228,17 @@ AcquireSourceLease ==
         /\ graph.intentByIncarnation[child] = "Reserved"
         /\ HasParent(child)
         /\ LET parent == Parent(child)
-               candidates == graph.historyByIncarnation[parent] \cup
-                             {graph.generationByIncarnation[parent]}
-           IN \E selected \in candidates :
-                /\ graph.stateByIncarnation[parent] = "Active"
-                /\ ~graph.fenceByIncarnation[parent]
-                /\ graph.sourceLeaseOwnerByParent[parent] = NoOwner
-                /\ graph.leaseTokenByIncarnation[parent] < 10
-                /\ graph' = [graph EXCEPT
-                    !.sourceLeaseOwnerByParent[parent] = child,
-                    !.leaseTokenByIncarnation[parent] = @ + 1,
-                    !.baseGenerationByChild[child] = selected,
-                    !.baseDigestByChild[child] = Digest(selected),
-                    !.reservedConfigByChild[child] = graph.dataPlaneConfigByIncarnation[parent]]
+               head == graph.generationByIncarnation[parent]
+           IN /\ graph.stateByIncarnation[parent] = "Active"
+              /\ ~graph.fenceByIncarnation[parent]
+              /\ graph.sourceLeaseOwnerByParent[parent] = NoOwner
+              /\ graph.leaseTokenByIncarnation[parent] < 10
+              /\ graph' = [graph EXCEPT
+                  !.sourceLeaseOwnerByParent[parent] = child,
+                  !.leaseTokenByIncarnation[parent] = @ + 1,
+                  !.baseGenerationByChild[child] = head,
+                  !.baseDigestByChild[child] = Digest(head),
+                  !.reservedConfigByChild[child] = graph.dataPlaneConfigByIncarnation[parent]]
         /\ UNCHANGED <<policy, preservation, now, crashed>>
 
 \* Source PATCH takes the same lease domain atomically and then releases it.
@@ -316,7 +314,7 @@ WriteSourceHeadHistory ==
                   !.rootPreCasEtagByChild[child] = graph.etagByIncarnation[parent]]
         /\ UNCHANGED <<policy, preservation, now, crashed>>
 
-\* Live manifest CAS: selected root identity and pre-CAS head identity are distinct.
+\* Live manifest CAS: the rooted identity is exactly the pre-CAS live head.
 PublishSourceRootCAS ==
     \E child \in Incarnations :
         /\ ~crashed
@@ -325,12 +323,13 @@ PublishSourceRootCAS ==
         /\ graph.rootHistoryPreparedByChild[child]
         /\ HasParent(child)
         /\ LET parent == Parent(child)
-               selected == graph.baseGenerationByChild[child]
                head == graph.rootPreCasHeadByChild[child]
            IN /\ graph.sourceLeaseOwnerByParent[parent] = child
               /\ graph.stateByIncarnation[parent] = "Active"
               /\ ~graph.fenceByIncarnation[parent]
-              /\ selected \in graph.historyByIncarnation[parent]
+              /\ graph.baseGenerationByChild[child] = head
+              /\ graph.baseDigestByChild[child] = Digest(head)
+              /\ head \in graph.historyByIncarnation[parent]
               /\ graph.generationByIncarnation[parent] = head
               /\ graph.etagByIncarnation[parent] = graph.rootPreCasEtagByChild[child]
               /\ head < MaxGeneration
@@ -340,8 +339,8 @@ PublishSourceRootCAS ==
                   !.generationByIncarnation[parent] = @ + 1,
                   !.etagByIncarnation[parent] = @ + 1,
                   !.rootsByParent[parent] = @ \cup {child},
-                  !.rootGenerationByChild[child] = selected,
-                  !.rootDigestByChild[child] = Digest(selected),
+                  !.rootGenerationByChild[child] = head,
+                  !.rootDigestByChild[child] = Digest(head),
                   !.rootPublicationGenerationByChild[child] = head + 1,
                   !.rootWasPublishedByChild[child] = TRUE,
                   !.rootConfigDigestByChild[child] = graph.dataPlaneConfigByIncarnation[parent],
@@ -891,7 +890,9 @@ RootPinsExactPredecessorGeneration ==
     \A child \in Incarnations :
         graph.rootWasPublishedByChild[child] =>
             LET parent == Parent(child)
-            IN /\ graph.rootGenerationByChild[child] \in graph.historyByIncarnation[parent]
+            IN /\ graph.rootGenerationByChild[child] = graph.rootPreCasHeadByChild[child]
+               /\ graph.rootDigestByChild[child] = graph.rootPreCasDigestByChild[child]
+               /\ graph.rootGenerationByChild[child] \in graph.historyByIncarnation[parent]
                /\ graph.rootDigestByChild[child] = Digest(graph.rootGenerationByChild[child])
                /\ graph.rootPreCasHeadByChild[child] \in graph.historyByIncarnation[parent]
                /\ graph.rootPreCasDigestByChild[child] = Digest(graph.rootPreCasHeadByChild[child])

@@ -3,8 +3,8 @@
 \* the durable reader-grace protocol.
 \*
 \* Protocol:
-\* 1. Reserve a fresh child under a visible parent and pin one exact parent
-\*    generation before publishing child visibility.
+\* 1. Reserve a fresh child under a visible parent and pin the exact live
+\*    predecessor generation before publishing child visibility.
 \* 2. Source history pruning retains current branch pins and named snapshots.
 \* 3. GC marks only unreachable objects, records the complete root observation,
 \*    revalidates that observation, ages the mark, and checks current reachability
@@ -130,6 +130,7 @@ Init ==
         branchRootPinsByParent |-> [n \in Incarnations |-> {}],
         parentByChild |-> [n \in Incarnations |-> NoParent],
         rootGenerationByChild |-> [n \in Incarnations |-> 0],
+        rootPublicationHeadByChild |-> [n \in Incarnations |-> 0],
         rootEverPublishedByChild |-> [n \in Incarnations |-> FALSE],
         rootRemovedByChild |-> [n \in Incarnations |-> FALSE],
         generationRefsByIncarnation |->
@@ -181,6 +182,9 @@ ReserveBranch ==
             !.branchReservedByChild[child] = TRUE]
         /\ UNCHANGED now
 
+\* Root creation is head-only. If the provisional reservation generation is no
+\* longer live, this action is disabled and the lifecycle orchestrator must
+\* rebuild against the fresh head rather than root retained history.
 CreateBranchRoot ==
     \E child \in Incarnations :
         /\ gc.branchReservedByChild[child]
@@ -191,7 +195,6 @@ CreateBranchRoot ==
               /\ ~gc.sourceDeletedByIncarnation[parent]
               /\ child \notin gc.branchRootPinsByParent[parent]
               /\ generation = gc.liveGenerationByIncarnation[parent]
-                 \/ generation \in gc.retainedGenerationsByIncarnation[parent]
               /\ gc.gcInventoryVersion < 10
               /\ gc' = [gc EXCEPT
                   !.branchRootPinsByParent[parent] = @ \cup {child},
@@ -199,6 +202,8 @@ CreateBranchRoot ==
                   !.historyRefsByIncarnation[parent] =
                       HistoryClosure(parent,
                           gc.retainedGenerationsByIncarnation[parent] \cup {generation}),
+                  !.rootPublicationHeadByChild[child] =
+                      gc.liveGenerationByIncarnation[parent],
                   !.rootEverPublishedByChild[child] = TRUE,
                   !.gcInventoryVersion = @ + 1,
                   !.markValidated = FALSE]
@@ -496,6 +501,7 @@ TypeOK ==
     /\ gc.branchRootPinsByParent \in [Incarnations -> SUBSET Incarnations]
     /\ gc.parentByChild \in [Incarnations -> Incarnations \cup {NoParent}]
     /\ gc.rootGenerationByChild \in [Incarnations -> Generations]
+    /\ gc.rootPublicationHeadByChild \in [Incarnations -> Generations]
     /\ gc.rootEverPublishedByChild \in [Incarnations -> BOOLEAN]
     /\ gc.rootRemovedByChild \in [Incarnations -> BOOLEAN]
     /\ gc.generationRefsByIncarnation \in
@@ -533,6 +539,11 @@ BranchPinnedGenerationRetained ==
       \A child \in gc.branchRootPinsByParent[parent] :
         gc.rootGenerationByChild[child] \in
             gc.retainedGenerationsByIncarnation[parent]
+
+RootCreatedFromLiveHead ==
+    \A child \in Incarnations :
+        gc.rootEverPublishedByChild[child] =>
+            gc.rootGenerationByChild[child] = gc.rootPublicationHeadByChild[child]
 
 VisibleBranchRefsExist ==
     \A child \in Incarnations :

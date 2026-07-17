@@ -143,6 +143,28 @@ The complete lifecycle model retains the same negative path behind
 `AllowPublishWithoutRoot`, but now the trace performs target reservation and the
 generation-one history write before the unsafe live-manifest publication.
 
+#### Head-only root-selection regression
+
+A later contract audit found that the first complete model accidentally allowed
+the root action to select an already-retained historical generation. V1 permits
+only the exact live predecessor observed under the source lease. The lifecycle
+invariant was strengthened to require the rooted generation/digest to equal the
+pre-CAS head, and the GC model gained `RootCreatedFromLiveHead`.
+
+Before narrowing the actions, TLC produced both required RED counterexamples:
+
+| Model | Violated invariant | Generated | Distinct | Queue | Depth |
+|-------|--------------------|----------:|---------:|------:|------:|
+| `NamespaceBranching` | `RootPinsExactPredecessorGeneration` | 965 | 426 | 189 | 7 |
+| `NamespaceBranchingGc` | `RootCreatedFromLiveHead` | 56 | 34 | 13 | 4 |
+
+The lifecycle trace reserved generation 0, advanced the source to generation 1,
+then historically rooted generation 0 while publishing generation 2. The GC
+trace likewise reserved generation 0, advanced the source to generation 1, and
+then created the stale root. Both actions are now disabled: lease acquisition
+refreshes the provisional view to the current head, and root publication
+requires that same head through the history PUT and live CAS.
+
 #### Default GREEN commands and results
 
 These are the exact exhaustive commands used from `formal-verifications/tla`:
@@ -159,8 +181,8 @@ JAVA="${JAVA:-/opt/homebrew/opt/openjdk/bin/java}"
 
 | Model | Result | Generated | Distinct | Queue | Depth |
 |-------|--------|----------:|---------:|------:|------:|
-| `NamespaceBranching` | PASS | 14,944 | 3,775 | 0 | 33 |
-| `NamespaceBranchingGc` | PASS | 470 | 171 | 0 | 19 |
+| `NamespaceBranching` | PASS | 14,366 | 3,595 | 0 | 33 |
+| `NamespaceBranchingGc` | PASS | 430 | 171 | 0 | 18 |
 
 Both completed without an invariant, deadlock, parser, or configuration error.
 Each includes a stuttering action, so terminal protocol states are intentional
@@ -237,18 +259,18 @@ Observed counterexamples:
 
 | # | One-hot control | Intended violated invariant | Generated | Distinct | Queue | Depth |
 |--:|-----------------|-----------------------------|----------:|---------:|------:|------:|
-| 01 | `AllowPublishWithoutRoot` | `VisibleManifestRequiresRoot` | 277 | 173 | 101 | 5 |
-| 02 | `AllowDeleteWithRoots` | `SourceFenceExcludesRoots` | 2,700 | 977 | 354 | 9 |
-| 03 | `AllowRootRemovalBeforeVisibilityGone` | `RootRemovalRequiresTargetVisibilityGone` | 15,148 | 3,835 | 0 | 33 |
-| 04 | `AllowRootRemovalBeforeReaderGrace` | `RootRemovalRequiresReaderGrace` | 14,111 | 3,600 | 16 | 23 |
-| 05 | `AllowActivateBeforeSubsystems` | `ActivationRequiresBranchSafeSubsystems` | 5,257 | 1,675 | 397 | 11 |
-| 06 | `AllowVisibilityRemovalWithoutEvidence` | `VisibilityRemovalRequiresDestructionEvidence` | 1,288 | 556 | 262 | 8 |
-| 07 | `AllowIgnoreBranchPin` | `BranchPinnedGenerationRetained` | 99 | 66 | 16 | 6 |
-| 08 | `AllowDeleteForeignPendingKey` | `TargetGcDeletesOnlyTargetOwnedKeys` | 155 | 89 | 18 | 8 |
-| 09 | `AllowActivationWithoutPolicyGuard` | `ActivationUsesOneFencedPolicyHead` | 6,456 | 1,965 | 399 | 12 |
-| 10 | `AllowPolicyWritePastActivationGuard` | `PolicyMutationCannotPassActivationGuard` | 8,158 | 2,377 | 390 | 13 |
-| 11 | `AllowGuardRemovalBeforeNonceRevocation` | `GuardRemovalRevokesStaleActivationOrObservesActive` | 7,007 | 2,093 | 384 | 12 |
-| 12 | `AllowDestructionWithStalePreservation` | `EachDestructiveBoundaryUsesFreshPreservationHead` | 207 | 130 | 72 | 5 |
+| 01 | `AllowPublishWithoutRoot` | `VisibleManifestRequiresRoot` | 327 | 204 | 114 | 6 |
+| 02 | `AllowDeleteWithRoots` | `SourceFenceExcludesRoots` | 2,420 | 904 | 328 | 9 |
+| 03 | `AllowRootRemovalBeforeVisibilityGone` | `RootRemovalRequiresTargetVisibilityGone` | 14,523 | 3,652 | 11 | 32 |
+| 04 | `AllowRootRemovalBeforeReaderGrace` | `RootRemovalRequiresReaderGrace` | 13,535 | 3,421 | 17 | 23 |
+| 05 | `AllowActivateBeforeSubsystems` | `ActivationRequiresBranchSafeSubsystems` | 6,027 | 1,841 | 385 | 11 |
+| 06 | `AllowVisibilityRemovalWithoutEvidence` | `VisibilityRemovalRequiresDestructionEvidence` | 1,369 | 586 | 263 | 8 |
+| 07 | `AllowIgnoreBranchPin` | `BranchPinnedGenerationRetained` | 93 | 66 | 16 | 6 |
+| 08 | `AllowDeleteForeignPendingKey` | `TargetGcDeletesOnlyTargetOwnedKeys` | 152 | 91 | 20 | 7 |
+| 09 | `AllowActivationWithoutPolicyGuard` | `ActivationUsesOneFencedPolicyHead` | 5,654 | 1,760 | 402 | 11 |
+| 10 | `AllowPolicyWritePastActivationGuard` | `PolicyMutationCannotPassActivationGuard` | 8,958 | 2,486 | 315 | 13 |
+| 11 | `AllowGuardRemovalBeforeNonceRevocation` | `GuardRemovalRevokesStaleActivationOrObservesActive` | 8,818 | 2,471 | 327 | 13 |
+| 12 | `AllowDestructionWithStalePreservation` | `EachDestructiveBoundaryUsesFreshPreservationHead` | 251 | 150 | 80 | 6 |
 
 Every negative run exited `12` for its intended invariant. No temporary config
 is retained in the repository.
@@ -267,9 +289,9 @@ is retained in the repository.
   administrative operations.
 - Generation digests are abstracted as an injective finite identity
   (`Digest(g) = g`); exact MessagePack/JSON bytes, SHA-256, and S3 ETag strings
-  remain Rust-test obligations. The lifecycle still stores the selected
-  generation/digest separately from the pre-CAS current head and splits the
-  source history PUT from the live root CAS.
+  remain Rust-test obligations. The lifecycle stores the lease-observed head
+  identity separately from the pre-CAS head, requires them to agree, and splits
+  the source history PUT from the live root CAS.
 - Target generation-one history and live publication are separate actions.
   Vector contents, IVF math, HTTP JSON, cache bodies, and object-copy mechanics
   are intentionally outside this packet.
