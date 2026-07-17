@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use zeppelin::cache::decoded_cache::DecodedArtifactCache;
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
+use zeppelin::compaction::background::CompactionLifecycle;
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
 use zeppelin::fts::wal_cache::WalFtsCache;
@@ -29,7 +30,7 @@ use zeppelin::index::quantization::QuantizationType;
 use zeppelin::index::{HierarchicalIndex, IvfFlatIndex, VectorIndex};
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
-use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
+use zeppelin::server::{build_router, parse_trusted_proxies, AppState, ServerTaskSupervisor};
 use zeppelin::types::{AttributeValue, DistanceMetric, Filter, SearchResult, VectorEntry};
 use zeppelin::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
@@ -93,12 +94,14 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
     ));
     let (audit, audit_runtime, _audit_node_id) =
         common::server::start_test_audit(&config, &store, Some(&harness.prefix), &security).await;
+    let server_tasks = Arc::new(ServerTaskSupervisor::new());
+    let compaction_lifecycle = CompactionLifecycle::new();
 
     let app = build_router(AppState {
         store: store.clone(),
         clock: clock.clone(),
         receipts: zeppelin::server::ReceiptCapability::compose(&security),
-        security,
+        security: Arc::clone(&security),
         audit,
         credential_adapter,
         namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
@@ -107,6 +110,8 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor: compactor.clone(),
         lease_manager,
+        compaction_lifecycle: compaction_lifecycle.clone(),
+        server_tasks: Arc::clone(&server_tasks),
         fragment_cache,
         decoded_artifact_cache: Arc::new(DecodedArtifactCache::new(
             config.cache.decoded_artifact_cache_max_mb * 1024 * 1024,
@@ -122,7 +127,15 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
         query_semaphore,
         rate_limiters: Arc::new(DashMap::new()),
     });
-    let base_url = common::server::spawn_test_router(&harness, app, audit_runtime).await;
+    let base_url = common::server::spawn_test_router_with_lifecycle(
+        &harness,
+        app,
+        server_tasks,
+        compaction_lifecycle,
+        security,
+        audit_runtime,
+    )
+    .await;
 
     CountingApiServer {
         base_url,

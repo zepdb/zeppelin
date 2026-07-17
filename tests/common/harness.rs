@@ -4,27 +4,38 @@ use object_store::memory::InMemory;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+use zeppelin::compaction::background::CompactionLifecycle;
 use zeppelin::config::{StorageBackend, StorageConfig};
-use zeppelin::security::AuditRuntime;
+use zeppelin::security::{AuditRuntime, SecurityKernel};
+use zeppelin::server::ServerTaskSupervisor;
 use zeppelin::storage::ZeppelinStore;
 
-/// HTTP and audit tasks that must stop before one harness deletes remote state.
+/// Server-owned work that must stop before one harness deletes remote state.
 pub(crate) struct TestServerRuntime {
     shutdown_http: watch::Sender<bool>,
     server_task: JoinHandle<()>,
+    server_tasks: Arc<ServerTaskSupervisor>,
+    compaction_lifecycle: CompactionLifecycle,
     audit_runtime: Option<AuditRuntime>,
+    audit_signing_security: Option<Arc<SecurityKernel>>,
 }
 
 impl TestServerRuntime {
     pub(crate) fn new(
         shutdown_http: watch::Sender<bool>,
         server_task: JoinHandle<()>,
+        server_tasks: Arc<ServerTaskSupervisor>,
+        compaction_lifecycle: CompactionLifecycle,
         audit_runtime: AuditRuntime,
+        audit_signing_security: Arc<SecurityKernel>,
     ) -> Self {
         Self {
             shutdown_http,
             server_task,
+            server_tasks,
+            compaction_lifecycle,
             audit_runtime: Some(audit_runtime),
+            audit_signing_security: Some(audit_signing_security),
         }
     }
 
@@ -34,6 +45,16 @@ impl TestServerRuntime {
             .server_task
             .await
             .map_err(|error| format!("test HTTP server failed: {error}"));
+        let request_tasks_result = self
+            .server_tasks
+            .join()
+            .await
+            .map_err(|error| format!("test request-spawned task failed: {error}"));
+        let heartbeat_result = self
+            .compaction_lifecycle
+            .close_and_abort_heartbeats()
+            .await
+            .map_err(|error| format!("test compaction heartbeat retirement failed: {error}"));
         let audit_result = match self.audit_runtime.take() {
             Some(runtime) => runtime
                 .shutdown()
@@ -41,21 +62,32 @@ impl TestServerRuntime {
                 .map_err(|error| format!("test audit runtime failed: {error}")),
             None => Ok(()),
         };
+        // The store retains only a weak signer binding. Keep the kernel's
+        // signer root alive until graceful audit shutdown has sealed its tail.
+        drop(self.audit_signing_security.take());
 
-        match (server_result, audit_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(server_error), Ok(())) => Err(server_error),
-            (Ok(()), Err(audit_error)) => Err(audit_error),
-            (Err(server_error), Err(audit_error)) => Err(format!(
-                "{server_error}; secondary shutdown failure: {audit_error}"
-            )),
+        let errors = [
+            server_result,
+            request_tasks_result,
+            heartbeat_result,
+            audit_result,
+        ]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; secondary shutdown failure: "))
         }
     }
 
     fn abort(mut self) {
         self.server_task.abort();
+        self.server_tasks.abort();
         // AuditRuntime::drop aborts the writer before fallback object cleanup.
         drop(self.audit_runtime.take());
+        drop(self.audit_signing_security.take());
     }
 }
 

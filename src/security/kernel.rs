@@ -359,6 +359,23 @@ impl SecurityKernel {
         self.preservation.as_ref()
     }
 
+    /// Abort and join every disposable authority-refresh task owned by this kernel.
+    ///
+    /// The external application owner must call this only after HTTP has
+    /// stopped accepting work. It prevents a retired node from continuing S3
+    /// revalidation while a replacement owns the same authority.
+    pub async fn shutdown_refresh_tasks(&self) {
+        if let Some(delegation) = &self.delegation {
+            delegation.shutdown_refresh_task().await;
+        }
+        if let SecurityAuthority::Policy(cache) = &self.authority {
+            cache.shutdown_refresh_task().await;
+        }
+        if let Some(preservation) = &self.preservation {
+            preservation.shutdown_refresh_task().await;
+        }
+    }
+
     /// Fail closed when an active lock protects one namespace destruction seam.
     pub fn guard_namespace_destruction(
         &self,

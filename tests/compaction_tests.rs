@@ -11,7 +11,8 @@ use common::vectors::{random_vectors, simple_attributes, with_attributes};
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::{
-    compact_namespace_under_lease, evaluate_compaction_trigger, CompactionLoopOptions,
+    compact_namespace_under_lease_with_lifecycle, evaluate_compaction_trigger, CompactionLifecycle,
+    CompactionLoopOptions,
 };
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
@@ -98,6 +99,7 @@ async fn cluster_checksums(
 async fn test_compaction_fragment_cache_is_read_only_and_output_deterministic() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
+    let compaction_lifecycle = CompactionLifecycle::new();
     let mut outputs = Vec::new();
 
     for (label, warm_fragments) in [("cold", 0usize), ("partial", 2), ("warm", 4)] {
@@ -140,12 +142,13 @@ async fn test_compaction_fragment_cache_is_read_only_and_output_deterministic() 
             format!("fragment-cache-{label}"),
             Duration::from_secs(30),
         ));
-        let result = compact_namespace_under_lease(
+        let result = compact_namespace_under_lease_with_lifecycle(
             &test_compactor(&store),
             &lease_manager,
             &namespace,
             &HashMap::new(),
             FragmentCachePolicy::ReadOnly(&cache),
+            &compaction_lifecycle,
         )
         .await
         .unwrap();
@@ -185,6 +188,10 @@ async fn test_compaction_fragment_cache_is_read_only_and_output_deterministic() 
         );
     }
 
+    compaction_lifecycle
+        .close_and_abort_heartbeats()
+        .await
+        .unwrap();
     harness.cleanup().await;
 }
 
@@ -1094,13 +1101,15 @@ async fn test_leased_compaction_rejects_missing_authoritative_metadata() {
         format!("test-{}", uuid::Uuid::new_v4()),
         Duration::from_secs(30),
     ));
+    let compaction_lifecycle = CompactionLifecycle::new();
 
-    let error = compact_namespace_under_lease(
+    let error = compact_namespace_under_lease_with_lifecycle(
         &test_compactor(&harness.store),
         &lease_manager,
         &ns,
         &HashMap::new(),
         FragmentCachePolicy::Bypass,
+        &compaction_lifecycle,
     )
     .await
     .expect_err("missing authoritative metadata must stop leased compaction");
@@ -1112,6 +1121,10 @@ async fn test_leased_compaction_rejects_missing_authoritative_metadata() {
         ),
         "missing metadata must remain a namespace error, got {error:?}"
     );
+    compaction_lifecycle
+        .close_and_abort_heartbeats()
+        .await
+        .unwrap();
 
     let after = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     assert_eq!(after.version(), before.version());

@@ -54,8 +54,10 @@
 //!
 //! - [`crate::startup::build_app`] owns service construction and background-task
 //!   startup. This module only composes those handles into a router.
-//! - [`crate::startup::shutdown_background_tasks`] stops compaction; dropping a
-//!   router alone is not Zeppelin's graceful-shutdown protocol.
+//! - [`crate::startup::shutdown_background_tasks`] retires maintenance,
+//!   request-spawned authoritative work, lease heartbeats, and authority
+//!   refresh; dropping a router alone is not Zeppelin's graceful-shutdown
+//!   protocol.
 //! - A client-supplied `X-Forwarded-For` value affects rate limiting only when
 //!   the socket peer belongs to a configured trusted-proxy CIDR.
 //! - Middleware-generated 404, 405, 408, and 413 responses use the same public
@@ -76,6 +78,10 @@
 
 /// HTTP handlers and shared response helpers for every API endpoint.
 pub mod handlers;
+/// Lifecycle ownership for request-spawned authoritative mutation tasks.
+pub mod task_supervisor;
+
+pub use task_supervisor::{ServerTaskSupervisor, ServerTaskSupervisorError};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -99,6 +105,7 @@ use crate::cache::decoded_cache::DecodedArtifactCache;
 use crate::cache::hydration::SegmentHydrator;
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
+use crate::compaction::background::CompactionLifecycle;
 use crate::compaction::Compactor;
 use crate::config::Config;
 use crate::error::ZeppelinError;
@@ -304,6 +311,10 @@ pub struct AppState {
     pub compactor: Arc<Compactor>,
     /// Per-namespace compaction lease manager.
     pub lease_manager: Arc<LeaseManager>,
+    /// Shared owner for periodic and manual leased-compaction heartbeats.
+    pub compaction_lifecycle: CompactionLifecycle,
+    /// Owner for request-spawned authoritative mutation tasks.
+    pub server_tasks: Arc<ServerTaskSupervisor>,
     /// Immutable boot-time server, storage, indexing, and compaction settings.
     pub config: Arc<Config>,
     /// Trusted proxy CIDRs parsed once at startup for rate-limit client-IP resolution.
@@ -1079,34 +1090,36 @@ async fn finish_audited_request(
 
 fn spawn_namespace_delete_cleanup(state: &AppState, namespace: String) {
     let namespace_manager = state.namespace_manager.clone();
-    tokio::spawn(async move {
-        match namespace_manager
-            .finish_delete(&namespace, Duration::from_secs(25))
-            .await
-        {
-            Ok(outcome) if outcome.complete => {
-                tracing::info!(
-                    namespace = %namespace,
-                    objects_deleted = outcome.deleted,
-                    "namespace background delete completed"
-                );
+    state
+        .server_tasks
+        .spawn("namespace delete cleanup", async move {
+            match namespace_manager
+                .finish_delete(&namespace, Duration::from_secs(25))
+                .await
+            {
+                Ok(outcome) if outcome.complete => {
+                    tracing::info!(
+                        namespace = %namespace,
+                        objects_deleted = outcome.deleted,
+                        "namespace background delete completed"
+                    );
+                }
+                Ok(outcome) => {
+                    tracing::warn!(
+                        namespace = %namespace,
+                        objects_deleted = outcome.deleted,
+                        "namespace background delete budget exhausted; retry DELETE to resume"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        namespace = %namespace,
+                        error = %error,
+                        "namespace background delete failed; retry DELETE to resume"
+                    );
+                }
             }
-            Ok(outcome) => {
-                tracing::warn!(
-                    namespace = %namespace,
-                    objects_deleted = outcome.deleted,
-                    "namespace background delete budget exhausted; retry DELETE to resume"
-                );
-            }
-            Err(error) => {
-                tracing::error!(
-                    namespace = %namespace,
-                    error = %error,
-                    "namespace background delete failed; retry DELETE to resume"
-                );
-            }
-        }
-    });
+        });
 }
 
 /// Invoke the central route map and kernel before any protected handler.

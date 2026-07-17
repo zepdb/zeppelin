@@ -324,6 +324,14 @@ pub enum ZeppelinError {
     #[error("audit sink error: {0}")]
     AuditSink(#[from] crate::security::AuditSinkError),
 
+    /// Request-spawned authoritative work failed to retire cleanly.
+    #[error("server task lifecycle error: {0}")]
+    ServerTaskSupervisor(#[from] crate::server::ServerTaskSupervisorError),
+
+    /// Leased-compaction heartbeat admission or retirement failed.
+    #[error("compaction lifecycle error: {0}")]
+    CompactionLifecycle(#[from] crate::compaction::background::CompactionLifecycleError),
+
     /// Signed-license parsing or verification failed during composition.
     #[error("license error: {0}")]
     License(#[from] crate::security::LicenseError),
@@ -566,6 +574,8 @@ impl ZeppelinError {
             ZeppelinError::Config(_) => "INTERNAL_ERROR",
             ZeppelinError::Security(error) => error.code(),
             ZeppelinError::AuditSink(_) => "INTERNAL_ERROR",
+            ZeppelinError::ServerTaskSupervisor(_) => "INTERNAL_ERROR",
+            ZeppelinError::CompactionLifecycle(_) => "INTERNAL_ERROR",
             ZeppelinError::License(_) => "INTERNAL_ERROR",
             ZeppelinError::Io(_) => "INTERNAL_ERROR",
             ZeppelinError::Cache(_) => "INTERNAL_ERROR",
@@ -695,6 +705,8 @@ impl ZeppelinError {
             | ZeppelinError::KMeansConvergence { .. }
             | ZeppelinError::Config(_)
             | ZeppelinError::AuditSink(_)
+            | ZeppelinError::ServerTaskSupervisor(_)
+            | ZeppelinError::CompactionLifecycle(_)
             | ZeppelinError::License(_)
             | ZeppelinError::Io(_)
             | ZeppelinError::Cache(_)

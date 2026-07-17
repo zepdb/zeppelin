@@ -1,13 +1,13 @@
 //! S3-authoritative preservation locks and fail-closed destruction guards.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 use ulid::Ulid;
 
 use crate::error::{Result, ZeppelinError};
@@ -360,7 +360,7 @@ pub struct PreservationService {
     clock: Clock,
     current: RwLock<Arc<CachedPreservation>>,
     refresh_interval: Duration,
-    refresh_abort: OnceLock<AbortHandle>,
+    refresh_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl PreservationService {
@@ -376,18 +376,14 @@ impl PreservationService {
             clock,
             current: RwLock::new(Arc::new(loaded)),
             refresh_interval,
-            refresh_abort: OnceLock::new(),
+            refresh_task: Mutex::new(None),
         });
         let weak = Arc::downgrade(&service);
         let task = tokio::spawn(refresh_loop(weak, refresh_interval));
-        service
-            .refresh_abort
-            .set(task.abort_handle())
-            .map_err(|_| {
-                SecurityError::InvalidPreservationRequest(
-                    "preservation refresh runtime initialized twice".to_string(),
-                )
-            })?;
+        *service
+            .refresh_task
+            .lock()
+            .unwrap_or_else(|_| panic!("preservation refresh task lock poisoned")) = Some(task);
         Ok(service)
     }
 
@@ -591,6 +587,26 @@ impl PreservationService {
         self.install_refreshed(loaded)
     }
 
+    /// Abort and join this service's owned refresh task before its authority retires.
+    pub(crate) async fn shutdown_refresh_task(&self) {
+        let task = self
+            .refresh_task
+            .lock()
+            .unwrap_or_else(|_| panic!("preservation refresh task lock poisoned"))
+            .take();
+        let Some(task) = task else {
+            return;
+        };
+        task.abort();
+        match task.await {
+            Err(error) if error.is_cancelled() => {}
+            Ok(()) => {
+                panic!("preservation refresh task exited normally while authority remained live")
+            }
+            Err(error) => panic!("preservation refresh task failed during shutdown: {error}"),
+        }
+    }
+
     fn install_refreshed(&self, loaded: CachedPreservation) -> Result<()> {
         let mut current = self
             .current
@@ -703,8 +719,13 @@ impl PreservationService {
 
 impl Drop for PreservationService {
     fn drop(&mut self) {
-        if let Some(abort) = self.refresh_abort.get() {
-            abort.abort();
+        let task = self
+            .refresh_task
+            .get_mut()
+            .unwrap_or_else(|_| panic!("preservation refresh task lock poisoned"))
+            .take();
+        if let Some(task) = task {
+            task.abort();
         }
     }
 }
@@ -712,10 +733,21 @@ impl Drop for PreservationService {
 async fn refresh_loop(cache: Weak<PreservationService>, interval: Duration) {
     loop {
         tokio::time::sleep(interval).await;
+        let store = {
+            let Some(cache) = cache.upgrade() else {
+                return;
+            };
+            cache.store.clone()
+        };
+        let loaded = load_existing(&store).await;
         let Some(cache) = cache.upgrade() else {
             return;
         };
-        if let Err(error) = cache.refresh_once().await {
+        let result = match loaded {
+            Ok(loaded) => cache.install_refreshed(loaded),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
             tracing::error!(
                 error = %error,
                 "preservation head refresh failed; destruction will fail closed after freshness bound"

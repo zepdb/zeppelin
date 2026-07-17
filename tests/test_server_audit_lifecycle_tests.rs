@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use common::harness::TestHarness;
 use common::server::{
-    client_with_bearer, start_test_server_on_store, start_test_server_with_config,
+    client_with_bearer, start_test_server_full, start_test_server_on_store,
+    start_test_server_with_config,
 };
 use zeppelin::config::Config;
 
@@ -111,4 +112,66 @@ async fn on_store_server_without_namespace_prefix_still_uses_harness_audit_scope
         !remaining,
         "namespace_name_prefix=None left its own audit object behind: {own_audit_key}"
     );
+}
+
+#[tokio::test]
+async fn crash_retirement_aborts_audit_without_writing_a_terminal_seal() {
+    let _serial = LIFECYCLE_TEST_LOCK.lock().await;
+    let harness = TestHarness::new().await;
+    let server = start_test_server_full(
+        harness.store.clone(),
+        Some(harness.prefix.clone()),
+        Config::default(),
+        false,
+        None,
+    )
+    .await;
+    let retired_node_id = server.audit_node_id.clone();
+    let response = client_with_bearer(&server.admin_bearer)
+        .get(format!("{}/v1/config/query", server.base_url))
+        .send()
+        .await
+        .expect("audited request should reach the live test server");
+    assert_eq!(response.status(), 200);
+    drop(response);
+    server.flush_audit().await;
+
+    server
+        .abort_and_drop()
+        .await
+        .expect("audit crash retirement must join its HTTP task");
+
+    let stream_marker = format!("/{retired_node_id}/");
+    let stream_keys = harness
+        .store
+        .list_prefix("_audit/")
+        .await
+        .expect("retired audit stream should remain listable")
+        .into_iter()
+        .filter(|key| key.contains(&stream_marker) && key.ends_with(".jsonl"))
+        .collect::<Vec<_>>();
+    assert!(
+        !stream_keys.is_empty(),
+        "the crash fixture must have durable pre-crash audit evidence"
+    );
+    for key in stream_keys {
+        let body = harness
+            .store
+            .get(&key)
+            .await
+            .expect("retired audit object should remain readable");
+        let has_terminal_seal = String::from_utf8(body.to_vec())
+            .expect("retired audit object must be UTF-8 JSON lines")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|value| {
+                value.get("format").and_then(serde_json::Value::as_str)
+                    == Some("zeppelin_audit_terminal_seal_v1")
+            });
+        assert!(
+            !has_terminal_seal,
+            "crash retirement must abort the writer instead of sealing {key}"
+        );
+    }
+    harness.cleanup().await;
 }

@@ -743,6 +743,29 @@ impl AuditRuntime {
             Err(error) => joined.and(Err(error)),
         }
     }
+
+    /// Abort the writer immediately and join its task without flushing or sealing.
+    ///
+    /// Crash simulation uses this path after HTTP has drained its accepted
+    /// connections. It intentionally leaves an unsealed durable tail rather
+    /// than converting a crash into graceful terminal evidence.
+    pub async fn abort_and_join(mut self) -> Result<(), AuditSinkError> {
+        let Some(task) = self.task.take() else {
+            return Ok(());
+        };
+        task.abort();
+        // Keep the sender alive until the aborted writer has actually stopped.
+        // Closing it first drives `receiver.recv()` to `None`, which is the
+        // graceful path that flushes and writes a terminal seal.
+        let result = match task.await {
+            Err(error) if error.is_cancelled() => Ok(()),
+            Ok(Ok(())) => panic!("audit writer exited normally while crash retirement was active"),
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(AuditSinkError::WriterTask(error.to_string())),
+        };
+        self.sender.take();
+        result
+    }
 }
 
 impl Drop for AuditRuntime {

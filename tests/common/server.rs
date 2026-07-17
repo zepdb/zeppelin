@@ -12,8 +12,9 @@ use object_store::path::Path;
 use object_store::prefix::PrefixStore;
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 
 use super::harness::{TestHarness, TestServerRuntime};
 
@@ -21,7 +22,9 @@ use zeppelin::cache::decoded_cache::DecodedArtifactCache;
 use zeppelin::cache::hydration::{heat_policy_from_config, HydrationConfig, SegmentHydrator};
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
-use zeppelin::compaction::background::{compaction_loop, CompactionLoopOptions};
+use zeppelin::compaction::background::{
+    compaction_loop_with_lifecycle, CompactionLifecycle, CompactionLoopOptions,
+};
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{ApiKeyConfig, Config, SecurityMode};
 use zeppelin::fts::wal_cache::WalFtsCache;
@@ -31,7 +34,7 @@ use zeppelin::security::{
     ApiKeyAdapter, AuditClient, AuditRecord, AuditRuntime, CredentialAdapter, EntitlementLimits,
     EntitlementSource, Entitlements, Feature, SecurityKernel,
 };
-use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
+use zeppelin::server::{build_router, parse_trusted_proxies, AppState, ServerTaskSupervisor};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::Clock;
 use zeppelin::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
@@ -216,10 +219,34 @@ async fn start_test_audit_with_entitlements(
     (client, runtime, node_id)
 }
 
-/// Spawn one HTTP server and register its HTTP/audit lifecycle with the harness.
+/// Spawn one HTTP server with isolated empty background owners.
+///
+/// Custom router fixtures that install authoritative background owners in
+/// [`AppState`] must call [`spawn_test_router_with_lifecycle`] instead.
 pub async fn spawn_test_router(
     harness: &TestHarness,
     app: Router,
+    audit_signing_security: Arc<SecurityKernel>,
+    audit_runtime: AuditRuntime,
+) -> String {
+    spawn_test_router_with_lifecycle(
+        harness,
+        app,
+        Arc::new(ServerTaskSupervisor::new()),
+        CompactionLifecycle::new(),
+        audit_signing_security,
+        audit_runtime,
+    )
+    .await
+}
+
+/// Spawn one HTTP server and register its exact authoritative lifecycle owners.
+pub async fn spawn_test_router_with_lifecycle(
+    harness: &TestHarness,
+    app: Router,
+    server_tasks: Arc<ServerTaskSupervisor>,
+    compaction_lifecycle: CompactionLifecycle,
+    audit_signing_security: Arc<SecurityKernel>,
     audit_runtime: AuditRuntime,
 ) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -239,7 +266,10 @@ pub async fn spawn_test_router(
     harness.register_test_server(TestServerRuntime::new(
         shutdown_http,
         server_task,
+        server_tasks,
+        compaction_lifecycle,
         audit_runtime,
+        audit_signing_security,
     ));
     format!("http://{addr}")
 }
@@ -664,6 +694,8 @@ async fn start_test_server_with_config_inner(
         clock.now(),
     )
     .await;
+    let server_tasks = Arc::new(ServerTaskSupervisor::new());
+    let compaction_lifecycle = CompactionLifecycle::new();
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
@@ -677,6 +709,8 @@ async fn start_test_server_with_config_inner(
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         compactor,
         lease_manager,
+        compaction_lifecycle: compaction_lifecycle.clone(),
+        server_tasks: Arc::clone(&server_tasks),
         fragment_cache: test_fragment_cache(&config),
         decoded_artifact_cache: test_decoded_artifact_cache(&config),
         config: Arc::new(config),
@@ -692,7 +726,15 @@ async fn start_test_server_with_config_inner(
     };
 
     let app = build_router(state);
-    let base_url = spawn_test_router(&harness, app, audit_runtime).await;
+    let base_url = spawn_test_router_with_lifecycle(
+        &harness,
+        app,
+        server_tasks,
+        compaction_lifecycle,
+        security,
+        audit_runtime,
+    )
+    .await;
 
     (base_url, harness, cache, cache_dir, admin_bearer)
 }
@@ -736,6 +778,8 @@ pub async fn start_test_server_on_store(
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let (audit, audit_runtime, _audit_node_id) =
         start_test_audit(&config, &store, Some(&harness.prefix), &security).await;
+    let server_tasks = Arc::new(ServerTaskSupervisor::new());
+    let compaction_lifecycle = CompactionLifecycle::new();
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
@@ -749,6 +793,8 @@ pub async fn start_test_server_on_store(
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor,
         lease_manager,
+        compaction_lifecycle: compaction_lifecycle.clone(),
+        server_tasks: Arc::clone(&server_tasks),
         fragment_cache: test_fragment_cache(&config),
         decoded_artifact_cache: test_decoded_artifact_cache(&config),
         config: Arc::new(config),
@@ -764,7 +810,15 @@ pub async fn start_test_server_on_store(
     };
 
     let app = build_router(state);
-    let base_url = spawn_test_router(harness, app, audit_runtime).await;
+    let base_url = spawn_test_router_with_lifecycle(
+        harness,
+        app,
+        server_tasks,
+        compaction_lifecycle,
+        security,
+        audit_runtime,
+    )
+    .await;
 
     (base_url, cache, cache_dir, admin_bearer)
 }
@@ -811,6 +865,8 @@ pub async fn start_test_server_with_compactor(
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let (audit, audit_runtime, _audit_node_id) =
         start_test_audit(&config, &harness.store, Some(&harness.prefix), &security).await;
+    let server_tasks = Arc::new(ServerTaskSupervisor::new());
+    let compaction_lifecycle = CompactionLifecycle::new();
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
@@ -824,6 +880,8 @@ pub async fn start_test_server_with_compactor(
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         compactor: compactor.clone(),
         lease_manager,
+        compaction_lifecycle: compaction_lifecycle.clone(),
+        server_tasks: Arc::clone(&server_tasks),
         fragment_cache: test_fragment_cache(&config),
         decoded_artifact_cache: test_decoded_artifact_cache(&config),
         config: Arc::new(config),
@@ -839,7 +897,15 @@ pub async fn start_test_server_with_compactor(
     };
 
     let app = build_router(state);
-    let base_url = spawn_test_router(&harness, app, audit_runtime).await;
+    let base_url = spawn_test_router_with_lifecycle(
+        &harness,
+        app,
+        server_tasks,
+        compaction_lifecycle,
+        security,
+        audit_runtime,
+    )
+    .await;
 
     (base_url, harness, cache, cache_dir, compactor, admin_bearer)
 }
@@ -882,6 +948,7 @@ pub async fn start_test_server_with_compaction(
     // Spawn background compaction loop (mirrors main.rs)
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(500)));
     let lease_manager = lease_manager(&config, &harness.store, &clock);
+    let compaction_lifecycle = CompactionLifecycle::new();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let gc_config = config.gc.clone();
     {
@@ -890,9 +957,10 @@ pub async fn start_test_server_with_compaction(
         let manifest_cache = manifest_cache.clone();
         let lease_manager = lease_manager.clone();
         let cache = cache.clone();
+        let compaction_lifecycle = compaction_lifecycle.clone();
         let namespace_prefix = Some(harness.prefix.clone());
         tokio::spawn(with_background_compaction_origin(async move {
-            compaction_loop(
+            compaction_loop_with_lifecycle(
                 compactor,
                 namespace_manager,
                 shutdown_rx,
@@ -903,6 +971,7 @@ pub async fn start_test_server_with_compaction(
                     gc_config,
                     namespace_prefix,
                 },
+                &compaction_lifecycle,
             )
             .await;
         }));
@@ -916,11 +985,12 @@ pub async fn start_test_server_with_compaction(
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let (audit, audit_runtime, _audit_node_id) =
         start_test_audit(&config, &harness.store, Some(&harness.prefix), &security).await;
+    let server_tasks = Arc::new(ServerTaskSupervisor::new());
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
         receipts: zeppelin::server::ReceiptCapability::compose(&security),
-        security,
+        security: Arc::clone(&security),
         audit,
         credential_adapter,
         namespace_manager: Arc::clone(&namespace_manager),
@@ -929,6 +999,8 @@ pub async fn start_test_server_with_compaction(
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         compactor,
         lease_manager,
+        compaction_lifecycle: compaction_lifecycle.clone(),
+        server_tasks: Arc::clone(&server_tasks),
         fragment_cache: test_fragment_cache(&config),
         decoded_artifact_cache: test_decoded_artifact_cache(&config),
         config: Arc::new(config),
@@ -944,7 +1016,15 @@ pub async fn start_test_server_with_compaction(
     };
 
     let app = build_router(state);
-    let base_url = spawn_test_router(&harness, app, audit_runtime).await;
+    let base_url = spawn_test_router_with_lifecycle(
+        &harness,
+        app,
+        server_tasks,
+        compaction_lifecycle,
+        security,
+        audit_runtime,
+    )
+    .await;
 
     (
         base_url,
@@ -1042,6 +1122,14 @@ pub async fn cleanup_ns(store: &ZeppelinStore, ns: &str) {
     let _ = store.delete_prefix(&prefix).await;
 }
 
+/// Failure observed while crash retirement settles an already-stopped test server.
+#[derive(Debug, Error)]
+pub enum FullTestServerRetirementError {
+    /// The HTTP task failed or was cancelled before retirement joined it.
+    #[error("test HTTP crash retirement failed: {0}")]
+    HttpTask(#[source] JoinError),
+}
+
 pub struct FullTestServer {
     pub base_url: String,
     pub admin_bearer: String,
@@ -1057,6 +1145,8 @@ pub struct FullTestServer {
     pub security: Arc<SecurityKernel>,
     pub namespace_manager: Arc<NamespaceManager>,
     pub workload_credentials: WorkloadCredentialRegistry,
+    compaction_lifecycle: CompactionLifecycle,
+    server_tasks: Arc<ServerTaskSupervisor>,
     audit_runtime: Option<AuditRuntime>,
     fragment_cache: Arc<WalFragmentCache>,
     decoded_artifact_cache: Arc<DecodedArtifactCache>,
@@ -1065,6 +1155,7 @@ pub struct FullTestServer {
     pub compaction_loop_task: Option<JoinHandle<()>>,
     pub server_task: JoinHandle<()>,
     pub shutdown_http: tokio::sync::watch::Sender<bool>,
+    shutdown_timeout: Duration,
 }
 
 impl FullTestServer {
@@ -1131,18 +1222,79 @@ impl FullTestServer {
         }
     }
 
+    /// Simulate a process crash, then retire request-spawned authoritative work.
+    ///
+    /// Unlike [`Self::abort`], this consumes the server so a recovery test cannot
+    /// compose its replacement while the crashed node still owns security refresh,
+    /// audit, or request-spawned authoritative mutation work. Cache-only hydration
+    /// is independently queue-owned and is disabled by the adversarial runner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FullTestServerRetirementError::HttpTask`] when the HTTP task had
+    /// already failed or been cancelled. The error is deferred until compaction,
+    /// audit, request-task, and security-refresh retirement barriers all finish.
+    pub async fn abort_and_drop(mut self) -> Result<(), FullTestServerRetirementError> {
+        // Axum's graceful shutdown stops accepting new connections and does not
+        // resolve until every accepted connection task has been joined. A task
+        // abort only drops the listener owner and can leave connection-owned
+        // `AppState` (including security refresh work) alive past recovery.
+        let _ = self.shutdown_http.send_replace(true);
+
+        let http_result = (&mut self.server_task)
+            .await
+            .map_err(FullTestServerRetirementError::HttpTask);
+
+        // Let an in-flight periodic tick observe retirement before its next
+        // lifecycle reservation. Without this signal, the close below is a
+        // false operational compaction failure rather than shutdown control
+        // flow for a tick racing between trigger evaluation and lease acquire.
+        if let Some(shutdown) = self.shutdown_compaction.take() {
+            let _ = shutdown.send(true);
+        }
+        self.compaction_lifecycle
+            .close_and_abort_heartbeats()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("test compaction heartbeat crash retirement failed: {error}")
+            });
+
+        if let Some(task) = self.compaction_loop_task.as_ref() {
+            // A simulated crash intentionally does not let compaction finish
+            // work or publish another result. The lifecycle barrier above has
+            // already stopped every lease renewer owned by this outer task.
+            task.abort();
+        }
+
+        if let Some(task) = self.compaction_loop_task.take() {
+            match task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => panic!("test compaction crash retirement failed: {error}"),
+            }
+        }
+
+        self.audit_runtime
+            .take()
+            .expect("test audit runtime must be present during crash retirement")
+            .abort_and_join()
+            .await
+            .unwrap_or_else(|error| panic!("test audit crash retirement failed: {error}"));
+        self.server_tasks
+            .abort_and_join()
+            .await
+            .unwrap_or_else(|error| panic!("test request-task crash retirement failed: {error}"));
+        self.security.shutdown_refresh_tasks().await;
+        drop(self);
+        http_result
+    }
+
     /// Gracefully stop the HTTP server and background compaction loop.
     pub async fn shutdown(mut self) {
         let _ = self.shutdown_http.send(true);
         if let Some(shutdown) = self.shutdown_compaction.take() {
             let _ = shutdown.send(true);
         }
-        let compaction_result = match self.compaction_loop_task.take() {
-            Some(task) => task
-                .await
-                .map_err(|error| format!("test compaction loop failed: {error}")),
-            None => Ok(()),
-        };
         let server_result = self
             .server_task
             .await
@@ -1154,11 +1306,34 @@ impl FullTestServer {
                 .map_err(|error| format!("test audit runtime failed: {error}")),
             None => Ok(()),
         };
+        let request_tasks_result = self
+            .server_tasks
+            .join_with_timeout(self.shutdown_timeout)
+            .await
+            .map_err(|error| format!("test request-spawned task failed: {error}"));
+        let compaction_result = match self.compaction_loop_task.take() {
+            Some(task) => task
+                .await
+                .map_err(|error| format!("test compaction loop failed: {error}")),
+            None => Ok(()),
+        };
+        let heartbeat_result = self
+            .compaction_lifecycle
+            .close_and_abort_heartbeats()
+            .await
+            .map_err(|error| format!("test compaction heartbeat retirement failed: {error}"));
+        self.security.shutdown_refresh_tasks().await;
 
-        let errors = [compaction_result, server_result, audit_result]
-            .into_iter()
-            .filter_map(Result::err)
-            .collect::<Vec<_>>();
+        let errors = [
+            compaction_result,
+            server_result,
+            audit_result,
+            request_tasks_result,
+            heartbeat_result,
+        ]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>();
         assert!(
             errors.is_empty(),
             "test server shutdown failed: {}",
@@ -1380,6 +1555,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     let namespace_manager = namespace_manager(&config, &store, &clock, &security);
     let compactor = compactor(&config, &store, &clock, &security);
     let lease_manager = lease_manager(&config, &store, &clock);
+    let compaction_lifecycle = CompactionLifecycle::new();
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(
         config.cache.manifest_cache_ttl_ms,
     )));
@@ -1394,10 +1570,11 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
             let manifest_cache = manifest_cache.clone();
             let lease_manager = lease_manager.clone();
             let cache = cache.clone();
+            let compaction_lifecycle = compaction_lifecycle.clone();
             let namespace_prefix = namespace_name_prefix.clone();
             compaction_loop_task = Some(tokio::spawn(with_background_compaction_origin(
                 async move {
-                    compaction_loop(
+                    compaction_loop_with_lifecycle(
                         compactor,
                         namespace_manager,
                         shutdown_rx,
@@ -1408,6 +1585,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
                             gc_config,
                             namespace_prefix,
                         },
+                        &compaction_lifecycle,
                     )
                     .await;
                 },
@@ -1427,6 +1605,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     let wal_writer = Arc::new(WalWriter::with_clock(store.clone(), clock.clone()));
     let fragment_cache = test_fragment_cache(&config);
     let decoded_artifact_cache = test_decoded_artifact_cache(&config);
+    let shutdown_timeout = Duration::from_secs(config.server.shutdown_timeout_secs);
     let (audit, audit_runtime, audit_node_id) = start_test_audit_with_entitlements(
         &config,
         &store,
@@ -1437,6 +1616,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     )
     .await;
     let workload_credentials = WorkloadCredentialRegistry::with_admin(&admin_bearer);
+    let server_tasks = Arc::new(ServerTaskSupervisor::new());
     let state_security = Arc::clone(&security);
     let state = AppState {
         store: store.clone(),
@@ -1451,6 +1631,8 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor: compactor.clone(),
         lease_manager: lease_manager.clone(),
+        compaction_lifecycle: compaction_lifecycle.clone(),
+        server_tasks: Arc::clone(&server_tasks),
         fragment_cache: Arc::clone(&fragment_cache),
         decoded_artifact_cache: Arc::clone(&decoded_artifact_cache),
         config: Arc::new(config),
@@ -1498,6 +1680,8 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         security,
         namespace_manager,
         workload_credentials,
+        compaction_lifecycle,
+        server_tasks,
         audit_runtime: Some(audit_runtime),
         fragment_cache,
         decoded_artifact_cache,
@@ -1506,5 +1690,6 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         compaction_loop_task,
         server_task,
         shutdown_http,
+        shutdown_timeout,
     }
 }

@@ -1,13 +1,13 @@
 //! Disposable compiled-policy cache with bounded S3 revalidation.
 
-use std::sync::{Arc, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 use ulid::Ulid;
 
 use super::policy::CompiledPolicy;
@@ -43,7 +43,7 @@ pub(crate) struct PolicyCache {
     clock: Clock,
     current: RwLock<Arc<CachedPolicy>>,
     refresh_interval: Duration,
-    refresh_abort: OnceLock<AbortHandle>,
+    refresh_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl PolicyCache {
@@ -65,15 +65,14 @@ impl PolicyCache {
             clock,
             current: RwLock::new(cached),
             refresh_interval,
-            refresh_abort: OnceLock::new(),
+            refresh_task: Mutex::new(None),
         });
         let weak = Arc::downgrade(&cache);
         let task = tokio::spawn(refresh_loop(weak, refresh_interval));
-        cache.refresh_abort.set(task.abort_handle()).map_err(|_| {
-            SecurityError::InvalidPolicy(
-                "policy refresh runtime initialized more than once".to_string(),
-            )
-        })?;
+        *cache
+            .refresh_task
+            .lock()
+            .unwrap_or_else(|_| panic!("security policy refresh task lock poisoned")) = Some(task);
         Ok(cache)
     }
 
@@ -96,6 +95,10 @@ impl PolicyCache {
             .store
             .refresh(&observed.head_etag, self.clock.now())
             .await?;
+        self.install_refresh(observed, refresh)
+    }
+
+    fn install_refresh(&self, observed: Arc<CachedPolicy>, refresh: PolicyRefresh) -> Result<()> {
         match refresh {
             PolicyRefresh::Unchanged { observed_at } => {
                 let mut current = self
@@ -117,6 +120,26 @@ impl PolicyCache {
             }
         }
         Ok(())
+    }
+
+    /// Abort and join this cache's owned refresh task before its authority retires.
+    pub(crate) async fn shutdown_refresh_task(&self) {
+        let task = self
+            .refresh_task
+            .lock()
+            .unwrap_or_else(|_| panic!("security policy refresh task lock poisoned"))
+            .take();
+        let Some(task) = task else {
+            return;
+        };
+        task.abort();
+        match task.await {
+            Err(error) if error.is_cancelled() => {}
+            Ok(()) => {
+                panic!("security policy refresh task exited normally while authority remained live")
+            }
+            Err(error) => panic!("security policy refresh task failed during shutdown: {error}"),
+        }
     }
 
     #[must_use]
@@ -488,8 +511,13 @@ fn generate_api_key() -> Result<(ApiKeyId, String, String)> {
 
 impl Drop for PolicyCache {
     fn drop(&mut self) {
-        if let Some(abort) = self.refresh_abort.get() {
-            abort.abort();
+        let task = self
+            .refresh_task
+            .get_mut()
+            .unwrap_or_else(|_| panic!("security policy refresh task lock poisoned"))
+            .take();
+        if let Some(task) = task {
+            task.abort();
         }
     }
 }
@@ -497,10 +525,21 @@ impl Drop for PolicyCache {
 async fn refresh_loop(cache: Weak<PolicyCache>, refresh_interval: Duration) {
     loop {
         tokio::time::sleep(refresh_interval).await;
+        let (store, clock, observed) = {
+            let Some(cache) = cache.upgrade() else {
+                return;
+            };
+            (cache.store.clone(), cache.clock.clone(), cache.current())
+        };
+        let refresh = store.refresh(&observed.head_etag, clock.now()).await;
         let Some(cache) = cache.upgrade() else {
             return;
         };
-        if let Err(error) = cache.refresh_once().await {
+        let result = match refresh {
+            Ok(refresh) => cache.install_refresh(observed, refresh),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
             tracing::error!(
                 error = %error,
                 policy_version = cache.version().get(),

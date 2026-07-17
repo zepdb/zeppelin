@@ -14,11 +14,11 @@
 //! blocking pool do not occupy query-runtime workers. Tests may call
 //! [`compaction_loop`][crate::compaction::background::compaction_loop] directly
 //! on their runtime. The HTTP manual-compaction handler enters through
-//! [`run_compaction_with_lease`][crate::compaction::background::run_compaction_with_lease]
-//! after acquiring a lease; the periodic loop normally uses
-//! [`compact_namespace_under_lease`][crate::compaction::background::compact_namespace_under_lease]
-//! to acquire
-//! and run in one operation.
+//! [`run_compaction_with_reserved_lease`][crate::compaction::background::run_compaction_with_reserved_lease]
+//! after reserving lifecycle admission and acquiring a lease; the periodic loop
+//! uses
+//! [`compact_namespace_under_lease_with_lifecycle`][crate::compaction::background::compact_namespace_under_lease_with_lifecycle]
+//! to reserve, acquire, and run in one operation.
 //!
 //! S3 or MinIO remains authoritative throughout this file. The namespace
 //! registry is only a discovery hint, the periodic loop invalidates its manifest
@@ -35,10 +35,10 @@
 //!    and [`CompactionLoopOptions`][crate::compaction::background::CompactionLoopOptions]
 //!    to see which boot-time values are moved into the scheduler.
 //! 2. Read
-//!    [`compact_namespace_under_lease`][crate::compaction::background::compact_namespace_under_lease]
-//!    and [`run_compaction_with_lease`][crate::compaction::background::run_compaction_with_lease]
-//!    for the acquire, heartbeat, fenced-commit,
-//!    and best-effort-release lifecycle.
+//!    [`compact_namespace_under_lease_with_lifecycle`][crate::compaction::background::compact_namespace_under_lease_with_lifecycle]
+//!    and [`run_compaction_with_reserved_lease`][crate::compaction::background::run_compaction_with_reserved_lease]
+//!    for lifecycle admission, lease acquisition, heartbeat, fenced commit, and
+//!    best-effort release.
 //! 3. Read
 //!    [`start_compaction_thread`][crate::compaction::background::start_compaction_thread]
 //!    for the OS-thread and Tokio-runtime
@@ -132,11 +132,15 @@
 //! points; `Arc` expresses shared lifetime, not automatic locking.
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use thiserror::Error;
 use tracing::{debug, error, info, warn};
+
+use tokio::task::JoinHandle;
 
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
@@ -155,6 +159,363 @@ use super::gc::{GcNamespaceIncarnation, GcRunner};
 use super::{CompactionResult, Compactor};
 
 const NAMESPACE_DISCOVERY_REFRESH_TICKS: u64 = 12;
+
+/// Failure while admitting or retiring leased-compaction heartbeat work.
+#[derive(Debug, Error)]
+pub enum CompactionLifecycleError {
+    /// Crash retirement closed admission before a run could register.
+    #[error("compaction lifecycle retired before leased compaction registration")]
+    RetiredBeforeRegistration,
+
+    /// Crash retirement won after reservation but before heartbeat ownership.
+    #[error("compaction lifecycle retired during heartbeat registration")]
+    RetiredDuringHeartbeatRegistration,
+
+    /// A heartbeat task failed for a reason other than requested cancellation.
+    #[error("compaction heartbeat failed during crash retirement: {failures}")]
+    HeartbeatFailed {
+        /// Joined task failures, preserved for operator diagnostics.
+        failures: String,
+    },
+}
+
+/// Process-local owner for leased-compaction heartbeats.
+///
+/// A heartbeat is a child task of a periodic or manual compaction run, but it
+/// owns the capability to keep that run's S3 lease alive. It must therefore be
+/// retired independently of the outer task: aborting an outer Tokio task only
+/// drops its local handle, which would otherwise detach the heartbeat.
+///
+/// One application instance shares one lifecycle between its periodic loop and
+/// manual HTTP compactions. Crash retirement closes admission, marks every
+/// active run as publication-aborted, and aborts plus joins every heartbeat
+/// before a replacement is allowed to begin. Normal runs stop and join their
+/// own heartbeat before best-effort lease release.
+#[derive(Clone)]
+pub struct CompactionLifecycle {
+    inner: Arc<Mutex<CompactionLifecycleState>>,
+}
+
+struct CompactionLifecycleState {
+    accepting: bool,
+    next_run_id: u64,
+    runs: HashMap<u64, ActiveCompactionState>,
+}
+
+struct ActiveCompactionState {
+    publication_aborted: Arc<AtomicBool>,
+    heartbeat: Option<JoinHandle<()>>,
+    heartbeat_completion: Option<HeartbeatCompletion>,
+}
+
+/// One registered compaction run.
+///
+/// This stays private to the orchestration module so callers cannot detach a
+/// heartbeat from the lifecycle which must retire it.
+struct ActiveCompaction {
+    lifecycle: CompactionLifecycle,
+    run_id: u64,
+    publication_aborted: Arc<AtomicBool>,
+    finished: bool,
+}
+
+/// Admission reservation for one future leased compaction.
+///
+/// Periodic and manual callers reserve before acquiring S3 ownership. A crash
+/// close can therefore mark the reservation before acquisition completes; the
+/// caller then releases any lease it acquired rather than creating an
+/// untracked heartbeat or stranding a live lease across replacement.
+pub struct CompactionRunReservation {
+    active: Option<ActiveCompaction>,
+}
+
+/// Completion latch retained even while a normal run is joining its heartbeat.
+///
+/// Crash retirement may race a normal completion after that completion has
+/// removed the `JoinHandle` from the registry. The latch prevents crash
+/// retirement from returning until that in-flight join's task has actually
+/// stopped; merely knowing that it was asked to abort is not sufficient.
+#[derive(Clone)]
+struct HeartbeatCompletion {
+    exited: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+struct HeartbeatExitGuard(HeartbeatCompletion);
+
+impl HeartbeatCompletion {
+    fn new() -> Self {
+        Self {
+            exited: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    async fn wait_until_exited(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.exited.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for HeartbeatExitGuard {
+    fn drop(&mut self) {
+        self.0.exited.store(true, Ordering::SeqCst);
+        self.0.notify.notify_waiters();
+    }
+}
+
+impl CompactionLifecycle {
+    /// Construct an accepting lifecycle with no active lease heartbeats.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(CompactionLifecycleState {
+                accepting: true,
+                next_run_id: 0,
+                runs: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Close compaction admission, abort publication, and join every heartbeat.
+    ///
+    /// Crash retirement must call this before it aborts its periodic-loop or
+    /// request-task owners. Closing the gate first makes a registration race
+    /// loud rather than allowing a new untracked lease renewer to escape. Every
+    /// active publication flag is set before any heartbeat is aborted, so a
+    /// compactor that reaches a manifest CAS while retirement is in progress
+    /// fails closed even if its outer future has not yet been cancelled.
+    pub async fn close_and_abort_heartbeats(
+        &self,
+    ) -> std::result::Result<(), CompactionLifecycleError> {
+        let (tasks, completions) = {
+            let mut state = self
+                .inner
+                .lock()
+                .unwrap_or_else(|_| panic!("compaction lifecycle lock poisoned"));
+            state.accepting = false;
+
+            let mut tasks = Vec::new();
+            let mut completions = Vec::new();
+            for run in state.runs.values_mut() {
+                run.publication_aborted.store(true, Ordering::SeqCst);
+                if let Some(task) = run.heartbeat.take() {
+                    tasks.push(task);
+                }
+                if let Some(completion) = &run.heartbeat_completion {
+                    completions.push(completion.clone());
+                }
+            }
+            (tasks, completions)
+        };
+
+        for task in &tasks {
+            task.abort();
+        }
+
+        let mut failures = Vec::new();
+        for task in tasks {
+            match task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        for completion in completions {
+            completion.wait_until_exited().await;
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(CompactionLifecycleError::HeartbeatFailed {
+                failures: failures.join("; "),
+            })
+        }
+    }
+
+    /// Reserve admission for a leased compaction before acquiring its S3 lease.
+    ///
+    /// A closed lifecycle returns a loud error without touching storage. The
+    /// returned reservation removes itself if acquisition fails before work
+    /// starts.
+    pub fn reserve(&self) -> Result<CompactionRunReservation> {
+        self.begin_run().map(|active| CompactionRunReservation {
+            active: Some(active),
+        })
+    }
+
+    /// Return whether crash retirement has closed new leased-compaction admission.
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        !self
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("compaction lifecycle lock poisoned"))
+            .accepting
+    }
+
+    fn begin_run(&self) -> Result<ActiveCompaction> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("compaction lifecycle lock poisoned"));
+        if !state.accepting {
+            return Err(CompactionLifecycleError::RetiredBeforeRegistration.into());
+        }
+        let run_id = state.next_run_id;
+        state.next_run_id = state
+            .next_run_id
+            .checked_add(1)
+            .expect("compaction lifecycle run ID overflow");
+        let publication_aborted = Arc::new(AtomicBool::new(false));
+        state.runs.insert(
+            run_id,
+            ActiveCompactionState {
+                publication_aborted: Arc::clone(&publication_aborted),
+                heartbeat: None,
+                heartbeat_completion: None,
+            },
+        );
+        Ok(ActiveCompaction {
+            lifecycle: self.clone(),
+            run_id,
+            publication_aborted,
+            finished: false,
+        })
+    }
+}
+
+impl Default for CompactionLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CompactionRunReservation {
+    fn into_active(mut self) -> ActiveCompaction {
+        self.active
+            .take()
+            .expect("compaction run reservation consumed more than once")
+    }
+}
+
+impl Drop for CompactionRunReservation {
+    fn drop(&mut self) {
+        if let Some(mut active) = self.active.take() {
+            active.finish();
+        }
+    }
+}
+
+impl ActiveCompaction {
+    fn publication_abort_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.publication_aborted)
+    }
+
+    fn spawn_heartbeat<F, Make>(&self, make_future: Make) -> Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+        Make: FnOnce(Arc<AtomicBool>) -> F,
+    {
+        let mut state = self
+            .lifecycle
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("compaction lifecycle lock poisoned"));
+        if !state.accepting || self.publication_aborted.load(Ordering::SeqCst) {
+            return Err(CompactionLifecycleError::RetiredDuringHeartbeatRegistration.into());
+        }
+        let run = state.runs.get_mut(&self.run_id).unwrap_or_else(|| {
+            panic!("compaction lifecycle lost active run before heartbeat registration")
+        });
+        assert!(
+            run.heartbeat.is_none() && run.heartbeat_completion.is_none(),
+            "compaction lifecycle registered more than one heartbeat for one run"
+        );
+
+        let completion = HeartbeatCompletion::new();
+        let exit_guard = HeartbeatExitGuard(completion.clone());
+        let future = make_future(Arc::clone(&self.publication_aborted));
+        run.heartbeat = Some(tokio::spawn(async move {
+            let _exit_guard = exit_guard;
+            future.await;
+        }));
+        run.heartbeat_completion = Some(completion);
+        Ok(())
+    }
+
+    async fn stop_and_join_heartbeat(&self) {
+        let (task, completion) = {
+            let mut state = self
+                .lifecycle
+                .inner
+                .lock()
+                .unwrap_or_else(|_| panic!("compaction lifecycle lock poisoned"));
+            let run = state.runs.get_mut(&self.run_id).unwrap_or_else(|| {
+                panic!("compaction lifecycle lost active run before heartbeat shutdown")
+            });
+            (run.heartbeat.take(), run.heartbeat_completion.clone())
+        };
+
+        if let Some(task) = task {
+            task.abort();
+            match task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => panic!("compaction heartbeat failed during normal shutdown: {error}"),
+            }
+        }
+        if let Some(completion) = completion {
+            completion.wait_until_exited().await;
+        }
+    }
+
+    fn finish(&mut self) {
+        let removed = self
+            .lifecycle
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("compaction lifecycle lock poisoned"))
+            .runs
+            .remove(&self.run_id);
+        let Some(run) = removed else {
+            panic!("compaction lifecycle lost active run before completion");
+        };
+        assert!(
+            run.heartbeat.is_none(),
+            "compaction lifecycle completed a run before joining its heartbeat"
+        );
+        self.finished = true;
+    }
+}
+
+impl Drop for ActiveCompaction {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let state = self
+            .lifecycle
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("compaction lifecycle lock poisoned"));
+        if let Some(run) = state.runs.get(&self.run_id) {
+            run.publication_aborted.store(true, Ordering::SeqCst);
+            if let Some(task) = &run.heartbeat {
+                // This is a last-resort drop-path request only. Ordered crash
+                // retirement calls close_and_abort_heartbeats(), which also
+                // joins this task before replacement may begin.
+                task.abort();
+            }
+        }
+    }
+}
 
 #[must_use]
 fn is_fresh_namespace_discovery_tick(tick: u64) -> bool {
@@ -227,7 +588,7 @@ pub struct CompactionLoopOptions {
     pub namespace_prefix: Option<String>,
 }
 
-/// Owns the abort signal and spawned renewal task for one leased compaction.
+/// Owns one lifecycle-registered renewal task for one leased compaction.
 ///
 /// The task renews at one third of the configured lease duration. Successful
 /// renewal extends expiry without changing the fencing token. A definite
@@ -255,8 +616,8 @@ pub struct CompactionLoopOptions {
 struct LeaseHeartbeat {
     /// Sequentially consistent publication-abort signal shared with compaction.
     lease_lost: Arc<AtomicBool>,
-    /// Tokio task that sleeps, renews, records metrics, and exits on lease loss.
-    handle: tokio::task::JoinHandle<()>,
+    /// Registration whose lifecycle owns and joins the Tokio task.
+    active: ActiveCompaction,
 }
 
 impl LeaseHeartbeat {
@@ -325,20 +686,33 @@ impl LeaseHeartbeat {
     /// cleanup. Rust statically prevents this detached future from borrowing
     /// local stack variables. Cloning `Arc` increments a reference count; it
     /// does not duplicate the atomic value.
-    fn spawn(lease_manager: Arc<LeaseManager>, namespace: String, lease: Lease) -> Self {
-        let lease_lost = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&lease_lost);
+    fn spawn(
+        mut active: ActiveCompaction,
+        lease_manager: Arc<LeaseManager>,
+        namespace: String,
+        lease: Lease,
+    ) -> Result<Self> {
+        let lease_lost = active.publication_abort_signal();
         // One missed renewal still leaves two nominal intervals before expiry,
         // giving a transient object-store failure another scheduled attempt.
         let interval = lease_manager.lease_duration() / 3;
 
-        let handle = tokio::spawn(async move {
+        let heartbeat_result = active.spawn_heartbeat(move |flag| async move {
             let mut current = lease;
             loop {
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
                 tokio::time::sleep(interval).await;
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
 
                 match lease_manager.renew(&namespace, &current).await {
                     Ok(renewed) => {
+                        if flag.load(Ordering::SeqCst) {
+                            return;
+                        }
                         crate::metrics::COMPACTION_LEASE_RENEWALS_TOTAL
                             .with_label_values(&[namespace.as_str()])
                             .inc();
@@ -392,20 +766,24 @@ impl LeaseHeartbeat {
                 }
             }
         });
+        if let Err(error) = heartbeat_result {
+            active.finish();
+            return Err(error);
+        }
 
-        Self { lease_lost, handle }
+        Ok(Self { lease_lost, active })
     }
 
-    /// Requests cancellation of the renewal task after compaction finishes.
+    /// Stops and joins the renewal task after compaction finishes.
     ///
-    /// This method consumes the heartbeat, so its task handle cannot be stopped
-    /// or reused twice.
+    /// The lifecycle run is consumed exactly once at final completion, so its
+    /// heartbeat cannot be stopped or reused twice.
     ///
     /// # Side Effects
     ///
-    /// Calls [`tokio::task::JoinHandle::abort`]. It does not await task
-    /// termination and does not release the lease; the wrapper performs release
-    /// separately after this call.
+    /// Calls [`tokio::task::JoinHandle::abort`] and awaits termination. It does
+    /// not release the lease; the wrapper performs release separately after this
+    /// join.
     ///
     /// # Examples
     ///
@@ -414,22 +792,27 @@ impl LeaseHeartbeat {
     ///
     /// # Rust Notes for Java/C Engineers
     ///
-    /// Taking `self` by value is a compiler-enforced one-shot ownership
+    /// The private lifecycle run is a compiler-enforced one-shot ownership
     /// transition. Java code would rely on an idempotent state flag, while C
     /// would conventionally invalidate a handle after cancellation. Tokio abort
-    /// is cooperative at async yield points; consuming the handle requests but
-    /// does not synchronously join task completion.
-    fn stop(self) {
-        self.handle.abort();
+    /// is cooperative at async yield points; awaiting the owned handle proves
+    /// the task reached cancellation before release proceeds.
+    async fn stop_and_join(&self) {
+        self.active.stop_and_join_heartbeat().await;
+    }
+
+    fn finish(&mut self) {
+        self.active.finish();
     }
 }
 
 /// Acquires a namespace lease and runs one fenced compaction lifecycle.
 ///
-/// This is the periodic scheduler's production entry point. Acquisition happens
-/// before any compaction work. A successful lease is delegated to
-/// [`run_compaction_with_lease`], which renews it while immutable artifacts are
-/// built and carries its token into manifest publication.
+/// The caller must retain `lifecycle` until every future using it has completed
+/// or cancellation has been followed by
+/// [`CompactionLifecycle::close_and_abort_heartbeats`]. A successful lease
+/// renews while immutable artifacts are built and carries its token into
+/// manifest publication.
 ///
 /// # Parameters
 ///
@@ -443,6 +826,8 @@ impl LeaseHeartbeat {
 ///   snapshot used for this cycle.
 /// - `fragment_cache`: Immutable WAL-byte cache behavior for the compaction
 ///   read. Production supplies read-only access; direct tools may bypass it.
+/// - `lifecycle`: Caller-owned admission and heartbeat join authority shared by
+///   every leased compaction in the same server or test lifecycle.
 ///
 /// # Returns
 ///
@@ -490,21 +875,24 @@ impl LeaseHeartbeat {
 /// here. The `?` operator forwards acquisition failure immediately, analogous to
 /// propagating a Java exception or returning a checked C status, while Rust
 /// still drops all local owned values on that path.
-pub async fn compact_namespace_under_lease(
+pub async fn compact_namespace_under_lease_with_lifecycle(
     compactor: &Compactor,
     lease_manager: &Arc<LeaseManager>,
     namespace: &str,
     fts_configs: &HashMap<String, FtsFieldConfig>,
     fragment_cache: FragmentCachePolicy<'_>,
+    lifecycle: &CompactionLifecycle,
 ) -> Result<CompactionResult> {
+    let reservation = lifecycle.reserve()?;
     let lease = lease_manager.acquire(namespace).await?;
-    run_compaction_with_lease(
+    run_compaction_with_reserved_lease(
         compactor,
         lease_manager,
         namespace,
         lease,
         fts_configs,
         fragment_cache,
+        reservation,
     )
     .await
 }
@@ -540,6 +928,8 @@ pub async fn compact_namespace_under_lease(
 /// - `fts_configs`: Borrowed full-text field definitions to materialize.
 /// - `fragment_cache`: Immutable WAL-byte cache behavior used while building
 ///   the segment.
+/// - `lifecycle`: Caller-owned heartbeat authority that must outlive this
+///   future and be explicitly retired after cancellation before replacement.
 ///
 /// # Returns
 ///
@@ -567,11 +957,13 @@ pub async fn compact_namespace_under_lease(
 ///
 /// # Cancellation
 ///
-/// Cleanup is explicit rather than implemented with `Drop`. If the future is
-/// cancelled or panics while awaiting compaction, execution does not reach
-/// `stop` or `release`; dropping Tokio's join handle detaches the heartbeat
-/// rather than aborting it. Callers that spawn this future should normally let
-/// it finish and observe its result.
+/// Normal cleanup is explicit: it stops and joins renewal before release. If
+/// the outer future is cancelled or panics while awaiting compaction,
+/// [`ActiveCompaction::drop`] requests heartbeat cancellation but cannot join
+/// it. The shared [`CompactionLifecycle`] retains that join responsibility, so
+/// ordered crash retirement must call
+/// [`CompactionLifecycle::close_and_abort_heartbeats`] before replacing the
+/// node.
 ///
 /// # Performance
 ///
@@ -594,13 +986,55 @@ pub async fn compact_namespace_under_lease(
 /// explicit ownership split; C needs a refcount, atomic memory-order choices,
 /// and cleanup on every exit path. Rust cleans up ordinary owned values, but a
 /// detached Tokio task still requires explicit cancellation as described above.
-pub async fn run_compaction_with_lease(
+pub async fn run_compaction_with_lease_and_lifecycle(
     compactor: &Compactor,
     lease_manager: &Arc<LeaseManager>,
     namespace: &str,
     lease: Lease,
     fts_configs: &HashMap<String, FtsFieldConfig>,
     fragment_cache: FragmentCachePolicy<'_>,
+    lifecycle: &CompactionLifecycle,
+) -> Result<CompactionResult> {
+    let reservation = match lifecycle.reserve() {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            // Compatibility callers may already have acquired their lease.
+            // Do not leave it live when retirement beats registration.
+            if let Err(release_error) = lease_manager.release(namespace, &lease).await {
+                warn!(
+                    namespace = %namespace,
+                    error = %release_error,
+                    "lease release failed after compaction lifecycle retirement"
+                );
+            }
+            return Err(error);
+        }
+    };
+    run_compaction_with_reserved_lease(
+        compactor,
+        lease_manager,
+        namespace,
+        lease,
+        fts_configs,
+        fragment_cache,
+        reservation,
+    )
+    .await
+}
+
+/// Runs an already-acquired lease using a reservation made before acquisition.
+///
+/// Server paths call [`CompactionLifecycle::reserve`] while they still hold no
+/// S3 lease, then pass that reservation here after successful acquisition.
+/// This makes lifecycle close atomic with both periodic and manual admission.
+pub async fn run_compaction_with_reserved_lease(
+    compactor: &Compactor,
+    lease_manager: &Arc<LeaseManager>,
+    namespace: &str,
+    lease: Lease,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+    fragment_cache: FragmentCachePolicy<'_>,
+    reservation: CompactionRunReservation,
 ) -> Result<CompactionResult> {
     info!(
         namespace = %namespace,
@@ -609,11 +1043,28 @@ pub async fn run_compaction_with_lease(
         "starting compaction with acquired lease"
     );
 
-    let heartbeat = LeaseHeartbeat::spawn(
+    let mut heartbeat = match LeaseHeartbeat::spawn(
+        reservation.into_active(),
         Arc::clone(lease_manager),
         namespace.to_string(),
         lease.clone(),
-    );
+    ) {
+        Ok(heartbeat) => heartbeat,
+        Err(error) => {
+            // The lifecycle may have closed after this caller acquired its
+            // lease but before it could register a heartbeat. Do not strand a
+            // short-lived lease over a replacement: release best-effort, then
+            // surface the retired lifecycle loudly to the caller.
+            if let Err(release_error) = lease_manager.release(namespace, &lease).await {
+                warn!(
+                    namespace = %namespace,
+                    error = %release_error,
+                    "lease release failed after compaction lifecycle retirement"
+                );
+            }
+            return Err(error);
+        }
+    };
 
     let result = compactor
         .compact_with_fts_signaled(
@@ -625,7 +1076,7 @@ pub async fn run_compaction_with_lease(
         )
         .await;
 
-    heartbeat.stop();
+    heartbeat.stop_and_join().await;
 
     // Best-effort release; never blocks or fails the cycle. If the lease
     // was taken over, release() detects the holder/token mismatch and
@@ -633,6 +1084,7 @@ pub async fn run_compaction_with_lease(
     if let Err(e) = lease_manager.release(namespace, &lease).await {
         warn!(namespace = %namespace, error = %e, "lease release failed (best-effort)");
     }
+    heartbeat.finish();
 
     result
 }
@@ -772,7 +1224,8 @@ async fn warm_segment_index_meta(store: ZeppelinStore, cache: Arc<DiskCache>, na
 /// - `namespace_manager`: Shared namespace discovery, deletion, and health
 ///   coordinator.
 /// - `shutdown`: Watch receiver whose next change or closed channel asks the loop
-///   to stop. The current boolean value is not inspected by this module.
+///   to stop. A lifecycle-retired admission error also reads its current value
+///   to distinguish shutdown control flow from an operational failure.
 /// - `manifest_cache`: Process-local query-manifest cache invalidated after
 ///   successful deletion or compaction.
 /// - `lease_manager`: Shared holder used for all namespace compaction leases.
@@ -825,8 +1278,10 @@ async fn warm_segment_index_meta(store: ZeppelinStore, cache: Arc<DiskCache>, na
 /// The `move` closure transfers owned `Arc` handles and the watch receiver into
 /// the OS thread. Unlike a Java reference capture or C pointer handoff, Rust
 /// requires every captured value to be safe to send across threads. Dropping a
-/// Rust thread `JoinHandle` detaches the thread; production therefore retains
-/// and explicitly joins it during shutdown.
+/// Rust thread `JoinHandle` detaches the thread; production retains it and
+/// attempts a bounded join during shutdown. A timeout is reported loudly and
+/// process exit, rather than same-process replacement, contains any remaining
+/// OS-thread work.
 #[allow(clippy::expect_used)]
 pub fn start_compaction_thread(
     compactor: Arc<Compactor>,
@@ -835,6 +1290,7 @@ pub fn start_compaction_thread(
     manifest_cache: Arc<ManifestCache>,
     lease_manager: Arc<LeaseManager>,
     cache: Arc<DiskCache>,
+    lifecycle: CompactionLifecycle,
     options: CompactionThreadOptions,
 ) -> std::thread::JoinHandle<()> {
     let compaction_workers = options.compaction_workers;
@@ -850,7 +1306,7 @@ pub fn start_compaction_thread(
                 .build()
                 .expect("failed to build compaction runtime");
 
-            rt.block_on(compaction_loop(
+            rt.block_on(compaction_loop_with_lifecycle(
                 compactor,
                 namespace_manager,
                 shutdown,
@@ -861,6 +1317,7 @@ pub fn start_compaction_thread(
                     gc_config,
                     namespace_prefix: None,
                 },
+                &lifecycle,
             ));
         })
         .expect("failed to spawn compaction thread")
@@ -970,7 +1427,7 @@ pub async fn evaluate_compaction_trigger(
 /// lease-protected compaction, or remaining namespaces in the current snapshot.
 /// After the loop returns, dropping the dedicated runtime cancels any spawned
 /// warm tasks still running. The per-compaction heartbeat is normally stopped by
-/// [`run_compaction_with_lease`] before control returns here.
+/// [`run_compaction_with_reserved_lease`] before control returns here.
 ///
 /// # Performance
 ///
@@ -1011,11 +1468,41 @@ pub async fn evaluate_compaction_trigger(
 pub async fn compaction_loop(
     compactor: Arc<Compactor>,
     namespace_manager: Arc<NamespaceManager>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    manifest_cache: Arc<ManifestCache>,
+    lease_manager: Arc<LeaseManager>,
+    cache: Arc<DiskCache>,
+    options: CompactionLoopOptions,
+) {
+    let lifecycle = CompactionLifecycle::new();
+    compaction_loop_with_lifecycle(
+        compactor,
+        namespace_manager,
+        shutdown,
+        manifest_cache,
+        lease_manager,
+        cache,
+        options,
+        &lifecycle,
+    )
+    .await;
+}
+
+/// Repeatedly runs maintenance under a shared server compaction lifecycle.
+///
+/// The periodic loop and manual HTTP endpoint must receive the same lifecycle
+/// from server construction so one crash-retirement barrier owns every lease
+/// heartbeat. Direct callers that do not have a server owner use
+/// [`compaction_loop`], which creates an isolated lifecycle.
+pub async fn compaction_loop_with_lifecycle(
+    compactor: Arc<Compactor>,
+    namespace_manager: Arc<NamespaceManager>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     manifest_cache: Arc<ManifestCache>,
     lease_manager: Arc<LeaseManager>,
     cache: Arc<DiskCache>,
     options: CompactionLoopOptions,
+    lifecycle: &CompactionLifecycle,
 ) {
     let CompactionLoopOptions {
         gc_config,
@@ -1185,12 +1672,13 @@ pub async fn compaction_loop(
                     // Compact under the per-namespace lease (acquire →
                     // heartbeat → compact → release). LeaseHeld means
                     // another node is on it — skip quietly, not a failure.
-                    match compact_namespace_under_lease(
+                    match compact_namespace_under_lease_with_lifecycle(
                         &compactor,
                         &lease_manager,
                         &ns.name,
                         &ns.full_text_search,
                         FragmentCachePolicy::ReadOnly(&cache),
+                        lifecycle,
                     )
                     .await
                     {
@@ -1235,6 +1723,19 @@ pub async fn compaction_loop(
                                     ns.name.clone(),
                                 ));
                             }
+                        }
+                        Err(e) if lifecycle.is_retired() && *shutdown.borrow() => {
+                            // Shutdown can race a periodic tick between its
+                            // trigger read and lease reservation. Retirement is
+                            // not an operational compaction failure: the
+                            // process already withdrew the authority to begin
+                            // another run, so do not persist a false health
+                            // failure before leaving the loop.
+                            debug!(
+                                namespace = %ns.name,
+                                "compaction admission retired during shutdown"
+                            );
+                            return;
                         }
                         Err(e) => {
                             crate::metrics::COMPACTIONS_TOTAL

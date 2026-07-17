@@ -10,7 +10,7 @@
 //!
 //! [`Compactor`][crate::compaction::Compactor] is the domain coordinator.
 //! Production normally enters it through
-//! [`background::compact_namespace_under_lease`][crate::compaction::background::compact_namespace_under_lease], which acquires and
+//! [`background::compact_namespace_under_lease_with_lifecycle`][crate::compaction::background::compact_namespace_under_lease_with_lifecycle], which acquires and
 //! renews a per-namespace lease, supplies its fencing token, and runs on the
 //! dedicated compaction runtime. Direct entry points remain useful to tests and
 //! administrative tools. This file calls the WAL reader, IVF-Flat or
@@ -193,7 +193,7 @@
 /// Runs lease-protected background compaction and cache warming.
 ///
 /// See
-/// [`background::compact_namespace_under_lease`]
+/// [`background::compact_namespace_under_lease_with_lifecycle`]
 /// for the production entry point that supplies the fencing token and
 /// lease-loss signal used here.
 pub mod background;
@@ -899,7 +899,7 @@ impl Compactor {
     ///
     /// ETag CAS preserves concurrent manifest changes, but this wrapper supplies
     /// no lease fencing token. Use
-    /// [`background::compact_namespace_under_lease`] for production multi-node
+    /// [`background::compact_namespace_under_lease_with_lifecycle`] for production multi-node
     /// coordination.
     ///
     /// # Examples

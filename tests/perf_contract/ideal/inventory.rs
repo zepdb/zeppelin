@@ -273,7 +273,7 @@ const PRODUCTION_PATHS: &[ProductionPath] = &[
     ),
     path(
         "background.compaction_fenced",
-        "src/compaction/background.rs:compact_namespace_under_lease",
+        "src/compaction/background.rs:compact_namespace_under_lease_with_lifecycle",
         &[
             StoreMethod::Get,
             StoreMethod::GetWithMeta,
@@ -799,7 +799,7 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
     ),
     path(
         "catalog.background.tick_lease_held",
-        "src/compaction/background.rs:compact_namespace_under_lease",
+        "src/compaction/background.rs:compact_namespace_under_lease_with_lifecycle",
         &[StoreMethod::Get, StoreMethod::GetWithMeta],
         &[PhysicalVariant::GetFull],
         ideal_case("background.tick_lease_held"),
@@ -895,7 +895,7 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
     ),
     path(
         "catalog.compaction.fenced_incremental",
-        "src/compaction/background.rs:compact_namespace_under_lease",
+        "src/compaction/background.rs:compact_namespace_under_lease_with_lifecycle",
         &[
             StoreMethod::Get,
             StoreMethod::GetWithMeta,
@@ -917,7 +917,7 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
     ),
     path(
         "catalog.compaction.fragment_cache_warm",
-        "src/compaction/background.rs:compact_namespace_under_lease",
+        "src/compaction/background.rs:compact_namespace_under_lease_with_lifecycle",
         &[
             StoreMethod::Get,
             StoreMethod::GetWithMeta,

@@ -14,13 +14,14 @@ use zeppelin::cache::decoded_cache::DecodedArtifactCache;
 use zeppelin::cache::hydration::{heat_policy_from_config, HydrationConfig, SegmentHydrator};
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
+use zeppelin::compaction::background::CompactionLifecycle;
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, Config, DEFAULT_RERANK_COALESCE_GAP_BYTES};
 use zeppelin::fts::wal_cache::WalFtsCache;
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
-use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
+use zeppelin::server::{build_router, parse_trusted_proxies, AppState, ServerTaskSupervisor};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
 use zeppelin::wal::manifest::{Manifest, SegmentRef};
@@ -111,11 +112,13 @@ async fn start_parity_server(mut config: Config) -> ParityServer {
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let (audit, audit_runtime, _audit_node_id) =
         common::server::start_test_audit(&config, &store, Some(&harness.prefix), &security).await;
+    let server_tasks = Arc::new(ServerTaskSupervisor::new());
+    let compaction_lifecycle = CompactionLifecycle::new();
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
         receipts: zeppelin::server::ReceiptCapability::compose(&security),
-        security,
+        security: Arc::clone(&security),
         audit,
         credential_adapter,
         namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
@@ -124,6 +127,8 @@ async fn start_parity_server(mut config: Config) -> ParityServer {
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor: compactor.clone(),
         lease_manager,
+        compaction_lifecycle: compaction_lifecycle.clone(),
+        server_tasks: Arc::clone(&server_tasks),
         fragment_cache: Arc::new(WalFragmentCache::new(
             config.cache.wal_fragment_cache_max_mb * 1024 * 1024,
         )),
@@ -143,7 +148,15 @@ async fn start_parity_server(mut config: Config) -> ParityServer {
     };
 
     let app = build_router(state);
-    let base_url = common::server::spawn_test_router(&harness, app, audit_runtime).await;
+    let base_url = common::server::spawn_test_router_with_lifecycle(
+        &harness,
+        app,
+        server_tasks,
+        compaction_lifecycle,
+        security,
+        audit_runtime,
+    )
+    .await;
 
     ParityServer {
         base_url,

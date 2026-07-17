@@ -143,7 +143,7 @@ use std::collections::BTreeMap;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
-use crate::compaction::background::run_compaction_with_lease;
+use crate::compaction::background::run_compaction_with_reserved_lease;
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
@@ -2204,6 +2204,10 @@ pub async fn compact_namespace(
         ));
     }
 
+    let reservation = state
+        .compaction_lifecycle
+        .reserve()
+        .map_err(ApiError::from)?;
     let lease = state
         .lease_manager
         .acquire(&ns)
@@ -2222,36 +2226,39 @@ pub async fn compact_namespace(
     let clock = state.clock.clone();
     let ns_for_task = ns.clone();
     let fts_configs = meta.full_text_search.clone();
-    tokio::spawn(async move {
-        match run_compaction_with_lease(
-            &compactor,
-            &lease_manager,
-            &ns_for_task,
-            lease,
-            &fts_configs,
-            FragmentCachePolicy::ReadOnly(&cache),
-        )
-        .await
-        {
-            Ok(result) => {
-                manifest_cache.invalidate_at(&ns_for_task, clock.now());
-                info!(
-                    namespace = %ns_for_task,
-                    vectors_compacted = result.vectors_compacted,
-                    fragments_removed = result.fragments_removed,
-                    "manual compaction completed"
-                );
+    state
+        .server_tasks
+        .spawn("manual namespace compaction", async move {
+            match run_compaction_with_reserved_lease(
+                &compactor,
+                &lease_manager,
+                &ns_for_task,
+                lease,
+                &fts_configs,
+                FragmentCachePolicy::ReadOnly(&cache),
+                reservation,
+            )
+            .await
+            {
+                Ok(result) => {
+                    manifest_cache.invalidate_at(&ns_for_task, clock.now());
+                    info!(
+                        namespace = %ns_for_task,
+                        vectors_compacted = result.vectors_compacted,
+                        fragments_removed = result.fragments_removed,
+                        "manual compaction completed"
+                    );
+                }
+                Err(e) => {
+                    manifest_cache.invalidate_at(&ns_for_task, clock.now());
+                    tracing::error!(
+                        namespace = %ns_for_task,
+                        error = %e,
+                        "manual compaction failed"
+                    );
+                }
             }
-            Err(e) => {
-                manifest_cache.invalidate_at(&ns_for_task, clock.now());
-                tracing::error!(
-                    namespace = %ns_for_task,
-                    error = %e,
-                    "manual compaction failed"
-                );
-            }
-        }
-    });
+        });
 
     Ok((
         StatusCode::ACCEPTED,

@@ -20,7 +20,7 @@ use ulid::Ulid;
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::{
-    compact_namespace_under_lease, evaluate_compaction_trigger,
+    compact_namespace_under_lease_with_lifecycle, evaluate_compaction_trigger, CompactionLifecycle,
 };
 use zeppelin::compaction::gc::{
     active_staged_keys_at, clear_compaction_staging, drain_pending_deletes_at, load_gc_candidates,
@@ -443,14 +443,16 @@ async fn execute_fenced_full(case: &IdealCase) -> IdealSample {
         .expect("ideal fenced-full WAL setup failed");
     let compactor = maintenance_compactor(&world, CompactionConfig::default());
     let lease_manager = maintenance_lease_manager(&world, "ideal-fenced-full");
+    let compaction_lifecycle = CompactionLifecycle::new();
 
     world.begin_measurement().await;
-    let result = compact_namespace_under_lease(
+    let result = compact_namespace_under_lease_with_lifecycle(
         &compactor,
         &lease_manager,
         &namespace,
         &HashMap::new(),
         FragmentCachePolicy::Bypass,
+        &compaction_lifecycle,
     )
     .await
     .expect("ideal fenced full compaction failed");
@@ -486,14 +488,16 @@ async fn execute_fenced_incremental(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal incremental WAL setup failed");
     let lease_manager = maintenance_lease_manager(&world, "ideal-fenced-incremental");
+    let compaction_lifecycle = CompactionLifecycle::new();
 
     world.begin_measurement().await;
-    let result = compact_namespace_under_lease(
+    let result = compact_namespace_under_lease_with_lifecycle(
         &compactor,
         &lease_manager,
         &namespace,
         &HashMap::new(),
         FragmentCachePolicy::Bypass,
+        &compaction_lifecycle,
     )
     .await
     .expect("ideal fenced incremental compaction failed");
@@ -546,13 +550,15 @@ async fn execute_fragment_cache_warm(case: &IdealCase) -> IdealSample {
 
     let compactor = maintenance_compactor(&world, CompactionConfig::default());
     let lease_manager = maintenance_lease_manager(&world, "ideal-cache-warm");
+    let compaction_lifecycle = CompactionLifecycle::new();
     world.begin_measurement().await;
-    let result = compact_namespace_under_lease(
+    let result = compact_namespace_under_lease_with_lifecycle(
         &compactor,
         &lease_manager,
         &namespace,
         &HashMap::new(),
         FragmentCachePolicy::ReadOnly(&cache),
+        &compaction_lifecycle,
     )
     .await
     .expect("ideal cache-warm compaction failed");
@@ -920,6 +926,7 @@ async fn execute_tick_lease_held(case: &IdealCase) -> IdealSample {
         .expect("ideal held-lease setup acquisition failed");
     let contender = maintenance_lease_manager(&world, "ideal-contender");
     let compactor = maintenance_compactor(&world, trigger_each_fragment());
+    let compaction_lifecycle = CompactionLifecycle::new();
     let manifest_cache = ManifestCache::new(Duration::from_secs(3_600));
     let metadata = manager
         .cached_namespaces(Some(&world.harness.prefix))
@@ -933,12 +940,13 @@ async fn execute_tick_lease_held(case: &IdealCase) -> IdealSample {
             .await
             .expect("ideal held-lease trigger check failed")
     );
-    let result = compact_namespace_under_lease(
+    let result = compact_namespace_under_lease_with_lifecycle(
         &compactor,
         &contender,
         &namespace,
         &HashMap::new(),
         FragmentCachePolicy::Bypass,
+        &compaction_lifecycle,
     )
     .await;
     assert!(matches!(result, Err(ZeppelinError::LeaseHeld { .. })));
@@ -966,6 +974,7 @@ async fn execute_tick_compaction_success(case: &IdealCase) -> IdealSample {
         .expect("ideal successful-tick WAL setup failed");
     let compactor = maintenance_compactor(&world, trigger_each_fragment());
     let lease_manager = maintenance_lease_manager(&world, "ideal-tick");
+    let compaction_lifecycle = CompactionLifecycle::new();
     let manifest_cache = ManifestCache::new(Duration::from_secs(3_600));
     let metadata = manager
         .cached_namespaces(Some(&world.harness.prefix))
@@ -979,12 +988,13 @@ async fn execute_tick_compaction_success(case: &IdealCase) -> IdealSample {
             .await
             .expect("ideal successful-tick trigger check failed")
     );
-    let result = compact_namespace_under_lease(
+    let result = compact_namespace_under_lease_with_lifecycle(
         &compactor,
         &lease_manager,
         &namespace,
         &HashMap::new(),
         FragmentCachePolicy::Bypass,
+        &compaction_lifecycle,
     )
     .await
     .expect("ideal successful-tick compaction failed");

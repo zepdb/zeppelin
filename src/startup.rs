@@ -1,4 +1,4 @@
-//! Builds the complete Zeppelin process graph and shuts down compaction.
+//! Builds the complete Zeppelin process graph and retires owned server work.
 //!
 //! [`crate::startup::build_app`] is the composition root between boot-time
 //! [`crate::config::Config`] and the HTTP [`axum::Router`]. It validates
@@ -52,13 +52,15 @@
 //! ## Shutdown ownership
 //!
 //! ```text
-//! main owns watch::Sender + compaction JoinHandle
+//! main owns watch::Sender + compaction JoinHandle + server lifecycle owners
 //!                 |
-//!                 | send true
+//!                 | send true; join request mutation + background work against
+//!                 | one absolute graceful deadline
 //!                 v
 //! compaction runtime observes shutdown and exits its OS thread
 //!                 |
-//!                 | spawn_blocking joins without blocking query workers
+//!                 | close leased-compaction admission; abort/join heartbeats
+//!                 | and authority refresh owners before return
 //!                 v
 //! success / thread panic / join failure / timeout
 //! ```
@@ -74,9 +76,9 @@
 //! - The compaction runtime is isolated on its own OS thread. Hydration runs on
 //!   the main Tokio runtime and query admission uses a semaphore in
 //!   [`crate::server::AppState`].
-//! - [`crate::startup::shutdown_background_tasks`] signals/joins the compaction
-//!   thread only. Hydration and request tasks end through normal Tokio/AppState
-//!   lifecycle.
+//! - [`crate::startup::shutdown_background_tasks`] retires request-originated
+//!   authoritative mutations, authority refresh tasks, and the compaction
+//!   thread. Hydration remains independently queue-owned.
 //!
 //! TODO(doc): Verify where
 //! [`CpuBudget::query_workers`][crate::config::CpuBudget::query_workers] and
@@ -113,7 +115,9 @@ use crate::cache::{
     hydration::{heat_policy_from_config, HydrationConfig, SegmentHydrator},
     DiskCache,
 };
-use crate::compaction::background::{start_compaction_thread, CompactionThreadOptions};
+use crate::compaction::background::{
+    start_compaction_thread, CompactionLifecycle, CompactionThreadOptions,
+};
 use crate::compaction::Compactor;
 use crate::config::{Config, CpuBudget, SecurityMode, StorageBackend};
 use crate::error::{Result as ZeppelinResult, ZeppelinError};
@@ -124,8 +128,7 @@ use crate::security::{
     AuditRecord, AuditRuntime, EntitlementResolver, Entitlements, Feature, FileLicenseResolver,
     SecurityKernel,
 };
-use crate::server::build_router;
-use crate::server::AppState;
+use crate::server::{build_router, AppState, ServerTaskSupervisor};
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
 use crate::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
@@ -187,11 +190,14 @@ fn spawn_license_observer(
     })
 }
 
-/// Unique lifecycle ownership for every non-audit background service.
+/// Unique lifecycle ownership for maintenance and request-spawned authoritative work.
 pub struct BackgroundTasks {
     shutdown_tx: watch::Sender<bool>,
     compaction_handle: std::thread::JoinHandle<()>,
     license_observer: tokio::task::JoinHandle<()>,
+    compaction_lifecycle: CompactionLifecycle,
+    server_tasks: Arc<ServerTaskSupervisor>,
+    security: Option<Arc<SecurityKernel>>,
 }
 
 impl BackgroundTasks {
@@ -206,7 +212,24 @@ impl BackgroundTasks {
             shutdown_tx,
             compaction_handle,
             license_observer,
+            compaction_lifecycle: CompactionLifecycle::new(),
+            server_tasks: Arc::new(ServerTaskSupervisor::new()),
+            security: None,
         }
+    }
+
+    /// Attach HTTP-owned authority and mutation-task lifecycle to this process owner.
+    #[must_use]
+    pub fn with_server_lifecycle(
+        mut self,
+        security: Arc<SecurityKernel>,
+        server_tasks: Arc<ServerTaskSupervisor>,
+        compaction_lifecycle: CompactionLifecycle,
+    ) -> Self {
+        self.security = Some(security);
+        self.server_tasks = server_tasks;
+        self.compaction_lifecycle = compaction_lifecycle;
+        self
     }
 }
 
@@ -304,11 +327,11 @@ pub fn init_logging(config: &Config) {
 ///
 /// # Returns
 ///
-/// A ready [`Router`], a [`watch::Sender`] used to request compaction shutdown,
-/// the owned OS-thread join handle required by [`shutdown_background_tasks`],
-/// and the owned [`AuditRuntime`] that must drain after HTTP stops accepting
-/// work. The caller must bind/serve the router, drain audit, and eventually
-/// signal/join the thread.
+/// A ready [`Router`], an owned [`BackgroundTasks`] lifecycle containing the
+/// maintenance, request-mutation, lease-heartbeat, and authority-refresh
+/// owners, and the owned [`AuditRuntime`] that must drain after HTTP stops
+/// accepting work. The caller must bind/serve the router, drain audit, and
+/// eventually retire the background owner.
 ///
 /// # Errors
 ///
@@ -625,6 +648,7 @@ async fn build_app_with_entitlement_resolver(
         Duration::from_secs(config.compaction.lease_duration_secs),
         clock.clone(),
     ));
+    let compaction_lifecycle = CompactionLifecycle::new();
 
     // Spawn background compaction on a dedicated runtime (CPU isolation from queries)
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -635,6 +659,7 @@ async fn build_app_with_entitlement_resolver(
         manifest_cache.clone(),
         lease_manager.clone(),
         cache.clone(),
+        compaction_lifecycle.clone(),
         CompactionThreadOptions {
             compaction_workers: cpu_budget.compaction_workers,
             gc_config: config.gc.clone(),
@@ -697,6 +722,8 @@ async fn build_app_with_entitlement_resolver(
     );
     let credential_adapter: Arc<dyn crate::security::CredentialAdapter> = credential_adapter;
     let receipts = crate::server::ReceiptCapability::compose(&security);
+    let background_security = Arc::clone(&security);
+    let server_tasks = Arc::new(ServerTaskSupervisor::new());
     let state = AppState {
         store,
         clock,
@@ -710,6 +737,8 @@ async fn build_app_with_entitlement_resolver(
         wal_reader,
         compactor,
         lease_manager,
+        compaction_lifecycle: compaction_lifecycle.clone(),
+        server_tasks: Arc::clone(&server_tasks),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,
@@ -729,7 +758,8 @@ async fn build_app_with_entitlement_resolver(
 
     Ok((
         app,
-        BackgroundTasks::from_parts(shutdown_tx, compaction_handle, license_observer),
+        BackgroundTasks::from_parts(shutdown_tx, compaction_handle, license_observer)
+            .with_server_lifecycle(background_security, server_tasks, compaction_lifecycle),
         audit_runtime,
     ))
 }
@@ -783,25 +813,36 @@ async fn probe_storage(store: &ZeppelinStore) -> ZeppelinResult<()> {
 /// # Parameters
 ///
 /// - `backgrounds`: Unique compaction and license-observer lifecycle owner.
-/// - `timeout_duration`: Maximum time this caller waits for the spawned join
-///   task.
+/// - `timeout_duration`: One shared graceful-drain budget for request mutation
+///   work and the compaction/license background joins.
 ///
 /// # Returns
 ///
-/// `Ok(())` only when the compaction OS thread and license observer both exit
-/// normally before the deadline.
+/// `Ok(())` only when request-originated authoritative mutations and the
+/// compaction/license observers complete their cooperative drain inside the
+/// configured graceful budget, followed by completed heartbeat and
+/// authority-refresh cancellation barriers. The latter are non-detaching safety
+/// cleanup and may outlast the cooperative budget.
 ///
 /// # Errors
 ///
-/// Returns configuration errors when either task panics, the blocking join task
-/// fails, or the timeout expires. The shutdown send result itself is ignored
-/// because a closed receiver already means no active listener remains.
+/// Returns configuration errors when an owned task panics, the blocking join
+/// task fails, or the shared graceful deadline expires. The shutdown send
+/// result itself is ignored because a closed receiver already means no active
+/// listener remains.
 ///
 /// # Side Effects
 ///
-/// Publishes `true` on the shared watch channel and occupies a blocking-pool
-/// task while joining the compaction OS thread. It does not explicitly stop
-/// hydration or request tasks.
+/// Publishes `true` on the shared watch channel, then drains accepted
+/// request-originated authoritative mutations and joins compaction/license work
+/// against one absolute deadline. It subsequently closes leased-compaction
+/// admission and joins the heartbeat and authority-refresh cancellation
+/// barriers. Those barriers prove that request-owned mutation, lease-renewal,
+/// publication, and authority-refresh capability cannot survive into a
+/// replacement. If the compaction OS thread or license observer misses the
+/// graceful deadline, this function returns a loud error; process exit, rather
+/// than a replacement in the same process, contains that remaining background
+/// work. Hydration remains independently queue-owned.
 ///
 /// # Examples
 ///
@@ -823,11 +864,23 @@ pub async fn shutdown_background_tasks(
         shutdown_tx,
         compaction_handle,
         license_observer,
+        compaction_lifecycle,
+        server_tasks,
+        security,
     } = backgrounds;
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+    // Shared background workers must see shutdown before this owner waits for
+    // foreground mutation work. Existing periodic work receives its normal
+    // completion path; no new HTTP request can admit manual work after Axum's
+    // prior graceful drain.
     let _ = shutdown_tx.send(true);
+    let request_task_result = server_tasks
+        .join_until(deadline)
+        .await
+        .map_err(ZeppelinError::from);
     let join_task = tokio::task::spawn_blocking(move || compaction_handle.join());
 
-    match tokio::time::timeout(timeout_duration, async {
+    let background_result = match tokio::time::timeout_at(deadline, async {
         tokio::join!(join_task, license_observer)
     })
     .await
@@ -846,6 +899,23 @@ pub async fn shutdown_background_tasks(
             "timed out after {}s waiting for background task shutdown",
             timeout_duration.as_secs()
         ))),
+    };
+    let heartbeat_result = compaction_lifecycle
+        .close_and_abort_heartbeats()
+        .await
+        .map_err(ZeppelinError::from);
+    if let Some(security) = security {
+        security.shutdown_refresh_tasks().await;
+    }
+    let errors = [request_task_result, background_result, heartbeat_result]
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ZeppelinError::Config(errors.join("; ")))
     }
 }
 

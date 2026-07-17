@@ -226,6 +226,99 @@ pub struct PauseAfterGetStore {
     release: Arc<tokio::sync::Semaphore>,
 }
 
+/// Controller for an explicitly armed one-shot matching GET pause.
+///
+/// Unlike [`PauseGetHandle`], this starts disarmed so a test can complete
+/// server bootstrap before pinning a background refresh at the storage
+/// boundary.
+#[derive(Clone, Debug)]
+pub struct ArmedPauseGetHandle {
+    armed: Arc<AtomicBool>,
+    arrivals: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+    cancelled_before_storage: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
+    exit_notify: Arc<tokio::sync::Notify>,
+}
+
+impl ArmedPauseGetHandle {
+    /// Pause the next matching GET before it reaches storage.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait until the armed matching GET is blocked before reaching storage.
+    pub async fn wait_until_paused(&self) {
+        loop {
+            let notified = self.entered.notified();
+            if self.arrivals.load(Ordering::SeqCst) != 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Allow the paused GET to reach the authoritative backend.
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+
+    /// Wait until the paused GET future has exited for any reason.
+    pub async fn wait_until_exited(&self) {
+        loop {
+            let notified = self.exit_notify.notified();
+            if self.exited.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Return whether the paused GET was cancelled before it could reach S3.
+    #[must_use]
+    pub fn was_cancelled_before_storage(&self) -> bool {
+        self.cancelled_before_storage.load(Ordering::SeqCst)
+    }
+
+    /// Return whether the paused GET future has exited.
+    #[must_use]
+    pub fn has_exited(&self) -> bool {
+        self.exited.load(Ordering::SeqCst)
+    }
+}
+
+/// Object-store decorator that pauses the next explicitly armed matching GET.
+#[derive(Debug)]
+pub struct ArmedPauseGetStore {
+    inner: Arc<dyn ObjectStore>,
+    needle: String,
+    armed: Arc<AtomicBool>,
+    arrivals: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+    cancelled_before_storage: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
+    exit_notify: Arc<tokio::sync::Notify>,
+}
+
+struct ArmedPauseGetFlight {
+    reached_storage: bool,
+    cancelled_before_storage: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
+    exit_notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for ArmedPauseGetFlight {
+    fn drop(&mut self) {
+        if !self.reached_storage {
+            self.cancelled_before_storage.store(true, Ordering::SeqCst);
+        }
+        self.exited.store(true, Ordering::SeqCst);
+        self.exit_notify.notify_waiters();
+    }
+}
+
 /// Controller for a one-shot matching create-only PUT pause.
 #[derive(Clone, Debug)]
 pub struct PauseCreateHandle {
@@ -390,6 +483,44 @@ pub fn pause_first_after_get_matching(
             arrivals,
             entered,
             release,
+        },
+    )
+}
+
+/// Wrap a store with an initially disarmed one-shot pause before a matching
+/// GET reaches S3.
+pub fn pause_next_get_matching(
+    store: &ZeppelinStore,
+    needle: impl Into<String>,
+) -> (ZeppelinStore, ArmedPauseGetHandle) {
+    let armed = Arc::new(AtomicBool::new(false));
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let cancelled_before_storage = Arc::new(AtomicBool::new(false));
+    let exited = Arc::new(AtomicBool::new(false));
+    let exit_notify = Arc::new(tokio::sync::Notify::new());
+    let wrapper = ArmedPauseGetStore {
+        inner: store.inner(),
+        needle: needle.into(),
+        armed: Arc::clone(&armed),
+        arrivals: Arc::clone(&arrivals),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        cancelled_before_storage: Arc::clone(&cancelled_before_storage),
+        exited: Arc::clone(&exited),
+        exit_notify: Arc::clone(&exit_notify),
+    };
+    (
+        ZeppelinStore::new(Arc::new(wrapper)),
+        ArmedPauseGetHandle {
+            armed,
+            arrivals,
+            entered,
+            release,
+            cancelled_before_storage,
+            exited,
+            exit_notify,
         },
     )
 }
@@ -1274,6 +1405,12 @@ impl fmt::Display for PauseAfterGetStore {
     }
 }
 
+impl fmt::Display for ArmedPauseGetStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ArmedPauseGetStore({})", self.inner)
+    }
+}
+
 impl fmt::Display for PauseCreateStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "PauseCreateStore({})", self.inner)
@@ -1432,6 +1569,76 @@ impl ObjectStore for PauseAfterGetStore {
             permit.forget();
         }
         result
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for ArmedPauseGetStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        let should_pause = location.as_ref().contains(&self.needle)
+            && self
+                .armed
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+        if should_pause {
+            self.arrivals.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_waiters();
+            let mut flight = ArmedPauseGetFlight {
+                reached_storage: false,
+                cancelled_before_storage: Arc::clone(&self.cancelled_before_storage),
+                exited: Arc::clone(&self.exited),
+                exit_notify: Arc::clone(&self.exit_notify),
+            };
+            let permit = self
+                .release
+                .acquire()
+                .await
+                .expect("armed pause GET semaphore must remain open");
+            permit.forget();
+            flight.reached_storage = true;
+        }
+        self.inner.get_opts(location, options).await
     }
 
     async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {

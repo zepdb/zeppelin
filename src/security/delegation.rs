@@ -5,7 +5,7 @@ use std::fmt;
 #[cfg(unix)]
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration as StdDuration, Instant};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -14,7 +14,7 @@ use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 use ulid::Ulid;
 
 use crate::error::{Result as ZeppelinResult, ZeppelinError};
@@ -416,6 +416,11 @@ impl DelegationAuthority {
         self.verifier.signer_cache.refresh_once().await
     }
 
+    /// Stop and join the disposable signer-cache refresh before this authority retires.
+    pub(crate) async fn shutdown_refresh_task(&self) {
+        self.verifier.signer_cache.shutdown_refresh_task().await;
+    }
+
     pub(crate) fn mint(
         &self,
         parent_principal: PrincipalId,
@@ -616,7 +621,7 @@ struct SignerCache {
     signers: RwLock<HashMap<String, VerifyingKey>>,
     last_confirmed: Mutex<Instant>,
     refresh_interval: StdDuration,
-    refresh_abort: OnceLock<AbortHandle>,
+    refresh_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl SignerCache {
@@ -635,17 +640,17 @@ impl SignerCache {
             signers: RwLock::new(signers),
             last_confirmed: Mutex::new(Instant::now()),
             refresh_interval,
-            refresh_abort: OnceLock::new(),
+            refresh_task: Mutex::new(None),
         });
         let task = tokio::spawn(signer_refresh_loop(
             Arc::downgrade(&cache),
             refresh_interval,
         ));
-        cache.refresh_abort.set(task.abort_handle()).map_err(|_| {
-            ZeppelinError::Config(
-                "delegation signer refresh runtime initialized more than once".to_string(),
-            )
-        })?;
+        *cache
+            .refresh_task
+            .lock()
+            .unwrap_or_else(|_| panic!("delegation signer refresh task lock poisoned")) =
+            Some(task);
         Ok(cache)
     }
 
@@ -668,6 +673,11 @@ impl SignerCache {
 
     async fn refresh_once(&self) -> ZeppelinResult<()> {
         let signers = load_signers(&self.store).await?;
+        self.install_refresh(signers);
+        Ok(())
+    }
+
+    fn install_refresh(&self, signers: HashMap<String, VerifyingKey>) {
         *self
             .signers
             .write()
@@ -677,14 +687,39 @@ impl SignerCache {
             .lock()
             .unwrap_or_else(|_| panic!("delegation signer freshness lock poisoned")) =
             Instant::now();
-        Ok(())
+    }
+
+    async fn shutdown_refresh_task(&self) {
+        let task = self
+            .refresh_task
+            .lock()
+            .unwrap_or_else(|_| panic!("delegation signer refresh task lock poisoned"))
+            .take();
+        let Some(task) = task else {
+            return;
+        };
+        task.abort();
+        match task.await {
+            Err(error) if error.is_cancelled() => {}
+            Ok(()) => {
+                panic!(
+                    "delegation signer refresh task exited normally while authority remained live"
+                )
+            }
+            Err(error) => panic!("delegation signer refresh task failed during shutdown: {error}"),
+        }
     }
 }
 
 impl Drop for SignerCache {
     fn drop(&mut self) {
-        if let Some(abort) = self.refresh_abort.get() {
-            abort.abort();
+        let task = self
+            .refresh_task
+            .get_mut()
+            .unwrap_or_else(|_| panic!("delegation signer refresh task lock poisoned"))
+            .take();
+        if let Some(task) = task {
+            task.abort();
         }
     }
 }
@@ -692,10 +727,24 @@ impl Drop for SignerCache {
 async fn signer_refresh_loop(cache: Weak<SignerCache>, refresh_interval: StdDuration) {
     loop {
         tokio::time::sleep(refresh_interval).await;
+        let store = {
+            let Some(cache) = cache.upgrade() else {
+                return;
+            };
+            cache.store.clone()
+        };
+        let signers = load_signers(&store).await;
         let Some(cache) = cache.upgrade() else {
             return;
         };
-        if let Err(error) = cache.refresh_once().await {
+        let result = match signers {
+            Ok(signers) => {
+                cache.install_refresh(signers);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
             tracing::warn!(error = %error, "delegation signer refresh failed");
         }
     }

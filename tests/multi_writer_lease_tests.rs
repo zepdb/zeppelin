@@ -23,7 +23,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zeppelin::compaction::background::compact_namespace_under_lease;
+use zeppelin::compaction::background::{
+    compact_namespace_under_lease_with_lifecycle, CompactionLifecycle,
+};
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
 use zeppelin::error::ZeppelinError;
@@ -444,20 +446,23 @@ async fn test_lease_renewed_during_long_compaction() {
         Duration::from_secs(2), // tiny lease: compaction (~5s) outlasts it
     ));
     let compactor = Arc::new(slow_compactor(&store, Duration::from_secs(5)));
+    let compaction_lifecycle = CompactionLifecycle::new();
 
     // Snapshot the initial lease token by peeking after acquire: run the
     // compaction in a background task, then observe the lease from outside.
     let compaction = {
         let compactor = Arc::clone(&compactor);
         let lease_manager = Arc::clone(&lease_manager);
+        let compaction_lifecycle = compaction_lifecycle.clone();
         let ns = ns.clone();
         tokio::spawn(async move {
-            compact_namespace_under_lease(
+            compact_namespace_under_lease_with_lifecycle(
                 &compactor,
                 &lease_manager,
                 &ns,
                 &HashMap::new(),
                 zeppelin::wal::FragmentCachePolicy::Bypass,
+                &compaction_lifecycle,
             )
             .await
         })
@@ -494,6 +499,10 @@ async fn test_lease_renewed_during_long_compaction() {
 
     // The long compaction must complete successfully.
     let result = compaction.await.unwrap().unwrap();
+    compaction_lifecycle
+        .close_and_abort_heartbeats()
+        .await
+        .unwrap();
     assert_eq!(result.vectors_compacted, 40);
     assert!(
         result.segment_id.is_some(),
@@ -548,18 +557,21 @@ async fn test_stolen_lease_aborts_compaction_before_cas() {
         Duration::from_secs(2),
     ));
     let compactor = Arc::new(slow_compactor(&store, Duration::from_secs(6)));
+    let compaction_lifecycle = CompactionLifecycle::new();
 
     let compaction = {
         let compactor = Arc::clone(&compactor);
         let lease_manager = Arc::clone(&lease_manager);
+        let compaction_lifecycle = compaction_lifecycle.clone();
         let ns = ns.clone();
         tokio::spawn(async move {
-            compact_namespace_under_lease(
+            compact_namespace_under_lease_with_lifecycle(
                 &compactor,
                 &lease_manager,
                 &ns,
                 &HashMap::new(),
                 zeppelin::wal::FragmentCachePolicy::Bypass,
+                &compaction_lifecycle,
             )
             .await
         })
@@ -587,6 +599,10 @@ async fn test_stolen_lease_aborts_compaction_before_cas() {
 
     // The victim's compaction must abort with a clean error — never commit.
     let result = compaction.await.expect("compaction task must not panic");
+    compaction_lifecycle
+        .close_and_abort_heartbeats()
+        .await
+        .unwrap();
     assert!(
         result.is_err(),
         "A2 VIOLATED: compaction committed its manifest CAS after its lease \
@@ -710,17 +726,20 @@ async fn stolen_lease_aborts_legacy_receipt_hydration_before_cas() {
         Duration::from_millis(600),
     ));
     let compactor = Arc::new(slow_compactor(&victim_store, Duration::ZERO));
+    let compaction_lifecycle = CompactionLifecycle::new();
     let compaction = {
         let compactor = Arc::clone(&compactor);
         let lease_manager = Arc::clone(&lease_manager);
+        let compaction_lifecycle = compaction_lifecycle.clone();
         let ns = ns.clone();
         tokio::spawn(async move {
-            compact_namespace_under_lease(
+            compact_namespace_under_lease_with_lifecycle(
                 &compactor,
                 &lease_manager,
                 &ns,
                 &HashMap::new(),
                 zeppelin::wal::FragmentCachePolicy::Bypass,
+                &compaction_lifecycle,
             )
             .await
         })
@@ -751,6 +770,10 @@ async fn stolen_lease_aborts_legacy_receipt_hydration_before_cas() {
         .await
         .expect("legacy hydration task must not panic")
         .expect_err("stolen legacy hydration lease must abort publication");
+    compaction_lifecycle
+        .close_and_abort_heartbeats()
+        .await
+        .unwrap();
     assert!(
         matches!(
             error,

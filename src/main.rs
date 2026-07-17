@@ -3,8 +3,8 @@
 //! The binary keeps policy-light orchestration here and delegates dependency
 //! construction to [`zeppelin::startup::build_app`]. It loads optional dotenv
 //! values, resolves/loads configuration, installs logging, binds the Axum
-//! listener, serves requests until SIGINT/SIGTERM, then signals and joins the
-//! dedicated compaction thread.
+//! listener, serves requests until SIGINT/SIGTERM, then retires the owned
+//! request-mutation, lease-heartbeat, authority-refresh, and maintenance work.
 //!
 //! ```text
 //! dotenv (best effort) -> Config::load -> init logging -> build_app
@@ -22,13 +22,16 @@
 //!                                      drain durable audit writer
 //!                                                    |
 //!                                                    v
-//!                               signal + join compaction thread -> exit
+//!                signal maintenance + join accepted mutation work
+//!                                                    |
+//!                                                    v
+//!              retire lease heartbeats + authority refresh -> exit
 //! ```
 //!
 //! The application router and store remain responsible for S3/manifest
 //! authority; this file never reads local data as a substitute. Once startup
 //! returns owned background handles, every bind/serve outcome is settled only
-//! after audit drain and compaction shutdown have both been attempted.
+//! after audit drain and owned background retirement have both been attempted.
 //!
 //! ## Rust concepts used here
 //!
@@ -36,8 +39,9 @@
 //! owned signal futures and cancels the losing wait. The shutdown future is
 //! passed to Axum, which stops accepting new work and waits for in-flight
 //! services before returning. `?` then propagates bind, serve, and shutdown
-//! errors to Rust's runtime as a nonzero process exit. Audit drains before the
-//! compaction thread is stopped so every already-accepted HTTP event settles.
+//! errors to Rust's runtime as a nonzero process exit. Audit drains before
+//! background retirement so every already-accepted HTTP event settles before
+//! its request-originated mutation task is joined or cancelled.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -88,15 +92,15 @@ async fn settle_server_and_backgrounds(
 ///
 /// # Returns
 ///
-/// `Ok(())` after graceful HTTP and audit drains plus normal
-/// compaction-thread shutdown.
+/// `Ok(())` after graceful HTTP and audit drains plus normal retirement of
+/// request-originated mutation, authority-refresh, and maintenance owners.
 ///
 /// # Errors
 ///
 /// Propagates dotenv-independent configuration loading, application startup,
-/// TCP bind, Axum serve, audit drain, or compaction shutdown errors. After
+/// TCP bind, Axum serve, audit drain, or owned-background shutdown errors. After
 /// application construction succeeds, a bind/serve error remains the primary
-/// result but does not bypass audit drain or compaction shutdown.
+/// result but does not bypass audit drain or owned-background retirement.
 ///
 /// # Panics
 ///
@@ -114,8 +118,9 @@ async fn settle_server_and_backgrounds(
 ///
 /// With defaults, the process loads `./zeppelin.toml` when present, binds the
 /// configured host/port, and on Ctrl-C drains Axum before waiting up to the
-/// configured shutdown timeout for compaction after flushing queued audit
-/// records.
+/// configured shutdown timeout for accepted mutation and maintenance work after
+/// flushing queued audit records. A timeout is returned loudly; it is not a
+/// same-process replacement boundary for an unjoined maintenance OS thread.
 ///
 /// # Rust Notes for Java/C Engineers
 ///

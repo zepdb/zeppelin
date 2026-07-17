@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::Utc;
-use zeppelin::compaction::background::compact_namespace_under_lease;
+use zeppelin::compaction::background::{
+    compact_namespace_under_lease_with_lifecycle, CompactionLifecycle,
+};
 use zeppelin::compaction::gc::{active_staged_keys, reachable_keys_with_staging};
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
@@ -201,17 +203,20 @@ async fn test_gc_does_not_delete_active_staged_compaction_uploads() {
         Duration::from_secs(10),
     ));
     let compactor = Arc::new(staging_compactor(&store, Duration::from_secs(2), 30));
+    let compaction_lifecycle = CompactionLifecycle::new();
     let compaction = {
         let compactor = Arc::clone(&compactor);
         let lease_manager = Arc::clone(&lease_manager);
+        let compaction_lifecycle = compaction_lifecycle.clone();
         let ns = ns.clone();
         tokio::spawn(async move {
-            compact_namespace_under_lease(
+            compact_namespace_under_lease_with_lifecycle(
                 &compactor,
                 &lease_manager,
                 &ns,
                 &HashMap::new(),
                 zeppelin::wal::FragmentCachePolicy::Bypass,
+                &compaction_lifecycle,
             )
             .await
         })
@@ -226,6 +231,10 @@ async fn test_gc_does_not_delete_active_staged_compaction_uploads() {
         "R4-I1 violated: active staged uploads were deleted: {deleted:?}; uploaded={uploaded:?}"
     );
     compaction.await.unwrap().unwrap();
+    compaction_lifecycle
+        .close_and_abort_heartbeats()
+        .await
+        .unwrap();
     assert!(
         active_staged_keys(&store, &ns).await.unwrap().is_empty(),
         "R4-I2: staging entry must clear after successful CAS"
@@ -259,17 +268,20 @@ async fn test_stolen_lease_staging_drops_and_orphans_obey_horizon() {
         Duration::from_secs(2),
     ));
     let compactor = Arc::new(staging_compactor(&store, Duration::from_secs(5), 30));
+    let compaction_lifecycle = CompactionLifecycle::new();
     let compaction = {
         let compactor = Arc::clone(&compactor);
         let lease_manager = Arc::clone(&lease_manager);
+        let compaction_lifecycle = compaction_lifecycle.clone();
         let ns = ns.clone();
         tokio::spawn(async move {
-            compact_namespace_under_lease(
+            compact_namespace_under_lease_with_lifecycle(
                 &compactor,
                 &lease_manager,
                 &ns,
                 &HashMap::new(),
                 zeppelin::wal::FragmentCachePolicy::Bypass,
+                &compaction_lifecycle,
             )
             .await
         })
@@ -317,6 +329,10 @@ async fn test_stolen_lease_staging_drops_and_orphans_obey_horizon() {
     );
 
     let result = compaction.await.unwrap();
+    compaction_lifecycle
+        .close_and_abort_heartbeats()
+        .await
+        .unwrap();
     assert!(
         matches!(
             result,
