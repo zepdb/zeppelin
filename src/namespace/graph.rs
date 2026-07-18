@@ -149,6 +149,22 @@ impl NamespaceGraph {
             .into());
         }
         if let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind {
+            let identity =
+                metadata
+                    .branch_identity
+                    .as_ref()
+                    .ok_or(BranchError::BranchRootMismatch {
+                        branch_id: reservation.branch_id,
+                    })?;
+            if identity.branch_id != reservation.branch_id
+                || identity.target_namespace != request.namespace
+                || identity.target_incarnation != reservation.target_incarnation
+            {
+                return Err(BranchError::BranchRootMismatch {
+                    branch_id: reservation.branch_id,
+                }
+                .into());
+            }
             let source_manifest = Manifest::read_versioned_required_for_incarnation(
                 &self.store,
                 reservation.source_namespace.as_str(),
