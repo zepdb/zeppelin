@@ -2603,6 +2603,29 @@ impl NamespaceManager {
             } else {
                 None
             };
+            let parent_root = if governed {
+                if let NamespaceCreationKind::Fork(reservation) = &meta.creation_kind {
+                    let source_manifest = crate::wal::Manifest::read_versioned_required(
+                        &self.store,
+                        reservation.source_namespace.as_str(),
+                    )
+                    .await?
+                    .0;
+                    Some(
+                        source_manifest
+                            .branch_roots()
+                            .get(&reservation.branch_id)
+                            .cloned()
+                            .ok_or(BranchError::BranchRootMissing {
+                                branch_id: reservation.branch_id,
+                            })?,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             if meta.state == NamespaceState::Deleting {
                 match (&meta.destruction_record_key, &governed_key) {
@@ -2622,7 +2645,7 @@ impl NamespaceManager {
                                 incarnation,
                                 destruction_record_key: existing.clone(),
                                 decision_evidence_ref: existing.clone(),
-                                parent_root: None,
+                                parent_root: parent_root.clone(),
                             });
                         }
                     }
@@ -2644,7 +2667,7 @@ impl NamespaceManager {
                                 incarnation,
                                 destruction_record_key: expected.clone(),
                                 decision_evidence_ref: expected.clone(),
-                                parent_root: None,
+                                parent_root: parent_root.clone(),
                             });
                         }
                     }
@@ -2662,7 +2685,7 @@ impl NamespaceManager {
                         incarnation,
                         destruction_record_key: expected.clone(),
                         decision_evidence_ref: expected,
-                        parent_root: None,
+                        parent_root,
                     });
                 }
             }
