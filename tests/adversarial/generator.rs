@@ -10,8 +10,8 @@ use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter};
 
 use super::model::Model;
 use super::ops::{
-    ActorSel, AsOfTarget, GenVector, GeneratedQuery, InvalidProbe, MaintenanceKind, NamespaceSpec,
-    Op, QueryOracleClass,
+    ActorSel, AsOfTarget, BranchingOp, GenVector, GeneratedQuery, InvalidProbe, MaintenanceKind,
+    NamespaceSpec, Op, QueryOracleClass,
 };
 use super::security_program::{SecurityProgramConfig, SECURITY_PROGRAM_START_OP};
 use super::vocab;
@@ -30,6 +30,59 @@ pub struct Coverage {
     pub tag_counts: BTreeMap<String, u64>,
     #[serde(default)]
     pub security_oracle_counts: BTreeMap<String, u64>,
+}
+
+/// Reader-safety window in which a generated source-delete attempt executes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchingDeleteWindow {
+    PreGrace,
+    ElapsedGraceBeforeRelease,
+}
+
+/// Seeded deletion-only branching schedule used while production activation is
+/// unavailable to the general workload scheduler.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BranchingDeleteSchedule {
+    pub pre_grace_source_attempts: u8,
+    pub elapsed_grace_source_attempts: u8,
+}
+
+impl BranchingDeleteSchedule {
+    #[must_use]
+    pub fn for_seed(seed: u64) -> Self {
+        let extra_pre_grace_attempt = u8::from(((seed ^ (seed >> 1)) & 1) != 0);
+        Self {
+            pre_grace_source_attempts: 1 + extra_pre_grace_attempt,
+            elapsed_grace_source_attempts: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn source_delete_ops(&self, source: &str, window: BranchingDeleteWindow) -> Vec<Op> {
+        let attempts = match window {
+            BranchingDeleteWindow::PreGrace => self.pre_grace_source_attempts,
+            BranchingDeleteWindow::ElapsedGraceBeforeRelease => self.elapsed_grace_source_attempts,
+        };
+        (0..attempts)
+            .map(|_| {
+                Op::Branching(BranchingOp::DeleteSourceWithBranches {
+                    actor: ActorSel::ADMIN,
+                    source: source.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn expected_source_conflicts(self) -> u64 {
+        u64::from(self.pre_grace_source_attempts) + u64::from(self.elapsed_grace_source_attempts)
+    }
+
+    #[must_use]
+    pub fn expected_source_delete_ops(self) -> u64 {
+        self.expected_source_conflicts() + 1
+    }
 }
 
 impl Coverage {
@@ -1598,6 +1651,23 @@ impl AdversarialGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branching_delete_schedule_is_seeded_and_uses_runner_ops() {
+        let seed_zero = BranchingDeleteSchedule::for_seed(0);
+        let seed_two = BranchingDeleteSchedule::for_seed(2);
+        assert_ne!(seed_zero, seed_two);
+        assert_eq!(seed_zero.expected_source_conflicts(), 2);
+        assert_eq!(seed_two.expected_source_conflicts(), 3);
+
+        let operations = seed_two.source_delete_ops("source", BranchingDeleteWindow::PreGrace);
+        assert_eq!(operations.len(), 2);
+        assert!(operations.iter().all(|operation| matches!(
+            operation,
+            Op::Branching(BranchingOp::DeleteSourceWithBranches { source, .. })
+                if source == "source"
+        )));
+    }
 
     #[test]
     fn deterministic_queue_covers_v4_sketch_adc_and_incremental_compaction() {

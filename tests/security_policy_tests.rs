@@ -34,12 +34,8 @@ fn scoped_store(harness: &TestHarness) -> ZeppelinStore {
     ZeppelinStore::new(Arc::new(scoped_backend))
 }
 
-fn full_entitlements() -> Arc<Entitlements> {
-    Arc::new(test_entitlements(
-        Feature::ALL
-            .into_iter()
-            .filter(|feature| *feature != Feature::Delegation),
-    ))
+fn rbac_entitlements() -> Arc<Entitlements> {
+    Arc::new(test_entitlements([Feature::Rbac]))
 }
 
 #[derive(Debug)]
@@ -277,7 +273,7 @@ async fn delayed_initial_snapshot_load_does_not_reset_freshness_origin() {
         store.clone(),
         &config.security,
         clock.clone(),
-        full_entitlements(),
+        rbac_entitlements(),
     )
     .await
     .expect("seed policy runtime must bootstrap");
@@ -291,7 +287,7 @@ async fn delayed_initial_snapshot_load_does_not_reset_freshness_origin() {
         delayed,
         &config.security,
         clock.clone(),
-        full_entitlements(),
+        rbac_entitlements(),
     )
     .await
     .expect("delayed policy runtime must load the authoritative snapshot");
@@ -662,7 +658,7 @@ async fn mutation_reauthorization_uses_fresh_clock_after_overlap_expiry() {
         store,
         &config.security,
         clock.clone(),
-        full_entitlements(),
+        rbac_entitlements(),
     )
     .await
     .expect("S3 policy runtime must start");
@@ -925,7 +921,7 @@ async fn revoked_credential_cannot_authorize_captured_principal() {
         store,
         &config.security,
         clock.clone(),
-        full_entitlements(),
+        rbac_entitlements(),
     )
     .await
     .expect("S3 policy runtime must start");
@@ -1648,11 +1644,12 @@ async fn security_admin_events_use_actual_policy_versions() {
 async fn security_admin_mutation_audits_fresh_authoritative_denial() {
     let harness = TestHarness::new().await;
     let store = scoped_store(&harness);
+    let writer_store = ZeppelinStore::new(store.inner());
     let mut config = Config::default();
     config.security.policy_refresh_secs = 60;
     let stale = start_test_server_full(store.clone(), None, config.clone(), false, None).await;
     let writer = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
-        store,
+        writer_store,
         None,
         config,
         false,
@@ -1715,11 +1712,12 @@ async fn security_admin_mutation_audits_fresh_authoritative_denial() {
 async fn security_admin_mutation_audits_latest_allow_before_build_error() {
     let harness = TestHarness::new().await;
     let store = scoped_store(&harness);
+    let writer_store = ZeppelinStore::new(store.inner());
     let mut config = Config::default();
     config.security.policy_refresh_secs = 60;
     let stale = start_test_server_full(store.clone(), None, config.clone(), false, None).await;
     let writer = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
-        store,
+        writer_store,
         None,
         config,
         false,
@@ -1783,7 +1781,7 @@ async fn security_admin_read_surfaces_cache_swap_denial_for_handler_audit() {
         store.clone(),
         &config.security,
         clock.clone(),
-        full_entitlements(),
+        rbac_entitlements(),
     )
     .await
     .expect("reader policy cache must start");
@@ -1791,7 +1789,7 @@ async fn security_admin_read_surfaces_cache_swap_denial_for_handler_audit() {
         store,
         &config.security,
         clock.clone(),
-        full_entitlements(),
+        rbac_entitlements(),
     )
     .await
     .expect("writer policy cache must start");

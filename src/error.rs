@@ -600,6 +600,9 @@ impl ZeppelinError {
                 crate::namespace::branching::BranchError::BranchHasLiveChildren { .. } => {
                     "branch_has_live_children"
                 }
+                crate::namespace::branching::BranchError::BranchIntegrity => {
+                    "branch_integrity_error"
+                }
                 _ => "INTERNAL_ERROR",
             },
             ZeppelinError::AuditSink(_) => "INTERNAL_ERROR",

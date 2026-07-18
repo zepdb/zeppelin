@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod artifacts;
+pub mod branching;
 pub mod chaos;
 pub mod faults;
 pub mod generator;

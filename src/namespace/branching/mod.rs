@@ -15,9 +15,9 @@ pub use crate::namespace::types::{
     BranchId, BranchRoot, ForkViewDigest, ManifestDigest, ManifestGeneration,
     SourceDataPlaneConfigDigest,
 };
-pub use error::BranchError;
+pub use error::{BranchError, DisclosedBranchChild};
 pub use lifecycle::{
-    BranchDescriptor, BranchLineage, BranchListRequest, BranchMaintenanceReport,
+    BranchDescriptor, BranchLifecycleState, BranchLineage, BranchMaintenanceReport,
     BranchPrepareStage, ForkDataPlaneConfig, ForkIdentity, ForkPrepareIntent,
     ForkReservationIdentity, NamespaceCreationKind, NamespaceDeleteOutcome, NamespaceDeleteRequest,
     PrepareForkOutcome, PrepareForkRequest, PreparedBranch,

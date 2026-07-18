@@ -4109,6 +4109,8 @@ impl Manifest {
         if self.deletion_fence.is_some() && !self.branch_roots.is_empty() {
             return Err(BranchError::NamespaceHasLiveBranches {
                 namespace: namespace.to_string(),
+                visible_children: Vec::new(),
+                has_additional_children: true,
             }
             .into());
         }
@@ -4699,6 +4701,8 @@ impl Manifest {
             if !manifest.branch_roots.is_empty() {
                 return Err(BranchError::NamespaceHasLiveBranches {
                     namespace: namespace.to_string(),
+                    visible_children: Vec::new(),
+                    has_additional_children: true,
                 }
                 .into());
             }
@@ -4747,6 +4751,8 @@ impl Manifest {
             if !manifest.branch_roots.is_empty() {
                 return Err(BranchError::NamespaceHasLiveBranches {
                     namespace: namespace.to_string(),
+                    visible_children: Vec::new(),
+                    has_additional_children: true,
                 }
                 .into());
             }

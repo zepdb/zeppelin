@@ -2366,6 +2366,8 @@ impl NamespaceManager {
             if !manifest.branch_roots().is_empty() {
                 return Err(BranchError::NamespaceHasLiveBranches {
                     namespace: name.to_string(),
+                    visible_children: Vec::new(),
+                    has_additional_children: true,
                 }
                 .into());
             }
@@ -3264,6 +3266,8 @@ impl NamespaceManager {
                 if !manifest.branch_roots().is_empty() {
                     return Err(BranchError::NamespaceHasLiveBranches {
                         namespace: name.to_string(),
+                        visible_children: Vec::new(),
+                        has_additional_children: true,
                     }
                     .into());
                 }

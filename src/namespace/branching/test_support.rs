@@ -37,14 +37,14 @@ use crate::wal::{LeaseManager, WalReader};
 use chrono::{DateTime, Utc};
 
 use super::deletion::{
-    deletion_decision_evidence_key, AuthorizedNamespaceDelete, DeletionBoundary, DeletionDecision,
-    DeletionGovernance, DeletionLifecycleEvent,
+    deletion_decision_evidence_key, AuthorizedBranchList, AuthorizedNamespaceDelete,
+    DeletionBoundary, DeletionDecision, DeletionGovernance, DeletionLifecycleAudit,
 };
 use super::{
     ArtifactOrigin, ArtifactOriginIndex, BranchDescriptor, BranchId, BranchLineage,
-    BranchListRequest, BranchMaintenanceReport, BranchPrepareStage, BranchRoot, ForkIdentity,
-    ForkReservationIdentity, ForkViewDigest, ManifestGeneration, NamespaceCreationKind,
-    NamespaceDeleteOutcome, PrepareForkOutcome, PrepareForkRequest,
+    BranchMaintenanceReport, BranchPrepareStage, BranchRoot, ForkIdentity, ForkReservationIdentity,
+    ForkViewDigest, ManifestGeneration, NamespaceCreationKind, NamespaceDeleteOutcome,
+    PrepareForkOutcome, PrepareForkRequest,
 };
 use crate::namespace::branch_root::{
     insert_branch_root, remove_branch_root, source_data_plane_config_digest,
@@ -241,7 +241,7 @@ impl DeletionGovernance for TestDeletionGovernance {
         Ok(true)
     }
 
-    async fn settle_lifecycle_audit(&self, _event: DeletionLifecycleEvent) -> Result<()> {
+    async fn settle_lifecycle_audit(&self, _event: DeletionLifecycleAudit) -> Result<()> {
         Ok(())
     }
 }
@@ -395,7 +395,10 @@ pub async fn list_children_for_test(
     branching: BranchingConfig,
 ) -> Result<Vec<BranchDescriptor>> {
     graph_for_test(store, indexing, branching)?
-        .list_children(BranchListRequest { source })
+        .list_children(AuthorizedBranchList::new(
+            source,
+            Arc::new(|_target| Ok(true)),
+        ))
         .await
 }
 

@@ -21,24 +21,26 @@ use crate::namespace::branch_root::{
     InsertBranchRootRequest, RemoveBranchRootRequest,
 };
 use crate::namespace::branching::deletion::{
-    load_deletion_decision_evidence, persist_branch_visibility_removal,
-    persist_deletion_decision_evidence, AuthorizedNamespaceDelete, DeletionBoundary,
-    DeletionDecision, DeletionGovernance, DeletionLifecycleEvent,
+    load_branch_visibility_removal, load_deletion_decision_evidence,
+    persist_branch_visibility_removal, persist_deletion_decision_evidence, AuthorizedBranchList,
+    AuthorizedNamespaceDelete, BranchVisibilityRemovalMarker, DeletionBoundary, DeletionDecision,
+    DeletionGovernance, DeletionLifecycleAudit,
 };
 use crate::namespace::branching::{
-    ArtifactOrigin, BranchDescriptor, BranchError, BranchListRequest, BranchMaintenanceReport,
-    BranchPrepareStage, ForkDataPlaneConfig, ForkIdentity, ForkPrepareIntent,
+    ArtifactOrigin, BranchDescriptor, BranchError, BranchLifecycleState, BranchMaintenanceReport,
+    BranchPrepareStage, DisclosedBranchChild, ForkDataPlaneConfig, ForkIdentity, ForkPrepareIntent,
     ForkReservationIdentity, NamespaceCreationKind, NamespaceDeleteOutcome, PrepareForkOutcome,
     PrepareForkRequest, PreparedBranch,
 };
 use crate::namespace::manager::{
     CompactionHealth, GovernedDeletionIdentity, NamespaceDeletionIntent,
     NamespaceDestructionRecord, NamespaceIndexConfig, NamespaceManager, NamespaceMetadata,
-    NamespaceState, ReserveMetadataOutcome, RootReleaseState,
+    NamespaceState, ReserveMetadataOutcome, RootReleaseState, VisibilityRemoval,
 };
 use crate::namespace::{
     BranchId, BranchRoot, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
 };
+use crate::security::{RootReleaseAuditProgress, RootReleaseFailureClass, SecurityError};
 use crate::storage::{CreateOnlyOutcome, NamespaceObjectKey, ZeppelinStore};
 use crate::time::Clock;
 use crate::wal::manifest::{BranchLineageSeed, PreparedManifestPublication, PreparedZeroCopyFork};
@@ -88,6 +90,25 @@ enum ParentRootObservation {
 enum CancellationParentObservation {
     Live { root: Option<BranchRoot> },
     PublicationImpossible,
+}
+
+enum BranchVisibilityResume {
+    Metadata(NamespaceMetadata),
+    Deleted,
+}
+
+struct LiveChildDisclosure {
+    visible_children: Vec<DisclosedBranchChild>,
+    has_additional_children: bool,
+}
+
+impl LiveChildDisclosure {
+    fn hidden() -> Self {
+        Self {
+            visible_children: Vec::new(),
+            has_additional_children: true,
+        }
+    }
 }
 
 impl NamespaceGraph {
@@ -176,8 +197,8 @@ impl NamespaceGraph {
         let (manifest, _) = Manifest::read_versioned_required(&self.store, name).await?;
         self.verify_active_branch(&metadata).await?;
         if !manifest.branch_roots().is_empty() {
-            self.require_child_disclosure(&manifest, governance.as_ref())?;
-            return Err(self.live_child_error(&metadata, &namespace));
+            let disclosure = self.disclose_live_children(&manifest, governance.as_ref())?;
+            return Err(self.live_child_error(&metadata, &namespace, disclosure));
         }
 
         let parent_root = self.deletion_parent_root(&metadata, &namespace).await?;
@@ -554,6 +575,8 @@ impl NamespaceGraph {
                     if root.is_some() {
                         return Err(BranchError::NamespaceHasLiveBranches {
                             namespace: source.to_string(),
+                            visible_children: Vec::new(),
+                            has_additional_children: true,
                         }
                         .into());
                     }
@@ -1087,91 +1110,122 @@ impl NamespaceGraph {
         parent_lease: Option<&Lease>,
     ) -> Result<()> {
         let namespace = &reservation.target_namespace;
-        self.require_unlocked_boundary(governance, namespace, DeletionBoundary::RootRelease)
+        let result: Result<bool> = async {
+            self.require_unlocked_boundary(governance, namespace, DeletionBoundary::RootRelease)
+                .await?;
+            self.require_unlocked_boundary(
+                governance,
+                &reservation.source_namespace,
+                DeletionBoundary::RootRelease,
+            )
             .await?;
-        self.require_unlocked_boundary(
-            governance,
-            &reservation.source_namespace,
-            DeletionBoundary::RootRelease,
-        )
-        .await?;
-        let (latest, _) = self
-            .namespace_manager
-            .read_creating_intent_strong(namespace.as_str())
-            .await?;
-        let latest_intent = latest.deletion_intent.as_ref().ok_or_else(|| {
-            ZeppelinError::Validation(format!(
-                "never-active target {namespace} lost its cancellation intent before root release"
-            ))
-        })?;
-        if latest_intent != intent {
-            return Err(BranchError::CancellationInProgress {
-                target: namespace.clone(),
+            let (latest, _) = self
+                .namespace_manager
+                .read_creating_intent_strong(namespace.as_str())
+                .await?;
+            let latest_intent = latest.deletion_intent.as_ref().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "never-active target {namespace} lost its cancellation intent before root release"
+                ))
+            })?;
+            if latest_intent != intent {
+                return Err(BranchError::CancellationInProgress {
+                    target: namespace.clone(),
+                }
+                .into());
             }
-            .into());
-        }
-        let evidence = NamespaceDestructionRecord::from_bytes(
-            &self.store.get(&intent.destruction_record_key).await?,
-        )?;
-        self.validate_cancellation_evidence(namespace, metadata, intent, decision, &evidence, 0)?;
+            let evidence = NamespaceDestructionRecord::from_bytes(
+                &self.store.get(&intent.destruction_record_key).await?,
+            )?;
+            self.validate_cancellation_evidence(
+                namespace, metadata, intent, decision, &evidence, 0,
+            )?;
 
-        let parent = self.observe_cancellation_parent(reservation).await?;
-        let converged = match (parent_lease, parent, intent.parent_root.as_ref()) {
-            (Some(lease), CancellationParentObservation::Live { root }, Some(expected)) => {
-                match root {
-                    Some(actual) if actual == *expected => {
-                        remove_branch_root_with_lease(
-                            &self.store,
-                            &self.namespace_manager,
-                            &self.lease_manager,
-                            lease,
-                            RemoveBranchRootRequest {
-                                source_namespace: reservation.source_namespace.clone(),
-                                expected_source_incarnation: reservation.source_incarnation.clone(),
-                                expected_root: expected.clone(),
-                            },
-                        )
-                        .await?;
-                        false
-                    }
-                    None => true,
-                    Some(actual) => {
-                        return Err(BranchError::BranchRootMismatch {
-                            branch_id: actual.branch_id,
+            let parent = self.observe_cancellation_parent(reservation).await?;
+            let converged = match (parent_lease, parent, intent.parent_root.as_ref()) {
+                (Some(lease), CancellationParentObservation::Live { root }, Some(expected)) => {
+                    match root {
+                        Some(actual) if actual == *expected => {
+                            remove_branch_root_with_lease(
+                                &self.store,
+                                &self.namespace_manager,
+                                &self.lease_manager,
+                                lease,
+                                RemoveBranchRootRequest {
+                                    source_namespace: reservation.source_namespace.clone(),
+                                    expected_source_incarnation: reservation
+                                        .source_incarnation
+                                        .clone(),
+                                    expected_root: expected.clone(),
+                                },
+                            )
+                            .await?;
+                            false
                         }
-                        .into())
+                        None => true,
+                        Some(actual) => {
+                            return Err(BranchError::BranchRootMismatch {
+                                branch_id: actual.branch_id,
+                            }
+                            .into())
+                        }
                     }
                 }
-            }
-            (Some(_), CancellationParentObservation::Live { root: None }, None) => false,
-            (Some(_), CancellationParentObservation::Live { root: Some(actual) }, None) => {
-                return Err(BranchError::BranchRootMismatch {
-                    branch_id: actual.branch_id,
+                (Some(_), CancellationParentObservation::Live { root: None }, None) => false,
+                (
+                    Some(_),
+                    CancellationParentObservation::Live { root: Some(actual) },
+                    None,
+                ) => {
+                    return Err(BranchError::BranchRootMismatch {
+                        branch_id: actual.branch_id,
+                    }
+                    .into())
                 }
-                .into())
-            }
-            (None, CancellationParentObservation::PublicationImpossible, None) => false,
-            (None, CancellationParentObservation::PublicationImpossible, Some(_)) => true,
-            (_, CancellationParentObservation::PublicationImpossible, Some(_)) => true,
-            (_, CancellationParentObservation::PublicationImpossible, None) => false,
-            (None, CancellationParentObservation::Live { .. }, _) => {
-                return Err(ZeppelinError::Validation(format!(
-                    "branch parent {} became live without a cancellation lease",
-                    reservation.source_namespace
-                )))
+                (None, CancellationParentObservation::PublicationImpossible, None) => false,
+                (None, CancellationParentObservation::PublicationImpossible, Some(_)) => true,
+                (_, CancellationParentObservation::PublicationImpossible, Some(_)) => true,
+                (_, CancellationParentObservation::PublicationImpossible, None) => false,
+                (None, CancellationParentObservation::Live { .. }, _) => {
+                    return Err(ZeppelinError::Validation(format!(
+                        "branch parent {} became live without a cancellation lease",
+                        reservation.source_namespace
+                    )))
+                }
+            };
+
+            self.confirm_cancellation_root_absent(reservation, intent)
+                .await?;
+            Ok(converged)
+        }
+        .await;
+        let converged = match result {
+            Ok(converged) => converged,
+            Err(error) => {
+                if intent.parent_root.is_some() {
+                    self.settle_root_release_failure(
+                        governance,
+                        namespace,
+                        &intent.decision_evidence_ref,
+                        &error,
+                    )
+                    .await?;
+                }
+                return Err(error);
             }
         };
-
-        self.confirm_cancellation_root_absent(reservation, intent)
-            .await?;
         if intent.parent_root.is_some() {
-            governance
-                .settle_lifecycle_audit(DeletionLifecycleEvent::RootRelease {
-                    namespace: namespace.clone(),
-                    converged,
-                    decision_evidence_ref: intent.decision_evidence_ref.clone(),
-                })
-                .await?;
+            self.settle_root_release_audit(
+                governance,
+                namespace,
+                if converged {
+                    RootReleaseAuditProgress::Converged
+                } else {
+                    RootReleaseAuditProgress::Released
+                },
+                &intent.decision_evidence_ref,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1214,7 +1268,7 @@ impl NamespaceGraph {
             .await?;
         if !outcome.complete {
             governance
-                .settle_lifecycle_audit(DeletionLifecycleEvent::CleanupIncomplete {
+                .settle_lifecycle_audit(DeletionLifecycleAudit::NamespaceDeleteCleanupIncomplete {
                     namespace: namespace.clone(),
                     remaining: 1,
                     decision_evidence_ref: intent.decision_evidence_ref.clone(),
@@ -1259,13 +1313,15 @@ impl NamespaceGraph {
         let (manifest, _) = Manifest::read_versioned_required(&self.store, name).await?;
         self.verify_active_branch(&metadata).await?;
         if !manifest.branch_roots().is_empty() {
-            if disclose_conflict {
-                self.require_child_disclosure(&manifest, governance.as_ref())?;
-            }
             self.namespace_manager
                 .clear_unfenced_deletion_intent(name, &expected_intent.decision_evidence_ref)
                 .await?;
-            return Err(self.live_child_error(&metadata, namespace));
+            let disclosure = if disclose_conflict {
+                self.disclose_live_children(&manifest, governance.as_ref())?
+            } else {
+                LiveChildDisclosure::hidden()
+            };
+            return Err(self.live_child_error(&metadata, namespace, disclosure));
         }
 
         let (guard, head_proof) = governance
@@ -1291,12 +1347,14 @@ impl NamespaceGraph {
                     .clear_unfenced_deletion_intent(name, &expected_intent.decision_evidence_ref)
                     .await?;
                 let (latest, _) = self.namespace_manager.read_metadata_versioned(name).await?;
-                if disclose_conflict {
+                let disclosure = if disclose_conflict {
                     let (latest_manifest, _) =
                         Manifest::read_versioned_required(&self.store, name).await?;
-                    self.require_child_disclosure(&latest_manifest, governance.as_ref())?;
-                }
-                return Err(self.live_child_error(&latest, namespace));
+                    self.disclose_live_children(&latest_manifest, governance.as_ref())?
+                } else {
+                    LiveChildDisclosure::hidden()
+                };
+                return Err(self.live_child_error(&latest, namespace, disclosure));
             }
             Err(error) => return Err(error),
         };
@@ -1366,6 +1424,15 @@ impl NamespaceGraph {
             self.namespace_manager
                 .record_visibility_removal(name, visibility.clone())
                 .await?;
+            self.settle_root_release_audit(
+                governance.as_ref(),
+                namespace,
+                RootReleaseAuditProgress::GracePending {
+                    not_before: visibility.not_before,
+                },
+                &intent.decision_evidence_ref,
+            )
+            .await?;
             NamespaceDeleteOutcome::BranchGraceWait {
                 not_before: visibility.not_before,
             }
@@ -1390,29 +1457,55 @@ impl NamespaceGraph {
         }
     }
 
-    fn require_child_disclosure(
+    fn disclose_live_children(
         &self,
         manifest: &Manifest,
         governance: &dyn DeletionGovernance,
-    ) -> Result<()> {
+    ) -> Result<LiveChildDisclosure> {
+        let mut visible_children = Vec::new();
+        let mut has_additional_children = false;
         for root in manifest.branch_roots().values() {
-            let _visible = governance.disclose_child(&root.target_namespace)?;
+            if governance.disclose_child(&root.target_namespace)? {
+                visible_children.push(DisclosedBranchChild {
+                    namespace: root.target_namespace.clone(),
+                    branch_id: root.branch_id,
+                });
+            } else {
+                has_additional_children = true;
+            }
         }
-        Ok(())
+        visible_children.sort_by(|left, right| {
+            left.namespace
+                .cmp(&right.namespace)
+                .then(left.branch_id.cmp(&right.branch_id))
+        });
+        if visible_children.len() > self.branching.max_children_per_namespace {
+            visible_children.truncate(self.branching.max_children_per_namespace);
+            has_additional_children = true;
+        }
+        Ok(LiveChildDisclosure {
+            visible_children,
+            has_additional_children,
+        })
     }
 
     fn live_child_error(
         &self,
         metadata: &NamespaceMetadata,
         namespace: &NamespaceId,
+        disclosure: LiveChildDisclosure,
     ) -> ZeppelinError {
         match &metadata.creation_kind {
             NamespaceCreationKind::Fork(reservation) => BranchError::BranchHasLiveChildren {
                 branch_id: reservation.branch_id,
+                visible_children: disclosure.visible_children,
+                has_additional_children: disclosure.has_additional_children,
             }
             .into(),
             NamespaceCreationKind::Root => BranchError::NamespaceHasLiveBranches {
                 namespace: namespace.to_string(),
+                visible_children: disclosure.visible_children,
+                has_additional_children: disclosure.has_additional_children,
             }
             .into(),
         }
@@ -1700,12 +1793,50 @@ impl NamespaceGraph {
         namespace: &NamespaceId,
         metadata: &NamespaceMetadata,
     ) -> Result<()> {
+        self.confirm_missing_after_resume_with_visibility(namespace, metadata, None)
+            .await
+    }
+
+    async fn confirm_missing_after_resume_with_visibility(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        published_visibility: Option<&VisibilityRemoval>,
+    ) -> Result<()> {
         if let Some(intent) = metadata.deletion_intent.as_ref() {
             self.load_bound_destruction_evidence(namespace, metadata, intent)
                 .await?;
-            if matches!(metadata.creation_kind, NamespaceCreationKind::Fork(_)) {
-                self.require_released_branch_root_absent(namespace, metadata, intent)
+            if let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind {
+                if Self::root_release_is_final(intent) {
+                    self.require_released_branch_root_absent(namespace, metadata, intent)
+                        .await?;
+                } else {
+                    let visibility = match (intent.visibility.as_ref(), published_visibility) {
+                        (Some(durable), Some(published)) if durable != published => {
+                            return Err(ZeppelinError::Validation(format!(
+                                "branch namespace {namespace} completed with conflicting visibility evidence"
+                            )))
+                        }
+                        (Some(durable), _) => durable,
+                        (None, Some(published)) => published,
+                        (None, None) => {
+                            return Err(ZeppelinError::Validation(format!(
+                                "branch namespace {namespace} disappeared before visibility evidence became durable"
+                            )))
+                        }
+                    };
+                    self.require_branch_root_absent_after_grace(
+                        namespace, metadata, intent, visibility,
+                    )
                     .await?;
+                    self.remove_completed_branch_visibility_marker(
+                        namespace,
+                        reservation,
+                        intent,
+                        visibility,
+                    )
+                    .await?;
+                }
             }
         } else if matches!(metadata.creation_kind, NamespaceCreationKind::Fork(_)) {
             return Err(ZeppelinError::Validation(format!(
@@ -1837,11 +1968,7 @@ impl NamespaceGraph {
         }
 
         if matches!(metadata.creation_kind, NamespaceCreationKind::Fork(_)) {
-            let release_is_final = matches!(
-                intent.root_release,
-                Some(RootReleaseState::Released { .. } | RootReleaseState::Converged { .. })
-            );
-            if release_is_final {
+            if Self::root_release_is_final(&intent) {
                 // Owned cleanup is allowed to delete the visibility marker.
                 // Once the root-release acknowledgement is durable, retries
                 // must not recreate that marker and start a new grace window.
@@ -1852,40 +1979,66 @@ impl NamespaceGraph {
                     self.require_branch_root_retained(namespace, &metadata, &intent)
                         .await?;
                 }
-                metadata = self
+                metadata = match self
                     .ensure_branch_visibility_removal(namespace, &metadata)
-                    .await?;
+                    .await?
+                {
+                    BranchVisibilityResume::Metadata(metadata) => metadata,
+                    BranchVisibilityResume::Deleted => return Ok(NamespaceDeleteOutcome::Deleted),
+                };
                 intent = metadata.deletion_intent.clone().ok_or_else(|| {
                     ZeppelinError::Validation(format!(
                         "branch namespace {namespace} lost its deletion intent"
                     ))
                 })?;
-                let visibility = intent.visibility.as_ref().ok_or_else(|| {
-                    ZeppelinError::Validation(format!(
-                        "branch namespace {namespace} has no persisted visibility deadline"
-                    ))
-                })?;
-                if self.clock.now() < visibility.not_before {
-                    self.require_branch_root_retained(namespace, &metadata, &intent)
+                if Self::root_release_is_final(&intent) {
+                    self.require_released_branch_root_absent(namespace, &metadata, &intent)
                         .await?;
-                    return Ok(NamespaceDeleteOutcome::BranchGraceWait {
-                        not_before: visibility.not_before,
-                    });
+                } else {
+                    let visibility = intent.visibility.as_ref().ok_or_else(|| {
+                        ZeppelinError::Validation(format!(
+                            "branch namespace {namespace} has no persisted visibility deadline"
+                        ))
+                    })?;
+                    if self.clock.now() < visibility.not_before {
+                        self.require_branch_root_retained(namespace, &metadata, &intent)
+                            .await?;
+                        self.settle_root_release_audit(
+                            governance.as_ref(),
+                            namespace,
+                            RootReleaseAuditProgress::GracePending {
+                                not_before: visibility.not_before,
+                            },
+                            &intent.decision_evidence_ref,
+                        )
+                        .await?;
+                        return Ok(NamespaceDeleteOutcome::BranchGraceWait {
+                            not_before: visibility.not_before,
+                        });
+                    }
+                    self.release_branch_root(namespace, &metadata, Arc::clone(&governance))
+                        .await?;
+                    metadata = match self
+                        .namespace_manager
+                        .read_metadata_versioned(namespace.as_str())
+                        .await
+                    {
+                        Ok((metadata, _)) => metadata,
+                        Err(ZeppelinError::NamespaceNotFound { .. }) => {
+                            self.confirm_missing_after_resume(namespace, &metadata)
+                                .await?;
+                            return Ok(NamespaceDeleteOutcome::Deleted);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    intent = metadata.deletion_intent.clone().ok_or_else(|| {
+                        ZeppelinError::Validation(format!(
+                            "branch namespace {namespace} lost its root-release acknowledgement"
+                        ))
+                    })?;
+                    self.require_released_branch_root_absent(namespace, &metadata, &intent)
+                        .await?;
                 }
-                self.release_branch_root(namespace, &metadata, Arc::clone(&governance))
-                    .await?;
-                metadata = self
-                    .namespace_manager
-                    .read_metadata_versioned(namespace.as_str())
-                    .await?
-                    .0;
-                intent = metadata.deletion_intent.clone().ok_or_else(|| {
-                    ZeppelinError::Validation(format!(
-                        "branch namespace {namespace} lost its root-release acknowledgement"
-                    ))
-                })?;
-                self.require_released_branch_root_absent(namespace, &metadata, &intent)
-                    .await?;
             }
         }
 
@@ -1897,7 +2050,7 @@ impl NamespaceGraph {
         &self,
         namespace: &NamespaceId,
         metadata: &NamespaceMetadata,
-    ) -> Result<NamespaceMetadata> {
+    ) -> Result<BranchVisibilityResume> {
         if Manifest::read(&self.store, namespace.as_str())
             .await?
             .is_some()
@@ -1906,36 +2059,208 @@ impl NamespaceGraph {
                 "branch namespace {namespace} visibility marker requires live manifest removal"
             )));
         }
-        let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind else {
+        let current = match self
+            .namespace_manager
+            .read_metadata_versioned(namespace.as_str())
+            .await
+        {
+            Ok((current, _)) => current,
+            Err(ZeppelinError::NamespaceNotFound { .. }) => {
+                self.confirm_missing_after_resume(namespace, metadata)
+                    .await?;
+                return Ok(BranchVisibilityResume::Deleted);
+            }
+            Err(error) => return Err(error),
+        };
+        self.require_same_branch_resume_identity(namespace, metadata, &current)?;
+        let NamespaceCreationKind::Fork(reservation) = &current.creation_kind else {
             return Err(ZeppelinError::Validation(format!(
                 "namespace {namespace} is not a branch target"
             )));
         };
-        let intent = metadata.deletion_intent.as_ref().ok_or_else(|| {
+        let intent = current.deletion_intent.as_ref().ok_or_else(|| {
             ZeppelinError::Validation(format!(
                 "branch namespace {namespace} has no deletion intent"
             ))
         })?;
+        self.load_bound_destruction_evidence(namespace, &current, intent)
+            .await?;
+        if Self::root_release_is_final(intent) {
+            self.require_released_branch_root_absent(namespace, &current, intent)
+                .await?;
+            return Ok(BranchVisibilityResume::Metadata(current));
+        }
+        if intent.visibility.is_some() {
+            match load_branch_visibility_removal(
+                &self.store,
+                namespace,
+                reservation.branch_id,
+                intent,
+            )
+            .await
+            {
+                Ok(_) => return Ok(BranchVisibilityResume::Metadata(current)),
+                Err(ZeppelinError::NotFound { key })
+                    if intent
+                        .visibility
+                        .as_ref()
+                        .is_some_and(|visibility| visibility.marker_key == key) =>
+                {
+                    return self
+                        .classify_missing_visibility_marker(namespace, &current)
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.require_branch_root_retained(namespace, &current, intent)
+            .await?;
         let floor_secs = self.gc_horizon_floor_secs.ok_or_else(|| {
             ZeppelinError::Validation(
                 "branch deletion requires a checked GC horizon floor".to_string(),
             )
         })?;
-        let visibility = persist_branch_visibility_removal(
+        let expected_marker_key = BranchVisibilityRemovalMarker::key(
+            namespace,
+            reservation.branch_id,
+            intent.incarnation.clone(),
+        );
+        let visibility = match persist_branch_visibility_removal(
             &self.store,
             namespace,
             reservation.branch_id,
             intent,
             Duration::from_secs(floor_secs),
         )
-        .await?;
-        self.namespace_manager
-            .record_visibility_removal(namespace.as_str(), visibility)
-            .await?;
-        self.namespace_manager
+        .await
+        {
+            Ok(visibility) => visibility,
+            Err(ZeppelinError::NotFound { key }) if key == expected_marker_key => {
+                return self
+                    .classify_missing_visibility_marker(namespace, &current)
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
+        match self
+            .namespace_manager
+            .record_visibility_removal(namespace.as_str(), visibility.clone())
+            .await
+        {
+            Ok(()) => {}
+            Err(ZeppelinError::NamespaceNotFound { .. }) => {
+                self.confirm_missing_after_resume_with_visibility(
+                    namespace,
+                    &current,
+                    Some(&visibility),
+                )
+                .await?;
+                return Ok(BranchVisibilityResume::Deleted);
+            }
+            Err(error) => return Err(error),
+        }
+        match self
+            .namespace_manager
             .read_metadata_versioned(namespace.as_str())
             .await
-            .map(|(metadata, _)| metadata)
+        {
+            Ok((latest, _)) => {
+                self.require_same_branch_resume_identity(namespace, &current, &latest)?;
+                Ok(BranchVisibilityResume::Metadata(latest))
+            }
+            Err(ZeppelinError::NamespaceNotFound { .. }) => {
+                self.confirm_missing_after_resume_with_visibility(
+                    namespace,
+                    &current,
+                    Some(&visibility),
+                )
+                .await?;
+                Ok(BranchVisibilityResume::Deleted)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn classify_missing_visibility_marker(
+        &self,
+        namespace: &NamespaceId,
+        observed: &NamespaceMetadata,
+    ) -> Result<BranchVisibilityResume> {
+        match self
+            .namespace_manager
+            .read_metadata_versioned(namespace.as_str())
+            .await
+        {
+            Ok((current, _)) => {
+                self.require_same_branch_resume_identity(namespace, observed, &current)?;
+                let intent = current.deletion_intent.as_ref().ok_or_else(|| {
+                    ZeppelinError::Validation(format!(
+                        "branch namespace {namespace} lost its deletion intent at the visibility boundary"
+                    ))
+                })?;
+                self.load_bound_destruction_evidence(namespace, &current, intent)
+                    .await?;
+                if Self::root_release_is_final(intent) {
+                    self.require_released_branch_root_absent(namespace, &current, intent)
+                        .await?;
+                    Ok(BranchVisibilityResume::Metadata(current))
+                } else {
+                    Err(ZeppelinError::Serialization(format!(
+                        "branch namespace {namespace} has pending root release but its durable visibility marker is missing"
+                    )))
+                }
+            }
+            Err(ZeppelinError::NamespaceNotFound { .. }) => {
+                self.confirm_missing_after_resume(namespace, observed)
+                    .await?;
+                Ok(BranchVisibilityResume::Deleted)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn require_same_branch_resume_identity(
+        &self,
+        namespace: &NamespaceId,
+        observed: &NamespaceMetadata,
+        current: &NamespaceMetadata,
+    ) -> Result<()> {
+        let observed_intent = observed.deletion_intent.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "branch namespace {namespace} has no observed deletion intent"
+            ))
+        })?;
+        let current_intent = current.deletion_intent.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "branch namespace {namespace} lost its deletion intent"
+            ))
+        })?;
+        let mut observed_identity = observed_intent.clone();
+        observed_identity.visibility = None;
+        observed_identity.root_release = None;
+        let mut current_identity = current_intent.clone();
+        current_identity.visibility = None;
+        current_identity.root_release = None;
+        if current.state != NamespaceState::Deleting
+            || current.name != observed.name
+            || current.incarnation_id != observed.incarnation_id
+            || current.creation_kind != observed.creation_kind
+            || current.branch_identity != observed.branch_identity
+            || current.destruction_record_key != observed.destruction_record_key
+            || current_identity != observed_identity
+        {
+            return Err(ZeppelinError::Serialization(format!(
+                "branch namespace {namespace} identity changed during concurrent deletion resume"
+            )));
+        }
+        Ok(())
+    }
+
+    fn root_release_is_final(intent: &NamespaceDeletionIntent) -> bool {
+        matches!(
+            intent.root_release,
+            Some(RootReleaseState::Released { .. } | RootReleaseState::Converged { .. })
+        )
     }
 
     async fn require_branch_root_retained(
@@ -2117,110 +2442,180 @@ impl NamespaceGraph {
         })?;
         let source_namespace = reservation.source_namespace.clone();
         let decision_evidence_ref = intent.decision_evidence_ref.clone();
-        let parent_lease = self
-            .lease_manager
-            .acquire(source_namespace.as_str())
-            .await?;
-        let result = async {
-            self.require_unlocked_boundary(
-                governance.as_ref(),
-                namespace,
-                DeletionBoundary::RootRelease,
-            )
-            .await?;
-            self.require_unlocked_boundary(
-                governance.as_ref(),
-                &source_namespace,
-                DeletionBoundary::RootRelease,
-            )
-            .await?;
-
-            let (current_target, current_target_etag) = self
-                .namespace_manager
-                .read_metadata_versioned(namespace.as_str())
-                .await?;
-            let current_target_etag = current_target_etag
-                .filter(|etag| !etag.is_empty())
-                .ok_or_else(|| {
-                    ZeppelinError::Serialization(format!(
-                        "branch namespace {namespace} metadata has no ETag for root-release acknowledgement"
+        match self
+            .namespace_manager
+            .read_metadata_versioned(namespace.as_str())
+            .await
+        {
+            Ok((current, _)) => {
+                self.require_same_branch_resume_identity(namespace, metadata, &current)?;
+                let current_intent = current.deletion_intent.as_ref().ok_or_else(|| {
+                    ZeppelinError::Validation(format!(
+                        "branch namespace {namespace} lost its deletion intent before root release"
                     ))
                 })?;
-            let current_intent = current_target.deletion_intent.as_ref().ok_or_else(|| {
-                ZeppelinError::Validation(format!(
-                    "branch namespace {namespace} lost its deletion intent before root release"
-                ))
-            })?;
-            if current_target.state != NamespaceState::Deleting
-                || current_target.incarnation_id != metadata.incarnation_id
-                || current_target.creation_kind != metadata.creation_kind
-                || current_target.branch_identity != metadata.branch_identity
-                || current_intent != intent
-                || self.clock.now() < visibility.not_before
-            {
-                return Err(ZeppelinError::Serialization(format!(
-                    "branch namespace {namespace} identity changed before root release"
-                )));
+                if Self::root_release_is_final(current_intent) {
+                    self.require_released_branch_root_absent(namespace, &current, current_intent)
+                        .await?;
+                    return Ok(());
+                }
             }
-            self.load_bound_destruction_evidence(namespace, &current_target, current_intent)
-                .await?;
-            let floor_secs = self.gc_horizon_floor_secs.ok_or_else(|| {
-                ZeppelinError::Validation(
-                    "branch deletion requires a checked GC horizon floor".to_string(),
+            Err(ZeppelinError::NamespaceNotFound { .. }) => {
+                self.confirm_missing_after_resume(namespace, metadata)
+                    .await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        let parent_lease = match self.lease_manager.acquire(source_namespace.as_str()).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.settle_root_release_failure(
+                    governance.as_ref(),
+                    namespace,
+                    &decision_evidence_ref,
+                    &error,
                 )
-            })?;
-            let marker = persist_branch_visibility_removal(
-                &self.store,
-                namespace,
-                reservation.branch_id,
-                current_intent,
-                Duration::from_secs(floor_secs),
-            )
-            .await?;
-            if &marker != visibility {
-                return Err(ZeppelinError::Validation(format!(
-                    "branch namespace {namespace} visibility marker changed before root release"
-                )));
+                .await?;
+                return Err(error);
             }
+        };
+        let result = async {
+            let mutation: Result<Option<(bool, NamespaceMetadata, String)>> = async {
+                self.require_unlocked_boundary(
+                    governance.as_ref(),
+                    namespace,
+                    DeletionBoundary::RootRelease,
+                )
+                .await?;
+                self.require_unlocked_boundary(
+                    governance.as_ref(),
+                    &source_namespace,
+                    DeletionBoundary::RootRelease,
+                )
+                .await?;
 
-            let root_was_present = matches!(
-                self.observe_parent_root(reservation, &expected_root, false)
-                    .await?,
-                ParentRootObservation::Present
-            );
-
-            if root_was_present {
-                remove_branch_root_with_lease(
+                let (current_target, current_target_etag) = self
+                    .namespace_manager
+                    .read_metadata_versioned(namespace.as_str())
+                    .await?;
+                let current_target_etag = current_target_etag
+                    .filter(|etag| !etag.is_empty())
+                    .ok_or_else(|| {
+                        ZeppelinError::Serialization(format!(
+                            "branch namespace {namespace} metadata has no ETag for root-release acknowledgement"
+                        ))
+                    })?;
+                let current_intent = current_target.deletion_intent.as_ref().ok_or_else(|| {
+                    ZeppelinError::Validation(format!(
+                        "branch namespace {namespace} lost its deletion intent before root release"
+                    ))
+                })?;
+                self.require_same_branch_resume_identity(namespace, metadata, &current_target)?;
+                if Self::root_release_is_final(current_intent) {
+                    self.require_released_branch_root_absent(
+                        namespace,
+                        &current_target,
+                        current_intent,
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+                if current_target.state != NamespaceState::Deleting
+                    || current_target.incarnation_id != metadata.incarnation_id
+                    || current_target.creation_kind != metadata.creation_kind
+                    || current_target.branch_identity != metadata.branch_identity
+                    || current_intent.visibility.as_ref() != Some(visibility)
+                    || self.clock.now() < visibility.not_before
+                {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "branch namespace {namespace} identity changed before root release"
+                    )));
+                }
+                self.load_bound_destruction_evidence(namespace, &current_target, current_intent)
+                    .await?;
+                match load_branch_visibility_removal(
                     &self.store,
-                    &self.namespace_manager,
-                    &self.lease_manager,
-                    &parent_lease,
-                    RemoveBranchRootRequest {
-                        source_namespace: source_namespace.clone(),
-                        expected_source_incarnation: reservation.source_incarnation.clone(),
-                        expected_root: expected_root.clone(),
-                    },
+                    namespace,
+                    reservation.branch_id,
+                    current_intent,
                 )
-                .await?;
-            } else {
+                .await
+                {
+                    Ok(_) => {}
+                    Err(ZeppelinError::NotFound { key })
+                        if current_intent
+                            .visibility
+                            .as_ref()
+                            .is_some_and(|visibility| visibility.marker_key == key) =>
+                    {
+                        match self
+                            .classify_missing_visibility_marker(namespace, &current_target)
+                            .await?
+                        {
+                            BranchVisibilityResume::Metadata(_)
+                            | BranchVisibilityResume::Deleted => return Ok(None),
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+
+                let root_was_present = matches!(
+                    self.observe_parent_root(reservation, &expected_root, false)
+                        .await?,
+                    ParentRootObservation::Present
+                );
+
+                if root_was_present {
+                    remove_branch_root_with_lease(
+                        &self.store,
+                        &self.namespace_manager,
+                        &self.lease_manager,
+                        &parent_lease,
+                        RemoveBranchRootRequest {
+                            source_namespace: source_namespace.clone(),
+                            expected_source_incarnation: reservation.source_incarnation.clone(),
+                            expected_root: expected_root.clone(),
+                        },
+                    )
+                    .await?;
+                }
                 self.renew_parent_lease_and_require_root_absent(
                     reservation,
                     &expected_root,
                     &parent_lease,
                 )
                 .await?;
+                Ok(Some((
+                    root_was_present,
+                    current_target,
+                    current_target_etag,
+                )))
             }
-            governance
-                .settle_lifecycle_audit(DeletionLifecycleEvent::RootRelease {
-                    namespace: namespace.clone(),
-                    converged: !root_was_present,
-                    decision_evidence_ref,
-                })
-                .await?;
-            self.renew_parent_lease_and_require_root_absent(
-                reservation,
-                &expected_root,
-                &parent_lease,
+            .await;
+            let (root_was_present, current_target, current_target_etag) = match mutation {
+                Ok(Some(progress)) => progress,
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    self.settle_root_release_failure(
+                        governance.as_ref(),
+                        namespace,
+                        &decision_evidence_ref,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            self.settle_root_release_audit(
+                governance.as_ref(),
+                namespace,
+                if root_was_present {
+                    RootReleaseAuditProgress::Released
+                } else {
+                    RootReleaseAuditProgress::Converged
+                },
+                &decision_evidence_ref,
             )
             .await?;
             let release = if root_was_present {
@@ -2232,7 +2627,8 @@ impl NamespaceGraph {
                     observed_at: self.clock.now(),
                 }
             };
-            self.namespace_manager
+            if let Err(error) = self
+                .namespace_manager
                 .record_root_release(
                     namespace.as_str(),
                     &current_target,
@@ -2240,6 +2636,17 @@ impl NamespaceGraph {
                     release,
                 )
                 .await
+            {
+                self.settle_root_release_failure(
+                    governance.as_ref(),
+                    namespace,
+                    &decision_evidence_ref,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+            Ok(())
         }
         .await;
         if let Err(error) = self
@@ -2289,6 +2696,17 @@ impl NamespaceGraph {
                 "branch namespace {namespace} root-release acknowledgement predates its reader-safety deadline"
             )));
         }
+        self.require_branch_root_absent_after_grace(namespace, metadata, intent, visibility)
+            .await
+    }
+
+    async fn require_branch_root_absent_after_grace(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        intent: &NamespaceDeletionIntent,
+        visibility: &VisibilityRemoval,
+    ) -> Result<()> {
         if self.clock.now() < visibility.not_before {
             return Err(ZeppelinError::Serialization(format!(
                 "branch namespace {namespace} root release predates its reader-safety deadline"
@@ -2304,13 +2722,13 @@ impl NamespaceGraph {
                 "branch namespace {namespace} has no exact parent root"
             ))
         })?;
-        // Root release is the durable authorization to clean target-owned
-        // artifacts. The source may itself finish deletion after that release,
-        // so a missing parent manifest is proof that the released root is no
-        // longer live rather than an error. If the source was recreated, its
-        // current manifest is still authoritative: any reuse of this branch ID
-        // must fail closed instead of allowing cleanup through an ambiguous
-        // root.
+        // A final acknowledgement, or metadata-last completion observed by a
+        // stale worker, authorizes this exact-root absence proof after grace.
+        // The source may itself finish deletion after root release, so a missing
+        // parent manifest means the released root is no longer live. If the
+        // source was recreated, its current manifest remains authoritative: any
+        // reuse of this branch ID fails closed instead of allowing cleanup
+        // through an ambiguous root.
         let Some(parent_manifest) =
             Manifest::read(&self.store, reservation.source_namespace.as_str()).await?
         else {
@@ -2328,6 +2746,30 @@ impl NamespaceGraph {
             )));
         }
         Ok(())
+    }
+
+    async fn remove_completed_branch_visibility_marker(
+        &self,
+        namespace: &NamespaceId,
+        reservation: &ForkReservationIdentity,
+        intent: &NamespaceDeletionIntent,
+        visibility: &VisibilityRemoval,
+    ) -> Result<()> {
+        let expected_key = BranchVisibilityRemovalMarker::key(
+            namespace,
+            reservation.branch_id,
+            intent.incarnation.clone(),
+        );
+        if visibility.marker_key != expected_key {
+            return Err(ZeppelinError::Serialization(format!(
+                "branch namespace {namespace} visibility marker key changed before completed cleanup"
+            )));
+        }
+        match self.store.delete(&expected_key).await {
+            Ok(()) => Ok(()),
+            Err(ZeppelinError::NotFound { key }) if key == expected_key => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     async fn finish_deleting_cleanup(
@@ -2354,7 +2796,7 @@ impl NamespaceGraph {
                 break;
             }
             governance
-                .settle_lifecycle_audit(DeletionLifecycleEvent::CleanupIncomplete {
+                .settle_lifecycle_audit(DeletionLifecycleAudit::NamespaceDeleteCleanupIncomplete {
                     namespace: namespace.clone(),
                     remaining: 1,
                     decision_evidence_ref: intent.decision_evidence_ref.clone(),
@@ -2425,45 +2867,156 @@ impl NamespaceGraph {
         Ok(proof)
     }
 
+    async fn settle_root_release_audit(
+        &self,
+        governance: &dyn DeletionGovernance,
+        namespace: &NamespaceId,
+        progress: RootReleaseAuditProgress,
+        decision_evidence_ref: &str,
+    ) -> Result<()> {
+        governance
+            .settle_lifecycle_audit(DeletionLifecycleAudit::NamespaceDeleteRootRelease {
+                namespace: namespace.clone(),
+                progress,
+                decision_evidence_ref: decision_evidence_ref.to_string(),
+            })
+            .await
+    }
+
+    async fn settle_root_release_failure(
+        &self,
+        governance: &dyn DeletionGovernance,
+        namespace: &NamespaceId,
+        decision_evidence_ref: &str,
+        error: &ZeppelinError,
+    ) -> Result<()> {
+        self.settle_root_release_audit(
+            governance,
+            namespace,
+            RootReleaseAuditProgress::Failed {
+                class: Self::root_release_failure_class(error),
+            },
+            decision_evidence_ref,
+        )
+        .await
+    }
+
+    fn root_release_failure_class(error: &ZeppelinError) -> RootReleaseFailureClass {
+        match error {
+            ZeppelinError::Security(SecurityError::PreservationLocked) => {
+                RootReleaseFailureClass::PreservationBlocked
+            }
+            ZeppelinError::LeaseHeld { .. }
+            | ZeppelinError::LeaseExpired { .. }
+            | ZeppelinError::FencingTokenStale { .. } => {
+                RootReleaseFailureClass::ParentLeaseUnavailable
+            }
+            ZeppelinError::Branch(_)
+            | ZeppelinError::ChecksumMismatch { .. }
+            | ZeppelinError::MalformedControlKey { .. }
+            | ZeppelinError::ManifestNotFound { .. }
+            | ZeppelinError::NamespaceNotFound { .. }
+            | ZeppelinError::NotFound { .. }
+            | ZeppelinError::Serialization(_) => RootReleaseFailureClass::IntegrityRejected,
+            ZeppelinError::Storage(_) | ZeppelinError::StoragePath(_) => {
+                RootReleaseFailureClass::StorageUnavailable
+            }
+            ZeppelinError::AuditSink(_)
+            | ZeppelinError::Security(SecurityError::AuditUnavailable) => {
+                RootReleaseFailureClass::AuditUnavailable
+            }
+            _ => RootReleaseFailureClass::MutationRejected,
+        }
+    }
+
     /// List only the direct children represented by the authoritative root map.
     #[cfg_attr(not(feature = "branching-test-support"), allow(dead_code))]
     pub(crate) async fn list_children(
         &self,
-        request: BranchListRequest,
+        request: AuthorizedBranchList,
     ) -> Result<Vec<BranchDescriptor>> {
         let (manifest, _) =
             Manifest::read_versioned_required(&self.store, request.source.as_str()).await?;
         let mut children = Vec::with_capacity(manifest.branch_roots().len());
         for root in manifest.branch_roots().values() {
-            let metadata = self
+            if !request.disclose_child(&root.target_namespace)? {
+                continue;
+            }
+            let metadata = match self
                 .namespace_manager
                 .read_metadata_versioned(root.target_namespace.as_str())
-                .await?
-                .0;
-            let identity =
-                metadata
-                    .branch_identity
-                    .as_ref()
-                    .ok_or(BranchError::BranchRootMismatch {
-                        branch_id: root.branch_id,
-                    })?;
-            if identity.branch_id != root.branch_id
-                || identity.target_namespace != root.target_namespace
-                || identity.target_incarnation != root.target_incarnation
+                .await
             {
-                return Err(BranchError::BranchRootMismatch {
-                    branch_id: root.branch_id,
+                Ok((metadata, _)) => metadata,
+                Err(error) => {
+                    warn!(
+                        source = %request.source,
+                        target = %root.target_namespace,
+                        branch_id = %root.branch_id,
+                        error = %error,
+                        "authorized branch metadata read failed integrity validation"
+                    );
+                    return Err(BranchError::BranchIntegrity.into());
                 }
-                .into());
+            };
+            let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind else {
+                warn!(
+                    source = %request.source,
+                    target = %root.target_namespace,
+                    branch_id = %root.branch_id,
+                    "authorized branch target is not a fork"
+                );
+                return Err(BranchError::BranchIntegrity.into());
+            };
+            let reservation_matches = reservation.branch_id == root.branch_id
+                && reservation.source_namespace == request.source
+                && reservation.target_namespace == root.target_namespace
+                && reservation.target_incarnation == root.target_incarnation
+                && reservation.created_at == root.created_at;
+            let active_identity_matches = match metadata.state {
+                NamespaceState::Creating => {
+                    metadata
+                        .branch_prepare
+                        .as_ref()
+                        .is_some_and(|prepare| match prepare.stage {
+                            BranchPrepareStage::Reserved => {
+                                metadata.branch_identity.is_none() && prepare.provisional.is_some()
+                            }
+                            BranchPrepareStage::Rooted | BranchPrepareStage::ManifestPublished => {
+                                prepare.provisional.is_none()
+                                    && metadata.branch_identity.as_ref().is_some_and(|identity| {
+                                        identity.matches_reservation(reservation)
+                                            && identity.matches_root(root)
+                                    })
+                            }
+                        })
+                }
+                NamespaceState::Active | NamespaceState::Deleting => {
+                    metadata.branch_identity.as_ref().is_some_and(|identity| {
+                        identity.matches_reservation(reservation) && identity.matches_root(root)
+                    })
+                }
+            };
+            if !reservation_matches || !active_identity_matches {
+                warn!(
+                    source = %request.source,
+                    target = %root.target_namespace,
+                    branch_id = %root.branch_id,
+                    "authorized branch target identity failed integrity validation"
+                );
+                return Err(BranchError::BranchIntegrity.into());
             }
             let state = match metadata.state {
-                NamespaceState::Creating => "creating",
-                NamespaceState::Active => "active",
-                NamespaceState::Deleting => "deleting",
+                NamespaceState::Creating => BranchLifecycleState::Preparing,
+                NamespaceState::Active => BranchLifecycleState::Active,
+                NamespaceState::Deleting => BranchLifecycleState::Deleting,
             };
             children.push(BranchDescriptor {
                 target: root.target_namespace.clone(),
                 branch_id: root.branch_id,
+                target_incarnation: root.target_incarnation.clone(),
+                depth: reservation.depth,
+                created_at: reservation.created_at,
                 state,
             });
         }

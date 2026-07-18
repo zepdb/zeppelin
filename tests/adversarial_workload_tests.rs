@@ -208,6 +208,67 @@ async fn smoke() {
     );
 }
 
+/// Deterministic deletion-unification smoke. Active branch setup uses the
+/// explicitly feature-gated test-support seam because production fork
+/// activation is not yet exposed through HTTP; both deletion operations
+/// themselves execute through the real HTTP namespace DELETE handler.
+#[cfg(feature = "branching-test-support")]
+#[tokio::test]
+#[ignore]
+async fn branching_delete_smoke() {
+    let env = adversarial::RunnerEnv::from_env();
+    assert_eq!(
+        env.mode,
+        adversarial::RunMode::Deterministic,
+        "branching deletion smoke requires deterministic mode"
+    );
+    assert!(
+        env.profile.is_none(),
+        "branching deletion smoke does not accept a chaos profile"
+    );
+    assert!(
+        env.seeds.len() >= 2,
+        "branching deletion smoke requires at least two pinned seeds"
+    );
+
+    let expected_seeds = u64::try_from(env.seeds.len())
+        .unwrap_or_else(|_| panic!("branching deletion smoke seed count does not fit u64"));
+    let expected_source_conflicts = env
+        .seeds
+        .iter()
+        .copied()
+        .map(adversarial::generator::BranchingDeleteSchedule::for_seed)
+        .map(adversarial::generator::BranchingDeleteSchedule::expected_source_conflicts)
+        .try_fold(0_u64, |total, count| total.checked_add(count))
+        .unwrap_or_else(|| panic!("branching deletion conflict count overflowed"));
+    let expected_source_deletes = env
+        .seeds
+        .iter()
+        .copied()
+        .map(adversarial::generator::BranchingDeleteSchedule::for_seed)
+        .map(adversarial::generator::BranchingDeleteSchedule::expected_source_delete_ops)
+        .try_fold(0_u64, |total, count| total.checked_add(count))
+        .unwrap_or_else(|| panic!("branching source-delete count overflowed"));
+    let summary = adversarial::branching::run_branching_delete_smoke(env)
+        .await
+        .unwrap_or_else(|error| panic!("branching deletion smoke failed: {error}"));
+    assert_eq!(summary.seeds_run, expected_seeds);
+    assert_eq!(summary.failed_seeds, 0);
+    assert_eq!(summary.delete_branch_ops, expected_seeds * 2);
+    assert_eq!(
+        summary.delete_source_with_branches_ops,
+        expected_source_deletes
+    );
+    assert_eq!(summary.expected_source_conflicts, expected_source_conflicts);
+    println!(
+        "branching deletion smoke: seeds={} delete_branch={} delete_source_with_branches={} expected_409s={}",
+        summary.seeds_run,
+        summary.delete_branch_ops,
+        summary.delete_source_with_branches_ops,
+        summary.expected_source_conflicts
+    );
+}
+
 #[test]
 fn smoke_coverage_contract_is_mode_aware() {
     for mode in [

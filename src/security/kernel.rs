@@ -9,8 +9,9 @@ use std::time::Duration;
 use crate::config::{SecurityConfig, SecurityMode};
 use crate::error::Result as ZeppelinResult;
 use crate::namespace::branching::deletion::{
-    deletion_decision_evidence_key, persist_deletion_lifecycle_audit, AuthorizedNamespaceDelete,
-    CallbackDeletionGovernance, DeletionDecision, DeletionGovernance,
+    deletion_decision_evidence_key, persist_deletion_lifecycle_audit, AuthorizedBranchList,
+    AuthorizedNamespaceDelete, CallbackDeletionGovernance, DeletionDecision, DeletionGovernance,
+    DisclosureCallback,
 };
 use crate::storage::store::ObjectSigner;
 use crate::storage::ZeppelinStore;
@@ -477,6 +478,20 @@ impl SecurityKernel {
         self.namespace_delete_governance(store, clock, None)
     }
 
+    /// Mint a source-authorized branch-list request with per-target disclosure.
+    #[must_use]
+    pub(crate) fn authorize_branch_list(
+        self: &Arc<Self>,
+        source: NamespaceId,
+        principal: Principal,
+        context: RequestContext,
+    ) -> AuthorizedBranchList {
+        AuthorizedBranchList::new(
+            source,
+            self.namespace_disclosure_callback(Some((principal, context))),
+        )
+    }
+
     fn namespace_delete_governance(
         self: &Arc<Self>,
         store: ZeppelinStore,
@@ -484,7 +499,6 @@ impl SecurityKernel {
         disclosure: Option<(Principal, RequestContext)>,
     ) -> Arc<dyn DeletionGovernance> {
         let preservation_kernel = Arc::clone(self);
-        let disclosure_kernel = Arc::clone(self);
         let audit_store = store;
         let audit_clock = clock;
         Arc::new(CallbackDeletionGovernance::new(
@@ -492,23 +506,7 @@ impl SecurityKernel {
                 let kernel = Arc::clone(&preservation_kernel);
                 Box::pin(async move { kernel.guard_namespace_destruction_strong(&namespace).await })
             }),
-            Arc::new(move |target| {
-                let Some((principal, context)) = disclosure.as_ref() else {
-                    return Err(SecurityError::MissingPrincipal.into());
-                };
-                match disclosure_kernel.authorize(
-                    principal,
-                    Action::NamespaceRead,
-                    &Resource::Namespace(target.clone()),
-                    context,
-                ) {
-                    Decision::Allow(_) => Ok(true),
-                    Decision::Deny(deny) if deny.reason == DenyReason::SecurityStale => {
-                        Err(SecurityError::Authorization(deny.reason).into())
-                    }
-                    Decision::Deny(_) => Ok(false),
-                }
-            }),
+            self.namespace_disclosure_callback(disclosure),
             Arc::new(move |event| {
                 let store = audit_store.clone();
                 let clock = audit_clock.clone();
@@ -517,6 +515,30 @@ impl SecurityKernel {
                 )
             }),
         ))
+    }
+
+    fn namespace_disclosure_callback(
+        self: &Arc<Self>,
+        disclosure: Option<(Principal, RequestContext)>,
+    ) -> Arc<DisclosureCallback> {
+        let kernel = Arc::clone(self);
+        Arc::new(move |target| {
+            let Some((principal, context)) = disclosure.as_ref() else {
+                return Err(SecurityError::MissingPrincipal.into());
+            };
+            match kernel.authorize(
+                principal,
+                Action::NamespaceRead,
+                &Resource::Namespace(target.clone()),
+                context,
+            ) {
+                Decision::Allow(_) => Ok(true),
+                Decision::Deny(deny) if deny.reason == DenyReason::SecurityStale => {
+                    Err(SecurityError::Authorization(deny.reason).into())
+                }
+                Decision::Deny(_) => Ok(false),
+            }
+        })
     }
 
     /// Fail closed when an active lock conservatively overlaps vector deletion.

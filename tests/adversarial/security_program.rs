@@ -19,9 +19,9 @@ use zeppelin::types::{AttributeValue, Filter};
 
 use super::model::{Model, ModelRecord};
 use super::ops::{
-    ActorRole, ActorSel, DelegatedTokenSpec, DeleteUnderLockSurface, ForbiddenWriteKind,
-    GrantChange, KeySel, LockSel, Op, PreservationScopeSpec, SecurityGrantSpec, TenantProbeSurface,
-    TokenSel,
+    ActorRole, ActorSel, BranchingOp, DelegatedTokenSpec, DeleteUnderLockSurface,
+    ForbiddenWriteKind, GrantChange, KeySel, LockSel, Op, PreservationScopeSpec, SecurityGrantSpec,
+    TenantProbeSurface, TokenSel,
 };
 use super::oracle::ViolationId;
 
@@ -1868,6 +1868,18 @@ fn simple_operation_requirement(op: &Op) -> Option<GrantRequirement<'_>> {
             namespace: Some(target_ns),
             unconstrained: false,
         }),
+        Op::Branching(BranchingOp::DeleteBranch { namespace, .. }) => Some(GrantRequirement {
+            action: Action::NamespaceDelete,
+            namespace: Some(namespace),
+            unconstrained: true,
+        }),
+        Op::Branching(BranchingOp::DeleteSourceWithBranches { source, .. }) => {
+            Some(GrantRequirement {
+                action: Action::NamespaceDelete,
+                namespace: Some(source),
+                unconstrained: true,
+            })
+        }
         Op::GcCycle { .. }
         | Op::GcUnderLock { .. }
         | Op::ProbeSandwich { .. }
@@ -1875,7 +1887,8 @@ fn simple_operation_requirement(op: &Op) -> Option<GrantRequirement<'_>> {
         | Op::CloneNamespace { .. }
         | Op::UseRevokedCredential { .. }
         | Op::ExportProbe { .. }
-        | Op::AuditChainCheck { .. } => None,
+        | Op::AuditChainCheck { .. }
+        | Op::Branching(_) => None,
     }
 }
 

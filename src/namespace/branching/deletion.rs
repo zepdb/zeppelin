@@ -20,6 +20,7 @@ use crate::namespace::NamespaceId;
 use crate::namespace::{BranchId, NamespaceIncarnationId};
 use crate::security::{
     DecisionId, PolicyVersion, PreservationGuard, PreservationHeadProof, PrincipalId,
+    RootReleaseAuditProgress,
 };
 use crate::storage::{CreateOnlyOutcome, ZeppelinStore};
 use serde::{Deserialize, Serialize};
@@ -54,7 +55,7 @@ pub(crate) trait DeletionGovernance: Send + Sync {
     fn disclose_child(&self, target: &NamespaceId) -> Result<bool>;
 
     /// Persist lifecycle audit evidence.
-    async fn settle_lifecycle_audit(&self, event: DeletionLifecycleEvent) -> Result<()>;
+    async fn settle_lifecycle_audit(&self, event: DeletionLifecycleAudit) -> Result<()>;
 }
 
 pub(crate) type PreservationCallback = dyn Fn(
@@ -64,10 +65,33 @@ pub(crate) type PreservationCallback = dyn Fn(
         -> Pin<Box<dyn Future<Output = Result<(PreservationGuard, PreservationHeadProof)>> + Send>>
     + Send
     + Sync;
-pub(crate) type AuditCallback = dyn Fn(DeletionLifecycleEvent) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
+pub(crate) type AuditCallback = dyn Fn(DeletionLifecycleAudit) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
     + Send
     + Sync;
 pub(crate) type DisclosureCallback = dyn Fn(&NamespaceId) -> Result<bool> + Send + Sync;
+
+/// Source-authorized direct-child listing request with per-target disclosure.
+///
+/// The closure owns request-scoped security context but never a bearer
+/// credential. The graph must invoke it before reading each target's metadata.
+pub(crate) struct AuthorizedBranchList {
+    /// Source namespace whose bounded direct-root map is listed.
+    pub source: NamespaceId,
+    disclosure: Arc<DisclosureCallback>,
+}
+
+impl AuthorizedBranchList {
+    /// Assemble the graph request after source-read authorization succeeds.
+    #[must_use]
+    pub(crate) fn new(source: NamespaceId, disclosure: Arc<DisclosureCallback>) -> Self {
+        Self { source, disclosure }
+    }
+
+    /// Apply the request principal's current target-read disclosure decision.
+    pub(crate) fn disclose_child(&self, target: &NamespaceId) -> Result<bool> {
+        (self.disclosure)(target)
+    }
+}
 
 /// Callback-backed governance adapter used by the security/server boundary.
 pub(crate) struct CallbackDeletionGovernance {
@@ -106,7 +130,7 @@ impl DeletionGovernance for CallbackDeletionGovernance {
         (self.disclose)(target)
     }
 
-    async fn settle_lifecycle_audit(&self, event: DeletionLifecycleEvent) -> Result<()> {
+    async fn settle_lifecycle_audit(&self, event: DeletionLifecycleAudit) -> Result<()> {
         (self.audit)(event).await
     }
 }
@@ -130,26 +154,30 @@ pub(crate) enum DeletionBoundary {
     MetadataRemoval,
 }
 
-/// Redacted lifecycle event supplied to the durable audit adapter.
+/// Closed lifecycle-audit vocabulary accepted by deletion governance.
+///
+/// Keeping this separate from request-level [`crate::security::AuditParams`]
+/// makes it impossible for a cleanup worker to emit an unrelated security
+/// event through the deletion adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum DeletionLifecycleEvent {
-    /// Parent-root release advanced or converged.
-    RootRelease {
-        /// Branch target whose root changed.
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum DeletionLifecycleAudit {
+    /// Durable progress for a branch deletion's parent-root release.
+    NamespaceDeleteRootRelease {
+        /// Branch target retaining the deletion intent.
         namespace: NamespaceId,
-        /// Whether the root was newly removed or already absent safely.
-        converged: bool,
-        /// Opaque authorization linkage from the durable deletion intent.
+        /// Typed progress or redacted failure classification.
+        progress: RootReleaseAuditProgress,
+        /// Opaque canonical linkage to the original authorization decision.
         decision_evidence_ref: String,
     },
-    /// Cleanup could not yet finish and must be retried.
-    CleanupIncomplete {
-        /// Namespace retaining its durable deletion intent.
+    /// A governed deletion cleanup pass exhausted its bounded work budget.
+    NamespaceDeleteCleanupIncomplete {
+        /// Namespace retaining the durable deletion intent.
         namespace: NamespaceId,
-        /// Approximate remaining object count, never a caller disclosure.
+        /// Approximate remaining object count; never a caller disclosure.
         remaining: usize,
-        /// Opaque authorization linkage from the durable deletion intent.
+        /// Opaque canonical linkage to the original authorization decision.
         decision_evidence_ref: String,
     },
 }
@@ -173,7 +201,7 @@ struct DeletionLifecycleAuditRecord {
     domain: String,
     event_id: String,
     ts: DateTime<Utc>,
-    event: DeletionLifecycleEvent,
+    params: DeletionLifecycleAudit,
 }
 
 impl DeletionLifecycleAuditRecord {
@@ -252,7 +280,7 @@ pub(crate) async fn load_deletion_decision_evidence(
 pub(crate) async fn persist_deletion_lifecycle_audit(
     store: &ZeppelinStore,
     clock: &crate::time::Clock,
-    event: DeletionLifecycleEvent,
+    params: DeletionLifecycleAudit,
 ) -> Result<()> {
     let event_id = ulid::Ulid::new().to_string();
     let key = format!("_audit/deletion-lifecycle/{event_id}.json");
@@ -260,7 +288,7 @@ pub(crate) async fn persist_deletion_lifecycle_audit(
         domain: DeletionLifecycleAuditRecord::DOMAIN.to_string(),
         event_id,
         ts: clock.now(),
-        event,
+        params,
     };
     let body = serde_json::to_vec(&record)
         .map(Bytes::from)
@@ -508,6 +536,58 @@ pub(crate) async fn persist_branch_visibility_removal(
         }
     };
     let observed_at = store.head(&key).await?.last_modified;
+    visibility_removal_from_marker(&key, &marker, observed_at)
+}
+
+/// Load and validate the exact durable visibility marker without recreating it.
+///
+/// Once the marker-derived deadline is present in namespace metadata, a resume
+/// must only adopt the immutable object already bound by that deadline. Creating
+/// the key again would mint a new S3 timestamp and could restore a grace window
+/// after another worker has durably released the parent root.
+pub(crate) async fn load_branch_visibility_removal(
+    store: &ZeppelinStore,
+    target: &NamespaceId,
+    branch_id: BranchId,
+    intent: &NamespaceDeletionIntent,
+) -> Result<super::super::manager::VisibilityRemoval> {
+    let expected_visibility = intent.visibility.as_ref().ok_or_else(|| {
+        crate::error::ZeppelinError::Validation(format!(
+            "branch visibility marker for {target} has no durable deadline"
+        ))
+    })?;
+    let key = BranchVisibilityRemovalMarker::key(target, branch_id, intent.incarnation.clone());
+    if expected_visibility.marker_key != key {
+        return Err(crate::error::ZeppelinError::Serialization(format!(
+            "branch visibility marker key for {target} does not match its durable intent"
+        )));
+    }
+    let existing = store.get(&key).await?;
+    // The creator's floor is encoded in the immutable bytes. A nonzero
+    // placeholder is replaced by `adopt_existing_bytes` before comparison.
+    let expected = BranchVisibilityRemovalMarker::from_intent(target, branch_id, intent, 1)?;
+    let marker = expected
+        .adopt_existing_bytes(existing.as_ref())
+        .map_err(|error| {
+            crate::error::ZeppelinError::Validation(format!(
+                "branch visibility marker {key} cannot be adopted: {error}"
+            ))
+        })?;
+    let observed_at = store.head(&key).await?.last_modified;
+    let visibility = visibility_removal_from_marker(&key, &marker, observed_at)?;
+    if &visibility != expected_visibility {
+        return Err(crate::error::ZeppelinError::Validation(format!(
+            "branch visibility marker {key} does not match its durable deadline"
+        )));
+    }
+    Ok(visibility)
+}
+
+fn visibility_removal_from_marker(
+    key: &str,
+    marker: &BranchVisibilityRemovalMarker,
+    observed_at: DateTime<Utc>,
+) -> Result<super::super::manager::VisibilityRemoval> {
     let rounded = observed_at
         .checked_add_signed(ChronoDuration::seconds(1))
         .ok_or_else(|| {
@@ -529,7 +609,7 @@ pub(crate) async fn persist_branch_visibility_removal(
             crate::error::ZeppelinError::Validation("branch grace deadline overflow".to_string())
         })?;
     Ok(super::super::manager::VisibilityRemoval {
-        marker_key: key,
+        marker_key: key.to_string(),
         observed_at,
         not_before,
     })
@@ -540,14 +620,14 @@ pub(crate) async fn persist_branch_visibility_removal(
 mod tests {
     use super::{
         BranchVisibilityRemovalMarker, CallbackDeletionGovernance, DeletionBoundary,
-        DeletionGovernance, DeletionLifecycleEvent,
+        DeletionGovernance, DeletionLifecycleAudit,
     };
     use crate::namespace::manager::{NamespaceDeletionIntent, RootReleaseState, VisibilityRemoval};
     use crate::namespace::{
         BranchId, BranchRoot, ForkViewDigest, ManifestDigest, ManifestGeneration, NamespaceId,
         NamespaceIncarnationId, SourceDataPlaneConfigDigest,
     };
-    use crate::security::{PreservationGuard, PreservationHeadProof};
+    use crate::security::{PreservationGuard, PreservationHeadProof, RootReleaseAuditProgress};
     use chrono::{DateTime, Utc};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -779,7 +859,7 @@ mod tests {
             .unwrap();
         assert!(adapter.disclose_child(&target).unwrap());
         adapter
-            .settle_lifecycle_audit(DeletionLifecycleEvent::CleanupIncomplete {
+            .settle_lifecycle_audit(DeletionLifecycleAudit::NamespaceDeleteCleanupIncomplete {
                 namespace: target,
                 remaining: 1,
                 decision_evidence_ref: "test-decision".to_string(),
@@ -789,5 +869,25 @@ mod tests {
         assert_eq!(preservation_calls.load(Ordering::SeqCst), 1);
         assert_eq!(disclose_calls.load(Ordering::SeqCst), 1);
         assert_eq!(audit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn root_release_lifecycle_event_uses_typed_progress_not_a_boolean() {
+        let params = DeletionLifecycleAudit::NamespaceDeleteRootRelease {
+            namespace: NamespaceId::new("branch-target").unwrap(),
+            progress: RootReleaseAuditProgress::Released,
+            decision_evidence_ref: "decision-evidence".to_string(),
+        };
+        let value = serde_json::to_value(params).unwrap();
+        assert_eq!(
+            value["namespace_delete_root_release"]["progress"],
+            "released"
+        );
+        assert!(value["namespace_delete_root_release"]
+            .get("converged")
+            .is_none());
+        assert!(value["namespace_delete_root_release"]
+            .get("error")
+            .is_none());
     }
 }

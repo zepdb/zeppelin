@@ -255,6 +255,31 @@ pub fn error_response(err: &ZeppelinError) -> Response {
     if let Some(rid) = request_id {
         body["request_id"] = json!(rid);
     }
+    if let ZeppelinError::Branch(branch_error) = err {
+        let disclosure = match branch_error.as_ref() {
+            crate::namespace::branching::BranchError::NamespaceHasLiveBranches {
+                visible_children,
+                has_additional_children,
+                ..
+            }
+            | crate::namespace::branching::BranchError::BranchHasLiveChildren {
+                visible_children,
+                has_additional_children,
+                ..
+            } => Some((visible_children, *has_additional_children)),
+            _ => None,
+        };
+        if let Some((visible_children, has_additional_children)) = disclosure {
+            body["visible_children"] = json!(visible_children
+                .iter()
+                .map(|child| json!({
+                    "namespace": child.namespace.to_string(),
+                    "branch_id": child.branch_id.to_string(),
+                }))
+                .collect::<Vec<_>>());
+            body["has_additional_children"] = json!(has_additional_children);
+        }
+    }
 
     let mut response = (status_code, axum::Json(body)).into_response();
     response

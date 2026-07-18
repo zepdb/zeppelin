@@ -152,7 +152,9 @@ use crate::namespace::branching::http::{
     BranchDescriptorResponse, BranchHealth, BranchLifecycle, BranchListResponse, BranchMode,
     BranchStatusDescriptor, BranchTargetIdentity,
 };
-use crate::namespace::branching::{BranchError, PrepareForkOutcome, PrepareForkRequest};
+use crate::namespace::branching::{
+    BranchError, BranchLifecycleState, PrepareForkOutcome, PrepareForkRequest,
+};
 use crate::namespace::graph::NamespaceGraph;
 use crate::namespace::manager::{
     CreateNamespaceOutcome, NamespaceIndexConfig, NamespaceMetadata, NamespaceState,
@@ -343,12 +345,11 @@ pub async fn create_branch(
 }
 
 /// List direct branch roots for an enabled source namespace.
-#[instrument(skip(state, principal, context, audit), fields(source = %source))]
+#[instrument(skip(state, principal, context), fields(source = %source))]
 pub async fn list_branches(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Extension(context): Extension<RequestContext>,
-    Extension(audit): Extension<AuditRequest>,
     Path(source): Path<String>,
 ) -> Result<Json<BranchListResponse>, ApiError> {
     if !state.config.branching.enabled {
@@ -358,60 +359,41 @@ pub async fn list_branches(
             },
         ))));
     }
-    authorize_namespace_action(
-        &state,
-        &principal,
-        &context,
-        &audit,
-        Action::NamespaceRead,
-        &source,
-    )
-    .map_err(|error| ApiError(error.into()))?;
-    let (manifest, _) = Manifest::read_versioned_required(&state.store, &source).await?;
-    let mut branches = Vec::with_capacity(manifest.branch_roots().len());
-    for root in manifest.branch_roots().values() {
-        match authorize_namespace_action(
-            &state,
-            &principal,
-            &context,
-            &audit,
-            Action::NamespaceRead,
-            root.target_namespace.as_str(),
-        ) {
-            Ok(_) => {}
-            Err(SecurityError::Authorization(_)) => continue,
-            Err(error) => return Err(ApiError(error.into())),
-        }
-        let (metadata, _) = state
-            .namespace_manager
-            .read_metadata_versioned(root.target_namespace.as_str())
-            .await?;
-        let identity = root;
-        let depth = metadata
-            .branch_identity
-            .as_ref()
-            .map(|value| value.depth)
-            .unwrap_or(0);
+    // Secure route middleware already authorized NamespaceRead for the source.
+    // Keep that decision request-local and use the principal only for each
+    // target disclosure check; NamespaceRead does not mint an AuditRequest.
+    let source_id = NamespaceId::new(source).map_err(|error| ApiError(error.into()))?;
+    let request = state
+        .security
+        .authorize_branch_list(source_id, principal, context);
+    let descriptors = namespace_graph(&state)
+        .list_children(request)
+        .await
+        .map_err(ApiError::from)?;
+    let mut branches = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        let (lifecycle, health) = match descriptor.state {
+            BranchLifecycleState::Preparing => (
+                BranchLifecycle::Preparing,
+                BranchHealth::AwaitingAuthenticatedRetry,
+            ),
+            BranchLifecycleState::Active => (BranchLifecycle::Active, BranchHealth::Ready),
+            BranchLifecycleState::Deleting => {
+                (BranchLifecycle::Deleting, BranchHealth::DeletionInProgress)
+            }
+        };
         branches.push(BranchDescriptorResponse {
-            branch_id: identity.branch_id.to_string(),
+            branch_id: descriptor.branch_id.to_string(),
             target: BranchTargetIdentity {
-                namespace: identity.target_namespace.to_string(),
-                incarnation: identity.target_incarnation.to_string(),
+                namespace: descriptor.target.to_string(),
+                incarnation: descriptor.target_incarnation.to_string(),
             },
             mode: BranchMode::CopyOnWrite,
-            depth,
-            lifecycle: match metadata.state {
-                NamespaceState::Creating => BranchLifecycle::Preparing,
-                NamespaceState::Active => BranchLifecycle::Active,
-                NamespaceState::Deleting => BranchLifecycle::Deleting,
-            },
-            health: if matches!(metadata.state, NamespaceState::Deleting) {
-                BranchHealth::DeletionInProgress
-            } else {
-                BranchHealth::Ready
-            },
+            depth: descriptor.depth,
+            lifecycle,
+            health,
             materialized: false,
-            created_at: identity.created_at,
+            created_at: descriptor.created_at,
         });
     }
     branches.sort_by(|a, b| {

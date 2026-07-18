@@ -3,6 +3,7 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -202,6 +203,44 @@ async fn read_namespace_metadata(store: &ZeppelinStore, namespace: &str) -> Name
         .await
         .expect("namespace metadata must remain authoritative");
     NamespaceMetadata::from_bytes(&bytes).expect("namespace metadata must decode")
+}
+
+async fn root_release_audit_progress(
+    store: &ZeppelinStore,
+    namespace: &str,
+    decision_evidence_ref: &str,
+) -> Vec<Value> {
+    let mut progress = Vec::new();
+    for key in store
+        .list_prefix("_audit/deletion-lifecycle/")
+        .await
+        .expect("deletion lifecycle audit prefix must be listable")
+    {
+        let record: Value = serde_json::from_slice(
+            &store
+                .get(&key)
+                .await
+                .expect("lifecycle audit record must be readable"),
+        )
+        .expect("lifecycle audit record must decode");
+        let Some(params) = record["params"]["namespace_delete_root_release"].as_object() else {
+            continue;
+        };
+        if params.get("namespace") != Some(&json!(namespace)) {
+            continue;
+        }
+        assert_eq!(
+            params.get("decision_evidence_ref"),
+            Some(&json!(decision_evidence_ref))
+        );
+        progress.push(
+            params
+                .get("progress")
+                .cloned()
+                .expect("root-release audit must carry typed progress"),
+        );
+    }
+    progress
 }
 
 fn expected_grace_deadline(observed_at: DateTime<Utc>, floor_secs: u64) -> DateTime<Utc> {
@@ -503,6 +542,205 @@ async fn http_delete_source_with_live_child_is_a_non_mutating_conflict() {
 
     harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn source_delete_conflict_discloses_only_readable_children_without_a_count_oracle() {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let source = format!("disclosure-source-{suffix}");
+    let visible = format!("disclosure-visible-{suffix}");
+    let hidden = format!("disclosure-hidden-{suffix}");
+    let mut config = Config::from_str(&format!(
+        r#"
+[branching]
+enabled = true
+
+[security]
+mode = "enforced"
+policy_refresh_secs = 3600
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[security.api_keys]]
+key_id = "zpk1_branch_disclosure"
+name = "branch-disclosure"
+sha256_hex = "0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a"
+actions = ["NamespaceRead", "NamespaceDelete"]
+namespaces = ["{source}", "{visible}"]
+"#,
+    ))
+    .expect("disclosure test config must decode");
+    config.security.audit_flush_secs = 1;
+    let (base_url, harness, _cache, _cache_dir, admin_bearer) =
+        start_test_server_with_config(Some(config)).await;
+    let admin = client_with_bearer(&admin_bearer);
+
+    create_source_with_one_row(&admin, &base_url, &source).await;
+    let mut visible_branch_id = None;
+    for target in [&visible, &hidden] {
+        let fork = admin
+            .post(format!("{base_url}/v1/namespaces/{source}/branches"))
+            .json(&json!({ "target": target }))
+            .send()
+            .await
+            .expect("fork request must complete");
+        assert_eq!(fork.status(), reqwest::StatusCode::CREATED);
+        let body: Value = fork.json().await.expect("fork response must decode");
+        if target == &visible {
+            visible_branch_id = body["branch_id"].as_str().map(ToOwned::to_owned);
+        }
+    }
+    let visible_branch_id = visible_branch_id.expect("visible fork must return its branch ID");
+    let scoped =
+        client_with_bearer("zpk1_branch_disclosure.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    let visible_probe = scoped
+        .get(format!("{base_url}/v1/namespaces/{visible}"))
+        .send()
+        .await
+        .expect("visible-child authorization probe must complete");
+    let visible_probe_status = visible_probe.status();
+    let visible_probe_body = visible_probe
+        .text()
+        .await
+        .expect("visible-child authorization response must be readable");
+    assert!(
+        !matches!(
+            visible_probe_status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ),
+        "fixture principal must pass visible-child authorization: status={visible_probe_status}, body={visible_probe_body}"
+    );
+    assert_eq!(
+        scoped
+            .get(format!("{base_url}/v1/namespaces/{hidden}"))
+            .send()
+            .await
+            .expect("hidden-child authorization probe must complete")
+            .status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "fixture principal must be denied read access to the hidden child"
+    );
+
+    let listing_before_corruption = scoped
+        .get(format!("{base_url}/v1/namespaces/{source}/branches"))
+        .send()
+        .await
+        .expect("branch listing precondition must complete");
+    assert_eq!(
+        listing_before_corruption.status(),
+        reqwest::StatusCode::OK,
+        "valid denied-child metadata must not affect the filtered listing"
+    );
+    let listing_before_corruption: Value = listing_before_corruption
+        .json()
+        .await
+        .expect("branch listing precondition must decode");
+    assert_eq!(
+        listing_before_corruption["branches"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        listing_before_corruption["branches"][0]["target"]["namespace"],
+        visible
+    );
+    assert!(!listing_before_corruption.to_string().contains(&hidden));
+
+    harness
+        .store
+        .delete(&NamespaceMetadata::s3_key(&hidden))
+        .await
+        .expect("denied child corruption fixture must be installed");
+
+    let listing = scoped
+        .get(format!("{base_url}/v1/namespaces/{source}/branches"))
+        .send()
+        .await
+        .expect("branch listing must complete");
+    let listing_status = listing.status();
+    let listing: Value = listing.json().await.expect("branch listing must decode");
+    assert_eq!(
+        listing_status,
+        reqwest::StatusCode::OK,
+        "unexpected branch-list response: {listing}"
+    );
+    assert_eq!(listing["branches"].as_array().map(Vec::len), Some(1));
+    assert_eq!(listing["branches"][0]["target"]["namespace"], visible);
+    assert!(
+        !listing.to_string().contains(&hidden),
+        "denied child identity must not appear anywhere in the listing"
+    );
+
+    let deletion = scoped
+        .delete(format!("{base_url}/v1/namespaces/{source}"))
+        .send()
+        .await
+        .expect("source delete conflict must complete");
+    assert_eq!(deletion.status(), reqwest::StatusCode::CONFLICT);
+    let body: Value = deletion
+        .json()
+        .await
+        .expect("source delete conflict must decode");
+    assert_eq!(body["code"], "namespace_has_live_branches");
+    assert_eq!(
+        body["visible_children"],
+        json!([{ "namespace": visible, "branch_id": visible_branch_id }])
+    );
+    assert_eq!(body["has_additional_children"], true);
+    assert!(body.get("child_count").is_none());
+    assert!(body.get("total").is_none());
+    assert!(
+        !body.to_string().contains(&hidden),
+        "denied child identity must not appear anywhere in the conflict"
+    );
+
+    harness.cleanup_artifact_origin_namespace(&hidden).await;
+    harness.cleanup_artifact_origin_namespace(&visible).await;
+    harness.cleanup_artifact_origin_namespace(&source).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn readable_child_corruption_fails_branch_listing_with_a_generic_integrity_error() {
+    let mut config = Config::default();
+    config.branching.enabled = true;
+    config.security.policy_refresh_secs = 3_600;
+    let (base_url, harness, _cache, _cache_dir, admin_bearer) =
+        start_test_server_with_config(Some(config)).await;
+    let client = client_with_bearer(&admin_bearer);
+    let source = harness.artifact_origin_namespace("list-corrupt-source");
+    let target = harness.artifact_origin_namespace("list-corrupt-target");
+
+    create_source_with_one_row(&client, &base_url, &source).await;
+    let fork = client
+        .post(format!("{base_url}/v1/namespaces/{source}/branches"))
+        .json(&json!({ "target": target }))
+        .send()
+        .await
+        .expect("fork request must complete");
+    assert_eq!(fork.status(), reqwest::StatusCode::CREATED);
+
+    harness
+        .store
+        .delete(&NamespaceMetadata::s3_key(&target))
+        .await
+        .expect("target metadata corruption fixture must be installed");
+    let listing = client
+        .get(format!("{base_url}/v1/namespaces/{source}/branches"))
+        .send()
+        .await
+        .expect("corrupt branch listing must complete");
+    assert_eq!(listing.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value = listing.json().await.expect("error envelope must decode");
+    assert_eq!(body["code"], "branch_integrity_error");
+    assert!(
+        !body.to_string().contains(&target),
+        "generic integrity failure must not disclose the corrupt child identity"
+    );
+
+    harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup().await;
 }
 
@@ -1277,6 +1515,145 @@ async fn slice_five_lost_parent_root_cas_reply_converges_before_final_cleanup() 
 }
 
 #[tokio::test]
+async fn failed_and_successful_root_release_attempts_write_typed_lifecycle_audit() {
+    let harness = common::harness::TestHarness::new().await;
+    let source = harness.artifact_origin_namespace("root-release-audit-source");
+    let target = harness.artifact_origin_namespace("root-release-audit-target");
+    let fixture = establish_branch_grace(&harness, &source, &target).await;
+    fixture.wall_clock.set(fixture.visibility.not_before);
+    let deleting = read_namespace_metadata(&harness.store, &target).await;
+    let decision_evidence_ref = deleting
+        .deletion_intent
+        .as_ref()
+        .map(|intent| intent.decision_evidence_ref.clone())
+        .expect("branch grace fixture must retain decision evidence linkage");
+
+    let (faulted_store, failure) =
+        fail_put_once_matching(&harness.store, format!("{source}/manifest.json"));
+    let faulted = start_branch_recovery_server(&harness, faulted_store, &fixture).await;
+    let response = client_with_bearer(&fixture.admin_bearer)
+        .delete(format!("{}/v1/namespaces/{target}", faulted.base_url))
+        .send()
+        .await
+        .expect("faulted branch deletion retry must complete");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(failure.failures_injected(), 1);
+    faulted.shutdown().await;
+
+    let resumed = start_branch_recovery_server(&harness, harness.store.clone(), &fixture).await;
+    let response = client_with_bearer(&fixture.admin_bearer)
+        .delete(format!("{}/v1/namespaces/{target}", resumed.base_url))
+        .send()
+        .await
+        .expect("successful branch deletion retry must complete");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    resumed.shutdown().await;
+
+    let progress =
+        root_release_audit_progress(&harness.store, &target, &decision_evidence_ref).await;
+    assert!(
+        progress.contains(&json!({
+            "grace_pending": {"not_before": fixture.visibility.not_before}
+        })),
+        "initial visibility removal must durably record the persisted grace deadline: {progress:?}"
+    );
+    assert!(
+        progress.contains(&json!({"failed": {"class": "storage_unavailable"}})),
+        "root-removal storage failure must be durably classified: {progress:?}"
+    );
+    assert!(
+        progress.contains(&json!("released")),
+        "successful retry must durably record exact-root release: {progress:?}"
+    );
+
+    harness.cleanup_artifact_origin_namespace(&source).await;
+    harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn root_release_audit_outage_fails_closed_then_retry_records_convergence() {
+    let harness = common::harness::TestHarness::new().await;
+    let source = harness.artifact_origin_namespace("root-release-audit-outage-source");
+    let target = harness.artifact_origin_namespace("root-release-audit-outage-target");
+    let fixture = establish_branch_grace(&harness, &source, &target).await;
+    fixture.wall_clock.set(fixture.visibility.not_before);
+    let deleting = read_namespace_metadata(&harness.store, &target).await;
+    let decision_evidence_ref = deleting
+        .deletion_intent
+        .as_ref()
+        .map(|intent| intent.decision_evidence_ref.clone())
+        .expect("branch grace fixture must retain decision evidence linkage");
+
+    let (audit_failure_store, audit_failure) =
+        fail_put_once_matching(&harness.store, "_audit/deletion-lifecycle/");
+    let faulted = start_branch_recovery_server(&harness, audit_failure_store, &fixture).await;
+    let response = client_with_bearer(&fixture.admin_bearer)
+        .delete(format!("{}/v1/namespaces/{target}", faulted.base_url))
+        .send()
+        .await
+        .expect("audit-faulted branch deletion retry must return a response");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "root removal must never return success when its required lifecycle audit is unavailable"
+    );
+    assert_eq!(audit_failure.failures_injected(), 1);
+    faulted.shutdown().await;
+
+    assert!(
+        branch_control_snapshot(&harness.store, &source)
+            .await
+            .expect("parent root map must remain authoritative after audit failure")
+            .roots
+            .is_empty(),
+        "the audit outage is injected only after the exact parent root is removed"
+    );
+    let interrupted = read_namespace_metadata(&harness.store, &target).await;
+    assert_eq!(
+        interrupted
+            .deletion_intent
+            .as_ref()
+            .and_then(|intent| intent.root_release.as_ref()),
+        None,
+        "an unaudited root removal must not receive a durable release acknowledgement"
+    );
+
+    let resumed = start_branch_recovery_server(&harness, harness.store.clone(), &fixture).await;
+    let response = client_with_bearer(&fixture.admin_bearer)
+        .delete(format!("{}/v1/namespaces/{target}", resumed.base_url))
+        .send()
+        .await
+        .expect("retry after lifecycle-audit recovery must return a response");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    resumed.shutdown().await;
+
+    let progress =
+        root_release_audit_progress(&harness.store, &target, &decision_evidence_ref).await;
+    assert!(
+        progress.contains(&json!({
+            "grace_pending": {"not_before": fixture.visibility.not_before}
+        })),
+        "the durable grace observation must survive the later audit outage: {progress:?}"
+    );
+    assert!(
+        progress.contains(&json!("converged")),
+        "the retry must durably classify the already-absent exact root as converged: {progress:?}"
+    );
+    assert!(
+        !progress.contains(&json!("released")),
+        "the failed audit attempt must not manufacture a durable released event: {progress:?}"
+    );
+
+    harness.cleanup_artifact_origin_namespace(&source).await;
+    harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn slice_five_retry_after_marker_cleanup_does_not_recreate_visibility() {
     let harness = common::harness::TestHarness::new().await;
     let source = harness.artifact_origin_namespace("marker-cleanup-source");
@@ -1330,6 +1707,98 @@ async fn slice_five_retry_after_marker_cleanup_does_not_recreate_visibility() {
         harness.store.get(&meta_key).await,
         Err(zeppelin::error::ZeppelinError::NotFound { .. })
     ));
+
+    harness.cleanup_artifact_origin_namespace(&source).await;
+    harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn concurrent_stale_resume_after_marker_cleanup_converges_without_recreation() {
+    let harness = common::harness::TestHarness::new().await;
+    let source = harness.artifact_origin_namespace("concurrent-marker-cleanup-source");
+    let target = harness.artifact_origin_namespace("concurrent-marker-cleanup-target");
+    let fixture = establish_branch_grace(&harness, &source, &target).await;
+    fixture.wall_clock.set(fixture.visibility.not_before);
+
+    let (paused_store, marker_get) =
+        pause_next_get_matching(&harness.store, fixture.visibility.marker_key.clone());
+    // Both concurrent graph instances need their own disposable gateway view.
+    // The fixture server's signer root ended at shutdown, so reusing the
+    // application gateway for a manifest CAS would correctly fail its signer
+    // lifecycle check instead of exercising the deletion race.
+    let winning_store = ZeppelinStore::new(harness.store.inner());
+    marker_get.arm();
+    let stale_target = NamespaceId::new(target.clone()).expect("target namespace must be valid");
+    let stale_config = fixture.config.clone();
+    let stale_clock = fixture.clock.clone();
+    let mut stale_resume = tokio::spawn(async move {
+        resume_delete_with_config_and_clock_for_test(
+            paused_store,
+            stale_target,
+            &stale_config,
+            stale_clock,
+            Duration::from_secs(1),
+        )
+        .await
+    });
+    tokio::select! {
+        () = marker_get.wait_until_paused() => {}
+        outcome = &mut stale_resume => {
+            panic!("stale resume returned before its marker read was paused: {outcome:?}");
+        }
+    }
+
+    assert_eq!(
+        resume_delete_with_config_and_clock_for_test(
+            winning_store,
+            NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+            &fixture.config,
+            fixture.clock.clone(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the winning concurrent resume must finish deletion"),
+        NamespaceDeleteOutcome::Deleted
+    );
+    assert!(
+        branch_control_snapshot(&harness.store, &source)
+            .await
+            .expect("parent root map must remain authoritative")
+            .roots
+            .is_empty(),
+        "the winning resume must release the exact parent root"
+    );
+    assert!(matches!(
+        harness.store.get(&fixture.visibility.marker_key).await,
+        Err(zeppelin::error::ZeppelinError::NotFound { .. })
+    ));
+    assert!(matches!(
+        harness.store.get(&NamespaceMetadata::s3_key(&target)).await,
+        Err(zeppelin::error::ZeppelinError::NotFound { .. })
+    ));
+
+    marker_get.release();
+    assert_eq!(
+        stale_resume
+            .await
+            .expect("stale resume task must not panic")
+            .expect("stale resume must prove completed deletion after marker loss"),
+        NamespaceDeleteOutcome::Deleted
+    );
+    assert!(matches!(
+        harness.store.get(&fixture.visibility.marker_key).await,
+        Err(zeppelin::error::ZeppelinError::NotFound { .. })
+    ));
+    assert!(
+        harness
+            .store
+            .list_prefix(&format!("{target}/"))
+            .await
+            .expect("target prefix must remain listable")
+            .is_empty(),
+        "the stale worker must not recreate target-owned lifecycle state"
+    );
 
     harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup_artifact_origin_namespace(&target).await;
@@ -1931,7 +2400,7 @@ fn run_slice_six_maintain_recovery_row(
                 zeppelin::error::ZeppelinError::Branch(inner)
                     if matches!(
                         inner.as_ref(),
-                        BranchError::NamespaceHasLiveBranches { namespace }
+                        BranchError::NamespaceHasLiveBranches { namespace, .. }
                             if namespace == &source
                     )
             ));

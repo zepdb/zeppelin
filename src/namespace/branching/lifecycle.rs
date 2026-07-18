@@ -221,11 +221,15 @@ pub enum NamespaceDeleteOutcome {
     },
 }
 
-/// Direct-child listing request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BranchListRequest {
-    /// Source namespace whose direct root map is listed.
-    pub source: NamespaceId,
+/// Closed lifecycle vocabulary disclosed for a direct child branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchLifecycleState {
+    /// The target reservation has not completed activation.
+    Preparing,
+    /// The target is active and ready for branch reads and writes.
+    Active,
+    /// The target is fenced and its deletion protocol is in progress.
+    Deleting,
 }
 
 /// Redacted direct-child descriptor returned by the graph.
@@ -235,8 +239,14 @@ pub struct BranchDescriptor {
     pub target: NamespaceId,
     /// Stable branch edge identity.
     pub branch_id: BranchId,
+    /// Exact child lifetime already disclosed by the parent root.
+    pub target_incarnation: NamespaceIncarnationId,
+    /// One-based ancestry depth copied from the verified target reservation.
+    pub depth: u16,
+    /// Stable branch reservation timestamp.
+    pub created_at: DateTime<Utc>,
     /// Redacted lifecycle state.
-    pub state: &'static str,
+    pub state: BranchLifecycleState,
 }
 
 /// Complete proof returned after prepare reaches `manifest_published`.

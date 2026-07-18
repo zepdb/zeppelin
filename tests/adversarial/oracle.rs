@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use zeppelin::index::filter::evaluate_filter;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, Filter};
 
+use super::branching::BranchDeleteViolation;
 use super::model::{
     model_distance, IndetEffect, Model, ModelRecord, NsIndeterminate, NsModel, OracleMutation,
 };
@@ -48,6 +49,7 @@ pub enum ViolationId {
     I27ConstraintDrop,
     I28PreservationBypass,
     I29ReceiptIntegrity,
+    I30BranchingLifecycle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +59,21 @@ pub struct Violation {
     pub namespace: String,
     pub detail: String,
     pub evidence: serde_json::Value,
+}
+
+#[must_use]
+pub fn branching_delete_violation(
+    op_index: u64,
+    namespace: &str,
+    violation: BranchDeleteViolation,
+) -> Violation {
+    Violation {
+        id: ViolationId::I30BranchingLifecycle,
+        op_index,
+        namespace: namespace.to_string(),
+        detail: format!("branch deletion lifecycle violation: {violation:?}"),
+        evidence: serde_json::json!({ "violation": violation }),
+    }
 }
 
 pub trait Invariant {

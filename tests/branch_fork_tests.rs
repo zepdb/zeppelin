@@ -24,7 +24,8 @@ use zeppelin::namespace::branching::test_support::{
     prepared_manifest_snapshot, publish_deletion_fence, resume_delete_for_test,
 };
 use zeppelin::namespace::branching::{
-    BranchError, BranchPrepareStage, NamespaceDeleteOutcome, PrepareForkOutcome,
+    BranchError, BranchLifecycleState, BranchPrepareStage, NamespaceDeleteOutcome,
+    PrepareForkOutcome,
 };
 use zeppelin::namespace::manager::{
     CompactionStatus, NamespaceIndexConfig, NamespaceMetadata, NamespaceState,
@@ -308,7 +309,9 @@ async fn graph_lists_direct_children_in_target_order() {
         .map(|child| child.target.to_string())
         .collect::<Vec<_>>();
     assert_eq!(names, vec![target_a.clone(), target_b.clone()]);
-    assert!(children.iter().all(|child| child.state == "creating"));
+    assert!(children
+        .iter()
+        .all(|child| child.state == BranchLifecycleState::Preparing));
 
     harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup_artifact_origin_namespace(&target_a).await;

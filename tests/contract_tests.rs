@@ -193,6 +193,50 @@ fn branching_release_contract_is_gated_and_has_no_merge_surface() {
 }
 
 #[test]
+fn namespace_delete_conflict_documents_filtered_children_without_an_exact_total() {
+    let api = include_str!("../api/zeppelin-api.yaml");
+    let list = operation_block(api, "get", "/v1/namespaces/{ns}/branches");
+    assert!(list.contains("Disclosure is checked before target metadata is read"));
+    assert!(list.contains("branch_integrity_error"));
+
+    let delete = operation_block(api, "delete", "/v1/namespaces/{ns}");
+    assert!(delete.contains("#/components/responses/NamespaceDeleteConflict"));
+    let response = component_schema_block(api, "NamespaceDeleteConflict");
+    assert!(response.contains("oneOf:"));
+    assert!(response.contains("#/components/schemas/NamespaceHasLiveBranchesErrorResponse"));
+    assert!(response.contains("#/components/schemas/NamespaceDeleteGenericConflictErrorResponse"));
+    assert!(!response.contains("#/components/schemas/ErrorResponse"));
+
+    let conflict = component_schema_block(api, "NamespaceHasLiveBranchesErrorResponse");
+    assert!(conflict.contains("additionalProperties: false"));
+    assert!(conflict.contains(
+        "required: [code, error, status, retryable, visible_children, has_additional_children]"
+    ));
+    assert!(conflict.contains("enum: [namespace_has_live_branches, branch_has_live_children]"));
+    assert!(conflict.contains("const: 409"));
+    assert!(conflict.contains("const: false"));
+    assert!(conflict.contains("#/components/schemas/VisibleBranchChild"));
+    assert!(conflict.contains("denied or truncated children"));
+    assert!(!conflict.contains("child_count"));
+    assert!(!conflict.contains("total_children"));
+    assert!(!conflict.contains("total:"));
+
+    let generic = component_schema_block(api, "NamespaceDeleteGenericConflictErrorResponse");
+    assert!(generic.contains("additionalProperties: false"));
+    assert!(generic.contains("required: [code, error, status, retryable]"));
+    assert!(generic.contains("enum: [preservation_locked, CONFLICT_RETRY]"));
+
+    let child = component_schema_block(api, "VisibleBranchChild");
+    assert!(child.contains("additionalProperties: false"));
+    assert!(child.contains("required: [namespace, branch_id]"));
+
+    let errors = component_schema_block(api, "ErrorResponse");
+    assert!(errors.contains("namespace_has_live_branches"));
+    assert!(errors.contains("branch_has_live_children"));
+    assert!(errors.contains("branch_integrity_error"));
+}
+
+#[test]
 fn openapi_documents_bearer_security_for_every_protected_operation() {
     let api = include_str!("../api/zeppelin-api.yaml");
     assert!(
@@ -370,7 +414,10 @@ fn openapi_security_admin_contract_is_exact_and_redacted() {
     assert!(all_actions.contains("AttributeAdmin"));
     assert!(all_actions.contains("are excluded"));
     assert!(all_actions.contains("CredentialDelegate"));
+    assert!(all_actions.contains("NamespaceFork"));
     assert!(all_actions.contains("SecurityAdminWrite"));
+    let actions = component_schema_block(api, "SecurityAction");
+    assert!(actions.contains("NamespaceFork"));
     let grant = component_schema_block(api, "SecurityGrantMutationRequest");
     for constraint in [
         "mandatory_filter:",
@@ -403,6 +450,7 @@ fn openapi_security_admin_contract_is_exact_and_redacted() {
     assert!(minted.contains("required: [policy_version, token_id, token, expires_at]"));
     assert!(minted.contains("returned by a later read"));
     let delegated_actions = component_schema_block(api, "DelegatedSecurityAction");
+    assert!(delegated_actions.contains("NamespaceFork"));
     assert!(delegated_actions.contains("VectorDelete"));
     assert!(!delegated_actions.contains("SecurityAdminWrite"));
     assert!(!delegated_actions.contains("CredentialDelegate"));

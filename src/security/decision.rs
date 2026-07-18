@@ -439,6 +439,7 @@ impl AllowDecision {
             action,
             Action::RuntimeConfigWrite
                 | Action::NamespaceDelete
+                | Action::NamespaceFork
                 | Action::SnapshotDelete
                 | Action::IndexConfigWrite
                 | Action::VectorDelete
@@ -495,7 +496,7 @@ mod tests {
     use crate::{security::Action, types::AttributeValue};
 
     #[test]
-    fn durable_audit_obligation_inventory_is_exact_through_phase_eight() {
+    fn durable_audit_obligation_inventory_is_exact_through_phase_ten() {
         let durable = Action::ALL
             .into_iter()
             .filter(|action| {
@@ -511,6 +512,7 @@ mod tests {
                 Action::RuntimeConfigWrite,
                 Action::NamespaceDelete,
                 Action::SnapshotDelete,
+                Action::NamespaceFork,
                 Action::IndexConfigWrite,
                 Action::VectorDelete,
                 Action::SecurityAdminRead,

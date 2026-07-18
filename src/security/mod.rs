@@ -30,8 +30,8 @@ pub use crate::namespace::NamespaceId;
 pub use action::Action;
 pub use audit::{
     AuditChainPosition, AuditOutcome, AuditParams, AuditRecord, AuditedVectorIds,
-    IndexConfigValues, PreservationBlockedSurface, ResourceRef, RuntimeConfigValues,
-    MAX_AUDITED_VECTOR_IDS,
+    IndexConfigValues, PreservationBlockedSurface, ResourceRef, RootReleaseAuditProgress,
+    RootReleaseFailureClass, RuntimeConfigValues, MAX_AUDITED_VECTOR_IDS,
 };
 pub use audit_chain::{
     verify_audit_day, AuditChainDivergence, AuditChainVerification, AuditDayAnchor,

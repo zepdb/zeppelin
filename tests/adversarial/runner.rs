@@ -57,10 +57,10 @@ use super::model::{
     AmbiguityReason, IndetEffect, Model, ModelRecord, NsIndeterminate, OpOutcome, OracleMutation,
 };
 use super::ops::{
-    ActorSel, DelegatedTokenSpec, DeleteUnderLockSurface, ExecutionMetadata, ExecutionPhase,
-    ForbiddenWriteKind, GenVector, GeneratedQuery, GrantChange, HeldExecutionMetadata,
-    HoldReleaseCause, InvalidProbe, LockSel, NamespaceSpec, Op, OpRecord, PreservationScopeSpec,
-    QueryOracleClass, TenantProbeSurface, TokenSel,
+    ActorSel, BranchingOp, DelegatedTokenSpec, DeleteUnderLockSurface, ExecutionMetadata,
+    ExecutionPhase, ForbiddenWriteKind, GenVector, GeneratedQuery, GrantChange,
+    HeldExecutionMetadata, HoldReleaseCause, InvalidProbe, LockSel, NamespaceSpec, Op, OpRecord,
+    PreservationScopeSpec, QueryOracleClass, TenantProbeSurface, TokenSel,
 };
 use super::oracle::{self, Violation, ViolationId};
 use super::s3_oracle::{self, S3Tracker};
@@ -6247,6 +6247,9 @@ async fn execute_op(
             }
             ("DELETE".to_string(), path, status, response)
         }
+        Op::Branching(operation) => {
+            execute_branching_http(client, &target.base_url, operation).await
+        }
         Op::ProbeSandwich {
             ns, maintenance, ..
         } => {
@@ -7331,6 +7334,39 @@ async fn execute_invalid_probe(
             ("POST".to_string(), path, status, response)
         }
     }
+}
+
+pub(crate) async fn execute_branching_http(
+    client: &Client,
+    base_url: &str,
+    operation: &BranchingOp,
+) -> (String, String, u16, serde_json::Value) {
+    let (method, path, body) = match operation {
+        BranchingOp::ForkNamespace { source, target, .. } => (
+            Method::POST,
+            format!("/v1/namespaces/{source}/branches"),
+            Some(json!({ "target": target })),
+        ),
+        BranchingOp::ListBranches { source, .. } => (
+            Method::GET,
+            format!("/v1/namespaces/{source}/branches"),
+            None,
+        ),
+        BranchingOp::CompactBranch { namespace, .. } => (
+            Method::POST,
+            format!("/v1/namespaces/{namespace}/compact"),
+            None,
+        ),
+        BranchingOp::DeleteBranch { namespace, .. } => {
+            (Method::DELETE, format!("/v1/namespaces/{namespace}"), None)
+        }
+        BranchingOp::DeleteSourceWithBranches { source, .. } => {
+            (Method::DELETE, format!("/v1/namespaces/{source}"), None)
+        }
+    };
+    let method_label = method.to_string();
+    let (status, response) = request_json(client, method, &format!("{base_url}{path}"), body).await;
+    (method_label, path, status, response)
 }
 
 async fn request_json(

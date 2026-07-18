@@ -119,6 +119,40 @@ Use `provider_contract_abuse` for broken provider/adapter research and
 `semantic`, `ops`, and `full` profile names remain accepted for artifact replay
 and explicitly requested historical campaigns, but none is selected by Mixed.
 
+## Branch deletion smoke
+
+The deletion-unification trace carries the real `BranchingOp::DeleteBranch`
+and `BranchingOp::DeleteSourceWithBranches` values inside the runner's normal
+`Op`/`OpRecord` replay vocabulary while sending every delete through the
+authenticated HTTP namespace handler. The seeded schedule varies the number
+of safe pre-grace source-delete attempts and writes standard `ops.jsonl` plus
+coverage. Until production exposes an authorized fork-activation endpoint,
+setup alone uses the explicitly labeled
+`branching-test-support::activate_fork_for_test` seam. That setup must not be
+treated as activation-path release evidence.
+
+Each seed proves that source deletion returns the expected
+`namespace_has_live_branches` 409 both before the persisted reader-safety
+deadline and after the deadline while the root remains. An injected wall clock
+then lets a second branch DELETE release the exact root without a sleep. The
+server is gracefully restarted before that clock movement so the initial
+request's pre-grace cleanup worker is joined rather than raced by the explicit
+retry. Only after exact root release may the source DELETE return 202. Records
+are written under `target/adversarial/branching-delete-smoke/seed-*/` by
+default.
+
+Run at least two pinned deterministic seeds against real MinIO:
+
+```bash
+TEST_BACKEND=minio \
+ZEPPELIN_ADVERSARIAL_MODE=deterministic \
+ZEPPELIN_ADVERSARIAL_SEEDS=0,2 \
+ZEPPELIN_ADVERSARIAL_PRESERVE=never \
+cargo test --features branching-test-support \
+  --test adversarial_workload_tests branching_delete_smoke \
+  -- --ignored --nocapture
+```
+
 ## Product-fix admission
 
 Before a runner finding can authorize a production `src/` change, its RCA must

@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use zeppelin::types::{AttributeValue, DistanceMetric};
 
+use super::branching::{BranchDeleteBookkeeping, BranchDeleteViolation};
 use super::ops::{AsOfTarget, GenVector, GeneratedQuery, MaintenanceKind, NamespaceSpec, Op};
 use super::security_program::SecurityPolicyModel;
 
@@ -222,6 +224,9 @@ pub struct Model {
     /// Authoritative manifest roots observed at completed logical-op boundaries.
     #[serde(default)]
     pub published_roots: BTreeMap<String, Vec<PublishedRootObservation>>,
+    /// Exact branch-edge deletion state used by branching operation oracles.
+    #[serde(default)]
+    pub branch_deletions: BTreeMap<String, BranchDeleteBookkeeping>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -328,6 +333,75 @@ pub enum NsIndeterminate {
 }
 
 impl Model {
+    pub fn track_branch_delete(
+        &mut self,
+        bookkeeping: BranchDeleteBookkeeping,
+    ) -> Result<(), BranchDeleteViolation> {
+        let target_namespace = bookkeeping.target_namespace.clone();
+        match self.branch_deletions.entry(target_namespace.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(bookkeeping);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                Err(BranchDeleteViolation::DuplicateBranchTarget { target_namespace })
+            }
+        }
+    }
+
+    pub fn observe_branch_delete_accepted(
+        &mut self,
+        target_namespace: &str,
+        not_before: DateTime<Utc>,
+        root_retained: bool,
+    ) -> Result<(), BranchDeleteViolation> {
+        self.branch_delete_bookkeeping_mut(target_namespace)?
+            .observe_branch_delete_accepted(not_before, root_retained)
+    }
+
+    pub fn observe_branch_delete_progress(
+        &mut self,
+        target_namespace: &str,
+        observed_at: DateTime<Utc>,
+        root_retained: bool,
+    ) -> Result<(), BranchDeleteViolation> {
+        self.branch_delete_bookkeeping_mut(target_namespace)?
+            .observe_branch_delete_progress(observed_at, root_retained)
+    }
+
+    pub fn observe_branch_source_delete(
+        &mut self,
+        target_namespace: &str,
+        status: u16,
+        code: Option<&str>,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), BranchDeleteViolation> {
+        self.branch_delete_bookkeeping_mut(target_namespace)?
+            .observe_source_delete(status, code, observed_at)
+    }
+
+    pub fn branch_delete_bookkeeping(
+        &self,
+        target_namespace: &str,
+    ) -> Result<&BranchDeleteBookkeeping, BranchDeleteViolation> {
+        self.branch_deletions.get(target_namespace).ok_or_else(|| {
+            BranchDeleteViolation::UnknownBranchTarget {
+                target_namespace: target_namespace.to_string(),
+            }
+        })
+    }
+
+    fn branch_delete_bookkeeping_mut(
+        &mut self,
+        target_namespace: &str,
+    ) -> Result<&mut BranchDeleteBookkeeping, BranchDeleteViolation> {
+        self.branch_deletions
+            .get_mut(target_namespace)
+            .ok_or_else(|| BranchDeleteViolation::UnknownBranchTarget {
+                target_namespace: target_namespace.to_string(),
+            })
+    }
+
     pub fn observe_published_root(
         &mut self,
         namespace: &str,
@@ -616,7 +690,8 @@ impl Model {
             | Op::CreateLock { .. }
             | Op::ReleaseLock { .. }
             | Op::DeleteUnderLock { .. }
-            | Op::GcUnderLock { .. } => {}
+            | Op::GcUnderLock { .. }
+            | Op::Branching(_) => {}
         }
     }
 
@@ -924,7 +999,8 @@ impl Model {
             | Op::CreateLock { .. }
             | Op::ReleaseLock { .. }
             | Op::DeleteUnderLock { .. }
-            | Op::GcUnderLock { .. } => {}
+            | Op::GcUnderLock { .. }
+            | Op::Branching(_) => {}
         }
     }
 

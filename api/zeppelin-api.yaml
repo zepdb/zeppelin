@@ -768,7 +768,11 @@ paths:
       description: |
         Marks a namespace as deleting and starts resumable background cleanup.
         Re-issuing DELETE while cleanup is in progress resumes cleanup. Once
-        cleanup finishes, the namespace returns 404.
+        cleanup finishes, the namespace returns 404. A namespace with direct
+        branch roots returns 409. Deleting a child branch intentionally keeps
+        that 409 in force through its durable reader-safety grace and parent-root
+        release. Conflict details list only children the caller may currently
+        read and never include an exact total.
       tags: [Namespaces]
       responses:
         "401":
@@ -784,7 +788,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFoundError"
         "409":
-          $ref: "#/components/responses/PreservationLocked"
+          $ref: "#/components/responses/NamespaceDeleteConflict"
         "500":
           $ref: "#/components/responses/AuditUnavailable"
         "503":
@@ -911,6 +915,13 @@ paths:
     get:
       operationId: listNamespaceBranches
       summary: List direct namespace branches
+      description: |
+        Returns only direct child targets for which the caller currently has
+        NamespaceRead. Disclosure is checked before target metadata is read;
+        denied targets are omitted without affecting names, counts, status, or
+        errors. Policy freshness failure fails the whole request closed. A
+        missing or mismatched authorized target returns the generic
+        `branch_integrity_error` without exposing the target identity.
       tags: [Namespaces]
       responses:
         "401":
@@ -923,6 +934,14 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/BranchListResponse" }
         "404": { $ref: "#/components/responses/NotFoundError" }
+        "500":
+          description: |
+            An authorized direct child's root and metadata identity failed
+            integrity validation. The canonical error envelope uses code
+            `branch_integrity_error` and omits child identities.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
 
     post:
       operationId: createNamespaceBranch
@@ -1597,6 +1616,19 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    NamespaceDeleteConflict:
+      description: |
+        Deletion is blocked by active preservation, a retryable lifecycle
+        conflict, or one or more direct branch roots (409). A live-branch
+        conflict adds only disclosure-filtered `visible_children` and
+        `has_additional_children`; the latter is true for denied or truncated
+        children, and the response never returns an exact child count.
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/NamespaceHasLiveBranchesErrorResponse"
+              - $ref: "#/components/schemas/NamespaceDeleteGenericConflictErrorResponse"
     PreservationStateUnavailable:
       description: |
         The S3-authoritative preservation head could not be confirmed within
@@ -1814,6 +1846,9 @@ components:
             - DATA_CORRUPTION
             - STORAGE_ERROR
             - INTERNAL_ERROR
+            - namespace_has_live_branches
+            - branch_has_live_children
+            - branch_integrity_error
         error:
           type: string
           description: Human-readable, client-safe message. Never contains internal S3 keys, endpoints, or tokens.
@@ -1839,6 +1874,65 @@ components:
         status: 404
         retryable: false
         request_id: "b3f1c2e4-..."
+
+    VisibleBranchChild:
+      type: object
+      additionalProperties: false
+      required: [namespace, branch_id]
+      properties:
+        namespace:
+          type: string
+          description: Direct child target authorized for current NamespaceRead.
+        branch_id:
+          type: string
+          description: Stable direct-edge identifier for that visible child.
+
+    NamespaceHasLiveBranchesErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [code, error, status, retryable, visible_children, has_additional_children]
+      properties:
+        code:
+          type: string
+          enum: [namespace_has_live_branches, branch_has_live_children]
+        error:
+          type: string
+          description: Generic client-safe conflict text with no denied child identity.
+        status:
+          type: integer
+          const: 409
+        retryable:
+          type: boolean
+          const: false
+        request_id:
+          type: string
+        visible_children:
+          type: array
+          maxItems: 4096
+          description: Bounded, deterministic target/branch pairs the caller may read.
+          items:
+            $ref: "#/components/schemas/VisibleBranchChild"
+        has_additional_children:
+          type: boolean
+          description: True when denied or truncated children also block deletion; never an exact total.
+
+    NamespaceDeleteGenericConflictErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [code, error, status, retryable]
+      properties:
+        code:
+          type: string
+          enum: [preservation_locked, CONFLICT_RETRY]
+        error:
+          type: string
+        status:
+          type: integer
+          const: 409
+        retryable:
+          type: boolean
+        request_id:
+          type: string
 
     SecurityPrincipalId:
       type: string
@@ -2054,6 +2148,7 @@ components:
         - SnapshotWrite
         - SnapshotDelete
         - NamespaceClone
+        - NamespaceFork
         - IndexConfigWrite
         - CompactionTrigger
         - CompactionStatusRead
@@ -2079,6 +2174,7 @@ components:
         - SnapshotRead
         - SnapshotWrite
         - SnapshotDelete
+        - NamespaceFork
         - IndexConfigWrite
         - CompactionTrigger
         - CompactionStatusRead
@@ -2133,9 +2229,9 @@ components:
       type: object
       description: |
         Grants the frozen baseline action inventory. AttributeAdmin,
-        CredentialDelegate, PreservationAdmin, PreservationRelease, and
-        SecurityAdminWrite are excluded and must always be named explicitly in
-        a selected action grant.
+        CredentialDelegate, NamespaceFork, PreservationAdmin,
+        PreservationRelease, and SecurityAdminWrite are excluded and must
+        always be named explicitly in a selected action grant.
       additionalProperties: false
       required: [kind]
       properties:

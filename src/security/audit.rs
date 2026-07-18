@@ -130,6 +130,48 @@ pub enum PreservationBlockedSurface {
     VectorDelete,
 }
 
+/// Redacted progress vocabulary for one branch parent-root release attempt.
+///
+/// Failure values carry only Zeppelin's closed, low-cardinality failure class.
+/// Internal object keys, ETags, lease identities, and error strings never
+/// enter the lifecycle audit record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RootReleaseAuditProgress {
+    /// Target visibility is gone while the durable reader-safety grace runs.
+    GracePending {
+        /// Persisted earliest release time derived from the marker's S3 time.
+        not_before: DateTime<Utc>,
+    },
+    /// This attempt removed the exact matching parent root.
+    Released,
+    /// This attempt proved the exact root was already safely absent.
+    Converged,
+    /// This attempt failed before a durable release acknowledgement.
+    Failed {
+        /// Closed redacted failure class, never an internal diagnostic string.
+        class: RootReleaseFailureClass,
+    },
+}
+
+/// Closed, low-cardinality failure classes for branch root-release audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootReleaseFailureClass {
+    /// A current preservation lock ordered before root removal.
+    PreservationBlocked,
+    /// The parent writer lease could not be acquired, renewed, or validated.
+    ParentLeaseUnavailable,
+    /// Durable branch/root identities failed exact validation.
+    IntegrityRejected,
+    /// Authoritative object storage could not complete the attempt.
+    StorageUnavailable,
+    /// Required lifecycle audit durability was unavailable.
+    AuditUnavailable,
+    /// Another typed mutation precondition rejected the attempt.
+    MutationRejected,
+}
+
 impl AuditOutcome {
     /// Return the bounded label used by audit metrics.
     #[must_use]

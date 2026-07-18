@@ -59,7 +59,23 @@ mod branching_operation_tests {
             assert_eq!(operation.kind(), kind);
             assert_eq!(operation.namespace(), namespace);
             assert_eq!(operation.actor().0, actor);
+            assert!(!operation.kind().contains("merge"));
         }
+    }
+
+    #[test]
+    fn wrapped_branching_operation_rewrites_every_namespace_for_replay() {
+        let wrapped = super::Op::Branching(BranchingOp::ForkNamespace {
+            actor: super::ActorSel::ADMIN,
+            source: "old-source".to_string(),
+            target: "old-target".to_string(),
+        });
+        let rewritten = wrapped.rewrite_namespace_prefix("old-", "new-");
+        assert!(matches!(
+            rewritten,
+            super::Op::Branching(BranchingOp::ForkNamespace { source, target, .. })
+                if source == "new-source" && target == "new-target"
+        ));
     }
 }
 
@@ -120,6 +136,43 @@ impl BranchingOp {
             | Self::CompactBranch { actor, .. }
             | Self::DeleteBranch { actor, .. }
             | Self::DeleteSourceWithBranches { actor, .. } => *actor,
+        }
+    }
+
+    #[must_use]
+    pub fn rewrite_namespace_prefix(&self, old_prefix: &str, new_prefix: &str) -> Self {
+        let rewrite = |value: &str| {
+            value.strip_prefix(old_prefix).map_or_else(
+                || value.to_string(),
+                |suffix| format!("{new_prefix}{suffix}"),
+            )
+        };
+        match self {
+            Self::ForkNamespace {
+                actor,
+                source,
+                target,
+            } => Self::ForkNamespace {
+                actor: *actor,
+                source: rewrite(source),
+                target: rewrite(target),
+            },
+            Self::ListBranches { actor, source } => Self::ListBranches {
+                actor: *actor,
+                source: rewrite(source),
+            },
+            Self::CompactBranch { actor, namespace } => Self::CompactBranch {
+                actor: *actor,
+                namespace: rewrite(namespace),
+            },
+            Self::DeleteBranch { actor, namespace } => Self::DeleteBranch {
+                actor: *actor,
+                namespace: rewrite(namespace),
+            },
+            Self::DeleteSourceWithBranches { actor, source } => Self::DeleteSourceWithBranches {
+                actor: *actor,
+                source: rewrite(source),
+            },
         }
     }
 }
@@ -386,6 +439,8 @@ pub enum Op {
         actor: ActorSel,
         ns: String,
     },
+    /// Feature-gated branching vocabulary carried by ordinary runner records.
+    Branching(BranchingOp),
     ProbeSandwich {
         #[serde(default)]
         actor: ActorSel,
@@ -705,6 +760,7 @@ impl Op {
             | Self::ReleaseLock { actor, .. }
             | Self::DeleteUnderLock { actor, .. }
             | Self::GcUnderLock { actor, .. } => *actor,
+            Self::Branching(operation) => operation.actor(),
             Self::UseRevokedCredential { key } => key.actor,
             Self::UseToken { token, .. }
             | Self::TokenExceedScopeProbe { token, .. }
@@ -743,6 +799,7 @@ impl Op {
                 | Op::ReleaseLock { .. }
                 | Op::DeleteUnderLock { .. }
                 | Op::GcUnderLock { .. }
+                | Op::Branching(BranchingOp::ListBranches { .. })
         )
     }
 
@@ -768,6 +825,7 @@ impl Op {
             Op::PatchIndexConfig { .. } => "patch_index_config",
             Op::Hydrate { .. } => "hydrate",
             Op::DeleteNamespace { .. } => "delete_namespace",
+            Op::Branching(operation) => operation.kind(),
             Op::ProbeSandwich { .. } => "probe_sandwich",
             Op::CompactInline { .. } => "compact_inline",
             Op::CreateKey { .. } => "create_key",
@@ -852,6 +910,7 @@ impl Op {
             | Op::QueryWithReceipt { ns, .. }
             | Op::VerifyReceipt { ns, .. }
             | Op::TamperArtifactThenVerify { ns, .. } => ns,
+            Op::Branching(operation) => operation.namespace(),
             Op::DeleteUnderLock { ns, .. } | Op::GcUnderLock { ns, .. } => ns,
             Op::CreateLock { scope, .. } => scope.namespace().unwrap_or("_security"),
             Op::CloneNamespace { source, .. } => source,
@@ -888,6 +947,12 @@ impl Op {
                 | Op::CloneNamespace { .. }
                 | Op::PatchIndexConfig { .. }
                 | Op::DeleteNamespace { .. }
+                | Op::Branching(
+                    BranchingOp::ForkNamespace { .. }
+                        | BranchingOp::CompactBranch { .. }
+                        | BranchingOp::DeleteBranch { .. }
+                        | BranchingOp::DeleteSourceWithBranches { .. }
+                )
                 | Op::ProbeSandwich { .. }
                 | Op::CompactInline { .. }
                 | Op::CreateKey { .. }
@@ -923,6 +988,10 @@ impl Op {
             Op::PatchIndexConfig { .. } => vec!["config-patch"],
             Op::Hydrate { .. } => vec!["hydrate"],
             Op::DeleteNamespace { .. } => vec!["delete-recreate"],
+            Op::Branching(
+                BranchingOp::DeleteBranch { .. } | BranchingOp::DeleteSourceWithBranches { .. },
+            ) => vec!["branching", "branch-delete"],
+            Op::Branching(_) => vec!["branching"],
             Op::ProbeSandwich { maintenance, .. } => vec!["sandwich", maintenance.tag()],
             Op::CreateKey { .. }
             | Op::RotateKey { .. }
@@ -1078,6 +1147,9 @@ impl Op {
                 actor: *actor,
                 ns: rewrite(ns),
             },
+            Op::Branching(operation) => {
+                Op::Branching(operation.rewrite_namespace_prefix(old_prefix, new_prefix))
+            }
             Op::ProbeSandwich {
                 actor,
                 ns,

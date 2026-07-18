@@ -7,6 +7,15 @@ use crate::namespace::{
     BranchId, BranchRoot, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
 };
 
+/// One direct child identity the current caller may safely receive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisclosedBranchChild {
+    /// Target namespace authorized for current `NamespaceRead`.
+    pub namespace: NamespaceId,
+    /// Stable direct-edge identity from the authoritative parent root.
+    pub branch_id: BranchId,
+}
+
 /// Failures produced while validating or coordinating namespace branches.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum BranchError {
@@ -159,8 +168,12 @@ pub enum BranchError {
     /// Governed deletion cannot fence a namespace with current live children.
     #[error("namespace {namespace} has live branches")]
     NamespaceHasLiveBranches {
-        /// Source namespace; the child count is intentionally not disclosed.
+        /// Source namespace; never used as an exact-child-count oracle.
         namespace: String,
+        /// Bounded direct children authorized for caller disclosure.
+        visible_children: Vec<DisclosedBranchChild>,
+        /// Whether denied children also block deletion.
+        has_additional_children: bool,
     },
 
     /// A branch cannot be deleted while it has direct child roots.
@@ -168,7 +181,15 @@ pub enum BranchError {
     BranchHasLiveChildren {
         /// Branch edge whose direct children block deletion.
         branch_id: BranchId,
+        /// Bounded direct children authorized for caller disclosure.
+        visible_children: Vec<DisclosedBranchChild>,
+        /// Whether denied children also block deletion.
+        has_additional_children: bool,
     },
+
+    /// An authorized direct child failed exact root/metadata identity checks.
+    #[error("authorized branch state failed an integrity check")]
+    BranchIntegrity,
 
     /// Retained bytes do not match the exact digest named by a current root.
     #[error("manifest history generation {generation:?} does not match its branch root")]
