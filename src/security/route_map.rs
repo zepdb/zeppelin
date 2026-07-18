@@ -180,7 +180,7 @@ pub static ROUTE_ACTIONS: &[RouteAction] = &[
     RouteAction {
         method: Method::POST,
         path: "/v1/namespaces/:ns/branches",
-        class: RouteClass::Protected(Action::NamespaceClone),
+        class: RouteClass::Protected(Action::NamespaceFork),
     },
     RouteAction {
         method: Method::PATCH,

@@ -31,6 +31,8 @@ pub enum Action {
     SnapshotDelete,
     /// Clone a namespace into a new namespace.
     NamespaceClone,
+    /// Fork a namespace through the branching lifecycle.
+    NamespaceFork,
     /// Change namespace index configuration.
     IndexConfigWrite,
     /// Trigger namespace compaction.
@@ -68,7 +70,7 @@ pub enum Action {
 
 impl Action {
     /// Every action in declaration order for completeness tests and parsing.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::SystemRead,
         Self::MetricsRead,
         Self::RuntimeConfigRead,
@@ -80,6 +82,7 @@ impl Action {
         Self::SnapshotWrite,
         Self::SnapshotDelete,
         Self::NamespaceClone,
+        Self::NamespaceFork,
         Self::IndexConfigWrite,
         Self::CompactionTrigger,
         Self::CompactionStatusRead,
@@ -159,7 +162,7 @@ impl Action {
     /// This is deliberately distinct from persisted `GrantActions::All`: a
     /// bootstrap `actions = ["*"]` must retain policy-administration authority,
     /// while a policy wildcard must never acquire privileged security actions.
-    pub(crate) const BOOTSTRAP_ADMIN_V1: [Self; 22] = [
+    pub(crate) const BOOTSTRAP_ADMIN_V1: [Self; 23] = [
         Self::SystemRead,
         Self::MetricsRead,
         Self::RuntimeConfigRead,
@@ -171,6 +174,7 @@ impl Action {
         Self::SnapshotWrite,
         Self::SnapshotDelete,
         Self::NamespaceClone,
+        Self::NamespaceFork,
         Self::IndexConfigWrite,
         Self::CompactionTrigger,
         Self::CompactionStatusRead,
@@ -199,6 +203,7 @@ impl Action {
             Self::SnapshotWrite => "SnapshotWrite",
             Self::SnapshotDelete => "SnapshotDelete",
             Self::NamespaceClone => "NamespaceClone",
+            Self::NamespaceFork => "NamespaceFork",
             Self::IndexConfigWrite => "IndexConfigWrite",
             Self::CompactionTrigger => "CompactionTrigger",
             Self::CompactionStatusRead => "CompactionStatusRead",
@@ -290,6 +295,7 @@ mod tests {
                 "SnapshotWrite",
                 "SnapshotDelete",
                 "NamespaceClone",
+                "NamespaceFork",
                 "IndexConfigWrite",
                 "CompactionTrigger",
                 "CompactionStatusRead",

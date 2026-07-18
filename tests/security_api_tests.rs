@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use serde_json::json;
 use zeppelin::config::Config;
-use zeppelin::security::{RouteClass, ROUTE_ACTIONS};
+use zeppelin::security::{Action, RouteClass, ROUTE_ACTIONS};
 
 use common::server::{
     start_test_server_with_config, start_test_server_with_config_no_limit_override,
@@ -695,6 +695,18 @@ fn route_map_complete() {
         .collect();
 
     assert_eq!(registered, mapped);
+}
+
+#[test]
+fn branch_creation_uses_distinct_fork_action() {
+    let entry = ROUTE_ACTIONS
+        .iter()
+        .find(|entry| {
+            entry.method == reqwest::Method::POST
+                && entry.path == "/v1/namespaces/:ns/branches"
+        })
+        .expect("branch creation route must be mapped");
+    assert_eq!(entry.class, RouteClass::Protected(Action::NamespaceFork));
 }
 
 #[tokio::test]
