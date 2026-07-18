@@ -29,11 +29,10 @@ disabled by default until every required contract below is green.
   cross-repository edits were not authorized in this checkout.
 - The complete public HTTP MinIO matrix and adversarial fault matrix from plan
   10 have not yet been run green.
-- The adversarial workload test binary currently fails to compile before the
-  branching vocabulary test runs because existing `s3_oracle.rs` paths pass a
-  non-serializable `ZeppelinError` to `serde_json::json!` (lines 235 and 471).
-  This is recorded as a harness validation blocker and was not changed in the
-  branching slice.
+- The harness serialization blocker was fixed in `b210e0e` by recording
+  `ZeppelinError` as text in the oracle evidence payload. The two branching
+  vocabulary tests now pass, but the full adversarial fault matrix remains
+  outstanding.
 
 Therefore this ledger must not be treated as a release approval or as evidence
 that the branching feature is ready for production enablement.
