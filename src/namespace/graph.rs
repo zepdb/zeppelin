@@ -428,6 +428,7 @@ impl NamespaceGraph {
             updated_at: created_at,
             state: NamespaceState::Creating,
             destruction_record_key: None,
+            deletion_intent: None,
             full_text_search: source.full_text_search.clone(),
             index_config: Some(resolved_index_config),
             compaction_health: CompactionHealth::default(),

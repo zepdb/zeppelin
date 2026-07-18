@@ -2579,7 +2579,22 @@ impl NamespaceManager {
                             "namespace {name} deletion is bound to a different destruction record"
                         )));
                     }
-                    (Some(_), Some(_)) | (None, None) => return Ok(meta),
+                    (Some(existing), Some(_)) => {
+                        if meta.deletion_intent.is_none() {
+                            let incarnation = meta.incarnation_id.clone().ok_or_else(|| {
+                                ZeppelinError::Serialization(format!(
+                                    "authoritative namespace metadata {key} omitted its incarnation"
+                                ))
+                            })?;
+                            meta.deletion_intent = Some(NamespaceDeletionIntent {
+                                incarnation,
+                                destruction_record_key: existing.clone(),
+                                decision_evidence_ref: existing.clone(),
+                                parent_root: None,
+                            });
+                        }
+                    }
+                    (None, None) => return Ok(meta),
                     (Some(_), None) => {
                         return Err(ZeppelinError::Validation(format!(
                             "namespace {name} requires governed deletion"
@@ -2587,11 +2602,37 @@ impl NamespaceManager {
                     }
                     (None, Some(expected)) => {
                         meta.destruction_record_key = Some(expected.clone());
+                        if meta.deletion_intent.is_none() {
+                            let incarnation = meta.incarnation_id.clone().ok_or_else(|| {
+                                ZeppelinError::Serialization(format!(
+                                    "authoritative namespace metadata {key} omitted its incarnation"
+                                ))
+                            })?;
+                            meta.deletion_intent = Some(NamespaceDeletionIntent {
+                                incarnation,
+                                destruction_record_key: expected.clone(),
+                                decision_evidence_ref: expected.clone(),
+                                parent_root: None,
+                            });
+                        }
                     }
                 }
             } else {
                 meta.state = NamespaceState::Deleting;
-                meta.destruction_record_key = governed_key;
+                meta.destruction_record_key = governed_key.clone();
+                if let Some(expected) = governed_key {
+                    let incarnation = meta.incarnation_id.clone().ok_or_else(|| {
+                        ZeppelinError::Serialization(format!(
+                            "authoritative namespace metadata {key} omitted its incarnation"
+                        ))
+                    })?;
+                    meta.deletion_intent = Some(NamespaceDeletionIntent {
+                        incarnation,
+                        destruction_record_key: expected.clone(),
+                        decision_evidence_ref: expected,
+                        parent_root: None,
+                    });
+                }
             }
 
             meta.updated_at = self.clock.now();
