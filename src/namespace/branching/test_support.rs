@@ -17,7 +17,9 @@ use async_trait::async_trait;
 use crate::cache::hydration::HydrationTarget;
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
-use crate::config::{BranchingConfig, IndexingConfig, DEFAULT_RERANK_COALESCE_GAP_BYTES};
+use crate::config::{
+    BranchingConfig, Config, IndexingConfig, SecurityMode, DEFAULT_RERANK_COALESCE_GAP_BYTES,
+};
 use crate::error::{Result, ZeppelinError};
 use crate::fts::rank_by::RankBy;
 use crate::fts::FtsFieldConfig;
@@ -147,7 +149,22 @@ fn graph_for_test(
     store: ZeppelinStore,
     indexing: IndexingConfig,
     branching: BranchingConfig,
-) -> NamespaceGraph {
+) -> Result<NamespaceGraph> {
+    let mut floor_config = Config::default();
+    // Keep branch-grace tests fast without bypassing the production GC-floor
+    // calculation or enabling the unsafe short-horizon override.
+    floor_config.security.mode = SecurityMode::OpenUnsafe;
+    floor_config.cache.manifest_cache_ttl_ms = 0;
+    floor_config.cache.namespace_registry_ttl_ms = 0;
+    floor_config.server.request_timeout_secs = 1;
+    floor_config.gc.compaction_upload_window_secs = 1;
+    floor_config.gc.skew_slop_secs = 0;
+    floor_config.gc.horizon_secs = 2;
+    floor_config.validate()?;
+    let gc_horizon_floor_secs = floor_config.gc_horizon_floor_secs().ok_or_else(|| {
+        ZeppelinError::Config("test GC reader-safety floor overflowed u64".to_string())
+    })?;
+
     let clock = Clock::system();
     let namespace_manager = Arc::new(NamespaceManager::new(store.clone()));
     let lease_manager = Arc::new(LeaseManager::with_clock(
@@ -156,7 +173,7 @@ fn graph_for_test(
         Duration::from_secs(30),
         clock.clone(),
     ));
-    NamespaceGraph::new(
+    Ok(NamespaceGraph::new(
         store,
         namespace_manager,
         lease_manager,
@@ -164,8 +181,8 @@ fn graph_for_test(
         Arc::new(ManifestCache::new(Duration::ZERO)),
         branching,
         indexing,
-        Some(0),
-    )
+        Some(gc_horizon_floor_secs),
+    ))
 }
 
 struct TestDeletionGovernance;
@@ -203,7 +220,7 @@ pub async fn prepare_fork_for_test(
     indexing: IndexingConfig,
     branching: BranchingConfig,
 ) -> Result<PrepareForkOutcome> {
-    graph_for_test(store, indexing, branching)
+    graph_for_test(store, indexing, branching)?
         .prepare_fork(PrepareForkRequest { source, target })
         .await
 }
@@ -239,7 +256,7 @@ pub async fn prepare_fork_until_root_for_test(
     indexing: IndexingConfig,
     branching: BranchingConfig,
 ) -> Result<()> {
-    graph_for_test(store, indexing, branching)
+    graph_for_test(store, indexing, branching)?
         .prepare_fork_until_root_for_test(PrepareForkRequest { source, target })
         .await
 }
@@ -252,7 +269,7 @@ pub async fn prepare_fork_until_reserved_for_test(
     indexing: IndexingConfig,
     branching: BranchingConfig,
 ) -> Result<()> {
-    graph_for_test(store, indexing, branching)
+    graph_for_test(store, indexing, branching)?
         .prepare_fork_until_reserved_for_test(PrepareForkRequest { source, target })
         .await
 }
@@ -264,7 +281,7 @@ pub async fn maintain_branches_for_test(
     branching: BranchingConfig,
     budget: Duration,
 ) -> Result<BranchMaintenanceReport> {
-    graph_for_test(store, indexing, branching)
+    graph_for_test(store, indexing, branching)?
         .maintain(budget)
         .await
 }
@@ -277,7 +294,7 @@ pub async fn delete_namespace_for_test(
     branching: BranchingConfig,
 ) -> Result<NamespaceDeleteOutcome> {
     let decision_id = DecisionId::new();
-    graph_for_test(store, indexing, branching)
+    graph_for_test(store, indexing, branching)?
         .delete(AuthorizedNamespaceDelete {
             namespace,
             decision: DeletionDecision {
@@ -300,7 +317,7 @@ pub async fn resume_delete_for_test(
     branching: BranchingConfig,
     budget: Duration,
 ) -> Result<NamespaceDeleteOutcome> {
-    graph_for_test(store, indexing, branching)
+    graph_for_test(store, indexing, branching)?
         .resume_delete(&namespace, Arc::new(TestDeletionGovernance), budget)
         .await
 }
@@ -312,7 +329,7 @@ pub async fn list_children_for_test(
     indexing: IndexingConfig,
     branching: BranchingConfig,
 ) -> Result<Vec<BranchDescriptor>> {
-    graph_for_test(store, indexing, branching)
+    graph_for_test(store, indexing, branching)?
         .list_children(BranchListRequest { source })
         .await
 }

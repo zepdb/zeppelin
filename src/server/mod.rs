@@ -1128,6 +1128,15 @@ fn spawn_namespace_delete_cleanup(state: &AppState, namespace: NamespaceId) {
                         "namespace background delete remains in progress"
                     );
                 }
+                Ok(crate::namespace::branching::NamespaceDeleteOutcome::BranchGraceWait {
+                    not_before,
+                }) => {
+                    tracing::info!(
+                        namespace = %namespace,
+                        not_before = %not_before,
+                        "branch delete is waiting for its persisted reader-safety grace"
+                    );
+                }
                 Err(ZeppelinError::NamespaceNotFound { .. }) => tracing::debug!(
                     namespace = %namespace,
                     "namespace background delete already completed"

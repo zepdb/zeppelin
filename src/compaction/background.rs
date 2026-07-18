@@ -1745,6 +1745,11 @@ async fn compaction_loop_with_lifecycle_inner(
                         namespace = %namespace,
                         "resumed namespace delete remains in progress"
                     ),
+                    Ok(NamespaceDeleteOutcome::BranchGraceWait { not_before }) => info!(
+                        namespace = %namespace,
+                        not_before = %not_before,
+                        "branch delete retains its root through reader-safety grace"
+                    ),
                     Err(ZeppelinError::NamespaceNotFound { .. }) => {
                         debug!(
                             namespace = %namespace,

@@ -241,7 +241,7 @@ async fn graph_delete_retains_branch_root_until_grace_resume() {
     .unwrap();
     assert!(matches!(
         outcome,
-        zeppelin::namespace::branching::NamespaceDeleteOutcome::AlreadyDeleting
+        zeppelin::namespace::branching::NamespaceDeleteOutcome::BranchGraceWait { .. }
     ));
     assert!(!branch_control_snapshot(&harness.store, &source)
         .await

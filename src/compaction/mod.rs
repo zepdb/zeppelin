@@ -4427,10 +4427,10 @@ mod tests {
         config.server.request_timeout_secs = 30;
         config.gc.compaction_upload_window_secs = 42;
         config.gc.skew_slop_secs = 3;
-        config.gc.horizon_secs = 78;
+        config.gc.horizon_secs = 83;
 
         config.validate().unwrap();
-        assert_eq!(config.gc_horizon_floor_secs(), Some(78));
+        assert_eq!(config.gc_horizon_floor_secs(), Some(83));
 
         let compactor = mem_compactor_with_upload_window(
             config.compaction.clone(),

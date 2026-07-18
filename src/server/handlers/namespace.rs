@@ -2749,8 +2749,8 @@ pub async fn patch_index_config(
 ///
 /// # Returns
 ///
-/// HTTP 202 with `{"state":"deleting"}` after the tombstone, immutable
-/// destruction evidence, and fenced manifest removal succeed. The must-audit
+/// HTTP 202 with `{"state":"deleting"}` after the trailing intent, immutable
+/// destruction evidence, tombstone, and fenced manifest removal succeed. The must-audit
 /// middleware spawns cleanup only after its own durable audit barrier succeeds.
 /// Completion is observed when [`get_namespace`] returns 404.
 ///
@@ -2760,9 +2760,9 @@ pub async fn patch_index_config(
 /// locks or repeated tombstone CAS conflicts; 503 when fresh lock authority is
 /// unavailable; 500 when required audit or destruction-evidence durability is
 /// unavailable; or mapped metadata, manifest, and serialization failures. If
-/// evidence or manifest publication fails, the durable tombstone can already
-/// exist even though this request returns an error; its bound evidence key makes
-/// retry deterministic.
+/// evidence or manifest publication fails, the durable trailing intent and
+/// deletion fence can already exist even though this request returns an error;
+/// their bound evidence key makes retry deterministic.
 ///
 /// Background listing/deletion failures happen after HTTP 202 and are logged;
 /// they leave the tombstone so a later DELETE can resume safely.
@@ -2777,14 +2777,13 @@ pub async fn patch_index_config(
 ///
 /// # Consistency
 ///
-/// Tombstone-before-fence-before-evidence-before-manifest-removal ordering
-/// prevents new operations, invalidates publication capabilities held by
-/// in-flight manifest writers, binds evidence to the exact visibility root being
-/// removed, and ends visibility before artifact deletion. DELETE is resumable
-/// while the tombstone exists; retries reuse its evidence key and after
-/// completion return 404. More than one retry may spawn overlapping cleanup
-/// passes, which each recheck fresh preservation state and rely on idempotent
-/// delete behavior plus final authoritative relisting.
+/// Intent-before-fence-before-evidence-before-tombstone ordering makes root
+/// publication and deletion compete on one manifest CAS while leaving a losing
+/// source active. Manifest removal then ends visibility before artifact
+/// deletion. Branch targets additionally persist an S3-timestamped grace marker
+/// and retain their parent root until that deadline. DELETE is resumable while
+/// the intent/tombstone exists; retries reuse its evidence key and after
+/// completion return 404.
 ///
 /// # Performance
 ///

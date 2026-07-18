@@ -56,8 +56,9 @@
 //!   being ignored.
 //! - [`crate::config::Config::validate`] reports all independent violations together so an
 //!   operator can fix one boot attempt rather than discovering errors serially.
-//! - The GC horizon must cover every interval during which a reader or
-//!   compactor can legitimately depend on an older manifest view.
+//! - The GC horizon must cover every interval during which a reader can be
+//!   admitted by cached namespace metadata, or a reader/compactor can
+//!   legitimately depend on an older manifest view.
 //!
 //! ## Rust concepts used here
 //!
@@ -423,6 +424,8 @@ fn is_canonical_api_key_id(value: &str) -> bool {
 /// deletion is allowed.
 ///
 /// ```text
+/// cached-namespace-metadata lifetime
+///        +
 /// cached-manifest lifetime
 ///        + request lifetime
 ///        + upload-before-publication window
@@ -439,12 +442,15 @@ pub struct GcConfig {
     /// Time-since-unreachable grace period GC waits before deleting objects.
     ///
     /// This must be at least:
-    /// `manifest_cache_ttl_secs + request_timeout_secs + compaction_upload_window_secs + skew_slop_secs`.
-    /// The manifest cache TTL is configured as `cache.manifest_cache_ttl_ms` and rounded
-    /// up to whole seconds for this floor. An interval-derived horizon is wrong because
-    /// the compaction interval is causally unrelated to the reader-staleness window; the
-    /// safe horizon is determined by how long readers may observe old manifests, continue
-    /// requests, race object uploads, and disagree on wall clocks.
+    /// `namespace_registry_ttl_secs + manifest_cache_ttl_secs + request_timeout_secs + compaction_upload_window_secs + skew_slop_secs`.
+    /// The namespace-registry and manifest-cache TTLs are configured as
+    /// `cache.namespace_registry_ttl_ms` and `cache.manifest_cache_ttl_ms` and
+    /// each rounded up to whole seconds for this floor. An interval-derived
+    /// horizon is wrong because the compaction interval is causally unrelated
+    /// to the reader-staleness window; the safe horizon is determined by how
+    /// long cached metadata may admit readers, readers may observe old
+    /// manifests and continue requests, compactors may race object uploads,
+    /// and nodes may disagree on wall clocks.
     #[serde(default = "default_gc_horizon_secs")]
     pub horizon_secs: u64,
     /// Maximum time a compaction cycle may expose uploaded objects before the manifest
@@ -1392,6 +1398,7 @@ mod tests {
     fn gc_horizon_below_floor_is_rejected_with_all_inputs() {
         let mut config = Config::default();
         config.cache.manifest_cache_ttl_ms = 2_500;
+        config.cache.namespace_registry_ttl_ms = 1_500;
         config.server.request_timeout_secs = 30;
         config.gc.compaction_upload_window_secs = 20;
         config.gc.skew_slop_secs = 3;
@@ -1402,10 +1409,11 @@ mod tests {
         for needle in [
             "gc.horizon_secs (55)",
             "cache.manifest_cache_ttl_ms (2500ms => 3s)",
+            "cache.namespace_registry_ttl_ms (1500ms => 2s)",
             "server.request_timeout_secs (30)",
             "gc.compaction_upload_window_secs (20)",
             "gc.skew_slop_secs (3)",
-            "floor (56)",
+            "floor (58)",
             "gc.allow_unsafe_short_horizon",
         ] {
             assert!(
@@ -1421,6 +1429,7 @@ mod tests {
         let mut config = Config::default();
         config.security.mode = SecurityMode::OpenUnsafe;
         config.cache.manifest_cache_ttl_ms = 1_000;
+        config.cache.namespace_registry_ttl_ms = 1_500;
         config.server.request_timeout_secs = 30;
         config.gc.compaction_upload_window_secs = 20;
         config.gc.skew_slop_secs = 5;
@@ -1428,7 +1437,7 @@ mod tests {
         config.gc.allow_unsafe_short_horizon = true;
 
         config.validate().unwrap();
-        assert_eq!(config.gc_horizon_floor_secs(), Some(56));
+        assert_eq!(config.gc_horizon_floor_secs(), Some(58));
         assert!(config.gc_horizon_is_unsafe_short());
         config.warn_if_unsafe_gc_horizon_override();
     }
@@ -1471,7 +1480,7 @@ mod tests {
         assert_eq!(config.gc.pitr_retention_secs, 86_400);
 
         let source = include_str!("config.rs");
-        assert!(source.contains("manifest_cache_ttl_secs + request_timeout_secs + compaction_upload_window_secs + skew_slop_secs"));
+        assert!(source.contains("namespace_registry_ttl_secs + manifest_cache_ttl_secs + request_timeout_secs + compaction_upload_window_secs + skew_slop_secs"));
         assert!(source.contains("causally unrelated to the reader-staleness window"));
     }
 
@@ -1803,6 +1812,10 @@ pub struct CacheConfig {
     #[serde(default = "default_manifest_cache_ttl_ms")]
     pub manifest_cache_ttl_ms: u64,
     /// Namespace metadata positive-cache TTL in milliseconds. Default: `5000`.
+    ///
+    /// This bounds how long cached active metadata may admit a new reader after
+    /// live visibility is removed, so its rounded-up duration contributes to
+    /// the GC reader-safety floor.
     #[serde(default = "default_namespace_registry_ttl_ms")]
     pub namespace_registry_ttl_ms: u64,
     /// Enable background warm-set hydration. Default: `false` (dark launch).
@@ -2649,7 +2662,7 @@ impl Config {
     /// Validation is separate from deserialization because important rules span
     /// fields: for example, default `top_k` must not exceed its maximum, default
     /// `nprobe` must not exceed its maximum, and the GC horizon must cover the
-    /// sum of every reader-staleness interval.
+    /// sum of every reader-admission and reader-staleness interval.
     ///
     /// # Parameters
     ///
@@ -2667,11 +2680,12 @@ impl Config {
     ///
     /// # Consistency
     ///
-    /// The GC floor protects readers using a cached older manifest while a
-    /// request is in flight and compaction uploads immutable artifacts before
-    /// publication. Allowing a shorter horizon can delete an object that such a
-    /// reader still legitimately needs; only the explicit unsafe override may
-    /// bypass this check.
+    /// The GC floor protects readers admitted by cached positive namespace
+    /// metadata, readers using a cached older manifest while a request is in
+    /// flight, and compaction uploads of immutable artifacts before publication.
+    /// Allowing a shorter horizon can delete an object that such a reader still
+    /// legitimately needs; only the explicit unsafe override may bypass this
+    /// check.
     ///
     /// # Example
     ///
@@ -2988,9 +3002,11 @@ impl Config {
                     && !self.gc.allow_unsafe_short_horizon =>
             {
                 violations.push(format!(
-                    "gc.horizon_secs ({}) must be >= floor ({}) unless gc.allow_unsafe_short_horizon=true; floor inputs: cache.manifest_cache_ttl_ms ({}ms => {}s), server.request_timeout_secs ({}), gc.compaction_upload_window_secs ({}), gc.skew_slop_secs ({})",
+                    "gc.horizon_secs ({}) must be >= floor ({}) unless gc.allow_unsafe_short_horizon=true; floor inputs: cache.namespace_registry_ttl_ms ({}ms => {}s), cache.manifest_cache_ttl_ms ({}ms => {}s), server.request_timeout_secs ({}), gc.compaction_upload_window_secs ({}), gc.skew_slop_secs ({})",
                     self.gc.horizon_secs,
                     floor_secs,
+                    self.cache.namespace_registry_ttl_ms,
+                    self.namespace_registry_ttl_secs_for_gc_floor(),
                     self.cache.manifest_cache_ttl_ms,
                     self.manifest_cache_ttl_secs_for_gc_floor(),
                     self.server.request_timeout_secs,
@@ -3000,7 +3016,9 @@ impl Config {
             }
             Some(_) => {}
             None => violations.push(format!(
-                "gc horizon floor overflows u64; floor inputs: cache.manifest_cache_ttl_ms ({}ms => {}s), server.request_timeout_secs ({}), gc.compaction_upload_window_secs ({}), gc.skew_slop_secs ({})",
+                "gc horizon floor overflows u64; floor inputs: cache.namespace_registry_ttl_ms ({}ms => {}s), cache.manifest_cache_ttl_ms ({}ms => {}s), server.request_timeout_secs ({}), gc.compaction_upload_window_secs ({}), gc.skew_slop_secs ({})",
+                self.cache.namespace_registry_ttl_ms,
+                self.namespace_registry_ttl_secs_for_gc_floor(),
                 self.cache.manifest_cache_ttl_ms,
                 self.manifest_cache_ttl_secs_for_gc_floor(),
                 self.server.request_timeout_secs,
@@ -3023,15 +3041,16 @@ impl Config {
     ///
     /// # Returns
     ///
-    /// The sum of rounded-up manifest-cache TTL, request timeout, compaction
-    /// upload window, and clock-skew allowance. Returns `None` if that sum would
-    /// overflow `u64`; overflow is treated as a validation error by
-    /// [`Config::validate`].
+    /// The sum of rounded-up namespace-registry TTL, rounded-up manifest-cache
+    /// TTL, request timeout, compaction upload window, and clock-skew allowance.
+    /// Returns `None` if that sum would overflow `u64`; overflow is treated as a
+    /// validation error by [`Config::validate`].
     ///
     /// # Example
     ///
-    /// A 2,500 ms cache TTL, 30-second request timeout, 20-second upload window,
-    /// and three-second skew allowance produce `Some(56)`.
+    /// A 1,500 ms namespace-registry TTL, 2,500 ms manifest-cache TTL,
+    /// 30-second request timeout, 20-second upload window, and three-second
+    /// skew allowance produce `Some(58)`.
     #[must_use]
     pub fn gc_horizon_floor_secs(&self) -> Option<u64> {
         self.checked_gc_horizon_floor_secs()
@@ -3047,7 +3066,7 @@ impl Config {
     ///
     /// # Example
     ///
-    /// With a 56-second floor, horizon 10, and
+    /// With a 58-second floor, horizon 10, and
     /// `allow_unsafe_short_horizon = true`, this returns `true`.
     #[must_use]
     pub fn gc_horizon_is_unsafe_short(&self) -> bool {
@@ -3068,7 +3087,7 @@ impl Config {
     ///
     /// # Example
     ///
-    /// A deployment intentionally using a 10-second horizon against a 56-second
+    /// A deployment intentionally using a 10-second horizon against a 58-second
     /// floor logs both numbers and `allow_unsafe_short_horizon = true` during
     /// boot, making the risk visible to operators.
     pub fn warn_if_unsafe_gc_horizon_override(&self) {
@@ -3082,6 +3101,8 @@ impl Config {
         tracing::warn!(
             gc_horizon_secs = self.gc.horizon_secs,
             gc_horizon_floor_secs = floor_secs,
+            cache_namespace_registry_ttl_ms = self.cache.namespace_registry_ttl_ms,
+            namespace_registry_ttl_floor_secs = self.namespace_registry_ttl_secs_for_gc_floor(),
             cache_manifest_cache_ttl_ms = self.cache.manifest_cache_ttl_ms,
             manifest_cache_ttl_floor_secs = self.manifest_cache_ttl_secs_for_gc_floor(),
             request_timeout_secs = self.server.request_timeout_secs,
@@ -3106,10 +3127,21 @@ impl Config {
     /// arithmetic and unsigned C arithmetic would require an explicit overflow
     /// check to avoid wrapping or losing the condition.
     fn checked_gc_horizon_floor_secs(&self) -> Option<u64> {
-        self.manifest_cache_ttl_secs_for_gc_floor()
+        self.namespace_registry_ttl_secs_for_gc_floor()
+            .checked_add(self.manifest_cache_ttl_secs_for_gc_floor())?
             .checked_add(self.server.request_timeout_secs)?
             .checked_add(self.gc.compaction_upload_window_secs)?
             .checked_add(self.gc.skew_slop_secs)
+    }
+
+    /// Rounds the namespace-registry TTL up from milliseconds to whole seconds.
+    ///
+    /// # Returns
+    ///
+    /// A ceiling conversion, so any partial second contributes a full second to
+    /// the safety floor. For example, 1,500 ms becomes two seconds.
+    fn namespace_registry_ttl_secs_for_gc_floor(&self) -> u64 {
+        self.cache.namespace_registry_ttl_ms.div_ceil(1_000)
     }
 
     /// Rounds the manifest-cache TTL up from milliseconds to whole seconds.

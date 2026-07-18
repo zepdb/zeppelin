@@ -76,6 +76,38 @@ impl ForkIdentity {
             && self.created_at == reservation.created_at
             && self.depth == reservation.depth
     }
+
+    /// Returns whether every parent-root field matches this immutable branch
+    /// identity. The target generation and target-manifest digest are not root
+    /// fields and are therefore deliberately excluded.
+    #[must_use]
+    pub fn matches_root(&self, root: &BranchRoot) -> bool {
+        self.branch_id == root.branch_id
+            && self.source_generation == root.source_generation
+            && self.source_manifest_sha256 == root.source_manifest_sha256
+            && self.fork_view_sha256 == root.fork_view_sha256
+            && self.source_config_sha256 == root.source_config_sha256
+            && self.target_namespace == root.target_namespace
+            && self.target_incarnation == root.target_incarnation
+            && self.created_at == root.created_at
+    }
+
+    /// Returns whether every immutable ancestry field matches the lineage
+    /// carried by a live manifest in this branch lifetime. Target binding is
+    /// established by the incarnation-bound manifest read; generation-one
+    /// bytes and their digest are deliberately not lineage fields.
+    #[must_use]
+    pub fn matches_lineage(&self, lineage: &BranchLineage) -> bool {
+        self.branch_id == lineage.branch_id
+            && self.source_namespace == lineage.parent_namespace
+            && self.source_incarnation == lineage.parent_incarnation
+            && self.source_generation == lineage.fork_generation
+            && self.source_manifest_sha256 == lineage.fork_manifest_sha256
+            && self.fork_view_sha256 == lineage.fork_view_sha256
+            && self.source_config_sha256 == lineage.source_config_sha256
+            && self.depth == lineage.depth
+            && self.created_at == lineage.created_at
+    }
 }
 
 /// Immutable ancestry proof signed by every manifest in a branch lifetime.
@@ -180,6 +212,13 @@ pub enum NamespaceDeleteOutcome {
     Deleted,
     /// The namespace was already in the deleting lifecycle state.
     AlreadyDeleting,
+    /// Branch visibility is gone, but its parent root remains pinned through
+    /// the persisted reader-safety deadline.
+    BranchGraceWait {
+        /// Earliest authoritative wall-clock instant at which root release may
+        /// begin. Derived from the marker object's S3 `last_modified` value.
+        not_before: DateTime<Utc>,
+    },
 }
 
 /// Direct-child listing request.
@@ -231,7 +270,7 @@ pub struct BranchMaintenanceReport {
     pub manifests_published: usize,
     /// Fully prepared reservations verified.
     pub prepared_verified: usize,
-    /// Active branches whose parent root and generation-one lineage verified.
+    /// Active branches whose parent root and current immutable lineage verified.
     pub active_verified: usize,
     /// Reserved targets deliberately left for a fresh authenticated retry.
     pub awaiting_authenticated_retry: usize,

@@ -12,8 +12,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use sha2::{Digest, Sha256};
 
 use crate::error::Result;
+use crate::namespace::manager::NamespaceDeletionIntent;
 use crate::namespace::NamespaceId;
 use crate::namespace::{BranchId, NamespaceIncarnationId};
 use crate::security::{
@@ -314,12 +316,22 @@ impl AuthorizedNamespaceDelete {
 pub(crate) struct BranchVisibilityRemovalMarker {
     /// Schema discriminator for future marker evolution.
     pub domain: String,
-    /// Target namespace whose visibility was removed.
-    pub target_namespace: NamespaceId,
     /// Exact branch edge being retired.
     pub branch_id: BranchId,
+    /// Target namespace whose visibility was removed.
+    pub target_namespace: NamespaceId,
     /// Target lifetime bound by the marker.
     pub target_incarnation: NamespaceIncarnationId,
+    /// Exact manifest generation at which destructive writes were fenced.
+    pub fenced_generation: u64,
+    /// Immutable destruction evidence bound by the deletion intent.
+    pub destruction_record_key: String,
+    /// Canonical digest of the immutable portion of the deletion intent.
+    pub intent_sha256: String,
+    /// Canonical digest of the exact direct-parent branch root.
+    pub parent_root_sha256: String,
+    /// Exact checked reader-safety floor selected by the marker creator.
+    pub reader_safety_floor_secs: u64,
 }
 
 impl BranchVisibilityRemovalMarker {
@@ -340,19 +352,116 @@ impl BranchVisibilityRemovalMarker {
         )
     }
 
-    /// Construct the canonical marker body for one branch lifetime.
-    #[must_use]
-    pub(crate) fn new(
-        target: NamespaceId,
+    /// Construct the canonical marker body from one fully fenced branch intent.
+    pub(crate) fn from_intent(
+        target: &NamespaceId,
         branch_id: BranchId,
-        target_incarnation: NamespaceIncarnationId,
-    ) -> Self {
-        Self {
-            domain: Self::DOMAIN.to_string(),
-            target_namespace: target,
-            branch_id,
-            target_incarnation,
+        intent: &NamespaceDeletionIntent,
+        reader_safety_floor_secs: u64,
+    ) -> Result<Self> {
+        if reader_safety_floor_secs == 0 {
+            return Err(crate::error::ZeppelinError::Validation(format!(
+                "branch visibility marker for {target} requires a nonzero grace floor"
+            )));
         }
+        let fenced_generation = intent.fenced_generation.ok_or_else(|| {
+            crate::error::ZeppelinError::Validation(format!(
+                "branch visibility marker for {target} requires a fenced generation"
+            ))
+        })?;
+        if intent.incarnation.is_nil() {
+            return Err(crate::error::ZeppelinError::Validation(format!(
+                "branch visibility marker for {target} requires a non-nil target incarnation"
+            )));
+        }
+        let parent_root = intent.parent_root.as_ref().ok_or_else(|| {
+            crate::error::ZeppelinError::Validation(format!(
+                "branch visibility marker for {target} requires an exact parent root"
+            ))
+        })?;
+        if parent_root.branch_id != branch_id
+            || &parent_root.target_namespace != target
+            || parent_root.target_incarnation != intent.incarnation
+        {
+            return Err(crate::error::ZeppelinError::Validation(format!(
+                "branch visibility marker for {target} does not match its exact parent root"
+            )));
+        }
+
+        let mut immutable_intent = intent.clone();
+        immutable_intent.visibility = None;
+        immutable_intent.root_release = None;
+        let intent_sha256 = canonical_json_sha256(&immutable_intent, "deletion intent")?;
+        let parent_root_sha256 = canonical_json_sha256(parent_root, "parent branch root")?;
+
+        Ok(Self {
+            domain: Self::DOMAIN.to_string(),
+            branch_id,
+            target_namespace: target.clone(),
+            target_incarnation: intent.incarnation.clone(),
+            fenced_generation,
+            destruction_record_key: intent.destruction_record_key.clone(),
+            intent_sha256,
+            parent_root_sha256,
+            reader_safety_floor_secs,
+        })
+    }
+
+    /// Validate a pre-existing marker as canonical bytes for this exact branch
+    /// identity while adopting the floor durably selected by its creator.
+    fn adopt_existing_bytes(&self, existing_bytes: &[u8]) -> Result<Self> {
+        let existing: Self = serde_json::from_slice(existing_bytes).map_err(|error| {
+            crate::error::ZeppelinError::Validation(format!(
+                "existing branch visibility marker is invalid: {error}"
+            ))
+        })?;
+        if existing.reader_safety_floor_secs == 0 {
+            return Err(crate::error::ZeppelinError::Validation(
+                "existing branch visibility marker has a zero grace floor".to_string(),
+            ));
+        }
+
+        let mut expected = self.clone();
+        expected.reader_safety_floor_secs = existing.reader_safety_floor_secs;
+        let expected_bytes = serde_json::to_vec(&expected).map_err(|error| {
+            crate::error::ZeppelinError::Serialization(format!("visibility marker encode: {error}"))
+        })?;
+        if existing_bytes != expected_bytes.as_slice() {
+            return Err(crate::error::ZeppelinError::Validation(
+                "existing branch visibility marker has conflicting bytes".to_string(),
+            ));
+        }
+        Ok(existing)
+    }
+}
+
+fn canonical_json_sha256<T: Serialize + ?Sized>(value: &T, label: &str) -> Result<String> {
+    let value = serde_json::to_value(value).map_err(|error| {
+        crate::error::ZeppelinError::Serialization(format!(
+            "branch visibility marker {label} canonicalization failed: {error}"
+        ))
+    })?;
+    let bytes = serde_json::to_vec(&canonicalize_json_value(value)).map_err(|error| {
+        crate::error::ZeppelinError::Serialization(format!(
+            "branch visibility marker {label} canonical encoding failed: {error}"
+        ))
+    })?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn canonicalize_json_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonicalize_json_value).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let ordered = values
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize_json_value(value)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            serde_json::Value::Object(ordered.into_iter().collect())
+        }
+        scalar => scalar,
     }
 }
 
@@ -362,28 +471,40 @@ pub(crate) async fn persist_branch_visibility_removal(
     store: &ZeppelinStore,
     target: &NamespaceId,
     branch_id: BranchId,
-    incarnation: NamespaceIncarnationId,
+    intent: &NamespaceDeletionIntent,
     grace_floor: Duration,
 ) -> Result<super::super::manager::VisibilityRemoval> {
-    let marker = BranchVisibilityRemovalMarker::new(target.clone(), branch_id, incarnation.clone());
-    let key = BranchVisibilityRemovalMarker::key(target, branch_id, incarnation);
+    if grace_floor.subsec_nanos() != 0 {
+        return Err(crate::error::ZeppelinError::Validation(
+            "branch grace floor must be an exact number of seconds".to_string(),
+        ));
+    }
+    let marker = BranchVisibilityRemovalMarker::from_intent(
+        target,
+        branch_id,
+        intent,
+        grace_floor.as_secs(),
+    )?;
+    let key = BranchVisibilityRemovalMarker::key(target, branch_id, intent.incarnation.clone());
     let body = serde_json::to_vec(&marker).map_err(|error| {
         crate::error::ZeppelinError::Serialization(format!("visibility marker encode: {error}"))
     })?;
-    match store
+    let marker = match store
         .put_create_outcome(&key, Bytes::from(body.clone()))
         .await?
     {
-        CreateOnlyOutcome::Created { .. } => {}
+        CreateOnlyOutcome::Created { .. } => marker,
         CreateOnlyOutcome::AlreadyExists => {
             let existing = store.get(&key).await?;
-            if existing.as_ref() != body.as_slice() {
-                return Err(crate::error::ZeppelinError::Validation(format!(
-                    "branch visibility marker {key} has conflicting bytes"
-                )));
-            }
+            marker
+                .adopt_existing_bytes(existing.as_ref())
+                .map_err(|error| {
+                    crate::error::ZeppelinError::Validation(format!(
+                        "branch visibility marker {key} cannot be adopted: {error}"
+                    ))
+                })?
         }
-    }
+    };
     let observed_at = store.head(&key).await?.last_modified;
     let rounded = observed_at
         .checked_add_signed(ChronoDuration::seconds(1))
@@ -391,11 +512,12 @@ pub(crate) async fn persist_branch_visibility_removal(
             crate::error::ZeppelinError::Validation("marker timestamp overflow".to_string())
         })?
         .timestamp();
-    let floor = ChronoDuration::from_std(grace_floor).map_err(|_| {
-        crate::error::ZeppelinError::Validation(
-            "branch grace floor exceeds chrono range".to_string(),
-        )
-    })?;
+    let floor = ChronoDuration::from_std(Duration::from_secs(marker.reader_safety_floor_secs))
+        .map_err(|_| {
+            crate::error::ZeppelinError::Validation(
+                "branch grace floor exceeds chrono range".to_string(),
+            )
+        })?;
     let not_before = DateTime::<Utc>::from_timestamp(rounded, 0)
         .ok_or_else(|| {
             crate::error::ZeppelinError::Validation("invalid marker timestamp".to_string())
@@ -412,23 +534,190 @@ pub(crate) async fn persist_branch_visibility_removal(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{
         BranchVisibilityRemovalMarker, CallbackDeletionGovernance, DeletionBoundary,
         DeletionGovernance, DeletionLifecycleEvent,
     };
-    use crate::namespace::{BranchId, NamespaceId, NamespaceIncarnationId};
+    use crate::namespace::manager::{NamespaceDeletionIntent, RootReleaseState, VisibilityRemoval};
+    use crate::namespace::{
+        BranchId, BranchRoot, ForkViewDigest, ManifestDigest, ManifestGeneration, NamespaceId,
+        NamespaceIncarnationId, SourceDataPlaneConfigDigest,
+    };
     use crate::security::{PreservationGuard, PreservationHeadProof};
+    use chrono::{DateTime, Utc};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    fn marker_contract_fixture() -> (NamespaceId, BranchId, NamespaceDeletionIntent) {
+        let target = NamespaceId::new("branch-target").expect("valid namespace");
+        let branch = BranchId::from_ulid(
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+                .parse()
+                .expect("valid branch ULID"),
+        );
+        let incarnation = NamespaceIncarnationId::from_uuid(
+            uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555555")
+                .expect("valid incarnation UUID"),
+        );
+        let created_at = DateTime::parse_from_rfc3339("2026-07-17T12:34:56Z")
+            .expect("valid timestamp")
+            .with_timezone(&Utc);
+        let parent_root = BranchRoot {
+            branch_id: branch,
+            source_generation: ManifestGeneration::new(5).expect("nonzero generation"),
+            source_manifest_sha256: ManifestDigest::new([17; 32]),
+            fork_view_sha256: ForkViewDigest::new([34; 32]),
+            source_config_sha256: SourceDataPlaneConfigDigest::new([51; 32]),
+            target_namespace: target.clone(),
+            target_incarnation: incarnation.clone(),
+            created_at,
+        };
+        let intent = NamespaceDeletionIntent {
+            incarnation,
+            destruction_record_key: "_audit/destruction/decision-01.json".to_string(),
+            decision_evidence_ref: "_audit/deletion-decisions/01ARZ3NDEKTSV4RRFFQ69G5FAV.json"
+                .to_string(),
+            parent_root: Some(parent_root),
+            fenced_generation: Some(7),
+            visibility: None,
+            root_release: None,
+        };
+        (target, branch, intent)
+    }
+
+    #[test]
+    fn visibility_marker_binds_canonical_intent_and_exact_parent_root() {
+        let (target, branch, intent) = marker_contract_fixture();
+
+        let marker = BranchVisibilityRemovalMarker::from_intent(&target, branch, &intent, 31)
+            .expect("valid branch deletion intent produces a marker");
+
+        assert_eq!(marker.fenced_generation, 7);
+        assert_eq!(
+            marker.destruction_record_key,
+            "_audit/destruction/decision-01.json"
+        );
+        assert_eq!(
+            marker.intent_sha256,
+            "4804e800c2f28164bb8f5a06ee718792e1255ec0fd9e12e1c370dd24122dd86e"
+        );
+        assert_eq!(
+            marker.parent_root_sha256,
+            "f830085b757e269821ba95e7ac87a411eceee4507c7c8de337d2f9dc06ef8eb4"
+        );
+        assert_eq!(marker.reader_safety_floor_secs, 31);
+        assert_eq!(marker.intent_sha256.len(), 64);
+        assert!(marker
+            .intent_sha256
+            .bytes()
+            .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) }));
+
+        assert_eq!(
+            serde_json::to_string(&marker).expect("marker encodes"),
+            r#"{"domain":"zeppelin.branch-visibility-removed.v1","branch_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","target_namespace":"branch-target","target_incarnation":"11111111-2222-4333-8444-555555555555","fenced_generation":7,"destruction_record_key":"_audit/destruction/decision-01.json","intent_sha256":"4804e800c2f28164bb8f5a06ee718792e1255ec0fd9e12e1c370dd24122dd86e","parent_root_sha256":"f830085b757e269821ba95e7ac87a411eceee4507c7c8de337d2f9dc06ef8eb4","reader_safety_floor_secs":31}"#
+        );
+    }
+
+    #[test]
+    fn visibility_marker_hash_ignores_later_mutable_intent_fields() {
+        let (target, branch, intent) = marker_contract_fixture();
+        let expected = BranchVisibilityRemovalMarker::from_intent(&target, branch, &intent, 31)
+            .expect("base intent produces a marker");
+        let mut advanced = intent;
+        advanced.visibility = Some(VisibilityRemoval {
+            marker_key: "branch-target/_lifecycle/branch_visibility_removed/existing.json"
+                .to_string(),
+            observed_at: DateTime::parse_from_rfc3339("2026-07-18T00:00:00Z")
+                .expect("valid timestamp")
+                .with_timezone(&Utc),
+            not_before: DateTime::parse_from_rfc3339("2026-07-19T00:00:00Z")
+                .expect("valid timestamp")
+                .with_timezone(&Utc),
+        });
+        advanced.root_release = Some(RootReleaseState::Pending);
+
+        let observed = BranchVisibilityRemovalMarker::from_intent(&target, branch, &advanced, 31)
+            .expect("advanced intent produces the same marker");
+
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn visibility_marker_rejects_unbound_branch_intents() {
+        let (target, branch, intent) = marker_contract_fixture();
+
+        let mut unfenced = intent.clone();
+        unfenced.fenced_generation = None;
+        assert!(
+            BranchVisibilityRemovalMarker::from_intent(&target, branch, &unfenced, 31).is_err()
+        );
+
+        let mut rootless = intent.clone();
+        rootless.parent_root = None;
+        assert!(
+            BranchVisibilityRemovalMarker::from_intent(&target, branch, &rootless, 31).is_err()
+        );
+
+        let wrong_target = NamespaceId::new("other-target").expect("valid namespace");
+        assert!(
+            BranchVisibilityRemovalMarker::from_intent(&wrong_target, branch, &intent, 31).is_err()
+        );
+
+        let wrong_branch = BranchId::new();
+        assert!(
+            BranchVisibilityRemovalMarker::from_intent(&target, wrong_branch, &intent, 31).is_err()
+        );
+
+        let mut wrong_incarnation = intent.clone();
+        wrong_incarnation
+            .parent_root
+            .as_mut()
+            .expect("fixture has a parent root")
+            .target_incarnation = NamespaceIncarnationId::new();
+        assert!(BranchVisibilityRemovalMarker::from_intent(
+            &target,
+            branch,
+            &wrong_incarnation,
+            31
+        )
+        .is_err());
+
+        assert!(BranchVisibilityRemovalMarker::from_intent(&target, branch, &intent, 0).is_err());
+    }
+
+    #[test]
+    fn visibility_marker_adopts_creator_floor_without_relaxing_identity_bytes() {
+        let (target, branch, intent) = marker_contract_fixture();
+        let created = BranchVisibilityRemovalMarker::from_intent(&target, branch, &intent, 31)
+            .expect("creator marker is valid");
+        let retry = BranchVisibilityRemovalMarker::from_intent(&target, branch, &intent, 61)
+            .expect("retry marker is valid");
+        let created_bytes = serde_json::to_vec(&created).expect("creator marker encodes");
+
+        let adopted = retry
+            .adopt_existing_bytes(&created_bytes)
+            .expect("retry adopts the creator-bound floor");
+
+        assert_eq!(adopted, created);
+
+        let mut conflicting = created.clone();
+        conflicting.destruction_record_key = "_audit/destruction/other.json".to_string();
+        let conflicting_bytes = serde_json::to_vec(&conflicting).expect("conflict marker encodes");
+        assert!(retry.adopt_existing_bytes(&conflicting_bytes).is_err());
+
+        let noncanonical_bytes =
+            serde_json::to_vec_pretty(&created).expect("pretty marker encodes");
+        assert!(retry.adopt_existing_bytes(&noncanonical_bytes).is_err());
+    }
+
     #[test]
     fn visibility_marker_is_deterministic_and_strict() {
-        let target = NamespaceId::new("branch-target").expect("valid namespace");
-        let branch = BranchId::new();
-        let incarnation = NamespaceIncarnationId::new();
-        let marker =
-            BranchVisibilityRemovalMarker::new(target.clone(), branch, incarnation.clone());
+        let (target, branch, intent) = marker_contract_fixture();
+        let incarnation = intent.incarnation.clone();
+        let marker = BranchVisibilityRemovalMarker::from_intent(&target, branch, &intent, 31)
+            .expect("valid branch deletion intent produces a marker");
         let encoded = serde_json::to_vec(&marker).expect("marker encodes");
         let decoded: BranchVisibilityRemovalMarker =
             serde_json::from_slice(&encoded).expect("marker decodes");

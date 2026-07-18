@@ -32,8 +32,9 @@ use crate::namespace::branching::{
     PrepareForkRequest, PreparedBranch,
 };
 use crate::namespace::manager::{
-    CompactionHealth, GovernedDeletionIdentity, NamespaceDestructionRecord, NamespaceIndexConfig,
-    NamespaceManager, NamespaceMetadata, NamespaceState, ReserveMetadataOutcome, RootReleaseState,
+    CompactionHealth, GovernedDeletionIdentity, NamespaceDeletionIntent,
+    NamespaceDestructionRecord, NamespaceIndexConfig, NamespaceManager, NamespaceMetadata,
+    NamespaceState, ReserveMetadataOutcome, RootReleaseState,
 };
 use crate::namespace::{
     BranchId, BranchRoot, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
@@ -130,7 +131,7 @@ impl NamespaceGraph {
         let name = namespace.as_str();
         let (metadata, _) = self.namespace_manager.read_metadata_versioned(name).await?;
         if metadata.state == NamespaceState::Deleting {
-            return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
+            return Ok(Self::deletion_in_progress_outcome(&metadata));
         }
         if metadata.state != NamespaceState::Active {
             return Err(ZeppelinError::Validation(format!(
@@ -138,6 +139,7 @@ impl NamespaceGraph {
             )));
         }
         let (manifest, _) = Manifest::read_versioned_required(&self.store, name).await?;
+        self.verify_active_branch(&metadata).await?;
         if !manifest.branch_roots().is_empty() {
             self.require_child_disclosure(&manifest, governance.as_ref())?;
             return Err(self.live_child_error(&metadata, &namespace));
@@ -169,16 +171,14 @@ impl NamespaceGraph {
                 "namespace {namespace} did not persist its deletion intent"
             ))
         })?;
-        let destruction_key = intent.destruction_record_key.clone();
-        let decision_evidence_ref = intent.decision_evidence_ref.clone();
+        let expected_intent = intent.clone();
         let lease = self.lease_manager.acquire(name).await?;
         let result = self
             .delete_active_under_lease(
                 &namespace,
                 &decision,
                 governance,
-                destruction_key,
-                decision_evidence_ref,
+                expected_intent,
                 lease.clone(),
                 true,
             )
@@ -198,23 +198,30 @@ impl NamespaceGraph {
         namespace: &NamespaceId,
         decision: &DeletionDecision,
         governance: Arc<dyn DeletionGovernance>,
-        destruction_key: String,
-        decision_evidence_ref: String,
+        expected_intent: NamespaceDeletionIntent,
         lease: Lease,
         disclose_conflict: bool,
     ) -> Result<NamespaceDeleteOutcome> {
         let name = namespace.as_str();
         let (metadata, _) = self.namespace_manager.read_metadata_versioned(name).await?;
         if metadata.state == NamespaceState::Deleting {
-            return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
+            return Ok(Self::deletion_in_progress_outcome(&metadata));
+        }
+        if metadata.state != NamespaceState::Active
+            || metadata.deletion_intent.as_ref() != Some(&expected_intent)
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {namespace} deletion intent changed under its writer lease"
+            )));
         }
         let (manifest, _) = Manifest::read_versioned_required(&self.store, name).await?;
+        self.verify_active_branch(&metadata).await?;
         if !manifest.branch_roots().is_empty() {
             if disclose_conflict {
                 self.require_child_disclosure(&manifest, governance.as_ref())?;
             }
             self.namespace_manager
-                .clear_unfenced_deletion_intent(name, &decision_evidence_ref)
+                .clear_unfenced_deletion_intent(name, &expected_intent.decision_evidence_ref)
                 .await?;
             return Err(self.live_child_error(&metadata, namespace));
         }
@@ -230,7 +237,7 @@ impl NamespaceGraph {
             &self.lease_manager,
             &lease,
             name,
-            &destruction_key,
+            &expected_intent.destruction_record_key,
         )
         .await
         {
@@ -239,7 +246,7 @@ impl NamespaceGraph {
                 if matches!(error.as_ref(), BranchError::NamespaceHasLiveBranches { .. }) =>
             {
                 self.namespace_manager
-                    .clear_unfenced_deletion_intent(name, &decision_evidence_ref)
+                    .clear_unfenced_deletion_intent(name, &expected_intent.decision_evidence_ref)
                     .await?;
                 let (latest, _) = self.namespace_manager.read_metadata_versioned(name).await?;
                 if disclose_conflict {
@@ -252,7 +259,11 @@ impl NamespaceGraph {
             Err(error) => return Err(error),
         };
         self.namespace_manager
-            .record_fenced_generation(name, &decision_evidence_ref, fenced.version())
+            .record_fenced_generation(
+                name,
+                &expected_intent.decision_evidence_ref,
+                fenced.version(),
+            )
             .await?;
         let (metadata, _) = self.namespace_manager.read_metadata_versioned(name).await?;
         let intent = metadata.deletion_intent.as_ref().ok_or_else(|| {
@@ -278,7 +289,7 @@ impl NamespaceGraph {
             return Err(crate::security::SecurityError::PreservationLocked.into());
         }
         self.namespace_manager
-            .tombstone_with_intent(name, &decision_evidence_ref)
+            .tombstone_with_intent(name, &expected_intent.decision_evidence_ref)
             .await?;
         let (guard, _) = governance
             .preservation_boundary(namespace, DeletionBoundary::VisibilityRemoval)
@@ -291,7 +302,7 @@ impl NamespaceGraph {
             .await?;
         self.manifest_cache.invalidate_at(name, self.clock.now());
 
-        if let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind {
+        let outcome = if let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind {
             let floor_secs = self.gc_horizon_floor_secs.ok_or_else(|| {
                 ZeppelinError::Validation(
                     "branch deletion requires a checked GC horizon floor".to_string(),
@@ -301,15 +312,35 @@ impl NamespaceGraph {
                 &self.store,
                 namespace,
                 reservation.branch_id,
-                intent.incarnation.clone(),
+                intent,
                 Duration::from_secs(floor_secs),
             )
             .await?;
             self.namespace_manager
-                .record_visibility_removal(name, visibility)
+                .record_visibility_removal(name, visibility.clone())
                 .await?;
+            NamespaceDeleteOutcome::BranchGraceWait {
+                not_before: visibility.not_before,
+            }
+        } else {
+            NamespaceDeleteOutcome::AlreadyDeleting
+        };
+        Ok(outcome)
+    }
+
+    fn deletion_in_progress_outcome(metadata: &NamespaceMetadata) -> NamespaceDeleteOutcome {
+        match &metadata.creation_kind {
+            NamespaceCreationKind::Fork(_) => metadata
+                .deletion_intent
+                .as_ref()
+                .and_then(|intent| intent.visibility.as_ref())
+                .map_or(NamespaceDeleteOutcome::AlreadyDeleting, |visibility| {
+                    NamespaceDeleteOutcome::BranchGraceWait {
+                        not_before: visibility.not_before,
+                    }
+                }),
+            NamespaceCreationKind::Root => NamespaceDeleteOutcome::AlreadyDeleting,
         }
-        Ok(NamespaceDeleteOutcome::AlreadyDeleting)
     }
 
     fn require_child_disclosure(
@@ -377,9 +408,7 @@ impl NamespaceGraph {
             .ok_or(BranchError::BranchRootMissing {
                 branch_id: reservation.branch_id,
             })?;
-        if root.target_namespace != *namespace
-            || root.target_incarnation != reservation.target_incarnation
-        {
+        if !identity.matches_root(&root) {
             return Err(BranchError::BranchRootMismatch {
                 branch_id: reservation.branch_id,
             }
@@ -551,8 +580,7 @@ impl NamespaceGraph {
                     namespace,
                     &decision,
                     Arc::clone(&governance),
-                    intent.destruction_record_key,
-                    intent.decision_evidence_ref,
+                    intent,
                     lease.clone(),
                     false,
                 )
@@ -692,7 +720,9 @@ impl NamespaceGraph {
                     ))
                 })?;
                 if self.clock.now() < visibility.not_before {
-                    return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
+                    return Ok(NamespaceDeleteOutcome::BranchGraceWait {
+                        not_before: visibility.not_before,
+                    });
                 }
                 self.release_branch_root(namespace, &metadata, Arc::clone(&governance))
                     .await?;
@@ -747,7 +777,7 @@ impl NamespaceGraph {
             &self.store,
             namespace,
             reservation.branch_id,
-            intent.incarnation.clone(),
+            intent,
             Duration::from_secs(floor_secs),
         )
         .await?;
@@ -853,7 +883,7 @@ impl NamespaceGraph {
                 &self.store,
                 namespace,
                 reservation.branch_id,
-                current_intent.incarnation.clone(),
+                current_intent,
                 Duration::from_secs(floor_secs),
             )
             .await?;
@@ -1937,64 +1967,30 @@ impl NamespaceGraph {
             .ok_or_else(|| BranchError::BranchRootMissing {
                 branch_id: reservation.branch_id,
             })?;
-        if root.source_generation != identity.source_generation
-            || root.source_manifest_sha256 != identity.source_manifest_sha256
-            || root.fork_view_sha256 != identity.fork_view_sha256
-            || root.source_config_sha256 != identity.source_config_sha256
-            || root.target_namespace != identity.target_namespace
-            || root.target_incarnation != identity.target_incarnation
-            || root.created_at != identity.created_at
-        {
+        if !identity.matches_root(root) {
             return Err(BranchError::BranchRootMismatch {
                 branch_id: reservation.branch_id,
             }
             .into());
         }
 
-        let history_bytes = self
-            .store
-            .get(&Manifest::history_key(
-                &metadata.name,
-                identity.target_generation.get(),
-            ))
-            .await?;
-        if crate::namespace::ManifestDigest::new(Sha256::digest(&history_bytes).into())
-            != identity.target_manifest_sha256
-        {
-            return Err(BranchError::ManifestDigestMismatch {
-                generation: identity.target_generation,
-            }
-            .into());
-        }
-        let generation_one = Manifest::from_bytes_for_namespace(&history_bytes, &metadata.name)?;
-        let lineage = generation_one.branch_lineage().ok_or_else(|| {
-            ZeppelinError::Serialization(format!(
-                "active branch {} generation one has no lineage",
-                metadata.name
-            ))
-        })?;
-        if lineage.branch_id != identity.branch_id
-            || lineage.parent_namespace != identity.source_namespace
-            || lineage.parent_incarnation != identity.source_incarnation
-            || lineage.fork_generation != identity.source_generation
-            || lineage.fork_manifest_sha256 != identity.source_manifest_sha256
-            || lineage.fork_view_sha256 != identity.fork_view_sha256
-            || lineage.source_config_sha256 != identity.source_config_sha256
-            || lineage.depth != identity.depth
-            || lineage.created_at != identity.created_at
-        {
-            return Err(BranchError::BranchRootMismatch {
-                branch_id: identity.branch_id,
-            }
-            .into());
-        }
+        // Generation-one history is retention data and may be pruned after
+        // the branch advances. Branch successor validation makes lineage
+        // immutable, so the signed, incarnation-bound live manifest is the
+        // durable creation-proof carrier for an active branch.
         let (live, _) = Manifest::read_versioned_required_for_incarnation(
             &self.store,
             &metadata.name,
             identity.target_incarnation.as_uuid(),
         )
         .await?;
-        if live.branch_lineage() != Some(lineage) {
+        let lineage = live.branch_lineage().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "active branch {} live manifest has no lineage",
+                metadata.name
+            ))
+        })?;
+        if !identity.matches_lineage(lineage) {
             return Err(BranchError::BranchRootMismatch {
                 branch_id: identity.branch_id,
             }
