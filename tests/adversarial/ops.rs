@@ -8,7 +8,43 @@ use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter};
 
 use super::oracle::ViolationId;
 
+#[cfg(test)]
+mod branching_operation_tests {
+    use super::BranchingOp;
+
+    #[test]
+    fn branching_operations_have_stable_kinds() {
+        let encoded = serde_json::to_value(BranchingOp::ForkNamespace {
+            actor: super::ActorSel::ADMIN,
+            source: "source".to_string(),
+            target: "target".to_string(),
+        })
+        .unwrap();
+        assert_eq!(encoded["kind"], "fork_namespace");
+    }
+}
+
 pub type Consistency = ConsistencyLevel;
+
+/// Branching operations emitted by the Phase 10 adapter layer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BranchingOp {
+    /// Prepare or retry a live-head copy-on-write fork.
+    ForkNamespace {
+        actor: ActorSel,
+        source: String,
+        target: String,
+    },
+    /// List direct branch children.
+    ListBranches { actor: ActorSel, source: String },
+    /// Compact a writable branch.
+    CompactBranch { actor: ActorSel, namespace: String },
+    /// Delete a branch target.
+    DeleteBranch { actor: ActorSel, namespace: String },
+    /// Attempt source deletion while children remain.
+    DeleteSourceWithBranches { actor: ActorSel, source: String },
+}
 
 /// Deterministic index into one seed's redaction-safe principal vocabulary.
 /// Index zero is the implicit administrator used by legacy artifacts.
