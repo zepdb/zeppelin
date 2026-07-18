@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use serde_json::json;
 use zeppelin::config::Config;
-use zeppelin::security::{Action, RouteClass, ROUTE_ACTIONS};
+use zeppelin::security::{Action, AuditParams, NamespaceId, RouteClass, ROUTE_ACTIONS};
 
 use common::server::{
     start_test_server_with_config, start_test_server_with_config_no_limit_override,
@@ -707,6 +707,18 @@ fn branch_creation_uses_distinct_fork_action() {
         })
         .expect("branch creation route must be mapped");
     assert_eq!(entry.class, RouteClass::Protected(Action::NamespaceFork));
+}
+
+#[test]
+fn fork_audit_params_have_a_distinct_stable_variant() {
+    let params = AuditParams::NamespaceFork {
+        source: NamespaceId::new("source").unwrap(),
+        target: NamespaceId::new("target").unwrap(),
+    };
+    let value = serde_json::to_value(params).unwrap();
+    assert_eq!(value["type"], "namespace_fork");
+    assert_eq!(value["source"], "source");
+    assert_eq!(value["target"], "target");
 }
 
 #[tokio::test]

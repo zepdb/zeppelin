@@ -254,7 +254,7 @@ pub async fn create_branch(
         target_id.as_str(),
     )
     .map_err(|error| ApiError(error.into()))?;
-    audit.set_params(AuditParams::NamespaceClone {
+    audit.set_params(AuditParams::NamespaceFork {
         source: source_id.clone(),
         target: target_id.clone(),
     });

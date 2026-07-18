@@ -305,6 +305,13 @@ pub enum AuditParams {
         /// Newly materialized target namespace.
         target: NamespaceId,
     },
+    /// A live-head copy-on-write branch was prepared or activated.
+    NamespaceFork {
+        /// Existing source namespace.
+        source: NamespaceId,
+        /// Newly prepared branch target namespace.
+        target: NamespaceId,
+    },
     /// Desired namespace index settings were replaced.
     IndexConfigPatch {
         /// Namespace whose settings changed.
