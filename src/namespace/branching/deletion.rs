@@ -114,6 +114,8 @@ impl DeletionGovernance for CallbackDeletionGovernance {
 /// Boundary at which preservation authority must be freshly observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeletionBoundary {
+    /// Before fencing a never-active fork with its cancellation intent.
+    CancellationIntent,
     /// Before publishing the manifest fence.
     Fence,
     /// Before tombstoning metadata.

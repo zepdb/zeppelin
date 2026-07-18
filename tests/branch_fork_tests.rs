@@ -5,6 +5,10 @@ mod common;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use common::fault_injection::{
+    fail_delete_once_matching, fail_put_once_matching, pause_first_after_get_matching,
+    pause_first_create_matching, pause_next_cas_matching,
+};
 use common::harness::TestHarness;
 use common::server::scoped_test_security_store;
 use common::vectors::random_vectors;
@@ -19,13 +23,15 @@ use zeppelin::namespace::branching::test_support::{
     prepare_fork_for_test, prepare_fork_until_reserved_for_test, prepare_fork_until_root_for_test,
     prepared_manifest_snapshot, publish_deletion_fence, resume_delete_for_test,
 };
-use zeppelin::namespace::branching::{BranchError, BranchPrepareStage, PrepareForkOutcome};
+use zeppelin::namespace::branching::{
+    BranchError, BranchPrepareStage, NamespaceDeleteOutcome, PrepareForkOutcome,
+};
 use zeppelin::namespace::manager::{
     CompactionStatus, NamespaceIndexConfig, NamespaceMetadata, NamespaceState,
 };
 use zeppelin::namespace::{NamespaceId, NamespaceManager};
 use zeppelin::types::{DistanceMetric, VectorEntry};
-use zeppelin::wal::{Manifest, WalReader, WalWriter};
+use zeppelin::wal::{LeaseManager, Manifest, WalReader, WalWriter};
 
 fn fork_indexing() -> IndexingConfig {
     IndexingConfig {
@@ -378,8 +384,14 @@ async fn compact_source(
 }
 
 async fn raw_namespace_metadata(harness: &TestHarness, namespace: &str) -> NamespaceMetadata {
-    let bytes = harness
-        .store
+    raw_namespace_metadata_from_store(&harness.store, namespace).await
+}
+
+async fn raw_namespace_metadata_from_store(
+    store: &zeppelin::storage::ZeppelinStore,
+    namespace: &str,
+) -> NamespaceMetadata {
+    let bytes = store
         .get(&NamespaceMetadata::s3_key(namespace))
         .await
         .unwrap();
@@ -1042,4 +1054,1176 @@ async fn retry_after_root_publication_reuses_the_same_branch_and_generation() {
     harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup_artifact_origin_namespace(&target).await;
     harness.cleanup().await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NeverActiveStage {
+    ReservedNoRoot,
+    ReservedWithRoot,
+    Rooted,
+    ManifestPublished,
+}
+
+impl NeverActiveStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ReservedNoRoot => "reserved-no-root",
+            Self::ReservedWithRoot => "reserved-with-root",
+            Self::Rooted => "rooted",
+            Self::ManifestPublished => "manifest-published",
+        }
+    }
+
+    fn durable_stage(self) -> BranchPrepareStage {
+        match self {
+            Self::ReservedNoRoot | Self::ReservedWithRoot => BranchPrepareStage::Reserved,
+            Self::Rooted => BranchPrepareStage::Rooted,
+            Self::ManifestPublished => BranchPrepareStage::ManifestPublished,
+        }
+    }
+
+    fn has_parent_root(self) -> bool {
+        !matches!(self, Self::ReservedNoRoot)
+    }
+}
+
+async fn prepare_never_active_stage(
+    store: zeppelin::storage::ZeppelinStore,
+    source: &str,
+    target: &str,
+    stage: NeverActiveStage,
+) {
+    let source = NamespaceId::new(source.to_string()).expect("source namespace must be valid");
+    let target_id = NamespaceId::new(target.to_string()).expect("target namespace must be valid");
+    match stage {
+        NeverActiveStage::ReservedNoRoot => {
+            prepare_fork_until_reserved_for_test(
+                store.clone(),
+                source.clone(),
+                target_id.clone(),
+                fork_indexing(),
+                fork_limits(),
+            )
+            .await
+            .expect("fixture must stop after target reservation");
+        }
+        NeverActiveStage::ReservedWithRoot => {
+            prepare_fork_until_root_for_test(
+                store.clone(),
+                source.clone(),
+                target_id.clone(),
+                fork_indexing(),
+                fork_limits(),
+            )
+            .await
+            .expect("fixture must stop after the parent-root CAS");
+        }
+        NeverActiveStage::Rooted => {
+            let (faulted_store, manifest_failure) =
+                fail_put_once_matching(&store, Manifest::s3_key(target));
+            prepare_fork_for_test(
+                faulted_store,
+                source.clone(),
+                target_id.clone(),
+                fork_indexing(),
+                fork_limits(),
+            )
+            .await
+            .expect_err("fixture must stop after Rooted metadata and before live publication");
+            assert_eq!(manifest_failure.failures_injected(), 1);
+        }
+        NeverActiveStage::ManifestPublished => {
+            prepare_fork_for_test(
+                store.clone(),
+                source.clone(),
+                target_id.clone(),
+                fork_indexing(),
+                fork_limits(),
+            )
+            .await
+            .expect("fixture must publish a never-active target manifest");
+        }
+    }
+
+    let metadata = branch_metadata_snapshot(&store, target)
+        .await
+        .expect("never-active target metadata must remain observable");
+    assert_eq!(metadata.prepare_stage, Some(stage.durable_stage()));
+    assert_eq!(
+        branch_control_snapshot(&store, source.as_str())
+            .await
+            .expect("parent branch-root map must be readable")
+            .roots
+            .iter()
+            .any(|root| root.branch_id == metadata.reservation.branch_id),
+        stage.has_parent_root()
+    );
+}
+
+async fn assert_never_active_stage_cancels(stage: NeverActiveStage) {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let source = harness.artifact_origin_namespace(&format!("cancel-{}-source", stage.label()));
+    let target = harness.artifact_origin_namespace(&format!("cancel-{}-target", stage.label()));
+    NamespaceManager::new(store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("cancellation fixture parent must be created");
+    prepare_never_active_stage(store.clone(), &source, &target, stage).await;
+    let reservation = branch_metadata_snapshot(&store, &target)
+        .await
+        .expect("cancellation fixture reservation must be readable")
+        .reservation;
+    let evidence_before = store
+        .list_prefix("_audit/destruction/")
+        .await
+        .expect("pre-cancellation evidence prefix must be listable");
+
+    let (cancelled, evidence_key, evidence_preceded_root_removal, root_still_present_at_evidence) =
+        if stage.has_parent_root() {
+            let expected_root = branch_control_snapshot(&store, &source)
+                .await
+                .expect("rooted cancellation fixture must have a readable parent")
+                .roots
+                .into_iter()
+                .find(|root| root.branch_id == reservation.branch_id)
+                .expect("rooted cancellation fixture must retain its exact parent root");
+            let (paused_store, root_removal) =
+                pause_next_cas_matching(&store, Manifest::s3_key(&source));
+            root_removal.arm();
+            let cancel_target =
+                NamespaceId::new(target.clone()).expect("target namespace must be valid");
+            let cancel_store = paused_store.clone();
+            let mut cancellation = tokio::spawn(async move {
+                delete_namespace_for_test(
+                    cancel_store,
+                    cancel_target,
+                    fork_indexing(),
+                    fork_limits(),
+                )
+                .await
+            });
+            tokio::select! {
+                () = root_removal.wait_until_paused() => {}
+                outcome = &mut cancellation => {
+                    let outcome = outcome.expect("cancellation task must not panic");
+                    harness.cleanup().await;
+                    panic!(
+                        "{stage:?} cancellation returned before its evidence-ordered parent-root CAS: {outcome:?}"
+                    );
+                }
+            }
+
+            let cancelling = raw_namespace_metadata_from_store(&paused_store, &target).await;
+            let evidence_key = cancelling
+                .deletion_intent
+                .as_ref()
+                .map(|intent| intent.destruction_record_key.clone())
+                .expect("cancellation intent must bind immutable destruction evidence");
+            let evidence_preceded_root_removal = paused_store.get(&evidence_key).await.is_ok();
+            let root_still_present_at_evidence = branch_control_snapshot(&paused_store, &source)
+                .await
+                .expect("paused parent root must remain readable")
+                .roots
+                == vec![expected_root];
+            root_removal.release();
+            let cancelled = cancellation
+                .await
+                .expect("cancellation task must not panic after root CAS release");
+            (
+                cancelled,
+                Some(evidence_key),
+                evidence_preceded_root_removal,
+                root_still_present_at_evidence,
+            )
+        } else {
+            let cancelled = delete_namespace_for_test(
+                store.clone(),
+                NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+                fork_indexing(),
+                fork_limits(),
+            )
+            .await;
+            let evidence_after = store
+                .list_prefix("_audit/destruction/")
+                .await
+                .expect("post-cancellation evidence prefix must be listable");
+            let evidence_key = evidence_after
+                .iter()
+                .find(|key| !evidence_before.contains(key))
+                .cloned();
+            (cancelled, evidence_key, true, true)
+        };
+
+    let source_roots = branch_control_snapshot(&store, &source)
+        .await
+        .expect("post-cancellation parent must remain readable")
+        .roots;
+    let target_keys = store
+        .list_prefix(&format!("{target}/"))
+        .await
+        .expect("post-cancellation target prefix must be listable");
+    let visibility_markers = store
+        .list_prefix(&format!("{target}/_lifecycle/branch_visibility_removed/"))
+        .await
+        .expect("visibility-marker prefix must be listable");
+    let evidence_survived = match evidence_key.as_ref() {
+        Some(key) => store.exists(key).await.unwrap_or(false),
+        None => false,
+    };
+    harness.cleanup().await;
+
+    assert_eq!(
+        cancelled.expect("authorized never-active cancellation must succeed"),
+        NamespaceDeleteOutcome::Deleted,
+        "never-active cancellation must complete without reader grace"
+    );
+    assert!(
+        evidence_preceded_root_removal,
+        "destruction evidence must exist before the exact parent-root CAS"
+    );
+    assert!(
+        root_still_present_at_evidence,
+        "the exact parent root must remain authoritative while evidence is checked"
+    );
+    assert!(
+        source_roots
+            .iter()
+            .all(|root| root.branch_id != reservation.branch_id),
+        "cancellation must remove its exact root when one was published"
+    );
+    assert!(target_keys.is_empty(), "target-owned cleanup must finish");
+    assert!(
+        visibility_markers.is_empty(),
+        "a never-active target must not enter reader grace"
+    );
+    assert!(
+        evidence_survived,
+        "immutable cancellation evidence must survive cleanup"
+    );
+}
+
+#[tokio::test]
+async fn never_active_cancellation_cleans_reserved_no_root() {
+    assert_never_active_stage_cancels(NeverActiveStage::ReservedNoRoot).await;
+}
+
+#[tokio::test]
+async fn never_active_cancellation_cleans_reserved_root_crash() {
+    assert_never_active_stage_cancels(NeverActiveStage::ReservedWithRoot).await;
+}
+
+#[tokio::test]
+async fn never_active_cancellation_cleans_rooted_target() {
+    assert_never_active_stage_cancels(NeverActiveStage::Rooted).await;
+}
+
+#[tokio::test]
+async fn never_active_cancellation_cleans_manifest_published_target() {
+    assert_never_active_stage_cancels(NeverActiveStage::ManifestPublished).await;
+}
+
+#[tokio::test]
+async fn never_active_cancellation_retries_after_root_release_before_cleanup() {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let source = harness.artifact_origin_namespace("cancel-root-released-retry-source");
+    let target = harness.artifact_origin_namespace("cancel-root-released-retry-target");
+    NamespaceManager::new(store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("root-release retry fixture source must be created");
+    prepare_never_active_stage(
+        store.clone(),
+        &source,
+        &target,
+        NeverActiveStage::ManifestPublished,
+    )
+    .await;
+
+    let (faulted_store, cleanup_failure) =
+        fail_delete_once_matching(&store, Manifest::history_key(&target, 1));
+    let first = delete_namespace_for_test(
+        faulted_store,
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await;
+    assert!(
+        first.is_err(),
+        "the target cleanup fault must interrupt cancellation"
+    );
+    assert_eq!(cleanup_failure.failures_injected(), 1);
+    assert!(
+        branch_control_snapshot(&store, &source)
+            .await
+            .expect("parent root map must remain readable after cleanup failure")
+            .roots
+            .is_empty(),
+        "the exact parent root must already be released before cleanup starts"
+    );
+    let interrupted = raw_namespace_metadata_from_store(&store, &target).await;
+    assert_eq!(interrupted.state, NamespaceState::Creating);
+    assert!(interrupted.deletion_intent.is_some());
+
+    let retried = delete_namespace_for_test(
+        store.clone(),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .expect("authorized retry must resume after the root-release crash boundary");
+    let target_keys = store
+        .list_prefix(&format!("{target}/"))
+        .await
+        .expect("retried target prefix must be listable");
+    harness.cleanup().await;
+
+    assert_eq!(retried, NamespaceDeleteOutcome::Deleted);
+    assert!(target_keys.is_empty());
+}
+
+#[tokio::test]
+async fn never_active_cancellation_retry_survives_parent_history_deletion() {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let source = harness.artifact_origin_namespace("cancel-parent-gone-retry-source");
+    let target = harness.artifact_origin_namespace("cancel-parent-gone-retry-target");
+    NamespaceManager::new(store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("parent-deletion retry fixture source must be created");
+    prepare_never_active_stage(
+        store.clone(),
+        &source,
+        &target,
+        NeverActiveStage::ManifestPublished,
+    )
+    .await;
+
+    let (faulted_store, cleanup_failure) =
+        fail_delete_once_matching(&store, Manifest::history_key(&target, 1));
+    delete_namespace_for_test(
+        faulted_store,
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .expect_err("target-history cleanup fault must interrupt cancellation");
+    assert_eq!(cleanup_failure.failures_injected(), 1);
+    assert!(
+        branch_control_snapshot(&store, &source)
+            .await
+            .expect("parent root map must remain readable after cleanup failure")
+            .roots
+            .is_empty(),
+        "exact parent-root release must precede target-owned cleanup"
+    );
+    let interrupted = raw_namespace_metadata_from_store(&store, &target).await;
+    let evidence_key = interrupted
+        .deletion_intent
+        .as_ref()
+        .map(|intent| intent.destruction_record_key.clone())
+        .expect("interrupted cancellation must retain its durable intent");
+    assert!(
+        store
+            .exists(&evidence_key)
+            .await
+            .expect("immutable cancellation evidence must be observable"),
+        "immutable evidence must precede root release and cleanup"
+    );
+    assert!(
+        store
+            .exists(&Manifest::history_key(&target, 1))
+            .await
+            .expect("faulted target history key must be observable"),
+        "the injected cleanup failure must leave target-owned work to resume"
+    );
+
+    NamespaceManager::new(store.clone())
+        .delete(&source)
+        .await
+        .expect("rootless parent namespace deletion must complete");
+    let source_keys = store
+        .list_prefix(&format!("{source}/"))
+        .await
+        .expect("deleted parent prefix must be listable");
+    assert!(
+        source_keys.is_empty(),
+        "parent metadata, manifest, and immutable history must all be absent before retry"
+    );
+
+    let retried = delete_namespace_for_test(
+        store.clone(),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .expect("authorized retry must rely on durable intent/evidence after parent deletion");
+    let target_keys = store
+        .list_prefix(&format!("{target}/"))
+        .await
+        .expect("retried target prefix must be listable");
+    let evidence_survived = store
+        .exists(&evidence_key)
+        .await
+        .expect("immutable cancellation evidence must remain observable");
+    harness.cleanup().await;
+
+    assert_eq!(retried, NamespaceDeleteOutcome::Deleted);
+    assert!(target_keys.is_empty());
+    assert!(
+        evidence_survived,
+        "parent and target cleanup must not delete immutable cancellation evidence"
+    );
+}
+
+#[tokio::test]
+async fn maintenance_reports_but_never_executes_an_authorized_cancellation_intent() {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let source = harness.artifact_origin_namespace("cancel-maintain-source");
+    let target = harness.artifact_origin_namespace("cancel-maintain-target");
+    NamespaceManager::new(store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("maintenance cancellation fixture source must be created");
+    prepare_never_active_stage(
+        store.clone(),
+        &source,
+        &target,
+        NeverActiveStage::ReservedWithRoot,
+    )
+    .await;
+    let reservation = branch_metadata_snapshot(&store, &target)
+        .await
+        .expect("maintenance cancellation reservation must be readable")
+        .reservation;
+    let evidence_key = format!(
+        "_audit/destruction/{}.json",
+        reservation.target_incarnation.to_string().replace('-', "")
+    );
+    let (faulted_store, evidence_failure) = fail_put_once_matching(&store, evidence_key);
+    let interrupted = delete_namespace_for_test(
+        faulted_store,
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await;
+    assert!(interrupted.is_err());
+    assert_eq!(evidence_failure.failures_injected(), 1);
+    let metadata_before = store
+        .get(&NamespaceMetadata::s3_key(&target))
+        .await
+        .expect("interrupted cancellation metadata must be readable");
+    let roots_before = branch_control_snapshot(&store, &source)
+        .await
+        .expect("interrupted cancellation root must be readable")
+        .roots;
+
+    let report = maintain_branches_for_test(
+        store.clone(),
+        fork_indexing(),
+        fork_limits(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("maintenance must report an authorized cancellation intent");
+    let metadata_after = store
+        .get(&NamespaceMetadata::s3_key(&target))
+        .await
+        .expect("maintenance must retain cancellation metadata");
+    let roots_after = branch_control_snapshot(&store, &source)
+        .await
+        .expect("maintenance must retain the cancellation root")
+        .roots;
+    assert!(report.awaiting_authorized_cancellation >= 1);
+    assert_eq!(metadata_after, metadata_before);
+    assert_eq!(roots_after, roots_before);
+
+    let retried = delete_namespace_for_test(
+        store.clone(),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .expect("fresh authorized retry must finish cancellation");
+    harness.cleanup().await;
+    assert_eq!(retried, NamespaceDeleteOutcome::Deleted);
+}
+
+#[tokio::test]
+async fn maintenance_stale_reserved_read_cannot_advance_a_cancellation_intent() {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    // The target sorts before the source so maintenance's first matching
+    // metadata read is the outer Creating-target snapshot, not source graph
+    // verification reaching through to the child.
+    let source = harness.artifact_origin_namespace("cancel-maintain-race-z-source");
+    let target = harness.artifact_origin_namespace("cancel-maintain-race-a-target");
+    NamespaceManager::new(store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("maintenance race fixture source must be created");
+    prepare_never_active_stage(
+        store.clone(),
+        &source,
+        &target,
+        NeverActiveStage::ReservedWithRoot,
+    )
+    .await;
+    let reservation = branch_metadata_snapshot(&store, &target)
+        .await
+        .expect("maintenance race reservation must be readable")
+        .reservation;
+    let evidence_key = format!(
+        "_audit/destruction/{}.json",
+        reservation.target_incarnation.to_string().replace('-', "")
+    );
+    let (faulted_store, evidence_failure) = fail_put_once_matching(&store, evidence_key);
+    let (race_store, maintenance_stale_read) =
+        pause_first_after_get_matching(&faulted_store, NamespaceMetadata::s3_key(&target));
+    let maintenance_store = race_store.clone();
+    let mut maintenance = tokio::spawn(async move {
+        maintain_branches_for_test(
+            maintenance_store,
+            fork_indexing(),
+            fork_limits(),
+            Duration::from_secs(120),
+        )
+        .await
+    });
+    tokio::select! {
+        () = maintenance_stale_read.wait_until_paused() => {}
+        outcome = &mut maintenance => {
+            harness.cleanup().await;
+            panic!("maintenance returned before its stale target snapshot: {outcome:?}");
+        }
+    }
+
+    let cancellation = delete_namespace_for_test(
+        race_store.clone(),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await;
+    assert!(cancellation.is_err());
+    assert_eq!(evidence_failure.failures_injected(), 1);
+    let metadata_before = store
+        .get(&NamespaceMetadata::s3_key(&target))
+        .await
+        .expect("interrupted cancellation metadata must be readable");
+    let roots_before = branch_control_snapshot(&store, &source)
+        .await
+        .expect("interrupted cancellation root must be readable")
+        .roots;
+
+    maintenance_stale_read.release();
+    let maintenance_result = maintenance
+        .await
+        .expect("maintenance race task must not panic");
+    let metadata_after = store
+        .get(&NamespaceMetadata::s3_key(&target))
+        .await
+        .expect("stale maintenance must retain cancellation metadata");
+    let roots_after = branch_control_snapshot(&store, &source)
+        .await
+        .expect("stale maintenance must retain the exact root")
+        .roots;
+    assert!(
+        matches!(
+        maintenance_result,
+        Err(ZeppelinError::Branch(ref inner))
+            if matches!(inner.as_ref(), BranchError::CancellationInProgress { .. })
+        ),
+        "stale maintenance must stop at the fresh cancellation guard: {maintenance_result:?}"
+    );
+    assert_eq!(metadata_after, metadata_before);
+    assert_eq!(roots_after, roots_before);
+
+    let retried = delete_namespace_for_test(
+        store.clone(),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .expect("fresh authorized retry must complete after stale maintenance exits");
+    harness.cleanup().await;
+    assert_eq!(retried, NamespaceDeleteOutcome::Deleted);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UnavailableParent {
+    Fenced,
+    Absent,
+}
+
+async fn assert_unavailable_parent_cancellation_skips_lease(parent: UnavailableParent) {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let suffix = match parent {
+        UnavailableParent::Fenced => "fenced",
+        UnavailableParent::Absent => "absent",
+    };
+    let source = harness.artifact_origin_namespace(&format!("cancel-{suffix}-parent"));
+    let target = harness.artifact_origin_namespace(&format!("cancel-{suffix}-target"));
+    NamespaceManager::new(store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("unavailable-parent fixture must create its source");
+    prepare_never_active_stage(
+        store.clone(),
+        &source,
+        &target,
+        NeverActiveStage::ReservedNoRoot,
+    )
+    .await;
+
+    match parent {
+        UnavailableParent::Fenced => {
+            publish_deletion_fence(
+                store.clone(),
+                &source,
+                "_audit/destruction/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+            )
+            .await
+            .expect("fixture must fence the exact parent incarnation");
+            assert!(
+                branch_control_snapshot(&store, &source)
+                    .await
+                    .expect("fenced parent manifest must remain readable")
+                    .deletion_fenced
+            );
+        }
+        UnavailableParent::Absent => {
+            NamespaceManager::new(store.clone())
+                .delete(&source)
+                .await
+                .expect("fixture must remove the exact parent incarnation");
+            assert!(Manifest::read(&store, &source)
+                .await
+                .expect("parent manifest absence must be readable")
+                .is_none());
+            assert!(!store
+                .exists(&NamespaceMetadata::s3_key(&source))
+                .await
+                .expect("parent metadata absence must be readable"));
+        }
+    }
+
+    // A live lease record is deliberately left behind after the parent becomes
+    // unable to publish. Authorized cancellation must prove the fenced/absent
+    // parent state and must not try to acquire or rewrite this lease.
+    let lease_manager = LeaseManager::new(
+        store.clone(),
+        format!("unavailable-parent-holder-{suffix}"),
+        Duration::from_secs(30),
+    );
+    let lease = lease_manager
+        .acquire(&source)
+        .await
+        .expect("fixture must hold the parent lease");
+    let lease_key = format!("{source}/lease.json");
+    let lease_before = store
+        .get(&lease_key)
+        .await
+        .expect("held parent lease must be readable");
+
+    let cancelled = delete_namespace_for_test(
+        store.clone(),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await;
+    let lease_after = store
+        .get(&lease_key)
+        .await
+        .expect("cancellation must leave the held parent lease readable");
+    let target_keys = store
+        .list_prefix(&format!("{target}/"))
+        .await
+        .expect("cancelled target prefix must be listable");
+    let evidence = store
+        .list_prefix("_audit/destruction/")
+        .await
+        .expect("cancellation evidence prefix must be listable");
+    lease_manager
+        .release(&source, &lease)
+        .await
+        .expect("fixture must release its unchanged parent lease");
+    harness.cleanup().await;
+
+    assert_eq!(
+        cancelled.expect("fenced/absent-parent cancellation must not require a parent lease"),
+        NamespaceDeleteOutcome::Deleted
+    );
+    assert_eq!(
+        lease_after, lease_before,
+        "cancellation must not acquire, renew, or release the unavailable parent's lease"
+    );
+    assert!(target_keys.is_empty());
+    assert_eq!(
+        evidence.len(),
+        1,
+        "cancellation must leave one immutable destruction record"
+    );
+}
+
+#[tokio::test]
+async fn never_active_cancellation_of_fenced_parent_skips_parent_lease() {
+    assert_unavailable_parent_cancellation_skips_lease(UnavailableParent::Fenced).await;
+}
+
+#[tokio::test]
+async fn never_active_cancellation_of_absent_parent_skips_parent_lease() {
+    assert_unavailable_parent_cancellation_skips_lease(UnavailableParent::Absent).await;
+}
+
+#[tokio::test]
+async fn never_active_cancellation_treats_recreated_parent_as_exact_parent_absence() {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let source = harness.artifact_origin_namespace("cancel-recreated-parent");
+    let target = harness.artifact_origin_namespace("cancel-recreated-target");
+    let manager = NamespaceManager::new(store.clone());
+    let original = manager
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("recreated-parent fixture must create its original source");
+    prepare_never_active_stage(
+        store.clone(),
+        &source,
+        &target,
+        NeverActiveStage::ReservedNoRoot,
+    )
+    .await;
+    manager
+        .delete(&source)
+        .await
+        .expect("fixture must delete the exact original parent");
+    let replacement = manager
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("fixture must recreate the parent name with a new incarnation");
+    assert_ne!(original.incarnation_id, replacement.incarnation_id);
+
+    let lease_manager = LeaseManager::new(
+        store.clone(),
+        "recreated-parent-holder".to_string(),
+        Duration::from_secs(30),
+    );
+    let lease = lease_manager
+        .acquire(&source)
+        .await
+        .expect("fixture must hold the replacement parent's lease");
+    let lease_key = format!("{source}/lease.json");
+    let lease_before = store
+        .get(&lease_key)
+        .await
+        .expect("replacement parent lease must be readable");
+
+    let cancelled = delete_namespace_for_test(
+        store.clone(),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .expect("the absent exact parent must not require the replacement lease");
+    let lease_after = store
+        .get(&lease_key)
+        .await
+        .expect("replacement parent lease must remain readable");
+    let replacement_after = manager
+        .get(&source)
+        .await
+        .expect("replacement parent must remain active");
+    lease_manager
+        .release(&source, &lease)
+        .await
+        .expect("fixture must release the unchanged replacement lease");
+    harness.cleanup().await;
+
+    assert_eq!(cancelled, NamespaceDeleteOutcome::Deleted);
+    assert_eq!(lease_after, lease_before);
+    assert_eq!(replacement_after.incarnation_id, replacement.incarnation_id);
+}
+
+#[tokio::test]
+async fn concurrent_no_lease_cancellation_uses_the_winning_durable_decision() {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let source = harness.artifact_origin_namespace("cancel-no-lease-race-source");
+    let target = harness.artifact_origin_namespace("cancel-no-lease-race-target");
+    NamespaceManager::new(store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("no-lease race fixture source must be created");
+    prepare_never_active_stage(
+        store.clone(),
+        &source,
+        &target,
+        NeverActiveStage::ReservedNoRoot,
+    )
+    .await;
+    let reservation = branch_metadata_snapshot(&store, &target)
+        .await
+        .expect("no-lease race reservation must be readable")
+        .reservation;
+    publish_deletion_fence(
+        store.clone(),
+        &source,
+        "_audit/destruction/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
+    )
+    .await
+    .expect("no-lease race parent must be fenced");
+    let evidence_key = format!(
+        "_audit/destruction/{}.json",
+        reservation.target_incarnation.to_string().replace('-', "")
+    );
+    let (evidence_store, evidence_pause) =
+        pause_first_create_matching(&store, evidence_key.clone());
+    let (race_store, first_intent_pause) =
+        pause_next_cas_matching(&evidence_store, NamespaceMetadata::s3_key(&target));
+    first_intent_pause.arm();
+
+    let first_store = race_store.clone();
+    let first_target = NamespaceId::new(target.clone()).expect("target namespace must be valid");
+    let mut first = tokio::spawn(async move {
+        delete_namespace_for_test(first_store, first_target, fork_indexing(), fork_limits()).await
+    });
+    tokio::select! {
+        () = first_intent_pause.wait_until_paused() => {}
+        outcome = &mut first => {
+            harness.cleanup().await;
+            panic!("first cancellation returned before its intent CAS pause: {outcome:?}");
+        }
+    }
+
+    let second_store = race_store.clone();
+    let second_target = NamespaceId::new(target.clone()).expect("target namespace must be valid");
+    let mut second = tokio::spawn(async move {
+        delete_namespace_for_test(second_store, second_target, fork_indexing(), fork_limits()).await
+    });
+    tokio::select! {
+        () = evidence_pause.wait_until_paused() => {}
+        outcome = &mut second => {
+            first_intent_pause.release();
+            let _ = first.await;
+            harness.cleanup().await;
+            panic!("second cancellation returned before its evidence pause: {outcome:?}");
+        }
+    }
+    let winning_metadata = raw_namespace_metadata_from_store(&race_store, &target).await;
+    let winning_decision_ref = winning_metadata
+        .deletion_intent
+        .as_ref()
+        .expect("winning cancellation intent must be durable")
+        .decision_evidence_ref
+        .clone();
+
+    first_intent_pause.release();
+    let first_outcome = first.await.expect("first cancellation task must not panic");
+    evidence_pause.release();
+    let second_outcome = second
+        .await
+        .expect("second cancellation task must not panic");
+    let evidence: serde_json::Value = serde_json::from_slice(
+        &store
+            .get(&evidence_key)
+            .await
+            .expect("one canonical cancellation evidence object must survive"),
+    )
+    .expect("cancellation evidence must be valid JSON");
+    let decision: serde_json::Value = serde_json::from_slice(
+        &store
+            .get(&winning_decision_ref)
+            .await
+            .expect("the winning durable decision evidence must survive"),
+    )
+    .expect("decision evidence must be valid JSON");
+    let target_keys = store
+        .list_prefix(&format!("{target}/"))
+        .await
+        .expect("concurrent cancellation target prefix must be listable");
+    harness.cleanup().await;
+
+    assert!(
+        matches!(first_outcome, Ok(NamespaceDeleteOutcome::Deleted))
+            || matches!(second_outcome, Ok(NamespaceDeleteOutcome::Deleted)),
+        "one authorized cancellation must complete"
+    );
+    assert_eq!(
+        evidence.get("decision_id"),
+        decision
+            .get("decision")
+            .and_then(|value| value.get("decision_id")),
+        "destruction evidence must bind the decision that won the durable target intent"
+    );
+    assert!(target_keys.is_empty());
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AmbiguousParent {
+    ManifestWithoutMetadata,
+    MetadataWithoutManifest,
+}
+
+async fn assert_ambiguous_parent_fails_closed(parent: AmbiguousParent) {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let suffix = match parent {
+        AmbiguousParent::ManifestWithoutMetadata => "manifest-without-meta",
+        AmbiguousParent::MetadataWithoutManifest => "meta-without-manifest",
+    };
+    let source = harness.artifact_origin_namespace(&format!("cancel-{suffix}-source"));
+    let target = harness.artifact_origin_namespace(&format!("cancel-{suffix}-target"));
+    NamespaceManager::new(store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("ambiguous-parent fixture source must be created");
+    prepare_never_active_stage(
+        store.clone(),
+        &source,
+        &target,
+        NeverActiveStage::ReservedNoRoot,
+    )
+    .await;
+    match parent {
+        AmbiguousParent::ManifestWithoutMetadata => store
+            .delete(&NamespaceMetadata::s3_key(&source))
+            .await
+            .expect("fixture must remove only parent metadata"),
+        AmbiguousParent::MetadataWithoutManifest => store
+            .delete(&Manifest::s3_key(&source))
+            .await
+            .expect("fixture must remove only parent manifest"),
+    }
+    let target_before = store
+        .get(&NamespaceMetadata::s3_key(&target))
+        .await
+        .expect("ambiguous-parent target metadata must be readable");
+
+    let cancellation = delete_namespace_for_test(
+        store.clone(),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await;
+    let target_after = store
+        .get(&NamespaceMetadata::s3_key(&target))
+        .await
+        .expect("failed cancellation must retain target metadata");
+    let evidence = store
+        .list_prefix("_audit/destruction/")
+        .await
+        .expect("ambiguous-parent evidence prefix must be listable");
+    harness.cleanup().await;
+
+    assert!(matches!(cancellation, Err(ZeppelinError::Validation(_))));
+    assert_eq!(target_after, target_before);
+    assert!(evidence.is_empty());
+}
+
+#[tokio::test]
+async fn never_active_cancellation_rejects_parent_manifest_without_metadata() {
+    assert_ambiguous_parent_fails_closed(AmbiguousParent::ManifestWithoutMetadata).await;
+}
+
+#[tokio::test]
+async fn never_active_cancellation_rejects_parent_metadata_without_manifest() {
+    assert_ambiguous_parent_fails_closed(AmbiguousParent::MetadataWithoutManifest).await;
+}
+
+#[tokio::test]
+async fn never_active_cancellation_loses_when_publisher_holds_parent_lease() {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let source = harness.artifact_origin_namespace("cancel-publisher-first-source");
+    let target = harness.artifact_origin_namespace("cancel-publisher-first-target");
+    NamespaceManager::new(store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("publisher-first fixture source must be created");
+    prepare_never_active_stage(
+        store.clone(),
+        &source,
+        &target,
+        NeverActiveStage::ReservedNoRoot,
+    )
+    .await;
+    let reservation = branch_metadata_snapshot(&store, &target)
+        .await
+        .expect("publisher-first reservation must be readable")
+        .reservation;
+
+    let (paused_store, root_publication) =
+        pause_next_cas_matching(&store, Manifest::s3_key(&source));
+    root_publication.arm();
+    let publisher_store = paused_store.clone();
+    let publisher_source =
+        NamespaceId::new(source.clone()).expect("source namespace must be valid");
+    let publisher_target =
+        NamespaceId::new(target.clone()).expect("target namespace must be valid");
+    let mut publisher = tokio::spawn(async move {
+        prepare_fork_for_test(
+            publisher_store,
+            publisher_source,
+            publisher_target,
+            fork_indexing(),
+            fork_limits(),
+        )
+        .await
+    });
+    tokio::select! {
+        () = root_publication.wait_until_paused() => {}
+        outcome = &mut publisher => {
+            harness.cleanup().await;
+            panic!("publisher returned before its deterministic root boundary: {outcome:?}");
+        }
+    }
+
+    let cancellation = delete_namespace_for_test(
+        paused_store.clone(),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await;
+    let reservation_intact = branch_metadata_snapshot(&paused_store, &target)
+        .await
+        .expect("losing cancellation must retain the reservation")
+        .reservation
+        == reservation;
+    let root_absent_while_paused = branch_control_snapshot(&paused_store, &source)
+        .await
+        .expect("publisher-first parent root map must be readable")
+        .roots
+        .is_empty();
+    root_publication.release();
+    publisher
+        .await
+        .expect("publisher task must not panic")
+        .expect("lease-owning publisher must finish preparation");
+    let final_target = branch_metadata_snapshot(&store, &target)
+        .await
+        .expect("winning publication must leave prepared metadata");
+    let final_roots = branch_control_snapshot(&store, &source)
+        .await
+        .expect("winning publication root must be readable")
+        .roots;
+    harness.cleanup().await;
+
+    assert!(matches!(
+        cancellation,
+        Err(ZeppelinError::LeaseHeld { ref namespace, .. }) if namespace == &source
+    ));
+    assert!(reservation_intact);
+    assert!(root_absent_while_paused);
+    assert_eq!(
+        final_target.prepare_stage,
+        Some(BranchPrepareStage::ManifestPublished)
+    );
+    assert_eq!(final_roots.len(), 1);
+    assert_eq!(final_roots[0].branch_id, reservation.branch_id);
+    assert_eq!(final_roots[0].target_namespace.as_str(), target);
+}
+
+#[tokio::test]
+async fn never_active_cancellation_wins_when_canceller_holds_parent_lease() {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let source = harness.artifact_origin_namespace("cancel-canceller-first-source");
+    let target = harness.artifact_origin_namespace("cancel-canceller-first-target");
+    NamespaceManager::new(store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("canceller-first fixture source must be created");
+    prepare_never_active_stage(
+        store.clone(),
+        &source,
+        &target,
+        NeverActiveStage::ReservedWithRoot,
+    )
+    .await;
+
+    let (paused_store, cancellation_intent) =
+        pause_next_cas_matching(&store, NamespaceMetadata::s3_key(&target));
+    cancellation_intent.arm();
+    let cancel_store = paused_store.clone();
+    let cancel_target = NamespaceId::new(target.clone()).expect("target namespace must be valid");
+    let mut cancellation = tokio::spawn(async move {
+        delete_namespace_for_test(cancel_store, cancel_target, fork_indexing(), fork_limits()).await
+    });
+    tokio::select! {
+        () = cancellation_intent.wait_until_paused() => {}
+        outcome = &mut cancellation => {
+            let outcome = outcome.expect("cancellation task must not panic");
+            harness.cleanup().await;
+            panic!(
+                "cancellation returned before its target-intent CAS under the parent lease: {outcome:?}"
+            );
+        }
+    }
+
+    let publication = prepare_fork_for_test(
+        paused_store.clone(),
+        NamespaceId::new(source.clone()).expect("source namespace must be valid"),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await;
+    let root_retained_while_intent_paused = branch_control_snapshot(&paused_store, &source)
+        .await
+        .expect("canceller-first parent root must remain readable")
+        .roots
+        .len()
+        == 1;
+    cancellation_intent.release();
+    let cancelled = cancellation
+        .await
+        .expect("cancellation task must not panic after intent release");
+    let final_roots = branch_control_snapshot(&store, &source)
+        .await
+        .expect("post-cancellation parent must remain readable")
+        .roots;
+    let target_keys = store
+        .list_prefix(&format!("{target}/"))
+        .await
+        .expect("post-cancellation target prefix must be listable");
+    let evidence = store
+        .list_prefix("_audit/destruction/")
+        .await
+        .expect("post-cancellation evidence prefix must be listable");
+    harness.cleanup().await;
+
+    assert!(matches!(
+        publication,
+        Err(ZeppelinError::LeaseHeld { ref namespace, .. }) if namespace == &source
+    ));
+    assert!(root_retained_while_intent_paused);
+    assert_eq!(
+        cancelled.expect("lease-owning cancellation must finish"),
+        NamespaceDeleteOutcome::Deleted
+    );
+    assert!(
+        final_roots.is_empty(),
+        "winning cancellation must remove the exact root"
+    );
+    assert!(
+        target_keys.is_empty(),
+        "winning cancellation must remove its reservation"
+    );
+    assert_eq!(evidence.len(), 1);
 }

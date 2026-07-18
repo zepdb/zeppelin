@@ -86,7 +86,7 @@ use crate::index::quantization::QuantizationType;
 use crate::security::{
     DecisionId, PreservationHeadProof, PreservationService, PrincipalId, SecurityError,
 };
-use crate::storage::{ObjectUserMetadata, ZeppelinStore};
+use crate::storage::{DeletePrefixOutcome, ObjectUserMetadata, ZeppelinStore};
 use crate::time::Clock;
 use crate::types::{DistanceMetric, IndexType};
 use crate::wal::LeaseManager;
@@ -583,6 +583,24 @@ impl NamespaceMetadata {
 
                 match self.state {
                     NamespaceState::Creating => {
+                        if let Some(intent) = self.deletion_intent.as_ref() {
+                            if intent.incarnation != reservation.target_incarnation {
+                                return Err(BranchError::IntentMismatch {
+                                    target: reservation.target_namespace.clone(),
+                                }
+                                .into());
+                            }
+                            if intent.fenced_generation.is_some()
+                                || intent.visibility.is_some()
+                                || intent.root_release.is_some()
+                                || self.destruction_record_key.is_some()
+                            {
+                                return Err(ZeppelinError::Serialization(format!(
+                                    "creating fork {} carries active-deletion state",
+                                    self.name
+                                )));
+                            }
+                        }
                         let prepare = self.branch_prepare.as_ref().ok_or_else(|| {
                             ZeppelinError::Serialization(format!(
                                 "creating fork {} has no preparation intent",
@@ -1325,6 +1343,12 @@ impl NamespaceManager {
                 }
                 NamespaceState::Deleting => return Ok(meta),
                 NamespaceState::Creating => {}
+            }
+
+            if meta.deletion_intent.is_some() {
+                return Err(ZeppelinError::NamespaceDeleting {
+                    namespace: name.to_string(),
+                });
             }
 
             match (&meta.creation_kind, expected_branch_identity) {
@@ -2831,6 +2855,33 @@ impl NamespaceManager {
         self.remove_metadata_after_cleanup(name).await
     }
 
+    /// Delete one bounded batch of a cancelled, never-active fork while
+    /// retaining its exact creating metadata as the recovery handle.
+    pub(crate) async fn cleanup_creating_cancellation_batch(
+        &self,
+        name: &str,
+        expected_intent: &NamespaceDeletionIntent,
+        budget: Duration,
+    ) -> Result<DeletePrefixOutcome> {
+        let meta = self.read_metadata_from_s3(name).await?;
+        self.require_creating_cancellation_cleanup_ready(name, &meta, expected_intent)
+            .await?;
+        self.delete_cleanup_batch(name, budget).await
+    }
+
+    /// Remove a cancelled fork's creating metadata only after every other
+    /// target-owned object is authoritatively absent.
+    pub(crate) async fn remove_creating_cancellation_metadata(
+        &self,
+        name: &str,
+        expected_intent: &NamespaceDeletionIntent,
+    ) -> Result<()> {
+        let meta = self.read_metadata_from_s3(name).await?;
+        self.require_creating_cancellation_cleanup_ready(name, &meta, expected_intent)
+            .await?;
+        self.remove_metadata_after_cleanup(name).await
+    }
+
     async fn delete_cleanup_batch(
         &self,
         name: &str,
@@ -2854,9 +2905,64 @@ impl NamespaceManager {
         }
         match self.store.delete(&meta_key).await {
             Ok(()) | Err(ZeppelinError::NotFound { .. }) => {}
-            Err(error) => return Err(error),
+            Err(delete_error) => match self.read_metadata_from_s3(name).await {
+                Err(ZeppelinError::NamespaceNotFound { .. }) => {}
+                Ok(_) => return Err(delete_error),
+                Err(read_error) => return Err(read_error),
+            },
         }
         self.registry.remove(name);
+        Ok(())
+    }
+
+    async fn require_creating_cancellation_cleanup_ready(
+        &self,
+        name: &str,
+        meta: &NamespaceMetadata,
+        expected_intent: &NamespaceDeletionIntent,
+    ) -> Result<()> {
+        let NamespaceCreationKind::Fork(reservation) = &meta.creation_kind else {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} cancellation cleanup requires a creating fork"
+            )));
+        };
+        if meta.state != NamespaceState::Creating
+            || meta.deletion_intent.as_ref() != Some(expected_intent)
+            || meta.incarnation_id.as_ref() != Some(&reservation.target_incarnation)
+            || expected_intent.incarnation != reservation.target_incarnation
+            || expected_intent.fenced_generation.is_some()
+            || expected_intent.visibility.is_some()
+            || expected_intent.root_release.is_some()
+            || meta.destruction_record_key.is_some()
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} cancellation cleanup identity changed"
+            )));
+        }
+        if crate::wal::Manifest::read(&self.store, name)
+            .await?
+            .is_some()
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} cancellation cleanup requires manifest removal"
+            )));
+        }
+
+        let evidence = NamespaceDestructionRecord::from_bytes(
+            &self
+                .store
+                .get(&expected_intent.destruction_record_key)
+                .await?,
+        )?;
+        let namespace = NamespaceId::new(name.to_string())?;
+        if evidence.namespace != namespace
+            || evidence.incarnation.as_ref() != Some(&expected_intent.incarnation)
+            || evidence.parent_root != expected_intent.parent_root
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} cancellation evidence does not match its durable intent"
+            )));
+        }
         Ok(())
     }
 

@@ -75,6 +75,13 @@ pub enum BranchError {
         target: NamespaceId,
     },
 
+    /// A governed cancellation intent won before the target became active.
+    #[error("creating branch target {target} is being cancelled")]
+    CancellationInProgress {
+        /// Never-active target protected from further publication.
+        target: NamespaceId,
+    },
+
     /// Authorization would make the target less restrictive than its source.
     #[error("branch security policy would widen source access")]
     SecurityWouldWiden,

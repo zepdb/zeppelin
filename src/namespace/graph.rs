@@ -46,6 +46,7 @@ use crate::wal::manifest::{BranchLineageSeed, PreparedManifestPublication, Prepa
 use crate::wal::{Lease, LeaseManager, Manifest};
 
 const MAX_PREPARE_ATTEMPTS: usize = 16;
+const NEVER_ACTIVE_CLEANUP_BUDGET: Duration = Duration::from_secs(25);
 
 /// Deep lifecycle boundary for namespace graph mutations and repair.
 pub(crate) struct NamespaceGraph {
@@ -83,6 +84,11 @@ enum RootedProgress {
 enum ParentRootObservation {
     Present,
     Absent,
+}
+
+enum CancellationParentObservation {
+    Live { root: Option<BranchRoot> },
+    PublicationImpossible,
 }
 
 impl NamespaceGraph {
@@ -138,6 +144,11 @@ impl NamespaceGraph {
         let (metadata, _) = self.namespace_manager.read_metadata_versioned(name).await?;
         if metadata.state == NamespaceState::Deleting {
             return Ok(Self::deletion_in_progress_outcome(&metadata));
+        }
+        if metadata.state == NamespaceState::Creating {
+            return self
+                .cancel_never_active_fork(&namespace, metadata, requested_decision, governance)
+                .await;
         }
         if metadata.state != NamespaceState::Active {
             return Err(ZeppelinError::Validation(format!(
@@ -197,6 +208,1013 @@ impl NamespaceGraph {
             );
         }
         result
+    }
+
+    async fn cancel_never_active_fork(
+        &self,
+        namespace: &NamespaceId,
+        initial: NamespaceMetadata,
+        requested_decision: DeletionDecision,
+        governance: Arc<dyn DeletionGovernance>,
+    ) -> Result<NamespaceDeleteOutcome> {
+        let reservation = Self::cancellation_reservation(namespace, &initial)?.clone();
+        Self::require_preparation_open_or_cancelling(namespace, &initial)?;
+        self.require_unlocked_boundary(
+            governance.as_ref(),
+            namespace,
+            DeletionBoundary::CancellationIntent,
+        )
+        .await?;
+
+        let decision = match initial.deletion_intent.as_ref() {
+            Some(intent) => {
+                load_deletion_decision_evidence(&self.store, &intent.decision_evidence_ref).await?
+            }
+            None => {
+                persist_deletion_decision_evidence(&self.store, &requested_decision)
+                    .await
+                    .map_err(Self::map_audit_evidence_error)?;
+                requested_decision
+            }
+        };
+
+        for _ in 0..MAX_PREPARE_ATTEMPTS {
+            match self.observe_cancellation_parent(&reservation).await? {
+                CancellationParentObservation::PublicationImpossible => {
+                    return self
+                        .cancel_never_active_with_parent_proof(
+                            namespace,
+                            &reservation,
+                            &decision,
+                            governance,
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                CancellationParentObservation::Live { .. } => {}
+            }
+
+            let source = reservation.source_namespace.as_str();
+            let lease = self.lease_manager.acquire(source).await?;
+            let result = match self.observe_cancellation_parent(&reservation).await? {
+                CancellationParentObservation::Live { root } => {
+                    self.cancel_never_active_with_parent_proof(
+                        namespace,
+                        &reservation,
+                        &decision,
+                        Arc::clone(&governance),
+                        Some(root),
+                        Some(&lease),
+                    )
+                    .await
+                }
+                CancellationParentObservation::PublicationImpossible => {
+                    Err(BranchError::SourceDeleting {
+                        namespace: reservation.source_namespace.clone(),
+                    }
+                    .into())
+                }
+            };
+            if let Err(error) = self.lease_manager.release(source, &lease).await {
+                warn!(
+                    namespace = source,
+                    error = %error,
+                    "never-active cancellation lease release failed (best-effort)"
+                );
+            }
+            match result {
+                Err(ZeppelinError::Branch(error))
+                    if matches!(error.as_ref(), BranchError::SourceDeleting { .. }) =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
+
+        Err(ZeppelinError::ManifestConflict {
+            namespace: reservation.source_namespace.to_string(),
+        })
+    }
+
+    async fn cancel_never_active_with_parent_proof(
+        &self,
+        namespace: &NamespaceId,
+        reservation: &ForkReservationIdentity,
+        decision: &DeletionDecision,
+        governance: Arc<dyn DeletionGovernance>,
+        observed_root: Option<Option<BranchRoot>>,
+        parent_lease: Option<&Lease>,
+    ) -> Result<NamespaceDeleteOutcome> {
+        let (metadata, target_etag) = self
+            .namespace_manager
+            .read_creating_intent_strong(namespace.as_str())
+            .await?;
+        if metadata.creation_kind != NamespaceCreationKind::Fork(reservation.clone()) {
+            return Err(BranchError::IntentMismatch {
+                target: namespace.clone(),
+            }
+            .into());
+        }
+        let current_root = observed_root.unwrap_or_default();
+        let target_manifest_version = self
+            .validate_never_active_cancellation_state(
+                namespace,
+                &metadata,
+                reservation,
+                current_root.as_ref(),
+            )
+            .await?;
+
+        let metadata = self
+            .install_never_active_cancellation_intent(
+                namespace,
+                metadata,
+                &target_etag,
+                current_root.as_ref(),
+                decision,
+            )
+            .await?;
+        let intent = metadata.deletion_intent.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "never-active target {namespace} did not retain its cancellation intent"
+            ))
+        })?;
+        let bound_decision =
+            load_deletion_decision_evidence(&self.store, &intent.decision_evidence_ref).await?;
+        self.validate_cancellation_root_observation(namespace, intent, current_root.as_ref())
+            .await?;
+
+        let preservation_head = self
+            .require_unlocked_boundary(
+                governance.as_ref(),
+                namespace,
+                DeletionBoundary::CancellationIntent,
+            )
+            .await?;
+        let evidence = self
+            .ensure_cancellation_evidence(
+                namespace,
+                &metadata,
+                intent,
+                &bound_decision,
+                target_manifest_version,
+                preservation_head,
+            )
+            .await
+            .map_err(Self::map_audit_evidence_error)?;
+
+        self.remove_never_active_target_manifest(
+            namespace,
+            reservation,
+            intent,
+            &evidence,
+            governance.as_ref(),
+        )
+        .await?;
+        self.release_never_active_parent_root(
+            reservation,
+            intent,
+            &metadata,
+            &bound_decision,
+            governance.as_ref(),
+            parent_lease,
+        )
+        .await?;
+
+        self.finish_never_active_cancellation(namespace, reservation, intent, governance.as_ref())
+            .await
+    }
+
+    fn cancellation_reservation<'a>(
+        namespace: &NamespaceId,
+        metadata: &'a NamespaceMetadata,
+    ) -> Result<&'a ForkReservationIdentity> {
+        if metadata.state != NamespaceState::Creating {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {namespace} is not never-active"
+            )));
+        }
+        match &metadata.creation_kind {
+            NamespaceCreationKind::Fork(reservation)
+                if reservation.target_namespace == *namespace
+                    && metadata.incarnation_id.as_ref()
+                        == Some(&reservation.target_incarnation) =>
+            {
+                Ok(reservation)
+            }
+            NamespaceCreationKind::Fork(_) => Err(BranchError::IntentMismatch {
+                target: namespace.clone(),
+            }
+            .into()),
+            NamespaceCreationKind::Root => Err(ZeppelinError::Validation(format!(
+                "creating root namespace {namespace} cannot use fork cancellation"
+            ))),
+        }
+    }
+
+    fn require_preparation_open_or_cancelling(
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+    ) -> Result<()> {
+        let reservation = Self::cancellation_reservation(namespace, metadata)?;
+        let prepare = metadata.branch_prepare.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "creating fork {namespace} has no preparation milestone"
+            ))
+        })?;
+        if prepare.branch_id != reservation.branch_id
+            || prepare.target_incarnation != reservation.target_incarnation
+        {
+            return Err(BranchError::IntentMismatch {
+                target: namespace.clone(),
+            }
+            .into());
+        }
+        if let Some(intent) = metadata.deletion_intent.as_ref() {
+            if intent.incarnation != reservation.target_incarnation
+                || intent.fenced_generation.is_some()
+                || intent.visibility.is_some()
+                || intent.root_release.is_some()
+            {
+                return Err(ZeppelinError::Validation(format!(
+                    "never-active target {namespace} has an invalid cancellation intent"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn require_preparation_not_cancelled(metadata: &NamespaceMetadata) -> Result<()> {
+        if metadata.deletion_intent.is_none() {
+            return Ok(());
+        }
+        let target = NamespaceId::parse(metadata.name.clone()).map_err(|_| {
+            ZeppelinError::Validation(format!(
+                "invalid creating branch target name: {}",
+                metadata.name
+            ))
+        })?;
+        Err(BranchError::CancellationInProgress { target }.into())
+    }
+
+    async fn observe_cancellation_parent(
+        &self,
+        reservation: &ForkReservationIdentity,
+    ) -> Result<CancellationParentObservation> {
+        let source = reservation.source_namespace.as_str();
+        let metadata = self.namespace_manager.read_metadata_versioned(source).await;
+        let manifest = Manifest::read_versioned(&self.store, source).await?;
+
+        match (metadata, manifest) {
+            (Err(ZeppelinError::NamespaceNotFound { .. }), None) => {
+                Ok(CancellationParentObservation::PublicationImpossible)
+            }
+            (Err(ZeppelinError::NamespaceNotFound { .. }), Some(_)) => {
+                Err(ZeppelinError::Validation(format!(
+                    "branch parent {source} has a live manifest without metadata"
+                )))
+            }
+            (Err(error), _) => Err(error),
+            (Ok((metadata, _)), manifest) => {
+                if metadata.incarnation_id.as_ref() != Some(&reservation.source_incarnation) {
+                    let current_incarnation =
+                        metadata.incarnation_id.as_ref().ok_or_else(|| {
+                            ZeppelinError::Serialization(format!(
+                                "branch parent {source} omitted its current incarnation"
+                            ))
+                        })?;
+                    return match manifest {
+                        Some((manifest, _))
+                            if manifest.namespace_incarnation()
+                                == Some(current_incarnation.as_uuid())
+                                && !manifest
+                                    .branch_roots()
+                                    .contains_key(&reservation.branch_id) =>
+                        {
+                            Ok(CancellationParentObservation::PublicationImpossible)
+                        }
+                        None if matches!(
+                            metadata.state,
+                            NamespaceState::Creating | NamespaceState::Deleting
+                        ) =>
+                        {
+                            Ok(CancellationParentObservation::PublicationImpossible)
+                        }
+                        _ => Err(BranchError::SourceIncarnationChanged {
+                            namespace: reservation.source_namespace.clone(),
+                        }
+                        .into()),
+                    };
+                }
+                let Some((manifest, version)) = manifest else {
+                    return match metadata.state {
+                        NamespaceState::Deleting => {
+                            Ok(CancellationParentObservation::PublicationImpossible)
+                        }
+                        NamespaceState::Creating | NamespaceState::Active => {
+                            Err(ZeppelinError::Validation(format!(
+                                "branch parent {source} metadata has no live manifest"
+                            )))
+                        }
+                    };
+                };
+                if manifest.namespace_incarnation()
+                    != Some(reservation.source_incarnation.as_uuid())
+                {
+                    return Err(BranchError::SourceIncarnationChanged {
+                        namespace: reservation.source_namespace.clone(),
+                    }
+                    .into());
+                }
+                let root = manifest.branch_roots().get(&reservation.branch_id).cloned();
+                if let Some(root) = root.as_ref() {
+                    Self::validate_reservation_root(reservation, root)?;
+                }
+                if version.is_deletion_fenced() {
+                    if root.is_some() {
+                        return Err(BranchError::NamespaceHasLiveBranches {
+                            namespace: source.to_string(),
+                        }
+                        .into());
+                    }
+                    return Ok(CancellationParentObservation::PublicationImpossible);
+                }
+                match metadata.state {
+                    NamespaceState::Active => Ok(CancellationParentObservation::Live { root }),
+                    NamespaceState::Deleting => Err(ZeppelinError::Validation(format!(
+                        "deleting branch parent {source} has an unfenced live manifest"
+                    ))),
+                    NamespaceState::Creating => Err(ZeppelinError::Validation(format!(
+                        "branch parent {source} regressed to creating"
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn validate_reservation_root(
+        reservation: &ForkReservationIdentity,
+        root: &BranchRoot,
+    ) -> Result<()> {
+        if root.branch_id != reservation.branch_id
+            || root.target_namespace != reservation.target_namespace
+            || root.target_incarnation != reservation.target_incarnation
+            || root.created_at != reservation.created_at
+        {
+            return Err(BranchError::BranchRootMismatch {
+                branch_id: reservation.branch_id,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn install_never_active_cancellation_intent(
+        &self,
+        namespace: &NamespaceId,
+        mut metadata: NamespaceMetadata,
+        target_etag: &str,
+        observed_root: Option<&BranchRoot>,
+        decision: &DeletionDecision,
+    ) -> Result<NamespaceMetadata> {
+        if let Some(intent) = metadata.deletion_intent.as_ref() {
+            self.validate_existing_cancellation_intent(namespace, &metadata, intent, observed_root)
+                .await?;
+            return Ok(metadata);
+        }
+        let incarnation = metadata.incarnation_id.clone().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "never-active target {namespace} omitted its incarnation"
+            ))
+        })?;
+        metadata.deletion_intent = Some(NamespaceDeletionIntent {
+            incarnation: incarnation.clone(),
+            destruction_record_key: format!(
+                "_audit/destruction/{}.json",
+                incarnation.as_uuid().simple()
+            ),
+            decision_evidence_ref: decision.decision_evidence_ref.clone(),
+            parent_root: observed_root.cloned(),
+            fenced_generation: None,
+            visibility: None,
+            root_release: None,
+        });
+        metadata.updated_at = self.clock.now();
+        match self
+            .namespace_manager
+            .cas_update_creating_intent(&metadata, target_etag)
+            .await
+        {
+            Ok(_) => Ok(metadata),
+            Err(ZeppelinError::ManifestConflict { .. }) => {
+                let (latest, _) = self
+                    .namespace_manager
+                    .read_creating_intent_strong(namespace.as_str())
+                    .await?;
+                let intent = latest.deletion_intent.as_ref().ok_or_else(|| {
+                    ZeppelinError::ManifestConflict {
+                        namespace: namespace.to_string(),
+                    }
+                })?;
+                self.validate_existing_cancellation_intent(
+                    namespace,
+                    &latest,
+                    intent,
+                    observed_root,
+                )
+                .await?;
+                Ok(latest)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn validate_existing_cancellation_intent(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        intent: &NamespaceDeletionIntent,
+        observed_root: Option<&BranchRoot>,
+    ) -> Result<()> {
+        Self::require_preparation_open_or_cancelling(namespace, metadata)?;
+        if metadata.incarnation_id.as_ref() != Some(&intent.incarnation)
+            || intent.fenced_generation.is_some()
+            || intent.visibility.is_some()
+            || intent.root_release.is_some()
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "never-active target {namespace} has a malformed cancellation intent"
+            )));
+        }
+        if let Some(root) = observed_root {
+            if intent.parent_root.as_ref() != Some(root) {
+                return Err(BranchError::BranchRootMismatch {
+                    branch_id: root.branch_id,
+                }
+                .into());
+            }
+        } else if intent.parent_root.is_some() {
+            match self.store.get(&intent.destruction_record_key).await {
+                Ok(_) => {}
+                Err(ZeppelinError::NotFound { .. }) => {
+                    return Err(ZeppelinError::Validation(format!(
+                        "never-active target {namespace} lost its parent root before cancellation evidence"
+                    )))
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_never_active_cancellation_state(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        reservation: &ForkReservationIdentity,
+        observed_root: Option<&BranchRoot>,
+    ) -> Result<u64> {
+        Self::require_preparation_open_or_cancelling(namespace, metadata)?;
+        let prepare = metadata.branch_prepare.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "creating fork {namespace} has no preparation milestone"
+            ))
+        })?;
+        if let Some(root) = observed_root {
+            Self::validate_reservation_root(reservation, root)?;
+        }
+        let retained_root = if let Some(root) = observed_root {
+            Some(root.clone())
+        } else if let Some(intent) = metadata.deletion_intent.as_ref() {
+            match intent.parent_root.as_ref() {
+                Some(root) => match self.store.get(&intent.destruction_record_key).await {
+                    Ok(_) => Some(root.clone()),
+                    Err(ZeppelinError::NotFound { .. }) => {
+                        return Err(ZeppelinError::Validation(format!(
+                            "never-active target {namespace} lost its parent root before immutable evidence"
+                        )))
+                    }
+                    Err(error) => return Err(error),
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let target_manifest = Manifest::read_versioned(&self.store, namespace.as_str()).await?;
+        if target_manifest.is_none() {
+            if let Some(intent) = metadata.deletion_intent.as_ref() {
+                match self.store.get(&intent.destruction_record_key).await {
+                    Ok(bytes) => {
+                        let evidence = NamespaceDestructionRecord::from_bytes(&bytes)?;
+                        let decision = load_deletion_decision_evidence(
+                            &self.store,
+                            &intent.decision_evidence_ref,
+                        )
+                        .await?;
+                        self.validate_cancellation_evidence(
+                            namespace, metadata, intent, &decision, &evidence, 0,
+                        )?;
+                        self.validate_post_evidence_cancellation_shape(
+                            namespace,
+                            metadata,
+                            reservation,
+                            retained_root.as_ref(),
+                        )?;
+                        return Ok(0);
+                    }
+                    Err(ZeppelinError::NotFound { .. }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        let candidate = match prepare.stage {
+            BranchPrepareStage::Reserved => {
+                if metadata.branch_identity.is_some() {
+                    return Err(BranchError::IntentMismatch {
+                        target: namespace.clone(),
+                    }
+                    .into());
+                }
+                match retained_root.as_ref() {
+                    Some(root) => Some(self.rebuild_candidate_from_root(metadata, root).await?),
+                    None => None,
+                }
+            }
+            BranchPrepareStage::Rooted | BranchPrepareStage::ManifestPublished => {
+                let root = retained_root
+                    .as_ref()
+                    .ok_or(BranchError::BranchRootMissing {
+                        branch_id: reservation.branch_id,
+                    })?;
+                let candidate = self.rebuild_candidate_from_root(metadata, root).await?;
+                if metadata.branch_identity.as_ref() != Some(&candidate.branch.identity) {
+                    return Err(BranchError::IntentMismatch {
+                        target: namespace.clone(),
+                    }
+                    .into());
+                }
+                Some(candidate)
+            }
+        };
+
+        match target_manifest {
+            Some((manifest, _)) => {
+                let candidate = candidate.as_ref().ok_or_else(|| {
+                    ZeppelinError::Validation(format!(
+                        "reserved target {namespace} published a manifest before rooting"
+                    ))
+                })?;
+                if manifest.version() != 1
+                    || manifest.namespace_incarnation()
+                        != Some(reservation.target_incarnation.as_uuid())
+                    || !manifest.branch_roots().is_empty()
+                    || self
+                        .store
+                        .get(&Manifest::s3_key(namespace.as_str()))
+                        .await?
+                        != *candidate.publication.exact_bytes()
+                {
+                    return Err(BranchError::ManifestDigestMismatch {
+                        generation: ManifestGeneration::new(1)?,
+                    }
+                    .into());
+                }
+                Ok(1)
+            }
+            None if prepare.stage == BranchPrepareStage::ManifestPublished => {
+                Err(ZeppelinError::Validation(format!(
+                    "manifest-published target {namespace} has no live manifest or immutable cancellation evidence"
+                )))
+            }
+            None => Ok(0),
+        }
+    }
+
+    fn validate_post_evidence_cancellation_shape(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        reservation: &ForkReservationIdentity,
+        retained_root: Option<&BranchRoot>,
+    ) -> Result<()> {
+        let prepare = metadata.branch_prepare.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "creating fork {namespace} has no preparation milestone"
+            ))
+        })?;
+        if let Some(root) = retained_root {
+            Self::validate_reservation_root(reservation, root)?;
+        }
+        match prepare.stage {
+            BranchPrepareStage::Reserved => {
+                if metadata.branch_identity.is_some() {
+                    return Err(BranchError::IntentMismatch {
+                        target: namespace.clone(),
+                    }
+                    .into());
+                }
+            }
+            BranchPrepareStage::Rooted | BranchPrepareStage::ManifestPublished => {
+                let root = retained_root.ok_or(BranchError::BranchRootMissing {
+                    branch_id: reservation.branch_id,
+                })?;
+                let identity = metadata.branch_identity.as_ref().ok_or_else(|| {
+                    ZeppelinError::Validation(format!(
+                        "rooted cancellation target {namespace} lost its fork identity"
+                    ))
+                })?;
+                if !identity.matches_reservation(reservation)
+                    || !identity.matches_root(root)
+                    || identity.target_generation != ManifestGeneration::new(1)?
+                {
+                    return Err(BranchError::IntentMismatch {
+                        target: namespace.clone(),
+                    }
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_cancellation_root_observation(
+        &self,
+        namespace: &NamespaceId,
+        intent: &NamespaceDeletionIntent,
+        observed_root: Option<&BranchRoot>,
+    ) -> Result<()> {
+        match (intent.parent_root.as_ref(), observed_root) {
+            (None, None) => Ok(()),
+            (Some(expected), Some(actual)) if expected == actual => Ok(()),
+            (Some(_), None) => match self.store.get(&intent.destruction_record_key).await {
+                Ok(_) => Ok(()),
+                Err(ZeppelinError::NotFound { .. }) => Err(ZeppelinError::Validation(format!(
+                    "never-active target {namespace} lost its root before immutable evidence"
+                ))),
+                Err(error) => Err(error),
+            },
+            (None, Some(actual)) | (Some(_), Some(actual)) => {
+                Err(BranchError::BranchRootMismatch {
+                    branch_id: actual.branch_id,
+                }
+                .into())
+            }
+        }
+    }
+
+    async fn ensure_cancellation_evidence(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        intent: &NamespaceDeletionIntent,
+        decision: &DeletionDecision,
+        observed_manifest_version: u64,
+        preservation_head: crate::security::PreservationHeadProof,
+    ) -> Result<NamespaceDestructionRecord> {
+        match self.store.get(&intent.destruction_record_key).await {
+            Ok(bytes) => {
+                let evidence = NamespaceDestructionRecord::from_bytes(&bytes)?;
+                self.validate_cancellation_evidence(
+                    namespace,
+                    metadata,
+                    intent,
+                    decision,
+                    &evidence,
+                    observed_manifest_version,
+                )?;
+                return Ok(evidence);
+            }
+            Err(ZeppelinError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+
+        let (object_count, byte_count) = self
+            .namespace_destruction_census(namespace.as_str())
+            .await?;
+        let evidence = NamespaceDestructionRecord {
+            namespace: namespace.clone(),
+            manifest_version_destroyed: observed_manifest_version,
+            object_count,
+            byte_count,
+            actor: decision.actor.clone(),
+            approver: decision.approver.clone(),
+            decision_id: decision.decision_id,
+            parent_root: intent.parent_root.clone(),
+            incarnation: Some(intent.incarnation.clone()),
+            preservation_head: Some(preservation_head),
+            ts: self.clock.now(),
+        };
+        let bytes = evidence.to_bytes()?;
+        match self
+            .store
+            .put_create_outcome(&intent.destruction_record_key, bytes)
+            .await?
+        {
+            CreateOnlyOutcome::Created { .. } => {
+                let (verified_count, verified_bytes) = self
+                    .namespace_destruction_census(namespace.as_str())
+                    .await?;
+                if verified_count != object_count || verified_bytes != byte_count {
+                    return Err(ZeppelinError::ManifestConflict {
+                        namespace: namespace.to_string(),
+                    });
+                }
+                Ok(evidence)
+            }
+            CreateOnlyOutcome::AlreadyExists => {
+                let existing = NamespaceDestructionRecord::from_bytes(
+                    &self.store.get(&intent.destruction_record_key).await?,
+                )?;
+                self.validate_cancellation_evidence(
+                    namespace,
+                    metadata,
+                    intent,
+                    decision,
+                    &existing,
+                    observed_manifest_version,
+                )?;
+                Ok(existing)
+            }
+        }
+    }
+
+    fn validate_cancellation_evidence(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        intent: &NamespaceDeletionIntent,
+        decision: &DeletionDecision,
+        evidence: &NamespaceDestructionRecord,
+        observed_manifest_version: u64,
+    ) -> Result<()> {
+        let prepare_stage = metadata
+            .branch_prepare
+            .as_ref()
+            .map(|prepare| prepare.stage)
+            .ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "never-active target {namespace} lost its preparation milestone"
+                ))
+            })?;
+        let version_matches_stage = match prepare_stage {
+            BranchPrepareStage::Reserved => evidence.manifest_version_destroyed == 0,
+            BranchPrepareStage::Rooted => {
+                matches!(evidence.manifest_version_destroyed, 0 | 1)
+            }
+            BranchPrepareStage::ManifestPublished => evidence.manifest_version_destroyed == 1,
+        };
+        let observed_matches = observed_manifest_version == 0
+            || evidence.manifest_version_destroyed == observed_manifest_version;
+        if metadata.state != NamespaceState::Creating
+            || metadata.incarnation_id.as_ref() != Some(&intent.incarnation)
+            || metadata.deletion_intent.as_ref() != Some(intent)
+            || intent.fenced_generation.is_some()
+            || intent.visibility.is_some()
+            || intent.root_release.is_some()
+            || evidence.namespace != *namespace
+            || evidence.parent_root != intent.parent_root
+            || evidence.incarnation.as_ref() != Some(&intent.incarnation)
+            || evidence.actor != decision.actor
+            || evidence.approver != decision.approver
+            || evidence.decision_id != decision.decision_id
+            || evidence.preservation_head.is_none()
+            || !version_matches_stage
+            || !observed_matches
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "never-active target {namespace} cancellation evidence does not match its durable intent"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn remove_never_active_target_manifest(
+        &self,
+        namespace: &NamespaceId,
+        reservation: &ForkReservationIdentity,
+        intent: &NamespaceDeletionIntent,
+        evidence: &NamespaceDestructionRecord,
+        governance: &dyn DeletionGovernance,
+    ) -> Result<()> {
+        self.require_unlocked_boundary(governance, namespace, DeletionBoundary::VisibilityRemoval)
+            .await?;
+        let (metadata, _) = self
+            .namespace_manager
+            .read_creating_intent_strong(namespace.as_str())
+            .await?;
+        if metadata.deletion_intent.as_ref() != Some(intent)
+            || metadata.creation_kind != NamespaceCreationKind::Fork(reservation.clone())
+        {
+            return Err(BranchError::CancellationInProgress {
+                target: namespace.clone(),
+            }
+            .into());
+        }
+        let Some((manifest, _)) = Manifest::read_versioned(&self.store, namespace.as_str()).await?
+        else {
+            return Ok(());
+        };
+        if evidence.manifest_version_destroyed != 1
+            || manifest.version() != 1
+            || manifest.namespace_incarnation() != Some(reservation.target_incarnation.as_uuid())
+            || !manifest.branch_roots().is_empty()
+        {
+            return Err(BranchError::ManifestDigestMismatch {
+                generation: ManifestGeneration::new(1)?,
+            }
+            .into());
+        }
+        let root = intent.parent_root.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "never-active target {namespace} published a manifest without a parent root"
+            ))
+        })?;
+        let candidate = self.rebuild_candidate_from_root(&metadata, root).await?;
+        if self
+            .store
+            .get(&Manifest::s3_key(namespace.as_str()))
+            .await?
+            != *candidate.publication.exact_bytes()
+        {
+            return Err(BranchError::ManifestDigestMismatch {
+                generation: ManifestGeneration::new(1)?,
+            }
+            .into());
+        }
+        let manifest_key = Manifest::s3_key(namespace.as_str());
+        if let Err(delete_error) = self.store.delete(&manifest_key).await {
+            match Manifest::read_versioned(&self.store, namespace.as_str()).await {
+                Ok(None) => {}
+                Ok(Some(_)) => return Err(delete_error),
+                Err(read_error) => return Err(read_error),
+            }
+        }
+        self.manifest_cache
+            .invalidate_at(namespace.as_str(), self.clock.now());
+        Ok(())
+    }
+
+    async fn release_never_active_parent_root(
+        &self,
+        reservation: &ForkReservationIdentity,
+        intent: &NamespaceDeletionIntent,
+        metadata: &NamespaceMetadata,
+        decision: &DeletionDecision,
+        governance: &dyn DeletionGovernance,
+        parent_lease: Option<&Lease>,
+    ) -> Result<()> {
+        let namespace = &reservation.target_namespace;
+        self.require_unlocked_boundary(governance, namespace, DeletionBoundary::RootRelease)
+            .await?;
+        self.require_unlocked_boundary(
+            governance,
+            &reservation.source_namespace,
+            DeletionBoundary::RootRelease,
+        )
+        .await?;
+        let (latest, _) = self
+            .namespace_manager
+            .read_creating_intent_strong(namespace.as_str())
+            .await?;
+        let latest_intent = latest.deletion_intent.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "never-active target {namespace} lost its cancellation intent before root release"
+            ))
+        })?;
+        if latest_intent != intent {
+            return Err(BranchError::CancellationInProgress {
+                target: namespace.clone(),
+            }
+            .into());
+        }
+        let evidence = NamespaceDestructionRecord::from_bytes(
+            &self.store.get(&intent.destruction_record_key).await?,
+        )?;
+        self.validate_cancellation_evidence(namespace, metadata, intent, decision, &evidence, 0)?;
+
+        let parent = self.observe_cancellation_parent(reservation).await?;
+        let converged = match (parent_lease, parent, intent.parent_root.as_ref()) {
+            (Some(lease), CancellationParentObservation::Live { root }, Some(expected)) => {
+                match root {
+                    Some(actual) if actual == *expected => {
+                        remove_branch_root_with_lease(
+                            &self.store,
+                            &self.namespace_manager,
+                            &self.lease_manager,
+                            lease,
+                            RemoveBranchRootRequest {
+                                source_namespace: reservation.source_namespace.clone(),
+                                expected_source_incarnation: reservation.source_incarnation.clone(),
+                                expected_root: expected.clone(),
+                            },
+                        )
+                        .await?;
+                        false
+                    }
+                    None => true,
+                    Some(actual) => {
+                        return Err(BranchError::BranchRootMismatch {
+                            branch_id: actual.branch_id,
+                        }
+                        .into())
+                    }
+                }
+            }
+            (Some(_), CancellationParentObservation::Live { root: None }, None) => false,
+            (Some(_), CancellationParentObservation::Live { root: Some(actual) }, None) => {
+                return Err(BranchError::BranchRootMismatch {
+                    branch_id: actual.branch_id,
+                }
+                .into())
+            }
+            (None, CancellationParentObservation::PublicationImpossible, None) => false,
+            (None, CancellationParentObservation::PublicationImpossible, Some(_)) => true,
+            (_, CancellationParentObservation::PublicationImpossible, Some(_)) => true,
+            (_, CancellationParentObservation::PublicationImpossible, None) => false,
+            (None, CancellationParentObservation::Live { .. }, _) => {
+                return Err(ZeppelinError::Validation(format!(
+                    "branch parent {} became live without a cancellation lease",
+                    reservation.source_namespace
+                )))
+            }
+        };
+
+        self.confirm_cancellation_root_absent(reservation, intent)
+            .await?;
+        if intent.parent_root.is_some() {
+            governance
+                .settle_lifecycle_audit(DeletionLifecycleEvent::RootRelease {
+                    namespace: namespace.clone(),
+                    converged,
+                    decision_evidence_ref: intent.decision_evidence_ref.clone(),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn confirm_cancellation_root_absent(
+        &self,
+        reservation: &ForkReservationIdentity,
+        _intent: &NamespaceDeletionIntent,
+    ) -> Result<()> {
+        match self.observe_cancellation_parent(reservation).await? {
+            CancellationParentObservation::PublicationImpossible => Ok(()),
+            CancellationParentObservation::Live { root: None } => Ok(()),
+            CancellationParentObservation::Live { root: Some(root) } => {
+                Err(BranchError::BranchRootMismatch {
+                    branch_id: root.branch_id,
+                }
+                .into())
+            }
+        }
+    }
+
+    async fn finish_never_active_cancellation(
+        &self,
+        namespace: &NamespaceId,
+        reservation: &ForkReservationIdentity,
+        intent: &NamespaceDeletionIntent,
+        governance: &dyn DeletionGovernance,
+    ) -> Result<NamespaceDeleteOutcome> {
+        self.require_unlocked_boundary(governance, namespace, DeletionBoundary::CleanupBatch)
+            .await?;
+        self.confirm_cancellation_root_absent(reservation, intent)
+            .await?;
+        let outcome = self
+            .namespace_manager
+            .cleanup_creating_cancellation_batch(
+                namespace.as_str(),
+                intent,
+                NEVER_ACTIVE_CLEANUP_BUDGET,
+            )
+            .await?;
+        if !outcome.complete {
+            governance
+                .settle_lifecycle_audit(DeletionLifecycleEvent::CleanupIncomplete {
+                    namespace: namespace.clone(),
+                    remaining: 1,
+                    decision_evidence_ref: intent.decision_evidence_ref.clone(),
+                })
+                .await?;
+            return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
+        }
+
+        self.require_unlocked_boundary(governance, namespace, DeletionBoundary::MetadataRemoval)
+            .await?;
+        self.confirm_cancellation_root_absent(reservation, intent)
+            .await?;
+        self.namespace_manager
+            .remove_creating_cancellation_metadata(namespace.as_str(), intent)
+            .await?;
+        self.manifest_cache
+            .invalidate_at(namespace.as_str(), self.clock.now());
+        Ok(NamespaceDeleteOutcome::Deleted)
     }
 
     async fn delete_active_under_lease(
@@ -1418,6 +2436,7 @@ impl NamespaceGraph {
         self.validate_request(&request)?;
         let (target, newly_reserved) = self.reserve_or_read(&request).await?;
         self.validate_retry_identity(&request, &target)?;
+        Self::require_preparation_not_cancelled(&target)?;
 
         #[cfg(feature = "branching-test-support")]
         if stop == PrepareStop::AfterReservation {
@@ -1441,9 +2460,28 @@ impl NamespaceGraph {
             .as_ref()
             .is_some_and(|prepare| prepare.stage == BranchPrepareStage::Rooted)
         {
-            let candidate = self.rebuild_rooted_candidate(&target).await?;
-            self.publish_and_mark_prepared(&target.name, &candidate)
-                .await?;
+            let source_name = request.source.as_str();
+            let mut lease = self.lease_manager.acquire(source_name).await?;
+            let publish = async {
+                let current = self
+                    .namespace_manager
+                    .read_creating_intent_strong(&target.name)
+                    .await?
+                    .0;
+                Self::require_preparation_not_cancelled(&current)?;
+                let candidate = self.rebuild_rooted_candidate(&current).await?;
+                self.publish_and_mark_prepared(&target.name, &candidate, &mut lease)
+                    .await
+            }
+            .await;
+            if let Err(error) = self.lease_manager.release(source_name, &lease).await {
+                warn!(
+                    namespace = source_name,
+                    error = %error,
+                    "fork source lease release failed (best-effort)"
+                );
+            }
+            publish?;
             let verified = self
                 .verify_prepared_target(
                     &self
@@ -1462,9 +2500,20 @@ impl NamespaceGraph {
 
         let source_name = request.source.as_str();
         let mut lease = self.lease_manager.acquire(source_name).await?;
-        let rooted = self
-            .root_and_install_identity(&request, &mut lease, stop)
-            .await;
+        let prepared = async {
+            let rooted = self
+                .root_and_install_identity(&request, &mut lease, stop)
+                .await?;
+            let candidate = match rooted {
+                RootedProgress::Candidate(candidate) => candidate,
+                #[cfg(feature = "branching-test-support")]
+                RootedProgress::StoppedAfterRoot => return Ok(None),
+            };
+            self.publish_and_mark_prepared(request.target.as_str(), &candidate, &mut lease)
+                .await?;
+            Ok::<_, ZeppelinError>(Some(candidate))
+        }
+        .await;
         if let Err(error) = self.lease_manager.release(source_name, &lease).await {
             warn!(
                 namespace = source_name,
@@ -1472,15 +2521,9 @@ impl NamespaceGraph {
                 "fork source lease release failed (best-effort)"
             );
         }
-        let rooted = rooted?;
-        let candidate = match rooted {
-            RootedProgress::Candidate(candidate) => candidate,
-            #[cfg(feature = "branching-test-support")]
-            RootedProgress::StoppedAfterRoot => return Ok(None),
+        let Some(_candidate) = prepared? else {
+            return Ok(None);
         };
-
-        self.publish_and_mark_prepared(request.target.as_str(), &candidate)
-            .await?;
         let final_metadata = self
             .namespace_manager
             .read_creating_intent_strong(request.target.as_str())
@@ -1686,6 +2729,7 @@ impl NamespaceGraph {
                 .namespace_manager
                 .read_creating_intent_strong(request.target.as_str())
                 .await?;
+            Self::require_preparation_not_cancelled(&target)?;
             let reservation = self.validate_retry_identity(request, &target)?;
             let prepare = target.branch_prepare.as_ref().ok_or_else(|| {
                 ZeppelinError::Serialization(format!(
@@ -2047,7 +3091,49 @@ impl NamespaceGraph {
         &self,
         target: &str,
         candidate: &PreparedCandidate,
+        lease: &mut Lease,
     ) -> Result<()> {
+        let source = candidate.branch.identity.source_namespace.as_str();
+        let renewed = self.lease_manager.renew(source, lease).await?;
+        if !self.lease_manager.validate(&renewed) {
+            return Err(ZeppelinError::LeaseExpired {
+                namespace: source.to_string(),
+            });
+        }
+        *lease = renewed;
+        let (source_manifest, source_version) = Manifest::read_versioned_required_for_incarnation(
+            &self.store,
+            source,
+            candidate.branch.identity.source_incarnation.as_uuid(),
+        )
+        .await?;
+        if source_version.is_deletion_fenced() {
+            return Err(BranchError::SourceDeleting {
+                namespace: candidate.branch.identity.source_namespace.clone(),
+            }
+            .into());
+        }
+        if source_manifest
+            .branch_roots()
+            .get(&candidate.branch.identity.branch_id)
+            != Some(&candidate.branch.root)
+        {
+            return Err(BranchError::BranchRootMismatch {
+                branch_id: candidate.branch.identity.branch_id,
+            }
+            .into());
+        }
+        let (before_publication, _) = self
+            .namespace_manager
+            .read_creating_intent_strong(target)
+            .await?;
+        Self::require_preparation_not_cancelled(&before_publication)?;
+        if before_publication.branch_identity.as_ref() != Some(&candidate.branch.identity) {
+            return Err(BranchError::IntentMismatch {
+                target: candidate.branch.identity.target_namespace.clone(),
+            }
+            .into());
+        }
         let target_identity = ArtifactOrigin {
             namespace: candidate.branch.identity.target_namespace.clone(),
             incarnation: candidate.branch.identity.target_incarnation.clone(),
@@ -2065,6 +3151,7 @@ impl NamespaceGraph {
                 .namespace_manager
                 .read_creating_intent_strong(target)
                 .await?;
+            Self::require_preparation_not_cancelled(&metadata)?;
             if metadata.branch_identity.as_ref() != Some(&candidate.branch.identity) {
                 return Err(BranchError::IntentMismatch {
                     target: candidate.branch.identity.target_namespace.clone(),
@@ -2120,6 +3207,7 @@ impl NamespaceGraph {
     }
 
     async fn verify_prepared_target(&self, target: &NamespaceMetadata) -> Result<PreparedBranch> {
+        Self::require_preparation_not_cancelled(target)?;
         let prepare = target.branch_prepare.as_ref().ok_or_else(|| {
             ZeppelinError::Serialization(format!(
                 "prepared branch {} has no preparation milestone",
@@ -2469,6 +3557,10 @@ impl NamespaceGraph {
                 NamespaceState::Deleting => continue,
                 NamespaceState::Creating => {}
             }
+            if metadata.deletion_intent.is_some() {
+                report.awaiting_authorized_cancellation += 1;
+                continue;
+            }
             let stage = metadata
                 .branch_prepare
                 .as_ref()
@@ -2530,6 +3622,7 @@ impl NamespaceGraph {
                             .namespace_manager
                             .read_creating_intent_strong(target_name)
                             .await?;
+                        Self::require_preparation_not_cancelled(&fresh)?;
                         if fresh.creation_kind != NamespaceCreationKind::Fork(reservation.clone()) {
                             return Err(BranchError::IntentMismatch {
                                 target: reservation.target_namespace.clone(),
@@ -2588,6 +3681,8 @@ impl NamespaceGraph {
                         self.namespace_manager
                             .cas_update_creating_intent(&rooted, &etag)
                             .await?;
+                        self.publish_and_mark_prepared(target_name, &candidate, &mut lease)
+                            .await?;
                         Ok(Some(candidate))
                     }
                     .await;
@@ -2598,14 +3693,28 @@ impl NamespaceGraph {
                         continue;
                     };
                     report.rooted_repaired += 1;
-                    self.publish_and_mark_prepared(target_name, &candidate)
-                        .await?;
+                    let _ = candidate;
                     report.manifests_published += 1;
                 }
                 BranchPrepareStage::Rooted => {
-                    let candidate = self.rebuild_rooted_candidate(&metadata).await?;
-                    self.publish_and_mark_prepared(target_name, &candidate)
-                        .await?;
+                    let source_name = reservation.source_namespace.as_str();
+                    let mut lease = self.lease_manager.acquire(source_name).await?;
+                    let publish = async {
+                        let current = self
+                            .namespace_manager
+                            .read_creating_intent_strong(target_name)
+                            .await?
+                            .0;
+                        Self::require_preparation_not_cancelled(&current)?;
+                        let candidate = self.rebuild_rooted_candidate(&current).await?;
+                        self.publish_and_mark_prepared(target_name, &candidate, &mut lease)
+                            .await
+                    }
+                    .await;
+                    if let Err(error) = self.lease_manager.release(source_name, &lease).await {
+                        warn!(namespace = source_name, error = %error, "branch maintenance lease release failed (best-effort)");
+                    }
+                    publish?;
                     report.manifests_published += 1;
                 }
                 BranchPrepareStage::ManifestPublished => {
