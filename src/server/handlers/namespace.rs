@@ -1988,6 +1988,40 @@ async fn materialize_clone_manifest(
     Ok(manifest)
 }
 
+#[cfg(test)]
+mod fork_response_tests {
+    use super::{BranchMode, BranchTargetIdentity, ForkResponse, ForkSourceIdentity};
+
+    #[test]
+    fn response_contains_only_redacted_public_fork_fields() {
+        let response = ForkResponse {
+            branch_id: "branch-1".to_string(),
+            created: true,
+            mode: BranchMode::CopyOnWrite,
+            source: ForkSourceIdentity {
+                namespace: "source".to_string(),
+                incarnation: "source-inc".to_string(),
+                generation: 42,
+            },
+            target: BranchTargetIdentity {
+                namespace: "target".to_string(),
+                incarnation: "target-inc".to_string(),
+            },
+            depth: 1,
+            materialized: false,
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["source"]["generation"], 42);
+        assert_eq!(value["mode"], "copy_on_write");
+        assert_eq!(value["materialized"], false);
+        assert!(value.get("source_manifest_sha256").is_none());
+        assert!(value.get("fencing_token").is_none());
+    }
+}
+
 /// Maps every manifest-reachable source key to its target-prefixed destination.
 ///
 /// # Parameters
