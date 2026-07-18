@@ -2952,6 +2952,8 @@ pub async fn delete_namespace(
                 .deletion_intent
                 .as_ref()
                 .and_then(|intent| intent.parent_root.clone()),
+            incarnation: lifecycle.incarnation_id.clone(),
+            preservation_head: None,
             ts: state.clock.now(),
         };
         let body = destruction.to_bytes().map_err(ApiError::from)?;

@@ -83,7 +83,9 @@ use crate::config::IndexingConfig;
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
-use crate::security::{DecisionId, PreservationService, PrincipalId, SecurityError};
+use crate::security::{
+    DecisionId, PreservationHeadProof, PreservationService, PrincipalId, SecurityError,
+};
 use crate::storage::{ObjectUserMetadata, ZeppelinStore};
 use crate::time::Clock;
 use crate::types::{DistanceMetric, IndexType};
@@ -396,6 +398,45 @@ pub struct NamespaceDeletionIntent {
     /// Exact direct parent root identity for a branch deletion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_root: Option<BranchRoot>,
+    /// Fenced manifest generation, once the deletion fence wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fenced_generation: Option<u64>,
+    /// Durable target-visibility removal marker and grace deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<VisibilityRemoval>,
+    /// Parent-root release acknowledgement for a branch deletion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_release: Option<RootReleaseState>,
+}
+
+/// Durable evidence that a branch target's live visibility was removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VisibilityRemoval {
+    /// Deterministic marker object key under the target lifecycle prefix.
+    pub marker_key: String,
+    /// S3 `last_modified` observed after marker creation or adoption.
+    pub observed_at: DateTime<Utc>,
+    /// Earliest safe parent-root release time.
+    pub not_before: DateTime<Utc>,
+}
+
+/// Durable acknowledgement of exact parent-root release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RootReleaseState {
+    /// Root release has not yet been attempted.
+    Pending,
+    /// Root was removed and the acknowledgement was persisted.
+    Released {
+        /// S3-backed timestamp at which the release acknowledgement won.
+        acked_at: DateTime<Utc>,
+    },
+    /// Retry observed an already-absent root after all safety checks.
+    Converged {
+        /// S3-backed timestamp at which absence was observed safely.
+        observed_at: DateTime<Utc>,
+    },
 }
 
 /// Immutable evidence that authorizes removal of one fenced live manifest.
@@ -420,6 +461,12 @@ pub(crate) struct NamespaceDestructionRecord {
     /// Exact parent root bound to a branch destruction, when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) parent_root: Option<BranchRoot>,
+    /// Exact namespace lifetime represented by the evidence, when newly minted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) incarnation: Option<NamespaceIncarnationId>,
+    /// Strong preservation head observed at the evidence boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) preservation_head: Option<PreservationHeadProof>,
     /// Wall-clock evidence timestamp.
     pub(crate) ts: DateTime<Utc>,
 }
@@ -2663,6 +2710,9 @@ impl NamespaceManager {
                                 destruction_record_key: existing.clone(),
                                 decision_evidence_ref: existing.clone(),
                                 parent_root: parent_root.clone(),
+                                fenced_generation: None,
+                                visibility: None,
+                                root_release: None,
                             });
                         }
                     }
@@ -2685,6 +2735,9 @@ impl NamespaceManager {
                                 destruction_record_key: expected.clone(),
                                 decision_evidence_ref: expected.clone(),
                                 parent_root: parent_root.clone(),
+                                fenced_generation: None,
+                                visibility: None,
+                                root_release: None,
                             });
                         }
                     }
@@ -2703,6 +2756,9 @@ impl NamespaceManager {
                         destruction_record_key: expected.clone(),
                         decision_evidence_ref: expected,
                         parent_root,
+                        fenced_generation: None,
+                        visibility: None,
+                        root_release: None,
                     });
                 }
             }
@@ -2929,6 +2985,9 @@ mod tests {
             destruction_record_key: "_audit/destruction/example.json".to_string(),
             decision_evidence_ref: "decision-123".to_string(),
             parent_root: None,
+            fenced_generation: None,
+            visibility: None,
+            root_release: None,
         };
         let encoded = serde_json::to_vec(&intent).expect("intent serializes");
         let decoded: NamespaceDeletionIntent =
