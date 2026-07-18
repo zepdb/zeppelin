@@ -185,6 +185,40 @@ fn graph_for_test(
     ))
 }
 
+fn graph_for_test_with_config_and_clock(
+    store: ZeppelinStore,
+    config: &Config,
+    clock: Clock,
+) -> Result<NamespaceGraph> {
+    config.validate()?;
+    let gc_horizon_floor_secs = config.gc_horizon_floor_secs().ok_or_else(|| {
+        ZeppelinError::Config("test GC reader-safety floor overflowed u64".to_string())
+    })?;
+    let namespace_manager = Arc::new(NamespaceManager::with_clock(
+        store.clone(),
+        Duration::from_millis(config.cache.namespace_registry_ttl_ms),
+        clock.clone(),
+    ));
+    let lease_manager = Arc::new(LeaseManager::with_clock(
+        store.clone(),
+        format!("branch-delete-test-{}", ulid::Ulid::new()),
+        Duration::from_secs(config.compaction.lease_duration_secs),
+        clock.clone(),
+    ));
+    Ok(NamespaceGraph::new(
+        store,
+        namespace_manager,
+        lease_manager,
+        clock,
+        Arc::new(ManifestCache::new(Duration::from_millis(
+            config.cache.manifest_cache_ttl_ms,
+        ))),
+        config.branching.clone(),
+        config.indexing.clone(),
+        Some(gc_horizon_floor_secs),
+    ))
+}
+
 struct TestDeletionGovernance;
 
 #[async_trait]
@@ -318,6 +352,22 @@ pub async fn resume_delete_for_test(
     budget: Duration,
 ) -> Result<NamespaceDeleteOutcome> {
     graph_for_test(store, indexing, branching)?
+        .resume_delete(&namespace, Arc::new(TestDeletionGovernance), budget)
+        .await
+}
+
+/// Resume deletion with the caller's validated production config and clock.
+///
+/// This is intentionally feature-only: integration tests use it to exercise
+/// exact grace-deadline and lease boundaries without sleeping.
+pub async fn resume_delete_with_config_and_clock_for_test(
+    store: ZeppelinStore,
+    namespace: NamespaceId,
+    config: &Config,
+    clock: Clock,
+    budget: Duration,
+) -> Result<NamespaceDeleteOutcome> {
+    graph_for_test_with_config_and_clock(store, config, clock)?
         .resume_delete(&namespace, Arc::new(TestDeletionGovernance), budget)
         .await
 }
@@ -494,6 +544,14 @@ pub async fn remove_prepared_branch_root(
         ))
     })?;
     let namespace_manager = NamespaceManager::new(store.clone());
+    let source_metadata = namespace_manager
+        .get_active_metadata_for_guarded_write(source_namespace.as_str())
+        .await?;
+    let expected_source_incarnation = source_metadata.incarnation_id.ok_or_else(|| {
+        ZeppelinError::Serialization(format!(
+            "active namespace {source_namespace} has no authoritative incarnation"
+        ))
+    })?;
     let lease_manager = LeaseManager::new(
         store.clone(),
         format!("branch-test-remove-{}", ulid::Ulid::new()),
@@ -505,6 +563,7 @@ pub async fn remove_prepared_branch_root(
         &lease_manager,
         RemoveBranchRootRequest {
             source_namespace,
+            expected_source_incarnation,
             expected_root,
         },
     )

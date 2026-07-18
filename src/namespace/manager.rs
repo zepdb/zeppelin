@@ -409,6 +409,21 @@ pub struct NamespaceDeletionIntent {
     pub root_release: Option<RootReleaseState>,
 }
 
+impl NamespaceDeletionIntent {
+    /// Compare the immutable identity that authorizes one parent-root release.
+    ///
+    /// `root_release` is the sole field advanced by the acknowledgement CAS;
+    /// every other field must still match the snapshot checked before the
+    /// parent manifest mutation.
+    fn has_same_root_release_identity(&self, other: &Self) -> bool {
+        let mut expected = self.clone();
+        expected.root_release = None;
+        let mut current = other.clone();
+        current.root_release = None;
+        expected == current
+    }
+}
+
 /// Exact namespace-lifetime identity required by graph-owned cleanup
 /// primitives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1891,51 +1906,112 @@ impl NamespaceManager {
     pub(crate) async fn record_root_release(
         &self,
         name: &str,
+        expected_metadata: &NamespaceMetadata,
+        expected_etag: &str,
         release: RootReleaseState,
     ) -> Result<()> {
-        for _attempt in 0..8 {
-            let (mut meta, etag) = self.read_metadata_versioned(name).await?;
-            let etag = etag.ok_or_else(|| {
-                ZeppelinError::Serialization(format!(
-                    "namespace {name} metadata has no ETag for root-release CAS"
-                ))
-            })?;
-            let intent = meta.deletion_intent.as_mut().ok_or_else(|| {
-                ZeppelinError::Validation(format!(
-                    "namespace {name} has no deletion intent for root release"
-                ))
-            })?;
-            if meta.state != NamespaceState::Deleting
-                || intent.fenced_generation.is_none()
-                || intent.visibility.is_none()
-            {
-                return Err(ZeppelinError::Validation(format!(
-                    "namespace {name} root release requires durable fenced visibility removal"
-                )));
-            }
-            match intent.root_release.as_ref() {
-                Some(RootReleaseState::Released { .. } | RootReleaseState::Converged { .. }) => {
-                    return Ok(())
-                }
-                Some(RootReleaseState::Pending) if release == RootReleaseState::Pending => {
-                    return Ok(())
-                }
-                Some(RootReleaseState::Pending) | None => {}
-            }
-            intent.root_release = Some(release.clone());
-            meta.updated_at = self.clock.now();
-            match self
-                .put_metadata_if_match(&NamespaceMetadata::s3_key(name), &meta, &etag, name)
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(ZeppelinError::ManifestConflict { .. }) => continue,
-                Err(error) => return Err(error),
-            }
+        let namespace = NamespaceId::new(name.to_string())?;
+        if expected_metadata.name != name {
+            return Err(ZeppelinError::Validation(format!(
+                "root-release metadata snapshot names {} instead of {name}",
+                expected_metadata.name
+            )));
         }
-        Err(ZeppelinError::Validation(format!(
-            "namespace {name} root-release metadata CAS exceeded retry budget"
-        )))
+        if expected_etag.is_empty() {
+            return Err(ZeppelinError::Serialization(format!(
+                "namespace {name} metadata has no ETag for root-release CAS"
+            )));
+        }
+
+        let mut updated = expected_metadata.clone();
+        let expected_intent = expected_metadata.deletion_intent.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "namespace {name} has no deletion intent for root release"
+            ))
+        })?;
+        if updated.state != NamespaceState::Deleting
+            || expected_intent.fenced_generation.is_none()
+            || expected_intent.visibility.is_none()
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} root release requires durable fenced visibility removal"
+            )));
+        }
+        let visibility = expected_intent.visibility.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "namespace {name} root release requires durable visibility removal"
+            ))
+        })?;
+        let release_time = match &release {
+            RootReleaseState::Released { acked_at } => *acked_at,
+            RootReleaseState::Converged { observed_at } => *observed_at,
+            RootReleaseState::Pending => {
+                return Err(ZeppelinError::Validation(format!(
+                    "namespace {name} root-release acknowledgement cannot remain pending"
+                )))
+            }
+        };
+        if release_time < visibility.not_before {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} root-release acknowledgement predates its reader-safety deadline"
+            )));
+        }
+        if matches!(
+            expected_intent.root_release,
+            Some(RootReleaseState::Released { .. } | RootReleaseState::Converged { .. })
+        ) {
+            return Ok(());
+        }
+
+        let updated_intent = updated.deletion_intent.as_mut().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "namespace {name} has no deletion intent for root release"
+            ))
+        })?;
+        updated_intent.root_release = Some(release);
+        updated.updated_at = self.clock.now();
+        match self
+            .put_metadata_if_match(
+                &NamespaceMetadata::s3_key(name),
+                &updated,
+                expected_etag,
+                name,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(ZeppelinError::ManifestConflict { .. }) => {
+                let (current, _) = self.read_metadata_versioned(name).await?;
+                let current_intent = current.deletion_intent.as_ref().ok_or_else(|| {
+                    BranchError::RootReleaseIntentChanged {
+                        namespace: namespace.clone(),
+                    }
+                })?;
+                let current_release_is_final_and_safe = match current_intent.root_release.as_ref() {
+                    Some(RootReleaseState::Released { acked_at }) => {
+                        *acked_at >= visibility.not_before
+                    }
+                    Some(RootReleaseState::Converged { observed_at }) => {
+                        *observed_at >= visibility.not_before
+                    }
+                    Some(RootReleaseState::Pending) | None => false,
+                };
+                if current.state == NamespaceState::Deleting
+                    && current.name == expected_metadata.name
+                    && current.incarnation_id == expected_metadata.incarnation_id
+                    && current.creation_kind == expected_metadata.creation_kind
+                    && current.branch_identity == expected_metadata.branch_identity
+                    && current.destruction_record_key == expected_metadata.destruction_record_key
+                    && expected_intent.has_same_root_release_identity(current_intent)
+                    && current_release_is_final_and_safe
+                {
+                    Ok(())
+                } else {
+                    Err(BranchError::RootReleaseIntentChanged { namespace }.into())
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// CAS-publishes metadata while preserving its namespace incarnation ID.
@@ -3526,6 +3602,30 @@ mod tests {
         let decoded: NamespaceDeletionIntent =
             serde_json::from_slice(&encoded).expect("intent decodes");
         assert_eq!(decoded, intent);
+    }
+
+    #[test]
+    fn root_release_identity_ignores_only_the_acknowledgement() {
+        let now = Utc::now();
+        let intent = NamespaceDeletionIntent {
+            incarnation: NamespaceIncarnationId::new(),
+            destruction_record_key: "_audit/destruction/example.json".to_string(),
+            decision_evidence_ref: "decision-123".to_string(),
+            parent_root: None,
+            fenced_generation: Some(7),
+            visibility: Some(VisibilityRemoval {
+                marker_key: "target/_lifecycle/branch_visibility_removed.json".to_string(),
+                observed_at: now,
+                not_before: now + chrono::Duration::seconds(31),
+            }),
+            root_release: None,
+        };
+        let mut acknowledged = intent.clone();
+        acknowledged.root_release = Some(RootReleaseState::Released { acked_at: now });
+        assert!(intent.has_same_root_release_identity(&acknowledged));
+
+        acknowledged.decision_evidence_ref = "decision-456".to_string();
+        assert!(!intent.has_same_root_release_identity(&acknowledged));
     }
 
     /// Verifies the accepted grammar covers the intended portable name forms.

@@ -50,6 +50,8 @@ pub(crate) struct InsertBranchRootRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct RemoveBranchRootRequest {
     pub(crate) source_namespace: NamespaceId,
+    /// Exact source lifetime named by the target's immutable fork identity.
+    pub(crate) expected_source_incarnation: crate::namespace::NamespaceIncarnationId,
     pub(crate) expected_root: BranchRoot,
 }
 
@@ -280,9 +282,18 @@ pub(crate) async fn remove_branch_root_with_lease(
         .get_active_metadata_for_guarded_write(namespace)
         .await?;
     let incarnation = required_incarnation(&metadata)?;
-    let (mut manifest, version) =
-        Manifest::read_versioned_required_for_incarnation(store, namespace, incarnation.as_uuid())
-            .await?;
+    if incarnation != &request.expected_source_incarnation {
+        return Err(BranchError::SourceIncarnationChanged {
+            namespace: request.source_namespace.clone(),
+        }
+        .into());
+    }
+    let (mut manifest, version) = Manifest::read_versioned_required_for_incarnation(
+        store,
+        namespace,
+        request.expected_source_incarnation.as_uuid(),
+    )
+    .await?;
     manifest.remove_branch_root_candidate(&request.expected_root)?;
 
     let renewed = lease_manager.renew(namespace, lease).await?;

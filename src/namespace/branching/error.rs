@@ -29,6 +29,13 @@ pub enum BranchError {
         namespace: NamespaceId,
     },
 
+    /// Root release raced with a different target deletion intent.
+    #[error("branch root-release intent for namespace {namespace} changed")]
+    RootReleaseIntentChanged {
+        /// Target namespace whose exact deletion intent no longer matches.
+        namespace: NamespaceId,
+    },
+
     /// The source entered deletion before a first root could be published.
     #[error("branch source {namespace} is deleting")]
     SourceDeleting {
