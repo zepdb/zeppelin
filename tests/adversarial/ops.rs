@@ -22,6 +22,45 @@ mod branching_operation_tests {
         .unwrap();
         assert_eq!(encoded["kind"], "fork_namespace");
     }
+
+    #[test]
+    fn branching_operations_expose_replay_metadata() {
+        let operations = [
+            BranchingOp::ForkNamespace {
+                actor: super::ActorSel::ADMIN,
+                source: "source".to_string(),
+                target: "target".to_string(),
+            },
+            BranchingOp::ListBranches {
+                actor: super::ActorSel(2),
+                source: "source".to_string(),
+            },
+            BranchingOp::CompactBranch {
+                actor: super::ActorSel(3),
+                namespace: "target".to_string(),
+            },
+            BranchingOp::DeleteBranch {
+                actor: super::ActorSel(4),
+                namespace: "target".to_string(),
+            },
+            BranchingOp::DeleteSourceWithBranches {
+                actor: super::ActorSel(5),
+                source: "source".to_string(),
+            },
+        ];
+        let expected = [
+            ("fork_namespace", "source", 0),
+            ("list_branches", "source", 2),
+            ("compact_branch", "target", 3),
+            ("delete_branch", "target", 4),
+            ("delete_source_with_branches", "source", 5),
+        ];
+        for (operation, (kind, namespace, actor)) in operations.iter().zip(expected) {
+            assert_eq!(operation.kind(), kind);
+            assert_eq!(operation.namespace(), namespace);
+            assert_eq!(operation.actor().0, actor);
+        }
+    }
 }
 
 pub type Consistency = ConsistencyLevel;
@@ -44,6 +83,45 @@ pub enum BranchingOp {
     DeleteBranch { actor: ActorSel, namespace: String },
     /// Attempt source deletion while children remain.
     DeleteSourceWithBranches { actor: ActorSel, source: String },
+}
+
+impl BranchingOp {
+    /// Stable operation vocabulary used by replay artifacts and coverage
+    /// reports.  Keep this separate from the legacy `Op` kind table until the
+    /// branching HTTP adapter is enabled in the workload scheduler.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::ForkNamespace { .. } => "fork_namespace",
+            Self::ListBranches { .. } => "list_branches",
+            Self::CompactBranch { .. } => "compact_branch",
+            Self::DeleteBranch { .. } => "delete_branch",
+            Self::DeleteSourceWithBranches { .. } => "delete_source_with_branches",
+        }
+    }
+
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        match self {
+            Self::ForkNamespace { source, .. }
+            | Self::ListBranches { source, .. }
+            | Self::DeleteSourceWithBranches { source, .. } => source,
+            Self::CompactBranch { namespace, .. } | Self::DeleteBranch { namespace, .. } => {
+                namespace
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn actor(&self) -> ActorSel {
+        match self {
+            Self::ForkNamespace { actor, .. }
+            | Self::ListBranches { actor, .. }
+            | Self::CompactBranch { actor, .. }
+            | Self::DeleteBranch { actor, .. }
+            | Self::DeleteSourceWithBranches { actor, .. } => *actor,
+        }
+    }
 }
 
 /// Deterministic index into one seed's redaction-safe principal vocabulary.
