@@ -14,8 +14,8 @@ use zeppelin::fts::FtsFieldConfig;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::namespace::branching::test_support::{
     activate_fork_for_test, branch_control_snapshot, branch_metadata_snapshot,
-    delete_namespace_for_test, maintain_branches_for_test, prepare_fork_for_test,
-    prepare_fork_until_reserved_for_test, prepare_fork_until_root_for_test,
+    delete_namespace_for_test, list_children_for_test, maintain_branches_for_test,
+    prepare_fork_for_test, prepare_fork_until_reserved_for_test, prepare_fork_until_root_for_test,
     prepared_manifest_snapshot, publish_deletion_fence,
 };
 use zeppelin::namespace::branching::{BranchError, BranchPrepareStage, PrepareForkOutcome};
@@ -178,6 +178,48 @@ async fn graph_delete_removes_branch_root_after_target_cleanup() {
 
     harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn graph_lists_direct_children_in_target_order() {
+    let harness = TestHarness::new().await;
+    let source = harness.artifact_origin_namespace("list-source");
+    let target_b = harness.artifact_origin_namespace("list-target-b");
+    let target_a = harness.artifact_origin_namespace("list-target-a");
+    NamespaceManager::new(harness.store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .unwrap();
+    for target in [&target_b, &target_a] {
+        prepare_fork_for_test(
+            harness.store.clone(),
+            NamespaceId::new(source.clone()).unwrap(),
+            NamespaceId::new((*target).clone()).unwrap(),
+            fork_indexing(),
+            fork_limits(),
+        )
+        .await
+        .unwrap();
+    }
+    let children = list_children_for_test(
+        harness.store.clone(),
+        NamespaceId::new(source.clone()).unwrap(),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .unwrap();
+    let names = children
+        .iter()
+        .map(|child| child.target.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec![target_a.clone(), target_b.clone()]);
+    assert!(children.iter().all(|child| child.state == "creating"));
+
+    harness.cleanup_artifact_origin_namespace(&source).await;
+    harness.cleanup_artifact_origin_namespace(&target_a).await;
+    harness.cleanup_artifact_origin_namespace(&target_b).await;
     harness.cleanup().await;
 }
 

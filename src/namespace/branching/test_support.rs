@@ -33,10 +33,10 @@ use crate::wal::{LeaseManager, WalReader};
 use chrono::{DateTime, Utc};
 
 use super::{
-    ArtifactOrigin, ArtifactOriginIndex, BranchId, BranchLineage, BranchMaintenanceReport,
-    BranchPrepareStage, BranchRoot, ForkIdentity, ForkReservationIdentity, ForkViewDigest,
-    ManifestGeneration, NamespaceCreationKind, NamespaceDeleteOutcome, NamespaceDeleteRequest,
-    PrepareForkOutcome, PrepareForkRequest,
+    ArtifactOrigin, ArtifactOriginIndex, BranchDescriptor, BranchId, BranchLineage,
+    BranchListRequest, BranchMaintenanceReport, BranchPrepareStage, BranchRoot, ForkIdentity,
+    ForkReservationIdentity, ForkViewDigest, ManifestGeneration, NamespaceCreationKind,
+    NamespaceDeleteOutcome, NamespaceDeleteRequest, PrepareForkOutcome, PrepareForkRequest,
 };
 use crate::namespace::branch_root::{
     insert_branch_root, remove_branch_root, source_data_plane_config_digest,
@@ -241,6 +241,18 @@ pub async fn delete_namespace_for_test(
 ) -> Result<NamespaceDeleteOutcome> {
     graph_for_test(store, indexing, branching)
         .delete(NamespaceDeleteRequest { namespace })
+        .await
+}
+
+/// Exercise authoritative direct-child listing through the graph seam.
+pub async fn list_children_for_test(
+    store: ZeppelinStore,
+    source: NamespaceId,
+    indexing: IndexingConfig,
+    branching: BranchingConfig,
+) -> Result<Vec<BranchDescriptor>> {
+    graph_for_test(store, indexing, branching)
+        .list_children(BranchListRequest { source })
         .await
 }
 

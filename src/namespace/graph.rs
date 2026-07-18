@@ -204,6 +204,11 @@ impl NamespaceGraph {
                 state,
             });
         }
+        children.sort_by(|left, right| {
+            left.target
+                .cmp(&right.target)
+                .then(left.branch_id.cmp(&right.branch_id))
+        });
         Ok(children)
     }
 
