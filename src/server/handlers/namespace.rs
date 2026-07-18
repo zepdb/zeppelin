@@ -302,6 +302,7 @@ pub async fn create_branch(
         state.manifest_cache.clone(),
         state.config.branching.clone(),
         state.config.indexing.clone(),
+        state.config.gc_horizon_floor_secs(),
     );
     let outcome = graph
         .prepare_fork(PrepareForkRequest {

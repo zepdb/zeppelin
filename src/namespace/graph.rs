@@ -21,7 +21,8 @@ use crate::namespace::branch_root::{
     InsertBranchRootRequest, RemoveBranchRootRequest,
 };
 use crate::namespace::branching::deletion::{
-    AuthorizedNamespaceDelete, DeletionBoundary, DeletionLifecycleEvent,
+    persist_branch_visibility_removal, AuthorizedNamespaceDelete, DeletionBoundary,
+    DeletionLifecycleEvent,
 };
 use crate::namespace::branching::{
     ArtifactOrigin, BranchDescriptor, BranchError, BranchListRequest, BranchMaintenanceReport,
@@ -52,6 +53,7 @@ pub(crate) struct NamespaceGraph {
     manifest_cache: Arc<ManifestCache>,
     branching: BranchingConfig,
     indexing: IndexingConfig,
+    gc_horizon_floor_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +87,7 @@ impl NamespaceGraph {
         manifest_cache: Arc<ManifestCache>,
         branching: BranchingConfig,
         indexing: IndexingConfig,
+        gc_horizon_floor_secs: Option<u64>,
     ) -> Self {
         Self {
             store,
@@ -94,6 +97,7 @@ impl NamespaceGraph {
             manifest_cache,
             branching,
             indexing,
+            gc_horizon_floor_secs,
         }
     }
 
@@ -240,10 +244,38 @@ impl NamespaceGraph {
             )));
         }
         if matches!(metadata.creation_kind, NamespaceCreationKind::Fork(_)) {
-            return Err(ZeppelinError::Validation(format!(
-                "branch namespace {} requires governed grace and root release",
-                namespace
-            )));
+            let reservation = match &metadata.creation_kind {
+                NamespaceCreationKind::Fork(reservation) => reservation,
+                NamespaceCreationKind::Root => unreachable!(),
+            };
+            let branch_id = metadata
+                .branch_identity
+                .as_ref()
+                .map(|identity| identity.branch_id)
+                .unwrap_or(reservation.branch_id);
+            let incarnation = metadata.incarnation_id.ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "branch namespace {} has no incarnation for visibility marker",
+                    namespace
+                ))
+            })?;
+            let floor_secs = self.gc_horizon_floor_secs.ok_or_else(|| {
+                ZeppelinError::Validation(
+                    "branch deletion requires a checked GC horizon floor".to_string(),
+                )
+            })?;
+            let visibility = persist_branch_visibility_removal(
+                &self.store,
+                namespace,
+                branch_id,
+                incarnation,
+                Duration::from_secs(floor_secs),
+            )
+            .await?;
+            self.namespace_manager
+                .record_visibility_removal(namespace.as_str(), visibility)
+                .await?;
+            return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
         }
         let outcome = self
             .namespace_manager

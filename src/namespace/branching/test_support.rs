@@ -164,6 +164,7 @@ fn graph_for_test(
         Arc::new(ManifestCache::new(Duration::ZERO)),
         branching,
         indexing,
+        Some(0),
     )
 }
 
