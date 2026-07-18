@@ -11,9 +11,11 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::namespace::NamespaceId;
+use crate::namespace::{BranchId, NamespaceIncarnationId};
 use crate::security::{
     DecisionId, PolicyVersion, PreservationGuard, PreservationHeadProof, PrincipalId,
 };
+use serde::{Deserialize, Serialize};
 
 /// One authorization decision passed from the security adapter to the graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,4 +95,84 @@ pub(crate) struct AuthorizedNamespaceDelete {
     pub governance: Arc<dyn DeletionGovernance>,
     /// Cleanup budget for this invocation.
     pub budget: Duration,
+}
+
+/// Stable lifecycle marker proving that a branch target's live visibility was
+/// removed. The body intentionally contains no process timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BranchVisibilityRemovalMarker {
+    /// Schema discriminator for future marker evolution.
+    pub domain: String,
+    /// Target namespace whose visibility was removed.
+    pub target_namespace: NamespaceId,
+    /// Exact branch edge being retired.
+    pub branch_id: BranchId,
+    /// Target lifetime bound by the marker.
+    pub target_incarnation: NamespaceIncarnationId,
+}
+
+impl BranchVisibilityRemovalMarker {
+    /// Marker schema discriminator.
+    pub const DOMAIN: &'static str = "zeppelin.branch-visibility-removed.v1";
+
+    /// Deterministic marker key under the target-owned lifecycle prefix.
+    #[must_use]
+    pub(crate) fn key(
+        target: &NamespaceId,
+        branch_id: BranchId,
+        incarnation: NamespaceIncarnationId,
+    ) -> String {
+        format!(
+            "{target}/_lifecycle/branch_visibility_removed/{}.{}.json",
+            branch_id.get(),
+            incarnation.as_uuid().simple()
+        )
+    }
+
+    /// Construct the canonical marker body for one branch lifetime.
+    #[must_use]
+    pub(crate) fn new(
+        target: NamespaceId,
+        branch_id: BranchId,
+        target_incarnation: NamespaceIncarnationId,
+    ) -> Self {
+        Self {
+            domain: Self::DOMAIN.to_string(),
+            target_namespace: target,
+            branch_id,
+            target_incarnation,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BranchVisibilityRemovalMarker;
+    use crate::namespace::{BranchId, NamespaceId, NamespaceIncarnationId};
+
+    #[test]
+    fn visibility_marker_is_deterministic_and_strict() {
+        let target = NamespaceId::new("branch-target").expect("valid namespace");
+        let branch = BranchId::new();
+        let incarnation = NamespaceIncarnationId::new();
+        let marker =
+            BranchVisibilityRemovalMarker::new(target.clone(), branch, incarnation.clone());
+        let encoded = serde_json::to_vec(&marker).expect("marker encodes");
+        let decoded: BranchVisibilityRemovalMarker =
+            serde_json::from_slice(&encoded).expect("marker decodes");
+        assert_eq!(decoded, marker);
+        assert_eq!(marker.domain, BranchVisibilityRemovalMarker::DOMAIN);
+        assert_eq!(
+            BranchVisibilityRemovalMarker::key(&target, branch, incarnation.clone()),
+            format!(
+                "branch-target/_lifecycle/branch_visibility_removed/{}.{}.json",
+                branch.get(),
+                incarnation.as_uuid().simple()
+            )
+        );
+        let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        value["unexpected"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<BranchVisibilityRemovalMarker>(value).is_err());
+    }
 }
