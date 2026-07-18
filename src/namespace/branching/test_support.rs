@@ -291,6 +291,19 @@ pub async fn delete_namespace_for_test(
         .await
 }
 
+/// Resume an ordinary deleting namespace through the graph retry seam.
+pub async fn resume_delete_for_test(
+    store: ZeppelinStore,
+    namespace: NamespaceId,
+    indexing: IndexingConfig,
+    branching: BranchingConfig,
+    budget: Duration,
+) -> Result<NamespaceDeleteOutcome> {
+    graph_for_test(store, indexing, branching)
+        .resume_delete(&namespace, Arc::new(TestDeletionGovernance), budget)
+        .await
+}
+
 /// Exercise authoritative direct-child listing through the graph seam.
 pub async fn list_children_for_test(
     store: ZeppelinStore,

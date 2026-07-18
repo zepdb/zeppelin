@@ -16,7 +16,7 @@ use zeppelin::namespace::branching::test_support::{
     activate_fork_for_test, branch_control_snapshot, branch_metadata_snapshot,
     delete_namespace_for_test, list_children_for_test, maintain_branches_for_test,
     prepare_fork_for_test, prepare_fork_until_reserved_for_test, prepare_fork_until_root_for_test,
-    prepared_manifest_snapshot, publish_deletion_fence,
+    prepared_manifest_snapshot, publish_deletion_fence, resume_delete_for_test,
 };
 use zeppelin::namespace::branching::{BranchError, BranchPrepareStage, PrepareForkOutcome};
 use zeppelin::namespace::manager::{
@@ -177,6 +177,39 @@ async fn ungoverned_manager_delete_rejects_a_source_with_a_live_child_root() {
         .is_ok());
     harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn graph_resume_completes_an_ordinary_deleting_namespace() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.artifact_origin_namespace("resume-ordinary");
+    NamespaceManager::new(harness.store.clone())
+        .create(&namespace, 4, DistanceMetric::Cosine)
+        .await
+        .unwrap();
+    NamespaceManager::new(harness.store.clone())
+        .start_delete(&namespace)
+        .await
+        .unwrap();
+    let outcome = resume_delete_for_test(
+        harness.store.clone(),
+        NamespaceId::new(namespace.clone()).unwrap(),
+        fork_indexing(),
+        fork_limits(),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        zeppelin::namespace::branching::NamespaceDeleteOutcome::Deleted
+    ));
+    assert!(NamespaceManager::new(harness.store.clone())
+        .get(&namespace)
+        .await
+        .is_err());
+    harness.cleanup_artifact_origin_namespace(&namespace).await;
     harness.cleanup().await;
 }
 
