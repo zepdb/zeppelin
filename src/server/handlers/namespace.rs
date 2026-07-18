@@ -160,7 +160,7 @@ use crate::namespace::manager::{
 };
 use crate::security::{
     Action, AllowDecision, AuditParams, IndexConfigValues, NamespaceId, PreservationBlockedSurface,
-    Principal, RequestContext, SecurityError,
+    Feature, Principal, RequestContext, SecurityError,
 };
 use crate::server::{authorize_namespace_action, AppState, AuditRequest};
 use crate::storage::CreateOnlyOutcome;
@@ -219,6 +219,11 @@ pub async fn create_branch(
                 feature: "namespace branching",
             },
         ))));
+    }
+    if !state.security.entitlements().has(Feature::Branching) {
+        return Err(ApiError(
+            SecurityError::FeatureNotLicensed(Feature::Branching).into(),
+        ));
     }
     let source_id = NamespaceId::new(source).map_err(|e| ApiError(e.into()))?;
     let target_id = NamespaceId::new(request.target).map_err(|e| ApiError(e.into()))?;

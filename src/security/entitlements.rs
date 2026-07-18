@@ -28,11 +28,13 @@ pub enum Feature {
     AuditStreaming,
     /// Customer-managed encryption keys reserved for a later phase.
     Cmek,
+    /// Namespace branching and fork lifecycle operations.
+    Branching,
 }
 
 impl Feature {
     /// Every licensable feature in stable bit-assignment order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Rbac,
         Self::Constraints,
         Self::AuditS3,
@@ -41,6 +43,7 @@ impl Feature {
         Self::Receipts,
         Self::AuditStreaming,
         Self::Cmek,
+        Self::Branching,
     ];
 
     /// Return the stable license and error-envelope spelling.
@@ -53,6 +56,7 @@ impl Feature {
             Self::Delegation => "delegation",
             Self::Preservation => "preservation",
             Self::Receipts => "receipts",
+            Self::Branching => "branching",
             Self::AuditStreaming => "audit_streaming",
             Self::Cmek => "cmek",
         }
