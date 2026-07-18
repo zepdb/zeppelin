@@ -179,35 +179,11 @@ impl NamespaceGraph {
                 }
                 .into());
             }
-            let source_manifest = Manifest::read_versioned_required_for_incarnation(
-                &self.store,
-                reservation.source_namespace.as_str(),
-                reservation.source_incarnation.as_uuid(),
-            )
-            .await?
-            .0;
-            let root = source_manifest
-                .branch_roots()
-                .get(&reservation.branch_id)
-                .cloned()
-                .ok_or(BranchError::BranchRootMissing {
-                    branch_id: reservation.branch_id,
-                })?;
-            remove_branch_root(
-                &self.store,
-                &self.namespace_manager,
-                &self.lease_manager,
-                RemoveBranchRootRequest {
-                    source_namespace: reservation.source_namespace.clone(),
-                    expected_root: root,
-                },
-            )
-            .await?;
-            // Release the parent visibility root before deleting target-owned
-            // metadata and artifacts.  A crash after this point leaves the
-            // target discoverable for resumable cleanup, never a live parent
-            // root pointing at an already-absent target.
-            self.namespace_manager.delete(name).await?;
+            // Branch deletion is deliberately trailing-intent: keep the
+            // parent root and target visibility until resume has persisted a
+            // marker and waited through the reader-safety grace period.
+            self.namespace_manager.prepare_governed_delete(name).await?;
+            return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
         } else {
             self.namespace_manager.delete(name).await?;
         }

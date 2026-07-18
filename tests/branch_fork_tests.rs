@@ -214,7 +214,7 @@ async fn graph_resume_completes_an_ordinary_deleting_namespace() {
 }
 
 #[tokio::test]
-async fn graph_delete_removes_branch_root_after_target_cleanup() {
+async fn graph_delete_retains_branch_root_until_grace_resume() {
     let harness = TestHarness::new().await;
     let source = harness.artifact_origin_namespace("drop-source");
     let target = harness.artifact_origin_namespace("drop-target");
@@ -231,7 +231,7 @@ async fn graph_delete_removes_branch_root_after_target_cleanup() {
     )
     .await
     .unwrap();
-    delete_namespace_for_test(
+    let outcome = delete_namespace_for_test(
         harness.store.clone(),
         NamespaceId::new(target.clone()).unwrap(),
         fork_indexing(),
@@ -239,7 +239,11 @@ async fn graph_delete_removes_branch_root_after_target_cleanup() {
     )
     .await
     .unwrap();
-    assert!(branch_control_snapshot(&harness.store, &source)
+    assert!(matches!(
+        outcome,
+        zeppelin::namespace::branching::NamespaceDeleteOutcome::AlreadyDeleting
+    ));
+    assert!(!branch_control_snapshot(&harness.store, &source)
         .await
         .unwrap()
         .roots
