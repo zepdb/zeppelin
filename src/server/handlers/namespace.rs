@@ -240,6 +240,10 @@ pub async fn create_branch(
         target_id.as_str(),
     )
     .map_err(|error| ApiError(error.into()))?;
+    audit.set_params(AuditParams::NamespaceClone {
+        source: source_id.clone(),
+        target: target_id.clone(),
+    });
     state
         .security
         .validate_namespace_copy_no_widening(decision.policy_version, &source_id, &target_id)
