@@ -162,7 +162,7 @@ use crate::security::{
     Action, AllowDecision, AuditParams, IndexConfigValues, NamespaceId, PreservationBlockedSurface,
     Principal, RequestContext, SecurityError,
 };
-use crate::server::{AppState, AuditRequest};
+use crate::server::{authorize_namespace_action, AppState, AuditRequest};
 use crate::storage::CreateOnlyOutcome;
 use crate::types::{DistanceMetric, IndexType};
 use crate::wal::manifest::{NamedSnapshot, NamedSnapshotRef, SegmentRef};
@@ -203,10 +203,13 @@ pub struct ForkResponse {
 }
 
 /// Create a live-head copy-on-write fork when branching is enabled.
-#[instrument(skip(state), fields(source = %source))]
+#[instrument(skip(state, decision, principal, context, audit), fields(source = %source))]
 pub async fn create_branch(
     State(state): State<AppState>,
     Extension(decision): Extension<AllowDecision>,
+    Extension(principal): Extension<Principal>,
+    Extension(context): Extension<RequestContext>,
+    Extension(audit): Extension<AuditRequest>,
     Path(source): Path<String>,
     Json(request): Json<ForkRequest>,
 ) -> Result<(StatusCode, Json<ForkResponse>), ApiError> {
@@ -219,10 +222,19 @@ pub async fn create_branch(
     }
     let source_id = NamespaceId::new(source).map_err(|e| ApiError(e.into()))?;
     let target_id = NamespaceId::new(request.target).map_err(|e| ApiError(e.into()))?;
+    authorize_namespace_action(
+        &state,
+        &principal,
+        &context,
+        &audit,
+        Action::NamespaceCreate,
+        target_id.as_str(),
+    )
+    .map_err(|error| ApiError(error.into()))?;
     state
         .security
         .validate_namespace_copy_no_widening(decision.policy_version, &source_id, &target_id)
-        .map_err(|error| ApiError(error.into()))?;
+        .map_err(|error: SecurityError| ApiError(error.into()))?;
     let graph = NamespaceGraph::new(
         state.store.clone(),
         state.namespace_manager.clone(),
@@ -238,7 +250,7 @@ pub async fn create_branch(
             target: target_id,
         })
         .await
-        .map_err(ApiError::from)?;
+        .map_err(|error| ApiError(error.into()))?;
     let (branch, created) = match outcome {
         PrepareForkOutcome::Prepared(branch) => (branch, true),
         PrepareForkOutcome::ExistingPrepared(branch) => (branch, false),
