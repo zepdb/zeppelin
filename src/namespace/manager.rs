@@ -2102,9 +2102,26 @@ impl NamespaceManager {
                 "namespace {name} destruction record is not bound to its tombstone"
             )));
         }
+        let namespace = NamespaceId::new(name.to_string())?;
+        let incarnation = meta.incarnation_id.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "namespace {name} deletion tombstone omitted its incarnation"
+            ))
+        })?;
+        let intent = meta.deletion_intent.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "namespace {name} deletion tombstone omitted its durable intent"
+            ))
+        })?;
+        if intent.incarnation != *incarnation
+            || intent.destruction_record_key != destruction_record_key
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} deletion intent does not match its tombstone"
+            )));
+        }
         let evidence =
             NamespaceDestructionRecord::from_bytes(&self.store.get(destruction_record_key).await?)?;
-        let namespace = NamespaceId::new(name.to_string())?;
         if evidence.namespace != namespace
             || evidence.manifest_version_destroyed != expected_manifest_version
         {
@@ -2229,6 +2246,21 @@ impl NamespaceManager {
                     "namespace {name} deletion tombstone has no destruction evidence reference"
                 ))
             })?;
+            let incarnation = meta.incarnation_id.as_ref().ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "namespace {name} deletion tombstone omitted its incarnation"
+                ))
+            })?;
+            let intent = meta.deletion_intent.as_ref().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "namespace {name} deletion tombstone omitted its durable intent"
+                ))
+            })?;
+            if intent.incarnation != *incarnation || intent.destruction_record_key != evidence_key {
+                return Err(ZeppelinError::Validation(format!(
+                    "namespace {name} deletion intent does not match its tombstone"
+                )));
+            }
             let evidence =
                 NamespaceDestructionRecord::from_bytes(&self.store.get(evidence_key).await?)?;
             if evidence.namespace != namespace {
