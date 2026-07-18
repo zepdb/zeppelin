@@ -271,9 +271,12 @@ pub async fn create_branch(
 }
 
 /// List direct branch roots for an enabled source namespace.
-#[instrument(skip(state), fields(source = %source))]
+#[instrument(skip(state, principal, context, audit), fields(source = %source))]
 pub async fn list_branches(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Extension(context): Extension<RequestContext>,
+    Extension(audit): Extension<AuditRequest>,
     Path(source): Path<String>,
 ) -> Result<Json<BranchListResponse>, ApiError> {
     if !state.config.branching.enabled {
@@ -286,6 +289,18 @@ pub async fn list_branches(
     let (manifest, _) = Manifest::read_versioned_required(&state.store, &source).await?;
     let mut branches = Vec::with_capacity(manifest.branch_roots().len());
     for root in manifest.branch_roots().values() {
+        if authorize_namespace_action(
+            &state,
+            &principal,
+            &context,
+            &audit,
+            Action::NamespaceRead,
+            root.target_namespace.as_str(),
+        )
+        .is_err()
+        {
+            continue;
+        }
         let (metadata, _) = state
             .namespace_manager
             .read_metadata_versioned(root.target_namespace.as_str())
