@@ -2026,7 +2026,10 @@ async fn materialize_clone_manifest(
 
 #[cfg(test)]
 mod fork_response_tests {
-    use super::{BranchMode, ForkResponse, ForkSourceIdentity, ForkTargetIdentity};
+    use super::{
+        BranchHealth, BranchLifecycle, BranchMode, BranchStatusDescriptor, ForkResponse,
+        ForkSourceIdentity, ForkTargetIdentity,
+    };
 
     #[test]
     fn response_contains_only_redacted_public_fork_fields() {
@@ -2057,6 +2060,26 @@ mod fork_response_tests {
         assert_eq!(value["materialized"], false);
         assert!(value.get("source_manifest_sha256").is_none());
         assert!(value.get("fencing_token").is_none());
+    }
+
+    #[test]
+    fn target_status_contains_no_parent_identity() {
+        let status = BranchStatusDescriptor {
+            branch_id: "branch-1".to_string(),
+            mode: BranchMode::CopyOnWrite,
+            depth: 2,
+            lifecycle: BranchLifecycle::Active,
+            health: BranchHealth::Ready,
+            materialized: false,
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["branch_id"], "branch-1");
+        assert_eq!(value["lifecycle"], "active");
+        assert!(value.get("source").is_none());
+        assert!(value.get("parent_namespace").is_none());
     }
 }
 
