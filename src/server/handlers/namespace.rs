@@ -2948,6 +2948,10 @@ pub async fn delete_namespace(
             actor: principal.id,
             approver: audit.approval_principal_id(),
             decision_id: decision.decision_id,
+            parent_root: lifecycle
+                .deletion_intent
+                .as_ref()
+                .and_then(|intent| intent.parent_root.clone()),
             ts: state.clock.now(),
         };
         let body = destruction.to_bytes().map_err(ApiError::from)?;

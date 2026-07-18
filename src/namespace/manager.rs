@@ -417,6 +417,9 @@ pub(crate) struct NamespaceDestructionRecord {
     pub(crate) approver: Option<PrincipalId>,
     /// Authorization decision bound to the destruction request.
     pub(crate) decision_id: DecisionId,
+    /// Exact parent root bound to a branch destruction, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_root: Option<BranchRoot>,
     /// Wall-clock evidence timestamp.
     pub(crate) ts: DateTime<Utc>,
 }
