@@ -261,6 +261,20 @@ impl NamespaceGraph {
                     namespace
                 ))
             })?;
+            if matches!(
+                intent.root_release,
+                Some(RootReleaseState::Released { .. } | RootReleaseState::Converged { .. })
+            ) {
+                let outcome = self
+                    .namespace_manager
+                    .finish_delete(namespace.as_str(), budget)
+                    .await?;
+                return Ok(if outcome.complete {
+                    NamespaceDeleteOutcome::Deleted
+                } else {
+                    NamespaceDeleteOutcome::AlreadyDeleting
+                });
+            }
             let destruction_key = intent.destruction_record_key.clone();
             Manifest::fence_for_destruction(&self.store, namespace.as_str(), &destruction_key)
                 .await?;
