@@ -33,6 +33,11 @@ disabled by default until every required contract below is green.
   `ZeppelinError` as text in the oracle evidence payload. The two branching
   vocabulary tests now pass, but the full adversarial fault matrix remains
   outstanding.
+- A bounded two-seed MinIO release smoke reached workload execution but
+  failed in existing model bookkeeping (`tests/adversarial/model.rs:487`): a
+  maintenance acknowledgement arrived for an unmodelled generated clone
+  namespace. This prevents claiming the full smoke/fault gate green and needs
+  a separate harness fix before rerunning.
 
 Therefore this ledger must not be treated as a release approval or as evidence
 that the branching feature is ready for production enablement.
