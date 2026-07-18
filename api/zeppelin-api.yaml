@@ -3327,6 +3327,33 @@ components:
           additionalProperties:
             $ref: "#/components/schemas/FtsFieldConfig"
           description: Present only when FTS fields are configured.
+        branch:
+          allOf:
+            - $ref: "#/components/schemas/BranchStatusDescriptor"
+          nullable: true
+          description: Redacted target-local branch status; omitted for ordinary namespaces.
+
+    BranchStatusDescriptor:
+      type: object
+      required: [branch_id, mode, depth, lifecycle, health, materialized, created_at]
+      properties:
+        branch_id:
+          type: string
+        mode:
+          $ref: "#/components/schemas/BranchMode"
+        depth:
+          type: integer
+          format: int32
+          minimum: 1
+        lifecycle:
+          $ref: "#/components/schemas/BranchLifecycle"
+        health:
+          $ref: "#/components/schemas/BranchHealth"
+        materialized:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
 
     DeleteNamespaceResponse:
       type: object
