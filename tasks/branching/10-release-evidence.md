@@ -38,6 +38,11 @@ disabled by default until every required contract below is green.
   maintenance acknowledgement arrived for an unmodelled generated clone
   namespace. This prevents claiming the full smoke/fault gate green and needs
   a separate harness fix before rerunning.
+- After `29d06a3`, the same smoke advances further but seed 0 still fails: the
+  clone request returns 500, then a follow-up compact request creates/serves an
+  empty target namespace and the model correctly has no clone target to apply
+  against. This is now a reproducible clone/compact contract issue, not a
+  branching-vocabulary failure; it remains outside the branching slice.
 
 Therefore this ledger must not be treated as a release approval or as evidence
 that the branching feature is ready for production enablement.
