@@ -179,7 +179,6 @@ impl NamespaceGraph {
                 .ok_or(BranchError::BranchRootMissing {
                     branch_id: reservation.branch_id,
                 })?;
-            self.namespace_manager.delete(name).await?;
             remove_branch_root(
                 &self.store,
                 &self.namespace_manager,
@@ -190,6 +189,11 @@ impl NamespaceGraph {
                 },
             )
             .await?;
+            // Release the parent visibility root before deleting target-owned
+            // metadata and artifacts.  A crash after this point leaves the
+            // target discoverable for resumable cleanup, never a live parent
+            // root pointing at an already-absent target.
+            self.namespace_manager.delete(name).await?;
         } else {
             self.namespace_manager.delete(name).await?;
         }
