@@ -281,8 +281,14 @@ pub(crate) async fn persist_branch_visibility_removal(
 
 #[cfg(test)]
 mod tests {
-    use super::BranchVisibilityRemovalMarker;
+    use super::{
+        BranchVisibilityRemovalMarker, CallbackDeletionGovernance, DeletionBoundary,
+        DeletionGovernance, DeletionLifecycleEvent,
+    };
     use crate::namespace::{BranchId, NamespaceId, NamespaceIncarnationId};
+    use crate::security::{PreservationGuard, PreservationHeadProof};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn visibility_marker_is_deterministic_and_strict() {
@@ -307,5 +313,57 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         value["unexpected"] = serde_json::Value::Bool(true);
         assert!(serde_json::from_value::<BranchVisibilityRemovalMarker>(value).is_err());
+    }
+
+    #[tokio::test]
+    async fn callback_governance_forwards_all_hooks() {
+        let preservation_calls = Arc::new(AtomicUsize::new(0));
+        let audit_calls = Arc::new(AtomicUsize::new(0));
+        let disclose_calls = Arc::new(AtomicUsize::new(0));
+        let preservation_calls_for_cb = Arc::clone(&preservation_calls);
+        let audit_calls_for_cb = Arc::clone(&audit_calls);
+        let disclose_calls_for_cb = Arc::clone(&disclose_calls);
+        let adapter = CallbackDeletionGovernance::new(
+            Arc::new(move |_namespace, _boundary| {
+                let calls = Arc::clone(&preservation_calls_for_cb);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok((
+                        PreservationGuard::unlocked(),
+                        PreservationHeadProof {
+                            head_sha256: [0; 32],
+                            e_tag: None,
+                        },
+                    ))
+                })
+            }),
+            Arc::new(move |_target| {
+                disclose_calls_for_cb.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            }),
+            Arc::new(move |_event| {
+                let calls = Arc::clone(&audit_calls_for_cb);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
+        );
+        let target = NamespaceId::new("adapter-target").unwrap();
+        adapter
+            .preservation_boundary(&target, DeletionBoundary::Fence)
+            .await
+            .unwrap();
+        assert!(adapter.disclose_child(&target).unwrap());
+        adapter
+            .settle_lifecycle_audit(DeletionLifecycleEvent::CleanupIncomplete {
+                namespace: target,
+                remaining: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(preservation_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(disclose_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(audit_calls.load(Ordering::SeqCst), 1);
     }
 }
