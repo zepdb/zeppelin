@@ -198,8 +198,18 @@ pub struct ForkResponse {
     pub branch_id: String,
     /// Whether this request created the target.
     pub created: bool,
-    /// Target namespace name.
-    pub target: String,
+    /// Public branch mode.
+    pub mode: BranchMode,
+    /// Redacted source identity.
+    pub source: BranchTargetIdentity,
+    /// Redacted target identity.
+    pub target: BranchTargetIdentity,
+    /// Ancestry depth.
+    pub depth: u16,
+    /// Whether all artifacts are target-owned.
+    pub materialized: bool,
+    /// Reservation timestamp.
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Create a live-head copy-on-write fork when branching is enabled.
@@ -292,7 +302,18 @@ pub async fn create_branch(
         Json(ForkResponse {
             branch_id: branch.identity.branch_id.to_string(),
             created,
-            target: branch.identity.target_namespace.to_string(),
+            mode: BranchMode::CopyOnWrite,
+            source: BranchTargetIdentity {
+                namespace: branch.identity.source_namespace.to_string(),
+                incarnation: branch.identity.source_incarnation.to_string(),
+            },
+            target: BranchTargetIdentity {
+                namespace: branch.identity.target_namespace.to_string(),
+                incarnation: branch.identity.target_incarnation.to_string(),
+            },
+            depth: branch.identity.depth,
+            materialized: false,
+            created_at: branch.identity.created_at,
         }),
     ))
 }
