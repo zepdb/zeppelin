@@ -318,6 +318,12 @@ impl NamespaceGraph {
                         },
                     )
                     .await?;
+                governance
+                    .settle_lifecycle_audit(DeletionLifecycleEvent::RootRelease {
+                        namespace: namespace.clone(),
+                        converged: false,
+                    })
+                    .await?;
             } else {
                 self.namespace_manager
                     .record_root_release(
@@ -326,6 +332,12 @@ impl NamespaceGraph {
                             observed_at: self.clock.now(),
                         },
                     )
+                    .await?;
+                governance
+                    .settle_lifecycle_audit(DeletionLifecycleEvent::RootRelease {
+                        namespace: namespace.clone(),
+                        converged: true,
+                    })
                     .await?;
             }
             let outcome = self
