@@ -2681,6 +2681,34 @@ pub async fn delete_namespace(
         return Err(ApiError(SecurityError::PreservationLocked.into()));
     }
 
+    // Check the authoritative child-root map before installing any deletion
+    // intent.  A source with live children, or a branch with its own children,
+    // must remain active and usable; the governed tombstone path below is only
+    // entered after this non-mutating conflict check succeeds.
+    let (metadata, _) = state
+        .namespace_manager
+        .read_metadata_versioned(&ns)
+        .await
+        .map_err(ApiError::from)?;
+    let (manifest, _) = Manifest::read_versioned_required(&state.store, &ns)
+        .await
+        .map_err(ApiError::from)?;
+    if !manifest.branch_roots().is_empty() {
+        let conflict = match &metadata.creation_kind {
+            crate::namespace::branching::NamespaceCreationKind::Fork(reservation) => {
+                BranchError::BranchHasLiveChildren {
+                    branch_id: reservation.branch_id,
+                }
+            }
+            crate::namespace::branching::NamespaceCreationKind::Root => {
+                BranchError::NamespaceHasLiveBranches {
+                    namespace: namespace_id.to_string(),
+                }
+            }
+        };
+        return Err(ApiError(conflict.into()));
+    }
+
     // The manager derives this key from the authoritative incarnation and
     // publishes both the key and the tombstone in one CAS retry loop. A cached
     // lifecycle snapshot is never allowed to bind destruction evidence.
