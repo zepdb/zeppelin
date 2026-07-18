@@ -2690,10 +2690,13 @@ pub async fn delete_namespace(
         .read_metadata_versioned(&ns)
         .await
         .map_err(ApiError::from)?;
-    let (manifest, _) = Manifest::read_versioned_required(&state.store, &ns)
+    let manifest = Manifest::read(&state.store, &ns)
         .await
         .map_err(ApiError::from)?;
-    if !manifest.branch_roots().is_empty() {
+    if manifest
+        .as_ref()
+        .is_some_and(|value| !value.branch_roots().is_empty())
+    {
         let conflict = match &metadata.creation_kind {
             crate::namespace::branching::NamespaceCreationKind::Fork(reservation) => {
                 BranchError::BranchHasLiveChildren {
