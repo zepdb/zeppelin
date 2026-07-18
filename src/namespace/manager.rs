@@ -2882,6 +2882,20 @@ mod tests {
         assert!(matches!(error, ZeppelinError::Serialization(_)));
     }
 
+    #[test]
+    fn deletion_intent_round_trips_with_exact_identity() {
+        let intent = NamespaceDeletionIntent {
+            incarnation: NamespaceIncarnationId::new(),
+            destruction_record_key: "_audit/destruction/example.json".to_string(),
+            decision_evidence_ref: "decision-123".to_string(),
+            parent_root: None,
+        };
+        let encoded = serde_json::to_vec(&intent).expect("intent serializes");
+        let decoded: NamespaceDeletionIntent =
+            serde_json::from_slice(&encoded).expect("intent decodes");
+        assert_eq!(decoded, intent);
+    }
+
     /// Verifies the accepted grammar covers the intended portable name forms.
     #[test]
     fn namespace_name_validator_accepts_s3_and_url_safe_names() {
