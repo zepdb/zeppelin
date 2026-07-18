@@ -289,17 +289,17 @@ pub async fn list_branches(
     let (manifest, _) = Manifest::read_versioned_required(&state.store, &source).await?;
     let mut branches = Vec::with_capacity(manifest.branch_roots().len());
     for root in manifest.branch_roots().values() {
-        if authorize_namespace_action(
+        match authorize_namespace_action(
             &state,
             &principal,
             &context,
             &audit,
             Action::NamespaceRead,
             root.target_namespace.as_str(),
-        )
-        .is_err()
-        {
-            continue;
+        ) {
+            Ok(_) => {}
+            Err(SecurityError::Authorization(_)) => continue,
+            Err(error) => return Err(ApiError(error.into())),
         }
         let (metadata, _) = state
             .namespace_manager
