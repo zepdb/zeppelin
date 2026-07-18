@@ -4512,6 +4512,7 @@ mod tests {
             creation_kind: crate::namespace::branching::NamespaceCreationKind::Root,
             branch_identity: None,
             branch_prepare: None,
+            branch_activation: None,
             incarnation_id: None,
         }
     }

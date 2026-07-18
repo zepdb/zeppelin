@@ -319,6 +319,7 @@ mod tests {
     #[test]
     fn namespace_fork_is_delegatable() {
         assert!(Action::NamespaceFork.is_delegatable());
+        assert!(Action::NamespaceFork.is_destructive());
         assert!(!Action::NamespaceClone.is_delegatable());
     }
 

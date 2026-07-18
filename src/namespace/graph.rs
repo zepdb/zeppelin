@@ -3248,6 +3248,7 @@ impl NamespaceGraph {
                 stage: BranchPrepareStage::Reserved,
                 provisional: Some(provisional),
             }),
+            branch_activation: None,
             incarnation_id: Some(target_incarnation),
         };
 

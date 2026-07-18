@@ -615,6 +615,7 @@ async fn test_list_namespaces_ignores_nested_meta_objects() {
         creation_kind: zeppelin::namespace::branching::NamespaceCreationKind::Root,
         branch_identity: None,
         branch_prepare: None,
+        branch_activation: None,
         incarnation_id: None,
     };
     harness

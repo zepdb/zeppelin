@@ -17,10 +17,11 @@ pub use crate::namespace::types::{
 };
 pub use error::{BranchError, DisclosedBranchChild};
 pub use lifecycle::{
-    BranchDescriptor, BranchLifecycleState, BranchLineage, BranchMaintenanceReport,
-    BranchPrepareStage, ForkDataPlaneConfig, ForkIdentity, ForkPrepareIntent,
-    ForkReservationIdentity, NamespaceCreationKind, NamespaceDeleteOutcome, NamespaceDeleteRequest,
-    PrepareForkOutcome, PrepareForkRequest, PreparedBranch,
+    ActivationNonce, BranchActivationEvidence, BranchDescriptor, BranchLifecycleState,
+    BranchLineage, BranchMaintenanceReport, BranchPrepareStage, ForkDataPlaneConfig, ForkIdentity,
+    ForkPrepareIntent, ForkReservationIdentity, NamespaceCreationKind, NamespaceDeleteOutcome,
+    NamespaceDeleteRequest, PolicyHeadIdentity, PrepareForkOutcome, PrepareForkRequest,
+    PreparedBranch,
 };
 pub(crate) use types::ArtifactOriginSetBuilder;
 pub use types::{ArtifactOrigin, ArtifactOriginIndex};

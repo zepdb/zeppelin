@@ -88,8 +88,8 @@ use crate::types::{DistanceMetric, IndexType};
 use crate::wal::LeaseManager;
 
 use super::branching::{
-    ArtifactOrigin, BranchError, BranchPrepareStage, ForkIdentity, ForkPrepareIntent,
-    NamespaceCreationKind,
+    ActivationNonce, ArtifactOrigin, BranchActivationEvidence, BranchError, BranchPrepareStage,
+    ForkIdentity, ForkPrepareIntent, NamespaceCreationKind,
 };
 pub use super::types::{is_valid_namespace_name, NamespaceIncarnationId};
 use super::{BranchRoot, NamespaceId};
@@ -372,6 +372,9 @@ pub struct NamespaceMetadata {
     /// Immutable final fork proof, absent until the direct-parent root wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_identity: Option<ForkIdentity>,
+    /// Immutable authorization and policy-head proof installed by branch activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_activation: Option<BranchActivationEvidence>,
     /// Non-visible monotonic prepare milestone, valid only while `creating`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_prepare: Option<ForkPrepareIntent>,
@@ -561,7 +564,10 @@ impl NamespaceMetadata {
     pub(crate) fn validate_creation_lifecycle(&self) -> Result<()> {
         match &self.creation_kind {
             NamespaceCreationKind::Root => {
-                if self.branch_identity.is_some() || self.branch_prepare.is_some() {
+                if self.branch_identity.is_some()
+                    || self.branch_activation.is_some()
+                    || self.branch_prepare.is_some()
+                {
                     return Err(ZeppelinError::Serialization(format!(
                         "root namespace {} carries branch-only metadata",
                         self.name
@@ -608,6 +614,12 @@ impl NamespaceMetadata {
 
                 match self.state {
                     NamespaceState::Creating => {
+                        if self.branch_activation.is_some() {
+                            return Err(ZeppelinError::Serialization(format!(
+                                "creating fork {} carries activation evidence",
+                                self.name
+                            )));
+                        }
                         if let Some(intent) = self.deletion_intent.as_ref() {
                             if intent.incarnation != reservation.target_incarnation {
                                 return Err(BranchError::IntentMismatch {
@@ -678,7 +690,9 @@ impl NamespaceMetadata {
                                     .into());
                                 }
                             }
-                            BranchPrepareStage::Rooted | BranchPrepareStage::ManifestPublished => {
+                            BranchPrepareStage::Rooted
+                            | BranchPrepareStage::ManifestPublished
+                            | BranchPrepareStage::ActivationPending { .. } => {
                                 if self.branch_identity.is_none() || prepare.provisional.is_some() {
                                     return Err(ZeppelinError::Serialization(format!(
                                         "rooted fork {} must retain one final identity and no provisional state",
@@ -689,9 +703,22 @@ impl NamespaceMetadata {
                         }
                     }
                     NamespaceState::Active | NamespaceState::Deleting => {
-                        if self.branch_prepare.is_some() || self.branch_identity.is_none() {
+                        if self.branch_prepare.is_some()
+                            || self.branch_identity.is_none()
+                            || self.branch_activation.is_none()
+                        {
                             return Err(ZeppelinError::Serialization(format!(
-                                "visible or deleting fork {} must retain identity and clear preparation state",
+                                "visible or deleting fork {} must retain identity and activation evidence and clear preparation state",
+                                self.name
+                            )));
+                        }
+                        if self.branch_activation.as_ref().is_some_and(|evidence| {
+                            self.branch_identity
+                                .as_ref()
+                                .is_none_or(|identity| !evidence.matches_identity(identity))
+                        }) {
+                            return Err(ZeppelinError::Serialization(format!(
+                                "fork {} carries mismatched activation evidence",
                                 self.name
                             )));
                         }
@@ -859,6 +886,200 @@ pub(crate) enum ReserveMetadataOutcome {
     Reserved(NamespaceMetadata),
     /// The name already had authoritative metadata; the caller must compare it.
     Existing(NamespaceMetadata),
+}
+
+/// Result of revoking one exact pending branch-activation attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchActivationRevocationOutcome {
+    /// This caller won the CAS and restored the non-visible prepared state.
+    Revoked,
+    /// The target is already non-visible and has no matching pending attempt.
+    AlreadyPrepared,
+    /// The exact activation attempt already won the visibility CAS.
+    ActivationCommitted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchActivationRevocationPlan {
+    PublishPrepared,
+    Outcome(BranchActivationRevocationOutcome),
+}
+
+fn branch_activation_conflict(target: &NamespaceId) -> ZeppelinError {
+    ZeppelinError::ManifestConflict {
+        namespace: target.as_str().to_string(),
+    }
+}
+
+fn validate_exact_branch_activation_identity(
+    metadata: &NamespaceMetadata,
+    target: &NamespaceId,
+    expected_identity: &ForkIdentity,
+) -> Result<()> {
+    let matches = metadata.name == target.as_str()
+        && expected_identity.target_namespace == *target
+        && matches!(&metadata.creation_kind,
+            NamespaceCreationKind::Fork(reservation)
+                if expected_identity.matches_reservation(reservation))
+        && metadata.branch_identity.as_ref() == Some(expected_identity);
+    if matches {
+        Ok(())
+    } else {
+        Err(BranchError::IntentMismatch {
+            target: target.clone(),
+        }
+        .into())
+    }
+}
+
+fn begin_branch_activation_metadata(
+    metadata: &mut NamespaceMetadata,
+    target: &NamespaceId,
+    expected_identity: &ForkIdentity,
+    nonce: ActivationNonce,
+    updated_at: DateTime<Utc>,
+) -> Result<bool> {
+    validate_exact_branch_activation_identity(metadata, target, expected_identity)?;
+    match metadata.state {
+        NamespaceState::Active => return Err(branch_activation_conflict(target)),
+        NamespaceState::Deleting => {
+            return Err(ZeppelinError::NamespaceDeleting {
+                namespace: target.as_str().to_string(),
+            })
+        }
+        NamespaceState::Creating => {}
+    }
+    if metadata.deletion_intent.is_some() {
+        return Err(BranchError::CancellationInProgress {
+            target: target.clone(),
+        }
+        .into());
+    }
+    if metadata.branch_activation.is_some() {
+        return Err(ZeppelinError::Serialization(format!(
+            "creating fork {target} carries activation evidence"
+        )));
+    }
+    let prepare = metadata.branch_prepare.as_mut().ok_or_else(|| {
+        ZeppelinError::Serialization(format!(
+            "creating fork {target} has no preparation intent"
+        ))
+    })?;
+    match prepare.stage {
+        BranchPrepareStage::ManifestPublished => {
+            prepare.stage = BranchPrepareStage::ActivationPending { nonce };
+            metadata.updated_at = updated_at;
+            Ok(true)
+        }
+        BranchPrepareStage::ActivationPending { nonce: current } if current == nonce => Ok(false),
+        BranchPrepareStage::ActivationPending { .. } => Err(branch_activation_conflict(target)),
+        BranchPrepareStage::Reserved | BranchPrepareStage::Rooted => {
+            Err(BranchError::CreatingRecoveryRequired {
+                target: target.clone(),
+            }
+            .into())
+        }
+    }
+}
+
+fn commit_branch_activation_metadata(
+    metadata: &mut NamespaceMetadata,
+    target: &NamespaceId,
+    expected_identity: &ForkIdentity,
+    evidence: &BranchActivationEvidence,
+    updated_at: DateTime<Utc>,
+) -> Result<bool> {
+    validate_exact_branch_activation_identity(metadata, target, expected_identity)?;
+    if !evidence.matches_identity(expected_identity) {
+        return Err(BranchError::IntentMismatch {
+            target: target.clone(),
+        }
+        .into());
+    }
+    match metadata.state {
+        NamespaceState::Active | NamespaceState::Deleting => {
+            return if metadata.branch_activation.as_ref() == Some(evidence) {
+                Ok(false)
+            } else {
+                Err(branch_activation_conflict(target))
+            };
+        }
+        NamespaceState::Creating => {}
+    }
+    if metadata.deletion_intent.is_some() {
+        return Err(BranchError::CancellationInProgress {
+            target: target.clone(),
+        }
+        .into());
+    }
+    if metadata.branch_activation.is_some() {
+        return Err(ZeppelinError::Serialization(format!(
+            "creating fork {target} carries activation evidence"
+        )));
+    }
+    let nonce = evidence.activation_nonce();
+    let prepare = metadata.branch_prepare.as_ref().ok_or_else(|| {
+        ZeppelinError::Serialization(format!(
+            "creating fork {target} has no preparation intent"
+        ))
+    })?;
+    if prepare.stage != (BranchPrepareStage::ActivationPending { nonce }) {
+        return Err(branch_activation_conflict(target));
+    }
+    metadata.state = NamespaceState::Active;
+    metadata.branch_prepare = None;
+    metadata.branch_activation = Some(evidence.clone());
+    metadata.updated_at = updated_at;
+    Ok(true)
+}
+
+fn revoke_branch_activation_metadata(
+    metadata: &mut NamespaceMetadata,
+    target: &NamespaceId,
+    expected_identity: &ForkIdentity,
+    nonce: ActivationNonce,
+    updated_at: DateTime<Utc>,
+) -> Result<BranchActivationRevocationPlan> {
+    validate_exact_branch_activation_identity(metadata, target, expected_identity)?;
+    match metadata.state {
+        NamespaceState::Active | NamespaceState::Deleting => {
+            return if metadata
+                .branch_activation
+                .as_ref()
+                .is_some_and(|evidence| evidence.activation_nonce() == nonce)
+            {
+                Ok(BranchActivationRevocationPlan::Outcome(
+                    BranchActivationRevocationOutcome::ActivationCommitted,
+                ))
+            } else {
+                Err(branch_activation_conflict(target))
+            };
+        }
+        NamespaceState::Creating => {}
+    }
+    if metadata.branch_activation.is_some() {
+        return Err(ZeppelinError::Serialization(format!(
+            "creating fork {target} carries activation evidence"
+        )));
+    }
+    let prepare = metadata.branch_prepare.as_mut().ok_or_else(|| {
+        ZeppelinError::Serialization(format!(
+            "creating fork {target} has no preparation intent"
+        ))
+    })?;
+    match prepare.stage {
+        BranchPrepareStage::ActivationPending { nonce: current } if current == nonce => {
+            prepare.stage = BranchPrepareStage::ManifestPublished;
+            metadata.updated_at = updated_at;
+            Ok(BranchActivationRevocationPlan::PublishPrepared)
+        }
+        BranchPrepareStage::ActivationPending { .. } => Err(branch_activation_conflict(target)),
+        BranchPrepareStage::Reserved
+        | BranchPrepareStage::Rooted
+        | BranchPrepareStage::ManifestPublished => Ok(BranchActivationRevocationPlan::Outcome(
+            BranchActivationRevocationOutcome::AlreadyPrepared,
+        )),
+    }
 }
 
 /// Coordinates namespace CRUD against authoritative S3 metadata.
@@ -1158,6 +1379,7 @@ impl NamespaceManager {
             compaction_health: CompactionHealth::default(),
             creation_kind: NamespaceCreationKind::Root,
             branch_identity: None,
+            branch_activation: None,
             branch_prepare: None,
             incarnation_id: Some(NamespaceIncarnationId::new()),
         };
@@ -1334,38 +1556,11 @@ impl NamespaceManager {
     /// Re-reading metadata on every retry preserves a concurrent deletion, and
     /// observing `active` makes the operation idempotent after a lost response.
     async fn activate_created_namespace(&self, name: &str) -> Result<NamespaceMetadata> {
-        self.activate_reserved_namespace(name, None).await
-    }
-
-    /// CAS-activates one initialized reservation after exact lifecycle checks.
-    ///
-    /// Phase 05 calls this only through ordinary root creation (`None`). The
-    /// branch identity form is extracted for Phase 08, which supplies fresh
-    /// authorization and prepared-branch proof before invoking it.
-    pub(crate) async fn activate_reserved_namespace(
-        &self,
-        name: &str,
-        expected_branch_identity: Option<&ForkIdentity>,
-    ) -> Result<NamespaceMetadata> {
         let key = NamespaceMetadata::s3_key(name);
         for _ in 0..10 {
             let (mut meta, etag) = self.read_metadata_versioned(name).await?;
             match meta.state {
-                NamespaceState::Active => {
-                    if expected_branch_identity
-                        .is_none_or(|expected| meta.branch_identity.as_ref() == Some(expected))
-                    {
-                        return Ok(meta);
-                    }
-                    return Err(BranchError::IntentMismatch {
-                        target: NamespaceId::parse(name.to_string()).map_err(|_| {
-                            ZeppelinError::Validation(format!(
-                                "invalid namespace name for activation: {name}"
-                            ))
-                        })?,
-                    }
-                    .into());
-                }
+                NamespaceState::Active => return Ok(meta),
                 NamespaceState::Deleting => return Ok(meta),
                 NamespaceState::Creating => {}
             }
@@ -1376,26 +1571,15 @@ impl NamespaceManager {
                 });
             }
 
-            match (&meta.creation_kind, expected_branch_identity) {
-                (NamespaceCreationKind::Root, None) => {}
-                (NamespaceCreationKind::Fork(_), Some(expected))
-                    if meta.branch_identity.as_ref() == Some(expected)
-                        && meta.branch_prepare.as_ref().is_some_and(|prepare| {
-                            prepare.stage == BranchPrepareStage::ManifestPublished
-                        }) =>
-                {
-                    meta.branch_prepare = None;
+            if !matches!(meta.creation_kind, NamespaceCreationKind::Root) {
+                return Err(BranchError::CreatingRecoveryRequired {
+                    target: NamespaceId::parse(name.to_string()).map_err(|_| {
+                        ZeppelinError::Validation(format!(
+                            "invalid namespace name for activation: {name}"
+                        ))
+                    })?,
                 }
-                _ => {
-                    return Err(BranchError::CreatingRecoveryRequired {
-                        target: NamespaceId::parse(name.to_string()).map_err(|_| {
-                            ZeppelinError::Validation(format!(
-                                "invalid namespace name for activation: {name}"
-                            ))
-                        })?,
-                    }
-                    .into())
-                }
+                .into());
             }
 
             meta.state = NamespaceState::Active;
@@ -1414,6 +1598,141 @@ impl NamespaceManager {
         Err(ZeppelinError::ManifestConflict {
             namespace: name.to_string(),
         })
+    }
+
+    /// Persist the exact stale-worker fence before installing a policy guard.
+    ///
+    /// Only a fully prepared, non-visible fork can begin activation. A retry
+    /// carrying the same nonce is idempotent; a different pending nonce or any
+    /// visible state is a conflict.
+    pub(crate) async fn begin_branch_activation(
+        &self,
+        target: &NamespaceId,
+        expected_identity: &ForkIdentity,
+        nonce: ActivationNonce,
+    ) -> Result<NamespaceMetadata> {
+        let name = target.as_str();
+        let key = NamespaceMetadata::s3_key(name);
+        for _ in 0..10 {
+            let (mut metadata, etag) = self.read_metadata_versioned(name).await?;
+            let changed = begin_branch_activation_metadata(
+                &mut metadata,
+                target,
+                expected_identity,
+                nonce,
+                self.clock.now(),
+            )?;
+            if !changed {
+                return Ok(metadata);
+            }
+            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "authoritative branch metadata {key} has no non-empty ETag required for activation"
+                ))
+            })?;
+            match self
+                .put_metadata_if_match(&key, &metadata, &etag, name)
+                .await
+            {
+                Ok(_) => {
+                    self.insert_registry(metadata.clone());
+                    return Ok(metadata);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(branch_activation_conflict(target))
+    }
+
+    /// Publish the sole branch-visibility boundary with immutable evidence.
+    ///
+    /// The evidence nonce must exactly equal the persisted pending nonce. The
+    /// successful CAS installs the evidence and clears transient preparation
+    /// state in one whole-object metadata replacement.
+    pub(crate) async fn commit_branch_activation(
+        &self,
+        target: &NamespaceId,
+        expected_identity: &ForkIdentity,
+        evidence: BranchActivationEvidence,
+    ) -> Result<NamespaceMetadata> {
+        let name = target.as_str();
+        let key = NamespaceMetadata::s3_key(name);
+        for _ in 0..10 {
+            let (mut metadata, etag) = self.read_metadata_versioned(name).await?;
+            let changed = commit_branch_activation_metadata(
+                &mut metadata,
+                target,
+                expected_identity,
+                &evidence,
+                self.clock.now(),
+            )?;
+            if !changed {
+                return Ok(metadata);
+            }
+            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "authoritative branch metadata {key} has no non-empty ETag required for activation"
+                ))
+            })?;
+            match self
+                .put_metadata_if_match(&key, &metadata, &etag, name)
+                .await
+            {
+                Ok(_) => {
+                    self.insert_registry(metadata.clone());
+                    return Ok(metadata);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(branch_activation_conflict(target))
+    }
+
+    /// Revoke one exact pending nonce before releasing its policy-head guard.
+    ///
+    /// A cancellation winner restores `ManifestPublished` and remains
+    /// invisible. If the exact activation already committed, the typed outcome
+    /// lets guard recovery finalize without attempting to hide an active fork.
+    pub(crate) async fn revoke_branch_activation(
+        &self,
+        target: &NamespaceId,
+        expected_identity: &ForkIdentity,
+        nonce: ActivationNonce,
+    ) -> Result<BranchActivationRevocationOutcome> {
+        let name = target.as_str();
+        let key = NamespaceMetadata::s3_key(name);
+        for _ in 0..10 {
+            let (mut metadata, etag) = self.read_metadata_versioned(name).await?;
+            match revoke_branch_activation_metadata(
+                &mut metadata,
+                target,
+                expected_identity,
+                nonce,
+                self.clock.now(),
+            )? {
+                BranchActivationRevocationPlan::Outcome(outcome) => return Ok(outcome),
+                BranchActivationRevocationPlan::PublishPrepared => {}
+            }
+            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "authoritative branch metadata {key} has no non-empty ETag required for activation revocation"
+                ))
+            })?;
+            match self
+                .put_metadata_if_match(&key, &metadata, &etag, name)
+                .await
+            {
+                Ok(_) => {
+                    self.insert_registry(metadata);
+                    return Ok(BranchActivationRevocationOutcome::Revoked);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(branch_activation_conflict(target))
     }
 
     /// Create-only reserve one complete `creating` metadata object.
@@ -3464,6 +3783,237 @@ mod tests {
     //! Unit tests for the namespace-name boundary shared by S3 keys and routes.
 
     use super::*;
+    use crate::namespace::branching::{
+        BranchActivationEvidence, ForkReservationIdentity, PolicyHeadIdentity,
+    };
+    use crate::namespace::{
+        ForkViewDigest, ManifestDigest, ManifestGeneration, SourceDataPlaneConfigDigest,
+    };
+
+    fn prepared_fork_metadata() -> Result<(NamespaceMetadata, NamespaceId, ForkIdentity)> {
+        let now = Utc::now();
+        let source_namespace = NamespaceId::parse("activation-source")
+            .map_err(|_| ZeppelinError::Validation("invalid test source".to_string()))?;
+        let target_namespace = NamespaceId::parse("activation-target")
+            .map_err(|_| ZeppelinError::Validation("invalid test target".to_string()))?;
+        let source_incarnation = NamespaceIncarnationId::new();
+        let target_incarnation = NamespaceIncarnationId::new();
+        let branch_id = crate::namespace::BranchId::new();
+        let reservation = ForkReservationIdentity {
+            branch_id,
+            source_namespace: source_namespace.clone(),
+            source_incarnation: source_incarnation.clone(),
+            target_namespace: target_namespace.clone(),
+            target_incarnation: target_incarnation.clone(),
+            created_at: now,
+            depth: 1,
+        };
+        let identity = ForkIdentity {
+            branch_id,
+            source_namespace,
+            source_incarnation,
+            target_namespace: target_namespace.clone(),
+            target_incarnation: target_incarnation.clone(),
+            created_at: now,
+            depth: 1,
+            source_generation: ManifestGeneration::new(7)?,
+            source_manifest_sha256: ManifestDigest::new([7; 32]),
+            fork_view_sha256: ForkViewDigest::new([8; 32]),
+            source_config_sha256: SourceDataPlaneConfigDigest::new([9; 32]),
+            target_generation: ManifestGeneration::new(1)?,
+            target_manifest_sha256: ManifestDigest::new([10; 32]),
+        };
+        let metadata = NamespaceMetadata {
+            name: target_namespace.as_str().to_string(),
+            dimensions: 4,
+            distance_metric: DistanceMetric::Euclidean,
+            index_type: IndexType::IvfFlat,
+            vector_count: 0,
+            created_at: now,
+            updated_at: now,
+            state: NamespaceState::Creating,
+            destruction_record_key: None,
+            deletion_intent: None,
+            full_text_search: std::collections::HashMap::new(),
+            index_config: None,
+            compaction_health: CompactionHealth::default(),
+            creation_kind: NamespaceCreationKind::Fork(reservation),
+            branch_identity: Some(identity.clone()),
+            branch_activation: None,
+            branch_prepare: Some(ForkPrepareIntent {
+                branch_id,
+                target_incarnation: target_incarnation.clone(),
+                stage: BranchPrepareStage::ManifestPublished,
+                provisional: None,
+            }),
+            incarnation_id: Some(target_incarnation),
+        };
+        Ok((metadata, target_namespace, identity))
+    }
+
+    fn boot_activation_evidence(
+        identity: &ForkIdentity,
+        nonce: ActivationNonce,
+    ) -> Result<BranchActivationEvidence> {
+        Ok(BranchActivationEvidence {
+            branch_id: identity.branch_id,
+            target_namespace: identity.target_namespace.clone(),
+            target_incarnation: identity.target_incarnation.clone(),
+            policy_head: PolicyHeadIdentity::Boot {
+                activation_nonce: nonce,
+            },
+            decision_id: DecisionId::new(),
+            approver: Some(PrincipalId::new("activation-approver")?),
+            audit_evidence_ref: "audit://branch-activation/request-1".to_string(),
+            activated_at: Utc::now(),
+        })
+    }
+
+    #[test]
+    fn cancellation_winning_exact_nonce_fences_the_stale_activator() -> Result<()> {
+        let (mut metadata, target, identity) = prepared_fork_metadata()?;
+        let nonce = ActivationNonce::new();
+        let evidence = boot_activation_evidence(&identity, nonce)?;
+        assert!(begin_branch_activation_metadata(
+            &mut metadata,
+            &target,
+            &identity,
+            nonce,
+            Utc::now(),
+        )?);
+
+        assert_eq!(
+            revoke_branch_activation_metadata(
+                &mut metadata,
+                &target,
+                &identity,
+                nonce,
+                Utc::now(),
+            )?,
+            BranchActivationRevocationPlan::PublishPrepared
+        );
+        assert_eq!(metadata.state, NamespaceState::Creating);
+        assert_eq!(
+            metadata.branch_prepare.as_ref().map(|prepare| prepare.stage),
+            Some(BranchPrepareStage::ManifestPublished)
+        );
+
+        let error = commit_branch_activation_metadata(
+            &mut metadata,
+            &target,
+            &identity,
+            &evidence,
+            Utc::now(),
+        )
+        .expect_err("a stale activator must not cross the visibility boundary");
+        assert!(matches!(error, ZeppelinError::ManifestConflict { .. }));
+        assert_eq!(metadata.state, NamespaceState::Creating);
+        assert!(metadata.branch_activation.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn activation_winning_exact_nonce_is_not_hidden_by_stale_cancellation() -> Result<()> {
+        let (mut metadata, target, identity) = prepared_fork_metadata()?;
+        let nonce = ActivationNonce::new();
+        let evidence = boot_activation_evidence(&identity, nonce)?;
+        assert!(begin_branch_activation_metadata(
+            &mut metadata,
+            &target,
+            &identity,
+            nonce,
+            Utc::now(),
+        )?);
+        assert!(commit_branch_activation_metadata(
+            &mut metadata,
+            &target,
+            &identity,
+            &evidence,
+            Utc::now(),
+        )?);
+        assert_eq!(metadata.state, NamespaceState::Active);
+        assert_eq!(metadata.branch_activation.as_ref(), Some(&evidence));
+
+        assert_eq!(
+            revoke_branch_activation_metadata(
+                &mut metadata,
+                &target,
+                &identity,
+                nonce,
+                Utc::now(),
+            )?,
+            BranchActivationRevocationPlan::Outcome(
+                BranchActivationRevocationOutcome::ActivationCommitted
+            )
+        );
+        assert_eq!(metadata.state, NamespaceState::Active);
+        assert_eq!(metadata.branch_activation.as_ref(), Some(&evidence));
+
+        metadata.state = NamespaceState::Deleting;
+        metadata.validate_creation_lifecycle()?;
+        metadata.branch_activation = None;
+        assert!(metadata.validate_creation_lifecycle().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_nonce_cannot_revoke_or_commit_a_newer_attempt() -> Result<()> {
+        let (mut metadata, target, identity) = prepared_fork_metadata()?;
+        let current = ActivationNonce::new();
+        let stale = ActivationNonce::new();
+        assert!(begin_branch_activation_metadata(
+            &mut metadata,
+            &target,
+            &identity,
+            current,
+            Utc::now(),
+        )?);
+        assert!(matches!(
+            revoke_branch_activation_metadata(
+                &mut metadata,
+                &target,
+                &identity,
+                stale,
+                Utc::now(),
+            ),
+            Err(ZeppelinError::ManifestConflict { .. })
+        ));
+        let stale_evidence = boot_activation_evidence(&identity, stale)?;
+        assert!(matches!(
+            commit_branch_activation_metadata(
+                &mut metadata,
+                &target,
+                &identity,
+                &stale_evidence,
+                Utc::now(),
+            ),
+            Err(ZeppelinError::ManifestConflict { .. })
+        ));
+        assert_eq!(
+            metadata.branch_prepare.as_ref().map(|prepare| prepare.stage),
+            Some(BranchPrepareStage::ActivationPending { nonce: current })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_without_branch_activation_field_remains_compatible_for_legacy_roots() -> Result<()> {
+        let now = Utc::now();
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "name": "legacy-root",
+            "dimensions": 4,
+            "distance_metric": "euclidean",
+            "index_type": "ivf_flat",
+            "vector_count": 0,
+            "created_at": now,
+            "updated_at": now
+        }))?;
+        let metadata = NamespaceMetadata::from_bytes(&encoded)?;
+        assert_eq!(metadata.state, NamespaceState::Active);
+        assert!(matches!(metadata.creation_kind, NamespaceCreationKind::Root));
+        assert!(metadata.branch_activation.is_none());
+        Ok(())
+    }
 
     #[test]
     fn malformed_incarnation_metadata_fails_loudly() {
@@ -3484,6 +4034,7 @@ mod tests {
             compaction_health: CompactionHealth::default(),
             creation_kind: NamespaceCreationKind::Root,
             branch_identity: None,
+            branch_activation: None,
             branch_prepare: None,
             incarnation_id: None,
         };

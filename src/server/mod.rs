@@ -407,7 +407,7 @@ struct AuditRequestState {
     decision: AuditRequestDecision,
     params: AuditParams,
     constraint_denial: bool,
-    approval_principal_id: Option<PrincipalId>,
+    approval_principal: Option<Principal>,
 }
 
 #[derive(Clone)]
@@ -430,7 +430,7 @@ impl AuditRequest {
                 decision: AuditRequestDecision::Allow(Box::new(decision)),
                 params,
                 constraint_denial: false,
-                approval_principal_id: None,
+                approval_principal: None,
             })),
         }
     }
@@ -450,11 +450,11 @@ impl AuditRequest {
             .params = params;
     }
 
-    fn set_approval_principal(&self, principal_id: PrincipalId) {
+    fn set_approval_principal(&self, principal: Principal) {
         self.inner
             .lock()
             .unwrap_or_else(|_| panic!("audit request annotation lock poisoned"))
-            .approval_principal_id = Some(principal_id);
+            .approval_principal = Some(principal);
     }
 
     /// Return the independently authorized approver attached by middleware.
@@ -463,7 +463,18 @@ impl AuditRequest {
         self.inner
             .lock()
             .unwrap_or_else(|_| panic!("audit request annotation lock poisoned"))
-            .approval_principal_id
+            .approval_principal
+            .as_ref()
+            .map(|principal| principal.id.clone())
+    }
+
+    /// Return the independently authenticated approver for a fresh activation recheck.
+    #[must_use]
+    pub(crate) fn approval_principal(&self) -> Option<Principal> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|_| panic!("audit request annotation lock poisoned"))
+            .approval_principal
             .clone()
     }
 
@@ -1081,7 +1092,10 @@ async fn finish_audited_request(
         params,
         state.audit.node_id(),
     );
-    record.approval_principal_id = audit.approval_principal_id;
+    record.approval_principal_id = audit
+        .approval_principal
+        .as_ref()
+        .map(|principal| principal.id.clone());
 
     if success && durable_audit {
         if let Err(error) = state.audit.submit_durable(record).await {
@@ -1324,7 +1338,7 @@ pub async fn authorize(
     });
     request.extensions_mut().insert::<AllowDecision>(allow);
     if let (Some(audit_request), Some(approver)) = (&audit_request, approval_principal) {
-        audit_request.set_approval_principal(approver.id);
+        audit_request.set_approval_principal(approver);
     }
     if let Some(audit_request) = &audit_request {
         request.extensions_mut().insert(audit_request.clone());

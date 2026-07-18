@@ -8,9 +8,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config::{ApiKeyConfig, SecurityConfig};
+use crate::namespace::BranchId;
 
 use super::{
     Action, AllowDecision, DenyReason, FieldMask, NamespaceId, PolicyVersion, Principal,
+    PendingBranchActivation, PolicyControlRevision, PolicyHeadDigest, PolicyLeaseFencingToken,
     PrincipalId, PrincipalKind, Resource, SecurityError, WriteConstraints,
 };
 
@@ -925,6 +927,19 @@ pub struct PolicyHead {
     version: PolicyVersion,
     object_key: String,
     checksum: String,
+    #[serde(default)]
+    control_revision: PolicyControlRevision,
+    #[serde(default)]
+    publication_fencing_token: Option<PolicyLeaseFencingToken>,
+    #[serde(default)]
+    pending_branch_activations: BTreeMap<BranchId, PendingBranchActivation>,
+}
+
+#[derive(Serialize)]
+struct SemanticPolicyHead<'a> {
+    version: PolicyVersion,
+    object_key: &'a str,
+    checksum: &'a str,
 }
 
 impl PolicyHead {
@@ -936,6 +951,9 @@ impl PolicyHead {
             version: snapshot.version,
             object_key,
             checksum: snapshot.checksum.clone(),
+            control_revision: PolicyControlRevision::INITIAL,
+            publication_fencing_token: None,
+            pending_branch_activations: BTreeMap::new(),
         };
         head.validate("_security")?;
         Ok(head)
@@ -960,7 +978,128 @@ impl PolicyHead {
                 "invalid policy head fields".to_string(),
             ));
         }
+        if self.pending_branch_activations.len() > super::MAX_PENDING_BRANCH_ACTIVATIONS {
+            return Err(SecurityError::InvalidPolicy(
+                "policy head has too many pending branch activations".to_string(),
+            ));
+        }
+        if !self.pending_branch_activations.is_empty()
+            && self.publication_fencing_token.is_none()
+        {
+            return Err(SecurityError::InvalidPolicy(
+                "guarded policy head has no publication fencing token".to_string(),
+            ));
+        }
+        let semantic_digest = self.semantic_digest()?;
+        for (branch_id, guard) in &self.pending_branch_activations {
+            guard.validate()?;
+            if *branch_id != guard.branch_id()
+                || guard.policy_version() != self.version
+                || guard.policy_head_digest() != semantic_digest
+            {
+                return Err(SecurityError::InvalidPolicy(
+                    "pending branch activation disagrees with policy head".to_string(),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Canonical digest of semantic head identity, excluding mutable controls.
+    pub fn semantic_digest(&self) -> Result<PolicyHeadDigest, SecurityError> {
+        let canonical = serde_json::to_vec(&SemanticPolicyHead {
+            version: self.version,
+            object_key: &self.object_key,
+            checksum: &self.checksum,
+        })
+        .map_err(|error| {
+            SecurityError::InvalidPolicy(format!(
+                "semantic policy head encoding failed: {error}"
+            ))
+        })?;
+        Ok(PolicyHeadDigest::new(Sha256::digest(canonical).into()))
+    }
+
+    pub(crate) fn claim_publication(
+        &self,
+        fencing_token: PolicyLeaseFencingToken,
+    ) -> Result<Self, SecurityError> {
+        let mut claimed = self.clone();
+        claimed.control_revision = claimed.control_revision.next()?;
+        claimed.publication_fencing_token = Some(fencing_token);
+        claimed.validate("_security")?;
+        Ok(claimed)
+    }
+
+    pub(crate) fn advance_semantic(
+        &self,
+        snapshot: &PolicySnapshot,
+        object_key: String,
+        fencing_token: PolicyLeaseFencingToken,
+    ) -> Result<Self, SecurityError> {
+        if self.publication_fencing_token != Some(fencing_token)
+            || !self.pending_branch_activations.is_empty()
+        {
+            return Err(SecurityError::PolicyConflict);
+        }
+        let head = Self {
+            version: snapshot.version,
+            object_key,
+            checksum: snapshot.checksum.clone(),
+            control_revision: self.control_revision.next()?,
+            publication_fencing_token: Some(fencing_token),
+            pending_branch_activations: BTreeMap::new(),
+        };
+        head.validate("_security")?;
+        Ok(head)
+    }
+
+    pub(crate) fn insert_pending_branch_activation(
+        &self,
+        guard: PendingBranchActivation,
+        fencing_token: PolicyLeaseFencingToken,
+    ) -> Result<Self, SecurityError> {
+        if self.publication_fencing_token != Some(fencing_token)
+            || !self.pending_branch_activations.is_empty()
+            || guard.policy_version() != self.version
+            || guard.policy_head_digest() != self.semantic_digest()?
+            || guard.lease_fencing_token() != fencing_token
+        {
+            return Err(SecurityError::PolicyConflict);
+        }
+        let mut guarded = self.clone();
+        guarded.control_revision = guarded.control_revision.next()?;
+        if guarded
+            .pending_branch_activations
+            .insert(guard.branch_id(), guard)
+            .is_some()
+        {
+            return Err(SecurityError::PolicyConflict);
+        }
+        guarded.validate("_security")?;
+        Ok(guarded)
+    }
+
+    pub(crate) fn remove_pending_branch_activation(
+        &self,
+        expected: &PendingBranchActivation,
+        fencing_token: PolicyLeaseFencingToken,
+    ) -> Result<Self, SecurityError> {
+        if self.publication_fencing_token != Some(fencing_token)
+            || self
+                .pending_branch_activations
+                .get(&expected.branch_id())
+                != Some(expected)
+        {
+            return Err(SecurityError::PolicyConflict);
+        }
+        let mut resolved = self.clone();
+        resolved.control_revision = resolved.control_revision.next()?;
+        resolved
+            .pending_branch_activations
+            .remove(&expected.branch_id());
+        resolved.validate("_security")?;
+        Ok(resolved)
     }
 
     /// Return the selected monotonic version.
@@ -979,6 +1118,26 @@ impl PolicyHead {
     #[must_use]
     pub fn checksum(&self) -> &str {
         &self.checksum
+    }
+
+    /// Return the non-semantic head control revision.
+    #[must_use]
+    pub const fn control_revision(&self) -> PolicyControlRevision {
+        self.control_revision
+    }
+
+    /// Return the lease generation most recently claimed into this head.
+    #[must_use]
+    pub const fn publication_fencing_token(&self) -> Option<PolicyLeaseFencingToken> {
+        self.publication_fencing_token
+    }
+
+    /// Borrow the bounded crash-recovery activation guards.
+    #[must_use]
+    pub fn pending_branch_activations(
+        &self,
+    ) -> &BTreeMap<BranchId, PendingBranchActivation> {
+        &self.pending_branch_activations
     }
 }
 

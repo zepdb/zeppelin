@@ -60,6 +60,7 @@ pub async fn write_active_namespace_metadata_with_fts(
         creation_kind: zeppelin::namespace::branching::NamespaceCreationKind::Root,
         branch_identity: None,
         branch_prepare: None,
+        branch_activation: None,
         incarnation_id: None,
     };
     store

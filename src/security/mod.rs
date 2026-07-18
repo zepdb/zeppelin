@@ -19,6 +19,7 @@ mod license;
 mod merkle;
 mod policy;
 mod policy_cache;
+mod policy_publication;
 mod policy_store;
 mod preservation;
 mod principal;
@@ -61,6 +62,12 @@ pub use merkle::{MerklePath, MerkleSide, MerkleStep, MerkleTree};
 pub use policy::{
     canonical_policy_checksum, ApiKeyId, GrantActions, GrantDefinition, GrantScope, IssuedApiKey,
     KeyState, PolicyGrant, PolicyHead, PolicyKey, PolicyPrincipal, PolicySnapshot,
+};
+pub use policy_publication::{
+    PendingBranchActivation, PolicyActivationGuardPermit, PolicyControlRevision,
+    PolicyHeadDigest, PolicyLeaseFencingToken, PolicyPublicationLease,
+    PolicyPublicationLeaseClaim, MAX_PENDING_BRANCH_ACTIVATIONS,
+    MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS, POLICY_PUBLICATION_LEASE_KEY,
 };
 pub use policy_store::{LoadedPolicy, PolicyStore};
 pub use preservation::{

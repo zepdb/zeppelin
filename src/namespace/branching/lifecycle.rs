@@ -4,13 +4,138 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 use crate::namespace::manager::NamespaceIndexConfig;
 use crate::namespace::{
     BranchId, BranchRoot, ForkViewDigest, ManifestDigest, ManifestGeneration, NamespaceId,
     NamespaceIncarnationId, SourceDataPlaneConfigDigest,
 };
+use crate::security::{
+    DecisionId, PolicyControlRevision, PolicyHeadDigest, PolicyLeaseFencingToken, PolicyVersion,
+    PrincipalId,
+};
 use crate::types::{DistanceMetric, IndexType};
+
+/// Collision-resistant fence for one branch-activation attempt.
+///
+/// The nonce is persisted in target metadata before any policy-head guard is
+/// installed. It is an ordering identity only and never bearer authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ActivationNonce(Ulid);
+
+impl ActivationNonce {
+    /// Mint a fresh activation-attempt identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Ulid::new())
+    }
+
+    /// Wrap an already validated ULID.
+    #[must_use]
+    pub const fn from_ulid(value: Ulid) -> Self {
+        Self(value)
+    }
+
+    /// Return the stable ULID value.
+    #[must_use]
+    pub const fn get(self) -> Ulid {
+        self.0
+    }
+}
+
+impl Default for ActivationNonce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for ActivationNonce {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+/// Exact policy publication boundary linearized with branch activation.
+///
+/// BOOT mode is represented explicitly because it has no persisted policy
+/// head and no fencing lease. It must never be made to look equivalent to a
+/// fenced persisted policy publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PolicyHeadIdentity {
+    /// Immutable boot-policy proof for deployments without an S3 policy head.
+    Boot {
+        /// Exact target activation attempt bound by the metadata CAS.
+        activation_nonce: ActivationNonce,
+    },
+    /// Persisted policy-head proof guarded by the publication lease.
+    Persisted {
+        /// Semantic policy version reauthorized at activation time.
+        policy_version: PolicyVersion,
+        /// Canonical digest of the guarded authoritative policy head.
+        policy_head_digest: PolicyHeadDigest,
+        /// Non-semantic policy-head control revision containing the guard.
+        control_revision: PolicyControlRevision,
+        /// Fencing token of the policy-publication lease holder.
+        lease_fencing_token: PolicyLeaseFencingToken,
+        /// Exact target activation attempt named by the policy-head guard.
+        activation_nonce: ActivationNonce,
+    },
+}
+
+impl PolicyHeadIdentity {
+    /// Return the exact target activation attempt carried by either authority.
+    #[must_use]
+    pub const fn activation_nonce(&self) -> ActivationNonce {
+        match self {
+            Self::Boot { activation_nonce } | Self::Persisted {
+                activation_nonce, ..
+            } => *activation_nonce,
+        }
+    }
+}
+
+/// Immutable evidence installed by the sole target-visibility CAS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchActivationEvidence {
+    /// Stable direct-edge identity that became visible.
+    pub branch_id: BranchId,
+    /// Exact target namespace made visible by this activation.
+    pub target_namespace: NamespaceId,
+    /// Exact target lifetime made visible by this activation.
+    pub target_incarnation: NamespaceIncarnationId,
+    /// Exact policy publication boundary proved immediately before activation.
+    pub policy_head: PolicyHeadIdentity,
+    /// Fresh authorization decision admitted by the activation attempt.
+    pub decision_id: DecisionId,
+    /// Independent approver when the policy required two-person approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<PrincipalId>,
+    /// Opaque durable audit linkage settled before the visibility CAS.
+    pub audit_evidence_ref: String,
+    /// Trusted activation timestamp used only for audit reporting.
+    pub activated_at: DateTime<Utc>,
+}
+
+impl BranchActivationEvidence {
+    /// Return whether this evidence is bound to one exact immutable fork.
+    #[must_use]
+    pub fn matches_identity(&self, identity: &ForkIdentity) -> bool {
+        self.branch_id == identity.branch_id
+            && self.target_namespace == identity.target_namespace
+            && self.target_incarnation == identity.target_incarnation
+            && !self.audit_evidence_ref.is_empty()
+    }
+
+    /// Return the exact activation-attempt fence committed by this evidence.
+    #[must_use]
+    pub fn activation_nonce(&self) -> ActivationNonce {
+        self.policy_head.activation_nonce()
+    }
+}
 
 /// Stable create-only reservation for one direct parent-to-child edge.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -171,6 +296,11 @@ pub enum BranchPrepareStage {
     Rooted,
     /// Exact target generation-one manifest and history are durable.
     ManifestPublished,
+    /// One exact authenticated activation attempt owns the visibility race.
+    ActivationPending {
+        /// Stale-worker fence minted once for this activation attempt.
+        nonce: ActivationNonce,
+    },
 }
 
 /// Transient preparation state valid only while target metadata is `creating`.
@@ -294,4 +424,29 @@ pub struct BranchMaintenanceReport {
     pub deletions_in_progress: usize,
     /// Branch deletions still retaining their root through reader-safety grace.
     pub branch_grace_waiting: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ActivationNonce, BranchPrepareStage};
+
+    #[test]
+    fn activation_pending_is_nonce_bound_without_changing_legacy_stage_encoding() {
+        let legacy: BranchPrepareStage =
+            serde_json::from_str("\"manifest_published\"").expect("legacy stage decodes");
+        assert_eq!(legacy, BranchPrepareStage::ManifestPublished);
+
+        let nonce = ActivationNonce::new();
+        let encoded = serde_json::to_value(BranchPrepareStage::ActivationPending { nonce })
+            .expect("activation stage encodes");
+        assert_eq!(
+            encoded,
+            serde_json::json!({"activation_pending": {"nonce": nonce}})
+        );
+        assert_eq!(
+            serde_json::from_value::<BranchPrepareStage>(encoded)
+                .expect("activation stage decodes"),
+            BranchPrepareStage::ActivationPending { nonce }
+        );
+    }
 }
