@@ -116,7 +116,7 @@ use crate::cache::{
     DiskCache,
 };
 use crate::compaction::background::{
-    start_compaction_thread, CompactionLifecycle, CompactionThreadOptions,
+    start_compaction_thread, CompactionLifecycle, CompactionThreadOptions, GovernedDeletionWorker,
 };
 use crate::compaction::Compactor;
 use crate::config::{Config, CpuBudget, SecurityMode, StorageBackend};
@@ -649,6 +649,15 @@ async fn build_app_with_entitlement_resolver(
         clock.clone(),
     ));
     let compaction_lifecycle = CompactionLifecycle::new();
+    let deletion_worker = GovernedDeletionWorker::new(
+        store.clone(),
+        namespace_manager.clone(),
+        lease_manager.clone(),
+        clock.clone(),
+        manifest_cache.clone(),
+        &config,
+        security.clone(),
+    );
 
     // Spawn background compaction on a dedicated runtime (CPU isolation from queries)
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -659,6 +668,7 @@ async fn build_app_with_entitlement_resolver(
         manifest_cache.clone(),
         lease_manager.clone(),
         cache.clone(),
+        deletion_worker,
         compaction_lifecycle.clone(),
         CompactionThreadOptions {
             compaction_workers: cpu_budget.compaction_workers,

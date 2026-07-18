@@ -17,12 +17,13 @@ use crate::cache::manifest_cache::ManifestCache;
 use crate::config::{BranchingConfig, IndexingConfig};
 use crate::error::{Result, ZeppelinError};
 use crate::namespace::branch_root::{
-    insert_branch_root_with_lease, remove_branch_root, source_data_plane_config_digest,
+    insert_branch_root_with_lease, remove_branch_root_with_lease, source_data_plane_config_digest,
     InsertBranchRootRequest, RemoveBranchRootRequest,
 };
 use crate::namespace::branching::deletion::{
-    persist_branch_visibility_removal, AuthorizedNamespaceDelete, DeletionBoundary,
-    DeletionLifecycleEvent,
+    load_deletion_decision_evidence, persist_branch_visibility_removal,
+    persist_deletion_decision_evidence, AuthorizedNamespaceDelete, DeletionBoundary,
+    DeletionDecision, DeletionGovernance, DeletionLifecycleEvent,
 };
 use crate::namespace::branching::{
     ArtifactOrigin, BranchDescriptor, BranchError, BranchListRequest, BranchMaintenanceReport,
@@ -31,12 +32,13 @@ use crate::namespace::branching::{
     PrepareForkRequest, PreparedBranch,
 };
 use crate::namespace::manager::{
-    CompactionHealth, NamespaceIndexConfig, NamespaceManager, NamespaceMetadata, NamespaceState,
-    ReserveMetadataOutcome, RootReleaseState,
+    CompactionHealth, GovernedDeletionIdentity, NamespaceDestructionRecord, NamespaceIndexConfig,
+    NamespaceManager, NamespaceMetadata, NamespaceState, ReserveMetadataOutcome, RootReleaseState,
 };
 use crate::namespace::{
     BranchId, BranchRoot, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
 };
+use crate::storage::CreateOnlyOutcome;
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
 use crate::wal::manifest::{BranchLineageSeed, PreparedManifestPublication, PreparedZeroCopyFork};
@@ -120,121 +122,176 @@ impl NamespaceGraph {
         &self,
         request: AuthorizedNamespaceDelete,
     ) -> Result<NamespaceDeleteOutcome> {
-        let name = request.namespace.as_str();
-        let (preservation, _head_proof) = request
-            .governance
-            .preservation_boundary(&request.namespace, DeletionBoundary::Fence)
-            .await?;
-        if preservation.is_locked() {
-            return Err(crate::security::SecurityError::PreservationLocked.into());
-        }
+        let AuthorizedNamespaceDelete {
+            namespace,
+            decision: requested_decision,
+            governance,
+        } = request;
+        let name = namespace.as_str();
         let (metadata, _) = self.namespace_manager.read_metadata_versioned(name).await?;
-        if matches!(metadata.state, NamespaceState::Deleting) {
+        if metadata.state == NamespaceState::Deleting {
+            return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
+        }
+        if metadata.state != NamespaceState::Active {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {namespace} is not active for governed deletion"
+            )));
+        }
+        let (manifest, _) = Manifest::read_versioned_required(&self.store, name).await?;
+        if !manifest.branch_roots().is_empty() {
+            self.require_child_disclosure(&manifest, governance.as_ref())?;
+            return Err(self.live_child_error(&metadata, &namespace));
+        }
+
+        let parent_root = self.deletion_parent_root(&metadata, &namespace).await?;
+        let decision = match metadata.deletion_intent.as_ref() {
+            Some(intent) => {
+                if intent.parent_root != parent_root {
+                    return Err(ZeppelinError::Validation(format!(
+                        "namespace {namespace} deletion intent has a stale parent root"
+                    )));
+                }
+                load_deletion_decision_evidence(&self.store, &intent.decision_evidence_ref).await?
+            }
+            None => {
+                persist_deletion_decision_evidence(&self.store, &requested_decision)
+                    .await
+                    .map_err(Self::map_audit_evidence_error)?;
+                requested_decision
+            }
+        };
+        let intent_meta = self
+            .namespace_manager
+            .install_deletion_intent(name, decision.decision_evidence_ref.clone(), parent_root)
+            .await?;
+        let intent = intent_meta.deletion_intent.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "namespace {namespace} did not persist its deletion intent"
+            ))
+        })?;
+        let destruction_key = intent.destruction_record_key.clone();
+        let decision_evidence_ref = intent.decision_evidence_ref.clone();
+        let lease = self.lease_manager.acquire(name).await?;
+        let result = self
+            .delete_active_under_lease(
+                &namespace,
+                &decision,
+                governance,
+                destruction_key,
+                decision_evidence_ref,
+                lease.clone(),
+                true,
+            )
+            .await;
+        if let Err(error) = self.lease_manager.release(name, &lease).await {
+            warn!(
+                namespace = %namespace,
+                error = %error,
+                "namespace deletion lease release failed (best-effort)"
+            );
+        }
+        result
+    }
+
+    async fn delete_active_under_lease(
+        &self,
+        namespace: &NamespaceId,
+        decision: &DeletionDecision,
+        governance: Arc<dyn DeletionGovernance>,
+        destruction_key: String,
+        decision_evidence_ref: String,
+        lease: Lease,
+        disclose_conflict: bool,
+    ) -> Result<NamespaceDeleteOutcome> {
+        let name = namespace.as_str();
+        let (metadata, _) = self.namespace_manager.read_metadata_versioned(name).await?;
+        if metadata.state == NamespaceState::Deleting {
             return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
         }
         let (manifest, _) = Manifest::read_versioned_required(&self.store, name).await?;
         if !manifest.branch_roots().is_empty() {
-            if let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind {
-                if metadata.branch_identity.is_some() && !manifest.branch_roots().is_empty() {
-                    // Child roots are checked against the target manifest below;
-                    // the source root itself is not a child of the target.
-                    let target_manifest = Manifest::read_versioned_required_for_incarnation(
-                        &self.store,
-                        name,
-                        reservation.target_incarnation.as_uuid(),
-                    )
-                    .await
-                    .ok()
-                    .map(|(value, _)| value);
-                    if target_manifest
-                        .as_ref()
-                        .is_some_and(|value| !value.branch_roots().is_empty())
-                    {
-                        return Err(BranchError::BranchHasLiveChildren {
-                            branch_id: reservation.branch_id,
-                        }
-                        .into());
-                    }
-                }
+            if disclose_conflict {
+                self.require_child_disclosure(&manifest, governance.as_ref())?;
             }
-            return Err(BranchError::NamespaceHasLiveBranches {
-                namespace: request.namespace.to_string(),
-            }
-            .into());
+            self.namespace_manager
+                .clear_unfenced_deletion_intent(name, &decision_evidence_ref)
+                .await?;
+            return Err(self.live_child_error(&metadata, namespace));
         }
-        if let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind {
-            let identity =
-                metadata
-                    .branch_identity
-                    .as_ref()
-                    .ok_or(BranchError::BranchRootMismatch {
-                        branch_id: reservation.branch_id,
-                    })?;
-            if identity.branch_id != reservation.branch_id
-                || identity.target_namespace != request.namespace
-                || identity.target_incarnation != reservation.target_incarnation
-            {
-                return Err(BranchError::BranchRootMismatch {
-                    branch_id: reservation.branch_id,
-                }
-                .into());
-            }
-            // Branch deletion is deliberately trailing-intent: keep the
-            // parent root and target visibility until resume has persisted a
-            // marker and waited through the reader-safety grace period.
-            self.namespace_manager.prepare_governed_delete(name).await?;
-            return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
-        } else {
-            self.namespace_manager.delete(name).await?;
-        }
-        Ok(NamespaceDeleteOutcome::Deleted)
-    }
 
-    /// Resume cleanup for a durable deleting tombstone.
-    ///
-    /// This is the retry seam used by background maintenance.  It only
-    /// completes ordinary namespaces whose live manifest has already been
-    /// removed; branch targets remain governed by the marker/grace/root
-    /// release protocol and are rejected until that protocol is installed.
-    pub(crate) async fn resume_delete(
-        &self,
-        namespace: &NamespaceId,
-        governance: Arc<dyn crate::namespace::branching::deletion::DeletionGovernance>,
-        budget: Duration,
-    ) -> Result<NamespaceDeleteOutcome> {
-        let (preservation, _head_proof) = governance
-            .preservation_boundary(namespace, DeletionBoundary::CleanupBatch)
+        let (guard, head_proof) = governance
+            .preservation_boundary(namespace, DeletionBoundary::Fence)
             .await?;
-        if preservation.is_locked() {
+        if guard.is_locked() {
             return Err(crate::security::SecurityError::PreservationLocked.into());
         }
-        let metadata = self
-            .namespace_manager
-            .read_metadata_versioned(namespace.as_str())
-            .await?
-            .0;
-        if metadata.state != NamespaceState::Deleting {
-            return Err(ZeppelinError::Validation(format!(
-                "namespace {} is not marked deleting",
-                namespace
-            )));
+        let fenced = match Manifest::fence_for_destruction_with_lease(
+            &self.store,
+            &self.lease_manager,
+            &lease,
+            name,
+            &destruction_key,
+        )
+        .await
+        {
+            Ok((manifest, _renewed)) => manifest,
+            Err(ZeppelinError::Branch(error))
+                if matches!(error.as_ref(), BranchError::NamespaceHasLiveBranches { .. }) =>
+            {
+                self.namespace_manager
+                    .clear_unfenced_deletion_intent(name, &decision_evidence_ref)
+                    .await?;
+                let (latest, _) = self.namespace_manager.read_metadata_versioned(name).await?;
+                if disclose_conflict {
+                    let (latest_manifest, _) =
+                        Manifest::read_versioned_required(&self.store, name).await?;
+                    self.require_child_disclosure(&latest_manifest, governance.as_ref())?;
+                }
+                return Err(self.live_child_error(&latest, namespace));
+            }
+            Err(error) => return Err(error),
+        };
+        self.namespace_manager
+            .record_fenced_generation(name, &decision_evidence_ref, fenced.version())
+            .await?;
+        let (metadata, _) = self.namespace_manager.read_metadata_versioned(name).await?;
+        let intent = metadata.deletion_intent.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "namespace {namespace} lost its fenced deletion intent"
+            ))
+        })?;
+        self.ensure_destruction_evidence(
+            namespace,
+            &metadata,
+            intent,
+            decision,
+            fenced.version(),
+            head_proof,
+        )
+        .await
+        .map_err(Self::map_audit_evidence_error)?;
+
+        let (guard, _) = governance
+            .preservation_boundary(namespace, DeletionBoundary::Tombstone)
+            .await?;
+        if guard.is_locked() {
+            return Err(crate::security::SecurityError::PreservationLocked.into());
         }
-        if matches!(metadata.creation_kind, NamespaceCreationKind::Fork(_)) {
-            let reservation = match &metadata.creation_kind {
-                NamespaceCreationKind::Fork(reservation) => reservation,
-                NamespaceCreationKind::Root => unreachable!(),
-            };
-            let branch_id = metadata
-                .branch_identity
-                .as_ref()
-                .map(|identity| identity.branch_id)
-                .unwrap_or(reservation.branch_id);
-            let incarnation = metadata.incarnation_id.ok_or_else(|| {
-                ZeppelinError::Serialization(format!(
-                    "branch namespace {} has no incarnation for visibility marker",
-                    namespace
-                ))
-            })?;
+        self.namespace_manager
+            .tombstone_with_intent(name, &decision_evidence_ref)
+            .await?;
+        let (guard, _) = governance
+            .preservation_boundary(namespace, DeletionBoundary::VisibilityRemoval)
+            .await?;
+        if guard.is_locked() {
+            return Err(crate::security::SecurityError::PreservationLocked.into());
+        }
+        self.namespace_manager
+            .remove_governed_live_manifest(name)
+            .await?;
+        self.manifest_cache.invalidate_at(name, self.clock.now());
+
+        if let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind {
             let floor_secs = self.gc_horizon_floor_secs.ok_or_else(|| {
                 ZeppelinError::Validation(
                     "branch deletion requires a checked GC horizon floor".to_string(),
@@ -243,153 +300,762 @@ impl NamespaceGraph {
             let visibility = persist_branch_visibility_removal(
                 &self.store,
                 namespace,
-                branch_id,
-                incarnation,
+                reservation.branch_id,
+                intent.incarnation.clone(),
                 Duration::from_secs(floor_secs),
             )
             .await?;
             self.namespace_manager
-                .record_visibility_removal(namespace.as_str(), visibility)
+                .record_visibility_removal(name, visibility)
                 .await?;
-            let (meta_after, _) = self
-                .namespace_manager
-                .read_metadata_versioned(namespace.as_str())
-                .await?;
-            let intent = meta_after.deletion_intent.as_ref().ok_or_else(|| {
+        }
+        Ok(NamespaceDeleteOutcome::AlreadyDeleting)
+    }
+
+    fn require_child_disclosure(
+        &self,
+        manifest: &Manifest,
+        governance: &dyn DeletionGovernance,
+    ) -> Result<()> {
+        for root in manifest.branch_roots().values() {
+            let _visible = governance.disclose_child(&root.target_namespace)?;
+        }
+        Ok(())
+    }
+
+    fn live_child_error(
+        &self,
+        metadata: &NamespaceMetadata,
+        namespace: &NamespaceId,
+    ) -> ZeppelinError {
+        match &metadata.creation_kind {
+            NamespaceCreationKind::Fork(reservation) => BranchError::BranchHasLiveChildren {
+                branch_id: reservation.branch_id,
+            }
+            .into(),
+            NamespaceCreationKind::Root => BranchError::NamespaceHasLiveBranches {
+                namespace: namespace.to_string(),
+            }
+            .into(),
+        }
+    }
+
+    async fn deletion_parent_root(
+        &self,
+        metadata: &NamespaceMetadata,
+        namespace: &NamespaceId,
+    ) -> Result<Option<BranchRoot>> {
+        let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind else {
+            return Ok(None);
+        };
+        let identity =
+            metadata
+                .branch_identity
+                .as_ref()
+                .ok_or(BranchError::BranchRootMismatch {
+                    branch_id: reservation.branch_id,
+                })?;
+        if identity.branch_id != reservation.branch_id
+            || identity.target_namespace != *namespace
+            || identity.target_incarnation != reservation.target_incarnation
+        {
+            return Err(BranchError::BranchRootMismatch {
+                branch_id: reservation.branch_id,
+            }
+            .into());
+        }
+        let (parent_manifest, _) = Manifest::read_versioned_required_for_incarnation(
+            &self.store,
+            reservation.source_namespace.as_str(),
+            reservation.source_incarnation.as_uuid(),
+        )
+        .await?;
+        let root = parent_manifest
+            .branch_roots()
+            .get(&reservation.branch_id)
+            .cloned()
+            .ok_or(BranchError::BranchRootMissing {
+                branch_id: reservation.branch_id,
+            })?;
+        if root.target_namespace != *namespace
+            || root.target_incarnation != reservation.target_incarnation
+        {
+            return Err(BranchError::BranchRootMismatch {
+                branch_id: reservation.branch_id,
+            }
+            .into());
+        }
+        Ok(Some(root))
+    }
+
+    async fn ensure_destruction_evidence(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        intent: &crate::namespace::manager::NamespaceDeletionIntent,
+        decision: &DeletionDecision,
+        fenced_generation: u64,
+        preservation_head: crate::security::PreservationHeadProof,
+    ) -> Result<NamespaceDestructionRecord> {
+        let key = &intent.destruction_record_key;
+        match self.store.get(key).await {
+            Ok(bytes) => {
+                let existing = NamespaceDestructionRecord::from_bytes(&bytes)?;
+                self.validate_destruction_evidence(
+                    namespace, metadata, intent, decision, &existing,
+                )?;
+                return Ok(existing);
+            }
+            Err(ZeppelinError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+
+        let (object_count, byte_count) = self
+            .namespace_destruction_census(namespace.as_str())
+            .await?;
+        let record = NamespaceDestructionRecord {
+            namespace: namespace.clone(),
+            manifest_version_destroyed: fenced_generation,
+            object_count,
+            byte_count,
+            actor: decision.actor.clone(),
+            approver: decision.approver.clone(),
+            decision_id: decision.decision_id,
+            parent_root: intent.parent_root.clone(),
+            incarnation: Some(intent.incarnation.clone()),
+            preservation_head: Some(preservation_head),
+            ts: self.clock.now(),
+        };
+        let body = record.to_bytes()?;
+        match self.store.put_create_outcome(key, body).await? {
+            CreateOnlyOutcome::Created { .. } => {
+                let (verified_count, verified_bytes) = self
+                    .namespace_destruction_census(namespace.as_str())
+                    .await?;
+                if verified_count != object_count || verified_bytes != byte_count {
+                    return Err(ZeppelinError::ManifestConflict {
+                        namespace: namespace.to_string(),
+                    });
+                }
+                Ok(record)
+            }
+            CreateOnlyOutcome::AlreadyExists => {
+                let existing = NamespaceDestructionRecord::from_bytes(&self.store.get(key).await?)?;
+                self.validate_destruction_evidence(
+                    namespace, metadata, intent, decision, &existing,
+                )?;
+                Ok(existing)
+            }
+        }
+    }
+
+    fn validate_destruction_evidence(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        intent: &crate::namespace::manager::NamespaceDeletionIntent,
+        decision: &DeletionDecision,
+        evidence: &NamespaceDestructionRecord,
+    ) -> Result<()> {
+        let metadata_incarnation = metadata.incarnation_id.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "namespace {namespace} deletion metadata omitted its incarnation"
+            ))
+        })?;
+        if metadata_incarnation != &intent.incarnation
+            || metadata
+                .destruction_record_key
+                .as_ref()
+                .is_some_and(|key| key != &intent.destruction_record_key)
+            || intent.fenced_generation != Some(evidence.manifest_version_destroyed)
+            || evidence.namespace != *namespace
+            || evidence.parent_root != intent.parent_root
+            || evidence.incarnation.as_ref() != Some(&intent.incarnation)
+            || evidence.actor != decision.actor
+            || evidence.approver != decision.approver
+            || evidence.decision_id != decision.decision_id
+            || evidence.preservation_head.is_none()
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {namespace} destruction evidence does not match its durable deletion intent"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn load_bound_destruction_evidence(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        intent: &crate::namespace::manager::NamespaceDeletionIntent,
+    ) -> Result<(DeletionDecision, NamespaceDestructionRecord)> {
+        let decision =
+            load_deletion_decision_evidence(&self.store, &intent.decision_evidence_ref).await?;
+        let evidence = NamespaceDestructionRecord::from_bytes(
+            &self.store.get(&intent.destruction_record_key).await?,
+        )?;
+        self.validate_destruction_evidence(namespace, metadata, intent, &decision, &evidence)?;
+        Ok((decision, evidence))
+    }
+
+    async fn namespace_destruction_census(&self, namespace: &str) -> Result<(usize, u64)> {
+        let objects = self
+            .store
+            .list_prefix_meta(&format!("{namespace}/"))
+            .await?;
+        let byte_count = objects.iter().try_fold(0_u64, |total, object| {
+            total.checked_add(object.size).ok_or_else(|| {
                 ZeppelinError::Validation(format!(
-                    "branch namespace {} lost its deletion intent",
-                    namespace
+                    "namespace {namespace} destruction census byte count overflowed"
+                ))
+            })
+        })?;
+        Ok((objects.len(), byte_count))
+    }
+
+    fn map_audit_evidence_error(error: ZeppelinError) -> ZeppelinError {
+        match error {
+            ZeppelinError::Storage(_) => crate::security::SecurityError::AuditUnavailable.into(),
+            error => error,
+        }
+    }
+
+    /// Resume one durable governed-deletion state machine.
+    ///
+    /// Request-spawned cleanup, periodic maintenance, and graph maintenance all
+    /// enter here. Every destructive batch has its own strong preservation
+    /// boundary, branch roots are released before target cleanup, and metadata
+    /// remains the final target-owned object.
+    pub(crate) async fn resume_delete(
+        &self,
+        namespace: &NamespaceId,
+        governance: Arc<dyn DeletionGovernance>,
+        budget: Duration,
+    ) -> Result<NamespaceDeleteOutcome> {
+        let (mut metadata, _) = self
+            .namespace_manager
+            .read_metadata_versioned(namespace.as_str())
+            .await?;
+
+        if metadata.state == NamespaceState::Active {
+            let intent = metadata.deletion_intent.clone().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "namespace {namespace} has no governed deletion intent to resume"
                 ))
             })?;
-            let decision_evidence_ref = intent.decision_evidence_ref.clone();
-            if matches!(
+            let decision =
+                load_deletion_decision_evidence(&self.store, &intent.decision_evidence_ref).await?;
+            let lease = self.lease_manager.acquire(namespace.as_str()).await?;
+            let result = self
+                .delete_active_under_lease(
+                    namespace,
+                    &decision,
+                    Arc::clone(&governance),
+                    intent.destruction_record_key,
+                    intent.decision_evidence_ref,
+                    lease.clone(),
+                    false,
+                )
+                .await;
+            if let Err(error) = self.lease_manager.release(namespace.as_str(), &lease).await {
+                warn!(
+                    namespace = %namespace,
+                    error = %error,
+                    "resumed namespace deletion lease release failed (best-effort)"
+                );
+            }
+            result?;
+            metadata = self
+                .namespace_manager
+                .read_metadata_versioned(namespace.as_str())
+                .await?
+                .0;
+        }
+
+        if metadata.state != NamespaceState::Deleting {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {namespace} is not in a resumable governed deletion state"
+            )));
+        }
+
+        if metadata.deletion_intent.is_none() {
+            return self
+                .finish_legacy_deleting_cleanup(namespace, &metadata, governance, budget)
+                .await;
+        }
+
+        self.resume_deleting(namespace, metadata, governance, budget)
+            .await
+    }
+
+    async fn finish_legacy_deleting_cleanup(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        governance: Arc<dyn DeletionGovernance>,
+        budget: Duration,
+    ) -> Result<NamespaceDeleteOutcome> {
+        if !matches!(metadata.creation_kind, NamespaceCreationKind::Root) {
+            return Err(ZeppelinError::Validation(format!(
+                "branch namespace {namespace} cannot resume without a governed deletion intent"
+            )));
+        }
+        let expected_incarnation = metadata.incarnation_id.clone();
+        let started = Instant::now();
+        loop {
+            self.require_unlocked_boundary(
+                governance.as_ref(),
+                namespace,
+                DeletionBoundary::CleanupBatch,
+            )
+            .await?;
+            let outcome = self
+                .namespace_manager
+                .cleanup_legacy_delete_batch(
+                    namespace.as_str(),
+                    expected_incarnation.as_ref(),
+                    Duration::ZERO,
+                )
+                .await?;
+            if outcome.complete {
+                break;
+            }
+            if started.elapsed() >= budget {
+                return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
+            }
+        }
+        self.require_unlocked_boundary(
+            governance.as_ref(),
+            namespace,
+            DeletionBoundary::MetadataRemoval,
+        )
+        .await?;
+        self.namespace_manager
+            .remove_legacy_deletion_metadata(namespace.as_str(), expected_incarnation.as_ref())
+            .await?;
+        self.manifest_cache
+            .invalidate_at(namespace.as_str(), self.clock.now());
+        Ok(NamespaceDeleteOutcome::Deleted)
+    }
+
+    async fn resume_deleting(
+        &self,
+        namespace: &NamespaceId,
+        mut metadata: NamespaceMetadata,
+        governance: Arc<dyn DeletionGovernance>,
+        budget: Duration,
+    ) -> Result<NamespaceDeleteOutcome> {
+        let mut intent = metadata.deletion_intent.clone().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "namespace {namespace} deletion tombstone omitted its durable intent"
+            ))
+        })?;
+        let (_decision, evidence) = self
+            .load_bound_destruction_evidence(namespace, &metadata, &intent)
+            .await?;
+
+        if let Some(manifest) = Manifest::read(&self.store, namespace.as_str()).await? {
+            manifest.require_destruction_fence(
+                namespace.as_str(),
+                &intent.destruction_record_key,
+                evidence.manifest_version_destroyed,
+            )?;
+            self.require_unlocked_boundary(
+                governance.as_ref(),
+                namespace,
+                DeletionBoundary::VisibilityRemoval,
+            )
+            .await?;
+            self.namespace_manager
+                .remove_governed_live_manifest(namespace.as_str())
+                .await?;
+            self.manifest_cache
+                .invalidate_at(namespace.as_str(), self.clock.now());
+        }
+
+        if matches!(metadata.creation_kind, NamespaceCreationKind::Fork(_)) {
+            metadata = self
+                .ensure_branch_visibility_removal(namespace, &metadata)
+                .await?;
+            intent = metadata.deletion_intent.clone().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "branch namespace {namespace} lost its deletion intent"
+                ))
+            })?;
+            if !matches!(
                 intent.root_release,
                 Some(RootReleaseState::Released { .. } | RootReleaseState::Converged { .. })
             ) {
-                let outcome = self
-                    .namespace_manager
-                    .finish_delete(namespace.as_str(), budget)
+                let visibility = intent.visibility.as_ref().ok_or_else(|| {
+                    ZeppelinError::Validation(format!(
+                        "branch namespace {namespace} has no persisted visibility deadline"
+                    ))
+                })?;
+                if self.clock.now() < visibility.not_before {
+                    return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
+                }
+                self.release_branch_root(namespace, &metadata, Arc::clone(&governance))
                     .await?;
-                return Ok(if outcome.complete {
-                    NamespaceDeleteOutcome::Deleted
-                } else {
-                    NamespaceDeleteOutcome::AlreadyDeleting
-                });
+                metadata = self
+                    .namespace_manager
+                    .read_metadata_versioned(namespace.as_str())
+                    .await?
+                    .0;
+                intent = metadata.deletion_intent.clone().ok_or_else(|| {
+                    ZeppelinError::Validation(format!(
+                        "branch namespace {namespace} lost its root-release acknowledgement"
+                    ))
+                })?;
             }
-            let destruction_key = intent.destruction_record_key.clone();
-            Manifest::fence_for_destruction(&self.store, namespace.as_str(), &destruction_key)
+            self.require_released_branch_root_absent(namespace, &metadata, &intent)
                 .await?;
-            let visibility = intent.visibility.as_ref().ok_or_else(|| {
-                ZeppelinError::Validation(format!(
-                    "branch namespace {} has no persisted visibility deadline",
-                    namespace
-                ))
-            })?;
-            if self.clock.now() < visibility.not_before {
-                return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
+        }
+
+        self.finish_deleting_cleanup(namespace, &intent, governance, budget)
+            .await
+    }
+
+    async fn ensure_branch_visibility_removal(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+    ) -> Result<NamespaceMetadata> {
+        if Manifest::read(&self.store, namespace.as_str())
+            .await?
+            .is_some()
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "branch namespace {namespace} visibility marker requires live manifest removal"
+            )));
+        }
+        let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind else {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {namespace} is not a branch target"
+            )));
+        };
+        let intent = metadata.deletion_intent.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "branch namespace {namespace} has no deletion intent"
+            ))
+        })?;
+        let floor_secs = self.gc_horizon_floor_secs.ok_or_else(|| {
+            ZeppelinError::Validation(
+                "branch deletion requires a checked GC horizon floor".to_string(),
+            )
+        })?;
+        let visibility = persist_branch_visibility_removal(
+            &self.store,
+            namespace,
+            reservation.branch_id,
+            intent.incarnation.clone(),
+            Duration::from_secs(floor_secs),
+        )
+        .await?;
+        self.namespace_manager
+            .record_visibility_removal(namespace.as_str(), visibility)
+            .await?;
+        self.namespace_manager
+            .read_metadata_versioned(namespace.as_str())
+            .await
+            .map(|(metadata, _)| metadata)
+    }
+
+    async fn release_branch_root(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        governance: Arc<dyn DeletionGovernance>,
+    ) -> Result<()> {
+        let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind else {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {namespace} is not a branch target"
+            )));
+        };
+        let intent = metadata.deletion_intent.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "branch namespace {namespace} has no deletion intent"
+            ))
+        })?;
+        let visibility = intent.visibility.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "branch namespace {namespace} has no persisted visibility removal"
+            ))
+        })?;
+        if self.clock.now() < visibility.not_before {
+            return Err(ZeppelinError::Validation(format!(
+                "branch namespace {namespace} reader-safety grace has not elapsed"
+            )));
+        }
+        let expected_root = intent.parent_root.clone().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "branch namespace {namespace} has no exact parent root"
+            ))
+        })?;
+        let source_namespace = reservation.source_namespace.clone();
+        let source_incarnation = reservation.source_incarnation.clone();
+        let decision_evidence_ref = intent.decision_evidence_ref.clone();
+        let parent_lease = self
+            .lease_manager
+            .acquire(source_namespace.as_str())
+            .await?;
+        let result = async {
+            let (parent_metadata, _) = self
+                .namespace_manager
+                .read_metadata_versioned(source_namespace.as_str())
+                .await?;
+            if parent_metadata.state != NamespaceState::Active
+                || parent_metadata.incarnation_id.as_ref() != Some(&source_incarnation)
+            {
+                return Err(ZeppelinError::Validation(format!(
+                    "branch namespace {namespace} parent incarnation changed before root release"
+                )));
             }
-            let parent_root = intent.parent_root.clone().ok_or_else(|| {
-                ZeppelinError::Validation(format!(
-                    "branch namespace {} has no exact parent root",
-                    namespace
-                ))
-            })?;
-            let source_namespace = match &metadata.creation_kind {
-                NamespaceCreationKind::Fork(reservation) => reservation.source_namespace.clone(),
-                NamespaceCreationKind::Root => unreachable!(),
-            };
-            let source_incarnation = match &metadata.creation_kind {
-                NamespaceCreationKind::Fork(reservation) => reservation.source_incarnation.clone(),
-                NamespaceCreationKind::Root => unreachable!(),
-            };
             let (parent_manifest, _) = Manifest::read_versioned_required_for_incarnation(
                 &self.store,
                 source_namespace.as_str(),
                 source_incarnation.as_uuid(),
             )
             .await?;
-            if let Some(current_root) = parent_manifest.branch_roots().get(&parent_root.branch_id) {
-                if current_root != &parent_root {
-                    return Err(ZeppelinError::Validation(format!(
-                        "parent root for branch {} changed before release",
-                        namespace
-                    )));
-                }
-                remove_branch_root(
+            let root_was_present =
+                match parent_manifest.branch_roots().get(&expected_root.branch_id) {
+                    Some(current) if current == &expected_root => true,
+                    Some(_) => {
+                        return Err(BranchError::BranchRootMismatch {
+                            branch_id: expected_root.branch_id,
+                        }
+                        .into())
+                    }
+                    None => false,
+                };
+
+            let (current_target, _) = self
+                .namespace_manager
+                .read_metadata_versioned(namespace.as_str())
+                .await?;
+            let current_intent = current_target.deletion_intent.as_ref().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "branch namespace {namespace} lost its deletion intent before root release"
+                ))
+            })?;
+            if current_intent != intent || self.clock.now() < visibility.not_before {
+                return Err(ZeppelinError::Validation(format!(
+                    "branch namespace {namespace} deletion intent changed before root release"
+                )));
+            }
+            self.load_bound_destruction_evidence(namespace, &current_target, current_intent)
+                .await?;
+            let floor_secs = self.gc_horizon_floor_secs.ok_or_else(|| {
+                ZeppelinError::Validation(
+                    "branch deletion requires a checked GC horizon floor".to_string(),
+                )
+            })?;
+            let marker = persist_branch_visibility_removal(
+                &self.store,
+                namespace,
+                reservation.branch_id,
+                current_intent.incarnation.clone(),
+                Duration::from_secs(floor_secs),
+            )
+            .await?;
+            if &marker != visibility {
+                return Err(ZeppelinError::Validation(format!(
+                    "branch namespace {namespace} visibility marker changed before root release"
+                )));
+            }
+
+            self.require_unlocked_boundary(
+                governance.as_ref(),
+                namespace,
+                DeletionBoundary::RootRelease,
+            )
+            .await?;
+            self.require_unlocked_boundary(
+                governance.as_ref(),
+                &source_namespace,
+                DeletionBoundary::RootRelease,
+            )
+            .await?;
+
+            if root_was_present {
+                remove_branch_root_with_lease(
                     &self.store,
                     &self.namespace_manager,
                     &self.lease_manager,
+                    &parent_lease,
                     RemoveBranchRootRequest {
-                        source_namespace,
-                        expected_root: parent_root,
+                        source_namespace: source_namespace.clone(),
+                        expected_root,
                     },
                 )
                 .await?;
-                self.namespace_manager
-                    .record_root_release(
-                        namespace.as_str(),
-                        RootReleaseState::Released {
-                            acked_at: self.clock.now(),
-                        },
-                    )
-                    .await?;
-                governance
-                    .settle_lifecycle_audit(DeletionLifecycleEvent::RootRelease {
-                        namespace: namespace.clone(),
-                        converged: false,
-                        decision_evidence_ref: decision_evidence_ref.clone(),
-                    })
-                    .await?;
-            } else {
-                self.namespace_manager
-                    .record_root_release(
-                        namespace.as_str(),
-                        RootReleaseState::Converged {
-                            observed_at: self.clock.now(),
-                        },
-                    )
-                    .await?;
-                governance
-                    .settle_lifecycle_audit(DeletionLifecycleEvent::RootRelease {
-                        namespace: namespace.clone(),
-                        converged: true,
-                        decision_evidence_ref: decision_evidence_ref.clone(),
-                    })
-                    .await?;
             }
+            governance
+                .settle_lifecycle_audit(DeletionLifecycleEvent::RootRelease {
+                    namespace: namespace.clone(),
+                    converged: !root_was_present,
+                    decision_evidence_ref,
+                })
+                .await?;
+            let release = if root_was_present {
+                RootReleaseState::Released {
+                    acked_at: self.clock.now(),
+                }
+            } else {
+                RootReleaseState::Converged {
+                    observed_at: self.clock.now(),
+                }
+            };
+            self.namespace_manager
+                .record_root_release(namespace.as_str(), release)
+                .await
+        }
+        .await;
+        if let Err(error) = self
+            .lease_manager
+            .release(source_namespace.as_str(), &parent_lease)
+            .await
+        {
+            warn!(
+                namespace = %source_namespace,
+                error = %error,
+                "branch root-release lease release failed (best-effort)"
+            );
+        }
+        result
+    }
+
+    async fn require_released_branch_root_absent(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        intent: &crate::namespace::manager::NamespaceDeletionIntent,
+    ) -> Result<()> {
+        if !matches!(
+            intent.root_release,
+            Some(RootReleaseState::Released { .. } | RootReleaseState::Converged { .. })
+        ) {
+            return Err(ZeppelinError::Validation(format!(
+                "branch namespace {namespace} cleanup requires final root release"
+            )));
+        }
+        let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind else {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {namespace} is not a branch target"
+            )));
+        };
+        let expected_root = intent.parent_root.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "branch namespace {namespace} has no exact parent root"
+            ))
+        })?;
+        // Root release is the durable authorization to clean target-owned
+        // artifacts. The source may itself finish deletion after that release,
+        // so a missing parent manifest is proof that the released root is no
+        // longer live rather than an error. If the source was recreated, its
+        // current manifest is still authoritative: any reuse of this branch ID
+        // must fail closed instead of allowing cleanup through an ambiguous
+        // root.
+        let Some(parent_manifest) =
+            Manifest::read(&self.store, reservation.source_namespace.as_str()).await?
+        else {
+            return Ok(());
+        };
+        if let Some(current) = parent_manifest.branch_roots().get(&expected_root.branch_id) {
+            if current != expected_root {
+                return Err(BranchError::BranchRootMismatch {
+                    branch_id: expected_root.branch_id,
+                }
+                .into());
+            }
+            return Err(ZeppelinError::Validation(format!(
+                "branch namespace {namespace} root-release acknowledgement exists while the parent root is still live"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn finish_deleting_cleanup(
+        &self,
+        namespace: &NamespaceId,
+        intent: &crate::namespace::manager::NamespaceDeletionIntent,
+        governance: Arc<dyn DeletionGovernance>,
+        budget: Duration,
+    ) -> Result<NamespaceDeleteOutcome> {
+        let identity = GovernedDeletionIdentity::from_intent(intent)?;
+        let started = Instant::now();
+        loop {
+            self.require_unlocked_boundary(
+                governance.as_ref(),
+                namespace,
+                DeletionBoundary::CleanupBatch,
+            )
+            .await?;
             let outcome = self
                 .namespace_manager
-                .finish_delete(namespace.as_str(), budget)
+                .cleanup_governed_delete_batch(namespace.as_str(), &identity, Duration::ZERO)
                 .await?;
-            return Ok(if outcome.complete {
-                NamespaceDeleteOutcome::Deleted
-            } else {
-                NamespaceDeleteOutcome::AlreadyDeleting
-            });
-        }
-        let outcome = self
-            .namespace_manager
-            .finish_delete(namespace.as_str(), budget)
-            .await?;
-        if outcome.complete {
-            Ok(NamespaceDeleteOutcome::Deleted)
-        } else {
+            if outcome.complete {
+                break;
+            }
             governance
                 .settle_lifecycle_audit(DeletionLifecycleEvent::CleanupIncomplete {
                     namespace: namespace.clone(),
-                    remaining: outcome.deleted.saturating_add(1),
-                    decision_evidence_ref: metadata
-                        .deletion_intent
-                        .as_ref()
-                        .map(|intent| intent.decision_evidence_ref.clone())
-                        .unwrap_or_default(),
+                    remaining: 1,
+                    decision_evidence_ref: intent.decision_evidence_ref.clone(),
                 })
                 .await?;
-            Ok(NamespaceDeleteOutcome::AlreadyDeleting)
+            if started.elapsed() >= budget {
+                return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
+            }
         }
+
+        self.require_unlocked_boundary(
+            governance.as_ref(),
+            namespace,
+            DeletionBoundary::MetadataRemoval,
+        )
+        .await?;
+        let (latest, _) = self
+            .namespace_manager
+            .read_metadata_versioned(namespace.as_str())
+            .await?;
+        let latest_intent = latest.deletion_intent.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "namespace {namespace} lost its deletion intent before metadata removal"
+            ))
+        })?;
+        if latest_intent != intent || latest.state != NamespaceState::Deleting {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {namespace} deletion intent changed before metadata removal"
+            )));
+        }
+        self.load_bound_destruction_evidence(namespace, &latest, latest_intent)
+            .await?;
+        self.namespace_manager
+            .remove_deletion_metadata(namespace.as_str(), &identity)
+            .await?;
+        self.manifest_cache
+            .invalidate_at(namespace.as_str(), self.clock.now());
+        Ok(NamespaceDeleteOutcome::Deleted)
+    }
+
+    async fn require_unlocked_boundary(
+        &self,
+        governance: &dyn DeletionGovernance,
+        namespace: &NamespaceId,
+        boundary: DeletionBoundary,
+    ) -> Result<crate::security::PreservationHeadProof> {
+        let (guard, proof) = governance
+            .preservation_boundary(namespace, boundary)
+            .await?;
+        if guard.is_locked() {
+            return Err(crate::security::SecurityError::PreservationLocked.into());
+        }
+        Ok(proof)
     }
 
     /// List only the direct children represented by the authoritative root map.
+    #[cfg_attr(not(feature = "branching-test-support"), allow(dead_code))]
     pub(crate) async fn list_children(
         &self,
         request: BranchListRequest,

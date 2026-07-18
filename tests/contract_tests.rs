@@ -2648,6 +2648,7 @@ async fn seed_deleting_namespace(store: &zeppelin::storage::ZeppelinStore, ns: &
         updated_at: timestamp,
         state: NamespaceState::Deleting,
         destruction_record_key: None,
+        deletion_intent: None,
         full_text_search: Default::default(),
         index_config: Some(NamespaceIndexConfig::from_indexing_config(
             &Config::default().indexing,

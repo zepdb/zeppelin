@@ -608,6 +608,7 @@ async fn test_list_namespaces_ignores_nested_meta_objects() {
         updated_at: now,
         state: NamespaceState::Active,
         destruction_record_key: None,
+        deletion_intent: None,
         full_text_search: std::collections::HashMap::new(),
         index_config: None,
         compaction_health: CompactionHealth::default(),

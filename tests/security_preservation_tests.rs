@@ -45,7 +45,8 @@ async fn create_namespace_lock(client: &reqwest::Client, base_url: &str, namespa
 #[tokio::test]
 async fn strong_preservation_probe_sees_lock_missing_from_stale_cache() {
     let harness = TestHarness::new().await;
-    let namespace = NamespaceId::new("strong-probe-target").unwrap();
+    let namespace =
+        NamespaceId::new(harness.artifact_origin_namespace("strong-probe-target")).unwrap();
     let first = PreservationService::start(
         harness.store.clone(),
         Clock::system(),
@@ -547,11 +548,19 @@ async fn destruction_record_is_durable_before_namespace_removal() {
         .await
         .unwrap();
     let meta = NamespaceMetadata::from_bytes(&meta_bytes).unwrap();
-    assert_eq!(meta.state, NamespaceState::Deleting);
+    assert_eq!(meta.state, NamespaceState::Active);
+    assert!(meta.destruction_record_key.is_none());
     let destruction_key = meta
+        .deletion_intent
+        .as_ref()
+        .expect("the active fenced state must retain its resumable intent")
         .destruction_record_key
-        .clone()
-        .expect("the tombstone must bind its resumable evidence key");
+        .clone();
+    assert!(meta
+        .deletion_intent
+        .as_ref()
+        .and_then(|intent| intent.fenced_generation)
+        .is_some());
     let manifest = Manifest::read(&harness.store, &namespace)
         .await
         .expect("manifest read must succeed")

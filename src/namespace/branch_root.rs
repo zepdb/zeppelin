@@ -268,7 +268,7 @@ pub(crate) async fn remove_branch_root(
     result
 }
 
-async fn remove_branch_root_with_lease(
+pub(crate) async fn remove_branch_root_with_lease(
     store: &ZeppelinStore,
     namespace_manager: &NamespaceManager,
     lease_manager: &LeaseManager,

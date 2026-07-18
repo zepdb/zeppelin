@@ -144,11 +144,15 @@ use tokio::task::JoinHandle;
 
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
-use crate::config::GcConfig;
+use crate::config::{Config, GcConfig};
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
+use crate::namespace::branching::deletion::DeletionGovernance;
+use crate::namespace::branching::NamespaceDeleteOutcome;
+use crate::namespace::graph::NamespaceGraph;
 use crate::namespace::manager::{NamespaceMetadata, NamespaceState};
-use crate::namespace::NamespaceManager;
+use crate::namespace::{NamespaceId, NamespaceManager};
+use crate::security::SecurityKernel;
 use crate::storage::ZeppelinStore;
 use crate::wal::FragmentCachePolicy;
 use crate::wal::Lease;
@@ -586,6 +590,67 @@ pub struct CompactionLoopOptions {
     /// tests use `Some(prefix)` for bucket isolation. This filters namespace
     /// names, not arbitrary S3 object-key descendants.
     pub namespace_prefix: Option<String>,
+}
+
+/// Boot-composed graph continuation capability for periodic namespace
+/// deletion.
+///
+/// The worker carries no principal and cannot authorize new deletion requests.
+/// It can only continue an already durable, evidence-bound intent through the
+/// same graph seam used by request-spawned cleanup.
+#[derive(Clone)]
+pub struct GovernedDeletionWorker {
+    graph: Arc<NamespaceGraph>,
+    governance: Arc<dyn DeletionGovernance>,
+}
+
+impl std::fmt::Debug for GovernedDeletionWorker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GovernedDeletionWorker")
+            .finish_non_exhaustive()
+    }
+}
+
+impl GovernedDeletionWorker {
+    /// Compose periodic deletion from the same boot snapshots as the server.
+    #[must_use]
+    pub fn new(
+        store: ZeppelinStore,
+        namespace_manager: Arc<NamespaceManager>,
+        lease_manager: Arc<LeaseManager>,
+        clock: crate::time::Clock,
+        manifest_cache: Arc<ManifestCache>,
+        config: &Config,
+        security: Arc<SecurityKernel>,
+    ) -> Self {
+        let governance =
+            security.namespace_delete_maintenance_governance(store.clone(), clock.clone());
+        let graph = NamespaceGraph::new(
+            store,
+            namespace_manager,
+            lease_manager,
+            clock,
+            manifest_cache,
+            config.branching.clone(),
+            config.indexing.clone(),
+            config.gc_horizon_floor_secs(),
+        );
+        Self {
+            graph: Arc::new(graph),
+            governance,
+        }
+    }
+
+    async fn resume(
+        &self,
+        namespace: &NamespaceId,
+        budget: Duration,
+    ) -> Result<NamespaceDeleteOutcome> {
+        self.graph
+            .resume_delete(namespace, Arc::clone(&self.governance), budget)
+            .await
+    }
 }
 
 /// Owns one lifecycle-registered renewal task for one leased compaction.
@@ -1290,6 +1355,7 @@ pub fn start_compaction_thread(
     manifest_cache: Arc<ManifestCache>,
     lease_manager: Arc<LeaseManager>,
     cache: Arc<DiskCache>,
+    deletion_worker: GovernedDeletionWorker,
     lifecycle: CompactionLifecycle,
     options: CompactionThreadOptions,
 ) -> std::thread::JoinHandle<()> {
@@ -1306,7 +1372,7 @@ pub fn start_compaction_thread(
                 .build()
                 .expect("failed to build compaction runtime");
 
-            rt.block_on(compaction_loop_with_lifecycle(
+            rt.block_on(compaction_loop_with_governed_deletion(
                 compactor,
                 namespace_manager,
                 shutdown,
@@ -1317,6 +1383,7 @@ pub fn start_compaction_thread(
                     gc_config,
                     namespace_prefix: None,
                 },
+                deletion_worker,
                 &lifecycle,
             ));
         })
@@ -1497,11 +1564,66 @@ pub async fn compaction_loop(
 pub async fn compaction_loop_with_lifecycle(
     compactor: Arc<Compactor>,
     namespace_manager: Arc<NamespaceManager>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    manifest_cache: Arc<ManifestCache>,
+    lease_manager: Arc<LeaseManager>,
+    cache: Arc<DiskCache>,
+    options: CompactionLoopOptions,
+    lifecycle: &CompactionLifecycle,
+) {
+    compaction_loop_with_lifecycle_inner(
+        compactor,
+        namespace_manager,
+        shutdown,
+        manifest_cache,
+        lease_manager,
+        cache,
+        options,
+        None,
+        lifecycle,
+    )
+    .await;
+}
+
+/// Run maintenance with an explicitly boot-composed governed deletion worker.
+///
+/// Production and production-like server tests use this entry point. Callers
+/// that omit the worker can still exercise compaction/GC, but a discovered
+/// deletion tombstone fails loudly and remains untouched.
+pub async fn compaction_loop_with_governed_deletion(
+    compactor: Arc<Compactor>,
+    namespace_manager: Arc<NamespaceManager>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    manifest_cache: Arc<ManifestCache>,
+    lease_manager: Arc<LeaseManager>,
+    cache: Arc<DiskCache>,
+    options: CompactionLoopOptions,
+    deletion_worker: GovernedDeletionWorker,
+    lifecycle: &CompactionLifecycle,
+) {
+    compaction_loop_with_lifecycle_inner(
+        compactor,
+        namespace_manager,
+        shutdown,
+        manifest_cache,
+        lease_manager,
+        cache,
+        options,
+        Some(&deletion_worker),
+        lifecycle,
+    )
+    .await;
+}
+
+async fn compaction_loop_with_lifecycle_inner(
+    compactor: Arc<Compactor>,
+    namespace_manager: Arc<NamespaceManager>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     manifest_cache: Arc<ManifestCache>,
     lease_manager: Arc<LeaseManager>,
     cache: Arc<DiskCache>,
     options: CompactionLoopOptions,
+    deletion_worker: Option<&GovernedDeletionWorker>,
     lifecycle: &CompactionLifecycle,
 ) {
     let CompactionLoopOptions {
@@ -1593,34 +1715,45 @@ pub async fn compaction_loop_with_lifecycle(
             }
             if ns.state == NamespaceState::Deleting {
                 gc_runner.forget_namespace(&ns.name);
-                match namespace_manager
-                    .finish_delete(&ns.name, Duration::from_secs(25))
-                    .await
-                {
-                    Ok(outcome) if outcome.complete => {
-                        manifest_cache.invalidate_at(&ns.name, compactor.clock().now());
-                        info!(
-                            namespace = %ns.name,
-                            objects_deleted = outcome.deleted,
-                            "resumed namespace delete completed"
-                        );
-                    }
-                    Ok(outcome) => {
+                let Some(deletion_worker) = deletion_worker else {
+                    error!(
+                        namespace = %ns.name,
+                        "governed deletion worker is not configured; tombstone left untouched"
+                    );
+                    continue;
+                };
+                let namespace = match NamespaceId::new(ns.name.clone()) {
+                    Ok(namespace) => namespace,
+                    Err(error) => {
                         warn!(
                             namespace = %ns.name,
-                            objects_deleted = outcome.deleted,
-                            "resumed namespace delete budget exhausted"
+                            error = %error,
+                            "invalid namespace identity in deletion maintenance"
                         );
+                        continue;
                     }
+                };
+                match deletion_worker
+                    .resume(&namespace, Duration::from_secs(25))
+                    .await
+                {
+                    Ok(NamespaceDeleteOutcome::Deleted) => info!(
+                        namespace = %namespace,
+                        "resumed namespace delete completed"
+                    ),
+                    Ok(NamespaceDeleteOutcome::AlreadyDeleting) => warn!(
+                        namespace = %namespace,
+                        "resumed namespace delete remains in progress"
+                    ),
                     Err(ZeppelinError::NamespaceNotFound { .. }) => {
                         debug!(
-                            namespace = %ns.name,
+                            namespace = %namespace,
                             "namespace delete already completed"
                         );
                     }
                     Err(e) => {
                         warn!(
-                            namespace = %ns.name,
+                            namespace = %namespace,
                             error = %e,
                             "failed to resume namespace delete"
                         );

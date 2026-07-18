@@ -35,8 +35,8 @@ use crate::wal::{LeaseManager, WalReader};
 use chrono::{DateTime, Utc};
 
 use super::deletion::{
-    AuthorizedNamespaceDelete, DeletionBoundary, DeletionDecision, DeletionGovernance,
-    DeletionLifecycleEvent,
+    deletion_decision_evidence_key, AuthorizedNamespaceDelete, DeletionBoundary, DeletionDecision,
+    DeletionGovernance, DeletionLifecycleEvent,
 };
 use super::{
     ArtifactOrigin, ArtifactOriginIndex, BranchDescriptor, BranchId, BranchLineage,
@@ -276,18 +276,18 @@ pub async fn delete_namespace_for_test(
     indexing: IndexingConfig,
     branching: BranchingConfig,
 ) -> Result<NamespaceDeleteOutcome> {
+    let decision_id = DecisionId::new();
     graph_for_test(store, indexing, branching)
         .delete(AuthorizedNamespaceDelete {
             namespace,
             decision: DeletionDecision {
                 actor: PrincipalId::new("test-delete-actor").expect("valid principal"),
                 approver: None,
-                decision_id: DecisionId::new(),
+                decision_id,
                 policy_version: PolicyVersion::BOOT,
-                decision_evidence_ref: "test-delete-decision".to_string(),
+                decision_evidence_ref: deletion_decision_evidence_key(decision_id),
             },
             governance: Arc::new(TestDeletionGovernance),
-            budget: Duration::from_secs(30),
         })
         .await
 }

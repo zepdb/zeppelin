@@ -23,7 +23,8 @@ use zeppelin::cache::hydration::{heat_policy_from_config, HydrationConfig, Segme
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::{
-    compaction_loop_with_lifecycle, CompactionLifecycle, CompactionLoopOptions,
+    compaction_loop_with_governed_deletion, CompactionLifecycle, CompactionLoopOptions,
+    GovernedDeletionWorker,
 };
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{ApiKeyConfig, Config, SecurityMode};
@@ -748,9 +749,23 @@ pub async fn start_test_server_on_store(
     store: ZeppelinStore,
     namespace_name_prefix: Option<String>,
 ) -> (String, Arc<DiskCache>, tempfile::TempDir, String) {
+    start_test_server_on_store_with_config(harness, store, namespace_name_prefix, Config::default())
+        .await
+}
+
+/// Start a test server on an instrumented store with an explicit configuration.
+///
+/// This keeps fault-injection tests on the production router while allowing
+/// correctness-sensitive intervals to remain valid during deliberately paused
+/// object-store operations.
+pub async fn start_test_server_on_store_with_config(
+    harness: &TestHarness,
+    store: ZeppelinStore,
+    namespace_name_prefix: Option<String>,
+    mut config: Config,
+) -> (String, Arc<DiskCache>, tempfile::TempDir, String) {
     zeppelin::metrics::init();
 
-    let mut config = Config::default();
     configure_test_server_limits(&mut config);
     let clock = Clock::system();
     // Custom application-store wrappers still share the harness's underlying
@@ -949,6 +964,15 @@ pub async fn start_test_server_with_compaction(
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(500)));
     let lease_manager = lease_manager(&config, &harness.store, &clock);
     let compaction_lifecycle = CompactionLifecycle::new();
+    let deletion_worker = GovernedDeletionWorker::new(
+        harness.store.clone(),
+        namespace_manager.clone(),
+        lease_manager.clone(),
+        clock.clone(),
+        manifest_cache.clone(),
+        &config,
+        security.clone(),
+    );
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let gc_config = config.gc.clone();
     {
@@ -960,7 +984,7 @@ pub async fn start_test_server_with_compaction(
         let compaction_lifecycle = compaction_lifecycle.clone();
         let namespace_prefix = Some(harness.prefix.clone());
         tokio::spawn(with_background_compaction_origin(async move {
-            compaction_loop_with_lifecycle(
+            compaction_loop_with_governed_deletion(
                 compactor,
                 namespace_manager,
                 shutdown_rx,
@@ -971,6 +995,7 @@ pub async fn start_test_server_with_compaction(
                     gc_config,
                     namespace_prefix,
                 },
+                deletion_worker,
                 &compaction_lifecycle,
             )
             .await;
@@ -1559,6 +1584,15 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(
         config.cache.manifest_cache_ttl_ms,
     )));
+    let deletion_worker = GovernedDeletionWorker::new(
+        store.clone(),
+        namespace_manager.clone(),
+        lease_manager.clone(),
+        clock.clone(),
+        manifest_cache.clone(),
+        &config,
+        security.clone(),
+    );
 
     let mut compaction_loop_task = None;
     let shutdown_compaction = if spawn_compaction_loop {
@@ -1574,7 +1608,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
             let namespace_prefix = namespace_name_prefix.clone();
             compaction_loop_task = Some(tokio::spawn(with_background_compaction_origin(
                 async move {
-                    compaction_loop_with_lifecycle(
+                    compaction_loop_with_governed_deletion(
                         compactor,
                         namespace_manager,
                         shutdown_rx,
@@ -1585,6 +1619,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
                             gc_config,
                             namespace_prefix,
                         },
+                        deletion_worker,
                         &compaction_lifecycle,
                     )
                     .await;

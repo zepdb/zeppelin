@@ -207,6 +207,7 @@ fn trigger_metadata(namespace: &str, dimensions: usize) -> NamespaceMetadata {
         updated_at: now,
         state: NamespaceState::Active,
         destruction_record_key: None,
+        deletion_intent: None,
         full_text_search: HashMap::new(),
         index_config: None,
         compaction_health: CompactionHealth::default(),
@@ -2208,6 +2209,22 @@ async fn test_background_compaction_accepts_missing_manifest_while_deleting() {
     let cache = Arc::new(
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
     );
+    let mut config = zeppelin::config::Config::default();
+    config.security.set_cursor_hmac_key_hex("42".repeat(32));
+    let security = Arc::new(
+        zeppelin::security::SecurityKernel::from_config(&config.security)
+            .expect("open test security kernel must compose"),
+    );
+    let deletion_worker = zeppelin::compaction::background::GovernedDeletionWorker::new(
+        store.clone(),
+        namespace_manager.clone(),
+        lease_manager.clone(),
+        zeppelin::time::Clock::system(),
+        manifest_cache.clone(),
+        &config,
+        security,
+    );
+    let compaction_lifecycle = zeppelin::compaction::background::CompactionLifecycle::new();
     let failures =
         zeppelin::metrics::COMPACTIONS_TOTAL.with_label_values(&[ns.as_str(), "failure"]);
     assert_eq!(failures.get(), 0);
@@ -2217,7 +2234,7 @@ async fn test_background_compaction_accepts_missing_manifest_while_deleting() {
         let namespace_manager = namespace_manager.clone();
         let namespace_prefix = Some(harness.prefix.clone());
         async move {
-            zeppelin::compaction::background::compaction_loop(
+            zeppelin::compaction::background::compaction_loop_with_governed_deletion(
                 compactor,
                 namespace_manager,
                 shutdown_rx,
@@ -2228,6 +2245,8 @@ async fn test_background_compaction_accepts_missing_manifest_while_deleting() {
                     gc_config: zeppelin::config::GcConfig::default(),
                     namespace_prefix,
                 },
+                deletion_worker,
+                &compaction_lifecycle,
             )
             .await;
         }

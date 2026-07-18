@@ -508,6 +508,16 @@ impl ZeppelinError {
 
             ZeppelinError::NotImplemented { .. } => 501,
 
+            ZeppelinError::Branch(error)
+                if matches!(
+                    error.as_ref(),
+                    crate::namespace::branching::BranchError::NamespaceHasLiveBranches { .. }
+                        | crate::namespace::branching::BranchError::BranchHasLiveChildren { .. }
+                ) =>
+            {
+                409
+            }
+
             ZeppelinError::IndexUnavailable(_) | ZeppelinError::QueryConcurrencyExhausted => 503,
 
             ZeppelinError::RateLimitExceeded { .. } => 429,
@@ -583,7 +593,15 @@ impl ZeppelinError {
             ZeppelinError::NotImplemented { .. } => "NOT_IMPLEMENTED",
             ZeppelinError::Config(_) => "INTERNAL_ERROR",
             ZeppelinError::Security(error) => error.code(),
-            ZeppelinError::Branch(_) => "INTERNAL_ERROR",
+            ZeppelinError::Branch(error) => match error.as_ref() {
+                crate::namespace::branching::BranchError::NamespaceHasLiveBranches { .. } => {
+                    "namespace_has_live_branches"
+                }
+                crate::namespace::branching::BranchError::BranchHasLiveChildren { .. } => {
+                    "branch_has_live_children"
+                }
+                _ => "INTERNAL_ERROR",
+            },
             ZeppelinError::AuditSink(_) => "INTERNAL_ERROR",
             ZeppelinError::ServerTaskSupervisor(_) => "INTERNAL_ERROR",
             ZeppelinError::CompactionLifecycle(_) => "INTERNAL_ERROR",

@@ -48,6 +48,7 @@ pub use decision::{
 };
 pub use delegation::{DelegationContext, DelegationNarrowing, IssuedDelegatedToken};
 pub use entitlements::{CustomerId, EntitlementLimits, EntitlementSource, Entitlements, Feature};
+pub(crate) use kernel::NamespaceDeleteAdmission;
 pub use kernel::SecurityKernel;
 #[cfg(feature = "managed")]
 pub use license::ControlPlaneResolver;

@@ -8,6 +8,10 @@ use std::time::Duration;
 
 use crate::config::{SecurityConfig, SecurityMode};
 use crate::error::Result as ZeppelinResult;
+use crate::namespace::branching::deletion::{
+    deletion_decision_evidence_key, persist_deletion_lifecycle_audit, AuthorizedNamespaceDelete,
+    CallbackDeletionGovernance, DeletionDecision, DeletionGovernance,
+};
 use crate::storage::store::ObjectSigner;
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
@@ -61,6 +65,17 @@ pub(crate) struct ReceiptPolicyLookup<'a> {
     pub namespace: &'a super::NamespaceId,
     pub version: super::PolicyVersion,
     pub checksum: Option<&'a str>,
+}
+
+/// Request-owned facts consumed when minting graph deletion authority.
+pub(crate) struct NamespaceDeleteAdmission {
+    pub namespace: NamespaceId,
+    pub principal: Principal,
+    pub context: RequestContext,
+    pub allow: AllowDecision,
+    pub approver: Option<PrincipalId>,
+    pub store: ZeppelinStore,
+    pub clock: Clock,
 }
 
 /// Outcome of the privileged historical-policy lookup used by receipt verification.
@@ -401,7 +416,86 @@ impl SecurityKernel {
                 },
             ));
         };
-        preservation.guard_namespace_strong(namespace).await
+        let (guard, proof) = preservation.guard_namespace_strong(namespace).await?;
+        if guard.is_locked() {
+            preservation
+                .record_namespace_delete_deferral(namespace, &guard)
+                .await?;
+        }
+        Ok((guard, proof))
+    }
+
+    /// Mint one request-scoped graph deletion envelope from the exact middleware decision.
+    #[must_use]
+    pub(crate) fn authorize_namespace_delete(
+        self: &Arc<Self>,
+        admission: NamespaceDeleteAdmission,
+    ) -> AuthorizedNamespaceDelete {
+        let decision_evidence_ref = deletion_decision_evidence_key(admission.allow.decision_id);
+        let decision = DeletionDecision {
+            actor: admission.principal.id.clone(),
+            approver: admission.approver,
+            decision_id: admission.allow.decision_id,
+            policy_version: admission.allow.policy_version,
+            decision_evidence_ref,
+        };
+        let governance = self.namespace_delete_governance(
+            admission.store,
+            admission.clock,
+            Some((admission.principal, admission.context)),
+        );
+        AuthorizedNamespaceDelete::new(admission.namespace, decision, governance)
+    }
+
+    /// Compose restart-safe deletion governance without a disclosure principal.
+    pub(crate) fn namespace_delete_maintenance_governance(
+        self: &Arc<Self>,
+        store: ZeppelinStore,
+        clock: Clock,
+    ) -> Arc<dyn DeletionGovernance> {
+        self.namespace_delete_governance(store, clock, None)
+    }
+
+    fn namespace_delete_governance(
+        self: &Arc<Self>,
+        store: ZeppelinStore,
+        clock: Clock,
+        disclosure: Option<(Principal, RequestContext)>,
+    ) -> Arc<dyn DeletionGovernance> {
+        let preservation_kernel = Arc::clone(self);
+        let disclosure_kernel = Arc::clone(self);
+        let audit_store = store;
+        let audit_clock = clock;
+        Arc::new(CallbackDeletionGovernance::new(
+            Arc::new(move |namespace, _boundary| {
+                let kernel = Arc::clone(&preservation_kernel);
+                Box::pin(async move { kernel.guard_namespace_destruction_strong(&namespace).await })
+            }),
+            Arc::new(move |target| {
+                let Some((principal, context)) = disclosure.as_ref() else {
+                    return Err(SecurityError::MissingPrincipal.into());
+                };
+                match disclosure_kernel.authorize(
+                    principal,
+                    Action::NamespaceRead,
+                    &Resource::Namespace(target.clone()),
+                    context,
+                ) {
+                    Decision::Allow(_) => Ok(true),
+                    Decision::Deny(deny) if deny.reason == DenyReason::SecurityStale => {
+                        Err(SecurityError::Authorization(deny.reason).into())
+                    }
+                    Decision::Deny(_) => Ok(false),
+                }
+            }),
+            Arc::new(move |event| {
+                let store = audit_store.clone();
+                let clock = audit_clock.clone();
+                Box::pin(
+                    async move { persist_deletion_lifecycle_audit(&store, &clock, event).await },
+                )
+            }),
+        ))
     }
 
     /// Fail closed when an active lock conservatively overlaps vector deletion.

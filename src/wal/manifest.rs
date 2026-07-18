@@ -4679,6 +4679,7 @@ impl Manifest {
     }
 
     /// CAS-publish the governed-destruction fence and return its exact manifest.
+    #[cfg_attr(not(feature = "branching-test-support"), allow(dead_code))]
     pub(crate) async fn fence_for_destruction(
         store: &ZeppelinStore,
         namespace: &str,
@@ -4715,6 +4716,68 @@ impl Manifest {
             {
                 Ok(_) => return Ok(manifest),
                 Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ZeppelinError::ManifestConflict {
+            namespace: namespace.to_string(),
+        })
+    }
+
+    /// Lease-fence and CAS-publish the governed destruction marker.
+    pub(crate) async fn fence_for_destruction_with_lease(
+        store: &ZeppelinStore,
+        lease_manager: &crate::wal::LeaseManager,
+        lease: &crate::wal::Lease,
+        namespace: &str,
+        destruction_record_key: &str,
+    ) -> Result<(Self, crate::wal::Lease)> {
+        const MAX_FENCE_ATTEMPTS: usize = 8;
+        validate_destruction_record_key(destruction_record_key)?;
+        let mut current_lease = lease.clone();
+        for _ in 0..MAX_FENCE_ATTEMPTS {
+            let (mut manifest, version) = Self::read_versioned_required(store, namespace).await?;
+            version.require_etag(namespace, "governed destruction fence")?;
+            if !manifest.branch_roots.is_empty() {
+                return Err(BranchError::NamespaceHasLiveBranches {
+                    namespace: namespace.to_string(),
+                }
+                .into());
+            }
+            match &manifest.deletion_fence {
+                Some(existing) if existing.destruction_record_key == destruction_record_key => {
+                    return Ok((manifest, current_lease));
+                }
+                Some(_) => {
+                    return Err(ZeppelinError::Validation(format!(
+                        "namespace {namespace} manifest is fenced by different destruction evidence"
+                    )));
+                }
+                None => {}
+            }
+            let renewed = lease_manager.renew(namespace, &current_lease).await?;
+            if !lease_manager.validate(&renewed) {
+                return Err(ZeppelinError::LeaseExpired {
+                    namespace: namespace.to_string(),
+                });
+            }
+            if manifest.fencing_token() > renewed.fencing_token {
+                return Err(ZeppelinError::FencingTokenStale {
+                    namespace: namespace.to_string(),
+                    our_token: renewed.fencing_token,
+                    manifest_token: manifest.fencing_token(),
+                });
+            }
+            manifest.fencing_token = renewed.fencing_token;
+            manifest.deletion_fence = Some(ManifestDeletionFence {
+                destruction_record_key: destruction_record_key.to_string(),
+            });
+            match manifest
+                .write_conditional_candidate(store, namespace, &version)
+                .await
+            {
+                Ok(_) => return Ok((manifest, renewed)),
+                Err(ZeppelinError::ManifestConflict { .. }) => current_lease = renewed,
                 Err(error) => return Err(error),
             }
         }

@@ -409,6 +409,33 @@ pub struct NamespaceDeletionIntent {
     pub root_release: Option<RootReleaseState>,
 }
 
+/// Exact namespace-lifetime identity required by graph-owned cleanup
+/// primitives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GovernedDeletionIdentity {
+    incarnation: NamespaceIncarnationId,
+    destruction_record_key: String,
+    decision_evidence_ref: String,
+    fenced_generation: u64,
+}
+
+impl GovernedDeletionIdentity {
+    /// Bind cleanup work to one durable intent after its manifest fence wins.
+    pub(crate) fn from_intent(intent: &NamespaceDeletionIntent) -> Result<Self> {
+        let fenced_generation = intent.fenced_generation.ok_or_else(|| {
+            ZeppelinError::Validation(
+                "governed deletion cleanup requires a fenced generation".to_string(),
+            )
+        })?;
+        Ok(Self {
+            incarnation: intent.incarnation.clone(),
+            destruction_record_key: intent.destruction_record_key.clone(),
+            decision_evidence_ref: intent.decision_evidence_ref.clone(),
+            fenced_generation,
+        })
+    }
+}
+
 /// Durable evidence that a branch target's live visibility was removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1831,6 +1858,11 @@ impl NamespaceManager {
                     "namespace {name} has no deletion intent for visibility removal"
                 ))
             })?;
+            if meta.state != NamespaceState::Deleting || intent.fenced_generation.is_none() {
+                return Err(ZeppelinError::Validation(format!(
+                    "namespace {name} visibility removal requires a fenced deletion tombstone"
+                )));
+            }
             if let Some(existing) = &intent.visibility {
                 if existing != &visibility {
                     return Err(ZeppelinError::Validation(format!(
@@ -1846,7 +1878,7 @@ impl NamespaceManager {
                 .await
             {
                 Ok(_) => return Ok(()),
-                Err(ZeppelinError::Storage(_)) => continue,
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
                 Err(error) => return Err(error),
             }
         }
@@ -1873,13 +1905,22 @@ impl NamespaceManager {
                     "namespace {name} has no deletion intent for root release"
                 ))
             })?;
-            if let Some(existing) = &intent.root_release {
-                if existing != &release {
-                    return Err(ZeppelinError::Validation(format!(
-                        "namespace {name} root-release state conflicts with durable intent"
-                    )));
+            if meta.state != NamespaceState::Deleting
+                || intent.fenced_generation.is_none()
+                || intent.visibility.is_none()
+            {
+                return Err(ZeppelinError::Validation(format!(
+                    "namespace {name} root release requires durable fenced visibility removal"
+                )));
+            }
+            match intent.root_release.as_ref() {
+                Some(RootReleaseState::Released { .. } | RootReleaseState::Converged { .. }) => {
+                    return Ok(())
                 }
-                return Ok(());
+                Some(RootReleaseState::Pending) if release == RootReleaseState::Pending => {
+                    return Ok(())
+                }
+                Some(RootReleaseState::Pending) | None => {}
             }
             intent.root_release = Some(release.clone());
             meta.updated_at = self.clock.now();
@@ -1888,7 +1929,7 @@ impl NamespaceManager {
                 .await
             {
                 Ok(_) => return Ok(()),
-                Err(ZeppelinError::Storage(_)) => continue,
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
                 Err(error) => return Err(error),
             }
         }
@@ -2223,6 +2264,234 @@ impl NamespaceManager {
         self.mark_deleting(name, true).await
     }
 
+    /// CAS-install a governed deletion intent while leaving live metadata active.
+    pub(crate) async fn install_deletion_intent(
+        &self,
+        name: &str,
+        decision_evidence_ref: String,
+        parent_root: Option<BranchRoot>,
+    ) -> Result<NamespaceMetadata> {
+        let key = NamespaceMetadata::s3_key(name);
+        for _ in 0..8 {
+            let (mut meta, etag) = self.read_metadata_versioned(name).await?;
+            if meta.incarnation_id.is_none() {
+                self.read_or_migrate_namespace_incarnation(name).await?;
+                continue;
+            }
+            if meta.state != NamespaceState::Active {
+                return Err(ZeppelinError::NamespaceDeleting {
+                    namespace: name.to_string(),
+                });
+            }
+            let incarnation = meta.incarnation_id.clone().ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "authoritative namespace metadata {key} omitted its incarnation"
+                ))
+            })?;
+            if let Some(existing) = &meta.deletion_intent {
+                if existing.incarnation != incarnation || existing.parent_root != parent_root {
+                    return Err(ZeppelinError::Validation(format!(
+                        "namespace {name} carries a conflicting deletion intent"
+                    )));
+                }
+                return Ok(meta);
+            }
+            meta.deletion_intent = Some(NamespaceDeletionIntent {
+                incarnation,
+                destruction_record_key: format!(
+                    "_audit/destruction/{}.json",
+                    meta.incarnation_id
+                        .as_ref()
+                        .ok_or_else(|| ZeppelinError::Serialization(format!(
+                            "authoritative namespace metadata {key} omitted its incarnation"
+                        )))?
+                        .as_uuid()
+                        .simple()
+                ),
+                decision_evidence_ref: decision_evidence_ref.clone(),
+                parent_root: parent_root.clone(),
+                fenced_generation: None,
+                visibility: None,
+                root_release: None,
+            });
+            meta.updated_at = self.clock.now();
+            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "authoritative namespace metadata {key} has no ETag for deletion intent"
+                ))
+            })?;
+            match self.put_metadata_if_match(&key, &meta, &etag, name).await {
+                Ok(_) => {
+                    self.insert_registry(meta.clone());
+                    return Ok(meta);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ZeppelinError::ManifestConflict {
+            namespace: name.to_string(),
+        })
+    }
+
+    /// Clear only the exact trailing intent that has not published a fence.
+    pub(crate) async fn clear_unfenced_deletion_intent(
+        &self,
+        name: &str,
+        decision_evidence_ref: &str,
+    ) -> Result<NamespaceMetadata> {
+        let key = NamespaceMetadata::s3_key(name);
+        for _ in 0..8 {
+            let (mut meta, etag) = self.read_metadata_versioned(name).await?;
+            let Some(intent) = meta.deletion_intent.as_ref() else {
+                return Ok(meta);
+            };
+            if intent.decision_evidence_ref != decision_evidence_ref {
+                return Err(ZeppelinError::Validation(format!(
+                    "namespace {name} deletion intent changed before clear"
+                )));
+            }
+            if meta.state != NamespaceState::Active || intent.fenced_generation.is_some() {
+                return Err(ZeppelinError::Validation(format!(
+                    "namespace {name} deletion intent is no longer clearable"
+                )));
+            }
+            let (_, manifest_version) =
+                crate::wal::Manifest::read_versioned_required(&self.store, name).await?;
+            if manifest_version.is_deletion_fenced() {
+                return Err(ZeppelinError::Validation(format!(
+                    "namespace {name} deletion intent has a published fence"
+                )));
+            }
+            meta.deletion_intent = None;
+            meta.destruction_record_key = None;
+            meta.updated_at = self.clock.now();
+            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "authoritative namespace metadata {key} has no ETag for deletion intent clear"
+                ))
+            })?;
+            match self.put_metadata_if_match(&key, &meta, &etag, name).await {
+                Ok(_) => {
+                    self.insert_registry(meta.clone());
+                    return Ok(meta);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ZeppelinError::ManifestConflict {
+            namespace: name.to_string(),
+        })
+    }
+
+    /// Record the exact manifest generation won by the deletion fence.
+    pub(crate) async fn record_fenced_generation(
+        &self,
+        name: &str,
+        decision_evidence_ref: &str,
+        generation: u64,
+    ) -> Result<NamespaceMetadata> {
+        let key = NamespaceMetadata::s3_key(name);
+        for _ in 0..8 {
+            let (mut meta, etag) = self.read_metadata_versioned(name).await?;
+            let intent = meta.deletion_intent.as_mut().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "namespace {name} has no deletion intent to bind a fence"
+                ))
+            })?;
+            if intent.decision_evidence_ref != decision_evidence_ref {
+                return Err(ZeppelinError::Validation(format!(
+                    "namespace {name} deletion intent changed before fence acknowledgement"
+                )));
+            }
+            match intent.fenced_generation {
+                Some(existing) if existing == generation => return Ok(meta),
+                Some(_) => {
+                    return Err(ZeppelinError::Validation(format!(
+                        "namespace {name} deletion fence generation changed"
+                    )))
+                }
+                None => intent.fenced_generation = Some(generation),
+            }
+            meta.updated_at = self.clock.now();
+            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "authoritative namespace metadata {key} has no ETag for fence acknowledgement"
+                ))
+            })?;
+            match self.put_metadata_if_match(&key, &meta, &etag, name).await {
+                Ok(_) => {
+                    self.insert_registry(meta.clone());
+                    return Ok(meta);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ZeppelinError::ManifestConflict {
+            namespace: name.to_string(),
+        })
+    }
+
+    /// CAS-transition an active, fenced intent to the durable deleting state.
+    pub(crate) async fn tombstone_with_intent(
+        &self,
+        name: &str,
+        decision_evidence_ref: &str,
+    ) -> Result<NamespaceMetadata> {
+        let key = NamespaceMetadata::s3_key(name);
+        for _ in 0..8 {
+            let (mut meta, etag) = self.read_metadata_versioned(name).await?;
+            let intent = meta.deletion_intent.as_ref().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "namespace {name} has no deletion intent to tombstone"
+                ))
+            })?;
+            if intent.decision_evidence_ref != decision_evidence_ref
+                || intent.fenced_generation.is_none()
+            {
+                return Err(ZeppelinError::Validation(format!(
+                    "namespace {name} deletion intent is not fenced"
+                )));
+            }
+            if meta.state == NamespaceState::Deleting {
+                return Ok(meta);
+            }
+            if meta.state != NamespaceState::Active {
+                return Err(ZeppelinError::Validation(format!(
+                    "namespace {name} cannot enter deleting from {}",
+                    meta.state.as_str()
+                )));
+            }
+            meta.state = NamespaceState::Deleting;
+            meta.destruction_record_key = Some(intent.destruction_record_key.clone());
+            meta.updated_at = self.clock.now();
+            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "authoritative namespace metadata {key} has no ETag for tombstone"
+                ))
+            })?;
+            match self.put_metadata_if_match(&key, &meta, &etag, name).await {
+                Ok(_) => {
+                    self.insert_registry(meta.clone());
+                    return Ok(meta);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ZeppelinError::ManifestConflict {
+            namespace: name.to_string(),
+        })
+    }
+
+    /// Remove a deletion-fenced live manifest after graph governance settles.
+    pub(crate) async fn remove_governed_live_manifest(&self, name: &str) -> Result<()> {
+        self.registry.remove(name);
+        self.remove_live_manifest(name).await
+    }
+
     /// Remove the live manifest only after the referenced evidence exists.
     ///
     /// This is the governed destruction commit step. It reloads authoritative
@@ -2367,7 +2636,6 @@ impl NamespaceManager {
         name: &str,
         budget: Duration,
     ) -> Result<crate::storage::DeletePrefixOutcome> {
-        let meta_key = NamespaceMetadata::s3_key(name);
         let meta = self.read_metadata_from_s3(name).await?;
         if meta.state != NamespaceState::Deleting {
             return Err(ZeppelinError::Validation(format!(
@@ -2418,6 +2686,115 @@ impl NamespaceManager {
             }
         }
 
+        let identity = meta
+            .deletion_intent
+            .as_ref()
+            .map(GovernedDeletionIdentity::from_intent)
+            .transpose()?;
+        let outcome = match identity.as_ref() {
+            Some(identity) => {
+                self.cleanup_governed_delete_batch(name, identity, budget)
+                    .await?
+            }
+            None => {
+                self.cleanup_legacy_delete_batch(name, meta.incarnation_id.as_ref(), budget)
+                    .await?
+            }
+        };
+
+        if !outcome.complete {
+            return Ok(outcome);
+        }
+
+        match identity.as_ref() {
+            Some(identity) => self.remove_deletion_metadata(name, identity).await?,
+            None => {
+                self.remove_legacy_deletion_metadata(name, meta.incarnation_id.as_ref())
+                    .await?
+            }
+        }
+
+        info!(
+            namespace = name,
+            objects_deleted = outcome.deleted + 1,
+            "deleted namespace"
+        );
+        Ok(outcome)
+    }
+
+    /// Delete one bounded batch of namespace-owned objects while retaining the
+    /// durable deletion tombstone.
+    ///
+    /// `NamespaceGraph` calls this only after a fresh `CleanupBatch`
+    /// preservation boundary. The method deliberately does not delete
+    /// `meta.json`; metadata removal is a separate graph-governed mutation.
+    pub(crate) async fn cleanup_governed_delete_batch(
+        &self,
+        name: &str,
+        identity: &GovernedDeletionIdentity,
+        budget: Duration,
+    ) -> Result<crate::storage::DeletePrefixOutcome> {
+        let meta = self.read_metadata_from_s3(name).await?;
+        self.require_cleanup_ready(name, &meta, identity).await?;
+        self.delete_cleanup_batch(name, budget).await
+    }
+
+    /// Delete the durable tombstone only after authoritative storage proves
+    /// every other target-owned object is absent.
+    ///
+    /// `NamespaceGraph` calls this only after a fresh `MetadataRemoval`
+    /// preservation boundary. A relist at this seam makes metadata-last an
+    /// invariant of the primitive rather than a caller convention.
+    pub(crate) async fn remove_deletion_metadata(
+        &self,
+        name: &str,
+        identity: &GovernedDeletionIdentity,
+    ) -> Result<()> {
+        let meta = self.read_metadata_from_s3(name).await?;
+        self.require_cleanup_ready(name, &meta, identity).await?;
+        self.remove_metadata_after_cleanup(name).await
+    }
+
+    async fn delete_cleanup_batch(
+        &self,
+        name: &str,
+        budget: Duration,
+    ) -> Result<crate::storage::DeletePrefixOutcome> {
+        let meta_key = NamespaceMetadata::s3_key(name);
+        self.store
+            .delete_prefix_paged(&format!("{name}/"), Some(&meta_key), budget)
+            .await
+    }
+
+    async fn remove_metadata_after_cleanup(&self, name: &str) -> Result<()> {
+        let meta_key = NamespaceMetadata::s3_key(name);
+        let remaining = self.store.list_prefix(&format!("{name}/")).await?;
+        let non_meta_remaining = remaining.iter().filter(|key| *key != &meta_key).count();
+        if non_meta_remaining != 0 {
+            return Err(ZeppelinError::NamespaceDeleteIncomplete {
+                namespace: name.to_string(),
+                remaining_keys: non_meta_remaining,
+            });
+        }
+        match self.store.delete(&meta_key).await {
+            Ok(()) | Err(ZeppelinError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        self.registry.remove(name);
+        Ok(())
+    }
+
+    async fn require_cleanup_ready(
+        &self,
+        name: &str,
+        meta: &NamespaceMetadata,
+        identity: &GovernedDeletionIdentity,
+    ) -> Result<()> {
+        if meta.state != NamespaceState::Deleting {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} is not marked deleting"
+            )));
+        }
         if crate::wal::Manifest::read(&self.store, name)
             .await?
             .is_some()
@@ -2426,38 +2803,110 @@ impl NamespaceManager {
                 "namespace {name} cleanup requires governed manifest removal"
             )));
         }
+        let incarnation = meta.incarnation_id.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "namespace {name} deletion metadata omitted its incarnation"
+            ))
+        })?;
+        let intent = meta.deletion_intent.as_ref().ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "namespace {name} deletion tombstone omitted its durable intent"
+            ))
+        })?;
+        if incarnation != &identity.incarnation
+            || intent.incarnation != identity.incarnation
+            || intent.destruction_record_key != identity.destruction_record_key
+            || intent.decision_evidence_ref != identity.decision_evidence_ref
+            || intent.fenced_generation != Some(identity.fenced_generation)
+            || meta.destruction_record_key.as_deref()
+                != Some(identity.destruction_record_key.as_str())
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} cleanup identity does not match its durable intent"
+            )));
+        }
+        let evidence = NamespaceDestructionRecord::from_bytes(
+            &self.store.get(&identity.destruction_record_key).await?,
+        )?;
+        let namespace = NamespaceId::new(name.to_string())?;
+        if evidence.namespace != namespace
+            || evidence.manifest_version_destroyed != identity.fenced_generation
+            || evidence.parent_root != intent.parent_root
+            || evidence.incarnation.as_ref() != Some(&identity.incarnation)
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} cleanup evidence does not match its durable intent"
+            )));
+        }
+        if matches!(meta.creation_kind, NamespaceCreationKind::Fork(_)) {
+            let released = matches!(
+                intent.root_release,
+                Some(RootReleaseState::Released { .. } | RootReleaseState::Converged { .. })
+            );
+            if !released {
+                return Err(ZeppelinError::Validation(format!(
+                    "branch namespace {name} cleanup requires durable parent-root release"
+                )));
+            }
+        }
+        Ok(())
+    }
 
-        let prefix = format!("{name}/");
-        let outcome = self
-            .store
-            .delete_prefix_paged(&prefix, Some(&meta_key), budget)
+    /// Continue a legacy ordinary tombstone that predates governed intents.
+    pub(crate) async fn cleanup_legacy_delete_batch(
+        &self,
+        name: &str,
+        expected_incarnation: Option<&NamespaceIncarnationId>,
+        budget: Duration,
+    ) -> Result<crate::storage::DeletePrefixOutcome> {
+        let meta = self.read_metadata_from_s3(name).await?;
+        self.require_legacy_cleanup_ready(name, &meta, expected_incarnation)
             .await?;
+        self.delete_cleanup_batch(name, budget).await
+    }
 
-        if !outcome.complete {
-            return Ok(outcome);
+    /// Remove metadata last for a legacy ordinary tombstone.
+    pub(crate) async fn remove_legacy_deletion_metadata(
+        &self,
+        name: &str,
+        expected_incarnation: Option<&NamespaceIncarnationId>,
+    ) -> Result<()> {
+        let meta = self.read_metadata_from_s3(name).await?;
+        self.require_legacy_cleanup_ready(name, &meta, expected_incarnation)
+            .await?;
+        self.remove_metadata_after_cleanup(name).await
+    }
+
+    async fn require_legacy_cleanup_ready(
+        &self,
+        name: &str,
+        meta: &NamespaceMetadata,
+        expected_incarnation: Option<&NamespaceIncarnationId>,
+    ) -> Result<()> {
+        if meta.state != NamespaceState::Deleting {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} is not marked deleting"
+            )));
         }
-
-        let remaining = self.store.list_prefix(&prefix).await?;
-        let non_meta_remaining = remaining.iter().filter(|key| *key != &meta_key).count();
-        if non_meta_remaining != 0 {
-            return Err(ZeppelinError::NamespaceDeleteIncomplete {
-                namespace: name.to_string(),
-                remaining_keys: non_meta_remaining,
-            });
+        if matches!(meta.creation_kind, NamespaceCreationKind::Fork(_)) {
+            return Err(ZeppelinError::Validation(format!(
+                "branch namespace {name} cannot use legacy ungoverned cleanup"
+            )));
         }
-
-        match self.store.delete(&meta_key).await {
-            Ok(()) | Err(ZeppelinError::NotFound { .. }) => {}
-            Err(e) => return Err(e),
+        if meta.incarnation_id.as_ref() != expected_incarnation {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} legacy deletion incarnation changed"
+            )));
         }
-        self.registry.remove(name);
-
-        info!(
-            namespace = name,
-            objects_deleted = outcome.deleted + 1,
-            "deleted namespace"
-        );
-        Ok(outcome)
+        if crate::wal::Manifest::read(&self.store, name)
+            .await?
+            .is_some()
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} cleanup requires manifest removal"
+            )));
+        }
+        Ok(())
     }
 
     /// Publishes new per-namespace index settings for future compactions.

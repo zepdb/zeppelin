@@ -23,7 +23,8 @@ use crate::storage::{CreateOnlyOutcome, ZeppelinStore};
 use serde::{Deserialize, Serialize};
 
 /// One authorization decision passed from the security adapter to the graph.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DeletionDecision {
     /// Principal that requested deletion.
     pub actor: PrincipalId,
@@ -54,17 +55,17 @@ pub(crate) trait DeletionGovernance: Send + Sync {
     async fn settle_lifecycle_audit(&self, event: DeletionLifecycleEvent) -> Result<()>;
 }
 
-type PreservationCallback = dyn Fn(
+pub(crate) type PreservationCallback = dyn Fn(
         NamespaceId,
         DeletionBoundary,
     )
         -> Pin<Box<dyn Future<Output = Result<(PreservationGuard, PreservationHeadProof)>> + Send>>
     + Send
     + Sync;
-type AuditCallback = dyn Fn(DeletionLifecycleEvent) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
+pub(crate) type AuditCallback = dyn Fn(DeletionLifecycleEvent) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
     + Send
     + Sync;
-type DisclosureCallback = dyn Fn(&NamespaceId) -> Result<bool> + Send + Sync;
+pub(crate) type DisclosureCallback = dyn Fn(&NamespaceId) -> Result<bool> + Send + Sync;
 
 /// Callback-backed governance adapter used by the security/server boundary.
 pub(crate) struct CallbackDeletionGovernance {
@@ -126,7 +127,8 @@ pub(crate) enum DeletionBoundary {
 }
 
 /// Redacted lifecycle event supplied to the durable audit adapter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum DeletionLifecycleEvent {
     /// Parent-root release advanced or converged.
     RootRelease {
@@ -148,6 +150,136 @@ pub(crate) enum DeletionLifecycleEvent {
     },
 }
 
+/// Immutable security decision evidence installed before a deletion intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeletionDecisionEvidence {
+    domain: String,
+    decision: DeletionDecision,
+}
+
+impl DeletionDecisionEvidence {
+    const DOMAIN: &'static str = "zeppelin.namespace-deletion-decision.v1";
+}
+
+/// Immutable lifecycle evidence emitted by retry and maintenance workers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeletionLifecycleAuditRecord {
+    domain: String,
+    event_id: String,
+    ts: DateTime<Utc>,
+    event: DeletionLifecycleEvent,
+}
+
+impl DeletionLifecycleAuditRecord {
+    const DOMAIN: &'static str = "zeppelin.namespace-deletion-lifecycle.v1";
+}
+
+/// Return the deterministic immutable key referenced by a deletion intent.
+#[must_use]
+pub(crate) fn deletion_decision_evidence_key(decision_id: DecisionId) -> String {
+    format!("_audit/deletion-decisions/{}.json", decision_id.get())
+}
+
+/// Create or verify the exact authorization evidence used by one deletion.
+pub(crate) async fn persist_deletion_decision_evidence(
+    store: &ZeppelinStore,
+    decision: &DeletionDecision,
+) -> Result<()> {
+    let expected_key = deletion_decision_evidence_key(decision.decision_id);
+    if decision.decision_evidence_ref != expected_key {
+        return Err(crate::error::ZeppelinError::Validation(
+            "deletion decision evidence reference is not canonical".to_string(),
+        ));
+    }
+    let record = DeletionDecisionEvidence {
+        domain: DeletionDecisionEvidence::DOMAIN.to_string(),
+        decision: decision.clone(),
+    };
+    let body = serde_json::to_vec(&record)
+        .map(Bytes::from)
+        .map_err(|error| {
+            crate::error::ZeppelinError::Serialization(format!(
+                "deletion decision evidence encode: {error}"
+            ))
+        })?;
+    match store
+        .put_create_outcome(&expected_key, body.clone())
+        .await?
+    {
+        CreateOnlyOutcome::Created { .. } => Ok(()),
+        CreateOnlyOutcome::AlreadyExists => {
+            let existing = store.get(&expected_key).await?;
+            if existing == body {
+                Ok(())
+            } else {
+                Err(crate::error::ZeppelinError::Validation(format!(
+                    "deletion decision evidence {expected_key} has conflicting bytes"
+                )))
+            }
+        }
+    }
+}
+
+/// Load and verify the decision referenced by a durable deletion intent.
+pub(crate) async fn load_deletion_decision_evidence(
+    store: &ZeppelinStore,
+    key: &str,
+) -> Result<DeletionDecision> {
+    let bytes = store.get(key).await?;
+    let record: DeletionDecisionEvidence = serde_json::from_slice(&bytes).map_err(|error| {
+        crate::error::ZeppelinError::Serialization(format!(
+            "deletion decision evidence decode: {error}"
+        ))
+    })?;
+    if record.domain != DeletionDecisionEvidence::DOMAIN
+        || record.decision.decision_evidence_ref != key
+        || deletion_decision_evidence_key(record.decision.decision_id) != key
+    {
+        return Err(crate::error::ZeppelinError::Validation(format!(
+            "deletion decision evidence {key} failed identity validation"
+        )));
+    }
+    Ok(record.decision)
+}
+
+/// Persist a truthful non-request lifecycle event without synthesizing a user.
+pub(crate) async fn persist_deletion_lifecycle_audit(
+    store: &ZeppelinStore,
+    clock: &crate::time::Clock,
+    event: DeletionLifecycleEvent,
+) -> Result<()> {
+    let event_id = ulid::Ulid::new().to_string();
+    let key = format!("_audit/deletion-lifecycle/{event_id}.json");
+    let record = DeletionLifecycleAuditRecord {
+        domain: DeletionLifecycleAuditRecord::DOMAIN.to_string(),
+        event_id,
+        ts: clock.now(),
+        event,
+    };
+    let body = serde_json::to_vec(&record)
+        .map(Bytes::from)
+        .map_err(|error| {
+            crate::error::ZeppelinError::Serialization(format!(
+                "deletion lifecycle audit encode: {error}"
+            ))
+        })?;
+    match store.put_create_outcome(&key, body.clone()).await? {
+        CreateOnlyOutcome::Created { .. } => Ok(()),
+        CreateOnlyOutcome::AlreadyExists => {
+            let existing = store.get(&key).await?;
+            if existing == body {
+                Ok(())
+            } else {
+                Err(crate::error::ZeppelinError::Validation(format!(
+                    "deletion lifecycle audit {key} has conflicting bytes"
+                )))
+            }
+        }
+    }
+}
+
 /// Kernel-minted authorization envelope consumed by `NamespaceGraph::delete`.
 pub(crate) struct AuthorizedNamespaceDelete {
     /// Namespace selected for deletion.
@@ -156,8 +288,6 @@ pub(crate) struct AuthorizedNamespaceDelete {
     pub decision: DeletionDecision,
     /// Strong governance hooks for the destructive lifecycle.
     pub governance: Arc<dyn DeletionGovernance>,
-    /// Cleanup budget for this invocation.
-    pub budget: Duration,
 }
 
 impl AuthorizedNamespaceDelete {
@@ -168,13 +298,11 @@ impl AuthorizedNamespaceDelete {
         namespace: NamespaceId,
         decision: DeletionDecision,
         governance: Arc<dyn DeletionGovernance>,
-        budget: Duration,
     ) -> Self {
         Self {
             namespace,
             decision,
             governance,
-            budget,
         }
     }
 }

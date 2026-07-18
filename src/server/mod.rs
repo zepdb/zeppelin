@@ -111,6 +111,7 @@ use crate::config::Config;
 use crate::error::ZeppelinError;
 use crate::fts::wal_cache::WalFtsCache;
 use crate::metrics::{HTTP_REQUESTS_TOTAL, RATE_LIMITED_TOTAL};
+use crate::namespace::graph::NamespaceGraph;
 use crate::namespace::NamespaceManager;
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::security::{
@@ -339,6 +340,20 @@ pub struct AppState {
     pub query_semaphore: Arc<Semaphore>,
     /// Concurrent, process-local token buckets keyed by subject and traffic class.
     pub rate_limiters: Arc<DashMap<RateLimitKey, RateLimitBucket>>,
+}
+
+/// Compose the namespace graph from the shared production service handles.
+pub(crate) fn namespace_graph(state: &AppState) -> NamespaceGraph {
+    NamespaceGraph::new(
+        state.store.clone(),
+        state.namespace_manager.clone(),
+        state.lease_manager.clone(),
+        state.clock.clone(),
+        state.manifest_cache.clone(),
+        state.config.branching.clone(),
+        state.config.indexing.clone(),
+        state.config.gc_horizon_floor_secs(),
+    )
 }
 
 /// Composition-root result for the licensed receipt service.
@@ -1080,7 +1095,7 @@ async fn finish_audited_request(
         }
         if audit.action == Action::NamespaceDelete {
             if let ResourceRef::Namespace { namespace } = audit.resource {
-                spawn_namespace_delete_cleanup(state, namespace.as_str().to_string());
+                spawn_namespace_delete_cleanup(state, namespace);
             }
         }
     } else {
@@ -1089,29 +1104,34 @@ async fn finish_audited_request(
     response
 }
 
-fn spawn_namespace_delete_cleanup(state: &AppState, namespace: String) {
-    let namespace_manager = state.namespace_manager.clone();
+fn spawn_namespace_delete_cleanup(state: &AppState, namespace: NamespaceId) {
+    let graph = namespace_graph(state);
+    let governance = state
+        .security
+        .namespace_delete_maintenance_governance(state.store.clone(), state.clock.clone());
     state
         .server_tasks
         .spawn("namespace delete cleanup", async move {
-            match namespace_manager
-                .finish_delete(&namespace, Duration::from_secs(25))
+            match graph
+                .resume_delete(&namespace, governance, Duration::from_secs(25))
                 .await
             {
-                Ok(outcome) if outcome.complete => {
+                Ok(crate::namespace::branching::NamespaceDeleteOutcome::Deleted) => {
                     tracing::info!(
                         namespace = %namespace,
-                        objects_deleted = outcome.deleted,
                         "namespace background delete completed"
                     );
                 }
-                Ok(outcome) => {
+                Ok(crate::namespace::branching::NamespaceDeleteOutcome::AlreadyDeleting) => {
                     tracing::warn!(
                         namespace = %namespace,
-                        objects_deleted = outcome.deleted,
-                        "namespace background delete budget exhausted; retry DELETE to resume"
+                        "namespace background delete remains in progress"
                     );
                 }
+                Err(ZeppelinError::NamespaceNotFound { .. }) => tracing::debug!(
+                    namespace = %namespace,
+                    "namespace background delete already completed"
+                ),
                 Err(error) => {
                     tracing::error!(
                         namespace = %namespace,

@@ -170,11 +170,44 @@ impl PauseCasHandle {
     }
 }
 
+/// Controller for an explicitly armed one-shot matching CAS pause.
+#[derive(Clone, Debug)]
+pub struct ArmedPauseCasHandle {
+    armed: Arc<AtomicBool>,
+    arrivals: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl ArmedPauseCasHandle {
+    /// Pause the next matching ETag-update PUT before it reaches storage.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait until the armed matching CAS reaches the publication boundary.
+    pub async fn wait_until_paused(&self) {
+        loop {
+            let notified = self.entered.notified();
+            if self.arrivals.load(Ordering::SeqCst) != 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Allow the paused CAS to reach the authoritative backend.
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
 /// Object-store decorator that pauses the first matching ETag-update PUT.
 #[derive(Debug)]
 pub struct PauseCasStore {
     inner: Arc<dyn ObjectStore>,
     needle: String,
+    armed: Arc<AtomicBool>,
     arrivals: Arc<AtomicUsize>,
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Semaphore>,
@@ -417,12 +450,14 @@ pub fn pause_first_cas_matching(
     store: &ZeppelinStore,
     needle: impl Into<String>,
 ) -> (ZeppelinStore, PauseCasHandle) {
+    let armed = Arc::new(AtomicBool::new(true));
     let arrivals = Arc::new(AtomicUsize::new(0));
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let wrapper = PauseCasStore {
         inner: store.inner(),
         needle: needle.into(),
+        armed,
         arrivals: Arc::clone(&arrivals),
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
@@ -430,6 +465,35 @@ pub fn pause_first_cas_matching(
     (
         ZeppelinStore::new(Arc::new(wrapper)),
         PauseCasHandle {
+            arrivals,
+            entered,
+            release,
+        },
+    )
+}
+
+/// Wrap a store with an initially disarmed one-shot pause before a matching
+/// ETag-update PUT reaches S3.
+pub fn pause_next_cas_matching(
+    store: &ZeppelinStore,
+    needle: impl Into<String>,
+) -> (ZeppelinStore, ArmedPauseCasHandle) {
+    let armed = Arc::new(AtomicBool::new(false));
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let wrapper = PauseCasStore {
+        inner: store.inner(),
+        needle: needle.into(),
+        armed: Arc::clone(&armed),
+        arrivals: Arc::clone(&arrivals),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    (
+        ZeppelinStore::new(Arc::new(wrapper)),
+        ArmedPauseCasHandle {
+            armed,
             arrivals,
             entered,
             release,
@@ -1427,8 +1491,12 @@ impl ObjectStore for PauseCasStore {
     ) -> OsResult<PutResult> {
         let should_pause = location.as_ref().contains(&self.needle)
             && matches!(&opts.mode, PutMode::Update(_))
-            && self.arrivals.fetch_add(1, Ordering::SeqCst) == 0;
+            && self
+                .armed
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
         if should_pause {
+            self.arrivals.fetch_add(1, Ordering::SeqCst);
             self.entered.notify_waiters();
             let permit = self
                 .release
