@@ -17,6 +17,7 @@ disabled by default until every required contract below is green.
 | Adversarial branching vocabulary | `43fc06d`; `BranchingOp` now has stable replay kind, namespace, and actor accessors with coverage for all five planned operations; `cargo test --test adversarial_workload_tests adversarial::ops` passed 5/5 after `b210e0e` |
 | Current branching integration gate | `TEST_BACKEND=minio cargo test --features branching-test-support --test branch_fork_tests -- --test-threads=1`; 20 passed in 60.92s on current HEAD |
 | Target namespace branch status | `4e2122c`, `922da4b`; namespace metadata now carries only redacted branch ID/mode/depth/lifecycle/health/materialized/created-at fields for branch targets, with focused redaction-shape coverage |
+| OpenAPI target branch status | `c421edf`; `NamespaceResponse.branch` and the redacted `BranchStatusDescriptor` schema are now documented in the versioned API contract |
 
 ## Explicitly incomplete
 
