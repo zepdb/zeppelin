@@ -94,7 +94,7 @@ use super::branching::{
     NamespaceCreationKind,
 };
 pub use super::types::{is_valid_namespace_name, NamespaceIncarnationId};
-use super::NamespaceId;
+use super::{BranchRoot, NamespaceId};
 
 /// Default lifetime of a process-local namespace registry entry.
 const DEFAULT_NAMESPACE_REGISTRY_TTL: Duration = Duration::from_secs(5);
@@ -354,6 +354,9 @@ pub struct NamespaceMetadata {
     /// Immutable destruction evidence committed by the governed delete protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destruction_record_key: Option<String>,
+    /// Durable deletion intent installed before the destruction fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_intent: Option<NamespaceDeletionIntent>,
     /// Per-field full-text search configuration.
     /// Empty map means FTS is not enabled for this namespace.
     #[serde(default)]
@@ -378,6 +381,21 @@ pub struct NamespaceMetadata {
     /// objects written before incarnation IDs were introduced.
     #[serde(skip)]
     pub incarnation_id: Option<NamespaceIncarnationId>,
+}
+
+/// Exact, resumable intent for one namespace lifetime's governed deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceDeletionIntent {
+    /// Namespace incarnation bound by the intent.
+    pub incarnation: NamespaceIncarnationId,
+    /// Deterministic immutable destruction-evidence key.
+    pub destruction_record_key: String,
+    /// Actor/decision evidence reference, opaque to the namespace layer.
+    pub decision_evidence_ref: String,
+    /// Exact direct parent root identity for a branch deletion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_root: Option<BranchRoot>,
 }
 
 /// Immutable evidence that authorizes removal of one fenced live manifest.
@@ -999,6 +1017,7 @@ impl NamespaceManager {
             updated_at: now,
             state: NamespaceState::Creating,
             destruction_record_key: None,
+            deletion_intent: None,
             full_text_search,
             index_config,
             compaction_health: CompactionHealth::default(),
@@ -2770,6 +2789,7 @@ mod tests {
             updated_at: now,
             state: NamespaceState::Active,
             destruction_record_key: None,
+            deletion_intent: None,
             full_text_search: std::collections::HashMap::new(),
             index_config: None,
             compaction_health: CompactionHealth::default(),
