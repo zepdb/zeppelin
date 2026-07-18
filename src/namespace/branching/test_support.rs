@@ -12,6 +12,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+
 use crate::cache::hydration::HydrationTarget;
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
@@ -32,11 +34,15 @@ use crate::wal::manifest::{Manifest, ReceiptBindingVersion};
 use crate::wal::{LeaseManager, WalReader};
 use chrono::{DateTime, Utc};
 
+use super::deletion::{
+    AuthorizedNamespaceDelete, DeletionBoundary, DeletionDecision, DeletionGovernance,
+    DeletionLifecycleEvent,
+};
 use super::{
     ArtifactOrigin, ArtifactOriginIndex, BranchDescriptor, BranchId, BranchLineage,
     BranchListRequest, BranchMaintenanceReport, BranchPrepareStage, BranchRoot, ForkIdentity,
     ForkReservationIdentity, ForkViewDigest, ManifestGeneration, NamespaceCreationKind,
-    NamespaceDeleteOutcome, NamespaceDeleteRequest, PrepareForkOutcome, PrepareForkRequest,
+    NamespaceDeleteOutcome, PrepareForkOutcome, PrepareForkRequest,
 };
 use crate::namespace::branch_root::{
     insert_branch_root, remove_branch_root, source_data_plane_config_digest,
@@ -45,6 +51,9 @@ use crate::namespace::branch_root::{
 use crate::namespace::graph::NamespaceGraph;
 use crate::namespace::manager::NamespaceIndexConfig;
 use crate::namespace::{NamespaceId, NamespaceIncarnationId, NamespaceManager};
+use crate::security::{
+    DecisionId, PolicyVersion, PreservationGuard, PreservationHeadProof, PrincipalId,
+};
 
 /// Observable result of one ANN query through a synthetic target manifest.
 #[derive(Debug, Clone)]
@@ -158,6 +167,33 @@ fn graph_for_test(
     )
 }
 
+struct TestDeletionGovernance;
+
+#[async_trait]
+impl DeletionGovernance for TestDeletionGovernance {
+    async fn preservation_boundary(
+        &self,
+        _namespace: &NamespaceId,
+        _boundary: DeletionBoundary,
+    ) -> Result<(PreservationGuard, PreservationHeadProof)> {
+        Ok((
+            PreservationGuard::unlocked(),
+            PreservationHeadProof {
+                head_sha256: [0; 32],
+                e_tag: None,
+            },
+        ))
+    }
+
+    fn disclose_child(&self, _target: &NamespaceId) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn settle_lifecycle_audit(&self, _event: DeletionLifecycleEvent) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Run the private prepare-only graph protocol through its production seam.
 pub async fn prepare_fork_for_test(
     store: ZeppelinStore,
@@ -240,7 +276,18 @@ pub async fn delete_namespace_for_test(
     branching: BranchingConfig,
 ) -> Result<NamespaceDeleteOutcome> {
     graph_for_test(store, indexing, branching)
-        .delete(NamespaceDeleteRequest { namespace })
+        .delete(AuthorizedNamespaceDelete {
+            namespace,
+            decision: DeletionDecision {
+                actor: PrincipalId::new("test-delete-actor").expect("valid principal"),
+                approver: None,
+                decision_id: DecisionId::new(),
+                policy_version: PolicyVersion::BOOT,
+                decision_evidence_ref: "test-delete-decision".to_string(),
+            },
+            governance: Arc::new(TestDeletionGovernance),
+            budget: Duration::from_secs(30),
+        })
         .await
 }
 

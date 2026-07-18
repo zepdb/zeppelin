@@ -20,11 +20,12 @@ use crate::namespace::branch_root::{
     insert_branch_root_with_lease, remove_branch_root, source_data_plane_config_digest,
     InsertBranchRootRequest, RemoveBranchRootRequest,
 };
+use crate::namespace::branching::deletion::AuthorizedNamespaceDelete;
 use crate::namespace::branching::{
     ArtifactOrigin, BranchDescriptor, BranchError, BranchListRequest, BranchMaintenanceReport,
     BranchPrepareStage, ForkDataPlaneConfig, ForkIdentity, ForkPrepareIntent,
-    ForkReservationIdentity, NamespaceCreationKind, NamespaceDeleteOutcome, NamespaceDeleteRequest,
-    PrepareForkOutcome, PrepareForkRequest, PreparedBranch,
+    ForkReservationIdentity, NamespaceCreationKind, NamespaceDeleteOutcome, PrepareForkOutcome,
+    PrepareForkRequest, PreparedBranch,
 };
 use crate::namespace::manager::{
     CompactionHealth, NamespaceIndexConfig, NamespaceManager, NamespaceMetadata, NamespaceState,
@@ -111,7 +112,7 @@ impl NamespaceGraph {
     /// Delete through the graph guard, refusing to bypass live child roots.
     pub(crate) async fn delete(
         &self,
-        request: NamespaceDeleteRequest,
+        request: AuthorizedNamespaceDelete,
     ) -> Result<NamespaceDeleteOutcome> {
         let name = request.namespace.as_str();
         let (metadata, _) = self.namespace_manager.read_metadata_versioned(name).await?;
