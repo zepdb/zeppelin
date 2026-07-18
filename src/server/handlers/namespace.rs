@@ -299,6 +299,15 @@ pub async fn list_branches(
             },
         ))));
     }
+    authorize_namespace_action(
+        &state,
+        &principal,
+        &context,
+        &audit,
+        Action::NamespaceRead,
+        &source,
+    )
+    .map_err(|error| ApiError(error.into()))?;
     let (manifest, _) = Manifest::read_versioned_required(&state.store, &source).await?;
     let mut branches = Vec::with_capacity(manifest.branch_roots().len());
     for root in manifest.branch_roots().values() {
