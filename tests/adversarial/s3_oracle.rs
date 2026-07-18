@@ -221,7 +221,7 @@ impl S3Tracker {
                         op_index,
                         namespace,
                         "retained-history reachability read-failed",
-                        json!({ "error": error }),
+                        json!({ "error": error.to_string() }),
                     ));
                 }
                 match reachable_keys(namespace, &manifest) {
@@ -232,7 +232,7 @@ impl S3Tracker {
                             op_index,
                             namespace,
                             "live-manifest artifact origins failed reachability validation",
-                            json!({ "error": error }),
+                            json!({ "error": error.to_string() }),
                         ));
                         return violations;
                     }
@@ -468,7 +468,7 @@ pub async fn check_clone_manifest(
                 op_index,
                 target,
                 "clone target artifact origins failed reachability validation",
-                json!({ "error": error }),
+                json!({ "error": error.to_string() }),
             ));
             return violations;
         }
