@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
@@ -316,6 +317,16 @@ pub struct PreservationGuard {
     lock_ids: Vec<PreservationLockId>,
 }
 
+/// Proof of one fresh preservation-head observation used to authorize a
+/// following destructive boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreservationHeadProof {
+    /// SHA-256 of the canonical authoritative head bytes.
+    pub head_sha256: [u8; 32],
+    /// ETag observed with the authoritative head.
+    pub e_tag: Option<String>,
+}
+
 impl PreservationGuard {
     pub(crate) fn unlocked() -> Self {
         Self {
@@ -585,6 +596,34 @@ impl PreservationService {
     pub async fn refresh_once(&self) -> Result<()> {
         let loaded = load_existing(&self.store).await?;
         self.install_refreshed(loaded)
+    }
+
+    /// Strongly observe the authoritative head and derive a proof from that
+    /// observation, without consulting the refreshable process cache.
+    pub async fn guard_namespace_strong(
+        &self,
+        namespace: &NamespaceId,
+    ) -> Result<(PreservationGuard, PreservationHeadProof)> {
+        let loaded = load_existing(&self.store).await?;
+        let canonical = serde_json::to_vec(&loaded.head)?;
+        let mut digest = Sha256::new();
+        digest.update(canonical);
+        let head_sha256 = digest.finalize().into();
+        let guard = PreservationGuard {
+            lock_ids: loaded
+                .active
+                .values()
+                .filter(|record| record.scope.protects_namespace(namespace))
+                .map(|record| record.lock_id.clone())
+                .collect(),
+        };
+        Ok((
+            guard,
+            PreservationHeadProof {
+                head_sha256,
+                e_tag: loaded.head_etag,
+            },
+        ))
     }
 
     /// Abort and join this service's owned refresh task before its authority retires.

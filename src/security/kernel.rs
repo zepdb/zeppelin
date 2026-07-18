@@ -387,6 +387,23 @@ impl SecurityKernel {
         preservation.guard_namespace(namespace)
     }
 
+    /// Strongly read preservation authority for one destructive boundary.
+    pub async fn guard_namespace_destruction_strong(
+        &self,
+        namespace: &NamespaceId,
+    ) -> ZeppelinResult<(super::PreservationGuard, super::PreservationHeadProof)> {
+        let Some(preservation) = &self.preservation else {
+            return Ok((
+                super::PreservationGuard::unlocked(),
+                super::PreservationHeadProof {
+                    head_sha256: [0; 32],
+                    e_tag: None,
+                },
+            ));
+        };
+        preservation.guard_namespace_strong(namespace).await
+    }
+
     /// Fail closed when an active lock conservatively overlaps vector deletion.
     pub fn guard_vector_destruction(
         &self,
