@@ -128,6 +128,18 @@ incarnation fails with a conflict, and an active namespace missing its manifest
 is an integrity error. Quiesce old Zeppelin binaries during this one-time
 upgrade so they cannot create or republish unbound state.
 
+Branch-aware deletion also has a one-way mixed-version boundary. Before
+downgrading to a binary that predates graph-owned deletion intents, keep the
+current-version nodes running while they resume or cancel every namespace that
+carries `deletion_intent` (whether `active`, `creating`, or `deleting`) and every
+legacy `deleting` tombstone. Verify that none remain, then stop every current
+node before starting any old binary. Do not run old and new binaries
+concurrently while deletion or cancellation is active. Fenced and otherwise
+advanced current intents deliberately contain fields rejected by the old strict
+decoder; that fail-closed behavior prevents an old cleanup worker from deleting
+branch-owned artifacts before the durable reader-grace period and parent-root
+release.
+
 A namespace clone copies raw immutable artifacts, so it cannot apply a row
 filter or field mask while preserving the source representation. Zeppelin
 therefore requires unconstrained clone, source-read, and target-create

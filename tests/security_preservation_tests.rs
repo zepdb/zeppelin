@@ -795,10 +795,10 @@ async fn destruction_evidence_survives_failure_after_record_before_manifest_remo
         .namespace_manager
         .finish_delete(&namespace, Duration::MAX)
         .await
-        .expect_err("physical cleanup must wait for governed manifest removal");
+        .expect_err("governed cleanup must not bypass the graph state machine");
     assert!(cleanup_error
         .to_string()
-        .contains("requires governed manifest removal"));
+        .contains("must resume through NamespaceGraph"));
 
     let stale_error = stale_manifest
         .write_conditional(&harness.store, &namespace, &stale_version)
@@ -878,7 +878,7 @@ async fn destruction_evidence_survives_failure_after_record_before_manifest_remo
 }
 
 #[tokio::test]
-async fn lock_created_after_evidence_blocks_manifest_commit_until_release() {
+async fn lock_created_after_evidence_blocks_graph_resume_until_release() {
     let harness = TestHarness::new().await;
     let (counted_store, counter) = counting_store(&harness.store);
     let (store, delete_failure) = fail_delete_once_matching(&counted_store, "manifest.json");
@@ -909,11 +909,8 @@ async fn lock_created_after_evidence_blocks_manifest_commit_until_release() {
     let evidence_key = metadata
         .destruction_record_key
         .expect("governed tombstone must bind its destruction evidence");
-    let evidence: Value =
+    let _: Value =
         serde_json::from_slice(&harness.store.get(&evidence_key).await.unwrap()).unwrap();
-    let manifest_version = evidence["manifest_version_destroyed"]
-        .as_u64()
-        .expect("destruction evidence must record a manifest generation");
 
     let peer = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
         harness.store.clone(),
@@ -929,27 +926,20 @@ async fn lock_created_after_evidence_blocks_manifest_commit_until_release() {
     let lock = create_namespace_lock(&peer_admin, &peer.base_url, &namespace).await;
     let lock_id = lock["lock_id"].as_str().unwrap();
 
-    let mismatched = server
-        .namespace_manager
-        .commit_governed_delete(
-            &namespace,
-            &evidence_key,
-            manifest_version.checked_add(1).unwrap(),
-        )
-        .await
-        .expect_err("the deepest commit must revalidate the evidence generation");
-    assert!(mismatched.to_string().contains("evidence does not match"));
-
     let head_gets_before = counter.gets_matching("_security/preservation/heads/locks.json");
-    let blocked = server
-        .namespace_manager
-        .commit_governed_delete(&namespace, &evidence_key, manifest_version)
+    let blocked = admin
+        .delete(format!("{}/v1/namespaces/{namespace}", server.base_url))
+        .send()
         .await
-        .expect_err("a fresh lock must block manifest removal at the commit point");
-    assert!(blocked.to_string().contains("preservation"));
+        .unwrap();
+    assert_eq!(blocked.status(), 409);
+    assert_eq!(
+        blocked.json::<Value>().await.unwrap()["code"],
+        "preservation_locked"
+    );
     assert!(
         counter.gets_matching("_security/preservation/heads/locks.json") > head_gets_before,
-        "governed commit must refresh the authoritative preservation head"
+        "graph resume must refresh the authoritative preservation head"
     );
     Manifest::read(&harness.store, &namespace)
         .await
@@ -970,14 +960,15 @@ async fn lock_created_after_evidence_blocks_manifest_commit_until_release() {
     assert_eq!(released.status(), 200, "{}", released.text().await.unwrap());
 
     let head_gets_before = counter.gets_matching("_security/preservation/heads/locks.json");
-    server
-        .namespace_manager
-        .commit_governed_delete(&namespace, &evidence_key, manifest_version)
+    let resumed = admin
+        .delete(format!("{}/v1/namespaces/{namespace}", server.base_url))
+        .send()
         .await
-        .expect("released lock must allow the same governed commit to resume");
+        .unwrap();
+    assert_eq!(resumed.status(), 202, "{}", resumed.text().await.unwrap());
     assert!(
         counter.gets_matching("_security/preservation/heads/locks.json") > head_gets_before,
-        "resumed governed commit must refresh released lock authority"
+        "resumed graph deletion must refresh released lock authority"
     );
     assert!(
         Manifest::read(&harness.store, &namespace)
@@ -1015,12 +1006,16 @@ async fn lock_created_after_tombstone_blocks_resumed_physical_cleanup() {
     assert_eq!(delete_failure.failures_injected(), 1);
 
     create_namespace_lock(&admin, &server.base_url, &namespace).await;
-    let error = server
-        .namespace_manager
-        .finish_delete(&namespace, Duration::MAX)
+    let blocked = admin
+        .delete(format!("{}/v1/namespaces/{namespace}", server.base_url))
+        .send()
         .await
-        .expect_err("a lock activated after tombstoning must stop resumed cleanup");
-    assert!(error.to_string().contains("preservation"));
+        .unwrap();
+    assert_eq!(blocked.status(), 409);
+    assert_eq!(
+        blocked.json::<Value>().await.unwrap()["code"],
+        "preservation_locked"
+    );
     Manifest::read(&harness.store, &namespace)
         .await
         .expect("manifest read must succeed")

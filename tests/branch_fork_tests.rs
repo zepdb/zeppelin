@@ -169,6 +169,9 @@ async fn ungoverned_manager_delete_rejects_a_source_with_a_live_child_root() {
     )
     .await
     .unwrap();
+    let before = branch_control_snapshot(&harness.store, &source)
+        .await
+        .unwrap();
     let error = NamespaceManager::new(harness.store.clone())
         .delete(&source)
         .await
@@ -178,10 +181,20 @@ async fn ungoverned_manager_delete_rejects_a_source_with_a_live_child_root() {
         ZeppelinError::Branch(inner)
             if matches!(*inner, BranchError::NamespaceHasLiveBranches { .. })
     ));
-    assert!(NamespaceManager::new(harness.store.clone())
-        .get(&source)
+    assert_eq!(
+        NamespaceManager::new(harness.store.clone())
+            .get(&source)
+            .await
+            .unwrap()
+            .state,
+        NamespaceState::Active
+    );
+    let after = branch_control_snapshot(&harness.store, &source)
         .await
-        .is_ok());
+        .unwrap();
+    assert_eq!(after.roots, before.roots);
+    assert_eq!(after.manifest_generation, before.manifest_generation);
+    assert_eq!(after.deletion_fenced, before.deletion_fenced);
     harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup_artifact_origin_namespace(&target).await;
     harness.cleanup().await;

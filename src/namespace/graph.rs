@@ -142,7 +142,26 @@ impl NamespaceGraph {
         let name = namespace.as_str();
         let (metadata, _) = self.namespace_manager.read_metadata_versioned(name).await?;
         if metadata.state == NamespaceState::Deleting {
-            return Ok(Self::deletion_in_progress_outcome(&metadata));
+            // A request retry is also a recovery worker. It must re-enter the
+            // same strong preservation boundaries as background maintenance;
+            // returning the cached lifecycle shape here would let a newly
+            // published lock be skipped after tombstoning.
+            return match self
+                .resume_delete(&namespace, governance, Duration::ZERO)
+                .await
+            {
+                Err(ZeppelinError::NamespaceNotFound { .. }) => {
+                    // Another recovery worker may remove metadata after this
+                    // request's authoritative tombstone read but before
+                    // resume_delete performs its own read. Re-prove completion
+                    // from the tombstone already observed instead of turning a
+                    // successful lost response into a false 404.
+                    self.confirm_missing_after_resume(&namespace, &metadata)
+                        .await?;
+                    Ok(NamespaceDeleteOutcome::Deleted)
+                }
+                outcome => outcome,
+            };
         }
         if metadata.state == NamespaceState::Creating {
             return self
@@ -1459,7 +1478,11 @@ impl NamespaceGraph {
             Ok(bytes) => {
                 let existing = NamespaceDestructionRecord::from_bytes(&bytes)?;
                 self.validate_destruction_evidence(
-                    namespace, metadata, intent, decision, &existing,
+                    namespace,
+                    metadata,
+                    intent,
+                    Some(decision),
+                    &existing,
                 )?;
                 return Ok(existing);
             }
@@ -1499,7 +1522,11 @@ impl NamespaceGraph {
             CreateOnlyOutcome::AlreadyExists => {
                 let existing = NamespaceDestructionRecord::from_bytes(&self.store.get(key).await?)?;
                 self.validate_destruction_evidence(
-                    namespace, metadata, intent, decision, &existing,
+                    namespace,
+                    metadata,
+                    intent,
+                    Some(decision),
+                    &existing,
                 )?;
                 Ok(existing)
             }
@@ -1511,7 +1538,7 @@ impl NamespaceGraph {
         namespace: &NamespaceId,
         metadata: &NamespaceMetadata,
         intent: &crate::namespace::manager::NamespaceDeletionIntent,
-        decision: &DeletionDecision,
+        decision: Option<&DeletionDecision>,
         evidence: &NamespaceDestructionRecord,
     ) -> Result<()> {
         let metadata_incarnation = metadata.incarnation_id.as_ref().ok_or_else(|| {
@@ -1519,19 +1546,30 @@ impl NamespaceGraph {
                 "namespace {namespace} deletion metadata omitted its incarnation"
             ))
         })?;
+        // Before graph-owned deletion decisions were introduced, the intent's
+        // decision reference pointed at the destruction record itself. That
+        // immutable record is the only durable actor/approval/decision binding
+        // available to an upgraded reader; every other reference shape must
+        // still resolve through the current decision-evidence envelope.
+        let legacy_binding = intent.is_legacy_direct_evidence_binding();
+        let fenced_generation_matches = intent.fenced_generation.map_or(legacy_binding, |value| {
+            value == evidence.manifest_version_destroyed
+        });
+        let decision_matches = decision.map_or(legacy_binding, |decision| {
+            evidence.actor == decision.actor
+                && evidence.approver == decision.approver
+                && evidence.decision_id == decision.decision_id
+        });
         if metadata_incarnation != &intent.incarnation
             || metadata
                 .destruction_record_key
                 .as_ref()
                 .is_some_and(|key| key != &intent.destruction_record_key)
-            || intent.fenced_generation != Some(evidence.manifest_version_destroyed)
+            || !fenced_generation_matches
             || evidence.namespace != *namespace
             || evidence.parent_root != intent.parent_root
-            || evidence.incarnation.as_ref() != Some(&intent.incarnation)
-            || evidence.actor != decision.actor
-            || evidence.approver != decision.approver
-            || evidence.decision_id != decision.decision_id
-            || evidence.preservation_head.is_none()
+            || !evidence.protocol_fields_match(intent)
+            || !decision_matches
         {
             return Err(ZeppelinError::Validation(format!(
                 "namespace {namespace} destruction evidence does not match its durable deletion intent"
@@ -1545,14 +1583,24 @@ impl NamespaceGraph {
         namespace: &NamespaceId,
         metadata: &NamespaceMetadata,
         intent: &crate::namespace::manager::NamespaceDeletionIntent,
-    ) -> Result<(DeletionDecision, NamespaceDestructionRecord)> {
-        let decision =
-            load_deletion_decision_evidence(&self.store, &intent.decision_evidence_ref).await?;
+    ) -> Result<NamespaceDestructionRecord> {
         let evidence = NamespaceDestructionRecord::from_bytes(
             &self.store.get(&intent.destruction_record_key).await?,
         )?;
-        self.validate_destruction_evidence(namespace, metadata, intent, &decision, &evidence)?;
-        Ok((decision, evidence))
+        let legacy_binding = intent.is_legacy_direct_evidence_binding();
+        let decision = if legacy_binding {
+            None
+        } else {
+            Some(load_deletion_decision_evidence(&self.store, &intent.decision_evidence_ref).await?)
+        };
+        self.validate_destruction_evidence(
+            namespace,
+            metadata,
+            intent,
+            decision.as_ref(),
+            &evidence,
+        )?;
+        Ok(evidence)
     }
 
     async fn namespace_destruction_census(&self, namespace: &str) -> Result<(usize, u64)> {
@@ -1739,9 +1787,35 @@ impl NamespaceGraph {
                 "namespace {namespace} deletion tombstone omitted its durable intent"
             ))
         })?;
-        let (_decision, evidence) = self
+        let mut evidence = self
             .load_bound_destruction_evidence(namespace, &metadata, &intent)
             .await?;
+
+        if intent.fenced_generation.is_none() {
+            if let Some(manifest) = Manifest::read(&self.store, namespace.as_str()).await? {
+                manifest.require_destruction_fence(
+                    namespace.as_str(),
+                    &intent.destruction_record_key,
+                    evidence.manifest_version_destroyed,
+                )?;
+            }
+            metadata = self
+                .namespace_manager
+                .record_fenced_generation(
+                    namespace.as_str(),
+                    &intent.decision_evidence_ref,
+                    evidence.manifest_version_destroyed,
+                )
+                .await?;
+            intent = metadata.deletion_intent.clone().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "namespace {namespace} lost its migrated deletion intent"
+                ))
+            })?;
+            evidence = self
+                .load_bound_destruction_evidence(namespace, &metadata, &intent)
+                .await?;
+        }
 
         if let Some(manifest) = Manifest::read(&self.store, namespace.as_str()).await? {
             manifest.require_destruction_fence(

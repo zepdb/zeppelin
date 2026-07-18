@@ -425,6 +425,27 @@ impl SecurityKernel {
         Ok((guard, proof))
     }
 
+    /// Durably record a delete deferral already proved by cached authority.
+    ///
+    /// The request adapter uses this only when the locally committed
+    /// preservation head already contains the blocking lock. A cache miss still
+    /// goes through [`Self::guard_namespace_destruction_strong`], which records
+    /// the same evidence after its authoritative S3 read.
+    pub async fn record_namespace_delete_deferral(
+        &self,
+        namespace: &NamespaceId,
+        guard: &super::PreservationGuard,
+    ) -> ZeppelinResult<()> {
+        let Some(preservation) = &self.preservation else {
+            return Err(crate::error::ZeppelinError::Validation(format!(
+                "namespace {namespace} has a preservation lock without a preservation service"
+            )));
+        };
+        preservation
+            .record_namespace_delete_deferral(namespace, guard)
+            .await
+    }
+
     /// Mint one request-scoped graph deletion envelope from the exact middleware decision.
     #[must_use]
     pub(crate) fn authorize_namespace_delete(

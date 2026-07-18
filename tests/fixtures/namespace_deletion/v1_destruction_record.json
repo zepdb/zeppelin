@@ -1,0 +1,9 @@
+{
+  "namespace": "__NAMESPACE__",
+  "manifest_version_destroyed": __MANIFEST_VERSION_DESTROYED__,
+  "object_count": __OBJECT_COUNT__,
+  "byte_count": __BYTE_COUNT__,
+  "actor": "legacy-delete-actor",
+  "decision_id": "__DECISION_ID__",
+  "ts": "2026-01-01T00:00:00Z"
+}

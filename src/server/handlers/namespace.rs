@@ -2818,10 +2818,25 @@ pub async fn delete_namespace(
 ) -> Result<(StatusCode, Json<DeleteNamespaceResponse>), ApiError> {
     require_unconstrained_namespace_operation(&decision)?;
     let namespace_id = NamespaceId::new(ns.clone()).map_err(|error| ApiError(error.into()))?;
-    let guard = state
+    let cached_guard = state
         .security
         .guard_namespace_destruction(&namespace_id)
         .map_err(|error| ApiError(error.into()))?;
+    let guard = if cached_guard.is_locked() {
+        state
+            .security
+            .record_namespace_delete_deferral(&namespace_id, &cached_guard)
+            .await
+            .map_err(ApiError::from)?;
+        cached_guard
+    } else {
+        state
+            .security
+            .guard_namespace_destruction_strong(&namespace_id)
+            .await
+            .map_err(ApiError)?
+            .0
+    };
     if guard.is_locked() {
         audit.set_params(AuditParams::preservation_blocked(
             PreservationBlockedSurface::NamespaceDelete,
