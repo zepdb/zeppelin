@@ -203,7 +203,7 @@ pub struct ForkResponse {
     /// Redacted source identity.
     pub source: ForkSourceIdentity,
     /// Redacted target identity.
-    pub target: BranchTargetIdentity,
+    pub target: ForkTargetIdentity,
     /// Ancestry depth.
     pub depth: u16,
     /// Whether all artifacts are target-owned.
@@ -220,6 +220,17 @@ pub struct ForkSourceIdentity {
     /// Source namespace incarnation.
     pub incarnation: String,
     /// Exact live-head generation selected by the fork.
+    pub generation: u64,
+}
+
+/// Redacted target identity returned by fork creation.
+#[derive(Debug, Serialize)]
+pub struct ForkTargetIdentity {
+    /// Target namespace name.
+    pub namespace: String,
+    /// Target namespace incarnation.
+    pub incarnation: String,
+    /// Prepared target manifest generation.
     pub generation: u64,
 }
 
@@ -319,9 +330,10 @@ pub async fn create_branch(
                 incarnation: branch.identity.source_incarnation.to_string(),
                 generation: branch.identity.source_generation.get(),
             },
-            target: BranchTargetIdentity {
+            target: ForkTargetIdentity {
                 namespace: branch.identity.target_namespace.to_string(),
                 incarnation: branch.identity.target_incarnation.to_string(),
+                generation: branch.identity.target_generation.get(),
             },
             depth: branch.identity.depth,
             materialized: false,
@@ -1990,7 +2002,7 @@ async fn materialize_clone_manifest(
 
 #[cfg(test)]
 mod fork_response_tests {
-    use super::{BranchMode, BranchTargetIdentity, ForkResponse, ForkSourceIdentity};
+    use super::{BranchMode, ForkResponse, ForkSourceIdentity, ForkTargetIdentity};
 
     #[test]
     fn response_contains_only_redacted_public_fork_fields() {
@@ -2003,9 +2015,10 @@ mod fork_response_tests {
                 incarnation: "source-inc".to_string(),
                 generation: 42,
             },
-            target: BranchTargetIdentity {
+            target: ForkTargetIdentity {
                 namespace: "target".to_string(),
                 incarnation: "target-inc".to_string(),
+                generation: 1,
             },
             depth: 1,
             materialized: false,
