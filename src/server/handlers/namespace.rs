@@ -159,8 +159,8 @@ use crate::namespace::manager::{
     NamespaceState, COMPACTION_DEGRADED_FAILURE_THRESHOLD,
 };
 use crate::security::{
-    Action, AllowDecision, AuditParams, IndexConfigValues, NamespaceId, PreservationBlockedSurface,
-    Feature, Principal, RequestContext, SecurityError,
+    Action, AllowDecision, AuditParams, Feature, IndexConfigValues, NamespaceId,
+    PreservationBlockedSurface, Principal, RequestContext, SecurityError,
 };
 use crate::server::{authorize_namespace_action, AppState, AuditRequest};
 use crate::storage::CreateOnlyOutcome;

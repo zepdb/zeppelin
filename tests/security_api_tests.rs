@@ -702,8 +702,7 @@ fn branch_creation_uses_distinct_fork_action() {
     let entry = ROUTE_ACTIONS
         .iter()
         .find(|entry| {
-            entry.method == reqwest::Method::POST
-                && entry.path == "/v1/namespaces/:ns/branches"
+            entry.method == reqwest::Method::POST && entry.path == "/v1/namespaces/:ns/branches"
         })
         .expect("branch creation route must be mapped");
     assert_eq!(entry.class, RouteClass::Protected(Action::NamespaceFork));
