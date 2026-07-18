@@ -32,7 +32,7 @@ use crate::namespace::branching::{
 };
 use crate::namespace::manager::{
     CompactionHealth, NamespaceIndexConfig, NamespaceManager, NamespaceMetadata, NamespaceState,
-    ReserveMetadataOutcome,
+    ReserveMetadataOutcome, RootReleaseState,
 };
 use crate::namespace::{
     BranchId, BranchRoot, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
@@ -275,7 +275,62 @@ impl NamespaceGraph {
             self.namespace_manager
                 .record_visibility_removal(namespace.as_str(), visibility)
                 .await?;
-            return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
+            let (meta_after, _) = self
+                .namespace_manager
+                .read_metadata_versioned(namespace.as_str())
+                .await?;
+            let intent = meta_after.deletion_intent.as_ref().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "branch namespace {} lost its deletion intent",
+                    namespace
+                ))
+            })?;
+            let visibility = intent.visibility.as_ref().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "branch namespace {} has no persisted visibility deadline",
+                    namespace
+                ))
+            })?;
+            if self.clock.now() < visibility.not_before {
+                return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
+            }
+            let parent_root = intent.parent_root.clone().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "branch namespace {} has no exact parent root",
+                    namespace
+                ))
+            })?;
+            let source_namespace = match &metadata.creation_kind {
+                NamespaceCreationKind::Fork(reservation) => reservation.source_namespace.clone(),
+                NamespaceCreationKind::Root => unreachable!(),
+            };
+            remove_branch_root(
+                &self.store,
+                &self.namespace_manager,
+                &self.lease_manager,
+                RemoveBranchRootRequest {
+                    source_namespace,
+                    expected_root: parent_root,
+                },
+            )
+            .await?;
+            self.namespace_manager
+                .record_root_release(
+                    namespace.as_str(),
+                    RootReleaseState::Released {
+                        acked_at: self.clock.now(),
+                    },
+                )
+                .await?;
+            let outcome = self
+                .namespace_manager
+                .finish_delete(namespace.as_str(), budget)
+                .await?;
+            return Ok(if outcome.complete {
+                NamespaceDeleteOutcome::Deleted
+            } else {
+                NamespaceDeleteOutcome::AlreadyDeleting
+            });
         }
         let outcome = self
             .namespace_manager
