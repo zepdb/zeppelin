@@ -18,7 +18,13 @@ use common::server::{
 use zeppelin::compaction::gc::{GcNamespaceIncarnation, GcRunner};
 use zeppelin::config::Config;
 use zeppelin::namespace::manager::{NamespaceMetadata, NamespaceState};
+use zeppelin::namespace::NamespaceId;
+use zeppelin::security::{
+    CreatePreservationLock, PreservationReasonKind, PreservationScope, PreservationService,
+    PrincipalId,
+};
 use zeppelin::storage::ObjectUserMetadata;
+use zeppelin::time::Clock;
 use zeppelin::wal::{Manifest, WalFragment};
 
 async fn create_namespace_lock(client: &reqwest::Client, base_url: &str, namespace: &str) -> Value {
@@ -34,6 +40,44 @@ async fn create_namespace_lock(client: &reqwest::Client, base_url: &str, namespa
         .unwrap();
     assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
     response.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn strong_preservation_probe_sees_lock_missing_from_stale_cache() {
+    let harness = TestHarness::new().await;
+    let namespace = NamespaceId::new("strong-probe-target").unwrap();
+    let first = PreservationService::start(
+        harness.store.clone(),
+        Clock::system(),
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let second = PreservationService::start(
+        harness.store.clone(),
+        Clock::system(),
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    second
+        .create_lock(
+            PrincipalId::new("human:strong-probe").unwrap(),
+            CreatePreservationLock {
+                scope: PreservationScope::Namespace {
+                    namespace: namespace.clone(),
+                },
+                reason_kind: PreservationReasonKind::Litigation,
+                reason_text: "strong probe regression".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!first.guard_namespace(&namespace).unwrap().is_locked());
+    let (guard, proof) = first.guard_namespace_strong(&namespace).await.unwrap();
+    assert!(guard.is_locked());
+    assert!(proof.e_tag.is_some());
+    harness.cleanup().await;
 }
 
 async fn create_release_approver(admin: &reqwest::Client, base_url: &str, suffix: &str) -> String {
