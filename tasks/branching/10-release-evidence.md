@@ -11,9 +11,10 @@ disabled by default until every required contract below is green.
 | Artifact origins and physical reads | `4d30aaa`, `4612b7e`; manifest origin tests |
 | Branch roots and exact generations | `d608135`, `cb967eb`; root-crash/retry MinIO cases |
 | Foreign-branch materialization | `a5f82d0`, `a45c25f`; activated materialization MinIO case and compaction unit suite |
-| Graph deletion/root release | `d9d1c71`, `625cfb7`; source-child blocking and target-drop MinIO cases |
+| Graph deletion/root release | `d9d1c71`, `625cfb7`, `e833fc9`; source-child blocking, target-drop, and pre-tombstone HTTP guard coverage |
 | Direct-child ordering/list contracts | `33908b0`, `897ef9b`, `e8ecb73`; target-order MinIO case and route/OpenAPI parity |
 | Fork security gates | `a8ac7b8`, `3df5c20`, `0d43b7e`; policy non-widening and central route-map checks |
+| Current branching integration gate | `TEST_BACKEND=minio cargo test --features branching-test-support --test branch_fork_tests`; 20 passed |
 
 ## Explicitly incomplete
 
