@@ -20,7 +20,9 @@ use crate::namespace::branch_root::{
     insert_branch_root_with_lease, remove_branch_root, source_data_plane_config_digest,
     InsertBranchRootRequest, RemoveBranchRootRequest,
 };
-use crate::namespace::branching::deletion::{AuthorizedNamespaceDelete, DeletionBoundary};
+use crate::namespace::branching::deletion::{
+    AuthorizedNamespaceDelete, DeletionBoundary, DeletionLifecycleEvent,
+};
 use crate::namespace::branching::{
     ArtifactOrigin, BranchDescriptor, BranchError, BranchListRequest, BranchMaintenanceReport,
     BranchPrepareStage, ForkDataPlaneConfig, ForkIdentity, ForkPrepareIntent,
@@ -206,6 +208,58 @@ impl NamespaceGraph {
             self.namespace_manager.delete(name).await?;
         }
         Ok(NamespaceDeleteOutcome::Deleted)
+    }
+
+    /// Resume cleanup for a durable deleting tombstone.
+    ///
+    /// This is the retry seam used by background maintenance.  It only
+    /// completes ordinary namespaces whose live manifest has already been
+    /// removed; branch targets remain governed by the marker/grace/root
+    /// release protocol and are rejected until that protocol is installed.
+    pub(crate) async fn resume_delete(
+        &self,
+        namespace: &NamespaceId,
+        governance: Arc<dyn crate::namespace::branching::deletion::DeletionGovernance>,
+        budget: Duration,
+    ) -> Result<NamespaceDeleteOutcome> {
+        let (preservation, _head_proof) = governance
+            .preservation_boundary(namespace, DeletionBoundary::CleanupBatch)
+            .await?;
+        if preservation.is_locked() {
+            return Err(crate::security::SecurityError::PreservationLocked.into());
+        }
+        let metadata = self
+            .namespace_manager
+            .read_metadata_versioned(namespace.as_str())
+            .await?
+            .0;
+        if metadata.state != NamespaceState::Deleting {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {} is not marked deleting",
+                namespace
+            )));
+        }
+        if matches!(metadata.creation_kind, NamespaceCreationKind::Fork(_)) {
+            return Err(ZeppelinError::Validation(format!(
+                "branch namespace {} requires governed grace and root release",
+                namespace
+            )));
+        }
+        let outcome = self
+            .namespace_manager
+            .finish_delete(namespace.as_str(), budget)
+            .await?;
+        if outcome.complete {
+            Ok(NamespaceDeleteOutcome::Deleted)
+        } else {
+            governance
+                .settle_lifecycle_audit(DeletionLifecycleEvent::CleanupIncomplete {
+                    namespace: namespace.clone(),
+                    remaining: outcome.deleted.saturating_add(1),
+                })
+                .await?;
+            Ok(NamespaceDeleteOutcome::AlreadyDeleting)
+        }
     }
 
     /// List only the direct children represented by the authoritative root map.
