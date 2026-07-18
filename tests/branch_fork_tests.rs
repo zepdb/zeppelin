@@ -145,6 +145,42 @@ async fn graph_delete_rejects_a_source_with_a_live_child_root() {
 }
 
 #[tokio::test]
+async fn ungoverned_manager_delete_rejects_a_source_with_a_live_child_root() {
+    let harness = TestHarness::new().await;
+    let source = harness.artifact_origin_namespace("manager-delete-source");
+    let target = harness.artifact_origin_namespace("manager-delete-target");
+    NamespaceManager::new(harness.store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .unwrap();
+    prepare_fork_for_test(
+        harness.store.clone(),
+        NamespaceId::new(source.clone()).unwrap(),
+        NamespaceId::new(target.clone()).unwrap(),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .unwrap();
+    let error = NamespaceManager::new(harness.store.clone())
+        .delete(&source)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ZeppelinError::Branch(inner)
+            if matches!(*inner, BranchError::NamespaceHasLiveBranches { .. })
+    ));
+    assert!(NamespaceManager::new(harness.store.clone())
+        .get(&source)
+        .await
+        .is_ok());
+    harness.cleanup_artifact_origin_namespace(&source).await;
+    harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn graph_delete_removes_branch_root_after_target_cleanup() {
     let harness = TestHarness::new().await;
     let source = harness.artifact_origin_namespace("drop-source");

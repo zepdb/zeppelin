@@ -2062,6 +2062,14 @@ impl NamespaceManager {
                 "namespace {name} requires governed deletion"
             )));
         }
+        if let Some(manifest) = crate::wal::Manifest::read(&self.store, name).await? {
+            if !manifest.branch_roots().is_empty() {
+                return Err(BranchError::NamespaceHasLiveBranches {
+                    namespace: name.to_string(),
+                }
+                .into());
+            }
+        }
         let meta = self.mark_deleting(name, false).await?;
 
         self.registry.remove(name);
