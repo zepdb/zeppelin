@@ -240,11 +240,7 @@ pub async fn delete_namespace_for_test(
     branching: BranchingConfig,
 ) -> Result<NamespaceDeleteOutcome> {
     graph_for_test(store, indexing, branching)
-        .delete(NamespaceDeleteRequest {
-            namespace,
-            decision_evidence_ref: None,
-            parent_root: None,
-        })
+        .delete(NamespaceDeleteRequest { namespace })
         .await
 }
 
