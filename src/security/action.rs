@@ -246,6 +246,7 @@ impl Action {
             self,
             Self::NamespaceRead
                 | Self::NamespaceDelete
+                | Self::NamespaceFork
                 | Self::SnapshotRead
                 | Self::SnapshotWrite
                 | Self::SnapshotDelete
@@ -313,6 +314,12 @@ mod tests {
                 "PreservationRelease",
             ]
         );
+    }
+
+    #[test]
+    fn namespace_fork_is_delegatable() {
+        assert!(Action::NamespaceFork.is_delegatable());
+        assert!(!Action::NamespaceClone.is_delegatable());
     }
 
     #[test]
