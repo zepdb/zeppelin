@@ -6,6 +6,7 @@ use chrono::Utc;
 use common::counting::{counting_store, ArtifactClass};
 use common::fault_injection::fail_put_once_matching;
 use common::harness::TestHarness;
+use common::server::scoped_test_security_store;
 use common::vectors::{random_vectors, simple_attributes, with_attributes};
 
 use zeppelin::cache::manifest_cache::ManifestCache;
@@ -2268,6 +2269,142 @@ async fn test_background_compaction_accepts_missing_manifest_while_deleting() {
         0,
         "a deleting namespace must bypass active compaction failure accounting"
     );
+
+    harness.cleanup().await;
+}
+
+#[cfg(feature = "branching-test-support")]
+#[tokio::test]
+async fn test_background_compaction_resumes_active_governed_deletion_intent() {
+    let harness = TestHarness::new().await;
+    let isolated_store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let ns = format!("{}-active-governed-delete", harness.prefix);
+    zeppelin::namespace::NamespaceManager::new(isolated_store.clone())
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .expect("governed deletion fixture namespace must be created");
+
+    // Reject the deletion fence publication after the graph has durably
+    // installed its metadata intent. This models a process crash in the exact
+    // pre-tombstone state that a stateless maintenance worker must discover.
+    let (crashed_store, fence_failure) =
+        fail_put_once_matching(&isolated_store, Manifest::s3_key(&ns));
+    let config = zeppelin::config::Config::default();
+    zeppelin::namespace::branching::test_support::delete_namespace_for_test(
+        crashed_store,
+        zeppelin::namespace::NamespaceId::new(ns.clone()).expect("fixture namespace must be valid"),
+        config.indexing.clone(),
+        config.branching.clone(),
+    )
+    .await
+    .expect_err("crash fixture must fail before publishing the deletion fence");
+    assert_eq!(fence_failure.failures_injected(), 1);
+
+    let metadata_key = NamespaceMetadata::s3_key(&ns);
+    let interrupted = NamespaceMetadata::from_bytes(
+        &isolated_store
+            .get(&metadata_key)
+            .await
+            .expect("crash fixture must retain authoritative namespace metadata"),
+    )
+    .expect("crash fixture metadata must decode");
+    assert_eq!(interrupted.state, NamespaceState::Active);
+    let interrupted_intent = interrupted
+        .deletion_intent
+        .as_ref()
+        .expect("crash fixture must retain its governed deletion intent");
+    assert_eq!(
+        interrupted_intent.fenced_generation, None,
+        "crash fixture must stop before the destruction fence and tombstone"
+    );
+
+    let (store, counter) = counting_store(&isolated_store);
+    let namespace_manager = Arc::new(zeppelin::namespace::NamespaceManager::new(store.clone()));
+    let compaction_config = CompactionConfig {
+        interval_secs: 1,
+        ..Default::default()
+    };
+    let compactor = Arc::new(Compactor::new(
+        store.clone(),
+        WalReader::new(store.clone()),
+        compaction_config.clone(),
+        IndexingConfig::default(),
+        common::default_gc_upload_window(),
+    ));
+    let manifest_cache = Arc::new(zeppelin::cache::manifest_cache::ManifestCache::new(
+        Duration::from_millis(10),
+    ));
+    let lease_manager = Arc::new(zeppelin::wal::LeaseManager::new(
+        store.clone(),
+        format!("test-{}", uuid::Uuid::new_v4()),
+        Duration::from_secs(compaction_config.lease_duration_secs),
+    ));
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+    );
+    let mut worker_config = config;
+    worker_config
+        .security
+        .set_cursor_hmac_key_hex("42".repeat(32));
+    let security = Arc::new(
+        zeppelin::security::SecurityKernel::from_config(&worker_config.security)
+            .expect("open test security kernel must compose"),
+    );
+    let deletion_worker = zeppelin::compaction::background::GovernedDeletionWorker::new(
+        store.clone(),
+        namespace_manager.clone(),
+        lease_manager.clone(),
+        zeppelin::time::Clock::system(),
+        manifest_cache.clone(),
+        &worker_config,
+        security,
+    );
+    let compaction_lifecycle = zeppelin::compaction::background::CompactionLifecycle::new();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let loop_handle = tokio::spawn({
+        let namespace_prefix = Some(harness.prefix.clone());
+        async move {
+            zeppelin::compaction::background::compaction_loop_with_governed_deletion(
+                compactor,
+                namespace_manager,
+                shutdown_rx,
+                manifest_cache,
+                lease_manager,
+                cache,
+                CompactionLoopOptions {
+                    gc_config: zeppelin::config::GcConfig::default(),
+                    namespace_prefix,
+                },
+                deletion_worker,
+                &compaction_lifecycle,
+            )
+            .await;
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while counter.delimiter_list_calls_for_prefix("") == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background loop must complete authoritative namespace discovery");
+    shutdown_tx.send(true).unwrap();
+    loop_handle.await.unwrap();
+
+    match store.get(&metadata_key).await {
+        Err(zeppelin::error::ZeppelinError::NotFound { .. }) => {}
+        Ok(bytes) => {
+            let remaining = NamespaceMetadata::from_bytes(&bytes)
+                .expect("remaining authoritative metadata must decode");
+            panic!(
+                "background governed deletion worker left crash metadata active: state={:?}, deletion_intent={:?}",
+                remaining.state, remaining.deletion_intent
+            );
+        }
+        Err(error) => panic!("authoritative metadata read failed unexpectedly: {error}"),
+    }
 
     harness.cleanup().await;
 }

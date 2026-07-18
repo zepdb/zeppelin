@@ -915,6 +915,46 @@ pub fn fail_delete_once_matching(
     (ZeppelinStore::new(Arc::new(failing)), handle)
 }
 
+/// Object-store decorator that loses the first successful matching DELETE reply.
+#[derive(Debug)]
+pub struct FailAfterDeleteOnceStore {
+    inner: Arc<dyn ObjectStore>,
+    needle: String,
+    remaining: AtomicUsize,
+    failures_injected: Arc<AtomicUsize>,
+}
+
+impl FailAfterDeleteOnceStore {
+    /// Wrap an existing store and fail after one matching DELETE commits.
+    pub fn wrap(
+        inner: Arc<dyn ObjectStore>,
+        needle: impl Into<String>,
+    ) -> (Self, PutFailureHandle) {
+        let failures_injected = Arc::new(AtomicUsize::new(0));
+        let handle = PutFailureHandle {
+            failures_injected: Arc::clone(&failures_injected),
+        };
+        (
+            Self {
+                inner,
+                needle: needle.into(),
+                remaining: AtomicUsize::new(1),
+                failures_injected,
+            },
+            handle,
+        )
+    }
+}
+
+/// Wrap a store so one matching DELETE commits but its acknowledgement is lost.
+pub fn fail_after_delete_once_matching(
+    store: &ZeppelinStore,
+    needle: impl Into<String>,
+) -> (ZeppelinStore, PutFailureHandle) {
+    let (failing, handle) = FailAfterDeleteOnceStore::wrap(store.inner(), needle);
+    (ZeppelinStore::new(Arc::new(failing)), handle)
+}
+
 /// `ObjectStore` decorator that delays every DELETE whose key contains `needle`.
 #[derive(Debug)]
 pub struct DelayDeleteStore {
@@ -1373,6 +1413,12 @@ impl fmt::Display for FailCasEtagReconciliationStore {
 impl fmt::Display for FailDeleteOnceStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "FailDeleteOnceStore({})", self.inner)
+    }
+}
+
+impl fmt::Display for FailAfterDeleteOnceStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FailAfterDeleteOnceStore({})", self.inner)
     }
 }
 
@@ -2368,6 +2414,69 @@ impl ObjectStore for FailDeleteOnceStore {
             });
         }
         self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FailAfterDeleteOnceStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await?;
+        if location.as_ref().contains(&self.needle)
+            && self
+                .remaining
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.failures_injected.fetch_add(1, Ordering::SeqCst);
+            return Err(object_store::Error::Generic {
+                store: "fail_after_delete_once",
+                source: Box::new(std::io::Error::other(format!(
+                    "injected lost acknowledgement after delete for {location}"
+                ))),
+            });
+        }
+        Ok(())
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {

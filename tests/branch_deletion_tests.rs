@@ -3,26 +3,29 @@
 mod common;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use common::counting::counting_store;
 use common::fault_injection::{
-    fail_after_put_once_matching, fail_delete_once_matching, fail_put_once_matching,
-    pause_next_cas_matching, pause_next_get_matching,
+    fail_after_delete_once_matching, fail_after_put_once_matching, fail_delete_once_matching,
+    fail_put_once_matching, pause_next_cas_matching, pause_next_get_matching,
 };
 use common::server::{
-    client_with_bearer, start_test_server_full,
+    client_with_bearer, scoped_test_security_store, start_test_server_full,
     start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer,
     start_test_server_on_store_with_config, start_test_server_with_config, FullTestServer,
 };
 use serde_json::{json, Value};
 use zeppelin::config::Config;
 use zeppelin::namespace::branching::test_support::{
-    activate_fork_for_test, branch_control_snapshot, insert_prepared_branch_root,
+    activate_fork_for_test, branch_control_snapshot, delete_namespace_for_test,
+    insert_prepared_branch_root, maintain_branches_with_config_and_clock_for_test,
     prepare_head_branch_root, remove_prepared_branch_root,
     resume_delete_with_config_and_clock_for_test,
 };
 use zeppelin::namespace::branching::{
-    BranchError, BranchId, ForkViewDigest, NamespaceDeleteOutcome,
+    BranchError, BranchId, BranchMaintenanceReport, ForkViewDigest, NamespaceDeleteOutcome,
 };
 use zeppelin::namespace::manager::{
     NamespaceMetadata, NamespaceState, RootReleaseState, VisibilityRemoval,
@@ -83,11 +86,20 @@ async fn establish_branch_grace(
     source: &str,
     target: &str,
 ) -> EstablishedBranchGrace {
+    establish_branch_grace_on_store(harness, harness.store.clone(), source, target).await
+}
+
+async fn establish_branch_grace_on_store(
+    harness: &common::harness::TestHarness,
+    store: ZeppelinStore,
+    source: &str,
+    target: &str,
+) -> EstablishedBranchGrace {
     let config = branch_grace_config();
     let wall_clock = Arc::new(AdjustableWallClock::new(Utc::now()));
     let clock = Clock::from_source(wall_clock.clone());
     let server = start_test_server_full(
-        harness.store.clone(),
+        store.clone(),
         Some(harness.prefix.clone()),
         config.clone(),
         false,
@@ -105,14 +117,14 @@ async fn establish_branch_grace(
         .await
         .expect("initial branch deletion must complete");
     assert_eq!(deletion.status(), reqwest::StatusCode::ACCEPTED);
-    let deleting = read_namespace_metadata(&harness.store, target).await;
+    let deleting = read_namespace_metadata(&store, target).await;
     let visibility = deleting
         .deletion_intent
         .as_ref()
         .and_then(|intent| intent.visibility.clone())
         .expect("initial branch deletion must persist its grace boundary");
     assert_eq!(
-        branch_control_snapshot(&harness.store, source)
+        branch_control_snapshot(&store, source)
             .await
             .expect("parent root must remain readable during grace")
             .roots
@@ -1326,5 +1338,1346 @@ async fn slice_five_lost_root_reply_can_converge_after_parent_is_fully_deleted()
 
     harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup().await;
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DeletingMaintenanceRow {
+    ActiveIntentUnfenced,
+    ActiveIntentFencedWithEvidence,
+    ActiveIntentRootWonConflict,
+    DeletingFencedManifestPresent,
+    BranchDeletingWithoutVisibility,
+    BranchGracePending,
+    BranchGraceElapsedRootPresent,
+    BranchRootAbsentBeforeGrace,
+    BranchRootReplyLost,
+    BranchCleanupPartial,
+    ActiveBranchVerified,
+    ActiveBranchMissingParentRoot,
+    BranchParentIncarnationReplaced,
+    OrdinaryGovernedDeleting,
+    FinalMetadataDeleteReplyLost,
+    ZeroBudget,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExpectedDeletionMaintenance {
+    inspected: usize,
+    completed: usize,
+    in_progress: usize,
+    grace_waiting: usize,
+}
+
+const SLICE_SIX_MAINTENANCE_BUDGET: Duration = Duration::from_secs(25);
+
+fn assert_deletion_maintenance_report(
+    row: DeletingMaintenanceRow,
+    report: &BranchMaintenanceReport,
+    expected: ExpectedDeletionMaintenance,
+) {
+    assert_eq!(
+        report.deletions_inspected, expected.inspected,
+        "{row:?}: maintenance must report each governed deletion state it dispatches"
+    );
+    assert_eq!(
+        report.deletions_completed, expected.completed,
+        "{row:?}: maintenance completion count must match metadata-last deletion"
+    );
+    assert_eq!(
+        report.deletions_in_progress, expected.in_progress,
+        "{row:?}: durable unfinished deletion must be reported as in progress"
+    );
+    assert_eq!(
+        report.branch_grace_waiting, expected.grace_waiting,
+        "{row:?}: only a branch still inside reader-safety grace may wait"
+    );
+}
+
+async fn maintain_deletions(
+    harness: &common::harness::TestHarness,
+    store: ZeppelinStore,
+    fixture: &EstablishedBranchGrace,
+    budget: Duration,
+) -> (BranchMaintenanceReport, FullTestServer) {
+    maintain_deletions_with_config(
+        harness,
+        store,
+        &fixture.config,
+        fixture.clock.clone(),
+        budget,
+    )
+    .await
+}
+
+async fn maintain_deletions_with_config(
+    harness: &common::harness::TestHarness,
+    store: ZeppelinStore,
+    config: &Config,
+    clock: Clock,
+    budget: Duration,
+) -> (BranchMaintenanceReport, FullTestServer) {
+    let server = start_test_server_full(
+        store,
+        Some(harness.prefix.clone()),
+        config.clone(),
+        false,
+        Some(clock.clone()),
+    )
+    .await;
+    let report = maintain_branches_with_config_and_clock_for_test(
+        server.store.clone(),
+        config,
+        clock,
+        budget,
+    )
+    .await
+    .expect("bounded deletion maintenance pass must complete");
+    (report, server)
+}
+
+async fn establish_ordinary_governed_deleting(
+    store: &ZeppelinStore,
+    namespace: &str,
+    config: &Config,
+) {
+    NamespaceManager::new(store.clone())
+        .create(namespace, 4, DistanceMetric::Cosine)
+        .await
+        .expect("ordinary namespace fixture must be created");
+    assert_eq!(
+        delete_namespace_for_test(
+            store.clone(),
+            NamespaceId::new(namespace.to_string()).expect("namespace must be valid"),
+            config.indexing.clone(),
+            config.branching.clone(),
+        )
+        .await
+        .expect("graph delete must establish an ordinary governed tombstone"),
+        NamespaceDeleteOutcome::AlreadyDeleting
+    );
+    assert_eq!(
+        read_namespace_metadata(store, namespace).await.state,
+        NamespaceState::Deleting,
+        "ordinary fixture must stop at a durable governed Deleting state"
+    );
+}
+
+async fn cleanup_branch_maintenance_fixture(harness: &common::harness::TestHarness) {
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn slice_six_maintain_resumes_governed_deletion_recovery_matrix() {
+    Box::pin(run_slice_six_maintain_recovery_matrix()).await;
+}
+
+async fn run_slice_six_maintain_recovery_matrix() {
+    let rows = [
+        DeletingMaintenanceRow::ActiveIntentUnfenced,
+        DeletingMaintenanceRow::ActiveIntentFencedWithEvidence,
+        DeletingMaintenanceRow::ActiveIntentRootWonConflict,
+        DeletingMaintenanceRow::DeletingFencedManifestPresent,
+        DeletingMaintenanceRow::BranchDeletingWithoutVisibility,
+        DeletingMaintenanceRow::BranchGracePending,
+        DeletingMaintenanceRow::BranchGraceElapsedRootPresent,
+        DeletingMaintenanceRow::BranchRootAbsentBeforeGrace,
+        DeletingMaintenanceRow::BranchRootReplyLost,
+        DeletingMaintenanceRow::BranchCleanupPartial,
+        DeletingMaintenanceRow::ActiveBranchVerified,
+        DeletingMaintenanceRow::ActiveBranchMissingParentRoot,
+        DeletingMaintenanceRow::BranchParentIncarnationReplaced,
+        DeletingMaintenanceRow::OrdinaryGovernedDeleting,
+        DeletingMaintenanceRow::FinalMetadataDeleteReplyLost,
+        DeletingMaintenanceRow::ZeroBudget,
+    ];
+
+    for row in rows {
+        run_slice_six_maintain_recovery_row(row).await;
+    }
+}
+
+fn run_slice_six_maintain_recovery_row(
+    row: DeletingMaintenanceRow,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
+    match row {
+        DeletingMaintenanceRow::ActiveIntentUnfenced => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let namespace = harness.artifact_origin_namespace("maintain-active-unfenced");
+            let config = branch_grace_config();
+            let clock = Clock::from_source(Arc::new(AdjustableWallClock::new(Utc::now())));
+            NamespaceManager::new(store.clone())
+                .create(&namespace, 4, DistanceMetric::Cosine)
+                .await
+                .expect("unfenced crash fixture namespace must be created");
+            let (crashed_store, fence_failure) =
+                fail_put_once_matching(&store, Manifest::s3_key(&namespace));
+            let crashed_server = start_test_server_full(
+                crashed_store,
+                Some(harness.prefix.clone()),
+                config.clone(),
+                false,
+                Some(clock.clone()),
+            )
+            .await;
+
+            delete_namespace_for_test(
+                crashed_server.store.clone(),
+                NamespaceId::new(namespace.clone()).expect("namespace must be valid"),
+                config.indexing.clone(),
+                config.branching.clone(),
+            )
+            .await
+            .expect_err("fence publication failure must stop after installing the intent");
+            assert_eq!(fence_failure.failures_injected(), 1);
+            let interrupted = read_namespace_metadata(&crashed_server.store, &namespace).await;
+            assert_eq!(interrupted.state, NamespaceState::Active);
+            let intent = interrupted
+                .deletion_intent
+                .as_ref()
+                .expect("unfenced crash must retain the durable deletion intent");
+            assert_eq!(intent.fenced_generation, None);
+            assert!(
+                !branch_control_snapshot(&crashed_server.store, &namespace)
+                    .await
+                    .expect("unfenced live manifest must remain readable")
+                    .deletion_fenced,
+                "crash before the fence must leave the live manifest writable"
+            );
+            crashed_server.shutdown().await;
+
+            let (report, server) = maintain_deletions_with_config(
+                &harness,
+                store.clone(),
+                &config,
+                clock,
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await;
+            assert_deletion_maintenance_report(
+                row,
+                &report,
+                ExpectedDeletionMaintenance {
+                    inspected: 1,
+                    completed: 1,
+                    in_progress: 0,
+                    grace_waiting: 0,
+                },
+            );
+            assert!(matches!(
+                store.get(&NamespaceMetadata::s3_key(&namespace)).await,
+                Err(zeppelin::error::ZeppelinError::NotFound { .. })
+            ));
+            assert!(
+                store
+                    .list_prefix(&format!("{namespace}/"))
+                    .await
+                    .expect("completed unfenced recovery prefix must be listable")
+                    .is_empty(),
+                "metadata-last completion must leave no namespace-owned objects"
+            );
+            server.shutdown().await;
+            harness.cleanup().await;
+        }),
+        DeletingMaintenanceRow::ActiveIntentFencedWithEvidence => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let namespace = harness.artifact_origin_namespace("maintain-active-fenced");
+            let config = branch_grace_config();
+            let clock = Clock::from_source(Arc::new(AdjustableWallClock::new(Utc::now())));
+            NamespaceManager::new(store.clone())
+                .create(&namespace, 4, DistanceMetric::Cosine)
+                .await
+                .expect("fenced crash fixture namespace must be created");
+            let (crashed_store, evidence_lost_reply) =
+                fail_after_put_once_matching(&store, "_audit/destruction/");
+            let crashed_server = start_test_server_full(
+                crashed_store,
+                Some(harness.prefix.clone()),
+                config.clone(),
+                false,
+                Some(clock.clone()),
+            )
+            .await;
+
+            delete_namespace_for_test(
+                crashed_server.store.clone(),
+                NamespaceId::new(namespace.clone()).expect("namespace must be valid"),
+                config.indexing.clone(),
+                config.branching.clone(),
+            )
+            .await
+            .expect_err("lost evidence PUT reply must stop before the tombstone CAS");
+            assert_eq!(evidence_lost_reply.failures_injected(), 1);
+            let interrupted = read_namespace_metadata(&crashed_server.store, &namespace).await;
+            assert_eq!(interrupted.state, NamespaceState::Active);
+            let intent = interrupted
+                .deletion_intent
+                .as_ref()
+                .expect("fenced crash must retain the durable deletion intent");
+            assert!(
+                intent.fenced_generation.is_some(),
+                "fenced crash must persist the exact fenced generation"
+            );
+            assert!(
+                branch_control_snapshot(&crashed_server.store, &namespace)
+                    .await
+                    .expect("fenced live manifest must remain readable")
+                    .deletion_fenced,
+                "crash after fence publication must leave data paths fenced"
+            );
+            assert!(
+                crashed_server
+                    .store
+                    .get(&intent.destruction_record_key)
+                    .await
+                    .is_ok(),
+                "lost evidence response must hide a durably committed evidence object"
+            );
+            crashed_server.shutdown().await;
+
+            let (report, server) = maintain_deletions_with_config(
+                &harness,
+                store.clone(),
+                &config,
+                clock,
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await;
+            assert_deletion_maintenance_report(
+                row,
+                &report,
+                ExpectedDeletionMaintenance {
+                    inspected: 1,
+                    completed: 1,
+                    in_progress: 0,
+                    grace_waiting: 0,
+                },
+            );
+            assert!(matches!(
+                store.get(&NamespaceMetadata::s3_key(&namespace)).await,
+                Err(zeppelin::error::ZeppelinError::NotFound { .. })
+            ));
+            assert!(
+                store
+                    .list_prefix(&format!("{namespace}/"))
+                    .await
+                    .expect("completed fenced recovery prefix must be listable")
+                    .is_empty(),
+                "metadata-last completion must leave no namespace-owned objects"
+            );
+            server.shutdown().await;
+            harness.cleanup().await;
+        }),
+        DeletingMaintenanceRow::ActiveIntentRootWonConflict => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let source = harness.artifact_origin_namespace("maintain-root-won-source");
+            let target = harness.artifact_origin_namespace("maintain-root-won-target");
+            let config = branch_grace_config();
+            let clock = Clock::from_source(Arc::new(AdjustableWallClock::new(Utc::now())));
+            NamespaceManager::new(store.clone())
+                .create(&source, 4, DistanceMetric::Cosine)
+                .await
+                .expect("root-won source fixture must be created");
+            let (crashed_store, fence_failure) =
+                fail_put_once_matching(&store, Manifest::s3_key(&source));
+            let crashed_server = start_test_server_full(
+                crashed_store,
+                Some(harness.prefix.clone()),
+                config.clone(),
+                false,
+                Some(clock.clone()),
+            )
+            .await;
+            delete_namespace_for_test(
+                crashed_server.store.clone(),
+                NamespaceId::new(source.clone()).expect("source namespace must be valid"),
+                config.indexing.clone(),
+                config.branching.clone(),
+            )
+            .await
+            .expect_err("root-won fixture must stop before the destruction fence");
+            assert_eq!(fence_failure.failures_injected(), 1);
+            assert!(read_namespace_metadata(&crashed_server.store, &source)
+                .await
+                .deletion_intent
+                .is_some());
+            crashed_server.shutdown().await;
+
+            let server = start_test_server_full(
+                store.clone(),
+                Some(harness.prefix.clone()),
+                config.clone(),
+                false,
+                Some(clock.clone()),
+            )
+            .await;
+            let root = prepare_head_branch_root(
+                server.store.clone(),
+                &source,
+                BranchId::new(),
+                &target,
+                uuid::Uuid::new_v4(),
+                ForkViewDigest::new([0x6c; 32]),
+                clock.now(),
+            )
+            .await
+            .expect("root-won fixture must bind the current source head");
+            insert_prepared_branch_root(server.store.clone(), &source, root.clone(), 8)
+                .await
+                .expect("branch root must win before deletion fencing");
+            let roots_before = branch_control_snapshot(&server.store, &source)
+                .await
+                .expect("winning root collection must remain readable")
+                .roots;
+            assert_eq!(roots_before, vec![root]);
+
+            let error = maintain_branches_with_config_and_clock_for_test(
+                server.store.clone(),
+                &config,
+                clock,
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await
+            .expect_err("root-won deletion recovery must fail the maintenance pass");
+            assert!(matches!(
+                error,
+                zeppelin::error::ZeppelinError::Branch(inner)
+                    if matches!(
+                        inner.as_ref(),
+                        BranchError::NamespaceHasLiveBranches { namespace }
+                            if namespace == &source
+                    )
+            ));
+            let recovered = read_namespace_metadata(&server.store, &source).await;
+            assert_eq!(recovered.state, NamespaceState::Active);
+            assert_eq!(
+                recovered.deletion_intent, None,
+                "root-won recovery must clear only the still-unfenced deletion intent"
+            );
+            assert_eq!(
+                branch_control_snapshot(&server.store, &source)
+                    .await
+                    .expect("winning root collection must remain authoritative")
+                    .roots,
+                roots_before,
+                "root-won recovery must not mutate any exact child root"
+            );
+            server.shutdown().await;
+            harness.cleanup().await;
+        }),
+        DeletingMaintenanceRow::DeletingFencedManifestPresent => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let namespace = harness.artifact_origin_namespace("maintain-deleting-fenced");
+            let config = branch_grace_config();
+            let clock = Clock::from_source(Arc::new(AdjustableWallClock::new(Utc::now())));
+            NamespaceManager::new(store.clone())
+                .create(&namespace, 4, DistanceMetric::Cosine)
+                .await
+                .expect("fenced-live fixture namespace must be created");
+            let (crashed_store, visibility_delete_failure) =
+                fail_delete_once_matching(&store, Manifest::s3_key(&namespace));
+            let crashed_server = start_test_server_full(
+                crashed_store,
+                Some(harness.prefix.clone()),
+                config.clone(),
+                false,
+                Some(clock.clone()),
+            )
+            .await;
+            delete_namespace_for_test(
+                crashed_server.store.clone(),
+                NamespaceId::new(namespace.clone()).expect("namespace must be valid"),
+                config.indexing.clone(),
+                config.branching.clone(),
+            )
+            .await
+            .expect_err("visibility DELETE failure must retain the fenced live manifest");
+            assert_eq!(visibility_delete_failure.failures_injected(), 1);
+            let interrupted = read_namespace_metadata(&crashed_server.store, &namespace).await;
+            assert_eq!(interrupted.state, NamespaceState::Deleting);
+            assert!(interrupted
+                .deletion_intent
+                .as_ref()
+                .and_then(|intent| intent.fenced_generation)
+                .is_some());
+            assert!(
+                branch_control_snapshot(&crashed_server.store, &namespace)
+                    .await
+                    .expect("fenced live manifest must remain readable")
+                    .deletion_fenced,
+                "Deleting fixture must retain the exact destruction fence"
+            );
+            crashed_server.shutdown().await;
+
+            let (report, server) = maintain_deletions_with_config(
+                &harness,
+                store.clone(),
+                &config,
+                clock,
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await;
+            assert_deletion_maintenance_report(
+                row,
+                &report,
+                ExpectedDeletionMaintenance {
+                    inspected: 1,
+                    completed: 1,
+                    in_progress: 0,
+                    grace_waiting: 0,
+                },
+            );
+            assert!(matches!(
+                store.get(&NamespaceMetadata::s3_key(&namespace)).await,
+                Err(zeppelin::error::ZeppelinError::NotFound { .. })
+            ));
+            server.shutdown().await;
+            harness.cleanup().await;
+        }),
+        DeletingMaintenanceRow::BranchDeletingWithoutVisibility => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let source = harness.artifact_origin_namespace("maintain-no-marker-source");
+            let target = harness.artifact_origin_namespace("maintain-no-marker-target");
+            let config = branch_grace_config();
+            let wall_clock = Arc::new(AdjustableWallClock::new(Utc::now()));
+            let clock = Clock::from_source(wall_clock.clone());
+            let setup_server = start_test_server_full(
+                store.clone(),
+                Some(harness.prefix.clone()),
+                config.clone(),
+                false,
+                Some(clock.clone()),
+            )
+            .await;
+            NamespaceManager::new(setup_server.store.clone())
+                .create(&source, 4, DistanceMetric::Cosine)
+                .await
+                .expect("marker-gap source fixture must be created");
+            activate_branch(setup_server.store.clone(), &source, &target, &config).await;
+            setup_server.shutdown().await;
+
+            let marker_prefix = format!("{target}/_lifecycle/branch_visibility_removed/");
+            let (crashed_store, marker_failure) =
+                fail_put_once_matching(&store, marker_prefix.clone());
+            let crashed_server = start_test_server_full(
+                crashed_store,
+                Some(harness.prefix.clone()),
+                config.clone(),
+                false,
+                Some(clock.clone()),
+            )
+            .await;
+            delete_namespace_for_test(
+                crashed_server.store.clone(),
+                NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+                config.indexing.clone(),
+                config.branching.clone(),
+            )
+            .await
+            .expect_err("marker PUT failure must leave a marker-free branch tombstone");
+            assert_eq!(marker_failure.failures_injected(), 1);
+            let interrupted = read_namespace_metadata(&crashed_server.store, &target).await;
+            assert_eq!(interrupted.state, NamespaceState::Deleting);
+            assert_eq!(
+                interrupted
+                    .deletion_intent
+                    .as_ref()
+                    .and_then(|intent| intent.visibility.as_ref()),
+                None
+            );
+            let roots_before = branch_control_snapshot(&crashed_server.store, &source)
+                .await
+                .expect("marker-free branch root must remain readable")
+                .roots;
+            crashed_server.shutdown().await;
+
+            let (waiting_report, waiting_server) = maintain_deletions_with_config(
+                &harness,
+                store.clone(),
+                &config,
+                clock.clone(),
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await;
+            assert_deletion_maintenance_report(
+                row,
+                &waiting_report,
+                ExpectedDeletionMaintenance {
+                    inspected: 1,
+                    completed: 0,
+                    in_progress: 1,
+                    grace_waiting: 1,
+                },
+            );
+            let recovered = read_namespace_metadata(&waiting_server.store, &target).await;
+            let visibility = recovered
+                .deletion_intent
+                .as_ref()
+                .and_then(|intent| intent.visibility.clone())
+                .expect("maintenance must persist a fresh full grace boundary");
+            assert!(waiting_server
+                .store
+                .get(&visibility.marker_key)
+                .await
+                .is_ok());
+            assert_eq!(
+                branch_control_snapshot(&waiting_server.store, &source)
+                    .await
+                    .expect("fresh grace must retain the exact root collection")
+                    .roots,
+                roots_before
+            );
+            waiting_server.shutdown().await;
+
+            wall_clock.set(visibility.not_before);
+            let (completed_report, completed_server) = maintain_deletions_with_config(
+                &harness,
+                store.clone(),
+                &config,
+                clock,
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await;
+            assert_deletion_maintenance_report(
+                row,
+                &completed_report,
+                ExpectedDeletionMaintenance {
+                    inspected: 1,
+                    completed: 1,
+                    in_progress: 0,
+                    grace_waiting: 0,
+                },
+            );
+            assert!(matches!(
+                store.get(&NamespaceMetadata::s3_key(&target)).await,
+                Err(zeppelin::error::ZeppelinError::NotFound { .. })
+            ));
+            completed_server.shutdown().await;
+            harness.cleanup().await;
+        }),
+        DeletingMaintenanceRow::BranchGracePending => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let source = harness.artifact_origin_namespace("maintain-grace-source");
+            let target = harness.artifact_origin_namespace("maintain-grace-target");
+            let fixture =
+                establish_branch_grace_on_store(&harness, store.clone(), &source, &target).await;
+            fixture.wall_clock.set(
+                fixture
+                    .visibility
+                    .not_before
+                    .checked_sub_signed(chrono::Duration::nanoseconds(1))
+                    .expect("pre-grace maintenance instant must be representable"),
+            );
+            let roots_before = branch_control_snapshot(&store, &source)
+                .await
+                .expect("grace-pending root collection must be readable")
+                .roots;
+
+            let (report, server) = maintain_deletions(
+                &harness,
+                store.clone(),
+                &fixture,
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await;
+            assert_deletion_maintenance_report(
+                row,
+                &report,
+                ExpectedDeletionMaintenance {
+                    inspected: 1,
+                    completed: 0,
+                    in_progress: 1,
+                    grace_waiting: 1,
+                },
+            );
+            assert_eq!(
+                branch_control_snapshot(&store, &source)
+                    .await
+                    .expect("grace-pending parent manifest must remain readable")
+                    .roots,
+                roots_before,
+                "maintenance must retain the full exact root collection through grace"
+            );
+            assert_eq!(
+                read_namespace_metadata(&store, &target).await.state,
+                NamespaceState::Deleting
+            );
+            server.shutdown().await;
+            cleanup_branch_maintenance_fixture(&harness).await;
+        }),
+        DeletingMaintenanceRow::BranchGraceElapsedRootPresent => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let source = harness.artifact_origin_namespace("maintain-release-source");
+            let target = harness.artifact_origin_namespace("maintain-release-target");
+            let fixture =
+                establish_branch_grace_on_store(&harness, store.clone(), &source, &target).await;
+            fixture.wall_clock.set(fixture.visibility.not_before);
+
+            let (report, server) = maintain_deletions(
+                &harness,
+                store.clone(),
+                &fixture,
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await;
+            assert_deletion_maintenance_report(
+                row,
+                &report,
+                ExpectedDeletionMaintenance {
+                    inspected: 1,
+                    completed: 1,
+                    in_progress: 0,
+                    grace_waiting: 0,
+                },
+            );
+            assert!(
+                branch_control_snapshot(&store, &source)
+                    .await
+                    .expect("released parent manifest must remain readable")
+                    .roots
+                    .is_empty(),
+                "elapsed maintenance must remove the exact parent root"
+            );
+            assert!(matches!(
+                store.get(&NamespaceMetadata::s3_key(&target)).await,
+                Err(zeppelin::error::ZeppelinError::NotFound { .. })
+            ));
+            server.shutdown().await;
+            cleanup_branch_maintenance_fixture(&harness).await;
+        }),
+        DeletingMaintenanceRow::BranchRootAbsentBeforeGrace => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let source = harness.artifact_origin_namespace("maintain-early-root-source");
+            let target = harness.artifact_origin_namespace("maintain-early-root-target");
+            let fixture =
+                establish_branch_grace_on_store(&harness, store.clone(), &source, &target).await;
+            fixture.wall_clock.set(
+                fixture
+                    .visibility
+                    .not_before
+                    .checked_sub_signed(chrono::Duration::nanoseconds(1))
+                    .expect("pre-grace integrity instant must be representable"),
+            );
+            let server = start_branch_recovery_server(&harness, store.clone(), &fixture).await;
+            let root = branch_control_snapshot(&server.store, &source)
+                .await
+                .expect("pre-grace root must remain readable")
+                .roots
+                .into_iter()
+                .next()
+                .expect("active branch must retain one exact parent root");
+            remove_prepared_branch_root(server.store.clone(), &source, root.clone())
+                .await
+                .expect("test must inject premature exact-root absence");
+
+            let error = maintain_branches_with_config_and_clock_for_test(
+                server.store.clone(),
+                &fixture.config,
+                fixture.clock.clone(),
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await
+            .expect_err("pre-grace root absence must fail the maintenance pass closed");
+            assert!(matches!(
+                error,
+                zeppelin::error::ZeppelinError::Branch(inner)
+                    if matches!(
+                        inner.as_ref(),
+                        BranchError::BranchRootMissing { branch_id }
+                            if branch_id == &root.branch_id
+                    )
+            ));
+            let unchanged = read_namespace_metadata(&server.store, &target).await;
+            assert_eq!(unchanged.state, NamespaceState::Deleting);
+            assert_eq!(
+                unchanged
+                    .deletion_intent
+                    .as_ref()
+                    .and_then(|intent| intent.root_release.as_ref()),
+                None,
+                "premature root absence must not manufacture release acknowledgement"
+            );
+            assert!(server
+                .store
+                .get(&fixture.visibility.marker_key)
+                .await
+                .is_ok());
+            server.shutdown().await;
+            cleanup_branch_maintenance_fixture(&harness).await;
+        }),
+        DeletingMaintenanceRow::BranchRootReplyLost => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let source = harness.artifact_origin_namespace("maintain-lost-root-source");
+            let target = harness.artifact_origin_namespace("maintain-lost-root-target");
+            let fixture =
+                establish_branch_grace_on_store(&harness, store.clone(), &source, &target).await;
+            fixture.wall_clock.set(fixture.visibility.not_before);
+            let (lost_reply_store, lost_reply) =
+                fail_after_put_once_matching(&store, format!("{source}/manifest.json"));
+            let interrupted =
+                start_branch_recovery_server(&harness, lost_reply_store, &fixture).await;
+            resume_branch_delete(&interrupted, &target, &fixture)
+                .await
+                .expect_err("lost parent-root CAS reply must leave convergence work");
+            assert_eq!(lost_reply.failures_injected(), 1);
+            assert!(branch_control_snapshot(&interrupted.store, &source)
+                .await
+                .expect("committed root removal must remain authoritative")
+                .roots
+                .is_empty());
+            assert_eq!(
+                read_namespace_metadata(&interrupted.store, &target)
+                    .await
+                    .deletion_intent
+                    .as_ref()
+                    .and_then(|intent| intent.root_release.as_ref()),
+                None,
+                "lost root reply must leave the target acknowledgement absent"
+            );
+            interrupted.shutdown().await;
+
+            let (report, server) = maintain_deletions(
+                &harness,
+                store.clone(),
+                &fixture,
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await;
+            assert_deletion_maintenance_report(
+                row,
+                &report,
+                ExpectedDeletionMaintenance {
+                    inspected: 1,
+                    completed: 1,
+                    in_progress: 0,
+                    grace_waiting: 0,
+                },
+            );
+            assert!(matches!(
+                store.get(&NamespaceMetadata::s3_key(&target)).await,
+                Err(zeppelin::error::ZeppelinError::NotFound { .. })
+            ));
+            server.shutdown().await;
+            cleanup_branch_maintenance_fixture(&harness).await;
+        }),
+        DeletingMaintenanceRow::BranchCleanupPartial => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let source = harness.artifact_origin_namespace("maintain-partial-source");
+            let target = harness.artifact_origin_namespace("maintain-partial-target");
+            let fixture =
+                establish_branch_grace_on_store(&harness, store.clone(), &source, &target).await;
+            fixture.wall_clock.set(fixture.visibility.not_before);
+            let target_meta_key = NamespaceMetadata::s3_key(&target);
+            let (partial_store, metadata_delete_failure) =
+                fail_delete_once_matching(&store, target_meta_key.clone());
+            let interrupted = start_branch_recovery_server(&harness, partial_store, &fixture).await;
+            resume_branch_delete(&interrupted, &target, &fixture)
+                .await
+                .expect_err("metadata-last failure must leave partial cleanup resumable");
+            assert_eq!(metadata_delete_failure.failures_injected(), 1);
+            let partial = read_namespace_metadata(&interrupted.store, &target).await;
+            assert_final_root_release(&partial, false);
+            assert!(matches!(
+                interrupted.store.get(&fixture.visibility.marker_key).await,
+                Err(zeppelin::error::ZeppelinError::NotFound { .. })
+            ));
+            interrupted.shutdown().await;
+
+            let (report, server) = maintain_deletions(
+                &harness,
+                store.clone(),
+                &fixture,
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await;
+            assert_deletion_maintenance_report(
+                row,
+                &report,
+                ExpectedDeletionMaintenance {
+                    inspected: 1,
+                    completed: 1,
+                    in_progress: 0,
+                    grace_waiting: 0,
+                },
+            );
+            assert!(matches!(
+                store.get(&target_meta_key).await,
+                Err(zeppelin::error::ZeppelinError::NotFound { .. })
+            ));
+            server.shutdown().await;
+            cleanup_branch_maintenance_fixture(&harness).await;
+        }),
+        DeletingMaintenanceRow::ActiveBranchVerified => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let source = harness.artifact_origin_namespace("maintain-active-source");
+            let target = harness.artifact_origin_namespace("maintain-active-target");
+            let config = branch_grace_config();
+            let clock = Clock::from_source(Arc::new(AdjustableWallClock::new(Utc::now())));
+            let server = start_test_server_full(
+                store,
+                Some(harness.prefix.clone()),
+                config.clone(),
+                false,
+                Some(clock.clone()),
+            )
+            .await;
+            NamespaceManager::new(server.store.clone())
+                .create(&source, 4, DistanceMetric::Cosine)
+                .await
+                .expect("active source fixture must be created");
+            activate_branch(server.store.clone(), &source, &target, &config).await;
+
+            let roots_before = branch_control_snapshot(&server.store, &source)
+                .await
+                .expect("active branch roots must be readable before maintenance")
+                .roots;
+            assert_eq!(
+                roots_before.len(),
+                1,
+                "active fixture must begin with exactly one parent root"
+            );
+            let source_metadata_before = server
+                .store
+                .get(&NamespaceMetadata::s3_key(&source))
+                .await
+                .expect("source metadata bytes must be readable before maintenance");
+            let target_metadata_before = server
+                .store
+                .get(&NamespaceMetadata::s3_key(&target))
+                .await
+                .expect("target metadata bytes must be readable before maintenance");
+            let source_manifest_before = server
+                .store
+                .get(&Manifest::s3_key(&source))
+                .await
+                .expect("source live manifest must be readable before maintenance");
+            let target_manifest_before = server
+                .store
+                .get(&Manifest::s3_key(&target))
+                .await
+                .expect("target live manifest must be readable before maintenance");
+
+            let report = maintain_branches_with_config_and_clock_for_test(
+                server.store.clone(),
+                &config,
+                clock,
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await
+            .expect("maintenance must verify a consistent active branch");
+            assert_eq!(
+                report,
+                BranchMaintenanceReport {
+                    active_verified: 1,
+                    ..BranchMaintenanceReport::default()
+                },
+                "active verification must not dispatch deletion or mutate another lifecycle"
+            );
+
+            let roots_after = branch_control_snapshot(&server.store, &source)
+                .await
+                .expect("active branch roots must remain readable after maintenance")
+                .roots;
+            assert_eq!(roots_after, roots_before);
+            assert_eq!(
+                server
+                    .store
+                    .get(&NamespaceMetadata::s3_key(&source))
+                    .await
+                    .expect("source metadata bytes must remain readable"),
+                source_metadata_before
+            );
+            assert_eq!(
+                server
+                    .store
+                    .get(&NamespaceMetadata::s3_key(&target))
+                    .await
+                    .expect("target metadata bytes must remain readable"),
+                target_metadata_before
+            );
+            assert_eq!(
+                server
+                    .store
+                    .get(&Manifest::s3_key(&source))
+                    .await
+                    .expect("source live manifest must remain readable"),
+                source_manifest_before
+            );
+            assert_eq!(
+                server
+                    .store
+                    .get(&Manifest::s3_key(&target))
+                    .await
+                    .expect("target live manifest must remain readable"),
+                target_manifest_before
+            );
+
+            server.shutdown().await;
+            harness.cleanup().await;
+        }),
+        DeletingMaintenanceRow::ActiveBranchMissingParentRoot => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let source = harness.artifact_origin_namespace("maintain-missing-root-source");
+            let target = harness.artifact_origin_namespace("maintain-missing-root-target");
+            let config = branch_grace_config();
+            let clock = Clock::from_source(Arc::new(AdjustableWallClock::new(Utc::now())));
+            let server = start_test_server_full(
+                store.clone(),
+                Some(harness.prefix.clone()),
+                config.clone(),
+                false,
+                Some(clock.clone()),
+            )
+            .await;
+            NamespaceManager::new(server.store.clone())
+                .create(&source, 4, DistanceMetric::Cosine)
+                .await
+                .expect("missing-root source fixture must be created");
+            activate_branch(server.store.clone(), &source, &target, &config).await;
+            let root = branch_control_snapshot(&server.store, &source)
+                .await
+                .expect("active branch root must remain readable")
+                .roots
+                .into_iter()
+                .next()
+                .expect("active target must begin with one exact parent root");
+            remove_prepared_branch_root(server.store.clone(), &source, root.clone())
+                .await
+                .expect("test must inject an active target with no parent root");
+
+            let error = maintain_branches_with_config_and_clock_for_test(
+                server.store.clone(),
+                &config,
+                clock,
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await
+            .expect_err("active target root absence must fail graph maintenance closed");
+            assert!(matches!(
+                error,
+                zeppelin::error::ZeppelinError::Branch(inner)
+                    if matches!(
+                        inner.as_ref(),
+                        BranchError::BranchRootMissing { branch_id }
+                            if branch_id == &root.branch_id
+                    )
+            ));
+            let target_metadata = read_namespace_metadata(&server.store, &target).await;
+            assert_eq!(target_metadata.state, NamespaceState::Active);
+            assert_eq!(target_metadata.deletion_intent, None);
+            assert!(Manifest::read(&server.store, &target)
+                .await
+                .expect("active target visibility must remain readable")
+                .is_some());
+            assert!(branch_control_snapshot(&server.store, &source)
+                .await
+                .expect("parent manifest must remain readable")
+                .roots
+                .is_empty());
+            server.shutdown().await;
+            harness.cleanup().await;
+        }),
+        DeletingMaintenanceRow::BranchParentIncarnationReplaced => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let source = harness.artifact_origin_namespace("maintain-replaced-source");
+            let target = harness.artifact_origin_namespace("maintain-replaced-target");
+            let fixture =
+                establish_branch_grace_on_store(&harness, store.clone(), &source, &target).await;
+            fixture.wall_clock.set(fixture.visibility.not_before);
+            let server = start_branch_recovery_server(&harness, store, &fixture).await;
+            let original = read_namespace_metadata(&server.store, &source).await;
+            server
+                .store
+                .delete_prefix(&format!("{source}/"))
+                .await
+                .expect("test must remove the original parent lifetime");
+            let replacement = server
+                .namespace_manager
+                .create(&source, 4, DistanceMetric::Cosine)
+                .await
+                .expect("same parent name must be recreated with a new incarnation");
+            assert_ne!(replacement.incarnation_id, original.incarnation_id);
+
+            let error = maintain_branches_with_config_and_clock_for_test(
+                server.store.clone(),
+                &fixture.config,
+                fixture.clock.clone(),
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await
+            .expect_err("replacement parent lifetime must fail graph maintenance closed");
+            assert!(matches!(
+                error,
+                zeppelin::error::ZeppelinError::Branch(inner)
+                    if matches!(
+                        inner.as_ref(),
+                        BranchError::SourceIncarnationChanged { namespace }
+                            if namespace.as_str() == source
+                    )
+            ));
+            let unchanged = read_namespace_metadata(&server.store, &target).await;
+            assert_eq!(unchanged.state, NamespaceState::Deleting);
+            assert_eq!(
+                unchanged
+                    .deletion_intent
+                    .as_ref()
+                    .and_then(|intent| intent.root_release.as_ref()),
+                None,
+                "replacement parent lifetime must not acknowledge old root release"
+            );
+            assert!(server
+                .store
+                .get(&fixture.visibility.marker_key)
+                .await
+                .is_ok());
+            assert!(branch_control_snapshot(&server.store, &source)
+                .await
+                .expect("replacement parent manifest must remain readable")
+                .roots
+                .is_empty());
+            server.shutdown().await;
+            harness.cleanup().await;
+        }),
+        DeletingMaintenanceRow::OrdinaryGovernedDeleting => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let namespace = harness.artifact_origin_namespace("maintain-ordinary");
+            let config = branch_grace_config();
+            let wall_clock = Arc::new(AdjustableWallClock::new(Utc::now()));
+            let clock = Clock::from_source(wall_clock);
+            let server = start_test_server_full(
+                store.clone(),
+                Some(harness.prefix.clone()),
+                config.clone(),
+                false,
+                Some(clock.clone()),
+            )
+            .await;
+            establish_ordinary_governed_deleting(&store, &namespace, &config).await;
+
+            let report = maintain_branches_with_config_and_clock_for_test(
+                server.store.clone(),
+                &config,
+                clock,
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await
+            .expect("ordinary governed deletion maintenance must complete");
+            assert_deletion_maintenance_report(
+                row,
+                &report,
+                ExpectedDeletionMaintenance {
+                    inspected: 1,
+                    completed: 1,
+                    in_progress: 0,
+                    grace_waiting: 0,
+                },
+            );
+            assert!(matches!(
+                store.get(&NamespaceMetadata::s3_key(&namespace)).await,
+                Err(zeppelin::error::ZeppelinError::NotFound { .. })
+            ));
+            server.shutdown().await;
+            harness.cleanup().await;
+        }),
+        DeletingMaintenanceRow::FinalMetadataDeleteReplyLost => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let namespace = harness.artifact_origin_namespace("maintain-lost-meta-reply");
+            let config = branch_grace_config();
+            let clock = Clock::from_source(Arc::new(AdjustableWallClock::new(Utc::now())));
+            let setup_server = start_test_server_full(
+                store.clone(),
+                Some(harness.prefix.clone()),
+                config.clone(),
+                false,
+                Some(clock.clone()),
+            )
+            .await;
+            establish_ordinary_governed_deleting(&store, &namespace, &config).await;
+            setup_server.shutdown().await;
+
+            let metadata_key = NamespaceMetadata::s3_key(&namespace);
+            let (lost_reply_store, lost_reply) =
+                fail_after_delete_once_matching(&store, metadata_key.clone());
+            let lost_reply_server = start_test_server_full(
+                lost_reply_store,
+                Some(harness.prefix.clone()),
+                config.clone(),
+                false,
+                Some(clock.clone()),
+            )
+            .await;
+            let report = maintain_branches_with_config_and_clock_for_test(
+                lost_reply_server.store.clone(),
+                &config,
+                clock.clone(),
+                SLICE_SIX_MAINTENANCE_BUDGET,
+            )
+            .await
+            .expect("lost final metadata DELETE reply must converge in the same pass");
+            assert_deletion_maintenance_report(
+                row,
+                &report,
+                ExpectedDeletionMaintenance {
+                    inspected: 1,
+                    completed: 1,
+                    in_progress: 0,
+                    grace_waiting: 0,
+                },
+            );
+            assert_eq!(lost_reply.failures_injected(), 1);
+            assert!(matches!(
+                lost_reply_server.store.get(&metadata_key).await,
+                Err(zeppelin::error::ZeppelinError::NotFound { .. })
+            ));
+            assert!(
+                lost_reply_server
+                    .store
+                    .list_prefix(&format!("{namespace}/"))
+                    .await
+                    .expect("lost-reply namespace prefix must remain listable")
+                    .is_empty(),
+                "the hidden successful DELETE must still complete metadata-last cleanup"
+            );
+            lost_reply_server.shutdown().await;
+            harness.cleanup().await;
+        }),
+        DeletingMaintenanceRow::ZeroBudget => Box::pin(async move {
+            let harness = common::harness::TestHarness::new().await;
+            let store = scoped_test_security_store(&harness.store, &harness.prefix);
+            let namespace = harness.artifact_origin_namespace("maintain-zero-budget");
+            let config = branch_grace_config();
+            let wall_clock = Arc::new(AdjustableWallClock::new(Utc::now()));
+            let clock = Clock::from_source(wall_clock);
+            let server = start_test_server_full(
+                store.clone(),
+                Some(harness.prefix.clone()),
+                config.clone(),
+                false,
+                Some(clock.clone()),
+            )
+            .await;
+            establish_ordinary_governed_deleting(&store, &namespace, &config).await;
+
+            let (counted_store, counter) = counting_store(&server.store);
+            let report = maintain_branches_with_config_and_clock_for_test(
+                counted_store,
+                &config,
+                clock,
+                Duration::ZERO,
+            )
+            .await
+            .expect("zero-budget maintenance must return without destructive work");
+            assert_deletion_maintenance_report(
+                row,
+                &report,
+                ExpectedDeletionMaintenance {
+                    inspected: 0,
+                    completed: 0,
+                    in_progress: 0,
+                    grace_waiting: 0,
+                },
+            );
+            assert_eq!(
+                counter.delimiter_list_calls_for_prefix(""),
+                0,
+                "zero budget must stop before authoritative namespace discovery"
+            );
+            assert_eq!(
+                read_namespace_metadata(&store, &namespace).await.state,
+                NamespaceState::Deleting,
+                "zero budget must leave the durable recovery handle untouched"
+            );
+            server.shutdown().await;
+            harness.cleanup().await;
+        }),
+    }
+}
+
+#[tokio::test]
+async fn slice_six_maintain_fails_closed_on_orphan_parent_root() {
+    let harness = common::harness::TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let source = harness.artifact_origin_namespace("maintain-orphan-source");
+    let target = harness.artifact_origin_namespace("maintain-orphan-target");
+    let config = branch_grace_config();
+    let wall_clock = Arc::new(AdjustableWallClock::new(Utc::now()));
+    let clock = Clock::from_source(wall_clock);
+
+    NamespaceManager::new(store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("orphan-root parent fixture must be created");
+    activate_branch(store.clone(), &source, &target, &config).await;
+
+    let before = branch_control_snapshot(&store, &source)
+        .await
+        .expect("parent root must be authoritative before corruption injection");
+    assert_eq!(before.roots.len(), 1);
+    let expected_root = before.roots[0].clone();
+
+    store
+        .delete_prefix(&format!("{target}/"))
+        .await
+        .expect("test must simulate target metadata disappearing before root release");
+    assert!(matches!(
+        store.get(&NamespaceMetadata::s3_key(&target)).await,
+        Err(zeppelin::error::ZeppelinError::NotFound { .. })
+    ));
+
+    let error = maintain_branches_with_config_and_clock_for_test(
+        store.clone(),
+        &config,
+        clock,
+        SLICE_SIX_MAINTENANCE_BUDGET,
+    )
+    .await
+    .expect_err("maintenance must fail closed on an orphan parent root");
+
+    match error {
+        zeppelin::error::ZeppelinError::Branch(error) => match *error {
+            BranchError::OrphanBranchRoot {
+                source_namespace,
+                root,
+            } => {
+                assert_eq!(source_namespace.as_str(), source);
+                assert_eq!(root.branch_id, expected_root.branch_id);
+                assert_eq!(root.target_namespace.as_str(), target);
+                assert_eq!(
+                    root.target_incarnation, expected_root.target_incarnation,
+                    "operator repair identity must name the exact missing target lifetime"
+                );
+                assert_eq!(
+                    root, expected_root,
+                    "the typed integrity error must carry the exact bounded root proof"
+                );
+            }
+            other => panic!("expected orphan-root integrity error, got {other:?}"),
+        },
+        other => panic!("expected typed branch integrity error, got {other:?}"),
+    }
+
+    let after = branch_control_snapshot(&store, &source)
+        .await
+        .expect("orphan root must remain authoritative after failed maintenance");
+    assert_eq!(
+        after.roots, before.roots,
+        "maintenance must never auto-release or rewrite an orphan root"
+    );
+
     harness.cleanup().await;
 }

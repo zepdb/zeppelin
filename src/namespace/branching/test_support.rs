@@ -308,7 +308,7 @@ pub async fn prepare_fork_until_reserved_for_test(
         .await
 }
 
-/// Run one bounded non-visible branch maintenance pass.
+/// Run one bounded governed-deletion and branch-control maintenance pass.
 pub async fn maintain_branches_for_test(
     store: ZeppelinStore,
     indexing: IndexingConfig,
@@ -316,7 +316,22 @@ pub async fn maintain_branches_for_test(
     budget: Duration,
 ) -> Result<BranchMaintenanceReport> {
     graph_for_test(store, indexing, branching)?
-        .maintain(budget)
+        .maintain(Arc::new(TestDeletionGovernance), budget)
+        .await
+}
+
+/// Run bounded graph maintenance with an exact validated config and clock.
+///
+/// This keeps grace-boundary recovery tests deterministic without weakening
+/// the production reader-safety floor or sleeping on wall time.
+pub async fn maintain_branches_with_config_and_clock_for_test(
+    store: ZeppelinStore,
+    config: &Config,
+    clock: Clock,
+    budget: Duration,
+) -> Result<BranchMaintenanceReport> {
+    graph_for_test_with_config_and_clock(store, config, clock)?
+        .maintain(Arc::new(TestDeletionGovernance), budget)
         .await
 }
 

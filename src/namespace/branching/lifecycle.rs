@@ -259,7 +259,7 @@ pub enum PrepareForkOutcome {
     ExistingPrepared(PreparedBranch),
 }
 
-/// Bounded maintenance observations for non-visible branch control state.
+/// Bounded maintenance observations for deletion and branch control state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BranchMaintenanceReport {
     /// Creating fork reservations inspected within the budget.
@@ -276,4 +276,12 @@ pub struct BranchMaintenanceReport {
     pub awaiting_authenticated_retry: usize,
     /// Reserved targets whose parent is absent or deleting.
     pub awaiting_authorized_cancellation: usize,
+    /// Governed deletion intents or tombstones inspected within the budget.
+    pub deletions_inspected: usize,
+    /// Governed deletions that reached metadata-last completion.
+    pub deletions_completed: usize,
+    /// Governed deletions that made bounded progress but remain durable.
+    pub deletions_in_progress: usize,
+    /// Branch deletions still retaining their root through reader-safety grace.
+    pub branch_grace_waiting: usize,
 }

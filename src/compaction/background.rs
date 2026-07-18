@@ -651,6 +651,16 @@ impl GovernedDeletionWorker {
             .resume_delete(namespace, Arc::clone(&self.governance), budget)
             .await
     }
+
+    async fn confirm_missing_after_resume(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+    ) -> Result<()> {
+        self.graph
+            .confirm_missing_after_resume(namespace, metadata)
+            .await
+    }
 }
 
 /// Owns one lifecycle-registered renewal task for one leased compaction.
@@ -1432,8 +1442,9 @@ pub async fn evaluate_compaction_trigger(
 /// created remote namespaces wait for a later successful refresh.
 ///
 /// For each discovered namespace, processing is deliberately ordered and
-/// serial. A durable `Deleting` tombstone gets a bounded continuation and skips
-/// all other work. An active namespace runs GC first, then trigger evaluation,
+/// serial. A durable `Deleting` tombstone or an `Active` namespace carrying a
+/// governed deletion intent gets a bounded continuation and skips all other
+/// work. An ordinary active namespace runs GC first, then trigger evaluation,
 /// then lease-protected compaction if due. Failures are recorded at their own
 /// boundary and the loop proceeds to the next namespace.
 ///
@@ -1705,20 +1716,14 @@ async fn compaction_loop_with_lifecycle_inner(
         );
 
         for ns in &namespaces {
-            if ns.state == NamespaceState::Creating {
-                gc_runner.forget_namespace(&ns.name);
-                warn!(
-                    namespace = %ns.name,
-                    "skipping namespace whose initial manifest is not yet active"
-                );
-                continue;
-            }
-            if ns.state == NamespaceState::Deleting {
+            let deletion_recovery_required = ns.state == NamespaceState::Deleting
+                || (ns.state == NamespaceState::Active && ns.deletion_intent.is_some());
+            if deletion_recovery_required {
                 gc_runner.forget_namespace(&ns.name);
                 let Some(deletion_worker) = deletion_worker else {
                     error!(
                         namespace = %ns.name,
-                        "governed deletion worker is not configured; tombstone left untouched"
+                        "governed deletion worker is not configured; deletion intent left untouched"
                     );
                     continue;
                 };
@@ -1751,10 +1756,20 @@ async fn compaction_loop_with_lifecycle_inner(
                         "branch delete retains its root through reader-safety grace"
                     ),
                     Err(ZeppelinError::NamespaceNotFound { .. }) => {
-                        debug!(
-                            namespace = %namespace,
-                            "namespace delete already completed"
-                        );
+                        match deletion_worker
+                            .confirm_missing_after_resume(&namespace, ns)
+                            .await
+                        {
+                            Ok(()) => debug!(
+                                namespace = %namespace,
+                                "namespace delete already completed"
+                            ),
+                            Err(error) => error!(
+                                namespace = %namespace,
+                                error = %error,
+                                "namespace delete completion could not be proven"
+                            ),
+                        }
                     }
                     Err(e) => {
                         warn!(
@@ -1766,7 +1781,14 @@ async fn compaction_loop_with_lifecycle_inner(
                 }
                 continue;
             }
-
+            if ns.state == NamespaceState::Creating {
+                gc_runner.forget_namespace(&ns.name);
+                warn!(
+                    namespace = %ns.name,
+                    "skipping namespace whose initial manifest is not yet active"
+                );
+                continue;
+            }
             match gc_runner
                 .run_cycle_at(
                     GcNamespaceIncarnation::from_metadata(ns),

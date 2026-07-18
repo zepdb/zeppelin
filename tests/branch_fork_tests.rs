@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use common::harness::TestHarness;
+use common::server::scoped_test_security_store;
 use common::vectors::random_vectors;
 use zeppelin::compaction::{CompactionResult, Compactor};
 use zeppelin::config::{BranchingConfig, CompactionConfig, IndexingConfig};
@@ -809,15 +810,16 @@ async fn prepare_copies_data_plane_config_and_resets_operational_metadata() {
 #[tokio::test]
 async fn maintenance_leaves_an_unrooted_reservation_for_authenticated_retry() {
     let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
     let source = harness.artifact_origin_namespace("branch-maintain-reserved-source");
     let target = harness.artifact_origin_namespace("branch-maintain-reserved-target");
-    NamespaceManager::new(harness.store.clone())
+    NamespaceManager::new(store.clone())
         .create(&source, 4, DistanceMetric::Cosine)
         .await
         .unwrap();
 
     prepare_fork_until_reserved_for_test(
-        harness.store.clone(),
+        store.clone(),
         NamespaceId::new(source.clone()).unwrap(),
         NamespaceId::new(target.clone()).unwrap(),
         fork_indexing(),
@@ -825,12 +827,10 @@ async fn maintenance_leaves_an_unrooted_reservation_for_authenticated_retry() {
     )
     .await
     .unwrap();
-    let reserved_before = branch_metadata_snapshot(&harness.store, &target)
-        .await
-        .unwrap();
+    let reserved_before = branch_metadata_snapshot(&store, &target).await.unwrap();
 
     let report = maintain_branches_for_test(
-        harness.store.clone(),
+        store.clone(),
         fork_indexing(),
         fork_limits(),
         Duration::from_secs(5),
@@ -838,27 +838,22 @@ async fn maintenance_leaves_an_unrooted_reservation_for_authenticated_retry() {
     .await
     .unwrap();
     assert!(report.awaiting_authenticated_retry >= 1);
-    assert!(branch_control_snapshot(&harness.store, &source)
+    assert!(branch_control_snapshot(&store, &source)
         .await
         .unwrap()
         .roots
         .is_empty());
-    let reserved_after = branch_metadata_snapshot(&harness.store, &target)
-        .await
-        .unwrap();
+    let reserved_after = branch_metadata_snapshot(&store, &target).await.unwrap();
     assert_eq!(
         reserved_after.prepare_stage,
         Some(BranchPrepareStage::Reserved)
     );
     assert_eq!(reserved_after.reservation, reserved_before.reservation);
     assert!(reserved_after.branch_identity.is_none());
-    assert!(Manifest::read(&harness.store, &target)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(Manifest::read(&store, &target).await.unwrap().is_none());
 
     let retry = prepare_fork_for_test(
-        harness.store.clone(),
+        store,
         NamespaceId::new(source.clone()).unwrap(),
         NamespaceId::new(target.clone()).unwrap(),
         fork_indexing(),
@@ -884,14 +879,15 @@ async fn maintenance_leaves_an_unrooted_reservation_for_authenticated_retry() {
 #[tokio::test]
 async fn fenced_source_reservation_waits_for_authorized_cancellation() {
     let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
     let source = harness.artifact_origin_namespace("branch-maintain-fenced-source");
     let target = harness.artifact_origin_namespace("branch-maintain-fenced-target");
-    NamespaceManager::new(harness.store.clone())
+    NamespaceManager::new(store.clone())
         .create(&source, 4, DistanceMetric::Cosine)
         .await
         .unwrap();
     prepare_fork_until_reserved_for_test(
-        harness.store.clone(),
+        store.clone(),
         NamespaceId::new(source.clone()).unwrap(),
         NamespaceId::new(target.clone()).unwrap(),
         fork_indexing(),
@@ -899,11 +895,9 @@ async fn fenced_source_reservation_waits_for_authorized_cancellation() {
     )
     .await
     .unwrap();
-    let reserved = branch_metadata_snapshot(&harness.store, &target)
-        .await
-        .unwrap();
+    let reserved = branch_metadata_snapshot(&store, &target).await.unwrap();
     publish_deletion_fence(
-        harness.store.clone(),
+        store.clone(),
         &source,
         "_audit/destruction/0123456789abcdef0123456789abcdef.json",
     )
@@ -911,7 +905,7 @@ async fn fenced_source_reservation_waits_for_authorized_cancellation() {
     .unwrap();
 
     let report = maintain_branches_for_test(
-        harness.store.clone(),
+        store.clone(),
         fork_indexing(),
         fork_limits(),
         Duration::from_secs(5),
@@ -919,18 +913,15 @@ async fn fenced_source_reservation_waits_for_authorized_cancellation() {
     .await
     .unwrap();
     assert!(report.awaiting_authorized_cancellation >= 1);
-    assert!(branch_control_snapshot(&harness.store, &source)
+    assert!(branch_control_snapshot(&store, &source)
         .await
         .unwrap()
         .roots
         .is_empty());
-    assert!(Manifest::read(&harness.store, &target)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(Manifest::read(&store, &target).await.unwrap().is_none());
 
     let retry = prepare_fork_for_test(
-        harness.store.clone(),
+        store.clone(),
         NamespaceId::new(source.clone()).unwrap(),
         NamespaceId::new(target.clone()).unwrap(),
         fork_indexing(),
@@ -942,16 +933,11 @@ async fn fenced_source_reservation_waits_for_authorized_cancellation() {
         branch_error(retry),
         BranchError::SourceDeleting { namespace } if namespace.as_str() == source
     ));
-    let after = branch_metadata_snapshot(&harness.store, &target)
-        .await
-        .unwrap();
+    let after = branch_metadata_snapshot(&store, &target).await.unwrap();
     assert_eq!(after.reservation, reserved.reservation);
     assert_eq!(after.prepare_stage, Some(BranchPrepareStage::Reserved));
     assert!(after.branch_identity.is_none());
-    assert!(Manifest::read(&harness.store, &target)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(Manifest::read(&store, &target).await.unwrap().is_none());
 
     harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup_artifact_origin_namespace(&target).await;

@@ -3,7 +3,9 @@
 use thiserror::Error;
 
 use super::types::{ArtifactOrigin, ArtifactOriginIndex};
-use crate::namespace::{BranchId, ManifestGeneration, NamespaceId, NamespaceIncarnationId};
+use crate::namespace::{
+    BranchId, BranchRoot, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
+};
 
 /// Failures produced while validating or coordinating namespace branches.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -129,6 +131,15 @@ pub enum BranchError {
     BranchRootMissing {
         /// Missing branch identity.
         branch_id: BranchId,
+    },
+
+    /// A parent still retains an exact root after its target lifetime vanished.
+    #[error("source namespace {source_namespace} retains an orphan branch root {root:?}")]
+    OrphanBranchRoot {
+        /// Parent namespace whose authoritative manifest retains the root.
+        source_namespace: NamespaceId,
+        /// Exact bounded operator-repair identity and digest proof.
+        root: BranchRoot,
     },
 
     /// Publishing another root would exceed the configured manifest bound.

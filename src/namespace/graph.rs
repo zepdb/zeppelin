@@ -622,6 +622,36 @@ impl NamespaceGraph {
             .await
     }
 
+    pub(crate) async fn confirm_missing_after_resume(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+    ) -> Result<()> {
+        if let Some(intent) = metadata.deletion_intent.as_ref() {
+            self.load_bound_destruction_evidence(namespace, metadata, intent)
+                .await?;
+            if matches!(metadata.creation_kind, NamespaceCreationKind::Fork(_)) {
+                self.require_released_branch_root_absent(namespace, metadata, intent)
+                    .await?;
+            }
+        } else if matches!(metadata.creation_kind, NamespaceCreationKind::Fork(_)) {
+            return Err(ZeppelinError::Validation(format!(
+                "branch namespace {namespace} disappeared without a deletion intent"
+            )));
+        }
+
+        let remaining = self
+            .store
+            .list_prefix_meta(&format!("{}/", namespace.as_str()))
+            .await?;
+        if !remaining.is_empty() {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {namespace} metadata disappeared before owned cleanup completed"
+            )));
+        }
+        Ok(())
+    }
+
     async fn finish_legacy_deleting_cleanup(
         &self,
         namespace: &NamespaceId,
@@ -1258,9 +1288,24 @@ impl NamespaceGraph {
         }
         self.load_bound_destruction_evidence(namespace, &latest, latest_intent)
             .await?;
-        self.namespace_manager
+        if let Err(delete_error) = self
+            .namespace_manager
             .remove_deletion_metadata(namespace.as_str(), &identity)
-            .await?;
+            .await
+        {
+            match self
+                .namespace_manager
+                .read_metadata_versioned(namespace.as_str())
+                .await
+            {
+                Err(ZeppelinError::NamespaceNotFound { .. }) => {
+                    self.confirm_missing_after_resume(namespace, &latest)
+                        .await?;
+                }
+                Ok(_) => return Err(delete_error),
+                Err(read_error) => return Err(read_error),
+            }
+        }
         self.manifest_cache
             .invalidate_at(namespace.as_str(), self.clock.now());
         Ok(NamespaceDeleteOutcome::Deleted)
@@ -2196,9 +2241,153 @@ impl NamespaceGraph {
         Ok(())
     }
 
-    /// Repair only already-authorized, non-visible branch preparation state.
-    #[allow(dead_code)] // Phase 07 composes the production maintenance loop.
-    pub(crate) async fn maintain(&self, budget: Duration) -> Result<BranchMaintenanceReport> {
+    fn target_matches_child_root(
+        parent: &NamespaceMetadata,
+        target: &NamespaceMetadata,
+        root: &BranchRoot,
+    ) -> bool {
+        let Some(parent_incarnation) = parent.incarnation_id.as_ref() else {
+            return false;
+        };
+        let NamespaceCreationKind::Fork(reservation) = &target.creation_kind else {
+            return false;
+        };
+        if target.name != root.target_namespace.as_str()
+            || target.incarnation_id.as_ref() != Some(&root.target_incarnation)
+            || reservation.branch_id != root.branch_id
+            || reservation.source_namespace.as_str() != parent.name
+            || &reservation.source_incarnation != parent_incarnation
+            || reservation.target_namespace != root.target_namespace
+            || reservation.target_incarnation != root.target_incarnation
+        {
+            return false;
+        }
+
+        match target.branch_identity.as_ref() {
+            Some(identity) => {
+                identity.matches_reservation(reservation) && identity.matches_root(root)
+            }
+            None => {
+                target.state == NamespaceState::Creating
+                    && target.branch_prepare.as_ref().is_some_and(|prepare| {
+                        prepare.stage == BranchPrepareStage::Reserved
+                            && prepare.branch_id == root.branch_id
+                            && prepare.target_incarnation == root.target_incarnation
+                    })
+            }
+        }
+    }
+
+    async fn confirm_child_root_failure(
+        &self,
+        parent: &NamespaceMetadata,
+        expected_root: &BranchRoot,
+        target_was_absent: bool,
+    ) -> Result<()> {
+        let parent_incarnation = parent.incarnation_id.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "branch-root parent {} has no namespace incarnation",
+                parent.name
+            ))
+        })?;
+        let (current_parent, _) = Manifest::read_versioned_required_for_incarnation(
+            &self.store,
+            &parent.name,
+            parent_incarnation.as_uuid(),
+        )
+        .await?;
+        match current_parent.branch_roots().get(&expected_root.branch_id) {
+            None => Ok(()),
+            Some(current_root) if current_root != expected_root => {
+                Err(BranchError::BranchRootMismatch {
+                    branch_id: expected_root.branch_id,
+                }
+                .into())
+            }
+            Some(_) if target_was_absent => Err(BranchError::OrphanBranchRoot {
+                source_namespace: NamespaceId::parse(parent.name.clone()).map_err(|_| {
+                    ZeppelinError::Validation(format!(
+                        "invalid branch-root parent namespace: {}",
+                        parent.name
+                    ))
+                })?,
+                root: expected_root.clone(),
+            }
+            .into()),
+            Some(_) => Err(BranchError::BranchRootMismatch {
+                branch_id: expected_root.branch_id,
+            }
+            .into()),
+        }
+    }
+
+    async fn verify_live_child_roots(
+        &self,
+        parent: &NamespaceMetadata,
+        started: &Instant,
+        budget: Duration,
+    ) -> Result<bool> {
+        if started.elapsed() >= budget {
+            return Ok(false);
+        }
+        let (parent_manifest, _) = match parent.incarnation_id.as_ref() {
+            Some(incarnation) => {
+                Manifest::read_versioned_required_for_incarnation(
+                    &self.store,
+                    &parent.name,
+                    incarnation.as_uuid(),
+                )
+                .await?
+            }
+            None => Manifest::read_versioned_required(&self.store, &parent.name).await?,
+        };
+
+        for root in parent_manifest.branch_roots().values() {
+            if started.elapsed() >= budget {
+                return Ok(false);
+            }
+            match self
+                .namespace_manager
+                .read_metadata_versioned(root.target_namespace.as_str())
+                .await
+            {
+                Ok((target, _)) if Self::target_matches_child_root(parent, &target, root) => {}
+                Ok(_) => {
+                    self.confirm_child_root_failure(parent, root, false).await?;
+                }
+                Err(ZeppelinError::NamespaceNotFound { .. }) => {
+                    self.confirm_child_root_failure(parent, root, true).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
+    }
+
+    async fn verify_active_graph_state(
+        &self,
+        metadata: &NamespaceMetadata,
+        started: &Instant,
+        budget: Duration,
+    ) -> Result<bool> {
+        if started.elapsed() >= budget {
+            return Ok(false);
+        }
+        self.verify_active_branch(metadata).await?;
+        self.verify_live_child_roots(metadata, started, budget)
+            .await
+    }
+
+    /// Resume governed deletion and repair already-authorized branch state.
+    #[allow(dead_code)] // Feature support exercises this seam before Phase 10 readiness wiring.
+    pub(crate) async fn maintain(
+        &self,
+        governance: Arc<dyn DeletionGovernance>,
+        budget: Duration,
+    ) -> Result<BranchMaintenanceReport> {
+        if budget.is_zero() {
+            return Ok(BranchMaintenanceReport::default());
+        }
         let started = Instant::now();
         let mut report = BranchMaintenanceReport::default();
         let mut seen_targets = HashSet::new();
@@ -2220,17 +2409,63 @@ impl NamespaceGraph {
                 Err(ZeppelinError::NamespaceNotFound { .. }) => continue,
                 Err(error) => return Err(error),
             };
+            if started.elapsed() >= budget {
+                break;
+            }
+            if metadata.state == NamespaceState::Deleting
+                || (metadata.state == NamespaceState::Active && metadata.deletion_intent.is_some())
+            {
+                report.deletions_inspected += 1;
+                let remaining = budget.saturating_sub(started.elapsed());
+                match self
+                    .resume_delete(
+                        &NamespaceId::new(target_name.to_string())?,
+                        Arc::clone(&governance),
+                        remaining,
+                    )
+                    .await
+                {
+                    Ok(NamespaceDeleteOutcome::Deleted) => {
+                        report.deletions_completed += 1;
+                    }
+                    Ok(NamespaceDeleteOutcome::AlreadyDeleting) => {
+                        report.deletions_in_progress += 1;
+                    }
+                    Ok(NamespaceDeleteOutcome::BranchGraceWait { .. }) => {
+                        report.deletions_in_progress += 1;
+                        report.branch_grace_waiting += 1;
+                    }
+                    Err(ZeppelinError::NamespaceNotFound { .. }) => {
+                        self.confirm_missing_after_resume(
+                            &NamespaceId::new(target_name.to_string())?,
+                            &metadata,
+                        )
+                        .await?;
+                        report.deletions_completed += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
+            if metadata.state == NamespaceState::Active {
+                if !self
+                    .verify_active_graph_state(&metadata, &started, budget)
+                    .await?
+                {
+                    break;
+                }
+                if matches!(metadata.creation_kind, NamespaceCreationKind::Fork(_)) {
+                    report.active_verified += 1;
+                }
+                continue;
+            }
             let reservation = match &metadata.creation_kind {
                 NamespaceCreationKind::Fork(reservation) => reservation.clone(),
                 NamespaceCreationKind::Root => continue,
             };
             report.inspected += 1;
             match metadata.state {
-                NamespaceState::Active => {
-                    self.verify_active_branch(&metadata).await?;
-                    report.active_verified += 1;
-                    continue;
-                }
+                NamespaceState::Active => continue,
                 NamespaceState::Deleting => continue,
                 NamespaceState::Creating => {}
             }
