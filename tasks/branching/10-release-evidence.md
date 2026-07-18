@@ -15,7 +15,7 @@ disabled by default until every required contract below is green.
 | Direct-child ordering/list contracts | `33908b0`, `897ef9b`, `e8ecb73`, `fcae0a1`, `0f585a5`, `12cf7d7`, `b8eb8bf`, `b1c61db`; target-order MinIO case, route/OpenAPI parity, and redacted fork response fields including source/target generations, with focused JSON-shape coverage |
 | Fork security gates | `a8ac7b8`, `3df5c20`, `0d43b7e`, `720d81e`, `bd65c94`, `b669470`, `a6bfb04`, `94077da`; policy non-widening, branching entitlement, distinct authorization, audited fork events, delegated fork capability, and central route-map checks; focused route/audit/delegation tests passed |
 | Adversarial branching vocabulary | `43fc06d`; `BranchingOp` now has stable replay kind, namespace, and actor accessors with coverage for all five planned operations; `cargo test --test adversarial_workload_tests adversarial::ops` passed 5/5 after `b210e0e` |
-| Current branching integration gate | `TEST_BACKEND=minio cargo test --features branching-test-support --test branch_fork_tests`; 20 passed |
+| Current branching integration gate | `TEST_BACKEND=minio cargo test --features branching-test-support --test branch_fork_tests -- --test-threads=1`; 20 passed in 60.92s on current HEAD |
 
 ## Explicitly incomplete
 
