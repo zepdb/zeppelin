@@ -1813,6 +1813,48 @@ impl NamespaceManager {
         }
     }
 
+    /// CAS-record the durable branch visibility marker and grace deadline.
+    pub(crate) async fn record_visibility_removal(
+        &self,
+        name: &str,
+        visibility: VisibilityRemoval,
+    ) -> Result<()> {
+        for _attempt in 0..8 {
+            let (mut meta, etag) = self.read_metadata_versioned(name).await?;
+            let etag = etag.ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "namespace {name} metadata has no ETag for visibility CAS"
+                ))
+            })?;
+            let intent = meta.deletion_intent.as_mut().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "namespace {name} has no deletion intent for visibility removal"
+                ))
+            })?;
+            if let Some(existing) = &intent.visibility {
+                if existing != &visibility {
+                    return Err(ZeppelinError::Validation(format!(
+                        "namespace {name} visibility removal conflicts with durable intent"
+                    )));
+                }
+                return Ok(());
+            }
+            intent.visibility = Some(visibility.clone());
+            meta.updated_at = self.clock.now();
+            match self
+                .put_metadata_if_match(&NamespaceMetadata::s3_key(name), &meta, &etag, name)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(ZeppelinError::Storage(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ZeppelinError::Validation(format!(
+            "namespace {name} visibility metadata CAS exceeded retry budget"
+        )))
+    }
+
     /// CAS-publishes metadata while preserving its namespace incarnation ID.
     async fn put_metadata_if_match(
         &self,
