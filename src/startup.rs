@@ -608,7 +608,10 @@ async fn build_app_with_entitlement_resolver(
     let cache = Arc::new(DiskCache::new(&config.cache)?);
 
     let hydrator = if config.cache.hydration_enabled {
-        let hydration_config = HydrationConfig::from_cache_config(&config.cache)?;
+        let hydration_config = HydrationConfig::from_cache_config(
+            &config.cache,
+            Duration::from_secs(config.server.request_timeout_secs),
+        )?;
         let policy = heat_policy_from_config(&config.cache)?;
         Some(SegmentHydrator::start(
             store.clone(),

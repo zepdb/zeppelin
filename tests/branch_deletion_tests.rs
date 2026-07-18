@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use common::counting::counting_store;
 use common::fault_injection::{
     fail_after_delete_once_matching, fail_after_put_once_matching, fail_delete_once_matching,
     fail_put_once_matching, pause_next_cas_matching, pause_next_get_matching,
+    record_delete_operations,
 };
 use common::server::{
     client_with_bearer, scoped_test_security_store, start_test_server_full,
@@ -34,6 +36,7 @@ use zeppelin::namespace::{NamespaceId, NamespaceManager};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::{Clock, TimeSource};
 use zeppelin::types::DistanceMetric;
+use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::Manifest;
 
 #[derive(Debug)]
@@ -265,6 +268,187 @@ async fn assert_parent_delete_is_blocked(client: &reqwest::Client, base_url: &st
         .await
         .expect("parent delete conflict must use the JSON envelope");
     assert_eq!(body["code"], "namespace_has_live_branches");
+}
+
+#[tokio::test]
+async fn branch_cleanup_rejects_foreign_pending_delete_without_source_delete() {
+    let harness = common::harness::TestHarness::new().await;
+    let (recording_store, deletes) = record_delete_operations(&harness.store);
+    let source = harness.artifact_origin_namespace("owned-cleanup-source");
+    let target = harness.artifact_origin_namespace("owned-cleanup-target");
+    let mut config = Config::default();
+    config.branching.enabled = true;
+
+    NamespaceManager::new(recording_store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("source namespace must be created");
+    activate_branch(recording_store.clone(), &source, &target, &config).await;
+
+    let foreign_key = WalFragment::s3_key(&source, &ulid::Ulid::new());
+    recording_store
+        .put(
+            &foreign_key,
+            bytes::Bytes::from_static(b"source-owned artifact"),
+        )
+        .await
+        .expect("source-owned artifact fixture must be persisted");
+    let (mut target_manifest, target_version) = Manifest::read_versioned(&recording_store, &target)
+        .await
+        .expect("target manifest read must succeed")
+        .expect("active target manifest must exist");
+    target_manifest.pending_deletes.push(foreign_key.clone());
+    target_manifest
+        .write_conditional(&recording_store, &target, &target_version)
+        .await
+        .expect("corrupt foreign pending-delete fixture must be installed");
+
+    deletes.reset().await;
+    let initial = delete_namespace_for_test(
+        recording_store.clone(),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        config.indexing.clone(),
+        config.branching.clone(),
+    )
+    .await;
+    let cleanup_error = match initial {
+        Err(error) => error,
+        Ok(_) => {
+            let deleting = read_namespace_metadata(&recording_store, &target).await;
+            let not_before = deleting
+                .deletion_intent
+                .as_ref()
+                .and_then(|intent| intent.visibility.as_ref())
+                .map(|visibility| visibility.not_before)
+                .expect("accepted branch deletion must persist a grace deadline");
+            let clock = Clock::from_source(Arc::new(AdjustableWallClock::new(not_before)));
+            resume_delete_with_config_and_clock_for_test(
+                recording_store.clone(),
+                NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+                &branch_grace_config(),
+                clock,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("foreign pending-delete corruption must halt owned cleanup")
+        }
+    };
+
+    let message = cleanup_error.to_string();
+    assert!(
+        message.contains("pending") && (message.contains("foreign") || message.contains("local")),
+        "cleanup must identify the foreign pending-delete corruption: {message}"
+    );
+    assert!(
+        recording_store
+            .get(&NamespaceMetadata::s3_key(&target))
+            .await
+            .is_ok(),
+        "cleanup corruption must retain target metadata as its recovery handle"
+    );
+    assert!(
+        recording_store.get(&foreign_key).await.is_ok(),
+        "target cleanup must not delete the source-owned artifact"
+    );
+    let source_prefix = format!("{source}/");
+    let observed = deletes.deleted_keys().await;
+    assert!(
+        observed.iter().all(|key| !key.starts_with(&source_prefix)),
+        "target cleanup issued source-prefix DELETEs: {observed:?}"
+    );
+
+    harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup_artifact_origin_namespace(&source).await;
+}
+
+#[tokio::test]
+async fn successful_branch_cleanup_deletes_only_target_inventory() {
+    let harness = common::harness::TestHarness::new().await;
+    let (recording_store, deletes) = record_delete_operations(&harness.store);
+    let source = harness.artifact_origin_namespace("owned-cleanup-success-source");
+    let target = harness.artifact_origin_namespace("owned-cleanup-success-target");
+    let fixture =
+        establish_branch_grace_on_store(&harness, recording_store.clone(), &source, &target).await;
+    let source_wal_keys = recording_store
+        .list_prefix(&format!("{source}/wal/"))
+        .await
+        .expect("source WAL inventory must remain readable");
+    assert!(
+        !source_wal_keys.is_empty(),
+        "the source-survival fixture requires one physical source artifact"
+    );
+    let expected_target_deletes = recording_store
+        .list_prefix(&format!("{target}/"))
+        .await
+        .expect("target cleanup inventory must remain readable")
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert!(
+        expected_target_deletes.contains(&NamespaceMetadata::s3_key(&target)),
+        "the cleanup inventory must include metadata for the final DELETE"
+    );
+
+    fixture.wall_clock.set(fixture.visibility.not_before);
+    let source_server =
+        start_branch_recovery_server(&harness, recording_store.clone(), &fixture).await;
+    deletes.reset().await;
+    let outcome = resume_delete_with_config_and_clock_for_test(
+        source_server.store.clone(),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        &fixture.config,
+        fixture.clock.clone(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("owned target cleanup must complete");
+    assert_eq!(outcome, NamespaceDeleteOutcome::Deleted);
+
+    let observed = deletes.deleted_keys().await;
+    let target_prefix = format!("{target}/");
+    let observed_target_deletes = observed
+        .iter()
+        .filter(|key| key.starts_with(&target_prefix))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        observed_target_deletes, expected_target_deletes,
+        "the recorder must observe every object from the authorized target inventory"
+    );
+    let source_prefix = format!("{source}/");
+    assert!(
+        observed.iter().all(|key| !key.starts_with(&source_prefix)),
+        "target cleanup issued source-prefix DELETEs: {observed:?}"
+    );
+    for source_key in &source_wal_keys {
+        assert!(
+            recording_store.get(source_key).await.is_ok(),
+            "source-owned artifact disappeared during target cleanup: {source_key}"
+        );
+    }
+
+    let source_query = client_with_bearer(&fixture.admin_bearer)
+        .post(format!(
+            "{}/v1/namespaces/{source}/query",
+            source_server.base_url
+        ))
+        .json(&json!({
+            "vector": [1.0, 0.0, 0.0, 0.0],
+            "top_k": 10,
+            "consistency": "strong"
+        }))
+        .send()
+        .await
+        .expect("source query after child cleanup must complete");
+    assert_eq!(source_query.status(), reqwest::StatusCode::OK);
+    let source_body: Value = source_query
+        .json()
+        .await
+        .expect("source query response must decode");
+    assert_eq!(source_body["results"][0]["id"], "retained-row");
+    source_server.shutdown().await;
+
+    harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup_artifact_origin_namespace(&source).await;
 }
 
 #[tokio::test]

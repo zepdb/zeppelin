@@ -3577,7 +3577,7 @@ async fn gc_runner_idle_gate_skips_unchanged_and_wakes_on_inventory_change() {
     assert_eq!(unchanged, GcCycleReport::default());
     assert_idle_cycle_only_listed_namespace(&namespace, &counter, &control);
 
-    let probe_key = format!("{namespace}/idle-gate-probe.bin");
+    let probe_key = format!("{namespace}/segments/idle-gate-probe.bin");
     store
         .put(&probe_key, Bytes::from_static(b"new inventory object"))
         .await
@@ -4132,7 +4132,8 @@ async fn gc_runner_unversioned_sibling_cannot_hide_candidate_replacement_before_
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 306);
     let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
-    let unversioned_sibling_key = format!("{namespace}/ordinary-unversioned.bin");
+    let unversioned_sibling_key =
+        format!("{namespace}/segments/ordinary-unversioned-inventory-probe.bin");
 
     gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
@@ -4591,6 +4592,118 @@ async fn malformed_reserved_inventory_key_fails_loud_on_cold_and_stateless_paths
         .await
         .expect_err("the stateless GC entrypoint must reject malformed reserved keys");
     assert!(stateless_error.to_string().contains(&malformed_key));
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn malformed_lifecycle_inventory_key_fails_before_gc_delete() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.artifact_origin_namespace("storage-gc-malformed-lifecycle-key");
+    let store = harness.store.clone();
+    let now = Utc::now();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
+    let malformed_key =
+        format!("{namespace}/_lifecycle/branch_visibility_removed/not-a-canonical-marker");
+    store
+        .put(&malformed_key, Bytes::from_static(b"{}"))
+        .await
+        .unwrap();
+
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+    let gc = GcConfig {
+        manifest_history_keep_count: 64,
+        ..unsafe_short_gc(0)
+    };
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), now);
+    let mut runner = GcRunner::new(controlled_store.clone(), gc.clone());
+
+    let cold_error = runner
+        .run_cycle_at(incarnation, now)
+        .await
+        .expect_err("a malformed lifecycle member must fail the cold GC inventory");
+    assert!(cold_error.to_string().contains(&malformed_key));
+    assert_eq!(
+        control.delete_calls(),
+        0,
+        "lifecycle-family validation must finish before any physical DELETE"
+    );
+
+    control.reset_observed_operations();
+    let stateless_error = run_gc_cycle_at(&controlled_store, &namespace, &gc, now)
+        .await
+        .expect_err("a malformed lifecycle member must fail stateless GC inventory");
+    assert!(stateless_error.to_string().contains(&malformed_key));
+    assert_eq!(
+        control.delete_calls(),
+        0,
+        "stateless lifecycle validation must precede every physical DELETE"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn canonical_lifecycle_marker_is_retained_gc_control_state() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.artifact_origin_namespace("storage-gc-canonical-lifecycle-key");
+    let store = harness.store.clone();
+    let now = Utc::now();
+    gc_manifest_at(now).write(&store, &namespace).await.unwrap();
+    let branch_id = Ulid::new();
+    let target_incarnation = uuid::Uuid::new_v4();
+    let marker_key = format!(
+        "{namespace}/_lifecycle/branch_visibility_removed/{branch_id}.{}.json",
+        target_incarnation.simple()
+    );
+    store
+        .put(
+            &marker_key,
+            Bytes::from_static(b"{\"domain\":\"zeppelin.branch-visibility-removed.v1\"}"),
+        )
+        .await
+        .unwrap();
+
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+    let gc = GcConfig {
+        manifest_history_keep_count: 64,
+        ..unsafe_short_gc(0)
+    };
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), now);
+    let mut runner = GcRunner::new(controlled_store.clone(), gc.clone());
+
+    let cold = runner
+        .run_cycle_at(incarnation, now)
+        .await
+        .expect("a canonical lifecycle marker must be accepted by cold GC");
+    assert_eq!(cold.candidates_marked, 0);
+    assert_eq!(cold.objects_deleted, 0);
+    assert_eq!(
+        cold.candidates_skipped, 0,
+        "a canonical lifecycle marker must be classified as control state, not an unknown skip"
+    );
+    assert_eq!(control.delete_calls(), 0);
+    assert_s3_object_exists(&store, &marker_key).await;
+
+    control.reset_observed_operations();
+    let stateless = run_gc_cycle_at(
+        &controlled_store,
+        &namespace,
+        &gc,
+        now + chrono::Duration::seconds(1),
+    )
+    .await
+    .expect("a canonical lifecycle marker must be accepted by stateless GC");
+    assert_eq!(stateless.candidates_marked, 0);
+    assert_eq!(stateless.objects_deleted, 0);
+    assert_eq!(
+        stateless.candidates_skipped, 0,
+        "stateless GC must classify a canonical lifecycle marker as control state"
+    );
+    assert_eq!(control.delete_calls(), 0);
+    assert_s3_object_exists(&store, &marker_key).await;
 
     harness.cleanup().await;
 }
@@ -5877,7 +5990,7 @@ async fn gc_runner_idle_gate_rejects_backward_clock_config_change_and_partial_fa
     .await;
     assert_idle_cycle_only_listed_namespace(&namespace, &counter, &control);
 
-    let probe_key = format!("{namespace}/partial-refresh-probe.bin");
+    let probe_key = format!("{namespace}/segments/partial-refresh-probe.bin");
     store
         .put(&probe_key, Bytes::from_static(b"force full refresh"))
         .await

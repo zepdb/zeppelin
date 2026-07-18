@@ -39,8 +39,7 @@ use crate::namespace::manager::{
 use crate::namespace::{
     BranchId, BranchRoot, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
 };
-use crate::storage::CreateOnlyOutcome;
-use crate::storage::ZeppelinStore;
+use crate::storage::{CreateOnlyOutcome, NamespaceObjectKey, ZeppelinStore};
 use crate::time::Clock;
 use crate::wal::manifest::{BranchLineageSeed, PreparedManifestPublication, PreparedZeroCopyFork};
 use crate::wal::{Lease, LeaseManager, Manifest};
@@ -1282,6 +1281,11 @@ impl NamespaceGraph {
             }
             Err(error) => return Err(error),
         };
+        // The fence makes this exact generation immutable to ordinary writers.
+        // Prove every deferred delete is a target-owned immutable artifact
+        // before binding destruction evidence to that generation. A foreign
+        // source key must stop deletion before visibility or cleanup changes.
+        fenced.validate_pending_deletes_are_local(name)?;
         self.namespace_manager
             .record_fenced_generation(
                 name,
@@ -1556,6 +1560,9 @@ impl NamespaceGraph {
             .store
             .list_prefix_meta(&format!("{namespace}/"))
             .await?;
+        for object in &objects {
+            NamespaceObjectKey::classify(namespace, object.key.clone())?;
+        }
         let byte_count = objects.iter().try_fold(0_u64, |total, object| {
             total.checked_add(object.size).ok_or_else(|| {
                 ZeppelinError::Validation(format!(

@@ -105,7 +105,11 @@ async fn start_api_server(mut config: Config) -> ApiServer {
             store.clone(),
             cache.clone(),
             heat_policy_from_config(&config.cache).unwrap(),
-            HydrationConfig::from_cache_config(&config.cache).unwrap(),
+            HydrationConfig::from_cache_config(
+                &config.cache,
+                Duration::from_secs(config.server.request_timeout_secs),
+            )
+            .unwrap(),
         ))
     } else {
         None

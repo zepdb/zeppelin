@@ -3842,11 +3842,19 @@ fn fragment_age_secs(id: &Ulid, now_ms: u64) -> u64 {
 }
 
 fn validate_deferred_deletes_are_local(namespace: &str, keys: &[String]) -> Result<()> {
-    let prefix = format!("{namespace}/");
-    if let Some(key) = keys.iter().find(|key| !key.starts_with(&prefix)) {
-        return Err(ZeppelinError::Validation(format!(
-            "deferred delete is not local to namespace {namespace}: {key}"
-        )));
+    for key in keys {
+        let owned = crate::storage::NamespaceObjectKey::classify(namespace, key.clone()).map_err(
+            |error| {
+                ZeppelinError::Validation(format!(
+                    "deferred delete is not local to namespace {namespace}: {key}: {error}"
+                ))
+            },
+        )?;
+        if !owned.allows_deferred_delete() {
+            return Err(ZeppelinError::Validation(format!(
+                "deferred delete is not a local immutable artifact for namespace {namespace}: {key}"
+            )));
+        }
     }
     Ok(())
 }

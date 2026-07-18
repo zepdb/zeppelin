@@ -146,7 +146,9 @@ use crate::namespace::{
     NamespaceIncarnationId, SourceDataPlaneConfigDigest,
 };
 use crate::storage::store::DELETE_MANY_MAX_KEYS;
-use crate::storage::{CreateOnlyOutcome, ListedObject, StorageVersion, ZeppelinStore};
+use crate::storage::{
+    CreateOnlyOutcome, ListedObject, NamespaceObjectKey, StorageVersion, ZeppelinStore,
+};
 
 /// Prefix byte identifying Zeppelin's current MessagePack manifest encoding.
 ///
@@ -663,8 +665,7 @@ impl<'a> ArtifactOriginResolver<'a> {
         })
     }
 
-    /// Resolve all visible fragment descriptors in manifest replay order.
-    #[allow(dead_code)] // Full-inventory consumers arrive with branch normalization in phase 05.
+    /// Resolve all retained fragment descriptors in manifest replay order.
     pub(crate) fn located_fragments(&self) -> Result<Vec<LocatedFragmentRef<'a>>> {
         self.manifest
             .fragments
@@ -3734,11 +3735,15 @@ impl Manifest {
 
     /// Rejects deferred-delete entries that are not owned by `namespace`.
     pub fn validate_pending_deletes_are_local(&self, namespace: &str) -> Result<()> {
-        let prefix = format!("{namespace}/");
         for key in &self.pending_deletes {
-            if !key.starts_with(&prefix) {
+            let owned = NamespaceObjectKey::classify(namespace, key.clone()).map_err(|error| {
+                ZeppelinError::Validation(format!(
+                    "pending delete is not local to namespace {namespace}: {key}: {error}"
+                ))
+            })?;
+            if !owned.allows_deferred_delete() {
                 return Err(ZeppelinError::Validation(format!(
-                    "pending delete is not local to namespace {namespace}: {key}"
+                    "pending delete is not a local immutable artifact for namespace {namespace}: {key}"
                 )));
             }
         }
@@ -3932,6 +3937,7 @@ impl Manifest {
         manifest.validate_branch_lineage_state(namespace)?;
         manifest.validate_receipt_binding_state(namespace)?;
         manifest.validate_foreign_origin_admission()?;
+        manifest.validate_pending_deletes_are_local(namespace)?;
         Ok(manifest)
     }
 
@@ -9360,9 +9366,18 @@ mod tests {
             .unwrap();
         manifest
             .pending_deletes
+            .push("target/meta.json".to_string());
+        assert!(manifest
+            .validate_pending_deletes_are_local("target")
+            .is_err());
+        manifest.pending_deletes.pop();
+        manifest
+            .pending_deletes
             .push("source/segment/object".to_string());
         assert!(manifest
             .validate_pending_deletes_are_local("target")
             .is_err());
+        let bytes = manifest.to_bytes().unwrap();
+        assert!(Manifest::from_bytes_for_namespace(&bytes, "target").is_err());
     }
 }

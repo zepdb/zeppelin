@@ -585,7 +585,11 @@ fn maybe_hydrator(
     if !config.cache.hydration_enabled {
         return None;
     }
-    let hydration_config = HydrationConfig::from_cache_config(&config.cache).unwrap();
+    let hydration_config = HydrationConfig::from_cache_config(
+        &config.cache,
+        Duration::from_secs(config.server.request_timeout_secs),
+    )
+    .unwrap();
     let policy = heat_policy_from_config(&config.cache).unwrap();
     Some(SegmentHydrator::start(
         store.clone(),

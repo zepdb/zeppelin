@@ -101,6 +101,7 @@ use tracing::{debug, instrument};
 
 use crate::config::StorageConfig;
 use crate::error::{Result, ZeppelinError};
+use crate::storage::{namespace_prefix, NamespaceObjectFamily, NamespaceObjectKey};
 
 /// Maximum number of exact keys accepted by one S3 DeleteObjects request.
 pub(crate) const DELETE_MANY_MAX_KEYS: usize = 1_000;
@@ -1925,6 +1926,23 @@ impl ZeppelinStore {
             .collect())
     }
 
+    /// Lists and classifies every object owned by one exact namespace prefix.
+    ///
+    /// Unlike a raw prefix listing, this seam proves each returned key belongs
+    /// to the requested namespace and one known production family. Unknown or
+    /// malformed control keys fail the complete listing closed.
+    pub(crate) async fn list_namespace_objects(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<NamespaceObjectKey>> {
+        let prefix = namespace_prefix(namespace)?;
+        self.list_prefix(&prefix)
+            .await?
+            .into_iter()
+            .map(|key| NamespaceObjectKey::classify(namespace, key))
+            .collect()
+    }
+
     /// Lists every object and its backend metadata beneath a non-empty prefix.
     ///
     /// This performs the same one logical recursive LIST as
@@ -2350,6 +2368,71 @@ impl ZeppelinStore {
             count = deleted,
             complete,
             "s3 delete_prefix"
+        );
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["delete_prefix"])
+            .observe(elapsed.as_secs_f64());
+        Ok(DeletePrefixOutcome { deleted, complete })
+    }
+
+    /// Deletes one bounded batch of known objects owned by an exact namespace.
+    ///
+    /// Every listed key crosses [`NamespaceObjectKey::classify`] before it can
+    /// enter a DELETE chunk. The exact `meta.json` key is always retained as the
+    /// lifecycle tombstone. A still-live `manifest.json`, or any unknown,
+    /// foreign, or malformed key, stops the pass; previously completed chunks
+    /// may already have made safe partial progress. The live manifest itself is
+    /// never submitted to DELETE.
+    /// Chunk size, budget behavior, native S3 batching, and decorated-store
+    /// per-key fault semantics match [`Self::delete_prefix_paged`].
+    pub(crate) async fn delete_namespace_objects_paged(
+        &self,
+        namespace: &str,
+        budget: Duration,
+    ) -> Result<DeletePrefixOutcome> {
+        let prefix = namespace_prefix(namespace)?;
+        let start = std::time::Instant::now();
+        use futures::TryStreamExt;
+
+        let path = Path::parse(&prefix)?;
+        let mut listed = self.inner.list(Some(&path));
+        let mut chunk = Vec::with_capacity(DELETE_MANY_MAX_KEYS);
+        let mut deleted = 0usize;
+        let mut complete = true;
+
+        while let Some(object) = listed.try_next().await? {
+            let owned = NamespaceObjectKey::classify(namespace, object.location.to_string())?;
+            match owned.family() {
+                NamespaceObjectFamily::Metadata => continue,
+                NamespaceObjectFamily::Manifest => {
+                    return Err(ZeppelinError::Validation(format!(
+                        "namespace {namespace} cleanup requires manifest removal before object deletion"
+                    )));
+                }
+                _ => {}
+            }
+            debug_assert_eq!(owned.namespace(), namespace);
+            chunk.push(owned.into_key());
+            if chunk.len() == DELETE_MANY_MAX_KEYS {
+                deleted += self.delete_prefix_chunk(std::mem::take(&mut chunk)).await?;
+                if start.elapsed() >= budget {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+
+        if complete && !chunk.is_empty() {
+            deleted += self.delete_prefix_chunk(chunk).await?;
+        }
+
+        let elapsed = start.elapsed();
+        debug!(
+            namespace,
+            elapsed_ms = elapsed.as_millis(),
+            count = deleted,
+            complete,
+            "s3 delete namespace objects"
         );
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["delete_prefix"])

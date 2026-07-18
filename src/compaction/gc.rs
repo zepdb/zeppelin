@@ -127,7 +127,7 @@ use crate::namespace::manager::{NamespaceIncarnationId, NamespaceMetadata};
 use crate::namespace::{BranchId, BranchRoot, ManifestDigest, ManifestGeneration};
 use crate::security::{NamespaceId, PreservationService};
 use crate::storage::store::DELETE_MANY_MAX_KEYS;
-use crate::storage::{ListedObject, StorageVersion, ZeppelinStore};
+use crate::storage::{ListedObject, NamespaceObjectKey, StorageVersion, ZeppelinStore};
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{
     Manifest, ManifestHistoryObservation, ManifestHistoryPruneResult, ManifestHistoryRetention,
@@ -159,13 +159,12 @@ struct TargetOwnedDeletionKey {
 impl TargetOwnedDeletionKey {
     fn classify(namespace: &str, key: String) -> Result<Self> {
         let target = NamespaceId::new(namespace.to_string())?;
-        let target_prefix = format!("{}/", target.as_str());
-        if !key.starts_with(&target_prefix) {
-            return Err(ZeppelinError::Serialization(format!(
-                "GC target {} cannot delete foreign key {key}",
+        NamespaceObjectKey::classify(target.as_str(), key.clone()).map_err(|error| {
+            ZeppelinError::Serialization(format!(
+                "GC target {} cannot delete unowned key {key}: {error}",
                 target.as_str()
-            )));
-        }
+            ))
+        })?;
         Ok(Self { target, key })
     }
 
@@ -567,7 +566,6 @@ fn listed_object_horizon_satisfied(
 
 impl NamespaceInventory {
     fn from_listed(namespace: &str, listed: Vec<ListedObject>) -> Result<Self> {
-        let namespace_prefix = format!("{namespace}/");
         let history_prefix = Manifest::history_prefix(namespace);
         let snapshot_prefix = NamedSnapshot::prefix(namespace);
         let staging_prefix = format!("{namespace}/_staging/");
@@ -578,13 +576,7 @@ impl NamespaceInventory {
         let mut snapshot_objects = Vec::new();
 
         for object in listed {
-            if !object.key.starts_with(&namespace_prefix) {
-                return Err(malformed_control_key(
-                    "namespace-inventory",
-                    object.key,
-                    format!("key is outside namespace {namespace}"),
-                ));
-            }
+            NamespaceObjectKey::classify(namespace, object.key.clone())?;
             if object.key.starts_with(&history_prefix) {
                 history_objects.push(object.clone());
             } else if object.key.starts_with(&snapshot_prefix) {
@@ -3865,12 +3857,22 @@ async fn run_gc_cycle_at_inner(
         &listed_keys,
         &mut mark_reachable,
     );
-    let unknown_shape_skips = listed_keys
-        .iter()
-        .filter(|key| !mark_reachable.contains(*key))
-        .filter(|key| parse_gc_artifact_key(namespace, key).is_none())
-        .inspect(|key| log_gc_skip(namespace, key, SkipReason::UnknownShape))
-        .count();
+    let unknown_shape_skips =
+        listed_keys
+            .iter()
+            .try_fold(0_usize, |count, key| -> Result<usize> {
+                if mark_reachable.contains(key) {
+                    return Ok(count);
+                }
+                let owned = NamespaceObjectKey::classify(namespace, key.clone())?;
+                if !owned.allows_deferred_delete()
+                    || parse_gc_artifact_key(namespace, key).is_some()
+                {
+                    return Ok(count);
+                }
+                log_gc_skip(namespace, key, SkipReason::UnknownShape);
+                Ok(count + 1)
+            })?;
     let marked_candidates = mark_gc_candidates(
         namespace,
         &listed_keys,
@@ -5972,7 +5974,7 @@ mod tests {
             "gc_source/segments/seg_foreign/cluster_0.bin".to_string(),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("cannot delete foreign key"));
+        assert!(error.to_string().contains("outside exact namespace prefix"));
     }
 
     #[test]

@@ -34,6 +34,11 @@
 /// Implements backend construction and normalized storage operations.
 pub mod store;
 
+/// Classifies exact namespace-owned object keys into production families.
+mod namespace_key;
+
+pub(crate) use namespace_key::{namespace_prefix, NamespaceObjectFamily, NamespaceObjectKey};
+
 /// Re-exports the storage gateway and its domain-facing result types.
 pub use store::{
     ConditionalPutOutcome, CreateOnlyOutcome, DeletePrefixOutcome, ListedObject,

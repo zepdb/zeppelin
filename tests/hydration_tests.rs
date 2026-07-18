@@ -265,6 +265,7 @@ fn test_hydration_config(max_segment_fraction: f64) -> HydrationConfig {
         max_segment_fraction,
         max_retries: 0,
         retry_backoff: Duration::from_millis(1),
+        job_timeout: Duration::from_secs(30),
     }
 }
 
@@ -335,7 +336,7 @@ async fn wait_for_cached_segment(cache: &DiskCache, target: &HydrationTarget) {
     .expect("segment objects should hydrate");
 }
 
-fn target_with_segment(fixture: &HydrationFixture, segment: SegmentRef) -> HydrationTarget {
+async fn target_with_segment(fixture: &HydrationFixture, segment: SegmentRef) -> HydrationTarget {
     let mut manifest = fixture.manifest.clone();
     let active_id = manifest
         .active_segment
@@ -347,6 +348,10 @@ fn target_with_segment(fixture: &HydrationFixture, segment: SegmentRef) -> Hydra
         .find(|candidate| candidate.id == active_id)
         .expect("hydration fixture active descriptor must be present");
     *descriptor = segment;
+    manifest
+        .write(&fixture.store, &fixture.namespace)
+        .await
+        .expect("modified hydration fixture manifest must publish");
     HydrationTarget::from_active_manifest(&manifest)
         .expect("modified hydration fixture must retain a valid origin")
         .expect("modified hydration fixture must retain an active segment")
@@ -1054,7 +1059,7 @@ async fn test_incremental_segment_refuses_hydration() {
     );
     let mut segment = fixture.segment.clone();
     segment.cluster_owners = vec!["older-segment".to_string(); segment.cluster_count];
-    let target = target_with_segment(&fixture, segment);
+    let target = target_with_segment(&fixture, segment).await;
 
     let before = metric_value(
         "zeppelin_hydration_skipped_total",
@@ -1093,7 +1098,7 @@ async fn test_size_mismatch_aborts_hydration() {
     let mut segment = fixture.segment.clone();
     segment.cluster_objects[0].size_bytes += 1;
     let bad_key = segment.cluster_objects[0].key.clone();
-    let target = target_with_segment(&fixture, segment);
+    let target = target_with_segment(&fixture, segment).await;
 
     let before = metric_value("zeppelin_hydration_failures_total", &[]);
     hydrator.observe_query(&target);

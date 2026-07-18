@@ -1,20 +1,23 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::time::Duration as StdDuration;
 
 use bytes::Bytes;
 use chrono::{Duration, Utc};
 use common::fault_injection::{
     assert_snapshot_on_copy, fail_copy_once_matching, fail_put_once_matching,
+    pause_next_copy_matching,
 };
 use common::server::{
     api_ns, cleanup_ns, create_ns_api_with, start_test_server, start_test_server_on_store,
-    start_test_server_with_compactor,
+    start_test_server_on_store_with_config, start_test_server_with_compactor,
 };
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use ulid::Ulid;
 use zeppelin::compaction::gc::reachable_keys;
+use zeppelin::config::Config;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::wal::manifest::{FragmentRef, NamedSnapshot};
@@ -666,6 +669,136 @@ async fn clone_holds_internal_source_pin_while_copying() {
             .iter()
             .all(|snapshot| !snapshot.name.starts_with("__clone_")),
         "temporary source pin must be released after clone publish"
+    );
+
+    cleanup_ns(&harness.store, &source).await;
+    cleanup_ns(&harness.store, &target).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn clone_timeout_cancels_paused_copy_and_leaves_history_pin() {
+    let harness = common::harness::TestHarness::new().await;
+    let source = api_ns(&harness, "timeout-pin-source");
+    let target = api_ns(&harness, "timeout-pin-target");
+    let (paused_store, pause) = pause_next_copy_matching(&harness.store, format!("{source}/wal/"));
+    let mut config = Config::default();
+    config.server.request_timeout_secs = 1;
+    let (base_url, _cache, _cache_dir, admin_bearer) =
+        start_test_server_on_store_with_config(&harness, paused_store, None, config).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
+
+    let created_source = create_ns_api_with(
+        &client,
+        &base_url,
+        json!({
+            "name": source,
+            "dimensions": 2,
+            "distance_metric": "euclidean"
+        }),
+    )
+    .await;
+    assert_eq!(created_source, source);
+
+    upsert(
+        &client,
+        &base_url,
+        &source,
+        json!([{ "id": "selected", "values": [0.0, 0.0] }]),
+    )
+    .await;
+    let selected_generation = Manifest::read(&harness.store, &source)
+        .await
+        .unwrap()
+        .unwrap()
+        .version();
+    upsert(
+        &client,
+        &base_url,
+        &source,
+        json!([{ "id": "newer-one", "values": [1.0, 1.0] }]),
+    )
+    .await;
+    upsert(
+        &client,
+        &base_url,
+        &source,
+        json!([{ "id": "newer-two", "values": [2.0, 2.0] }]),
+    )
+    .await;
+    assert!(
+        Manifest::read_history(&harness.store, &source, selected_generation)
+            .await
+            .unwrap()
+            .is_some(),
+        "selected generation must be retained before clone starts"
+    );
+
+    pause.arm();
+    let clone_client = client.clone();
+    let clone_base_url = base_url.clone();
+    let clone_source = source.clone();
+    let clone_target = target.clone();
+    let clone_task = tokio::spawn(async move {
+        clone_namespace(
+            &clone_client,
+            &clone_base_url,
+            &clone_source,
+            &clone_target,
+            &selected_generation.to_string(),
+        )
+        .await
+    });
+
+    tokio::time::timeout(StdDuration::from_secs(10), pause.wait_until_paused())
+        .await
+        .expect("clone COPY must reach the deterministic pause boundary");
+    let paused_pin = NamedSnapshot::list(&harness.store, &source)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|snapshot| {
+            snapshot.name.starts_with("__clone_") && snapshot.generation == selected_generation
+        })
+        .expect("internal clone pin must be durable before COPY starts");
+
+    let (status, body) = tokio::time::timeout(StdDuration::from_secs(10), clone_task)
+        .await
+        .expect("request timeout must bound the paused clone")
+        .expect("clone task must not panic");
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{body}");
+    assert_eq!(body["code"], "REQUEST_TIMEOUT", "{body}");
+    tokio::time::timeout(StdDuration::from_secs(10), pause.wait_until_exited())
+        .await
+        .expect("cancelled COPY future must exit");
+    assert!(
+        pause.was_cancelled_before_storage(),
+        "request timeout must cancel COPY before it reaches storage"
+    );
+
+    assert!(
+        NamedSnapshot::list(&harness.store, &source)
+            .await
+            .unwrap()
+            .iter()
+            .any(|snapshot| {
+                snapshot.name == paused_pin.name && snapshot.generation == selected_generation
+            }),
+        "timeout cancellation must fail conservatively by retaining the internal pin"
+    );
+    let pruned = Manifest::prune_history(&harness.store, &source, 1)
+        .await
+        .unwrap();
+    assert!(
+        pruned > 0,
+        "fixture must prune an unprotected older generation"
+    );
+    assert!(
+        Manifest::read_history(&harness.store, &source, selected_generation)
+            .await
+            .unwrap()
+            .is_some(),
+        "retained internal clone pin must protect the selected history generation"
     );
 
     cleanup_ns(&harness.store, &source).await;

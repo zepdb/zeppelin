@@ -2887,16 +2887,18 @@ impl NamespaceManager {
         name: &str,
         budget: Duration,
     ) -> Result<crate::storage::DeletePrefixOutcome> {
-        let meta_key = NamespaceMetadata::s3_key(name);
         self.store
-            .delete_prefix_paged(&format!("{name}/"), Some(&meta_key), budget)
+            .delete_namespace_objects_paged(name, budget)
             .await
     }
 
     async fn remove_metadata_after_cleanup(&self, name: &str) -> Result<()> {
         let meta_key = NamespaceMetadata::s3_key(name);
-        let remaining = self.store.list_prefix(&format!("{name}/")).await?;
-        let non_meta_remaining = remaining.iter().filter(|key| *key != &meta_key).count();
+        let remaining = self.store.list_namespace_objects(name).await?;
+        let non_meta_remaining = remaining
+            .iter()
+            .filter(|key| !key.family().is_metadata())
+            .count();
         if non_meta_remaining != 0 {
             return Err(ZeppelinError::NamespaceDeleteIncomplete {
                 namespace: name.to_string(),

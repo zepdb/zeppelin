@@ -52,6 +52,9 @@
 //!             v
 //! single background worker
 //!             |
+//!             +-- fresh logical manifest GET
+//!             |      +-- absent/fenced/rotated --> abort; no physical reads
+//!             |
 //!             +-- incremental segment --> refuse; no retry
 //!             +-- warm set too large ---> refuse; no retry
 //!             |
@@ -69,6 +72,9 @@
 //!
 //! - The supplied [`crate::wal::manifest::SegmentRef`] must come from an
 //!   authoritative manifest.
+//! - A queued job must still match that exact logical manifest generation,
+//!   namespace incarnation, active segment, and resolved physical origin before
+//!   any physical-origin HEAD or GET begins.
 //! - Hydration never publishes a segment or mutates immutable objects.
 //! - Capacity is checked before downloads using grouped-object manifest sizes
 //!   plus object-store HEAD sizes for sidecars.
@@ -76,6 +82,8 @@
 //!   size is invalidated and fails the attempt.
 //! - One job receives the initial attempt plus `max_retries`; retries preserve
 //!   later channel order by blocking the single worker during backoff.
+//! - The entire job is cancelled at `job_timeout`, including authority refresh,
+//!   planning, downloads, retry backoff, and retries.
 //! - The session policy emits at most one heat trigger per segment per active
 //!   window, but a later window or segment rotation may trigger again.
 //!
@@ -241,6 +249,13 @@ pub struct HydrationConfig {
     pub max_retries: usize,
     /// Delay before each retry; the single worker processes no later job then.
     pub retry_backoff: Duration,
+    /// Hard wall-clock bound for one accepted job, including authority refresh,
+    /// planning HEADs, downloads, retries, and retry backoff.
+    ///
+    /// Production sets this to the HTTP server request timeout. Governed
+    /// deletion already includes that timeout in its reader-safety floor, so a
+    /// detached hydration reader cannot outlive the configured grace window.
+    pub job_timeout: Duration,
 }
 
 impl HydrationConfig {
@@ -250,23 +265,29 @@ impl HydrationConfig {
     ///
     /// - `config`: Cache configuration containing hydration parallelism and the
     ///   maximum per-segment cache fraction.
+    /// - `server_request_timeout`: Validated server request bound reused as the
+    ///   detached reader's hard job deadline.
     ///
     /// # Returns
     ///
-    /// An owned runtime snapshot with the configured limits plus two retries
-    /// and a 250 ms retry backoff.
+    /// An owned runtime snapshot with the configured limits, supplied hard
+    /// deadline, two retries, and a 250 ms retry backoff.
     ///
     /// # Errors
     ///
-    /// Returns a configuration error when parallelism is zero or when the
-    /// fraction is non-finite, non-positive, or greater than one.
+    /// Returns a configuration error when parallelism or the supplied deadline
+    /// is zero, or when the fraction is non-finite, non-positive, or greater
+    /// than one.
     ///
     /// # Examples
     ///
     /// Parallelism eight and fraction `0.25` allow eight simultaneous object
     /// fetches for a segment whose planned warm set uses at most one quarter of
-    /// the cache budget.
-    pub fn from_cache_config(config: &CacheConfig) -> Result<Self> {
+    /// the cache budget, all within the supplied request-timeout duration.
+    pub fn from_cache_config(
+        config: &CacheConfig,
+        server_request_timeout: Duration,
+    ) -> Result<Self> {
         if config.hydration_parallelism == 0 {
             return Err(ZeppelinError::Config(
                 "cache.hydration_parallelism must be greater than zero".into(),
@@ -280,11 +301,17 @@ impl HydrationConfig {
                 "cache.hydration_max_segment_fraction must be finite and in (0, 1]".into(),
             ));
         }
+        if server_request_timeout.is_zero() {
+            return Err(ZeppelinError::Config(
+                "server.request_timeout_secs must be greater than zero for hydration".into(),
+            ));
+        }
         Ok(Self {
             parallelism: config.hydration_parallelism,
             max_segment_fraction: config.hydration_max_segment_fraction,
             max_retries: 2,
             retry_backoff: Duration::from_millis(250),
+            job_timeout: server_request_timeout,
         })
     }
 }
@@ -320,13 +347,14 @@ impl HydrationTrigger {
 ///
 /// The logical origin controls policy, metrics, and logs. The physical origin
 /// controls every immutable object-store key and disposable cache identity.
-/// Keeping both identities beside the cloned descriptor prevents the
-/// background worker from reconstructing storage location from a target
-/// namespace after the authoritative manifest borrow has ended.
+/// Keeping both identities and the selecting manifest generation beside the
+/// cloned descriptor lets the background worker prove the queued snapshot is
+/// still authoritative before it reads any physical artifact.
 #[derive(Debug, Clone)]
 pub struct HydrationTarget {
     logical_origin: ArtifactOrigin,
     physical_origin: ArtifactOrigin,
+    manifest_generation: u64,
     segment: SegmentRef,
 }
 
@@ -346,19 +374,23 @@ impl HydrationTarget {
     ///
     /// The manifest resolver validates the target binding, origin table,
     /// explicit artifact keys, duplicate global identities, and unique active
-    /// descriptor before this method returns an owned target.
+    /// descriptor before this method returns an owned target carrying that
+    /// exact manifest generation.
     pub fn from_active_manifest_with_origin(
         manifest: &Manifest,
         authoritative_local: &ArtifactOrigin,
     ) -> Result<Option<Self>> {
         let resolver = manifest.artifact_origin_resolver(authoritative_local)?;
-        Ok(resolver.active_located_segment()?.map(Self::from_located))
+        Ok(resolver
+            .active_located_segment()?
+            .map(|located| Self::from_located(manifest.version(), located)))
     }
 
-    fn from_located(located: LocatedSegmentRef<'_>) -> Self {
+    fn from_located(manifest_generation: u64, located: LocatedSegmentRef<'_>) -> Self {
         Self {
             logical_origin: located.logical_origin.as_origin().clone(),
             physical_origin: located.physical_origin.as_origin().clone(),
+            manifest_generation,
             segment: located.segment.clone(),
         }
     }
@@ -373,6 +405,13 @@ impl HydrationTarget {
     #[must_use]
     pub fn physical_namespace(&self) -> &str {
         self.physical_origin.namespace.as_str()
+    }
+
+    /// Return the exact authoritative logical-manifest generation that selected
+    /// this immutable descriptor.
+    #[must_use]
+    pub const fn manifest_generation(&self) -> u64 {
+        self.manifest_generation
     }
 
     /// Return the manifest-selected immutable segment descriptor.
@@ -395,6 +434,9 @@ struct HydrationJob {
     target: HydrationTarget,
     /// Source label retained across retries.
     trigger: HydrationTrigger,
+    /// Acknowledgement used only by the deterministic reader-safety test seam.
+    #[cfg(feature = "branching-test-support")]
+    completion: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Metric category and planning role for a hydrated object.
@@ -468,7 +510,8 @@ impl SegmentHydrator {
     /// - `store`: Owned object-store client moved into the worker.
     /// - `cache`: Shared disk/memory cache populated by the worker.
     /// - `policy`: Shared synchronous heat policy used by caller tasks.
-    /// - `config`: Validated concurrency, capacity, and retry limits.
+    /// - `config`: Validated concurrency, capacity, retry, and hard-deadline
+    ///   limits.
     ///
     /// # Returns
     ///
@@ -578,6 +621,40 @@ impl SegmentHydrator {
         }
     }
 
+    /// Enqueue one administrative job and wait until the detached worker has
+    /// either completed it or enforced its hard deadline.
+    ///
+    /// This seam exists only for deterministic branch-reader safety tests. It
+    /// does not expose the job's optimization result: hydration failures remain
+    /// observable through the normal metrics and logs.
+    #[cfg(feature = "branching-test-support")]
+    pub async fn request_hydration_and_wait_for_test(
+        &self,
+        target: &HydrationTarget,
+    ) -> Result<()> {
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        let trigger = HydrationTrigger::Admin;
+        self.jobs
+            .try_send(HydrationJob {
+                target: target.clone(),
+                trigger,
+                completion: Some(completion),
+            })
+            .map_err(|error| {
+                ZeppelinError::Validation(format!(
+                    "failed to enqueue deterministic hydration job: {error}"
+                ))
+            })?;
+        crate::metrics::HYDRATION_JOBS_TOTAL
+            .with_label_values(&[trigger.as_str()])
+            .inc();
+        completed.await.map_err(|_| {
+            ZeppelinError::Validation(
+                "hydration worker exited before acknowledging deterministic job".to_string(),
+            )
+        })
+    }
+
     /// Clones one job and submits it with `try_send`.
     ///
     /// # Parameters
@@ -603,6 +680,8 @@ impl SegmentHydrator {
         let job = HydrationJob {
             target: target.clone(),
             trigger,
+            #[cfg(feature = "branching-test-support")]
+            completion: None,
         };
         match self.jobs.try_send(job) {
             Ok(()) => {
@@ -624,7 +703,8 @@ impl SegmentHydrator {
     }
 }
 
-/// Receives jobs serially and runs each through retry handling.
+/// Receives jobs serially and runs each through authority, retry, and deadline
+/// handling.
 ///
 /// # Parameters
 ///
@@ -636,13 +716,15 @@ impl SegmentHydrator {
 /// # Returns
 ///
 /// Returns when every sender is dropped and all accepted messages are drained.
-/// Job failures are logged/metricized inside retry handling and do not stop the
-/// loop.
+/// Job failures and hard-deadline expirations are logged/metricized and do not
+/// stop the loop.
 ///
 /// # Performance
 ///
 /// Jobs are processed one at a time. Object downloads within the current job
-/// may run concurrently; retry backoff delays later queued jobs.
+/// may run concurrently; retry backoff delays later queued jobs. Dropping the
+/// timed-out job future cancels its `buffer_unordered` children because those
+/// object futures are owned by the stream rather than independently spawned.
 ///
 /// # Examples
 ///
@@ -656,11 +738,44 @@ async fn worker_loop(
 ) {
     let mut capacity_refusals_logged = HashMap::new();
     while let Some(job) = rx.recv().await {
-        run_job_with_retries(&store, &cache, &config, job, &mut capacity_refusals_logged).await;
+        #[cfg(feature = "branching-test-support")]
+        let (job, completion) = {
+            let mut job = job;
+            let completion = job.completion.take();
+            (job, completion)
+        };
+        let namespace = job.target.logical_namespace().to_string();
+        let segment_id = job.target.segment.id.clone();
+        let trigger = job.trigger;
+        if tokio::time::timeout(
+            config.job_timeout,
+            run_job_with_retries(&store, &cache, &config, job, &mut capacity_refusals_logged),
+        )
+        .await
+        .is_err()
+        {
+            crate::metrics::HYDRATION_FAILURES_TOTAL.inc();
+            error!(
+                namespace,
+                segment_id,
+                trigger = trigger.as_str(),
+                timeout_ms = config.job_timeout.as_millis(),
+                "hydration job exceeded its hard reader-safety deadline"
+            );
+        }
+        #[cfg(feature = "branching-test-support")]
+        if let Some(completion) = completion {
+            if completion.send(()).is_err() {
+                warn!(
+                    namespace,
+                    segment_id, "deterministic hydration completion receiver was dropped"
+                );
+            }
+        }
     }
 }
 
-/// Runs one job until success or its retry budget is exhausted.
+/// Revalidates one queued target, then runs it until success or retry exhaustion.
 ///
 /// # Parameters
 ///
@@ -678,8 +793,9 @@ async fn worker_loop(
 ///
 /// # Side Effects
 ///
-/// Increments/decrements the inflight gauge, records every failed attempt, logs
-/// errors, and sleeps between retryable attempts.
+/// Performs an uncached logical-manifest GET before each physical-origin
+/// attempt, increments/decrements the inflight gauge, records every failed
+/// attempt, logs errors, and sleeps between retryable attempts.
 ///
 /// # Examples
 ///
@@ -702,6 +818,19 @@ async fn run_job_with_retries(
     let _inflight_guard = crate::metrics::GaugeGuard(&crate::metrics::HYDRATION_INFLIGHT);
     let mut attempt = 0usize;
     loop {
+        if let Err(error) = validate_hydration_job_authority(store, &job).await {
+            crate::metrics::HYDRATION_FAILURES_TOTAL.inc();
+            error!(
+                namespace = job.target.logical_namespace(),
+                segment_id = %job.target.segment.id,
+                trigger = job.trigger.as_str(),
+                generation = job.target.manifest_generation,
+                attempt,
+                error = %error,
+                "hydration job no longer matches authoritative manifest state"
+            );
+            return;
+        }
         match hydrate_segment_once(store, cache, config, &job, capacity_refusals_logged).await {
             Ok(()) => return,
             Err(error) => {
@@ -722,6 +851,55 @@ async fn run_job_with_retries(
             }
         }
     }
+}
+
+/// Re-read one queued job's logical manifest directly from object storage.
+///
+/// No physical-origin key may be headed or fetched before this check succeeds.
+/// The queued descriptor is accepted only while the same logical namespace
+/// lifetime, exact manifest generation, unique active segment, and resolved
+/// physical owner remain authoritative and the live manifest is unfenced.
+async fn validate_hydration_job_authority(store: &ZeppelinStore, job: &HydrationJob) -> Result<()> {
+    let namespace = job.target.logical_namespace();
+    let Some((manifest, version)) = Manifest::read_versioned(store, namespace).await? else {
+        return Err(ZeppelinError::ManifestNotFound {
+            namespace: namespace.to_string(),
+        });
+    };
+    if version.is_deletion_fenced() {
+        return Err(ZeppelinError::NamespaceDeleting {
+            namespace: namespace.to_string(),
+        });
+    }
+    if manifest.version() != job.target.manifest_generation {
+        return Err(ZeppelinError::ManifestConflict {
+            namespace: namespace.to_string(),
+        });
+    }
+
+    let logical_origin = manifest.local_origin()?;
+    if logical_origin != job.target.logical_origin {
+        return Err(ZeppelinError::Validation(format!(
+            "hydration target logical origin changed for namespace {namespace}"
+        )));
+    }
+    let located = manifest
+        .artifact_origin_resolver(&logical_origin)?
+        .active_located_segment()?
+        .ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "hydration target namespace {namespace} has no active segment"
+            ))
+        })?;
+    if located.logical_origin.as_origin() != &job.target.logical_origin
+        || located.physical_origin.as_origin() != &job.target.physical_origin
+        || located.segment != &job.target.segment
+    {
+        return Err(ZeppelinError::Validation(format!(
+            "hydration target no longer matches active segment authority for namespace {namespace}"
+        )));
+    }
+    Ok(())
 }
 
 /// Plans, capacity-checks, and hydrates one segment attempt.
@@ -753,9 +931,10 @@ async fn run_job_with_retries(
 ///
 /// # Consistency
 ///
-/// Hydration uses exactly the immutable references in `job.target`; it does
-/// not re-read or publish a manifest. Cache population cannot make the segment
-/// visible independently of that manifest.
+/// The caller has already strongly revalidated the exact manifest generation,
+/// logical incarnation, active descriptor, and resolved physical origin in
+/// `job.target`. This attempt never publishes a manifest, and cache population
+/// cannot make the segment visible independently of that manifest.
 ///
 /// # Performance
 ///

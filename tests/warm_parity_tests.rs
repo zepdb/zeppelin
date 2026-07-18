@@ -105,7 +105,11 @@ async fn start_parity_server(mut config: Config) -> ParityServer {
         store.clone(),
         cache.clone(),
         heat_policy_from_config(&config.cache).unwrap(),
-        HydrationConfig::from_cache_config(&config.cache).unwrap(),
+        HydrationConfig::from_cache_config(
+            &config.cache,
+            Duration::from_secs(config.server.request_timeout_secs),
+        )
+        .unwrap(),
     );
     let runtime_query_config = Arc::new(RuntimeQueryConfig::from_config(&config));
     let query_knob_bounds = QueryKnobBounds::from_config(&config);
