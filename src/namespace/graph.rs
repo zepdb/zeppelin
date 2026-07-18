@@ -304,24 +304,51 @@ impl NamespaceGraph {
                 NamespaceCreationKind::Fork(reservation) => reservation.source_namespace.clone(),
                 NamespaceCreationKind::Root => unreachable!(),
             };
-            remove_branch_root(
+            let source_incarnation = match &metadata.creation_kind {
+                NamespaceCreationKind::Fork(reservation) => reservation.source_incarnation.clone(),
+                NamespaceCreationKind::Root => unreachable!(),
+            };
+            let (parent_manifest, _) = Manifest::read_versioned_required_for_incarnation(
                 &self.store,
-                &self.namespace_manager,
-                &self.lease_manager,
-                RemoveBranchRootRequest {
-                    source_namespace,
-                    expected_root: parent_root,
-                },
+                source_namespace.as_str(),
+                source_incarnation.as_uuid(),
             )
             .await?;
-            self.namespace_manager
-                .record_root_release(
-                    namespace.as_str(),
-                    RootReleaseState::Released {
-                        acked_at: self.clock.now(),
+            if let Some(current_root) = parent_manifest.branch_roots().get(&parent_root.branch_id) {
+                if current_root != &parent_root {
+                    return Err(ZeppelinError::Validation(format!(
+                        "parent root for branch {} changed before release",
+                        namespace
+                    )));
+                }
+                remove_branch_root(
+                    &self.store,
+                    &self.namespace_manager,
+                    &self.lease_manager,
+                    RemoveBranchRootRequest {
+                        source_namespace,
+                        expected_root: parent_root,
                     },
                 )
                 .await?;
+                self.namespace_manager
+                    .record_root_release(
+                        namespace.as_str(),
+                        RootReleaseState::Released {
+                            acked_at: self.clock.now(),
+                        },
+                    )
+                    .await?;
+            } else {
+                self.namespace_manager
+                    .record_root_release(
+                        namespace.as_str(),
+                        RootReleaseState::Converged {
+                            observed_at: self.clock.now(),
+                        },
+                    )
+                    .await?;
+            }
             let outcome = self
                 .namespace_manager
                 .finish_delete(namespace.as_str(), budget)
