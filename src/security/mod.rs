@@ -63,8 +63,9 @@ pub use policy::{
 };
 pub use policy_store::{LoadedPolicy, PolicyStore};
 pub use preservation::{
-    CreatePreservationLock, PreservationGuard, PreservationLockId, PreservationLockRecord,
-    PreservationReasonKind, PreservationScope, PreservationService, PreservationState,
+    CreatePreservationLock, PreservationGuard, PreservationHeadProof, PreservationLockId,
+    PreservationLockRecord, PreservationReasonKind, PreservationScope, PreservationService,
+    PreservationState,
 };
 pub use principal::{AuthStrength, Principal, PrincipalId, PrincipalKind};
 pub(crate) use receipt::{issue_receipt, verify_receipt, ReceiptIssue};
