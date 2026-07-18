@@ -913,8 +913,10 @@ paths:
       summary: List direct namespace branches
       tags: [Namespaces]
       responses:
-        "401": { $ref: "#/components/responses/UnauthorizedError" }
-        "403": { $ref: "#/components/responses/ForbiddenError" }
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Direct branch descriptors
           content:
