@@ -837,12 +837,32 @@ impl Compactor {
         manifest: &Manifest,
         metadata: &NamespaceMetadata,
     ) -> Result<bool> {
-        let fragments = manifest.uncompacted_fragments();
+        let fragments = if manifest.namespace_incarnation().is_some() {
+            let local_origin = manifest.local_origin()?;
+            let resolver = manifest.artifact_origin_resolver(&local_origin)?;
+            let local_ids = resolver
+                .uncompacted_located_fragments()?
+                .into_iter()
+                .filter(|located| located.physical_origin.as_origin() == &local_origin)
+                .map(|located| located.fragment.id)
+                .collect::<std::collections::HashSet<_>>();
+            manifest
+                .uncompacted_fragments()
+                .iter()
+                .filter(|fragment| local_ids.contains(&fragment.id))
+                .collect::<Vec<_>>()
+        } else {
+            // Pre-incarnation manifests have no origin context; preserve the
+            // legacy trigger semantics until a guarded read binds them.
+            manifest.uncompacted_fragments().iter().collect()
+        };
 
         // Idle namespace: nothing to compact, never trigger (no busy work,
         // no S3 churn on quiet namespaces).
         if fragments.is_empty() {
-            if manifest.has_foreign_visible_artifacts()? {
+            if manifest.namespace_incarnation().is_some()
+                && manifest.has_foreign_visible_artifacts()?
+            {
                 info!("compaction triggered by foreign branch materialization");
                 return Ok(true);
             }
