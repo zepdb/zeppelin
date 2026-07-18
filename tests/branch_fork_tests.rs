@@ -223,6 +223,66 @@ async fn graph_lists_direct_children_in_target_order() {
     harness.cleanup().await;
 }
 
+#[tokio::test]
+async fn nested_branching_tracks_depth_and_enforces_limit() {
+    let harness = TestHarness::new().await;
+    let source = harness.artifact_origin_namespace("nested-source");
+    let child = harness.artifact_origin_namespace("nested-child");
+    let grandchild = harness.artifact_origin_namespace("nested-grandchild");
+    let over_limit = harness.artifact_origin_namespace("nested-over-limit");
+    NamespaceManager::new(harness.store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .unwrap();
+    activate_fork_for_test(
+        harness.store.clone(),
+        NamespaceId::new(source.clone()).unwrap(),
+        NamespaceId::new(child.clone()).unwrap(),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .unwrap();
+    let nested = activate_fork_for_test(
+        harness.store.clone(),
+        NamespaceId::new(child.clone()).unwrap(),
+        NamespaceId::new(grandchild.clone()).unwrap(),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .unwrap();
+    let depth = match nested {
+        PrepareForkOutcome::Prepared(branch) | PrepareForkOutcome::ExistingPrepared(branch) => {
+            branch.identity.depth
+        }
+    };
+    assert_eq!(depth, 2);
+
+    let mut limited = fork_limits();
+    limited.max_depth = 2;
+    let error = prepare_fork_for_test(
+        harness.store.clone(),
+        NamespaceId::new(grandchild.clone()).unwrap(),
+        NamespaceId::new(over_limit.clone()).unwrap(),
+        fork_indexing(),
+        limited,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ZeppelinError::Branch(inner)
+            if matches!(*inner, BranchError::BranchDepthExceeded { .. })
+    ));
+
+    harness.cleanup_artifact_origin_namespace(&source).await;
+    harness.cleanup_artifact_origin_namespace(&child).await;
+    harness.cleanup_artifact_origin_namespace(&grandchild).await;
+    harness.cleanup_artifact_origin_namespace(&over_limit).await;
+    harness.cleanup().await;
+}
+
 async fn compact_source(
     harness: &TestHarness,
     source: &str,
