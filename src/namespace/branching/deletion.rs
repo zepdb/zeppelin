@@ -4,6 +4,8 @@
 //! authoritative namespace graph. It deliberately carries decisions and
 //! governance hooks, never bearer credentials or caller-supplied roots.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +52,60 @@ pub(crate) trait DeletionGovernance: Send + Sync {
 
     /// Persist lifecycle audit evidence.
     async fn settle_lifecycle_audit(&self, event: DeletionLifecycleEvent) -> Result<()>;
+}
+
+type PreservationCallback = dyn Fn(
+        NamespaceId,
+        DeletionBoundary,
+    )
+        -> Pin<Box<dyn Future<Output = Result<(PreservationGuard, PreservationHeadProof)>> + Send>>
+    + Send
+    + Sync;
+type AuditCallback = dyn Fn(DeletionLifecycleEvent) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
+    + Send
+    + Sync;
+type DisclosureCallback = dyn Fn(&NamespaceId) -> Result<bool> + Send + Sync;
+
+/// Callback-backed governance adapter used by the security/server boundary.
+pub(crate) struct CallbackDeletionGovernance {
+    preservation: Arc<PreservationCallback>,
+    disclose: Arc<DisclosureCallback>,
+    audit: Arc<AuditCallback>,
+}
+
+impl CallbackDeletionGovernance {
+    /// Assemble callbacks without carrying bearer credentials into the graph.
+    #[must_use]
+    pub(crate) fn new(
+        preservation: Arc<PreservationCallback>,
+        disclose: Arc<DisclosureCallback>,
+        audit: Arc<AuditCallback>,
+    ) -> Self {
+        Self {
+            preservation,
+            disclose,
+            audit,
+        }
+    }
+}
+
+#[async_trait]
+impl DeletionGovernance for CallbackDeletionGovernance {
+    async fn preservation_boundary(
+        &self,
+        namespace: &NamespaceId,
+        boundary: DeletionBoundary,
+    ) -> Result<(PreservationGuard, PreservationHeadProof)> {
+        (self.preservation)(namespace.clone(), boundary).await
+    }
+
+    fn disclose_child(&self, target: &NamespaceId) -> Result<bool> {
+        (self.disclose)(target)
+    }
+
+    async fn settle_lifecycle_audit(&self, event: DeletionLifecycleEvent) -> Result<()> {
+        (self.audit)(event).await
+    }
 }
 
 /// Boundary at which preservation authority must be freshly observed.
