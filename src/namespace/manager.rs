@@ -2127,6 +2127,7 @@ impl NamespaceManager {
             NamespaceDestructionRecord::from_bytes(&self.store.get(destruction_record_key).await?)?;
         if evidence.namespace != namespace
             || evidence.manifest_version_destroyed != expected_manifest_version
+            || evidence.parent_root != intent.parent_root
         {
             return Err(ZeppelinError::Validation(format!(
                 "namespace {name} destruction evidence does not match the governed commit"
@@ -2269,6 +2270,11 @@ impl NamespaceManager {
             if evidence.namespace != namespace {
                 return Err(ZeppelinError::Validation(format!(
                     "namespace {name} destruction evidence does not match its tombstone"
+                )));
+            }
+            if evidence.parent_root != intent.parent_root {
+                return Err(ZeppelinError::Validation(format!(
+                    "namespace {name} destruction evidence parent root does not match its intent"
                 )));
             }
         }
