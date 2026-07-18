@@ -62,6 +62,19 @@ pub struct BranchDescriptorResponse {
     pub created_at: DateTime<Utc>,
 }
 
+/// Redacted branch status embedded in target namespace metadata.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BranchStatusDescriptor {
+    pub branch_id: String,
+    pub mode: BranchMode,
+    pub depth: u16,
+    pub lifecycle: BranchLifecycle,
+    pub health: BranchHealth,
+    pub materialized: bool,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Direct-child list response without count or pagination oracle fields.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

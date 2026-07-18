@@ -150,7 +150,7 @@ use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
 use crate::namespace::branching::http::{
     BranchDescriptorResponse, BranchHealth, BranchLifecycle, BranchListResponse, BranchMode,
-    BranchTargetIdentity,
+    BranchStatusDescriptor, BranchTargetIdentity,
 };
 use crate::namespace::branching::{BranchError, PrepareForkOutcome, PrepareForkRequest};
 use crate::namespace::graph::NamespaceGraph;
@@ -606,6 +606,9 @@ pub struct NamespaceResponse {
     /// configured.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
+    /// Redacted target-local branch status, present only for branch targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<BranchStatusDescriptor>,
 }
 
 /// Acknowledges that namespace deletion entered or resumed its durable protocol.
@@ -870,6 +873,26 @@ impl NamespaceResponse {
         let index_kind = namespace_index_kind(&meta, manifest);
         let active_segment = active_segment_ref(manifest);
         let compaction_health = meta.compaction_health.clone();
+        let branch = meta
+            .branch_identity
+            .as_ref()
+            .map(|identity| BranchStatusDescriptor {
+                branch_id: identity.branch_id.to_string(),
+                mode: BranchMode::CopyOnWrite,
+                depth: identity.depth,
+                lifecycle: match meta.state {
+                    NamespaceState::Creating => BranchLifecycle::Preparing,
+                    NamespaceState::Active => BranchLifecycle::Active,
+                    NamespaceState::Deleting => BranchLifecycle::Deleting,
+                },
+                health: if matches!(meta.state, NamespaceState::Deleting) {
+                    BranchHealth::DeletionInProgress
+                } else {
+                    BranchHealth::Ready
+                },
+                materialized: false,
+                created_at: identity.created_at,
+            });
         Self {
             name: meta.name,
             dimensions: meta.dimensions,
@@ -899,6 +922,7 @@ impl NamespaceResponse {
             updated_at: meta.updated_at.to_rfc3339(),
             state: meta.state.as_str().to_string(),
             full_text_search: meta.full_text_search,
+            branch,
         }
     }
 }
