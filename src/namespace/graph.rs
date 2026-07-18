@@ -261,6 +261,9 @@ impl NamespaceGraph {
                     namespace
                 ))
             })?;
+            let destruction_key = intent.destruction_record_key.clone();
+            Manifest::fence_for_destruction(&self.store, namespace.as_str(), &destruction_key)
+                .await?;
             let visibility = intent.visibility.as_ref().ok_or_else(|| {
                 ZeppelinError::Validation(format!(
                     "branch namespace {} has no persisted visibility deadline",
