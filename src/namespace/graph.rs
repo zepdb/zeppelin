@@ -115,6 +115,9 @@ impl NamespaceGraph {
     ) -> Result<NamespaceDeleteOutcome> {
         let name = request.namespace.as_str();
         let (metadata, _) = self.namespace_manager.read_metadata_versioned(name).await?;
+        if matches!(metadata.state, NamespaceState::Deleting) {
+            return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
+        }
         let (manifest, _) = Manifest::read_versioned_required(&self.store, name).await?;
         if !manifest.branch_roots().is_empty() {
             if let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind {
@@ -144,9 +147,6 @@ impl NamespaceGraph {
                 namespace: request.namespace.to_string(),
             }
             .into());
-        }
-        if matches!(metadata.state, NamespaceState::Deleting) {
-            return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
         }
         if let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind {
             let source_manifest = Manifest::read_versioned_required_for_incarnation(
