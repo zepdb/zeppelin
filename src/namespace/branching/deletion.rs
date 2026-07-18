@@ -100,6 +100,25 @@ pub(crate) struct AuthorizedNamespaceDelete {
     pub budget: Duration,
 }
 
+impl AuthorizedNamespaceDelete {
+    /// Construct an envelope after the security layer has completed
+    /// authorization and assembled its governance callbacks.
+    #[must_use]
+    pub(crate) fn new(
+        namespace: NamespaceId,
+        decision: DeletionDecision,
+        governance: Arc<dyn DeletionGovernance>,
+        budget: Duration,
+    ) -> Self {
+        Self {
+            namespace,
+            decision,
+            governance,
+            budget,
+        }
+    }
+}
+
 /// Stable lifecycle marker proving that a branch target's live visibility was
 /// removed. The body intentionally contains no process timestamp.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
