@@ -865,6 +865,7 @@ fn audited_action(action: Action) -> bool {
             | Action::SnapshotWrite
             | Action::SnapshotDelete
             | Action::NamespaceClone
+            | Action::NamespaceFork
             | Action::IndexConfigWrite
             | Action::CompactionTrigger
             | Action::HydrationTrigger
