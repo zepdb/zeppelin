@@ -171,6 +171,11 @@ pub struct PrepareForkRequest {
 pub struct NamespaceDeleteRequest {
     /// Namespace selected for graph-owned deletion.
     pub namespace: NamespaceId,
+    /// Opaque authorization/decision evidence reference supplied by the
+    /// security adapter; never a bearer credential.
+    pub decision_evidence_ref: Option<String>,
+    /// Exact parent root binding when deleting a branch target.
+    pub parent_root: Option<BranchRoot>,
 }
 
 /// Result of graph-owned deletion.
