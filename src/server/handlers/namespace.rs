@@ -201,7 +201,7 @@ pub struct ForkResponse {
     /// Public branch mode.
     pub mode: BranchMode,
     /// Redacted source identity.
-    pub source: BranchTargetIdentity,
+    pub source: ForkSourceIdentity,
     /// Redacted target identity.
     pub target: BranchTargetIdentity,
     /// Ancestry depth.
@@ -210,6 +210,17 @@ pub struct ForkResponse {
     pub materialized: bool,
     /// Reservation timestamp.
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Redacted source identity returned by fork creation.
+#[derive(Debug, Serialize)]
+pub struct ForkSourceIdentity {
+    /// Source namespace name.
+    pub namespace: String,
+    /// Source namespace incarnation.
+    pub incarnation: String,
+    /// Exact live-head generation selected by the fork.
+    pub generation: u64,
 }
 
 /// Create a live-head copy-on-write fork when branching is enabled.
@@ -303,9 +314,10 @@ pub async fn create_branch(
             branch_id: branch.identity.branch_id.to_string(),
             created,
             mode: BranchMode::CopyOnWrite,
-            source: BranchTargetIdentity {
+            source: ForkSourceIdentity {
                 namespace: branch.identity.source_namespace.to_string(),
                 incarnation: branch.identity.source_incarnation.to_string(),
+                generation: branch.identity.source_generation.get(),
             },
             target: BranchTargetIdentity {
                 namespace: branch.identity.target_namespace.to_string(),
