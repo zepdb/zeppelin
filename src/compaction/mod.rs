@@ -4497,6 +4497,7 @@ mod tests {
             updated_at: now,
             state: NamespaceState::Active,
             destruction_record_key: None,
+            deletion_intent: None,
             full_text_search: HashMap::new(),
             index_config: None,
             compaction_health: CompactionHealth::default(),
