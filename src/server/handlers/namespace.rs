@@ -227,6 +227,15 @@ pub async fn create_branch(
         &principal,
         &context,
         &audit,
+        Action::NamespaceRead,
+        source_id.as_str(),
+    )
+    .map_err(|error| ApiError(error.into()))?;
+    authorize_namespace_action(
+        &state,
+        &principal,
+        &context,
+        &audit,
         Action::NamespaceCreate,
         target_id.as_str(),
     )
