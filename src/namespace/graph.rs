@@ -261,6 +261,7 @@ impl NamespaceGraph {
                     namespace
                 ))
             })?;
+            let decision_evidence_ref = intent.decision_evidence_ref.clone();
             if matches!(
                 intent.root_release,
                 Some(RootReleaseState::Released { .. } | RootReleaseState::Converged { .. })
@@ -336,6 +337,7 @@ impl NamespaceGraph {
                     .settle_lifecycle_audit(DeletionLifecycleEvent::RootRelease {
                         namespace: namespace.clone(),
                         converged: false,
+                        decision_evidence_ref: decision_evidence_ref.clone(),
                     })
                     .await?;
             } else {
@@ -351,6 +353,7 @@ impl NamespaceGraph {
                     .settle_lifecycle_audit(DeletionLifecycleEvent::RootRelease {
                         namespace: namespace.clone(),
                         converged: true,
+                        decision_evidence_ref: decision_evidence_ref.clone(),
                     })
                     .await?;
             }
@@ -375,6 +378,11 @@ impl NamespaceGraph {
                 .settle_lifecycle_audit(DeletionLifecycleEvent::CleanupIncomplete {
                     namespace: namespace.clone(),
                     remaining: outcome.deleted.saturating_add(1),
+                    decision_evidence_ref: metadata
+                        .deletion_intent
+                        .as_ref()
+                        .map(|intent| intent.decision_evidence_ref.clone())
+                        .unwrap_or_default(),
                 })
                 .await?;
             Ok(NamespaceDeleteOutcome::AlreadyDeleting)

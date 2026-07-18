@@ -134,6 +134,8 @@ pub(crate) enum DeletionLifecycleEvent {
         namespace: NamespaceId,
         /// Whether the root was newly removed or already absent safely.
         converged: bool,
+        /// Opaque authorization linkage from the durable deletion intent.
+        decision_evidence_ref: String,
     },
     /// Cleanup could not yet finish and must be retried.
     CleanupIncomplete {
@@ -141,6 +143,8 @@ pub(crate) enum DeletionLifecycleEvent {
         namespace: NamespaceId,
         /// Approximate remaining object count, never a caller disclosure.
         remaining: usize,
+        /// Opaque authorization linkage from the durable deletion intent.
+        decision_evidence_ref: String,
     },
 }
 
@@ -359,6 +363,7 @@ mod tests {
             .settle_lifecycle_audit(DeletionLifecycleEvent::CleanupIncomplete {
                 namespace: target,
                 remaining: 1,
+                decision_evidence_ref: "test-decision".to_string(),
             })
             .await
             .unwrap();
