@@ -173,6 +173,16 @@ pub static ROUTE_ACTIONS: &[RouteAction] = &[
         class: RouteClass::Protected(Action::NamespaceClone),
     },
     RouteAction {
+        method: Method::GET,
+        path: "/v1/namespaces/:ns/branches",
+        class: RouteClass::Protected(Action::NamespaceRead),
+    },
+    RouteAction {
+        method: Method::POST,
+        path: "/v1/namespaces/:ns/branches",
+        class: RouteClass::Protected(Action::NamespaceClone),
+    },
+    RouteAction {
         method: Method::PATCH,
         path: "/v1/namespaces/:ns/index_config",
         class: RouteClass::Protected(Action::IndexConfigWrite),

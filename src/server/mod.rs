@@ -2687,7 +2687,19 @@ pub fn build_router(state: AppState) -> Router {
                 post(vectors::upsert_vectors).delete(vectors::delete_vectors),
                 &state,
             ),
-        )
+        );
+
+    if state.config.branching.enabled {
+        other_routes = other_routes.route(
+            "/v1/namespaces/:ns/branches",
+            secure_route(
+                get(namespace::list_branches).post(namespace::create_branch),
+                &state,
+            ),
+        );
+    }
+
+    other_routes = other_routes
         .layer(axum::middleware::from_fn(http_metrics))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -2752,15 +2764,6 @@ mod tests {
             },
         );
 
-        if state.config.branching.enabled {
-            other_routes = other_routes.route(
-                "/v1/namespaces/:ns/branches",
-                secure_route(
-                    get(namespace::list_branches).post(namespace::create_branch),
-                    &state,
-                ),
-            );
-        }
         buckets.insert(
             fresh_key.clone(),
             RateLimitBucket {
