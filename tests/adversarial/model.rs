@@ -484,7 +484,11 @@ impl Model {
                 ..
             } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
-                    panic!("maintenance acked for unknown namespace {ns}");
+                    // Background maintenance may finish after a successful
+                    // namespace delete removed the logical model. Its
+                    // acknowledgement is stale but harmless; do not turn
+                    // that asynchronous race into a false product failure.
+                    return;
                 };
                 model.compacted_live = model.live.clone();
                 model.wal_tombstones.clear();
