@@ -1855,6 +1855,48 @@ impl NamespaceManager {
         )))
     }
 
+    /// CAS-record the durable acknowledgement for an exact parent-root release.
+    pub(crate) async fn record_root_release(
+        &self,
+        name: &str,
+        release: RootReleaseState,
+    ) -> Result<()> {
+        for _attempt in 0..8 {
+            let (mut meta, etag) = self.read_metadata_versioned(name).await?;
+            let etag = etag.ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "namespace {name} metadata has no ETag for root-release CAS"
+                ))
+            })?;
+            let intent = meta.deletion_intent.as_mut().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "namespace {name} has no deletion intent for root release"
+                ))
+            })?;
+            if let Some(existing) = &intent.root_release {
+                if existing != &release {
+                    return Err(ZeppelinError::Validation(format!(
+                        "namespace {name} root-release state conflicts with durable intent"
+                    )));
+                }
+                return Ok(());
+            }
+            intent.root_release = Some(release.clone());
+            meta.updated_at = self.clock.now();
+            match self
+                .put_metadata_if_match(&NamespaceMetadata::s3_key(name), &meta, &etag, name)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(ZeppelinError::Storage(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ZeppelinError::Validation(format!(
+            "namespace {name} root-release metadata CAS exceeded retry budget"
+        )))
+    }
+
     /// CAS-publishes metadata while preserving its namespace incarnation ID.
     async fn put_metadata_if_match(
         &self,
