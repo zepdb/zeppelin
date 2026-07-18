@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
 use crate::error::Result;
 use crate::namespace::NamespaceId;
@@ -15,6 +17,7 @@ use crate::namespace::{BranchId, NamespaceIncarnationId};
 use crate::security::{
     DecisionId, PolicyVersion, PreservationGuard, PreservationHeadProof, PrincipalId,
 };
+use crate::storage::{CreateOnlyOutcome, ZeppelinStore};
 use serde::{Deserialize, Serialize};
 
 /// One authorization decision passed from the security adapter to the graph.
@@ -144,6 +147,61 @@ impl BranchVisibilityRemovalMarker {
             target_incarnation,
         }
     }
+}
+
+/// Persist or adopt the exact branch visibility marker and derive its grace
+/// deadline from the authoritative S3 object timestamp.
+pub(crate) async fn persist_branch_visibility_removal(
+    store: &ZeppelinStore,
+    target: &NamespaceId,
+    branch_id: BranchId,
+    incarnation: NamespaceIncarnationId,
+    grace_floor: Duration,
+) -> Result<super::super::manager::VisibilityRemoval> {
+    let marker = BranchVisibilityRemovalMarker::new(target.clone(), branch_id, incarnation.clone());
+    let key = BranchVisibilityRemovalMarker::key(target, branch_id, incarnation);
+    let body = serde_json::to_vec(&marker).map_err(|error| {
+        crate::error::ZeppelinError::Serialization(format!("visibility marker encode: {error}"))
+    })?;
+    match store
+        .put_create_outcome(&key, Bytes::from(body.clone()))
+        .await?
+    {
+        CreateOnlyOutcome::Created { .. } => {}
+        CreateOnlyOutcome::AlreadyExists => {
+            let existing = store.get(&key).await?;
+            if existing.as_ref() != body.as_slice() {
+                return Err(crate::error::ZeppelinError::Validation(format!(
+                    "branch visibility marker {key} has conflicting bytes"
+                )));
+            }
+        }
+    }
+    let observed_at = store.head(&key).await?.last_modified;
+    let rounded = observed_at
+        .checked_add_signed(ChronoDuration::seconds(1))
+        .ok_or_else(|| {
+            crate::error::ZeppelinError::Validation("marker timestamp overflow".to_string())
+        })?
+        .timestamp();
+    let floor = ChronoDuration::from_std(grace_floor).map_err(|_| {
+        crate::error::ZeppelinError::Validation(
+            "branch grace floor exceeds chrono range".to_string(),
+        )
+    })?;
+    let not_before = DateTime::<Utc>::from_timestamp(rounded, 0)
+        .ok_or_else(|| {
+            crate::error::ZeppelinError::Validation("invalid marker timestamp".to_string())
+        })?
+        .checked_add_signed(floor)
+        .ok_or_else(|| {
+            crate::error::ZeppelinError::Validation("branch grace deadline overflow".to_string())
+        })?;
+    Ok(super::super::manager::VisibilityRemoval {
+        marker_key: key,
+        observed_at,
+        not_before,
+    })
 }
 
 #[cfg(test)]
