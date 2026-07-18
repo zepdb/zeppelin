@@ -189,15 +189,32 @@ impl NamespaceGraph {
             Manifest::read_versioned_required(&self.store, request.source.as_str()).await?;
         let mut children = Vec::with_capacity(manifest.branch_roots().len());
         for root in manifest.branch_roots().values() {
-            let state = self
+            let metadata = self
                 .namespace_manager
                 .read_metadata_versioned(root.target_namespace.as_str())
-                .await
-                .map(|(metadata, _)| match metadata.state {
-                    NamespaceState::Creating => "creating",
-                    NamespaceState::Active => "active",
-                    NamespaceState::Deleting => "deleting",
-                })?;
+                .await?
+                .0;
+            let identity =
+                metadata
+                    .branch_identity
+                    .as_ref()
+                    .ok_or(BranchError::BranchRootMismatch {
+                        branch_id: root.branch_id,
+                    })?;
+            if identity.branch_id != root.branch_id
+                || identity.target_namespace != root.target_namespace
+                || identity.target_incarnation != root.target_incarnation
+            {
+                return Err(BranchError::BranchRootMismatch {
+                    branch_id: root.branch_id,
+                }
+                .into());
+            }
+            let state = match metadata.state {
+                NamespaceState::Creating => "creating",
+                NamespaceState::Active => "active",
+                NamespaceState::Deleting => "deleting",
+            };
             children.push(BranchDescriptor {
                 target: root.target_namespace.clone(),
                 branch_id: root.branch_id,
