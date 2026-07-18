@@ -2028,6 +2028,7 @@ mod fork_response_tests {
         };
         let value = serde_json::to_value(response).unwrap();
         assert_eq!(value["source"]["generation"], 42);
+        assert_eq!(value["target"]["generation"], 1);
         assert_eq!(value["mode"], "copy_on_write");
         assert_eq!(value["materialized"], false);
         assert!(value.get("source_manifest_sha256").is_none());
