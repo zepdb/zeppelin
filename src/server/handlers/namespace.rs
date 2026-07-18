@@ -206,6 +206,7 @@ pub struct ForkResponse {
 #[instrument(skip(state), fields(source = %source))]
 pub async fn create_branch(
     State(state): State<AppState>,
+    Extension(decision): Extension<AllowDecision>,
     Path(source): Path<String>,
     Json(request): Json<ForkRequest>,
 ) -> Result<(StatusCode, Json<ForkResponse>), ApiError> {
@@ -216,6 +217,12 @@ pub async fn create_branch(
             },
         ))));
     }
+    let source_id = NamespaceId::new(source).map_err(|e| ApiError(e.into()))?;
+    let target_id = NamespaceId::new(request.target).map_err(|e| ApiError(e.into()))?;
+    state
+        .security
+        .validate_namespace_copy_no_widening(decision.policy_version, &source_id, &target_id)
+        .map_err(|error| ApiError(error.into()))?;
     let graph = NamespaceGraph::new(
         state.store.clone(),
         state.namespace_manager.clone(),
@@ -227,8 +234,8 @@ pub async fn create_branch(
     );
     let outcome = graph
         .prepare_fork(PrepareForkRequest {
-            source: NamespaceId::new(source).map_err(|e| ApiError(e.into()))?,
-            target: NamespaceId::new(request.target).map_err(|e| ApiError(e.into()))?,
+            source: source_id,
+            target: target_id,
         })
         .await
         .map_err(ApiError::from)?;
