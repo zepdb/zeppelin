@@ -20,7 +20,13 @@ use common::server::{
     start_test_server_on_store_with_config, start_test_server_with_config, FullTestServer,
 };
 use serde_json::{json, Value};
-use zeppelin::config::Config;
+use zeppelin::cache::hydration::{
+    HydrationConfig, HydrationTarget, SegmentHydrator, SessionWindowPolicy,
+};
+use zeppelin::cache::DiskCache;
+use zeppelin::compaction::Compactor;
+use zeppelin::config::{BranchingConfig, CompactionConfig, Config, IndexingConfig};
+use zeppelin::index::quantization::QuantizationType;
 use zeppelin::namespace::branching::test_support::{
     activate_fork_for_test, branch_control_snapshot, delete_namespace_for_test,
     insert_prepared_branch_root, maintain_branches_with_config_and_clock_for_test,
@@ -36,9 +42,9 @@ use zeppelin::namespace::manager::{
 use zeppelin::namespace::{NamespaceId, NamespaceManager};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::{Clock, TimeSource};
-use zeppelin::types::DistanceMetric;
+use zeppelin::types::{DistanceMetric, VectorEntry};
 use zeppelin::wal::fragment::WalFragment;
-use zeppelin::wal::Manifest;
+use zeppelin::wal::{Manifest, WalReader, WalWriter};
 
 #[derive(Debug)]
 struct AdjustableWallClock(Mutex<DateTime<Utc>>);
@@ -307,6 +313,187 @@ async fn assert_parent_delete_is_blocked(client: &reqwest::Client, base_url: &st
         .await
         .expect("parent delete conflict must use the JSON envelope");
     assert_eq!(body["code"], "namespace_has_live_branches");
+}
+
+#[tokio::test]
+async fn queued_branch_hydration_stops_at_deletion_fence_and_delete_resumes() {
+    assert_eq!(std::env::var("TEST_BACKEND").as_deref(), Ok("minio"));
+    zeppelin::metrics::init();
+
+    let harness = common::harness::TestHarness::new().await;
+    let source = harness.artifact_origin_namespace("hydration-delete-source");
+    let target = harness.artifact_origin_namespace("hydration-delete-target");
+    let indexing = IndexingConfig {
+        default_num_centroids: 1,
+        kmeans_max_iterations: 5,
+        quantization: QuantizationType::None,
+        bitmap_index: false,
+        ..IndexingConfig::default()
+    };
+    let branching = BranchingConfig {
+        enabled: true,
+        ..BranchingConfig::default()
+    };
+    NamespaceManager::new(harness.store.clone())
+        .create(&source, 4, DistanceMetric::Euclidean)
+        .await
+        .expect("hydration source namespace must be created");
+    WalWriter::new(harness.store.clone())
+        .append(
+            &source,
+            (0..32)
+                .map(|index| VectorEntry {
+                    id: format!("source-{index:02}"),
+                    values: vec![index as f32, 0.0, 0.0, 0.0],
+                    attributes: None,
+                })
+                .collect(),
+            vec![],
+        )
+        .await
+        .expect("hydration source WAL must be published");
+    Compactor::new(
+        harness.store.clone(),
+        WalReader::new(harness.store.clone()),
+        CompactionConfig {
+            max_wal_fragments_before_compact: 1,
+            ..CompactionConfig::default()
+        },
+        indexing.clone(),
+        common::default_gc_upload_window(),
+    )
+    .compact(&source)
+    .await
+    .expect("hydration source must compact into immutable segment artifacts");
+    activate_fork_for_test(
+        harness.store.clone(),
+        NamespaceId::new(source.clone()).expect("source namespace must be valid"),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        indexing.clone(),
+        branching.clone(),
+    )
+    .await
+    .expect("foreign-backed target branch must activate");
+    let target_manifest = Manifest::read(&harness.store, &target)
+        .await
+        .expect("target manifest read must succeed")
+        .expect("active target manifest must exist");
+    let hydration_target = HydrationTarget::from_active_manifest(&target_manifest)
+        .expect("target manifest origin table must be valid")
+        .expect("compacted target must expose one hydration target");
+    assert_eq!(hydration_target.logical_namespace(), target);
+    assert_eq!(hydration_target.physical_namespace(), source);
+    let first_cluster = hydration_target
+        .segment()
+        .cluster_objects
+        .first()
+        .expect("full compaction must publish a grouped cluster object")
+        .key
+        .clone();
+    let physical_source_prefix = format!("{source}/segments/");
+    assert!(
+        first_cluster.starts_with(&physical_source_prefix),
+        "the operation-recorder filter must cover the selected physical source artifact"
+    );
+
+    let (counted_store, operations) = counting_store(&harness.store);
+    let (paused_store, authority_read) =
+        pause_next_get_matching(&counted_store, Manifest::s3_key(&target));
+    let (crash_store, evidence_lost_reply) =
+        fail_after_put_once_matching(&paused_store, "_audit/destruction/");
+    authority_read.arm();
+    let cache_dir = tempfile::tempdir().expect("hydration cache directory must be created");
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().join("hydration"), 64 * 1024 * 1024)
+            .expect("hydration cache must be created"),
+    );
+    let hydrator = SegmentHydrator::start(
+        crash_store.clone(),
+        Arc::clone(&cache),
+        Arc::new(
+            SessionWindowPolicy::new(1, Duration::from_secs(60))
+                .expect("test heat policy must be valid"),
+        ),
+        HydrationConfig {
+            parallelism: 2,
+            max_segment_fraction: 1.0,
+            max_retries: 0,
+            retry_backoff: Duration::from_millis(1),
+            job_timeout: Duration::from_secs(30),
+        },
+    );
+    let hydration = {
+        let hydrator = Arc::clone(&hydrator);
+        let target = hydration_target.clone();
+        tokio::spawn(async move { hydrator.request_hydration_and_wait_for_test(&target).await })
+    };
+
+    tokio::time::timeout(Duration::from_secs(15), authority_read.wait_until_paused())
+        .await
+        .expect("queued hydration must reach its authoritative manifest barrier");
+    delete_namespace_for_test(
+        crash_store.clone(),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        indexing.clone(),
+        branching.clone(),
+    )
+    .await
+    .expect_err("lost destruction-evidence reply must interrupt deletion after fencing");
+    assert_eq!(evidence_lost_reply.failures_injected(), 1);
+    assert!(
+        branch_control_snapshot(&harness.store, &target)
+            .await
+            .expect("fenced target manifest must remain authoritative")
+            .deletion_fenced,
+        "the deletion crash must leave the exact target manifest fenced"
+    );
+
+    authority_read.release();
+    tokio::time::timeout(Duration::from_secs(15), hydration)
+        .await
+        .expect("fenced hydration must terminate")
+        .expect("hydration task must join")
+        .expect("deterministic hydration enqueue must remain connected");
+    assert_eq!(
+        operations.gets_matching(&physical_source_prefix),
+        0,
+        "a queued target hydration must reject the fence before any physical source GET"
+    );
+    assert_eq!(
+        operations.heads_matching(&physical_source_prefix),
+        0,
+        "a queued target hydration must reject the fence before physical planning"
+    );
+    assert_eq!(
+        cache.get(&hydration_target.cache_key(&first_cluster)).await,
+        None,
+        "a fenced hydration must not populate the physical source artifact cache"
+    );
+
+    let resumed = delete_namespace_for_test(
+        crash_store,
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        indexing,
+        branching,
+    )
+    .await
+    .expect("retry must resume the durable fenced deletion intent");
+    assert!(matches!(
+        resumed,
+        NamespaceDeleteOutcome::BranchGraceWait { .. }
+    ));
+    let deleting = read_namespace_metadata(&harness.store, &target).await;
+    assert_eq!(deleting.state, NamespaceState::Deleting);
+    assert!(
+        deleting
+            .deletion_intent
+            .as_ref()
+            .and_then(|intent| intent.visibility.as_ref())
+            .is_some(),
+        "resumed deletion must durably remove target visibility and retain its grace boundary"
+    );
+
+    harness.cleanup().await;
 }
 
 #[tokio::test]
