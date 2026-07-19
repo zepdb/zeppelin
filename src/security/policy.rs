@@ -11,8 +11,8 @@ use crate::config::{ApiKeyConfig, SecurityConfig};
 use crate::namespace::BranchId;
 
 use super::{
-    Action, AllowDecision, DenyReason, FieldMask, NamespaceId, PolicyVersion, Principal,
-    PendingBranchActivation, PolicyControlRevision, PolicyHeadDigest, PolicyLeaseFencingToken,
+    Action, AllowDecision, DenyReason, FieldMask, NamespaceId, PendingBranchActivation,
+    PolicyControlRevision, PolicyHeadDigest, PolicyLeaseFencingToken, PolicyVersion, Principal,
     PrincipalId, PrincipalKind, Resource, SecurityError, WriteConstraints,
 };
 
@@ -983,19 +983,26 @@ impl PolicyHead {
                 "policy head has too many pending branch activations".to_string(),
             ));
         }
-        if !self.pending_branch_activations.is_empty()
-            && self.publication_fencing_token.is_none()
+        if (self.control_revision == PolicyControlRevision::INITIAL)
+            != self.publication_fencing_token.is_none()
         {
             return Err(SecurityError::InvalidPolicy(
-                "guarded policy head has no publication fencing token".to_string(),
+                "policy head control revision and publication fence disagree".to_string(),
             ));
         }
         let semantic_digest = self.semantic_digest()?;
+        let mut target_identities = BTreeSet::new();
+        let mut activation_nonces = BTreeSet::new();
         for (branch_id, guard) in &self.pending_branch_activations {
             guard.validate()?;
             if *branch_id != guard.branch_id()
                 || guard.policy_version() != self.version
                 || guard.policy_head_digest() != semantic_digest
+                || !target_identities.insert((
+                    guard.target_namespace().clone(),
+                    guard.target_incarnation().clone(),
+                ))
+                || !activation_nonces.insert(guard.activation_nonce())
             {
                 return Err(SecurityError::InvalidPolicy(
                     "pending branch activation disagrees with policy head".to_string(),
@@ -1013,9 +1020,7 @@ impl PolicyHead {
             checksum: &self.checksum,
         })
         .map_err(|error| {
-            SecurityError::InvalidPolicy(format!(
-                "semantic policy head encoding failed: {error}"
-            ))
+            SecurityError::InvalidPolicy(format!("semantic policy head encoding failed: {error}"))
         })?;
         Ok(PolicyHeadDigest::new(Sha256::digest(canonical).into()))
     }
@@ -1037,8 +1042,10 @@ impl PolicyHead {
         object_key: String,
         fencing_token: PolicyLeaseFencingToken,
     ) -> Result<Self, SecurityError> {
+        let expected_version = self.version.get().checked_add(1);
         if self.publication_fencing_token != Some(fencing_token)
             || !self.pending_branch_activations.is_empty()
+            || expected_version != Some(snapshot.version.get())
         {
             return Err(SecurityError::PolicyConflict);
         }
@@ -1086,10 +1093,7 @@ impl PolicyHead {
         fencing_token: PolicyLeaseFencingToken,
     ) -> Result<Self, SecurityError> {
         if self.publication_fencing_token != Some(fencing_token)
-            || self
-                .pending_branch_activations
-                .get(&expected.branch_id())
-                != Some(expected)
+            || self.pending_branch_activations.get(&expected.branch_id()) != Some(expected)
         {
             return Err(SecurityError::PolicyConflict);
         }
@@ -1134,9 +1138,7 @@ impl PolicyHead {
 
     /// Borrow the bounded crash-recovery activation guards.
     #[must_use]
-    pub fn pending_branch_activations(
-        &self,
-    ) -> &BTreeMap<BranchId, PendingBranchActivation> {
+    pub fn pending_branch_activations(&self) -> &BTreeMap<BranchId, PendingBranchActivation> {
         &self.pending_branch_activations
     }
 }
@@ -2199,11 +2201,14 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use serde_json::json;
 
-    use super::{grant_order, CompiledPolicy, PolicyGrant, PolicySnapshot};
+    use super::{grant_order, CompiledPolicy, PolicyGrant, PolicyHead, PolicySnapshot};
     use crate::{
         config::Config,
+        namespace::branching::ActivationNonce,
+        namespace::{BranchId, NamespaceIncarnationId},
         security::{
-            Action, DenyReason, FieldMask, GrantActions, GrantScope, NamespaceId, PrincipalId,
+            Action, DenyReason, FieldMask, GrantActions, GrantScope, NamespaceId,
+            PendingBranchActivation, PolicyControlRevision, PolicyLeaseFencingToken, PrincipalId,
             PrincipalKind, Resource, SecurityError, WriteConstraints,
         },
         types::{AttributeValue, Filter},
@@ -2272,6 +2277,98 @@ namespaces = ["*"]
 
     fn grant(value: serde_json::Value) -> PolicyGrant {
         fixture(serde_json::from_value(value), "grant fixture must decode")
+    }
+
+    #[test]
+    fn legacy_policy_head_defaults_control_state_without_changing_semantic_digest() {
+        let snapshot = snapshot_with_grants(Vec::new());
+        let object_key = format!("_security/policies/{}.json", ulid::Ulid::new());
+        let head = fixture(
+            PolicyHead::new(&snapshot, object_key),
+            "policy head must validate",
+        );
+        let expected_digest = fixture(head.semantic_digest(), "semantic digest must compute");
+        let mut legacy = fixture(
+            serde_json::to_value(&head),
+            "policy head must encode for legacy fixture",
+        );
+        let object = fixture_option(legacy.as_object_mut(), "policy head must encode as object");
+        object.remove("control_revision");
+        object.remove("publication_fencing_token");
+        object.remove("pending_branch_activations");
+
+        let decoded: PolicyHead = fixture(
+            serde_json::from_value(legacy),
+            "legacy policy head must remain readable",
+        );
+        fixture(decoded.validate("_security"), "legacy head must validate");
+        assert_eq!(decoded.control_revision(), PolicyControlRevision::INITIAL);
+        assert_eq!(decoded.publication_fencing_token(), None);
+        assert!(decoded.pending_branch_activations().is_empty());
+        assert_eq!(
+            fixture(decoded.semantic_digest(), "legacy digest must compute"),
+            expected_digest
+        );
+    }
+
+    #[test]
+    fn activation_guard_changes_only_control_identity_and_is_digest_covered() {
+        let snapshot = snapshot_with_grants(Vec::new());
+        let head = fixture(
+            PolicyHead::new(
+                &snapshot,
+                format!("_security/policies/{}.json", ulid::Ulid::new()),
+            ),
+            "policy head must validate",
+        );
+        let token = fixture(
+            PolicyLeaseFencingToken::new(7),
+            "fencing token must validate",
+        );
+        let claimed = fixture(head.claim_publication(token), "head claim must validate");
+        let semantic_digest = fixture(
+            claimed.semantic_digest(),
+            "claimed semantic digest must compute",
+        );
+        let created_at = fixture_option(
+            Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).single(),
+            "guard time must exist",
+        );
+        let branch_id = BranchId::new();
+        let guard = fixture(
+            PendingBranchActivation::new(
+                branch_id,
+                fixture(NamespaceId::new("target"), "target namespace must validate"),
+                NamespaceIncarnationId::from_uuid(uuid::Uuid::new_v4()),
+                ActivationNonce::new(),
+                claimed.version(),
+                semantic_digest,
+                token,
+                created_at,
+                created_at + chrono::Duration::minutes(5),
+            ),
+            "pending activation must validate",
+        );
+        let guarded = fixture(
+            claimed.insert_pending_branch_activation(guard.clone(), token),
+            "guard insertion must validate",
+        );
+
+        assert_eq!(guarded.version(), claimed.version());
+        assert_eq!(guarded.checksum(), claimed.checksum());
+        assert_eq!(
+            fixture(guarded.semantic_digest(), "guarded digest must compute"),
+            semantic_digest
+        );
+        assert_eq!(
+            guarded.control_revision().get(),
+            claimed.control_revision().get() + 1
+        );
+        assert_eq!(
+            guarded.pending_branch_activations().get(&branch_id),
+            Some(&guard)
+        );
+        fixture(guarded.validate("_security"), "guarded head must validate");
     }
 
     #[test]

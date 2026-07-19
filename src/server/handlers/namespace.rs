@@ -152,19 +152,19 @@ use crate::namespace::branching::http::{
     BranchDescriptorResponse, BranchHealth, BranchLifecycle, BranchListResponse, BranchMode,
     BranchStatusDescriptor, BranchTargetIdentity,
 };
-use crate::namespace::branching::{
-    BranchError, BranchLifecycleState, PrepareForkOutcome, PrepareForkRequest,
-};
-use crate::namespace::graph::NamespaceGraph;
+use crate::namespace::branching::{BranchError, BranchLifecycleState};
 use crate::namespace::manager::{
     CreateNamespaceOutcome, NamespaceIndexConfig, NamespaceMetadata, NamespaceState,
     COMPACTION_DEGRADED_FAILURE_THRESHOLD,
 };
 use crate::security::{
     Action, AllowDecision, AuditParams, Feature, IndexConfigValues, NamespaceDeleteAdmission,
-    NamespaceId, PreservationBlockedSurface, Principal, RequestContext, SecurityError,
+    NamespaceForkAdmission, NamespaceId, PreservationBlockedSurface, Principal, RequestContext,
+    SecurityError,
 };
-use crate::server::{authorize_namespace_action, namespace_graph, AppState, AuditRequest};
+use crate::server::{
+    authorize_namespace_action, namespace_graph, AppState, AuditRequest, RateLimitIdentity,
+};
 use crate::types::{DistanceMetric, IndexType};
 use crate::wal::manifest::{NamedSnapshot, NamedSnapshotRef, SegmentRef};
 use crate::wal::{FragmentCachePolicy, Manifest};
@@ -236,13 +236,14 @@ pub struct ForkTargetIdentity {
 }
 
 /// Create a live-head copy-on-write fork when branching is enabled.
-#[instrument(skip(state, decision, principal, context, audit), fields(source = %source))]
+#[instrument(skip(state, decision, principal, context, audit, rate_identity), fields(source = %source))]
 pub async fn create_branch(
     State(state): State<AppState>,
     Extension(decision): Extension<AllowDecision>,
     Extension(principal): Extension<Principal>,
     Extension(context): Extension<RequestContext>,
     Extension(audit): Extension<AuditRequest>,
+    Extension(rate_identity): Extension<RateLimitIdentity>,
     Path(source): Path<String>,
     Json(request): Json<ForkRequest>,
 ) -> Result<(StatusCode, Json<ForkResponse>), ApiError> {
@@ -260,16 +261,7 @@ pub async fn create_branch(
     }
     let source_id = NamespaceId::new(source).map_err(|e| ApiError(e.into()))?;
     let target_id = NamespaceId::new(request.target).map_err(|e| ApiError(e.into()))?;
-    authorize_namespace_action(
-        &state,
-        &principal,
-        &context,
-        &audit,
-        Action::NamespaceFork,
-        source_id.as_str(),
-    )
-    .map_err(|error| ApiError(error.into()))?;
-    authorize_namespace_action(
+    let source_read_decision = authorize_namespace_action(
         &state,
         &principal,
         &context,
@@ -278,7 +270,7 @@ pub async fn create_branch(
         source_id.as_str(),
     )
     .map_err(|error| ApiError(error.into()))?;
-    authorize_namespace_action(
+    let target_create_decision = authorize_namespace_action(
         &state,
         &principal,
         &context,
@@ -287,6 +279,11 @@ pub async fn create_branch(
         target_id.as_str(),
     )
     .map_err(|error| ApiError(error.into()))?;
+    require_unconstrained_clone_control(
+        &decision,
+        &source_read_decision,
+        &target_create_decision,
+    )?;
     audit.set_params(AuditParams::NamespaceFork {
         source: source_id.clone(),
         target: target_id.clone(),
@@ -295,27 +292,28 @@ pub async fn create_branch(
         .security
         .validate_namespace_copy_no_widening(decision.policy_version, &source_id, &target_id)
         .map_err(|error: SecurityError| ApiError(error.into()))?;
-    let graph = NamespaceGraph::new(
-        state.store.clone(),
-        state.namespace_manager.clone(),
-        state.lease_manager.clone(),
-        state.clock,
-        state.manifest_cache.clone(),
-        state.config.branching.clone(),
-        state.config.indexing.clone(),
-        state.config.gc_horizon_floor_secs(),
-    );
-    let outcome = graph
-        .prepare_fork(PrepareForkRequest {
+    let authorized = state
+        .security
+        .authorize_namespace_fork(NamespaceForkAdmission {
             source: source_id,
             target: target_id,
+            principal,
+            approver: audit.approval_principal(),
+            context,
+            fork_decision: decision,
+            source_read_decision,
+            target_create_decision,
+            audit: state.audit.clone(),
+            source_ip: rate_identity.ip,
+            clock: state.clock.clone(),
         })
-        .await
         .map_err(|error| ApiError(error.into()))?;
-    let (branch, created) = match outcome {
-        PrepareForkOutcome::Prepared(branch) => (branch, true),
-        PrepareForkOutcome::ExistingPrepared(branch) => (branch, false),
-    };
+    let outcome = namespace_graph(&state)
+        .fork(authorized)
+        .await
+        .map_err(ApiError::from)?;
+    let created = outcome.created();
+    let branch = outcome.branch();
     let status = if created {
         StatusCode::CREATED
     } else {

@@ -49,7 +49,7 @@ pub use decision::{
 };
 pub use delegation::{DelegationContext, DelegationNarrowing, IssuedDelegatedToken};
 pub use entitlements::{CustomerId, EntitlementLimits, EntitlementSource, Entitlements, Feature};
-pub(crate) use kernel::NamespaceDeleteAdmission;
+pub(crate) use kernel::{NamespaceDeleteAdmission, NamespaceForkAdmission};
 pub use kernel::SecurityKernel;
 #[cfg(feature = "managed")]
 pub use license::ControlPlaneResolver;
@@ -64,10 +64,10 @@ pub use policy::{
     KeyState, PolicyGrant, PolicyHead, PolicyKey, PolicyPrincipal, PolicySnapshot,
 };
 pub use policy_publication::{
-    PendingBranchActivation, PolicyActivationGuardPermit, PolicyControlRevision,
-    PolicyHeadDigest, PolicyLeaseFencingToken, PolicyPublicationLease,
-    PolicyPublicationLeaseClaim, MAX_PENDING_BRANCH_ACTIVATIONS,
-    MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS, POLICY_PUBLICATION_LEASE_KEY,
+    PendingBranchActivation, PolicyActivationGuardPermit, PolicyControlRevision, PolicyHeadDigest,
+    PolicyLeaseFencingToken, PolicyPublicationLease, PolicyPublicationLeaseClaim,
+    MAX_PENDING_BRANCH_ACTIVATIONS, MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS,
+    POLICY_PUBLICATION_LEASE_KEY,
 };
 pub use policy_store::{LoadedPolicy, PolicyStore};
 pub use preservation::{

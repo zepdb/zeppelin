@@ -1,5 +1,6 @@
 //! Disposable compiled-policy cache with bounded S3 revalidation.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -14,11 +15,13 @@ use super::policy::CompiledPolicy;
 use super::policy_store::{PolicyPublication, PolicyRefresh};
 use super::{
     Action, ApiKeyId, GrantActions, GrantDefinition, GrantScope, IssuedApiKey, LoadedPolicy,
-    PolicyGrant, PolicyHead, PolicyKey, PolicyPrincipal, PolicySnapshot, PolicyStore,
-    PolicyVersion, Principal, PrincipalId, PrincipalKind, Resource, SecurityError,
-    SecurityOperationError, SecurityOperationResult,
+    PendingBranchActivation, PolicyActivationGuardPermit, PolicyGrant, PolicyHead, PolicyKey,
+    PolicyPrincipal, PolicySnapshot, PolicyStore, PolicyVersion, Principal, PrincipalId,
+    PrincipalKind, Resource, SecurityError, SecurityOperationError, SecurityOperationResult,
 };
 use crate::error::Result;
+use crate::namespace::branching::ActivationNonce;
+use crate::namespace::{BranchId, NamespaceIncarnationId};
 use crate::time::Clock;
 
 const POLICY_CAS_ATTEMPTS: usize = 5;
@@ -349,6 +352,131 @@ impl PolicyCache {
         })
     }
 
+    /// Acquire and claim the global publication lease, run fresh caller
+    /// validation against that exact authoritative head/snapshot, then install
+    /// a pending activation guard while retaining the same lease claim.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn begin_branch_activation<T, F, Fut>(
+        &self,
+        branch_id: BranchId,
+        target_namespace: super::NamespaceId,
+        target_incarnation: NamespaceIncarnationId,
+        activation_nonce: ActivationNonce,
+        expires_at: DateTime<Utc>,
+        validate: F,
+    ) -> SecurityOperationResult<(super::AllowDecision, T, PolicyActivationGuardPermit)>
+    where
+        F: FnOnce(LoadedPolicy) -> Fut,
+        Fut: Future<Output = SecurityOperationResult<(super::AllowDecision, T)>>,
+    {
+        let session = self.store.acquire_claimed_publication().await?;
+        let observation = session.loaded().clone();
+        let (authorization, validated) = match validate(observation.clone()).await {
+            Ok(validated) => validated,
+            Err(error) => {
+                self.store.release_claimed_publication(session).await;
+                return Err(error);
+            }
+        };
+        let created_at = self.clock.now();
+        let guard_result = (|| {
+            let fencing_token =
+                observation
+                    .head()
+                    .publication_fencing_token()
+                    .ok_or_else(|| {
+                        SecurityError::InvalidPolicy(
+                            "claimed policy head has no publication fencing token".to_string(),
+                        )
+                    })?;
+            PendingBranchActivation::new(
+                branch_id,
+                target_namespace,
+                target_incarnation,
+                activation_nonce,
+                observation.head().version(),
+                observation.head().semantic_digest()?,
+                fencing_token,
+                created_at,
+                expires_at,
+            )
+        })();
+        let guard = match guard_result {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.store.release_claimed_publication(session).await;
+                return Err(SecurityOperationError::after_allow(
+                    error.into(),
+                    authorization,
+                ));
+            }
+        };
+        let (loaded, permit) = self
+            .store
+            .insert_pending_branch_activation(session, guard)
+            .await
+            .map_err(|error| SecurityOperationError::after_allow(error, authorization.clone()))?;
+        if let Err(error) = self.install(loaded) {
+            self.store.release_branch_activation_permit(permit).await;
+            return Err(SecurityOperationError::after_allow(error, authorization));
+        }
+        Ok((authorization, validated, permit))
+    }
+
+    /// Renew and strongly re-read the exact guard immediately before target
+    /// activation. Expired guards fail closed and require nonce recovery.
+    pub(crate) async fn renew_branch_activation_guard(
+        &self,
+        permit: &mut PolicyActivationGuardPermit,
+    ) -> Result<()> {
+        if permit.guard().expires_at() <= self.clock.now() {
+            return Err(SecurityError::PolicyConflict.into());
+        }
+        let loaded = self.store.renew_branch_activation_guard(permit).await?;
+        self.install(loaded)
+    }
+
+    /// Take over and retain one exact persisted guard for target nonce
+    /// inspection during crash recovery or prepared cancellation.
+    pub(crate) async fn retain_pending_branch_activation(
+        &self,
+        branch_id: BranchId,
+        activation_nonce: ActivationNonce,
+    ) -> Result<Option<PolicyActivationGuardPermit>> {
+        let session = self.store.acquire_claimed_publication().await?;
+        let retained = self
+            .store
+            .retain_pending_branch_activation(session, branch_id, activation_nonce)
+            .await?;
+        let Some((loaded, permit)) = retained else {
+            return Ok(None);
+        };
+        if let Err(error) = self.install(loaded) {
+            self.store.release_branch_activation_permit(permit).await;
+            return Err(error);
+        }
+        Ok(Some(permit))
+    }
+
+    /// Finalize a committed target activation and remove only its exact guard.
+    pub(crate) async fn finalize_branch_activation(
+        &self,
+        permit: PolicyActivationGuardPermit,
+    ) -> Result<()> {
+        let loaded = self.store.finalize_branch_activation(permit).await?;
+        self.install(loaded)
+    }
+
+    /// Abort after the exact target nonce was durably revoked, then remove only
+    /// the matching policy guard.
+    pub(crate) async fn abort_branch_activation(
+        &self,
+        permit: PolicyActivationGuardPermit,
+    ) -> Result<()> {
+        let loaded = self.store.abort_branch_activation(permit).await?;
+        self.install(loaded)
+    }
+
     async fn publish_mutation<F>(
         &self,
         actor: &Principal,
@@ -377,7 +505,16 @@ impl PolicyCache {
                 .map_err(|error| {
                     SecurityOperationError::after_allow(error, authorization.clone())
                 })? {
-                PolicyPublication::Conflict => continue,
+                PolicyPublication::Conflict => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+                PolicyPublication::Guarded => {
+                    return Err(SecurityOperationError::after_allow(
+                        SecurityError::PolicyConflict.into(),
+                        authorization,
+                    ));
+                }
                 PolicyPublication::Published(loaded) => {
                     let current = loaded.snapshot().version();
                     self.install(*loaded).map_err(|error| {
@@ -413,6 +550,12 @@ impl PolicyCache {
         let mut current = current_slot
             .write()
             .unwrap_or_else(|_| panic!("security policy cache lock poisoned"));
+        if loaded.head().control_revision() < current.head.control_revision() {
+            return Err(SecurityError::InvalidPolicy(
+                "authoritative policy control revision regressed".to_string(),
+            )
+            .into());
+        }
         match next_version.cmp(&current.policy.version()) {
             std::cmp::Ordering::Less => {
                 return Err(SecurityError::InvalidPolicy(format!(
@@ -446,6 +589,12 @@ impl PolicyCache {
         let mut current = current_slot
             .write()
             .unwrap_or_else(|_| panic!("security policy cache lock poisoned"));
+        if loaded.head().control_revision() < current.head.control_revision() {
+            return Err(SecurityError::InvalidPolicy(
+                "authoritative policy control revision regressed".to_string(),
+            )
+            .into());
+        }
         match next_policy.version().cmp(&current.policy.version()) {
             std::cmp::Ordering::Less => return Ok(()),
             std::cmp::Ordering::Equal => {
@@ -455,7 +604,6 @@ impl PolicyCache {
                     )
                     .into());
                 }
-                return Ok(());
             }
             std::cmp::Ordering::Greater => {}
         }
@@ -568,6 +716,47 @@ mod tests {
             expires_at: None,
         }];
         config
+    }
+
+    #[test]
+    fn same_version_control_head_update_replaces_cached_etag_without_semantic_change() {
+        let now = Utc::now();
+        let initial = PolicySnapshot::from_bootstrap(&bootstrap_config(), now, false)
+            .expect("unit policy must compile");
+        let initial_head =
+            PolicyHead::new(&initial, format!("_security/policies/{}.json", Ulid::new()))
+                .expect("initial policy head must be valid");
+        let current = RwLock::new(Arc::new(CachedPolicy {
+            policy: Arc::new(initial.compile().expect("initial policy must compile")),
+            snapshot: Arc::new(initial.clone()),
+            head: initial_head.clone(),
+            head_etag: "initial-etag".to_string(),
+            last_confirmed: Instant::now(),
+        }));
+        let claimed = initial_head
+            .claim_publication(
+                crate::security::PolicyLeaseFencingToken::new(1)
+                    .expect("fencing token must validate"),
+            )
+            .expect("control claim must validate");
+
+        PolicyCache::install_into(
+            &current,
+            LoadedPolicy::from_publication(
+                claimed,
+                initial,
+                "claimed-etag".to_string(),
+                Instant::now(),
+            ),
+        )
+        .expect("same-version control update must install");
+
+        let installed = current
+            .read()
+            .unwrap_or_else(|_| panic!("test policy cache lock poisoned"));
+        assert_eq!(installed.policy.version().get(), 1);
+        assert_eq!(installed.head.control_revision().get(), 1);
+        assert_eq!(installed.head_etag, "claimed-etag");
     }
 
     #[test]

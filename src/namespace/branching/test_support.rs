@@ -41,10 +41,11 @@ use super::deletion::{
     DeletionBoundary, DeletionDecision, DeletionGovernance, DeletionLifecycleAudit,
 };
 use super::{
-    ArtifactOrigin, ArtifactOriginIndex, BranchDescriptor, BranchId, BranchLineage,
-    BranchMaintenanceReport, BranchPrepareStage, BranchRoot, ForkIdentity, ForkReservationIdentity,
-    ForkViewDigest, ManifestGeneration, NamespaceCreationKind, NamespaceDeleteOutcome,
-    PrepareForkOutcome, PrepareForkRequest,
+    ActivationNonce, ArtifactOrigin, ArtifactOriginIndex, BranchActivationEvidence,
+    BranchDescriptor, BranchId, BranchLineage, BranchMaintenanceReport, BranchPrepareStage,
+    BranchRoot, ForkIdentity, ForkReservationIdentity, ForkViewDigest, ManifestGeneration,
+    NamespaceCreationKind, NamespaceDeleteOutcome, PolicyHeadIdentity, PrepareForkOutcome,
+    PrepareForkRequest,
 };
 use crate::namespace::branch_root::{
     insert_branch_root, remove_branch_root, source_data_plane_config_digest,
@@ -276,8 +277,27 @@ pub async fn activate_fork_for_test(
             branch.identity.clone()
         }
     };
+    let nonce = ActivationNonce::new();
     manager
-        .activate_reserved_namespace(target.as_str(), Some(&identity))
+        .begin_branch_activation(&target, &identity, nonce)
+        .await?;
+    manager
+        .commit_branch_activation(
+            &target,
+            &identity,
+            BranchActivationEvidence {
+                branch_id: identity.branch_id,
+                target_namespace: identity.target_namespace.clone(),
+                target_incarnation: identity.target_incarnation.clone(),
+                policy_head: PolicyHeadIdentity::Boot {
+                    activation_nonce: nonce,
+                },
+                decision_id: DecisionId::new(),
+                approver: None,
+                audit_evidence_ref: format!("test-boot-branch-activation:{nonce}"),
+                activated_at: Utc::now(),
+            },
+        )
         .await?;
     Ok(outcome)
 }

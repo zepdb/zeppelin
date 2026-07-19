@@ -24,8 +24,7 @@ use crate::time::Clock;
 use super::{PolicyVersion, SecurityError};
 
 /// Authoritative object holding the one global policy-publication lease.
-pub const POLICY_PUBLICATION_LEASE_KEY: &str =
-    "_security/leases/policy-publication.json";
+pub const POLICY_PUBLICATION_LEASE_KEY: &str = "_security/leases/policy-publication.json";
 
 /// Maximum number of crash-recoverable branch activation guards in one head.
 pub const MAX_PENDING_BRANCH_ACTIVATIONS: usize = 1_024;
@@ -97,9 +96,7 @@ impl PolicyLeaseFencingToken {
     /// Advance on release or expired takeover, rejecting wraparound.
     pub fn next(self) -> std::result::Result<Self, SecurityError> {
         self.0.checked_add(1).map(Self).ok_or_else(|| {
-            SecurityError::InvalidPolicy(
-                "policy-publication fencing token overflow".to_string(),
-            )
+            SecurityError::InvalidPolicy("policy-publication fencing token overflow".to_string())
         })
     }
 }
@@ -314,17 +311,17 @@ impl PolicyPublicationLeaseRecord {
                 Ok(())
             }
             PolicyPublicationLeaseState::Released if lifetime == ChronoDuration::zero() => Ok(()),
-            PolicyPublicationLeaseState::Held | PolicyPublicationLeaseState::Released => Err(
-                SecurityError::InvalidPolicy(
+            PolicyPublicationLeaseState::Held | PolicyPublicationLeaseState::Released => {
+                Err(SecurityError::InvalidPolicy(
                     "policy-publication lease timestamps are invalid".to_string(),
-                ),
-            ),
+                ))
+            }
         }
     }
 }
 
 /// Owned, ETag-bearing observation of one acquired publication lease.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PolicyPublicationLeaseClaim {
     record: PolicyPublicationLeaseRecord,
     etag: String,
@@ -464,9 +461,7 @@ impl PolicyPublicationLease {
             .await?
         {
             ConditionalPutOutcome::Conflict => Err(SecurityError::PolicyConflict.into()),
-            ConditionalPutOutcome::Updated { e_tag } => {
-                self.claim_after_write(record, e_tag).await
-            }
+            ConditionalPutOutcome::Updated { e_tag } => self.claim_after_write(record, e_tag).await,
         }
     }
 
@@ -508,9 +503,7 @@ impl PolicyPublicationLease {
             )
         })?;
         let expires_at = issued_at.checked_add_signed(duration).ok_or_else(|| {
-            SecurityError::InvalidPolicy(
-                "policy-publication lease expiry overflow".to_string(),
-            )
+            SecurityError::InvalidPolicy("policy-publication lease expiry overflow".to_string())
         })?;
         let record = PolicyPublicationLeaseRecord {
             holder_id: self.holder_id,
@@ -564,7 +557,7 @@ impl PolicyPublicationLease {
 }
 
 /// Permit retained across target activation and exact guard finalization.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PolicyActivationGuardPermit {
     pub(crate) guard: PendingBranchActivation,
     pub(crate) lease_claim: PolicyPublicationLeaseClaim,
@@ -629,9 +622,7 @@ fn encode_record(record: &PolicyPublicationLeaseRecord) -> Result<Bytes> {
 
 fn decode_record(body: &[u8]) -> Result<PolicyPublicationLeaseRecord> {
     let record: PolicyPublicationLeaseRecord = serde_json::from_slice(body).map_err(|error| {
-        SecurityError::InvalidPolicy(format!(
-            "policy-publication lease JSON is invalid: {error}"
-        ))
+        SecurityError::InvalidPolicy(format!("policy-publication lease JSON is invalid: {error}"))
     })?;
     record.validate()?;
     Ok(record)
@@ -662,7 +653,47 @@ fn decode_digest(encoded: &str) -> std::result::Result<[u8; 32], &'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use crate::config::{StorageBackend, StorageConfig};
+    use crate::time::TimeSource;
+
     use super::*;
+
+    #[derive(Debug)]
+    struct AdjustableClock(Mutex<DateTime<Utc>>);
+
+    impl AdjustableClock {
+        fn new(now: DateTime<Utc>) -> Self {
+            Self(Mutex::new(now))
+        }
+
+        fn advance(&self, duration: ChronoDuration) {
+            let mut now = self
+                .0
+                .lock()
+                .unwrap_or_else(|_| panic!("policy lease test clock poisoned"));
+            *now += duration;
+        }
+    }
+
+    impl TimeSource for AdjustableClock {
+        fn now(&self) -> DateTime<Utc> {
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(|_| panic!("policy lease test clock poisoned"))
+        }
+    }
+
+    fn local_store() -> (tempfile::TempDir, ZeppelinStore) {
+        let directory = tempfile::tempdir().expect("policy lease tempdir");
+        let mut config = StorageConfig::default();
+        config.backend = StorageBackend::Local;
+        config.bucket = directory.path().to_string_lossy().into_owned();
+        let store = ZeppelinStore::from_config(&config).expect("local ZeppelinStore");
+        (directory, store)
+    }
 
     #[test]
     fn persisted_fencing_tokens_are_nonzero_and_monotonic() {
@@ -670,5 +701,87 @@ mod tests {
         let first = PolicyLeaseFencingToken::new(1).expect("token one is persisted");
         assert_eq!(first.get(), 1);
         assert_eq!(first.next().expect("token two").get(), 2);
+    }
+
+    #[tokio::test]
+    async fn missing_acquisition_is_create_only_and_release_keeps_a_cas_record() {
+        let (_directory, store) = local_store();
+        let now = Utc::now();
+        let clock = Clock::from_source(Arc::new(AdjustableClock::new(now)));
+        let first = PolicyPublicationLease::with_clock(
+            store.clone(),
+            Ulid::new(),
+            Duration::from_secs(30),
+            clock.clone(),
+        )
+        .expect("first lease manager");
+        let second = PolicyPublicationLease::with_clock(
+            store.clone(),
+            Ulid::new(),
+            Duration::from_secs(30),
+            clock,
+        )
+        .expect("second lease manager");
+
+        let (left, right) = tokio::join!(first.acquire(), second.acquire());
+        let (winner, loser) = match (left, right) {
+            (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+            state => panic!("exactly one create-only acquisition must win: {state:?}"),
+        };
+        assert!(matches!(
+            loser,
+            ZeppelinError::Security(SecurityError::PolicyConflict)
+        ));
+
+        let winner_manager = if winner.record.holder_id == first.holder_id {
+            &first
+        } else {
+            &second
+        };
+        winner_manager
+            .release(&winner)
+            .await
+            .expect("exact release CAS");
+        let released_bytes = store
+            .get(POLICY_PUBLICATION_LEASE_KEY)
+            .await
+            .expect("release must retain the lease object");
+        let released = decode_record(&released_bytes).expect("released record must validate");
+        assert_eq!(released.state, PolicyPublicationLeaseState::Released);
+    }
+
+    #[tokio::test]
+    async fn expired_takeover_increments_token_and_stale_release_cannot_overwrite() {
+        let (_directory, store) = local_store();
+        let source = Arc::new(AdjustableClock::new(Utc::now()));
+        let clock = Clock::from_source(source.clone());
+        let first = PolicyPublicationLease::with_clock(
+            store.clone(),
+            Ulid::new(),
+            Duration::from_secs(30),
+            clock.clone(),
+        )
+        .expect("first lease manager");
+        let second =
+            PolicyPublicationLease::with_clock(store, Ulid::new(), Duration::from_secs(30), clock)
+                .expect("second lease manager");
+        let stale = first.acquire().await.expect("first acquisition");
+        assert_eq!(stale.fencing_token().get(), 1);
+
+        source.advance(ChronoDuration::seconds(31));
+        let takeover = second.acquire().await.expect("expired takeover");
+        assert_eq!(takeover.fencing_token().get(), 2);
+        let stale_release = first
+            .release(&stale)
+            .await
+            .expect_err("stale release ETag must conflict");
+        assert!(matches!(
+            stale_release,
+            ZeppelinError::Security(SecurityError::PolicyConflict)
+        ));
+        second
+            .renew(&takeover)
+            .await
+            .expect("takeover remains authoritative");
     }
 }

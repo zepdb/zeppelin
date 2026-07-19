@@ -228,6 +228,7 @@ impl Action {
         matches!(
             self,
             Self::NamespaceDelete
+                | Self::NamespaceFork
                 | Self::SnapshotDelete
                 | Self::VectorDelete
                 | Self::SecurityAdminWrite

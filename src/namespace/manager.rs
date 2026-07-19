@@ -394,6 +394,10 @@ pub struct NamespaceDeletionIntent {
     pub destruction_record_key: String,
     /// Actor/decision evidence reference, opaque to the namespace layer.
     pub decision_evidence_ref: String,
+    /// Exact activation attempt revoked before a never-visible fork entered
+    /// cancellation. Absent for ordinary and already-visible deletion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_activation_nonce: Option<ActivationNonce>,
     /// Exact direct parent root identity for a branch deletion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_root: Option<BranchRoot>,
@@ -573,6 +577,16 @@ impl NamespaceMetadata {
                         self.name
                     )));
                 }
+                if self
+                    .deletion_intent
+                    .as_ref()
+                    .is_some_and(|intent| intent.branch_activation_nonce.is_some())
+                {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "root namespace {} carries a branch-activation cancellation marker",
+                        self.name
+                    )));
+                }
             }
             NamespaceCreationKind::Fork(reservation) => {
                 if reservation.target_namespace.as_str() != self.name {
@@ -652,6 +666,34 @@ impl NamespaceMetadata {
                             }
                             .into());
                         }
+                        if let Some(intent) = self.deletion_intent.as_ref() {
+                            if intent.branch_activation_nonce.is_some() {
+                                let identity = self.branch_identity.as_ref().ok_or_else(|| {
+                                    ZeppelinError::Serialization(format!(
+                                        "activation-cancelled fork {} has no final branch identity",
+                                        self.name
+                                    ))
+                                })?;
+                                if prepare.stage != BranchPrepareStage::ManifestPublished
+                                    || !identity.matches_reservation(reservation)
+                                    || intent
+                                        .parent_root
+                                        .as_ref()
+                                        .is_some_and(|root| !identity.matches_root(root))
+                                {
+                                    return Err(BranchError::IntentMismatch {
+                                        target: reservation.target_namespace.clone(),
+                                    }
+                                    .into());
+                                }
+                                if intent.decision_evidence_ref.trim().is_empty() {
+                                    return Err(ZeppelinError::Serialization(format!(
+                                        "activation-cancelled fork {} has no deletion decision evidence",
+                                        self.name
+                                    )));
+                                }
+                            }
+                        }
                         match prepare.stage {
                             BranchPrepareStage::Reserved => {
                                 if self.branch_identity.is_some() || prepare.provisional.is_none() {
@@ -703,6 +745,16 @@ impl NamespaceMetadata {
                         }
                     }
                     NamespaceState::Active | NamespaceState::Deleting => {
+                        if self
+                            .deletion_intent
+                            .as_ref()
+                            .is_some_and(|intent| intent.branch_activation_nonce.is_some())
+                        {
+                            return Err(ZeppelinError::Serialization(format!(
+                                "visible or deleting fork {} carries a never-visible activation cancellation marker",
+                                self.name
+                            )));
+                        }
                         if self.branch_prepare.is_some()
                             || self.branch_identity.is_none()
                             || self.branch_activation.is_none()
@@ -961,9 +1013,7 @@ fn begin_branch_activation_metadata(
         )));
     }
     let prepare = metadata.branch_prepare.as_mut().ok_or_else(|| {
-        ZeppelinError::Serialization(format!(
-            "creating fork {target} has no preparation intent"
-        ))
+        ZeppelinError::Serialization(format!("creating fork {target} has no preparation intent"))
     })?;
     match prepare.stage {
         BranchPrepareStage::ManifestPublished => {
@@ -1019,9 +1069,7 @@ fn commit_branch_activation_metadata(
     }
     let nonce = evidence.activation_nonce();
     let prepare = metadata.branch_prepare.as_ref().ok_or_else(|| {
-        ZeppelinError::Serialization(format!(
-            "creating fork {target} has no preparation intent"
-        ))
+        ZeppelinError::Serialization(format!("creating fork {target} has no preparation intent"))
     })?;
     if prepare.stage != (BranchPrepareStage::ActivationPending { nonce }) {
         return Err(branch_activation_conflict(target));
@@ -1063,9 +1111,7 @@ fn revoke_branch_activation_metadata(
         )));
     }
     let prepare = metadata.branch_prepare.as_mut().ok_or_else(|| {
-        ZeppelinError::Serialization(format!(
-            "creating fork {target} has no preparation intent"
-        ))
+        ZeppelinError::Serialization(format!("creating fork {target} has no preparation intent"))
     })?;
     match prepare.stage {
         BranchPrepareStage::ActivationPending { nonce: current } if current == nonce => {
@@ -2752,6 +2798,7 @@ impl NamespaceManager {
                         .simple()
                 ),
                 decision_evidence_ref: decision_evidence_ref.clone(),
+                branch_activation_nonce: None,
                 parent_root: parent_root.clone(),
                 fenced_generation: None,
                 visibility: None,
@@ -3869,6 +3916,34 @@ mod tests {
         })
     }
 
+    fn activation_cancellation_intent(
+        identity: &ForkIdentity,
+        nonce: ActivationNonce,
+    ) -> NamespaceDeletionIntent {
+        NamespaceDeletionIntent {
+            incarnation: identity.target_incarnation.clone(),
+            destruction_record_key: format!(
+                "_audit/destruction/{}.json",
+                identity.target_incarnation.as_uuid().simple()
+            ),
+            decision_evidence_ref: "_audit/deletion-decisions/cancel-activation.json".to_string(),
+            branch_activation_nonce: Some(nonce),
+            parent_root: Some(BranchRoot {
+                branch_id: identity.branch_id,
+                source_generation: identity.source_generation,
+                source_manifest_sha256: identity.source_manifest_sha256,
+                fork_view_sha256: identity.fork_view_sha256,
+                source_config_sha256: identity.source_config_sha256,
+                target_namespace: identity.target_namespace.clone(),
+                target_incarnation: identity.target_incarnation.clone(),
+                created_at: identity.created_at,
+            }),
+            fenced_generation: None,
+            visibility: None,
+            root_release: None,
+        }
+    }
+
     #[test]
     fn cancellation_winning_exact_nonce_fences_the_stale_activator() -> Result<()> {
         let (mut metadata, target, identity) = prepared_fork_metadata()?;
@@ -3894,9 +3969,13 @@ mod tests {
         );
         assert_eq!(metadata.state, NamespaceState::Creating);
         assert_eq!(
-            metadata.branch_prepare.as_ref().map(|prepare| prepare.stage),
+            metadata
+                .branch_prepare
+                .as_ref()
+                .map(|prepare| prepare.stage),
             Some(BranchPrepareStage::ManifestPublished)
         );
+        metadata.validate_creation_lifecycle()?;
 
         let error = commit_branch_activation_metadata(
             &mut metadata,
@@ -3909,6 +3988,19 @@ mod tests {
         assert!(matches!(error, ZeppelinError::ManifestConflict { .. }));
         assert_eq!(metadata.state, NamespaceState::Creating);
         assert!(metadata.branch_activation.is_none());
+
+        assert_eq!(
+            revoke_branch_activation_metadata(
+                &mut metadata,
+                &target,
+                &identity,
+                nonce,
+                Utc::now(),
+            )?,
+            BranchActivationRevocationPlan::Outcome(
+                BranchActivationRevocationOutcome::AlreadyPrepared
+            )
+        );
         Ok(())
     }
 
@@ -3931,8 +4023,33 @@ mod tests {
             &evidence,
             Utc::now(),
         )?);
+        metadata.validate_creation_lifecycle()?;
         assert_eq!(metadata.state, NamespaceState::Active);
         assert_eq!(metadata.branch_activation.as_ref(), Some(&evidence));
+
+        assert!(
+            !commit_branch_activation_metadata(
+                &mut metadata,
+                &target,
+                &identity,
+                &evidence,
+                Utc::now(),
+            )?,
+            "an exact lost-response retry must observe the committed evidence without a write"
+        );
+
+        let mut conflicting_evidence = evidence.clone();
+        conflicting_evidence.decision_id = DecisionId::new();
+        assert!(matches!(
+            commit_branch_activation_metadata(
+                &mut metadata,
+                &target,
+                &identity,
+                &conflicting_evidence,
+                Utc::now(),
+            ),
+            Err(ZeppelinError::ManifestConflict { .. })
+        ));
 
         assert_eq!(
             revoke_branch_activation_metadata(
@@ -3951,8 +4068,66 @@ mod tests {
 
         metadata.state = NamespaceState::Deleting;
         metadata.validate_creation_lifecycle()?;
+        assert_eq!(
+            revoke_branch_activation_metadata(
+                &mut metadata,
+                &target,
+                &identity,
+                nonce,
+                Utc::now(),
+            )?,
+            BranchActivationRevocationPlan::Outcome(
+                BranchActivationRevocationOutcome::ActivationCommitted
+            )
+        );
         metadata.branch_activation = None;
         assert!(metadata.validate_creation_lifecycle().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_begin_retry_is_idempotent_and_different_nonce_conflicts() -> Result<()> {
+        let (mut metadata, target, identity) = prepared_fork_metadata()?;
+        let nonce = ActivationNonce::new();
+        let first_update = Utc::now();
+        assert!(begin_branch_activation_metadata(
+            &mut metadata,
+            &target,
+            &identity,
+            nonce,
+            first_update,
+        )?);
+        assert_eq!(metadata.updated_at, first_update);
+
+        assert!(
+            !begin_branch_activation_metadata(
+                &mut metadata,
+                &target,
+                &identity,
+                nonce,
+                first_update + chrono::Duration::seconds(1),
+            )?,
+            "the same nonce must observe the pending attempt without a metadata write"
+        );
+        assert_eq!(metadata.updated_at, first_update);
+        assert!(matches!(
+            begin_branch_activation_metadata(
+                &mut metadata,
+                &target,
+                &identity,
+                ActivationNonce::new(),
+                first_update + chrono::Duration::seconds(2),
+            ),
+            Err(ZeppelinError::ManifestConflict { .. })
+        ));
+        assert_eq!(
+            metadata
+                .branch_prepare
+                .as_ref()
+                .map(|prepare| prepare.stage),
+            Some(BranchPrepareStage::ActivationPending { nonce })
+        );
+        metadata.validate_creation_lifecycle()?;
         Ok(())
     }
 
@@ -3968,14 +4143,10 @@ mod tests {
             current,
             Utc::now(),
         )?);
+        let stale_revoke =
+            revoke_branch_activation_metadata(&mut metadata, &target, &identity, stale, Utc::now());
         assert!(matches!(
-            revoke_branch_activation_metadata(
-                &mut metadata,
-                &target,
-                &identity,
-                stale,
-                Utc::now(),
-            ),
+            stale_revoke,
             Err(ZeppelinError::ManifestConflict { .. })
         ));
         let stale_evidence = boot_activation_evidence(&identity, stale)?;
@@ -3990,14 +4161,71 @@ mod tests {
             Err(ZeppelinError::ManifestConflict { .. })
         ));
         assert_eq!(
-            metadata.branch_prepare.as_ref().map(|prepare| prepare.stage),
+            metadata
+                .branch_prepare
+                .as_ref()
+                .map(|prepare| prepare.stage),
             Some(BranchPrepareStage::ActivationPending { nonce: current })
         );
+        let current_evidence = boot_activation_evidence(&identity, current)?;
+        assert!(commit_branch_activation_metadata(
+            &mut metadata,
+            &target,
+            &identity,
+            &current_evidence,
+            Utc::now(),
+        )?);
+        let stale_revoke =
+            revoke_branch_activation_metadata(&mut metadata, &target, &identity, stale, Utc::now());
+        assert!(matches!(
+            stale_revoke,
+            Err(ZeppelinError::ManifestConflict { .. })
+        ));
+        assert_eq!(metadata.state, NamespaceState::Active);
+        assert_eq!(metadata.branch_activation.as_ref(), Some(&current_evidence));
         Ok(())
     }
 
     #[test]
-    fn metadata_without_branch_activation_field_remains_compatible_for_legacy_roots() -> Result<()> {
+    fn branch_activation_evidence_is_required_only_after_visibility() -> Result<()> {
+        let (mut metadata, _, identity) = prepared_fork_metadata()?;
+        metadata.validate_creation_lifecycle()?;
+
+        let nonce = ActivationNonce::new();
+        metadata.branch_activation = Some(boot_activation_evidence(&identity, nonce)?);
+        assert!(metadata.validate_creation_lifecycle().is_err());
+
+        metadata.branch_prepare = None;
+        metadata.state = NamespaceState::Active;
+        metadata.branch_activation = None;
+        assert!(metadata.validate_creation_lifecycle().is_err());
+
+        let mut mismatched = boot_activation_evidence(&identity, nonce)?;
+        mismatched.target_incarnation = NamespaceIncarnationId::new();
+        metadata.branch_activation = Some(mismatched);
+        assert!(metadata.validate_creation_lifecycle().is_err());
+
+        let mut unaudited = boot_activation_evidence(&identity, nonce)?;
+        unaudited.audit_evidence_ref = " \t".to_string();
+        metadata.branch_activation = Some(unaudited);
+        assert!(metadata.validate_creation_lifecycle().is_err());
+
+        metadata.branch_activation = Some(boot_activation_evidence(&identity, nonce)?);
+        metadata.validate_creation_lifecycle()?;
+        let encoded = metadata.to_bytes()?;
+        let decoded = NamespaceMetadata::from_bytes(&encoded)?;
+        assert_eq!(decoded.branch_activation, metadata.branch_activation);
+
+        let mut with_unknown: serde_json::Value = serde_json::from_slice(&encoded)?;
+        with_unknown["branch_activation"]["bearer_credential"] =
+            serde_json::Value::String("must-not-persist".to_string());
+        assert!(NamespaceMetadata::from_bytes(&serde_json::to_vec(&with_unknown)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_without_branch_activation_field_remains_compatible_for_legacy_roots() -> Result<()>
+    {
         let now = Utc::now();
         let encoded = serde_json::to_vec(&serde_json::json!({
             "name": "legacy-root",
@@ -4010,7 +4238,10 @@ mod tests {
         }))?;
         let metadata = NamespaceMetadata::from_bytes(&encoded)?;
         assert_eq!(metadata.state, NamespaceState::Active);
-        assert!(matches!(metadata.creation_kind, NamespaceCreationKind::Root));
+        assert!(matches!(
+            metadata.creation_kind,
+            NamespaceCreationKind::Root
+        ));
         assert!(metadata.branch_activation.is_none());
         Ok(())
     }
@@ -4051,10 +4282,12 @@ mod tests {
 
     #[test]
     fn deletion_intent_round_trips_with_exact_identity() {
+        let nonce = ActivationNonce::new();
         let intent = NamespaceDeletionIntent {
             incarnation: NamespaceIncarnationId::new(),
             destruction_record_key: "_audit/destruction/example.json".to_string(),
             decision_evidence_ref: "decision-123".to_string(),
+            branch_activation_nonce: Some(nonce),
             parent_root: None,
             fenced_generation: None,
             visibility: None,
@@ -4064,6 +4297,121 @@ mod tests {
         let decoded: NamespaceDeletionIntent =
             serde_json::from_slice(&encoded).expect("intent decodes");
         assert_eq!(decoded, intent);
+        assert_eq!(decoded.branch_activation_nonce, Some(nonce));
+    }
+
+    #[test]
+    fn legacy_deletion_intent_defaults_branch_activation_nonce_to_none() {
+        let incarnation = NamespaceIncarnationId::new();
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "incarnation": incarnation,
+            "destruction_record_key": "_audit/destruction/legacy.json",
+            "decision_evidence_ref": "_audit/deletion-decisions/legacy.json"
+        }))
+        .expect("legacy intent serializes");
+        let decoded: NamespaceDeletionIntent =
+            serde_json::from_slice(&encoded).expect("legacy intent decodes");
+        assert!(decoded.branch_activation_nonce.is_none());
+    }
+
+    #[test]
+    fn activation_cancellation_marker_requires_revoked_prepared_fork() -> Result<()> {
+        let (mut metadata, target, identity) = prepared_fork_metadata()?;
+        let nonce = ActivationNonce::new();
+        assert!(begin_branch_activation_metadata(
+            &mut metadata,
+            &target,
+            &identity,
+            nonce,
+            Utc::now(),
+        )?);
+        assert_eq!(
+            revoke_branch_activation_metadata(
+                &mut metadata,
+                &target,
+                &identity,
+                nonce,
+                Utc::now(),
+            )?,
+            BranchActivationRevocationPlan::PublishPrepared
+        );
+        metadata.deletion_intent = Some(activation_cancellation_intent(&identity, nonce));
+        metadata.validate_creation_lifecycle()?;
+
+        let encoded = metadata.to_bytes()?;
+        let decoded = NamespaceMetadata::from_bytes(&encoded)?;
+        assert_eq!(decoded.deletion_intent, metadata.deletion_intent);
+        assert_eq!(
+            decoded
+                .deletion_intent
+                .as_ref()
+                .and_then(|intent| intent.branch_activation_nonce),
+            Some(nonce)
+        );
+
+        let intent = metadata
+            .deletion_intent
+            .as_mut()
+            .expect("cancellation intent remains present");
+        intent.decision_evidence_ref = " \t".to_string();
+        assert!(metadata.validate_creation_lifecycle().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn activation_cancellation_marker_is_rejected_before_nonce_revocation() -> Result<()> {
+        let (mut metadata, target, identity) = prepared_fork_metadata()?;
+        let nonce = ActivationNonce::new();
+        assert!(begin_branch_activation_metadata(
+            &mut metadata,
+            &target,
+            &identity,
+            nonce,
+            Utc::now(),
+        )?);
+        metadata.deletion_intent = Some(activation_cancellation_intent(&identity, nonce));
+        assert!(metadata.validate_creation_lifecycle().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn activation_cancellation_marker_is_never_valid_for_visible_deletion() -> Result<()> {
+        let (mut active, target, identity) = prepared_fork_metadata()?;
+        let nonce = ActivationNonce::new();
+        assert!(begin_branch_activation_metadata(
+            &mut active,
+            &target,
+            &identity,
+            nonce,
+            Utc::now(),
+        )?);
+        let evidence = boot_activation_evidence(&identity, nonce)?;
+        assert!(commit_branch_activation_metadata(
+            &mut active,
+            &target,
+            &identity,
+            &evidence,
+            Utc::now(),
+        )?);
+        active.deletion_intent = Some(activation_cancellation_intent(&identity, nonce));
+        assert!(active.validate_creation_lifecycle().is_err());
+
+        active.state = NamespaceState::Deleting;
+        assert!(active.validate_creation_lifecycle().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn activation_cancellation_marker_is_never_valid_for_root_deletion() -> Result<()> {
+        let (mut root, _, identity) = prepared_fork_metadata()?;
+        let nonce = ActivationNonce::new();
+        root.creation_kind = NamespaceCreationKind::Root;
+        root.branch_identity = None;
+        root.branch_prepare = None;
+        root.state = NamespaceState::Active;
+        root.deletion_intent = Some(activation_cancellation_intent(&identity, nonce));
+        assert!(root.validate_creation_lifecycle().is_err());
+        Ok(())
     }
 
     #[test]
@@ -4074,6 +4422,7 @@ mod tests {
             incarnation,
             destruction_record_key: canonical_key.clone(),
             decision_evidence_ref: canonical_key,
+            branch_activation_nonce: None,
             parent_root: None,
             fenced_generation: None,
             visibility: None,
@@ -4097,6 +4446,7 @@ mod tests {
             incarnation: incarnation.clone(),
             destruction_record_key: canonical_key.clone(),
             decision_evidence_ref: canonical_key,
+            branch_activation_nonce: None,
             parent_root: None,
             fenced_generation: None,
             visibility: None,
@@ -4138,6 +4488,7 @@ mod tests {
             incarnation: NamespaceIncarnationId::new(),
             destruction_record_key: "_audit/destruction/example.json".to_string(),
             decision_evidence_ref: "decision-123".to_string(),
+            branch_activation_nonce: None,
             parent_root: None,
             fenced_generation: Some(7),
             visibility: Some(VisibilityRemoval {

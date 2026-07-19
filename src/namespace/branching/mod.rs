@@ -5,6 +5,7 @@
 //! fork lifecycle coordinator; its source-root mutation primitive remains
 //! crate-private.
 
+pub(crate) mod activation;
 pub(crate) mod deletion;
 mod error;
 pub mod http;

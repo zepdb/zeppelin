@@ -25,6 +25,8 @@ use crate::security::{
 use crate::storage::{CreateOnlyOutcome, ZeppelinStore};
 use serde::{Deserialize, Serialize};
 
+use super::activation::BranchActivationRecovery;
+
 /// One authorization decision passed from the security adapter to the graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -320,6 +322,8 @@ pub(crate) struct AuthorizedNamespaceDelete {
     pub decision: DeletionDecision,
     /// Strong governance hooks for the destructive lifecycle.
     pub governance: Arc<dyn DeletionGovernance>,
+    /// Mechanical policy-guard recovery for an ActivationPending target.
+    pub activation_recovery: Arc<dyn BranchActivationRecovery>,
 }
 
 impl AuthorizedNamespaceDelete {
@@ -330,11 +334,13 @@ impl AuthorizedNamespaceDelete {
         namespace: NamespaceId,
         decision: DeletionDecision,
         governance: Arc<dyn DeletionGovernance>,
+        activation_recovery: Arc<dyn BranchActivationRecovery>,
     ) -> Self {
         Self {
             namespace,
             decision,
             governance,
+            activation_recovery,
         }
     }
 }

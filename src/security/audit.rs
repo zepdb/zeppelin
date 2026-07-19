@@ -13,7 +13,9 @@ use chrono::{DateTime, Utc};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 use crate::index::quantization::QuantizationType;
+use crate::namespace::branching::ActivationNonce;
 use crate::namespace::manager::NamespaceIndexConfig;
+use crate::namespace::{BranchId, ManifestGeneration, NamespaceIncarnationId};
 use crate::runtime_config::QueryKnobs;
 
 use super::{
@@ -353,6 +355,27 @@ pub enum AuditParams {
         source: NamespaceId,
         /// Newly prepared branch target namespace.
         target: NamespaceId,
+    },
+    /// A fresh, nonce-bound fork authorization was durably settled before the
+    /// target visibility CAS.
+    NamespaceForkActivation {
+        /// Existing source namespace.
+        source: NamespaceId,
+        /// Prepared branch target namespace.
+        target: NamespaceId,
+        /// Stable direct parent-to-child edge identity.
+        branch_id: BranchId,
+        /// Exact target namespace lifetime guarded by the activation nonce.
+        target_incarnation: NamespaceIncarnationId,
+        /// Exact parent generation selected by the immutable branch root.
+        source_generation: ManifestGeneration,
+        /// One-based ancestry depth of the prepared target.
+        depth: u16,
+        /// Non-bearer target metadata fence used by this activation attempt.
+        activation_nonce: ActivationNonce,
+        /// Initial request-admission decision retained for correlation with the
+        /// fresh decision carried by [`AuditRecord::decision_id`].
+        admission_decision_id: DecisionId,
     },
     /// Desired namespace index settings were replaced.
     IndexConfigPatch {

@@ -90,9 +90,27 @@ impl PolicyHeadIdentity {
     #[must_use]
     pub const fn activation_nonce(&self) -> ActivationNonce {
         match self {
-            Self::Boot { activation_nonce } | Self::Persisted {
+            Self::Boot { activation_nonce }
+            | Self::Persisted {
                 activation_nonce, ..
             } => *activation_nonce,
+        }
+    }
+
+    /// Return whether this identity can represent a completed activation proof.
+    ///
+    /// A persisted proof must name a semantic (non-BOOT) policy and the
+    /// post-guard control revision. BOOT is valid only through its explicit
+    /// variant, which deliberately carries no fictional lease fields.
+    #[must_use]
+    pub const fn is_valid_for_activation(&self) -> bool {
+        match self {
+            Self::Boot { .. } => true,
+            Self::Persisted {
+                policy_version,
+                control_revision,
+                ..
+            } => policy_version.get() != PolicyVersion::BOOT.get() && control_revision.get() > 0,
         }
     }
 }
@@ -127,7 +145,8 @@ impl BranchActivationEvidence {
         self.branch_id == identity.branch_id
             && self.target_namespace == identity.target_namespace
             && self.target_incarnation == identity.target_incarnation
-            && !self.audit_evidence_ref.is_empty()
+            && !self.audit_evidence_ref.trim().is_empty()
+            && self.policy_head.is_valid_for_activation()
     }
 
     /// Return the exact activation-attempt fence committed by this evidence.
@@ -428,13 +447,41 @@ pub struct BranchMaintenanceReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivationNonce, BranchPrepareStage};
+    use serde::Deserialize;
+
+    use super::{ActivationNonce, BranchPrepareStage, PolicyHeadIdentity};
+    use crate::security::{
+        PolicyControlRevision, PolicyHeadDigest, PolicyLeaseFencingToken, PolicyVersion,
+    };
+
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyBranchPrepareStage {
+        Reserved,
+        Rooted,
+        ManifestPublished,
+    }
 
     #[test]
     fn activation_pending_is_nonce_bound_without_changing_legacy_stage_encoding() {
-        let legacy: BranchPrepareStage =
-            serde_json::from_str("\"manifest_published\"").expect("legacy stage decodes");
-        assert_eq!(legacy, BranchPrepareStage::ManifestPublished);
+        for (encoded, expected) in [
+            ("\"reserved\"", BranchPrepareStage::Reserved),
+            ("\"rooted\"", BranchPrepareStage::Rooted),
+            (
+                "\"manifest_published\"",
+                BranchPrepareStage::ManifestPublished,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<BranchPrepareStage>(encoded).expect("legacy stage decodes"),
+                expected
+            );
+            assert_eq!(
+                serde_json::to_string(&expected).expect("legacy stage encodes"),
+                encoded
+            );
+        }
 
         let nonce = ActivationNonce::new();
         let encoded = serde_json::to_value(BranchPrepareStage::ActivationPending { nonce })
@@ -448,5 +495,83 @@ mod tests {
                 .expect("activation stage decodes"),
             BranchPrepareStage::ActivationPending { nonce }
         );
+        assert!(
+            serde_json::from_value::<LegacyBranchPrepareStage>(
+                serde_json::json!({"activation_pending": {"nonce": nonce}})
+            )
+            .is_err(),
+            "an old reader must fail closed on the nonce-bearing state"
+        );
+    }
+
+    #[test]
+    fn policy_head_identity_distinguishes_boot_from_fenced_publication() {
+        let boot_nonce = ActivationNonce::new();
+        let boot = PolicyHeadIdentity::Boot {
+            activation_nonce: boot_nonce,
+        };
+        let boot_json = serde_json::to_value(&boot).expect("boot identity encodes");
+        assert_eq!(
+            boot_json,
+            serde_json::json!({
+                "kind": "boot",
+                "activation_nonce": boot_nonce,
+            })
+        );
+        assert_eq!(boot.activation_nonce(), boot_nonce);
+        assert!(boot.is_valid_for_activation());
+
+        let persisted_nonce = ActivationNonce::new();
+        let persisted = PolicyHeadIdentity::Persisted {
+            policy_version: PolicyVersion::persisted(7).expect("nonzero policy version"),
+            policy_head_digest: PolicyHeadDigest::new([0xab; 32]),
+            control_revision: PolicyControlRevision::new(3),
+            lease_fencing_token: PolicyLeaseFencingToken::new(4)
+                .expect("nonzero lease fencing token"),
+            activation_nonce: persisted_nonce,
+        };
+        let persisted_json = serde_json::to_value(&persisted).expect("persisted identity encodes");
+        assert_eq!(
+            persisted_json,
+            serde_json::json!({
+                "kind": "persisted",
+                "policy_version": 7,
+                "policy_head_digest": "abababababababababababababababababababababababababababababababab",
+                "control_revision": 3,
+                "lease_fencing_token": 4,
+                "activation_nonce": persisted_nonce,
+            })
+        );
+        assert_eq!(persisted.activation_nonce(), persisted_nonce);
+        assert!(persisted.is_valid_for_activation());
+        assert_eq!(
+            serde_json::from_value::<PolicyHeadIdentity>(persisted_json)
+                .expect("persisted identity decodes"),
+            persisted
+        );
+
+        assert!(!PolicyHeadIdentity::Persisted {
+            policy_version: PolicyVersion::BOOT,
+            policy_head_digest: PolicyHeadDigest::new([0xcd; 32]),
+            control_revision: PolicyControlRevision::new(1),
+            lease_fencing_token: PolicyLeaseFencingToken::INITIAL,
+            activation_nonce: persisted_nonce,
+        }
+        .is_valid_for_activation());
+        assert!(!PolicyHeadIdentity::Persisted {
+            policy_version: PolicyVersion::persisted(8).expect("nonzero policy version"),
+            policy_head_digest: PolicyHeadDigest::new([0xef; 32]),
+            control_revision: PolicyControlRevision::INITIAL,
+            lease_fencing_token: PolicyLeaseFencingToken::INITIAL,
+            activation_nonce: persisted_nonce,
+        }
+        .is_valid_for_activation());
+
+        let with_unknown = serde_json::json!({
+            "kind": "boot",
+            "activation_nonce": boot_nonce,
+            "lease_fencing_token": 1,
+        });
+        assert!(serde_json::from_value::<PolicyHeadIdentity>(with_unknown).is_err());
     }
 }

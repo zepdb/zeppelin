@@ -1,32 +1,47 @@
 //! Pure-CPU phase-1 authorization over validated boot grants.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use crate::config::{SecurityConfig, SecurityMode};
 use crate::error::Result as ZeppelinResult;
+use crate::namespace::branching::activation::{
+    AuthorizedForkNamespace, BranchActivationGovernance, BranchActivationGuard,
+    BranchActivationPermit, BranchActivationRecovery,
+};
 use crate::namespace::branching::deletion::{
     deletion_decision_evidence_key, persist_deletion_lifecycle_audit, AuthorizedBranchList,
     AuthorizedNamespaceDelete, CallbackDeletionGovernance, DeletionDecision, DeletionGovernance,
     DisclosureCallback,
 };
+use crate::namespace::branching::{
+    ActivationNonce, BranchActivationEvidence, PolicyHeadIdentity, PreparedBranch,
+};
 use crate::storage::store::ObjectSigner;
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
 use super::{
     delegation::{DelegationAuthority, PublishedObjectSigner},
     policy_cache::PolicyCache,
-    Action, AllowDecision, ApiKeyAdapter, Decision, DelegationNarrowing, DenyDecision, DenyReason,
-    Entitlements, GrantActions, GrantDefinition, GrantScope, IssuedApiKey, IssuedDelegatedToken,
-    NamespaceId, PolicyGrant, PolicyPrincipal, PolicySnapshot, PolicyStore, PreservationLockId,
-    PreservationLockRecord, PreservationService, Principal, PrincipalId, PrincipalKind,
-    RequestContext, Resource, SecurityError, SecurityOperationResult,
+    Action, AllowDecision, ApiKeyAdapter, AuditClient, AuditOutcome, AuditParams, AuditRecord,
+    Decision, DelegationNarrowing, DenyDecision, DenyReason, Entitlements, GrantActions,
+    GrantDefinition, GrantScope, IssuedApiKey, IssuedDelegatedToken, LoadedPolicy, NamespaceId,
+    Obligation, PolicyActivationGuardPermit, PolicyGrant, PolicyPrincipal, PolicySnapshot,
+    PolicyStore, PreservationLockId, PreservationLockRecord, PreservationService, Principal,
+    PrincipalId, PrincipalKind, RequestContext, Resource, ResourceRef, SecurityError,
+    SecurityOperationError, SecurityOperationResult,
+    MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS,
 };
+
+const BRANCH_ACTIVATION_GUARD_TTL_SECS: i64 =
+    MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS / 2;
 
 #[derive(Debug)]
 struct BootstrapGrant {
@@ -77,6 +92,63 @@ pub(crate) struct NamespaceDeleteAdmission {
     pub approver: Option<PrincipalId>,
     pub store: ZeppelinStore,
     pub clock: Clock,
+}
+
+/// Request-owned facts consumed when minting one graph fork authority.
+///
+/// These are already-redacted principals and decisions. Bearer credentials are
+/// deliberately absent; fresh activation reuses only the typed identities.
+#[derive(Clone)]
+pub(crate) struct NamespaceForkAdmission {
+    pub source: NamespaceId,
+    pub target: NamespaceId,
+    pub principal: Principal,
+    pub approver: Option<Principal>,
+    pub context: RequestContext,
+    pub fork_decision: AllowDecision,
+    pub source_read_decision: AllowDecision,
+    pub target_create_decision: AllowDecision,
+    pub audit: AuditClient,
+    pub source_ip: IpAddr,
+    pub clock: Clock,
+}
+
+struct NamespaceForkGovernance {
+    kernel: Arc<SecurityKernel>,
+    admission: NamespaceForkAdmission,
+}
+
+struct FreshForkAuthorization {
+    fork: AllowDecision,
+    approver: Option<PrincipalId>,
+    authorized_at: DateTime<Utc>,
+}
+
+struct BootstrapBranchActivationPermit {
+    kernel: Arc<SecurityKernel>,
+    admission: NamespaceForkAdmission,
+    prepared: PreparedBranch,
+    evidence: BranchActivationEvidence,
+    audit_settled: bool,
+}
+
+struct PolicyBranchActivationPermit {
+    kernel: Arc<SecurityKernel>,
+    cache: Arc<PolicyCache>,
+    admission: NamespaceForkAdmission,
+    prepared: PreparedBranch,
+    guard: PolicyActivationGuardPermit,
+    evidence: BranchActivationEvidence,
+    audit_settled: bool,
+}
+
+struct PolicyRetainedBranchActivationGuard {
+    cache: Arc<PolicyCache>,
+    guard: PolicyActivationGuardPermit,
+}
+
+struct NamespaceBranchActivationRecovery {
+    kernel: Arc<SecurityKernel>,
 }
 
 /// Outcome of the privileged historical-policy lookup used by receipt verification.
@@ -466,7 +538,38 @@ impl SecurityKernel {
             admission.clock,
             Some((admission.principal, admission.context)),
         );
-        AuthorizedNamespaceDelete::new(admission.namespace, decision, governance)
+        AuthorizedNamespaceDelete::new(
+            admission.namespace,
+            decision,
+            governance,
+            self.branch_activation_recovery(),
+        )
+    }
+
+    /// Mint one request-scoped graph fork envelope from all three exact HTTP
+    /// admission decisions.
+    ///
+    /// Structural drift is rejected before the graph can reserve a target.
+    /// The returned governance adapter performs the second, authoritative
+    /// authorization under the policy-publication interlock.
+    pub(crate) fn authorize_namespace_fork(
+        self: &Arc<Self>,
+        admission: NamespaceForkAdmission,
+    ) -> ZeppelinResult<AuthorizedForkNamespace> {
+        if !self.entitlements.has(super::Feature::Branching) {
+            return Err(SecurityError::FeatureNotLicensed(super::Feature::Branching).into());
+        }
+        validate_namespace_fork_admission(&admission)?;
+        let source = admission.source.clone();
+        let target = admission.target.clone();
+        Ok(AuthorizedForkNamespace::new(
+            source,
+            target,
+            Box::new(NamespaceForkGovernance {
+                kernel: Arc::clone(self),
+                admission,
+            }),
+        ))
     }
 
     /// Compose restart-safe deletion governance without a disclosure principal.
@@ -476,6 +579,17 @@ impl SecurityKernel {
         clock: Clock,
     ) -> Arc<dyn DeletionGovernance> {
         self.namespace_delete_governance(store, clock, None)
+    }
+
+    /// Compose mechanical activation-guard recovery for deletion and
+    /// background maintenance. This adapter never authorizes or activates a
+    /// target; it only retains an exact persisted guard for graph resolution.
+    pub(crate) fn branch_activation_recovery(
+        self: &Arc<Self>,
+    ) -> Arc<dyn BranchActivationRecovery> {
+        Arc::new(NamespaceBranchActivationRecovery {
+            kernel: Arc::clone(self),
+        })
     }
 
     /// Mint a source-authorized branch-list request with per-target disclosure.
@@ -1203,6 +1317,595 @@ impl SecurityKernel {
                 "authoritative policy refresh requires S3 policy authority".to_string(),
             )
             .into()),
+        }
+    }
+}
+
+fn validate_namespace_fork_admission(admission: &NamespaceForkAdmission) -> ZeppelinResult<()> {
+    validate_fork_decision_set(
+        &admission.fork_decision,
+        &admission.source_read_decision,
+        &admission.target_create_decision,
+    )?;
+    let approval_required = admission
+        .fork_decision
+        .obligations
+        .contains(&Obligation::Approval);
+    if approval_required != admission.approver.is_some() {
+        return Err(SecurityError::ApprovalRequired.into());
+    }
+    if admission.approver.as_ref().is_some_and(|approver| {
+        approver.id == admission.principal.id
+            || admission
+                .principal
+                .delegation_parent
+                .as_ref()
+                .is_some_and(|parent| parent == &approver.id)
+    }) {
+        return Err(SecurityError::ApprovalRequired.into());
+    }
+    Ok(())
+}
+
+fn validate_fork_decision_set(
+    fork: &AllowDecision,
+    source_read: &AllowDecision,
+    target_create: &AllowDecision,
+) -> ZeppelinResult<()> {
+    if fork.policy_version != source_read.policy_version
+        || fork.policy_version != target_create.policy_version
+        || !fork.obligations.contains(&Obligation::DurableAudit)
+        || [fork, source_read, target_create]
+            .into_iter()
+            .any(allow_has_copy_constraints)
+    {
+        return Err(SecurityError::ConstraintViolation.into());
+    }
+    Ok(())
+}
+
+fn allow_has_copy_constraints(allow: &AllowDecision) -> bool {
+    allow.mandatory_filter.is_some()
+        || allow.field_mask.is_some()
+        || !allow.write_constraints.is_empty()
+}
+
+fn require_allow(decision: Decision) -> ZeppelinResult<AllowDecision> {
+    match decision {
+        Decision::Allow(allow) => Ok(*allow),
+        Decision::Deny(deny) => Err(SecurityError::Authorization(deny.reason).into()),
+    }
+}
+
+fn validate_fresh_approver(
+    kernel: &SecurityKernel,
+    admission: &NamespaceForkAdmission,
+    context: &RequestContext,
+    fork: &AllowDecision,
+) -> ZeppelinResult<Option<PrincipalId>> {
+    let approval_required = fork.obligations.contains(&Obligation::Approval);
+    let Some(approver) = admission.approver.as_ref() else {
+        return if approval_required {
+            Err(SecurityError::ApprovalRequired.into())
+        } else {
+            Ok(None)
+        };
+    };
+    if !approval_required
+        || approver.id == admission.principal.id
+        || admission
+            .principal
+            .delegation_parent
+            .as_ref()
+            .is_some_and(|parent| parent == &approver.id)
+    {
+        return Err(SecurityError::ApprovalRequired.into());
+    }
+    let allow = require_allow(kernel.authorize(
+        approver,
+        Action::NamespaceFork,
+        &Resource::Namespace(admission.source.clone()),
+        context,
+    ))?;
+    if allow.policy_version != fork.policy_version
+        || allow.obligations.contains(&Obligation::Approval)
+        || allow_has_copy_constraints(&allow)
+    {
+        return Err(SecurityError::ApprovalRequired.into());
+    }
+    Ok(Some(approver.id.clone()))
+}
+
+impl SecurityKernel {
+    fn fresh_current_fork_authorization(
+        &self,
+        admission: &NamespaceForkAdmission,
+    ) -> ZeppelinResult<FreshForkAuthorization> {
+        if !self.entitlements.has(super::Feature::Branching) {
+            return Err(SecurityError::FeatureNotLicensed(super::Feature::Branching).into());
+        }
+        let authorized_at = admission.clock.now();
+        let context = RequestContext::at(admission.context.request_id.clone(), authorized_at);
+        let fork = require_allow(self.authorize(
+            &admission.principal,
+            Action::NamespaceFork,
+            &Resource::Namespace(admission.source.clone()),
+            &context,
+        ))?;
+        let source_read = require_allow(self.authorize(
+            &admission.principal,
+            Action::NamespaceRead,
+            &Resource::Namespace(admission.source.clone()),
+            &context,
+        ))?;
+        let target_create = require_allow(self.authorize(
+            &admission.principal,
+            Action::NamespaceCreate,
+            &Resource::Namespace(admission.target.clone()),
+            &context,
+        ))?;
+        validate_fork_decision_set(&fork, &source_read, &target_create)?;
+        self.validate_namespace_copy_no_widening(
+            fork.policy_version,
+            &admission.source,
+            &admission.target,
+        )?;
+        let approver = validate_fresh_approver(self, admission, &context, &fork)?;
+        Ok(FreshForkAuthorization {
+            fork,
+            approver,
+            authorized_at,
+        })
+    }
+
+    fn fresh_loaded_policy_fork_authorization(
+        &self,
+        admission: &NamespaceForkAdmission,
+        loaded: &LoadedPolicy,
+    ) -> SecurityOperationResult<FreshForkAuthorization> {
+        let version = loaded.snapshot().version();
+        if admission.principal.delegation.is_some() {
+            return Err(SecurityOperationError::denied(DenyDecision::for_policy(
+                DenyReason::ActionNotGranted,
+                version,
+            )));
+        }
+        if !self.entitlements.has(super::Feature::Branching) {
+            return Err(SecurityError::FeatureNotLicensed(super::Feature::Branching).into());
+        }
+        let authorized_at = admission.clock.now();
+        let compiled = loaded.snapshot().compile()?;
+        let authorize = |principal: &Principal,
+                         action: Action,
+                         resource: Resource|
+         -> SecurityOperationResult<AllowDecision> {
+            let constraints = compiled
+                .authorize(principal, authorized_at, action, &resource)
+                .map_err(|reason| {
+                    SecurityOperationError::denied(DenyDecision::for_policy(reason, version))
+                })?;
+            let mut allow = AllowDecision::for_policy(action, version);
+            allow.policy_checksum = Some(loaded.snapshot().checksum().to_string());
+            allow.cursor_binding_key = self.cursor_binding_key;
+            allow.policy_filter = constraints.mandatory_filter.clone();
+            allow.mandatory_filter = constraints.mandatory_filter;
+            allow.field_mask = constraints.field_mask;
+            allow.write_constraints = constraints.write_constraints;
+            if constraints.require_approval {
+                allow.require_approval();
+            }
+            Ok(allow)
+        };
+        let fork = authorize(
+            &admission.principal,
+            Action::NamespaceFork,
+            Resource::Namespace(admission.source.clone()),
+        )?;
+        let source_read = authorize(
+            &admission.principal,
+            Action::NamespaceRead,
+            Resource::Namespace(admission.source.clone()),
+        )?;
+        let target_create = authorize(
+            &admission.principal,
+            Action::NamespaceCreate,
+            Resource::Namespace(admission.target.clone()),
+        )?;
+        validate_fork_decision_set(&fork, &source_read, &target_create)
+            .map_err(|error| SecurityOperationError::after_allow(error, fork.clone()))?;
+        compiled
+            .validate_namespace_copy_no_widening(&admission.source, &admission.target)
+            .map_err(|error| {
+                SecurityOperationError::after_allow(error.into(), fork.clone())
+            })?;
+
+        let approval_required = fork.obligations.contains(&Obligation::Approval);
+        let approver = match admission.approver.as_ref() {
+            None if approval_required => {
+                return Err(SecurityOperationError::after_allow(
+                    SecurityError::ApprovalRequired.into(),
+                    fork,
+                ))
+            }
+            None => None,
+            Some(approver)
+                if !approval_required
+                    || approver.id == admission.principal.id
+                    || admission
+                        .principal
+                        .delegation_parent
+                        .as_ref()
+                        .is_some_and(|parent| parent == &approver.id) =>
+            {
+                return Err(SecurityOperationError::after_allow(
+                    SecurityError::ApprovalRequired.into(),
+                    fork,
+                ))
+            }
+            Some(approver) => {
+                let approval = authorize(
+                    approver,
+                    Action::NamespaceFork,
+                    Resource::Namespace(admission.source.clone()),
+                )?;
+                if approval.obligations.contains(&Obligation::Approval)
+                    || allow_has_copy_constraints(&approval)
+                {
+                    return Err(SecurityOperationError::after_allow(
+                        SecurityError::ApprovalRequired.into(),
+                        fork,
+                    ));
+                }
+                Some(approver.id.clone())
+            }
+        };
+        Ok(FreshForkAuthorization {
+            fork,
+            approver,
+            authorized_at,
+        })
+    }
+}
+
+fn validate_prepared_fork(
+    admission: &NamespaceForkAdmission,
+    prepared: &PreparedBranch,
+) -> ZeppelinResult<()> {
+    if prepared.identity.source_namespace != admission.source
+        || prepared.identity.target_namespace != admission.target
+        || prepared.root.branch_id != prepared.identity.branch_id
+        || prepared.root.target_namespace != admission.target
+        || prepared.root.target_incarnation != prepared.identity.target_incarnation
+    {
+        return Err(crate::namespace::branching::BranchError::IntentMismatch {
+            target: admission.target.clone(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn branch_activation_audit_ref(
+    admission: &NamespaceForkAdmission,
+    prepared: &PreparedBranch,
+    decision_id: super::DecisionId,
+    nonce: ActivationNonce,
+) -> String {
+    format!(
+        "namespace-fork-activation:{}:{}:{}:{}",
+        admission.context.request_id,
+        prepared.identity.branch_id,
+        decision_id.get(),
+        nonce
+    )
+}
+
+fn branch_activation_evidence(
+    admission: &NamespaceForkAdmission,
+    prepared: &PreparedBranch,
+    fresh: &FreshForkAuthorization,
+    policy_head: PolicyHeadIdentity,
+) -> BranchActivationEvidence {
+    let nonce = policy_head.activation_nonce();
+    BranchActivationEvidence {
+        branch_id: prepared.identity.branch_id,
+        target_namespace: prepared.identity.target_namespace.clone(),
+        target_incarnation: prepared.identity.target_incarnation.clone(),
+        policy_head,
+        decision_id: fresh.fork.decision_id,
+        approver: fresh.approver.clone(),
+        audit_evidence_ref: branch_activation_audit_ref(
+            admission,
+            prepared,
+            fresh.fork.decision_id,
+            nonce,
+        ),
+        activated_at: fresh.authorized_at,
+    }
+}
+
+fn activation_audit_record(
+    admission: &NamespaceForkAdmission,
+    prepared: &PreparedBranch,
+    evidence: &BranchActivationEvidence,
+) -> AuditRecord {
+    let mut record = AuditRecord::decision_outcome(
+        evidence.activated_at,
+        admission.context.request_id.clone(),
+        evidence.decision_id,
+        &admission.principal,
+        Action::NamespaceFork,
+        ResourceRef::Namespace {
+            namespace: admission.source.clone(),
+        },
+        match &evidence.policy_head {
+            PolicyHeadIdentity::Boot { .. } => super::PolicyVersion::BOOT,
+            PolicyHeadIdentity::Persisted { policy_version, .. } => *policy_version,
+        },
+        admission.source_ip,
+        AuditOutcome::Success,
+        AuditParams::NamespaceForkActivation {
+            source: admission.source.clone(),
+            target: admission.target.clone(),
+            branch_id: prepared.identity.branch_id,
+            target_incarnation: prepared.identity.target_incarnation.clone(),
+            source_generation: prepared.identity.source_generation,
+            depth: prepared.identity.depth,
+            activation_nonce: evidence.activation_nonce(),
+            admission_decision_id: admission.fork_decision.decision_id,
+        },
+        admission.audit.node_id(),
+    );
+    record.approval_principal_id = evidence.approver.clone();
+    record
+}
+
+fn validate_reauthorization(
+    fresh: &FreshForkAuthorization,
+    evidence: &BranchActivationEvidence,
+) -> ZeppelinResult<()> {
+    let expected_version = match &evidence.policy_head {
+        PolicyHeadIdentity::Boot { .. } => super::PolicyVersion::BOOT,
+        PolicyHeadIdentity::Persisted { policy_version, .. } => *policy_version,
+    };
+    if fresh.fork.policy_version != expected_version || fresh.approver != evidence.approver {
+        return Err(SecurityError::ConstraintViolation.into());
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl BranchActivationGovernance for NamespaceForkGovernance {
+    async fn begin(
+        &self,
+        prepared: &PreparedBranch,
+        nonce: ActivationNonce,
+    ) -> ZeppelinResult<Box<dyn BranchActivationPermit>> {
+        validate_prepared_fork(&self.admission, prepared)?;
+        match &self.kernel.authority {
+            SecurityAuthority::Bootstrap(_) => {
+                let fresh = self
+                    .kernel
+                    .fresh_current_fork_authorization(&self.admission)?;
+                if fresh.fork.policy_version != super::PolicyVersion::BOOT {
+                    return Err(SecurityError::ConstraintViolation.into());
+                }
+                let evidence = branch_activation_evidence(
+                    &self.admission,
+                    prepared,
+                    &fresh,
+                    PolicyHeadIdentity::Boot {
+                        activation_nonce: nonce,
+                    },
+                );
+                Ok(Box::new(BootstrapBranchActivationPermit {
+                    kernel: Arc::clone(&self.kernel),
+                    admission: self.admission.clone(),
+                    prepared: prepared.clone(),
+                    evidence,
+                    audit_settled: false,
+                }))
+            }
+            SecurityAuthority::Policy(cache) => {
+                let expires_at = self
+                    .admission
+                    .clock
+                    .now()
+                    .checked_add_signed(ChronoDuration::seconds(
+                        BRANCH_ACTIVATION_GUARD_TTL_SECS,
+                    ))
+                    .ok_or_else(|| {
+                        SecurityError::InvalidPolicy(
+                            "branch activation guard expiry overflow".to_string(),
+                        )
+                    })?;
+                let kernel = Arc::clone(&self.kernel);
+                let validation_admission = self.admission.clone();
+                let (_, fresh, guard) = cache
+                    .begin_branch_activation(
+                        prepared.identity.branch_id,
+                        prepared.identity.target_namespace.clone(),
+                        prepared.identity.target_incarnation.clone(),
+                        nonce,
+                        expires_at,
+                        move |loaded| async move {
+                            let fresh = kernel.fresh_loaded_policy_fork_authorization(
+                                &validation_admission,
+                                &loaded,
+                            )?;
+                            Ok((fresh.fork.clone(), fresh))
+                        },
+                    )
+                    .await
+                    .map_err(SecurityOperationError::into_error)?;
+                let evidence = branch_activation_evidence(
+                    &self.admission,
+                    prepared,
+                    &fresh,
+                    PolicyHeadIdentity::Persisted {
+                        policy_version: guard.policy_version(),
+                        policy_head_digest: guard.policy_head_digest(),
+                        control_revision: guard.control_revision(),
+                        lease_fencing_token: guard.lease_fencing_token(),
+                        activation_nonce: nonce,
+                    },
+                );
+                Ok(Box::new(PolicyBranchActivationPermit {
+                    kernel: Arc::clone(&self.kernel),
+                    cache: Arc::clone(cache),
+                    admission: self.admission.clone(),
+                    prepared: prepared.clone(),
+                    guard,
+                    evidence,
+                    audit_settled: false,
+                }))
+            }
+        }
+    }
+
+    async fn retain_guard(
+        &self,
+        prepared: &PreparedBranch,
+        nonce: ActivationNonce,
+    ) -> ZeppelinResult<Option<Box<dyn BranchActivationGuard>>> {
+        validate_prepared_fork(&self.admission, prepared)?;
+        match &self.kernel.authority {
+            SecurityAuthority::Bootstrap(_) => Ok(None),
+            SecurityAuthority::Policy(cache) => cache
+                .retain_pending_branch_activation(prepared.identity.branch_id, nonce)
+                .await
+                .map(|guard| {
+                    guard.map(|guard| {
+                        Box::new(PolicyRetainedBranchActivationGuard {
+                            cache: Arc::clone(cache),
+                            guard,
+                        }) as Box<dyn BranchActivationGuard>
+                    })
+                }),
+        }
+    }
+}
+
+#[async_trait]
+impl BranchActivationPermit for BootstrapBranchActivationPermit {
+    fn evidence(&self) -> &BranchActivationEvidence {
+        &self.evidence
+    }
+
+    async fn settle_audit(&mut self) -> ZeppelinResult<()> {
+        if self.audit_settled {
+            return Ok(());
+        }
+        self.admission
+            .audit
+            .submit_durable(activation_audit_record(
+                &self.admission,
+                &self.prepared,
+                &self.evidence,
+            ))
+            .await?;
+        self.audit_settled = true;
+        Ok(())
+    }
+
+    async fn revalidate(&mut self) -> ZeppelinResult<()> {
+        if !self.audit_settled {
+            return Err(SecurityError::AuditUnavailable.into());
+        }
+        let fresh = self
+            .kernel
+            .fresh_current_fork_authorization(&self.admission)?;
+        validate_reauthorization(&fresh, &self.evidence)
+    }
+
+    async fn finalize(self: Box<Self>) -> ZeppelinResult<()> {
+        Ok(())
+    }
+
+    async fn abort(self: Box<Self>) -> ZeppelinResult<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl BranchActivationPermit for PolicyBranchActivationPermit {
+    fn evidence(&self) -> &BranchActivationEvidence {
+        &self.evidence
+    }
+
+    async fn settle_audit(&mut self) -> ZeppelinResult<()> {
+        if self.audit_settled {
+            return Ok(());
+        }
+        self.admission
+            .audit
+            .submit_durable(activation_audit_record(
+                &self.admission,
+                &self.prepared,
+                &self.evidence,
+            ))
+            .await?;
+        self.audit_settled = true;
+        Ok(())
+    }
+
+    async fn revalidate(&mut self) -> ZeppelinResult<()> {
+        if !self.audit_settled {
+            return Err(SecurityError::AuditUnavailable.into());
+        }
+        self.cache
+            .renew_branch_activation_guard(&mut self.guard)
+            .await?;
+        let fresh = self
+            .kernel
+            .fresh_current_fork_authorization(&self.admission)?;
+        validate_reauthorization(&fresh, &self.evidence)
+    }
+
+    async fn finalize(self: Box<Self>) -> ZeppelinResult<()> {
+        let permit = *self;
+        permit.cache.finalize_branch_activation(permit.guard).await
+    }
+
+    async fn abort(self: Box<Self>) -> ZeppelinResult<()> {
+        let permit = *self;
+        permit.cache.abort_branch_activation(permit.guard).await
+    }
+}
+
+#[async_trait]
+impl BranchActivationGuard for PolicyRetainedBranchActivationGuard {
+    async fn finalize(self: Box<Self>) -> ZeppelinResult<()> {
+        let guard = *self;
+        guard.cache.finalize_branch_activation(guard.guard).await
+    }
+
+    async fn abort(self: Box<Self>) -> ZeppelinResult<()> {
+        let guard = *self;
+        guard.cache.abort_branch_activation(guard.guard).await
+    }
+}
+
+#[async_trait]
+impl BranchActivationRecovery for NamespaceBranchActivationRecovery {
+    async fn retain_guard(
+        &self,
+        branch_id: crate::namespace::BranchId,
+        nonce: ActivationNonce,
+    ) -> ZeppelinResult<Option<Box<dyn BranchActivationGuard>>> {
+        match &self.kernel.authority {
+            SecurityAuthority::Bootstrap(_) => Ok(None),
+            SecurityAuthority::Policy(cache) => cache
+                .retain_pending_branch_activation(branch_id, nonce)
+                .await
+                .map(|guard| {
+                    guard.map(|guard| {
+                        Box::new(PolicyRetainedBranchActivationGuard {
+                            cache: Arc::clone(cache),
+                            guard,
+                        }) as Box<dyn BranchActivationGuard>
+                    })
+                }),
         }
     }
 }

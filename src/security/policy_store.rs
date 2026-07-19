@@ -1,7 +1,7 @@
 //! S3-authoritative loading and atomic bootstrap of security policy.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -13,10 +13,21 @@ use crate::error::{Result, ZeppelinError};
 use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, ZeppelinStore};
 
 use super::{Entitlements, Feature, PolicyHead, PolicySnapshot, SecurityError};
+use super::{
+    PendingBranchActivation, PolicyActivationGuardPermit, PolicyPublicationLease,
+    PolicyPublicationLeaseClaim,
+};
 
 const POLICY_ROOT: &str = "_security";
 const POLICY_HEAD_KEY: &str = "_security/heads/policy.json";
 const PHASE_SEVEN_MIGRATION_ATTEMPTS: usize = 5;
+const BOOTSTRAP_LEASE_ATTEMPTS: usize = 100;
+const BOOTSTRAP_LEASE_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+enum BootstrapPublicationAuthority {
+    Existing(LoadedPolicy),
+    Claimed(PolicyPublicationLeaseClaim),
+}
 
 #[derive(Serialize)]
 struct PhaseSevenMigrationRecord<'a> {
@@ -97,6 +108,21 @@ impl LoadedPolicy {
 pub struct PolicyStore {
     store: ZeppelinStore,
     entitlements: Arc<Entitlements>,
+    publication_lease: Arc<PolicyPublicationLease>,
+}
+
+/// One exact policy head claimed by a still-retained publication lease.
+pub(crate) struct ClaimedPolicyPublication {
+    loaded: LoadedPolicy,
+    lease_claim: PolicyPublicationLeaseClaim,
+}
+
+impl ClaimedPolicyPublication {
+    /// Borrow the exact strongly loaded head/snapshot observation.
+    #[must_use]
+    pub(crate) fn loaded(&self) -> &LoadedPolicy {
+        &self.loaded
+    }
 }
 
 pub(crate) enum PolicyRefresh {
@@ -107,15 +133,18 @@ pub(crate) enum PolicyRefresh {
 pub(crate) enum PolicyPublication {
     Published(Box<LoadedPolicy>),
     Conflict,
+    Guarded,
 }
 
 impl PolicyStore {
     /// Bind policy authority to the exact reserved `_security/` keyspace.
     #[must_use]
     pub fn new(store: ZeppelinStore, entitlements: Arc<Entitlements>) -> Self {
+        let publication_lease = Arc::new(PolicyPublicationLease::new(store.clone()));
         Self {
             store,
             entitlements,
+            publication_lease,
         }
     }
 
@@ -241,7 +270,13 @@ impl PolicyStore {
                 .await?;
             loaded = match self.publish(candidate, loaded.head_etag()).await? {
                 PolicyPublication::Published(published) => *published,
-                PolicyPublication::Conflict => self.load_current_unmigrated().await?,
+                PolicyPublication::Conflict => {
+                    tokio::time::sleep(BOOTSTRAP_LEASE_RETRY_DELAY).await;
+                    self.load_current_unmigrated().await?
+                }
+                PolicyPublication::Guarded => {
+                    return Err(SecurityError::PolicyConflict.into());
+                }
             };
         }
         Err(SecurityError::PolicyConflict.into())
@@ -288,6 +323,333 @@ impl PolicyStore {
         }
     }
 
+    /// Acquire the global lease, claim its token into the exact policy head,
+    /// and strongly load the snapshot selected by that claimed head.
+    pub(crate) async fn acquire_claimed_publication(&self) -> Result<ClaimedPolicyPublication> {
+        self.acquire_claimed_publication_from(None)
+            .await?
+            .ok_or_else(|| SecurityError::PolicyConflict.into())
+    }
+
+    async fn acquire_claimed_publication_from(
+        &self,
+        expected_head_etag: Option<&str>,
+    ) -> Result<Option<ClaimedPolicyPublication>> {
+        let lease_claim = self.publication_lease.acquire().await?;
+        match self
+            .claim_current_head(lease_claim, expected_head_etag)
+            .await
+        {
+            Ok(session) => Ok(session),
+            Err((error, lease_claim)) => {
+                self.release_publication_best_effort(&lease_claim).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn claim_current_head(
+        &self,
+        mut lease_claim: PolicyPublicationLeaseClaim,
+        expected_head_etag: Option<&str>,
+    ) -> std::result::Result<
+        Option<ClaimedPolicyPublication>,
+        (ZeppelinError, PolicyPublicationLeaseClaim),
+    > {
+        for _attempt in 0..PHASE_SEVEN_MIGRATION_ATTEMPTS {
+            let current = match self.load_current_unmigrated().await {
+                Ok(current) => current,
+                Err(error) => return Err((error, lease_claim)),
+            };
+            if expected_head_etag.is_some_and(|expected| expected != current.head_etag()) {
+                self.release_publication_best_effort(&lease_claim).await;
+                return Ok(None);
+            }
+            if current.snapshot().requires_phase_seven_all_migration() {
+                return Err((
+                    SecurityError::InvalidPolicy(
+                        "legacy wildcard policy must migrate before publication claim".to_string(),
+                    )
+                    .into(),
+                    lease_claim,
+                ));
+            }
+            lease_claim = match self.publication_lease.renew(&lease_claim).await {
+                Ok(renewed) => renewed,
+                Err(error) => return Err((error, lease_claim)),
+            };
+            let claimed_head = match current
+                .head()
+                .claim_publication(lease_claim.fencing_token())
+            {
+                Ok(claimed) => claimed,
+                Err(error) => return Err((error.into(), lease_claim)),
+            };
+            let head_bytes = match encode_policy_head(&claimed_head) {
+                Ok(bytes) => bytes,
+                Err(error) => return Err((error, lease_claim)),
+            };
+            let publication = match self
+                .store
+                .put_if_match_outcome(POLICY_HEAD_KEY, head_bytes, current.head_etag())
+                .await
+            {
+                Ok(publication) => publication,
+                Err(error) => return Err((error, lease_claim)),
+            };
+            let observed_at = Instant::now();
+            match publication {
+                ConditionalPutOutcome::Conflict => continue,
+                ConditionalPutOutcome::Updated {
+                    e_tag: Some(head_etag),
+                } => {
+                    return Ok(Some(ClaimedPolicyPublication {
+                        loaded: LoadedPolicy::from_publication(
+                            claimed_head,
+                            current.snapshot().clone(),
+                            head_etag,
+                            observed_at,
+                        ),
+                        lease_claim,
+                    }));
+                }
+                ConditionalPutOutcome::Updated { e_tag: None } => {
+                    let loaded = match self.load_current_unmigrated().await {
+                        Ok(loaded) => loaded,
+                        Err(error) => return Err((error, lease_claim)),
+                    };
+                    if loaded.head() != &claimed_head {
+                        return Err((SecurityError::PolicyConflict.into(), lease_claim));
+                    }
+                    return Ok(Some(ClaimedPolicyPublication {
+                        loaded,
+                        lease_claim,
+                    }));
+                }
+            }
+        }
+        Err((SecurityError::PolicyConflict.into(), lease_claim))
+    }
+
+    /// Release a claimed session whose caller validation did not install a guard.
+    pub(crate) async fn release_claimed_publication(&self, session: ClaimedPolicyPublication) {
+        self.release_publication_best_effort(&session.lease_claim)
+            .await;
+    }
+
+    /// Relinquish a retained lease while intentionally leaving its durable
+    /// guard for exact nonce recovery after a local post-CAS failure.
+    pub(crate) async fn release_branch_activation_permit(
+        &self,
+        permit: PolicyActivationGuardPermit,
+    ) {
+        self.release_publication_best_effort(&permit.lease_claim)
+            .await;
+    }
+
+    /// Take over the publication lease and retain an exact crash-recovery guard.
+    /// Callers inspect/revoke the target nonce before choosing finalize or abort.
+    pub(crate) async fn retain_pending_branch_activation(
+        &self,
+        session: ClaimedPolicyPublication,
+        branch_id: crate::namespace::BranchId,
+        activation_nonce: crate::namespace::branching::ActivationNonce,
+    ) -> Result<Option<(LoadedPolicy, PolicyActivationGuardPermit)>> {
+        let pending = session.loaded.head().pending_branch_activations();
+        let guard = pending
+            .get(&branch_id)
+            .filter(|guard| guard.activation_nonce() == activation_nonce)
+            .cloned();
+        let Some(guard) = guard else {
+            self.release_publication_best_effort(&session.lease_claim)
+                .await;
+            if pending.is_empty() {
+                // Claiming the head fenced every older holder. With no guard
+                // in that exact authoritative observation, the graph may
+                // safely revoke the target nonce without policy cleanup.
+                return Ok(None);
+            }
+            return Err(SecurityError::PolicyConflict.into());
+        };
+        let loaded = session.loaded;
+        let permit = PolicyActivationGuardPermit {
+            guard,
+            lease_claim: session.lease_claim,
+            head_etag: loaded.head_etag().to_string(),
+            control_revision: loaded.head().control_revision(),
+        };
+        Ok(Some((loaded, permit)))
+    }
+
+    /// CAS-insert one exact guard while retaining the same lease claim in the
+    /// returned permit. The permit is the only path to later target activation
+    /// verification and guard removal.
+    pub(crate) async fn insert_pending_branch_activation(
+        &self,
+        mut session: ClaimedPolicyPublication,
+        guard: PendingBranchActivation,
+    ) -> Result<(LoadedPolicy, PolicyActivationGuardPermit)> {
+        let result = self
+            .insert_pending_branch_activation_head(&mut session, &guard)
+            .await;
+        match result {
+            Ok(loaded) => {
+                let permit = PolicyActivationGuardPermit {
+                    guard,
+                    lease_claim: session.lease_claim,
+                    head_etag: loaded.head_etag().to_string(),
+                    control_revision: loaded.head().control_revision(),
+                };
+                Ok((loaded, permit))
+            }
+            Err(error) => {
+                self.release_publication_best_effort(&session.lease_claim)
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn insert_pending_branch_activation_head(
+        &self,
+        session: &mut ClaimedPolicyPublication,
+        guard: &PendingBranchActivation,
+    ) -> Result<LoadedPolicy> {
+        session.lease_claim = self.publication_lease.renew(&session.lease_claim).await?;
+        let guarded_head = session
+            .loaded
+            .head()
+            .insert_pending_branch_activation(guard.clone(), session.lease_claim.fencing_token())?;
+        let publication = self
+            .store
+            .put_if_match_outcome(
+                POLICY_HEAD_KEY,
+                encode_policy_head(&guarded_head)?,
+                session.loaded.head_etag(),
+            )
+            .await?;
+        let observed_at = Instant::now();
+        match publication {
+            ConditionalPutOutcome::Conflict => Err(SecurityError::PolicyConflict.into()),
+            ConditionalPutOutcome::Updated {
+                e_tag: Some(head_etag),
+            } => Ok(LoadedPolicy::from_publication(
+                guarded_head,
+                session.loaded.snapshot().clone(),
+                head_etag,
+                observed_at,
+            )),
+            ConditionalPutOutcome::Updated { e_tag: None } => {
+                let loaded = self.load_current_unmigrated().await?;
+                if loaded.head() != &guarded_head {
+                    return Err(SecurityError::PolicyConflict.into());
+                }
+                Ok(loaded)
+            }
+        }
+    }
+
+    /// Renew and strongly verify that the exact guard/lease/head permit remains
+    /// authoritative immediately before the target visibility CAS.
+    pub(crate) async fn renew_branch_activation_guard(
+        &self,
+        permit: &mut PolicyActivationGuardPermit,
+    ) -> Result<LoadedPolicy> {
+        permit.lease_claim = self.publication_lease.renew(&permit.lease_claim).await?;
+        let loaded = self.load_current_unmigrated().await?;
+        if loaded.head_etag() != permit.head_etag
+            || loaded.head().publication_fencing_token() != Some(permit.lease_claim.fencing_token())
+            || loaded
+                .head()
+                .pending_branch_activations()
+                .get(&permit.guard.branch_id())
+                != Some(&permit.guard)
+        {
+            return Err(SecurityError::PolicyConflict.into());
+        }
+        Ok(loaded)
+    }
+
+    /// Remove a guard after the matching target Active CAS committed.
+    pub(crate) async fn finalize_branch_activation(
+        &self,
+        permit: PolicyActivationGuardPermit,
+    ) -> Result<LoadedPolicy> {
+        self.resolve_branch_activation(permit, "finalized").await
+    }
+
+    /// Remove a guard only after the matching target nonce was durably revoked.
+    pub(crate) async fn abort_branch_activation(
+        &self,
+        permit: PolicyActivationGuardPermit,
+    ) -> Result<LoadedPolicy> {
+        self.resolve_branch_activation(permit, "aborted").await
+    }
+
+    async fn resolve_branch_activation(
+        &self,
+        mut permit: PolicyActivationGuardPermit,
+        outcome: &'static str,
+    ) -> Result<LoadedPolicy> {
+        let result = async {
+            let current = self.renew_branch_activation_guard(&mut permit).await?;
+            let resolved_head = current.head().remove_pending_branch_activation(
+                &permit.guard,
+                permit.lease_claim.fencing_token(),
+            )?;
+            let publication = self
+                .store
+                .put_if_match_outcome(
+                    POLICY_HEAD_KEY,
+                    encode_policy_head(&resolved_head)?,
+                    current.head_etag(),
+                )
+                .await?;
+            let observed_at = Instant::now();
+            let loaded = match publication {
+                ConditionalPutOutcome::Conflict => {
+                    return Err(SecurityError::PolicyConflict.into());
+                }
+                ConditionalPutOutcome::Updated {
+                    e_tag: Some(head_etag),
+                } => LoadedPolicy::from_publication(
+                    resolved_head,
+                    current.snapshot().clone(),
+                    head_etag,
+                    observed_at,
+                ),
+                ConditionalPutOutcome::Updated { e_tag: None } => {
+                    let loaded = self.load_current_unmigrated().await?;
+                    if loaded.head() != &resolved_head {
+                        return Err(SecurityError::PolicyConflict.into());
+                    }
+                    loaded
+                }
+            };
+            tracing::info!(
+                branch_id = %permit.guard.branch_id(),
+                activation_nonce = %permit.guard.activation_nonce(),
+                outcome,
+                "resolved pending branch activation policy guard"
+            );
+            Ok(loaded)
+        }
+        .await;
+        self.release_publication_best_effort(&permit.lease_claim)
+            .await;
+        result
+    }
+
+    async fn release_publication_best_effort(&self, claim: &PolicyPublicationLeaseClaim) {
+        if let Err(error) = self.publication_lease.release(claim).await {
+            tracing::warn!(
+                error = %error,
+                fencing_token = claim.fencing_token().get(),
+                "policy-publication lease release failed (best-effort)"
+            );
+        }
+    }
+
     pub(crate) async fn publish(
         &self,
         candidate: PolicySnapshot,
@@ -295,6 +657,38 @@ impl PolicyStore {
     ) -> Result<PolicyPublication> {
         candidate.validate_for_use()?;
         self.validate_entitlements(&candidate)?;
+        let mut session = match self
+            .acquire_claimed_publication_from(Some(expected_head_etag))
+            .await
+        {
+            Ok(Some(session)) => session,
+            Ok(None) | Err(ZeppelinError::Security(SecurityError::PolicyConflict)) => {
+                return Ok(PolicyPublication::Conflict);
+            }
+            Err(error) => return Err(error),
+        };
+        if !session
+            .loaded
+            .head()
+            .pending_branch_activations()
+            .is_empty()
+        {
+            self.release_publication_best_effort(&session.lease_claim)
+                .await;
+            return Ok(PolicyPublication::Guarded);
+        }
+
+        let result = self.publish_claimed(&mut session, candidate).await;
+        self.release_publication_best_effort(&session.lease_claim)
+            .await;
+        result
+    }
+
+    async fn publish_claimed(
+        &self,
+        session: &mut ClaimedPolicyPublication,
+        candidate: PolicySnapshot,
+    ) -> Result<PolicyPublication> {
         let object_key = format!("{POLICY_ROOT}/policies/{}.json", Ulid::new());
         let snapshot_bytes = serde_json::to_vec(&candidate).map_err(|error| {
             SecurityError::InvalidPolicy(format!("policy snapshot encoding failed: {error}"))
@@ -310,13 +704,19 @@ impl PolicyStore {
             }
         }
 
-        let head = PolicyHead::new(&candidate, object_key)?;
-        let head_bytes = serde_json::to_vec(&head).map_err(|error| {
-            SecurityError::InvalidPolicy(format!("policy head encoding failed: {error}"))
-        })?;
+        session.lease_claim = self.publication_lease.renew(&session.lease_claim).await?;
+        let head = session.loaded.head().advance_semantic(
+            &candidate,
+            object_key,
+            session.lease_claim.fencing_token(),
+        )?;
         let publication = self
             .store
-            .put_if_match_outcome(POLICY_HEAD_KEY, Bytes::from(head_bytes), expected_head_etag)
+            .put_if_match_outcome(
+                POLICY_HEAD_KEY,
+                encode_policy_head(&head)?,
+                session.loaded.head_etag(),
+            )
             .await?;
         let observed_at = Instant::now();
         match publication {
@@ -403,6 +803,55 @@ impl PolicyStore {
         )?;
         snapshot.validate_for_use()?;
         self.validate_entitlements(&snapshot)?;
+        let mut lease_claim = match self.acquire_bootstrap_publication().await? {
+            BootstrapPublicationAuthority::Existing(existing) => return Ok(existing),
+            BootstrapPublicationAuthority::Claimed(claim) => claim,
+        };
+        let result = self
+            .publish_bootstrap_claimed(snapshot, &mut lease_claim)
+            .await;
+        self.release_publication_best_effort(&lease_claim).await;
+        result
+    }
+
+    async fn acquire_bootstrap_publication(&self) -> Result<BootstrapPublicationAuthority> {
+        for _attempt in 0..BOOTSTRAP_LEASE_ATTEMPTS {
+            match self.publication_lease.acquire().await {
+                Ok(claim) => match self.load_current_unmigrated().await {
+                    Ok(existing) => {
+                        self.release_publication_best_effort(&claim).await;
+                        return Ok(BootstrapPublicationAuthority::Existing(existing));
+                    }
+                    Err(ZeppelinError::NotFound { .. }) => {
+                        return Ok(BootstrapPublicationAuthority::Claimed(claim));
+                    }
+                    Err(error) => {
+                        self.release_publication_best_effort(&claim).await;
+                        return Err(error);
+                    }
+                },
+                Err(ZeppelinError::Security(SecurityError::PolicyConflict)) => {
+                    match self.load_current_unmigrated().await {
+                        Ok(existing) => {
+                            return Ok(BootstrapPublicationAuthority::Existing(existing));
+                        }
+                        Err(ZeppelinError::NotFound { .. }) => {
+                            tokio::time::sleep(BOOTSTRAP_LEASE_RETRY_DELAY).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(SecurityError::PolicyConflict.into())
+    }
+
+    async fn publish_bootstrap_claimed(
+        &self,
+        snapshot: PolicySnapshot,
+        lease_claim: &mut PolicyPublicationLeaseClaim,
+    ) -> Result<LoadedPolicy> {
         let object_key = format!("{POLICY_ROOT}/policies/{}.json", Ulid::new());
         let snapshot_bytes = serde_json::to_vec(&snapshot).map_err(|error| {
             SecurityError::InvalidPolicy(format!("policy snapshot encoding failed: {error}"))
@@ -418,13 +867,12 @@ impl PolicyStore {
             }
         }
 
-        let head = PolicyHead::new(&snapshot, object_key)?;
-        let head_bytes = serde_json::to_vec(&head).map_err(|error| {
-            SecurityError::InvalidPolicy(format!("policy head encoding failed: {error}"))
-        })?;
+        *lease_claim = self.publication_lease.renew(lease_claim).await?;
+        let head = PolicyHead::new(&snapshot, object_key)?
+            .claim_publication(lease_claim.fencing_token())?;
         let publication = self
             .store
-            .put_create_outcome(POLICY_HEAD_KEY, Bytes::from(head_bytes))
+            .put_create_outcome(POLICY_HEAD_KEY, encode_policy_head(&head)?)
             .await?;
         let observed_at = Instant::now();
         match publication {
@@ -462,6 +910,12 @@ impl PolicyStore {
         }
         Ok(())
     }
+}
+
+fn encode_policy_head(head: &PolicyHead) -> Result<Bytes> {
+    serde_json::to_vec(head).map(Bytes::from).map_err(|error| {
+        SecurityError::InvalidPolicy(format!("policy head encoding failed: {error}")).into()
+    })
 }
 
 fn bootstrap_config_drifted(
