@@ -43,7 +43,12 @@ paths:
         anonymous requests receive 401 and authenticated principals without `SystemRead`
         receive 403. Operators may explicitly make only this route public with
         `[security].readyz_public = true`. An authorized request returns 503 if the
-        durable audit writer has failed or the storage backend is unreachable.
+        durable audit writer has failed, the storage backend is unreachable, or
+        authoritative branch roots require operator repair. Orphan-root repair
+        output is capped and contains only namespace/branch identities and digests;
+        readiness never removes a root automatically. When `readyz_public` is
+        enabled, the 503 remains generic and omits the operator repair bundle so
+        the public route cannot become a namespace-lineage oracle.
       tags: [Health]
       responses:
         "401":
@@ -78,6 +83,47 @@ paths:
                   s3_connected:
                     type: boolean
                     example: false
+                  branch_graph_healthy:
+                    type: boolean
+                    description: False when authoritative branch-root integrity cannot be proved.
+                  operator_repair:
+                    type: object
+                    description: Bounded, operator-safe orphan-root identities and digests.
+                    required:
+                      - orphan_branch_roots
+                      - has_additional_orphan_branch_roots
+                      - orphan_branch_roots_limit
+                    properties:
+                      orphan_branch_roots:
+                        type: array
+                        maxItems: 16
+                        items:
+                          type: object
+                          additionalProperties: false
+                          required:
+                            - source_namespace
+                            - branch_id
+                            - target_namespace
+                            - target_incarnation
+                            - source_generation
+                            - source_manifest_sha256
+                            - fork_view_sha256
+                            - source_config_sha256
+                          properties:
+                            source_namespace: { type: string }
+                            branch_id: { type: string }
+                            target_namespace: { type: string }
+                            target_incarnation: { type: string, format: uuid }
+                            source_generation: { type: integer, format: int64, minimum: 1 }
+                            source_manifest_sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+                            fork_view_sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+                            source_config_sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+                      has_additional_orphan_branch_roots:
+                        type: boolean
+                      orphan_branch_roots_limit:
+                        type: integer
+                        minimum: 1
+                        maximum: 16
                   error:
                     type: string
 

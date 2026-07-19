@@ -1,14 +1,244 @@
 mod common;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::fault_injection::synchronize_cas_pair_matching_payloads_with_winner;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use common::fault_injection::{
+    pause_next_cas_matching_payload, synchronize_cas_pair_matching_payloads_with_winner,
+    toggle_cas_precondition_failure_matching,
+};
 use common::harness::TestHarness;
 use common::server::{
-    client_with_bearer, start_test_server_on_store_with_config, start_test_server_with_config,
+    client_with_bearer, scoped_test_security_store, start_test_server_full,
+    start_test_server_on_store_with_config, start_test_server_with_config,
 };
 use serde_json::{json, Value};
 use zeppelin::config::Config;
+use zeppelin::namespace::manager::NamespaceMetadata;
+use zeppelin::time::{Clock, TimeSource};
+
+#[derive(Debug)]
+struct AdjustableActivationClock(Mutex<DateTime<Utc>>);
+
+impl AdjustableActivationClock {
+    fn new(now: DateTime<Utc>) -> Self {
+        Self(Mutex::new(now))
+    }
+
+    fn advance(&self, duration: ChronoDuration) {
+        let mut now = self
+            .0
+            .lock()
+            .expect("activation test clock mutex must not be poisoned");
+        *now += duration;
+    }
+}
+
+impl TimeSource for AdjustableActivationClock {
+    fn now(&self) -> DateTime<Utc> {
+        *self
+            .0
+            .lock()
+            .expect("activation test clock mutex must not be poisoned")
+    }
+}
+
+fn assert_sha256_hex(value: &Value, field: &str) {
+    let digest = value[field]
+        .as_str()
+        .unwrap_or_else(|| panic!("{field} must be a string in {value}"));
+    assert_eq!(digest.len(), 64, "{field} must be one SHA-256 digest");
+    assert!(
+        digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{field} must contain only hexadecimal digits: {digest}"
+    );
+}
+
+#[tokio::test]
+async fn readyz_reports_bounded_orphan_root_repair_identity_without_storage_or_policy_data() {
+    let harness = TestHarness::new().await;
+    let mut config = Config::default();
+    config.branching.enabled = true;
+    config.security.policy_refresh_secs = 3_600;
+    let (base_url, _cache, _cache_dir, admin_bearer) = start_test_server_on_store_with_config(
+        &harness,
+        harness.store.clone(),
+        Some(harness.prefix.clone()),
+        config,
+    )
+    .await;
+    let client = client_with_bearer(&admin_bearer);
+    let source = harness.artifact_origin_namespace("ready-orphan-source");
+    let target = harness.artifact_origin_namespace("ready-orphan-target");
+
+    let create = client
+        .post(format!("{base_url}/v1/namespaces"))
+        .json(&json!({
+            "name": source,
+            "dimensions": 4,
+            "distance_metric": "cosine"
+        }))
+        .send()
+        .await
+        .expect("source create request must complete");
+    assert_eq!(create.status(), reqwest::StatusCode::CREATED);
+
+    let fork = client
+        .post(format!("{base_url}/v1/namespaces/{source}/branches"))
+        .json(&json!({ "target": target }))
+        .send()
+        .await
+        .expect("fork request must complete");
+    assert_eq!(fork.status(), reqwest::StatusCode::CREATED);
+    let fork_body: Value = fork.json().await.expect("fork response must decode");
+
+    let healthy = client
+        .get(format!("{base_url}/readyz"))
+        .send()
+        .await
+        .expect("healthy readiness request must complete");
+    assert_eq!(healthy.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        healthy.json::<Value>().await.unwrap(),
+        json!({"status": "ready", "s3_connected": true})
+    );
+
+    harness
+        .store
+        .delete(&NamespaceMetadata::s3_key(&target))
+        .await
+        .expect("fixture must remove only the exact child metadata object");
+
+    let response = client
+        .get(format!("{base_url}/readyz"))
+        .send()
+        .await
+        .expect("orphan-root readiness request must complete");
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response
+        .json()
+        .await
+        .expect("readiness response must decode");
+    assert_eq!(body["status"], "not_ready");
+    assert_eq!(body["s3_connected"], true);
+    assert_eq!(body["branch_graph_healthy"], false);
+    assert_eq!(
+        body["error"],
+        "branch graph integrity requires operator repair"
+    );
+
+    let repair = &body["operator_repair"];
+    assert_eq!(repair["orphan_branch_roots_limit"], 16);
+    assert_eq!(repair["has_additional_orphan_branch_roots"], false);
+    let findings = repair["orphan_branch_roots"]
+        .as_array()
+        .expect("repair bundle must contain a bounded finding array");
+    assert!(
+        findings.len() <= 16,
+        "repair bundle exceeded its wire limit"
+    );
+    assert_eq!(findings.len(), 1);
+    let finding = &findings[0];
+    assert_eq!(finding["source_namespace"], source);
+    assert_eq!(finding["branch_id"], fork_body["branch_id"]);
+    assert_eq!(finding["target_namespace"], target);
+    assert_eq!(
+        finding["target_incarnation"],
+        fork_body["target"]["incarnation"]
+    );
+    assert_eq!(
+        finding["source_generation"],
+        fork_body["source"]["generation"]
+    );
+    assert_sha256_hex(finding, "source_manifest_sha256");
+    assert_sha256_hex(finding, "fork_view_sha256");
+    assert_sha256_hex(finding, "source_config_sha256");
+    let finding_keys = finding
+        .as_object()
+        .expect("repair finding must be an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        finding_keys,
+        std::collections::BTreeSet::from([
+            "branch_id",
+            "fork_view_sha256",
+            "source_config_sha256",
+            "source_generation",
+            "source_manifest_sha256",
+            "source_namespace",
+            "target_incarnation",
+            "target_namespace",
+        ]),
+        "operator repair findings may expose only identities and digests"
+    );
+    let raw = body.to_string();
+    for forbidden in [
+        "http://",
+        "https://",
+        "manifest.json",
+        "meta.json",
+        "bucket",
+        "access_key",
+        "secret",
+        "policy",
+        "created_at",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "readiness repair bundle leaked forbidden data {forbidden:?}: {raw}"
+        );
+    }
+
+    let mut public_config = Config::default();
+    public_config.branching.enabled = true;
+    public_config.security.readyz_public = true;
+    public_config.security.policy_refresh_secs = 3_600;
+    let (public_base_url, _public_cache, _public_cache_dir, _public_admin_bearer) =
+        start_test_server_on_store_with_config(
+            &harness,
+            harness.store.clone(),
+            Some(harness.prefix.clone()),
+            public_config,
+        )
+        .await;
+    let public_response = reqwest::Client::new()
+        .get(format!("{public_base_url}/readyz"))
+        .send()
+        .await
+        .expect("public orphan-root readiness request must complete");
+    assert_eq!(
+        public_response.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let public_body: Value = public_response
+        .json()
+        .await
+        .expect("public readiness response must decode");
+    assert_eq!(public_body["status"], "not_ready");
+    assert_eq!(public_body["s3_connected"], true);
+    assert_eq!(public_body["branch_graph_healthy"], false);
+    assert!(
+        public_body.get("operator_repair").is_none(),
+        "public readiness must not disclose the operator repair bundle: {public_body}"
+    );
+    let public_raw = public_body.to_string();
+    for private_identity in [
+        source.as_str(),
+        target.as_str(),
+        fork_body["branch_id"].as_str().unwrap(),
+        fork_body["target"]["incarnation"].as_str().unwrap(),
+    ] {
+        assert!(
+            !public_raw.contains(private_identity),
+            "public readiness leaked branch identity {private_identity:?}: {public_raw}"
+        );
+    }
+
+    harness.cleanup().await;
+}
 
 #[tokio::test]
 async fn authorized_http_fork_is_immediately_queryable_and_exact_retry_is_idempotent() {
@@ -91,6 +321,130 @@ async fn authorized_http_fork_is_immediately_queryable_and_exact_retry_is_idempo
 
     harness.cleanup_artifact_origin_namespace(&target).await;
     harness.cleanup_artifact_origin_namespace(&source).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn exact_active_retry_finalizes_a_crash_retained_policy_guard() {
+    const ACTIVE_PAYLOAD: &[u8] = b"\"state\": \"active\"";
+
+    let harness = TestHarness::new().await;
+    let source = harness.artifact_origin_namespace("retained-guard-source");
+    let target = harness.artifact_origin_namespace("retained-guard-target");
+    let scoped_store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let (store, target_activation) = pause_next_cas_matching_payload(
+        &scoped_store,
+        format!("{target}/meta.json"),
+        ACTIVE_PAYLOAD,
+    );
+    let (store, guard_cleanup_failure) =
+        toggle_cas_precondition_failure_matching(&store, "_security/heads/policy.json");
+    let wall_clock = Arc::new(AdjustableActivationClock::new(Utc::now()));
+    let clock = Clock::from_source(wall_clock.clone());
+    let mut config = Config::default();
+    config.branching.enabled = true;
+    config.security.policy_refresh_secs = 3_600;
+    let server = start_test_server_full(store, None, config, false, Some(clock)).await;
+    let client = client_with_bearer(&server.admin_bearer);
+
+    let create = client
+        .post(format!("{}/v1/namespaces", server.base_url))
+        .json(&json!({
+            "name": source,
+            "dimensions": 4,
+            "distance_metric": "cosine"
+        }))
+        .send()
+        .await
+        .expect("source create request must complete");
+    assert_eq!(create.status(), reqwest::StatusCode::CREATED);
+
+    target_activation.arm();
+    let fork_client = client.clone();
+    let fork_url = format!("{}/v1/namespaces/{source}/branches", server.base_url);
+    let target_for_fork = target.clone();
+    let fork = tokio::spawn(async move {
+        fork_client
+            .post(fork_url)
+            .json(&json!({ "target": target_for_fork }))
+            .send()
+            .await
+            .expect("fork request must complete")
+    });
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        target_activation.wait_until_paused(),
+    )
+    .await
+    .expect("guarded activation must reach the target Active CAS");
+    guard_cleanup_failure.enable();
+    target_activation.release();
+    let fork = tokio::time::timeout(Duration::from_secs(30), fork)
+        .await
+        .expect("fork must finish after the target activation is released")
+        .expect("fork task must not panic");
+    let fork_status = fork.status();
+    let fork_body = fork
+        .text()
+        .await
+        .expect("fork response body must be readable");
+    assert_eq!(
+        fork_status,
+        reqwest::StatusCode::CREATED,
+        "committed activation must survive lost guard cleanup: body={fork_body} policy_cas_failures={}",
+        guard_cleanup_failure.failures_injected()
+    );
+    assert_eq!(
+        guard_cleanup_failure.failures_injected(),
+        1,
+        "the committed activation must lose exactly its first guard-finalization CAS"
+    );
+
+    guard_cleanup_failure.disable();
+    wall_clock.advance(ChronoDuration::seconds(31));
+    let retry = client
+        .post(format!(
+            "{}/v1/namespaces/{source}/branches",
+            server.base_url
+        ))
+        .json(&json!({ "target": target }))
+        .send()
+        .await
+        .expect("exact active retry must complete");
+    let retry_status = retry.status();
+    let retry_body: Value = retry
+        .json()
+        .await
+        .expect("exact active retry response must decode");
+    assert_eq!(
+        retry_status,
+        reqwest::StatusCode::OK,
+        "exact active retry must converge the retained guard: {retry_body}"
+    );
+    assert_eq!(retry_body["created"], false);
+
+    let policy_mutation = client
+        .post(format!("{}/v1/security/principals", server.base_url))
+        .json(&json!({
+            "principal_id": "service:post-activation-guard",
+            "kind": "service",
+            "display_name": "post activation guard"
+        }))
+        .send()
+        .await
+        .expect("policy mutation after guard recovery must complete");
+    let mutation_status = policy_mutation.status();
+    let mutation_body: Value = policy_mutation
+        .json()
+        .await
+        .expect("policy mutation response must decode");
+    assert_eq!(
+        mutation_status,
+        reqwest::StatusCode::CREATED,
+        "active retry must remove the guard before a later policy mutation: {mutation_body}"
+    );
+
+    server.shutdown().await;
     harness.cleanup().await;
 }
 

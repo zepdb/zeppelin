@@ -224,6 +224,7 @@ impl ArmedPauseCasHandle {
 pub struct PauseCasStore {
     inner: Arc<dyn ObjectStore>,
     needle: String,
+    payload_needle: Option<Vec<u8>>,
     armed: Arc<AtomicBool>,
     arrivals: Arc<AtomicUsize>,
     entered: Arc<tokio::sync::Notify>,
@@ -609,6 +610,7 @@ pub fn pause_first_cas_matching(
     let wrapper = PauseCasStore {
         inner: store.inner(),
         needle: needle.into(),
+        payload_needle: None,
         armed,
         arrivals: Arc::clone(&arrivals),
         entered: Arc::clone(&entered),
@@ -637,6 +639,38 @@ pub fn pause_next_cas_matching(
     let wrapper = PauseCasStore {
         inner: store.inner(),
         needle: needle.into(),
+        payload_needle: None,
+        armed: Arc::clone(&armed),
+        arrivals: Arc::clone(&arrivals),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    (
+        ZeppelinStore::new(Arc::new(wrapper)),
+        ArmedPauseCasHandle {
+            armed,
+            arrivals,
+            entered,
+            release,
+        },
+    )
+}
+
+/// Wrap a store with an initially disarmed one-shot pause before a matching
+/// ETag-update PUT whose payload contains the exact byte sequence.
+pub fn pause_next_cas_matching_payload(
+    store: &ZeppelinStore,
+    needle: impl Into<String>,
+    payload_needle: impl Into<Vec<u8>>,
+) -> (ZeppelinStore, ArmedPauseCasHandle) {
+    let armed = Arc::new(AtomicBool::new(false));
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let wrapper = PauseCasStore {
+        inner: store.inner(),
+        needle: needle.into(),
+        payload_needle: Some(payload_needle.into()),
         armed: Arc::clone(&armed),
         arrivals: Arc::clone(&arrivals),
         entered: Arc::clone(&entered),
@@ -1770,8 +1804,13 @@ impl ObjectStore for PauseCasStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> OsResult<PutResult> {
+        let payload_matches = self
+            .payload_needle
+            .as_ref()
+            .is_none_or(|needle| put_payload_contains(&payload, needle));
         let should_pause = location.as_ref().contains(&self.needle)
             && matches!(&opts.mode, PutMode::Update(_))
+            && payload_matches
             && self
                 .armed
                 .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)

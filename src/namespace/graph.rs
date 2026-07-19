@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
@@ -52,6 +53,69 @@ use crate::wal::{Lease, LeaseManager, Manifest};
 
 const MAX_PREPARE_ATTEMPTS: usize = 16;
 const NEVER_ACTIVE_CLEANUP_BUDGET: Duration = Duration::from_secs(25);
+const ORPHAN_BRANCH_ROOT_READINESS_LIMIT: usize = 16;
+
+/// Operator-safe identity and digest projection for one orphan branch root.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct OrphanBranchRootRepairSummary {
+    source_namespace: NamespaceId,
+    branch_id: BranchId,
+    target_namespace: NamespaceId,
+    target_incarnation: NamespaceIncarnationId,
+    source_generation: u64,
+    source_manifest_sha256: String,
+    fork_view_sha256: String,
+    source_config_sha256: String,
+}
+
+impl OrphanBranchRootRepairSummary {
+    fn from_root(source_namespace: NamespaceId, root: &BranchRoot) -> Self {
+        Self {
+            source_namespace,
+            branch_id: root.branch_id,
+            target_namespace: root.target_namespace.clone(),
+            target_incarnation: root.target_incarnation.clone(),
+            source_generation: root.source_generation.get(),
+            source_manifest_sha256: sha256_hex(root.source_manifest_sha256.as_bytes()),
+            fork_view_sha256: sha256_hex(root.fork_view_sha256.as_bytes()),
+            source_config_sha256: sha256_hex(root.source_config_sha256.as_bytes()),
+        }
+    }
+}
+
+/// Bounded, read-only branch-graph readiness observation.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct BranchGraphReadinessReport {
+    orphan_branch_roots: Vec<OrphanBranchRootRepairSummary>,
+    has_additional_orphan_branch_roots: bool,
+    orphan_branch_roots_limit: usize,
+}
+
+impl BranchGraphReadinessReport {
+    #[must_use]
+    fn healthy() -> Self {
+        Self {
+            orphan_branch_roots: Vec::new(),
+            has_additional_orphan_branch_roots: false,
+            orphan_branch_roots_limit: ORPHAN_BRANCH_ROOT_READINESS_LIMIT,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.orphan_branch_roots.is_empty()
+    }
+}
+
+fn sha256_hex(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(*byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+    }
+    encoded
+}
 
 /// Deep lifecycle boundary for namespace graph mutations and repair.
 pub(crate) struct NamespaceGraph {
@@ -4851,6 +4915,129 @@ impl NamespaceGraph {
         self.verify_active_branch(metadata).await?;
         self.verify_live_child_roots(metadata, started, budget)
             .await
+    }
+
+    async fn orphan_root_still_authoritative(
+        &self,
+        parent: &NamespaceMetadata,
+        expected_root: &BranchRoot,
+    ) -> Result<bool> {
+        let reread = match parent.incarnation_id.as_ref() {
+            Some(incarnation) => {
+                Manifest::read_versioned_required_for_incarnation(
+                    &self.store,
+                    &parent.name,
+                    incarnation.as_uuid(),
+                )
+                .await
+            }
+            None => Manifest::read_versioned_required(&self.store, &parent.name).await,
+        };
+        let (manifest, _) = match reread {
+            Ok(value) => value,
+            Err(
+                ZeppelinError::NamespaceNotFound { .. }
+                | ZeppelinError::ManifestNotFound { .. }
+                | ZeppelinError::NotFound { .. },
+            ) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        match manifest.branch_roots().get(&expected_root.branch_id) {
+            None => Ok(false),
+            Some(current) if current == expected_root => Ok(true),
+            Some(_) => Err(BranchError::BranchRootMismatch {
+                branch_id: expected_root.branch_id,
+            }
+            .into()),
+        }
+    }
+
+    /// Inspect authoritative parent roots for child lifetimes whose metadata is absent.
+    ///
+    /// The scan is read-only. A missing child is reported only after a second
+    /// strong parent-manifest read proves the exact root is still authoritative,
+    /// preventing a completed concurrent root release from producing a false
+    /// readiness failure. Findings are projected to identities and digests and
+    /// capped independently of the number of namespaces in storage.
+    pub(crate) async fn inspect_readiness(
+        &self,
+        namespace_prefix: Option<&str>,
+    ) -> Result<BranchGraphReadinessReport> {
+        let mut report = BranchGraphReadinessReport::healthy();
+        // Namespace names are top-level path components, while a test scope is
+        // a lexical name prefix rather than an S3 directory. Discover at the
+        // root and filter names exactly as NamespaceManager::list does so the
+        // memory and S3 adapters cannot disagree about partial-prefix syntax.
+        let mut prefixes = self.store.list_common_prefixes("").await?;
+        if let Some(namespace_prefix) = namespace_prefix {
+            prefixes.retain(|prefix| prefix.trim_end_matches('/').starts_with(namespace_prefix));
+        }
+        for prefix in prefixes {
+            let parent_name = prefix.trim_end_matches('/');
+            let Ok(parent_id) = NamespaceId::new(parent_name.to_string()) else {
+                continue;
+            };
+            let (parent, _) = match self
+                .namespace_manager
+                .read_metadata_versioned(parent_name)
+                .await
+            {
+                Ok(value) => value,
+                Err(ZeppelinError::NamespaceNotFound { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            let manifest = match parent.incarnation_id.as_ref() {
+                Some(incarnation) => {
+                    Manifest::read_versioned_required_for_incarnation(
+                        &self.store,
+                        parent_name,
+                        incarnation.as_uuid(),
+                    )
+                    .await
+                }
+                None => Manifest::read_versioned_required(&self.store, parent_name).await,
+            };
+            let (manifest, _) = match manifest {
+                Ok(value) => value,
+                Err(
+                    ZeppelinError::NamespaceNotFound { .. }
+                    | ZeppelinError::ManifestNotFound { .. }
+                    | ZeppelinError::NotFound { .. },
+                ) if parent.state == NamespaceState::Deleting => continue,
+                Err(error) => return Err(error),
+            };
+
+            for root in manifest.branch_roots().values() {
+                match self
+                    .namespace_manager
+                    .read_metadata_versioned(root.target_namespace.as_str())
+                    .await
+                {
+                    Ok((target, _)) if Self::target_matches_child_root(&parent, &target, root) => {}
+                    Ok(_) => {
+                        self.confirm_child_root_failure(&parent, root, false)
+                            .await?;
+                    }
+                    Err(ZeppelinError::NamespaceNotFound { .. }) => {
+                        if !self.orphan_root_still_authoritative(&parent, root).await? {
+                            continue;
+                        }
+                        if report.orphan_branch_roots.len() == ORPHAN_BRANCH_ROOT_READINESS_LIMIT {
+                            report.has_additional_orphan_branch_roots = true;
+                            return Ok(report);
+                        }
+                        report
+                            .orphan_branch_roots
+                            .push(OrphanBranchRootRepairSummary::from_root(
+                                parent_id.clone(),
+                                root,
+                            ));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Resolve expired activation guards, resume governed deletion, and repair

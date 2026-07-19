@@ -709,7 +709,7 @@ async fn start_test_server_with_config_inner(
         audit,
         credential_adapter,
         namespace_manager: namespace_manager(&config, &harness.store, &clock, &security),
-        namespace_name_prefix: None,
+        namespace_name_prefix: Some(harness.prefix.clone()),
         wal_writer: Arc::new(WalWriter::with_clock(harness.store.clone(), clock)),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         compactor,

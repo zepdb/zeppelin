@@ -90,7 +90,7 @@ use prometheus::{Encoder, TextEncoder};
 use serde_json::{json, Value};
 
 use crate::error::ZeppelinError;
-use crate::server::{current_request_id, AppState};
+use crate::server::{current_request_id, namespace_graph, AppState};
 
 /// Adapts an owned Zeppelin domain failure to Axum's response protocol.
 ///
@@ -455,13 +455,13 @@ pub async fn health_check() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
-/// Checks whether the configured object store is reachable for list operations.
+/// Checks durable audit, object-store, and namespace-graph readiness.
 ///
 /// Readiness lists an intentionally unlikely prefix through
-/// [`crate::storage::ZeppelinStore`]. A successful empty listing is sufficient;
-/// this probe does not read a namespace manifest or prove that any particular
-/// immutable artifact exists. Failure text from `object_store` may include an
-/// endpoint, port, or bucket, so only a generic reason reaches the caller.
+/// [`crate::storage::ZeppelinStore`], then performs a read-only graph scan for
+/// parent roots whose exact child metadata is absent. Failure text from
+/// `object_store` may include an endpoint, port, or bucket, so only a generic
+/// reason reaches the caller.
 ///
 /// # Parameters
 ///
@@ -470,27 +470,30 @@ pub async fn health_check() -> Json<Value> {
 /// # Returns
 ///
 /// `Ok` with JSON `{"status":"ready","s3_connected":true}` and status 200
-/// when listing succeeds. Returns a direct `(503, JSON)` rejection with
-/// `s3_connected:false` when it fails; this operational body is intentionally
-/// distinct from the canonical domain-error envelope.
+/// when listing and graph inspection succeed. Returns a direct `(503, JSON)`
+/// rejection with `s3_connected:false` when the reachability probe fails. An
+/// orphan root returns `s3_connected:true` plus a bounded identities-and-digests
+/// operator repair summary; this operational body is intentionally distinct
+/// from the canonical domain-error envelope.
 ///
 /// # Errors
 ///
-/// The error return represents an unavailable durable audit actor or an
-/// unreachable storage backend. No raw backend diagnostic is returned, and no
-/// partial mutation can occur because the storage probe only lists.
+/// The error return represents an unavailable durable audit actor, an
+/// unreachable storage backend, or an unhealthy branch graph. No raw backend
+/// diagnostic is returned, and no partial mutation can occur because both
+/// storage checks are read-only.
 ///
 /// # Side Effects
 ///
-/// Checks the process-local durable-audit health latch, then performs one
-/// object-store list request. It logs either full failure and `/readyz` bypasses
-/// rate-limit charging.
+/// Checks the process-local durable-audit health latch, performs the existing
+/// object-store list request, then strongly reads namespace metadata and
+/// manifests. It logs full failures and `/readyz` bypasses rate-limit charging.
 ///
 /// # Consistency
 ///
-/// Success means the audit actor has not failed and S3 is reachable at that
-/// instant; it is not authoritative namespace state or a promise that a later
-/// request cannot fail.
+/// Success means the audit actor has not failed, S3 is reachable, and the
+/// completed graph scan found no authoritative orphan root at that instant. It
+/// is not a promise that a later request cannot fail.
 ///
 /// # Examples
 ///
@@ -512,16 +515,64 @@ pub async fn readiness_check(
             })),
         ));
     }
-    match state.store.list_prefix("__healthcheck__").await {
-        Ok(_) => Ok(Json(json!({"status": "ready", "s3_connected": true}))),
-        Err(e) => {
-            tracing::error!(error = %e, "readiness check failed: storage backend unreachable");
+    if let Err(e) = state.store.list_prefix("__healthcheck__").await {
+        tracing::error!(error = %e, "readiness check failed: storage backend unreachable");
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not_ready",
+                "s3_connected": false,
+                "error": "storage backend is unreachable",
+            })),
+        ));
+    }
+
+    match namespace_graph(&state)
+        .inspect_readiness(state.namespace_name_prefix.as_deref())
+        .await
+    {
+        Ok(report) if report.is_healthy() => {
+            Ok(Json(json!({"status": "ready", "s3_connected": true})))
+        }
+        Ok(report) => {
+            tracing::error!(
+                report = ?report,
+                "readiness check failed: branch graph requires operator repair"
+            );
+            if state.config.security.readyz_public {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "status": "not_ready",
+                        "s3_connected": true,
+                        "branch_graph_healthy": false,
+                        "error": "branch graph integrity requires operator repair",
+                    })),
+                ));
+            }
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
                     "status": "not_ready",
-                    "s3_connected": false,
-                    "error": "storage backend is unreachable",
+                    "s3_connected": true,
+                    "branch_graph_healthy": false,
+                    "error": "branch graph integrity requires operator repair",
+                    "operator_repair": report,
+                })),
+            ))
+        }
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "readiness check failed: branch graph inspection failed"
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "not_ready",
+                    "s3_connected": true,
+                    "branch_graph_healthy": false,
+                    "error": "branch graph integrity check failed",
                 })),
             ))
         }
