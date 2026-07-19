@@ -207,6 +207,13 @@ async fn activation_and_prepared_cancellation_cas_have_one_winner_without_resurr
         reqwest::StatusCode::CONFLICT,
         "a lost Active CAS must not report the cancelled target as active: {cancelled_fork_body}"
     );
+    let cancelled_fork_envelope: serde_json::Value = serde_json::from_str(&cancelled_fork_body)
+        .expect("cancel-winner fork response must use the canonical JSON error envelope");
+    assert_eq!(
+        cancelled_fork_envelope["code"], "branch_intent_mismatch",
+        "a durable cancellation winner is an intent conflict, not an internal error"
+    );
+    assert_eq!(cancelled_fork_envelope["retryable"], false);
     assert!(
         matches!(
             cancelled_delete.status(),
@@ -294,11 +301,20 @@ async fn activation_and_prepared_cancellation_cas_have_one_winner_without_resurr
         "the reverse ordering must also have one target-metadata CAS winner"
     );
     assert_eq!(active_fork.status(), reqwest::StatusCode::CREATED);
+    let active_delete_status = active_delete.status();
+    let active_delete_body = active_delete
+        .text()
+        .await
+        .expect("activation-winner delete response body must be readable");
     assert_eq!(
-        active_delete.status(),
+        active_delete_status,
         reqwest::StatusCode::CONFLICT,
-        "the cancellation loser must not delete an active branch"
+        "the cancellation loser must not delete an active branch: {active_delete_body}"
     );
+    let active_delete_envelope: serde_json::Value = serde_json::from_str(&active_delete_body)
+        .expect("activation-winner delete response must use the canonical JSON error envelope");
+    assert_eq!(active_delete_envelope["code"], "branch_target_exists");
+    assert_eq!(active_delete_envelope["retryable"], false);
 
     let active_query = client
         .post(format!("{base_url}/v1/namespaces/{active_target}/query"))

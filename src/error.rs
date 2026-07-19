@@ -511,8 +511,10 @@ impl ZeppelinError {
             ZeppelinError::Branch(error)
                 if matches!(
                     error.as_ref(),
-                    crate::namespace::branching::BranchError::NamespaceHasLiveBranches { .. }
+                    crate::namespace::branching::BranchError::TargetAlreadyExists { .. }
+                        | crate::namespace::branching::BranchError::NamespaceHasLiveBranches { .. }
                         | crate::namespace::branching::BranchError::BranchHasLiveChildren { .. }
+                        | crate::namespace::branching::BranchError::CancellationInProgress { .. }
                 ) =>
             {
                 409
@@ -594,6 +596,9 @@ impl ZeppelinError {
             ZeppelinError::Config(_) => "INTERNAL_ERROR",
             ZeppelinError::Security(error) => error.code(),
             ZeppelinError::Branch(error) => match error.as_ref() {
+                crate::namespace::branching::BranchError::TargetAlreadyExists { .. } => {
+                    "branch_target_exists"
+                }
                 crate::namespace::branching::BranchError::NamespaceHasLiveBranches { .. } => {
                     "namespace_has_live_branches"
                 }
@@ -602,6 +607,9 @@ impl ZeppelinError {
                 }
                 crate::namespace::branching::BranchError::BranchIntegrity => {
                     "branch_integrity_error"
+                }
+                crate::namespace::branching::BranchError::CancellationInProgress { .. } => {
+                    "branch_intent_mismatch"
                 }
                 _ => "INTERNAL_ERROR",
             },
@@ -724,6 +732,15 @@ impl ZeppelinError {
             }
             ZeppelinError::Storage(_) | ZeppelinError::StoragePath(_) => {
                 "a transient storage error occurred; please retry".to_string()
+            }
+            ZeppelinError::Branch(error)
+                if matches!(
+                    error.as_ref(),
+                    crate::namespace::branching::BranchError::TargetAlreadyExists { .. }
+                        | crate::namespace::branching::BranchError::CancellationInProgress { .. }
+                ) =>
+            {
+                error.to_string()
             }
             ZeppelinError::Json(_)
             | ZeppelinError::Bincode(_)
