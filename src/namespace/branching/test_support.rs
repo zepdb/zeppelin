@@ -40,6 +40,7 @@ use super::deletion::{
     deletion_decision_evidence_key, AuthorizedBranchList, AuthorizedNamespaceDelete,
     DeletionBoundary, DeletionDecision, DeletionGovernance, DeletionLifecycleAudit,
 };
+use super::activation::{BranchActivationGuard, BranchActivationRecovery};
 use super::{
     ActivationNonce, ArtifactOrigin, ArtifactOriginIndex, BranchActivationEvidence,
     BranchDescriptor, BranchId, BranchLineage, BranchMaintenanceReport, BranchPrepareStage,
@@ -222,6 +223,19 @@ fn graph_for_test_with_config_and_clock(
 
 struct TestDeletionGovernance;
 
+struct TestBranchActivationRecovery;
+
+#[async_trait]
+impl BranchActivationRecovery for TestBranchActivationRecovery {
+    async fn retain_guard(
+        &self,
+        _branch_id: BranchId,
+        _nonce: ActivationNonce,
+    ) -> Result<Option<Box<dyn BranchActivationGuard>>> {
+        Ok(None)
+    }
+}
+
 #[async_trait]
 impl DeletionGovernance for TestDeletionGovernance {
     async fn preservation_boundary(
@@ -336,7 +350,11 @@ pub async fn maintain_branches_for_test(
     budget: Duration,
 ) -> Result<BranchMaintenanceReport> {
     graph_for_test(store, indexing, branching)?
-        .maintain(Arc::new(TestDeletionGovernance), budget)
+        .maintain(
+            Arc::new(TestDeletionGovernance),
+            Arc::new(TestBranchActivationRecovery),
+            budget,
+        )
         .await
 }
 
@@ -351,7 +369,11 @@ pub async fn maintain_branches_with_config_and_clock_for_test(
     budget: Duration,
 ) -> Result<BranchMaintenanceReport> {
     graph_for_test_with_config_and_clock(store, config, clock)?
-        .maintain(Arc::new(TestDeletionGovernance), budget)
+        .maintain(
+            Arc::new(TestDeletionGovernance),
+            Arc::new(TestBranchActivationRecovery),
+            budget,
+        )
         .await
 }
 
@@ -374,6 +396,7 @@ pub async fn delete_namespace_for_test(
                 decision_evidence_ref: deletion_decision_evidence_key(decision_id),
             },
             governance: Arc::new(TestDeletionGovernance),
+            activation_recovery: Arc::new(TestBranchActivationRecovery),
         })
         .await
 }
@@ -387,7 +410,12 @@ pub async fn resume_delete_for_test(
     budget: Duration,
 ) -> Result<NamespaceDeleteOutcome> {
     graph_for_test(store, indexing, branching)?
-        .resume_delete(&namespace, Arc::new(TestDeletionGovernance), budget)
+        .resume_delete(
+            &namespace,
+            Arc::new(TestDeletionGovernance),
+            Arc::new(TestBranchActivationRecovery),
+            budget,
+        )
         .await
 }
 
@@ -403,7 +431,12 @@ pub async fn resume_delete_with_config_and_clock_for_test(
     budget: Duration,
 ) -> Result<NamespaceDeleteOutcome> {
     graph_for_test_with_config_and_clock(store, config, clock)?
-        .resume_delete(&namespace, Arc::new(TestDeletionGovernance), budget)
+        .resume_delete(
+            &namespace,
+            Arc::new(TestDeletionGovernance),
+            Arc::new(TestBranchActivationRecovery),
+            budget,
+        )
         .await
 }
 

@@ -1123,11 +1123,17 @@ fn spawn_namespace_delete_cleanup(state: &AppState, namespace: NamespaceId) {
     let governance = state
         .security
         .namespace_delete_maintenance_governance(state.store.clone(), state.clock.clone());
+    let activation_recovery = state.security.branch_activation_recovery();
     state
         .server_tasks
         .spawn("namespace delete cleanup", async move {
             match graph
-                .resume_delete(&namespace, governance, Duration::from_secs(25))
+                .resume_delete(
+                    &namespace,
+                    governance,
+                    activation_recovery,
+                    Duration::from_secs(25),
+                )
                 .await
             {
                 Ok(crate::namespace::branching::NamespaceDeleteOutcome::Deleted) => {

@@ -147,6 +147,7 @@ use crate::cache::DiskCache;
 use crate::config::{Config, GcConfig};
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
+use crate::namespace::branching::activation::BranchActivationRecovery;
 use crate::namespace::branching::deletion::DeletionGovernance;
 use crate::namespace::branching::NamespaceDeleteOutcome;
 use crate::namespace::graph::NamespaceGraph;
@@ -602,6 +603,7 @@ pub struct CompactionLoopOptions {
 pub struct GovernedDeletionWorker {
     graph: Arc<NamespaceGraph>,
     governance: Arc<dyn DeletionGovernance>,
+    activation_recovery: Arc<dyn BranchActivationRecovery>,
 }
 
 impl std::fmt::Debug for GovernedDeletionWorker {
@@ -626,6 +628,7 @@ impl GovernedDeletionWorker {
     ) -> Self {
         let governance =
             security.namespace_delete_maintenance_governance(store.clone(), clock.clone());
+        let activation_recovery = security.branch_activation_recovery();
         let graph = NamespaceGraph::new(
             store,
             namespace_manager,
@@ -639,6 +642,7 @@ impl GovernedDeletionWorker {
         Self {
             graph: Arc::new(graph),
             governance,
+            activation_recovery,
         }
     }
 
@@ -648,7 +652,12 @@ impl GovernedDeletionWorker {
         budget: Duration,
     ) -> Result<NamespaceDeleteOutcome> {
         self.graph
-            .resume_delete(namespace, Arc::clone(&self.governance), budget)
+            .resume_delete(
+                namespace,
+                Arc::clone(&self.governance),
+                Arc::clone(&self.activation_recovery),
+                budget,
+            )
             .await
     }
 
@@ -1717,7 +1726,9 @@ async fn compaction_loop_with_lifecycle_inner(
 
         for ns in &namespaces {
             let deletion_recovery_required = ns.state == NamespaceState::Deleting
-                || (ns.state == NamespaceState::Active && ns.deletion_intent.is_some());
+                || ((ns.state == NamespaceState::Active
+                    || ns.state == NamespaceState::Creating)
+                    && ns.deletion_intent.is_some());
             if deletion_recovery_required {
                 gc_runner.forget_namespace(&ns.name);
                 let Some(deletion_worker) = deletion_worker else {

@@ -132,6 +132,7 @@ fn pre_extension_reader_rejects_a_fenced_current_deletion_intent() {
         incarnation: incarnation.clone(),
         destruction_record_key: "_audit/destruction/legacy.json".to_string(),
         decision_evidence_ref: "_audit/destruction/legacy.json".to_string(),
+        branch_activation_nonce: None,
         parent_root: None,
         fenced_generation: None,
         visibility: None,

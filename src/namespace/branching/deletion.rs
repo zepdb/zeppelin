@@ -667,6 +667,7 @@ mod tests {
             destruction_record_key: "_audit/destruction/decision-01.json".to_string(),
             decision_evidence_ref: "_audit/deletion-decisions/01ARZ3NDEKTSV4RRFFQ69G5FAV.json"
                 .to_string(),
+            branch_activation_nonce: None,
             parent_root: Some(parent_root),
             fenced_generation: Some(7),
             visibility: None,

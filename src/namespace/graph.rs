@@ -500,7 +500,12 @@ impl NamespaceGraph {
             // returning the cached lifecycle shape here would let a newly
             // published lock be skipped after tombstoning.
             return match self
-                .resume_delete(&namespace, governance, Duration::ZERO)
+                .resume_delete(
+                    &namespace,
+                    governance,
+                    activation_recovery,
+                    Duration::ZERO,
+                )
                 .await
             {
                 Err(ZeppelinError::NamespaceNotFound { .. }) => {
@@ -820,16 +825,6 @@ impl NamespaceGraph {
             }
             .into());
         }
-        if matches!(prepare.stage, BranchPrepareStage::ActivationPending { .. }) {
-            // A pending activation may have a matching guard in the policy
-            // head. The deletion graph cannot safely release that guard, so
-            // it must leave both the target metadata and parent root intact
-            // for the activation-governance recovery path.
-            return Err(BranchError::CreatingRecoveryRequired {
-                target: namespace.clone(),
-            }
-            .into());
-        }
         if let Some(intent) = metadata.deletion_intent.as_ref() {
             if intent.incarnation != reservation.target_incarnation
                 || intent.fenced_generation.is_some()
@@ -839,6 +834,25 @@ impl NamespaceGraph {
                 return Err(ZeppelinError::Validation(format!(
                     "never-active target {namespace} has an invalid cancellation intent"
                 )));
+            }
+            match (prepare.stage, intent.branch_activation_nonce) {
+                (BranchPrepareStage::ManifestPublished, Some(_))
+                | (
+                    BranchPrepareStage::Reserved
+                    | BranchPrepareStage::Rooted
+                    | BranchPrepareStage::ManifestPublished,
+                    None,
+                ) => {}
+                (BranchPrepareStage::ActivationPending { .. }, _) => {
+                    return Err(ZeppelinError::Validation(format!(
+                        "never-active target {namespace} retained an activation-pending stage after cancellation intent publication"
+                    )))
+                }
+                (BranchPrepareStage::Reserved | BranchPrepareStage::Rooted, Some(_)) => {
+                    return Err(ZeppelinError::Validation(format!(
+                        "never-active target {namespace} carries an activation nonce before manifest publication"
+                    )))
+                }
             }
         }
         Ok(())
@@ -989,6 +1003,25 @@ impl NamespaceGraph {
                 "never-active target {namespace} omitted its incarnation"
             ))
         })?;
+        let activation_nonce = {
+            let prepare = metadata.branch_prepare.as_mut().ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "creating fork {namespace} has no preparation milestone"
+                ))
+            })?;
+            match prepare.stage {
+                BranchPrepareStage::ActivationPending { nonce } => {
+                    // This one metadata CAS is the stale-activator fence: the
+                    // exact nonce becomes durable cancellation evidence while
+                    // the activation precondition is cleared.
+                    prepare.stage = BranchPrepareStage::ManifestPublished;
+                    Some(nonce)
+                }
+                BranchPrepareStage::Reserved
+                | BranchPrepareStage::Rooted
+                | BranchPrepareStage::ManifestPublished => None,
+            }
+        };
         metadata.deletion_intent = Some(NamespaceDeletionIntent {
             incarnation: incarnation.clone(),
             destruction_record_key: format!(
@@ -996,6 +1029,7 @@ impl NamespaceGraph {
                 incarnation.as_uuid().simple()
             ),
             decision_evidence_ref: decision.decision_evidence_ref.clone(),
+            branch_activation_nonce: activation_nonce,
             parent_root: observed_root.cloned(),
             fenced_generation: None,
             visibility: None,
@@ -1065,6 +1099,42 @@ impl NamespaceGraph {
                 }
                 Err(error) => return Err(error),
             }
+        }
+        Ok(())
+    }
+
+    async fn resolve_cancellation_activation_guard(
+        &self,
+        namespace: &NamespaceId,
+        metadata: &NamespaceMetadata,
+        intent: &NamespaceDeletionIntent,
+        recovery: &dyn BranchActivationRecovery,
+    ) -> Result<()> {
+        let Some(nonce) = intent.branch_activation_nonce else {
+            return Ok(());
+        };
+        let reservation = Self::cancellation_reservation(namespace, metadata)?;
+        let prepare = metadata.branch_prepare.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "activation-cancelled fork {namespace} has no preparation milestone"
+            ))
+        })?;
+        if prepare.stage != BranchPrepareStage::ManifestPublished
+            || prepare.branch_id != reservation.branch_id
+            || prepare.target_incarnation != reservation.target_incarnation
+            || metadata.deletion_intent.as_ref() != Some(intent)
+        {
+            return Err(BranchError::IntentMismatch {
+                target: namespace.clone(),
+            }
+            .into());
+        }
+
+        // The target CAS above already made the exact stale activation CAS
+        // impossible. Claiming publication authority next fences any old
+        // policy holder; only then may the matching guard be removed.
+        if let Some(guard) = recovery.retain_guard(reservation.branch_id, nonce).await? {
+            guard.abort().await?;
         }
         Ok(())
     }
@@ -2103,12 +2173,32 @@ impl NamespaceGraph {
         &self,
         namespace: &NamespaceId,
         governance: Arc<dyn DeletionGovernance>,
+        activation_recovery: Arc<dyn BranchActivationRecovery>,
         budget: Duration,
     ) -> Result<NamespaceDeleteOutcome> {
         let (mut metadata, _) = self
             .namespace_manager
             .read_metadata_versioned(namespace.as_str())
             .await?;
+
+        if metadata.state == NamespaceState::Creating {
+            let intent = metadata.deletion_intent.as_ref().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "namespace {namespace} has no governed cancellation intent to resume"
+                ))
+            })?;
+            let decision =
+                load_deletion_decision_evidence(&self.store, &intent.decision_evidence_ref).await?;
+            return self
+                .cancel_never_active_fork(
+                    namespace,
+                    metadata,
+                    decision,
+                    governance,
+                    activation_recovery,
+                )
+                .await;
+        }
 
         if metadata.state == NamespaceState::Active {
             let intent = metadata.deletion_intent.clone().ok_or_else(|| {
@@ -4524,6 +4614,7 @@ impl NamespaceGraph {
     pub(crate) async fn maintain(
         &self,
         governance: Arc<dyn DeletionGovernance>,
+        activation_recovery: Arc<dyn BranchActivationRecovery>,
         budget: Duration,
     ) -> Result<BranchMaintenanceReport> {
         if budget.is_zero() {
@@ -4555,6 +4646,8 @@ impl NamespaceGraph {
             }
             if metadata.state == NamespaceState::Deleting
                 || (metadata.state == NamespaceState::Active && metadata.deletion_intent.is_some())
+                || (metadata.state == NamespaceState::Creating
+                    && metadata.deletion_intent.is_some())
             {
                 report.deletions_inspected += 1;
                 let remaining = budget.saturating_sub(started.elapsed());
@@ -4562,6 +4655,7 @@ impl NamespaceGraph {
                     .resume_delete(
                         &NamespaceId::new(target_name.to_string())?,
                         Arc::clone(&governance),
+                        Arc::clone(&activation_recovery),
                         remaining,
                     )
                     .await
