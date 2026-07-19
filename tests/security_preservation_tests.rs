@@ -755,6 +755,26 @@ async fn destruction_evidence_survives_failure_after_record_before_manifest_remo
     .await;
     let admin = client_with_bearer(&server.admin_bearer);
     let namespace = create_ns_api(&admin, &server.base_url, 2).await;
+    let namespace_id = NamespaceId::new(namespace.clone()).unwrap();
+    let (_, namespace_object_metadata) = harness
+        .store
+        .get_with_object_metadata(&NamespaceMetadata::s3_key(&namespace))
+        .await
+        .unwrap();
+    let expected_incarnation = namespace_object_metadata
+        .user_metadata
+        .get("zeppelin-namespace-incarnation")
+        .expect("new namespace metadata must carry an incarnation")
+        .to_string();
+    let (preservation_guard, expected_preservation_head) = server
+        .security
+        .preservation_service()
+        .expect("the full server must compose preservation governance")
+        .guard_namespace_strong(&namespace_id)
+        .await
+        .unwrap();
+    assert!(!preservation_guard.is_locked());
+    let expected_preservation_head = serde_json::to_value(expected_preservation_head).unwrap();
     let (mut stale_manifest, stale_version) = Manifest::read_versioned(&harness.store, &namespace)
         .await
         .unwrap()
@@ -781,6 +801,14 @@ async fn destruction_evidence_survives_failure_after_record_before_manifest_remo
     let evidence = harness.store.get(&evidence_key).await.unwrap();
     let record: Value = serde_json::from_slice(&evidence).unwrap();
     assert_eq!(record["namespace"], namespace);
+    assert_eq!(
+        record["incarnation"], expected_incarnation,
+        "destruction evidence must bind the exact authoritative namespace incarnation"
+    );
+    assert_eq!(
+        record["preservation_head"], expected_preservation_head,
+        "destruction evidence must bind the exact strong preservation-head proof"
+    );
     let fenced_manifest = Manifest::read(&harness.store, &namespace)
         .await
         .expect("manifest read must succeed")
