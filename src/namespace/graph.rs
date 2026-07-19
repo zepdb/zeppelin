@@ -20,15 +20,15 @@ use crate::namespace::branch_root::{
     insert_branch_root_with_lease, remove_branch_root_with_lease, source_data_plane_config_digest,
     InsertBranchRootRequest, RemoveBranchRootRequest,
 };
+use crate::namespace::branching::activation::{
+    AuthorizedForkNamespace, BranchActivationAttempt, BranchActivationGuard,
+    BranchActivationPermit, BranchActivationRecovery, BranchActivationTarget, ForkOutcome,
+};
 use crate::namespace::branching::deletion::{
     load_branch_visibility_removal, load_deletion_decision_evidence,
     persist_branch_visibility_removal, persist_deletion_decision_evidence, AuthorizedBranchList,
     AuthorizedNamespaceDelete, BranchVisibilityRemovalMarker, DeletionBoundary, DeletionDecision,
     DeletionGovernance, DeletionLifecycleAudit,
-};
-use crate::namespace::branching::activation::{
-    AuthorizedForkNamespace, BranchActivationAttempt, BranchActivationGuard,
-    BranchActivationPermit, BranchActivationRecovery, BranchActivationTarget, ForkOutcome,
 };
 use crate::namespace::branching::{
     ActivationNonce, ArtifactOrigin, BranchDescriptor, BranchError, BranchLifecycleState,
@@ -39,8 +39,7 @@ use crate::namespace::branching::{
 use crate::namespace::manager::{
     BranchActivationRevocationOutcome, CompactionHealth, GovernedDeletionIdentity,
     NamespaceDeletionIntent, NamespaceDestructionRecord, NamespaceIndexConfig, NamespaceManager,
-    NamespaceMetadata, NamespaceState, ReserveMetadataOutcome, RootReleaseState,
-    VisibilityRemoval,
+    NamespaceMetadata, NamespaceState, ReserveMetadataOutcome, RootReleaseState, VisibilityRemoval,
 };
 use crate::namespace::{
     BranchId, BranchRoot, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
@@ -303,9 +302,10 @@ impl NamespaceGraph {
         let retained = governance.retain_guard(branch, expected_nonce).await?;
         if let Some(guard) = retained {
             return match self.resolve_retained_activation_guard(guard).await? {
-                BranchActivationResolution::Finalized => {
-                    self.load_exact_active_branch(&branch.identity).await.map(Some)
-                }
+                BranchActivationResolution::Finalized => self
+                    .load_exact_active_branch(&branch.identity)
+                    .await
+                    .map(Some),
                 BranchActivationResolution::Aborted => Ok(None),
             };
         }
@@ -314,16 +314,13 @@ impl NamespaceGraph {
         };
         match self
             .namespace_manager
-            .revoke_branch_activation(
-                &branch.identity.target_namespace,
-                &branch.identity,
-                nonce,
-            )
+            .revoke_branch_activation(&branch.identity.target_namespace, &branch.identity, nonce)
             .await?
         {
-            BranchActivationRevocationOutcome::ActivationCommitted => {
-                self.load_exact_active_branch(&branch.identity).await.map(Some)
-            }
+            BranchActivationRevocationOutcome::ActivationCommitted => self
+                .load_exact_active_branch(&branch.identity)
+                .await
+                .map(Some),
             BranchActivationRevocationOutcome::Revoked
             | BranchActivationRevocationOutcome::AlreadyPrepared => Ok(None),
         }
@@ -364,24 +361,22 @@ impl NamespaceGraph {
         let retained = governance.retain_guard(branch, Some(nonce)).await?;
         if let Some(guard) = retained {
             return match self.resolve_retained_activation_guard(guard).await? {
-                BranchActivationResolution::Finalized => {
-                    self.load_exact_active_branch(&branch.identity).await.map(Some)
-                }
+                BranchActivationResolution::Finalized => self
+                    .load_exact_active_branch(&branch.identity)
+                    .await
+                    .map(Some),
                 BranchActivationResolution::Aborted => Ok(None),
             };
         }
         match self
             .namespace_manager
-            .revoke_branch_activation(
-                &branch.identity.target_namespace,
-                &branch.identity,
-                nonce,
-            )
+            .revoke_branch_activation(&branch.identity.target_namespace, &branch.identity, nonce)
             .await?
         {
-            BranchActivationRevocationOutcome::ActivationCommitted => {
-                self.load_exact_active_branch(&branch.identity).await.map(Some)
-            }
+            BranchActivationRevocationOutcome::ActivationCommitted => self
+                .load_exact_active_branch(&branch.identity)
+                .await
+                .map(Some),
             BranchActivationRevocationOutcome::Revoked
             | BranchActivationRevocationOutcome::AlreadyPrepared => Ok(None),
         }
@@ -491,9 +486,7 @@ impl NamespaceGraph {
                     .into());
                 }
                 match prepare.stage {
-                    BranchPrepareStage::ActivationPending { nonce }
-                        if nonce == attempt.nonce() =>
-                    {
+                    BranchPrepareStage::ActivationPending { nonce } if nonce == attempt.nonce() => {
                         match self
                             .namespace_manager
                             .revoke_branch_activation(namespace, identity, nonce)
@@ -546,9 +539,10 @@ impl NamespaceGraph {
                 .branch_prepare
                 .as_ref()
                 .is_none_or(|prepare| prepare.stage != BranchPrepareStage::ManifestPublished)
-            || metadata.deletion_intent.as_ref().is_some_and(|intent| {
-                intent.branch_activation_nonce != Some(attempt.nonce())
-            })
+            || metadata
+                .deletion_intent
+                .as_ref()
+                .is_some_and(|intent| intent.branch_activation_nonce != Some(attempt.nonce()))
         {
             return Err(BranchError::IntentMismatch {
                 target: namespace.clone(),
@@ -566,11 +560,7 @@ impl NamespaceGraph {
     ) {
         match self
             .namespace_manager
-            .revoke_branch_activation(
-                &branch.identity.target_namespace,
-                &branch.identity,
-                nonce,
-            )
+            .revoke_branch_activation(&branch.identity.target_namespace, &branch.identity, nonce)
             .await
         {
             Ok(BranchActivationRevocationOutcome::Revoked)
@@ -613,11 +603,7 @@ impl NamespaceGraph {
     ) -> Result<bool> {
         match self
             .namespace_manager
-            .revoke_branch_activation(
-                &branch.identity.target_namespace,
-                &branch.identity,
-                nonce,
-            )
+            .revoke_branch_activation(&branch.identity.target_namespace, &branch.identity, nonce)
             .await?
         {
             BranchActivationRevocationOutcome::ActivationCommitted => {
@@ -715,12 +701,7 @@ impl NamespaceGraph {
             // returning the cached lifecycle shape here would let a newly
             // published lock be skipped after tombstoning.
             return match self
-                .resume_delete(
-                    &namespace,
-                    governance,
-                    activation_recovery,
-                    Duration::ZERO,
-                )
+                .resume_delete(&namespace, governance, activation_recovery, Duration::ZERO)
                 .await
             {
                 Err(ZeppelinError::NamespaceNotFound { .. }) => {
@@ -747,11 +728,8 @@ impl NamespaceGraph {
                 )
                 .await;
         }
-        self.require_activation_guard_clear_for_deletion(
-            &metadata,
-            activation_recovery.as_ref(),
-        )
-        .await?;
+        self.require_activation_guard_clear_for_deletion(&metadata, activation_recovery.as_ref())
+            .await?;
         if metadata.state != NamespaceState::Active {
             return Err(ZeppelinError::Validation(format!(
                 "namespace {namespace} is not active for governed deletion"
@@ -2463,11 +2441,8 @@ impl NamespaceGraph {
                 .await;
         }
 
-        self.require_activation_guard_clear_for_deletion(
-            &metadata,
-            activation_recovery.as_ref(),
-        )
-        .await?;
+        self.require_activation_guard_clear_for_deletion(&metadata, activation_recovery.as_ref())
+            .await?;
 
         if metadata.state == NamespaceState::Active {
             let intent = metadata.deletion_intent.clone().ok_or_else(|| {

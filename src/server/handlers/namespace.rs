@@ -279,11 +279,7 @@ pub async fn create_branch(
         target_id.as_str(),
     )
     .map_err(|error| ApiError(error.into()))?;
-    require_unconstrained_clone_control(
-        &decision,
-        &source_read_decision,
-        &target_create_decision,
-    )?;
+    require_unconstrained_clone_control(&decision, &source_read_decision, &target_create_decision)?;
     audit.set_params(AuditParams::NamespaceFork {
         source: source_id.clone(),
         target: target_id.clone(),

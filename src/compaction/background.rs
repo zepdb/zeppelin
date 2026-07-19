@@ -1736,8 +1736,7 @@ async fn compaction_loop_with_lifecycle_inner(
 
         for ns in &namespaces {
             let deletion_recovery_required = ns.state == NamespaceState::Deleting
-                || ((ns.state == NamespaceState::Active
-                    || ns.state == NamespaceState::Creating)
+                || ((ns.state == NamespaceState::Active || ns.state == NamespaceState::Creating)
                     && ns.deletion_intent.is_some());
             if deletion_recovery_required {
                 gc_runner.forget_namespace(&ns.name);

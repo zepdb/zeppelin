@@ -36,12 +36,10 @@ use crate::wal::manifest::{Manifest, ReceiptBindingVersion};
 use crate::wal::{LeaseManager, WalReader};
 use chrono::{DateTime, Utc};
 
+use super::activation::{BranchActivationGuard, BranchActivationRecovery, BranchActivationTarget};
 use super::deletion::{
     deletion_decision_evidence_key, AuthorizedBranchList, AuthorizedNamespaceDelete,
     DeletionBoundary, DeletionDecision, DeletionGovernance, DeletionLifecycleAudit,
-};
-use super::activation::{
-    BranchActivationGuard, BranchActivationRecovery, BranchActivationTarget,
 };
 use super::{
     ActivationNonce, ArtifactOrigin, ArtifactOriginIndex, BranchActivationEvidence,
@@ -236,9 +234,7 @@ impl BranchActivationRecovery for TestBranchActivationRecovery {
         Ok(None)
     }
 
-    async fn retain_next_expired(
-        &self,
-    ) -> Result<Option<Box<dyn BranchActivationGuard>>> {
+    async fn retain_next_expired(&self) -> Result<Option<Box<dyn BranchActivationGuard>>> {
         Ok(None)
     }
 }
