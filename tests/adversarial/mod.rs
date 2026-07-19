@@ -46,7 +46,11 @@ pub fn effective_seed_assignment(
 ) -> SeedAssignment {
     if let Some(profile) = forced_profile {
         return SeedAssignment {
-            mode: RunMode::Chaos,
+            mode: if profile == FaultProfile::Branching {
+                RunMode::Deterministic
+            } else {
+                RunMode::Chaos
+            },
             profile: Some(profile),
         };
     }

@@ -322,6 +322,18 @@ mod inner {
             "Garbage-collection candidates skipped instead of deleted",
             &["namespace", "reason"]
         ).unwrap();
+
+        /// Branch lifecycle intents older than the operational stall threshold.
+        pub static ref BRANCH_INTENTS_STALLED: IntGaugeVec = register_int_gauge_vec!(
+            "zeppelin_branch_intents_stalled",
+            "Branch lifecycle intents older than the operational stall threshold",
+            &["state"]
+        ).unwrap();
+        /// Current direct-child roots observed across authoritative manifests.
+        pub static ref BRANCH_ROOTS: IntGauge = register_int_gauge!(
+            "zeppelin_branch_roots",
+            "Direct-child branch roots observed by the latest successful graph readiness scan"
+        ).unwrap();
     }
 }
 
@@ -447,4 +459,14 @@ pub fn init() {
     lazy_static::initialize(&GC_BYTES_RECLAIMED_TOTAL);
     lazy_static::initialize(&GC_CANDIDATES_MARKED_TOTAL);
     lazy_static::initialize(&GC_CANDIDATES_SKIPPED_TOTAL);
+    lazy_static::initialize(&BRANCH_INTENTS_STALLED);
+    lazy_static::initialize(&BRANCH_ROOTS);
+    for state in ["creating", "deleting"] {
+        if BRANCH_INTENTS_STALLED
+            .get_metric_with_label_values(&[state])
+            .is_err()
+        {
+            BRANCH_INTENTS_STALLED.with_label_values(&[state]).set(0);
+        }
+    }
 }

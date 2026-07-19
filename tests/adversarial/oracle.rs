@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use zeppelin::index::filter::evaluate_filter;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, Filter};
@@ -8,7 +9,9 @@ use super::branching::BranchDeleteViolation;
 use super::model::{
     model_distance, IndetEffect, Model, ModelRecord, NsIndeterminate, NsModel, OracleMutation,
 };
-use super::ops::{AsOfTarget, GeneratedQuery, MaintenanceKind, Op, OpRecord, QueryOracleClass};
+use super::ops::{
+    AsOfTarget, BranchingOp, GeneratedQuery, MaintenanceKind, Op, OpRecord, QueryOracleClass,
+};
 use super::security_program::{
     check_i22_authz_decision, check_i23_tenant_leak, check_i27_constraint_drop, ExpectedDecision,
     SecurityFinding,
@@ -92,6 +95,7 @@ pub fn check_op(
     violations.extend(check_i11_error_envelope(rec));
     violations.extend(check_expected_error(model, rec, mode));
     violations.extend(check_security_operation(model, rec, mutation));
+    violations.extend(check_i30_branching(model, rec));
     if mode == RunMode::Deterministic {
         violations.extend(check_i10_failed_validation_no_wal(rec));
     }
@@ -110,6 +114,82 @@ pub fn check_op(
         violations.extend(check_i7_fts_membership(model, rec));
     }
     violations
+}
+
+fn check_i30_branching(model: &Model, rec: &OpRecord) -> Vec<Violation> {
+    let mut findings = Vec::new();
+    if let Err(violation) =
+        super::branching::BranchDeleteBookkeeping::observe_generated_operation_kind(rec.op.kind())
+    {
+        findings.push(violation);
+    }
+
+    match &rec.op {
+        Op::Branching(BranchingOp::ListBranches { source, .. })
+            if (200..300).contains(&rec.status) =>
+        {
+            for branch in model
+                .branch_deletions
+                .values()
+                .filter(|branch| branch.source_namespace == *source)
+            {
+                if let Err(violation) = branch.require_matching_root() {
+                    findings.push(violation);
+                }
+            }
+        }
+        Op::Query { ns, q, .. }
+            if (200..300).contains(&rec.status)
+                && q.pattern_tags.iter().any(|tag| tag == "branching") =>
+        {
+            let observed_ids = rec.response["results"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|result| result["id"].as_str().map(str::to_string))
+                .collect::<BTreeSet<_>>();
+            for branch in model
+                .branch_deletions
+                .values()
+                .filter(|branch| branch.source_namespace == *ns || branch.target_namespace == *ns)
+            {
+                if let Err(violation) = branch.observe_namespace_view(ns, observed_ids.clone()) {
+                    findings.push(violation);
+                }
+            }
+        }
+        Op::Branching(BranchingOp::CompactBranch { namespace, .. })
+            if (200..300).contains(&rec.status) =>
+        {
+            if let Some(branch) = model.branch_deletions.get(namespace) {
+                if !branch.materialized() || !branch.root_retained() {
+                    findings.push(BranchDeleteViolation::MaterializationReleasedRoot);
+                }
+            }
+        }
+        Op::Branching(BranchingOp::DeleteSourceWithBranches { source, .. }) => {
+            for branch in model
+                .branch_deletions
+                .values()
+                .filter(|branch| branch.source_namespace == *source)
+            {
+                let mut observed = branch.clone();
+                if let Err(violation) = observed.observe_source_delete(
+                    rec.status,
+                    rec.response["code"].as_str(),
+                    Utc::now(),
+                ) {
+                    findings.push(violation);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    findings
+        .into_iter()
+        .map(|violation| branching_delete_violation(rec.index, rec.op.namespace(), violation))
+        .collect()
 }
 
 fn check_security_operation(

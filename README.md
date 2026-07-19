@@ -22,6 +22,7 @@
 - **BM25 full-text search** -- Inverted indexes with configurable tokenization, stemming, and multi-field `rank_by` expressions (opt-in, see below)
 - **Bitmap pre-filters** -- RoaringBitmap indexes for sub-millisecond attribute filtering
 - **Write-ahead log** -- Durable writes with compaction into indexed segments
+- **Namespace forks** -- Disabled-by-default, licensed copy-on-write branching ([operator guide](docs/branching-operations.md)); fork only, no merge
 - **Strong & eventual consistency** -- Choose per-query (see [Consistency semantics](#consistency-semantics))
 - **Object storage** -- S3, MinIO, and S3-compatible backends. GCS and Azure planned
 
@@ -88,6 +89,8 @@ curl -s -X DELETE http://localhost:8080/v1/namespaces/<ns>/vectors \
 | `POST`   | `/v1/namespaces`                  | Create a namespace (returns UUID) |
 | `GET`    | `/v1/namespaces/:ns`              | Get namespace metadata |
 | `DELETE` | `/v1/namespaces/:ns`              | Delete a namespace     |
+| `GET/POST` | `/v1/namespaces/:ns/branches`  | List/create direct branches (when enabled) |
+| `POST`   | `/v1/namespaces/:ns/clone`        | Create an independent copy clone |
 | `POST`   | `/v1/namespaces/:ns/vectors`      | Upsert vectors         |
 | `DELETE` | `/v1/namespaces/:ns/vectors`      | Delete vectors         |
 | `POST`   | `/v1/namespaces/:ns/query`        | Query nearest neighbors|

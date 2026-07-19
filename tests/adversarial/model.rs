@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use zeppelin::types::{AttributeValue, DistanceMetric};
 
 use super::branching::{BranchDeleteBookkeeping, BranchDeleteViolation};
-use super::ops::{AsOfTarget, GenVector, GeneratedQuery, MaintenanceKind, NamespaceSpec, Op};
+use super::ops::{
+    AsOfTarget, BranchingOp, GenVector, GeneratedQuery, MaintenanceKind, NamespaceSpec, Op,
+};
 use super::security_program::SecurityPolicyModel;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -380,6 +382,24 @@ impl Model {
             .observe_source_delete(status, code, observed_at)
     }
 
+    pub fn observe_branch_restart(
+        &mut self,
+        target_namespace: &str,
+    ) -> Result<(), BranchDeleteViolation> {
+        self.branch_delete_bookkeeping_mut(target_namespace)?
+            .observe_restart();
+        Ok(())
+    }
+
+    pub fn observe_branch_restart_maintenance(
+        &mut self,
+        target_namespace: &str,
+        converged: bool,
+    ) -> Result<(), BranchDeleteViolation> {
+        self.branch_delete_bookkeeping_mut(target_namespace)?
+            .observe_restart_maintenance(converged)
+    }
+
     pub fn branch_delete_bookkeeping(
         &self,
         target_namespace: &str,
@@ -517,6 +537,17 @@ impl Model {
                 if mutation == Some(OracleMutation::StaleCheckpoint) {
                     model.corrupt_latest_checkpoint();
                 }
+                let ids = vectors
+                    .iter()
+                    .map(|vector| vector.id.clone())
+                    .collect::<Vec<_>>();
+                for branch in self.branch_deletions.values_mut() {
+                    if branch.source_namespace == *ns {
+                        branch.observe_source_upserts(ids.clone());
+                    } else if branch.target_namespace == *ns {
+                        branch.observe_target_upserts(ids.clone());
+                    }
+                }
             }
             Op::DeleteVectors { ns, ids, .. } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
@@ -535,6 +566,13 @@ impl Model {
                 model.checkpoint_if_enabled(gen_after, generation_checkpoints);
                 if mutation == Some(OracleMutation::StaleCheckpoint) {
                     model.corrupt_latest_checkpoint();
+                }
+                for branch in self.branch_deletions.values_mut() {
+                    if branch.source_namespace == *ns {
+                        branch.observe_source_deletes(ids.iter().map(String::as_str));
+                    } else if branch.target_namespace == *ns {
+                        branch.observe_target_deletes(ids.iter().map(String::as_str));
+                    }
                 }
             }
             Op::CompactInline { ns, .. } => {
@@ -658,6 +696,121 @@ impl Model {
                 }
                 self.namespaces.remove(ns);
             }
+            Op::Branching(BranchingOp::ForkNamespace { source, target, .. }) => {
+                let Some(source_model) = self.namespaces.get(source).cloned() else {
+                    panic!("fork acked for unknown source namespace {source}");
+                };
+                let source_incarnation = response["source"]["incarnation"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("fork ack missing source incarnation for {source}"));
+                let target_incarnation = response["target"]["incarnation"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("fork ack missing target incarnation for {target}"));
+                let branch_id = response["branch_id"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("fork ack missing branch ID for {target}"));
+                let fork_generation = response["source"]["generation"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("fork ack missing source generation for {target}"));
+                let depth = response["depth"]
+                    .as_u64()
+                    .and_then(|depth| u16::try_from(depth).ok())
+                    .unwrap_or_else(|| panic!("fork ack missing valid depth for {target}"));
+                let bookkeeping = BranchDeleteBookkeeping::active(
+                    source,
+                    source_incarnation,
+                    target,
+                    target_incarnation,
+                    branch_id,
+                    fork_generation,
+                    depth,
+                )
+                .with_fork_snapshot(source_model.live.keys().cloned());
+                match self.branch_deletions.get(target) {
+                    Some(existing)
+                        if existing.source_namespace == bookkeeping.source_namespace
+                            && existing.source_incarnation == bookkeeping.source_incarnation
+                            && existing.target_incarnation == bookkeeping.target_incarnation
+                            && existing.branch_id == bookkeeping.branch_id
+                            && existing.fork_generation == bookkeeping.fork_generation
+                            && existing.depth == bookkeeping.depth => {}
+                    Some(_) => panic!("fork retry changed modeled branch identity for {target}"),
+                    None => {
+                        self.branch_deletions.insert(target.clone(), bookkeeping);
+                    }
+                }
+                let mut target_model = NsModel::new(source_model.spec.clone(), 1);
+                target_model.live = source_model.live.clone();
+                target_model.compacted_live = source_model.live.clone();
+                target_model.checkpoints.insert(1, source_model.live);
+                target_model.live_generation = 1;
+                self.namespaces
+                    .entry(target.clone())
+                    .or_insert(target_model);
+            }
+            Op::Branching(BranchingOp::CompactBranch { namespace, .. }) => {
+                let Some(model) = self.namespaces.get_mut(namespace) else {
+                    panic!("branch compaction acked for unknown namespace {namespace}");
+                };
+                model.compacted_live = model.live.clone();
+                model.wal_tombstones.clear();
+                model.checkpoint_if_enabled(gen_after, generation_checkpoints);
+                if let Some(branch) = self.branch_deletions.get_mut(namespace) {
+                    branch
+                        .observe_materialized(true)
+                        .unwrap_or_else(|violation| {
+                            panic!("branch compaction model: {violation:?}")
+                        });
+                }
+            }
+            Op::Branching(BranchingOp::DeleteBranch { namespace, .. }) => {
+                if let Some(branch) = self.branch_deletions.get_mut(namespace) {
+                    branch.begin_branch_delete_without_deadline();
+                }
+            }
+            Op::Branching(BranchingOp::DeleteSourceWithBranches { source, .. }) => {
+                let retained_root = self
+                    .branch_deletions
+                    .values()
+                    .any(|branch| branch.source_namespace == *source && branch.root_retained());
+                if !retained_root {
+                    self.namespaces.remove(source);
+                }
+            }
+            Op::Branching(BranchingOp::ListBranches { source, .. }) => {
+                let descriptors = response["branches"].as_array().unwrap_or_else(|| {
+                    panic!("branch list ack missing branches array for {source}")
+                });
+                for branch in self
+                    .branch_deletions
+                    .values_mut()
+                    .filter(|branch| branch.source_namespace == *source)
+                {
+                    let Some(descriptor) = descriptors.iter().find(|descriptor| {
+                        descriptor["target"]["namespace"].as_str()
+                            == Some(branch.target_namespace.as_str())
+                    }) else {
+                        continue;
+                    };
+                    let target_incarnation = descriptor["target"]["incarnation"]
+                        .as_str()
+                        .unwrap_or_default();
+                    let branch_id = descriptor["branch_id"].as_str().unwrap_or_default();
+                    let depth = descriptor["depth"]
+                        .as_u64()
+                        .and_then(|depth| u16::try_from(depth).ok())
+                        .unwrap_or_default();
+                    let source_incarnation = branch.source_incarnation.clone();
+                    let fork_generation = branch.fork_generation;
+                    let _ = branch.observe_matching_root(
+                        &source_incarnation,
+                        target_incarnation,
+                        branch_id,
+                        fork_generation,
+                        depth,
+                    );
+                }
+            }
             Op::GetNamespace { .. }
             | Op::FetchVectors { .. }
             | Op::Query { .. }
@@ -690,8 +843,7 @@ impl Model {
             | Op::CreateLock { .. }
             | Op::ReleaseLock { .. }
             | Op::DeleteUnderLock { .. }
-            | Op::GcUnderLock { .. }
-            | Op::Branching(_) => {}
+            | Op::GcUnderLock { .. } => {}
         }
     }
 

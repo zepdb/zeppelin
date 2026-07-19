@@ -2595,6 +2595,7 @@ fn profile_contracts(profile: Option<FaultProfile>) -> Vec<FaultContract> {
             | FaultProfile::Clock
             | FaultProfile::SupportedFull
             | FaultProfile::Security
+            | FaultProfile::Branching
             | FaultProfile::Sched,
         )
         | None => &[ContractClass::SupportedV1],

@@ -11,7 +11,7 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # policy_refresh_secs = 5            # must be > 0; phase 3 uses this freshness bound
 # audit_s3 = true                    # required true in enforced mode; durable JSONL under _audit/
 # audit_flush_secs = 2               # must be > 0; max background batch-flush interval
-# license_path = ""                  # phase 6 signed-license path; empty = community
+# license_path = ""                  # signed-license path; branching also requires the "branching" feature
 # cursor_hmac_key_hex = "..."        # REQUIRED in enforced mode; generate: openssl rand -hex 32
 
 # Generate one 43-character base64url secret and its SHA-256 digest:
@@ -44,6 +44,14 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # trusted_proxies = []               # ZEPPELIN_TRUSTED_PROXIES comma list; e.g. ["10.0.0.0/8", "127.0.0.1/32"]
 # If Zeppelin runs behind a load balancer or reverse proxy, set trusted_proxies
 # to only those proxy CIDRs. X-Forwarded-For is ignored from untrusted peers.
+
+[branching]
+# Branch routes require this switch AND a verified signed-license entitlement.
+# See docs/branching-operations.md before enabling; Zeppelin supports forks,
+# not merge/rebase/diff operations.
+# enabled = false
+# max_children_per_namespace = 256   # direct children; valid range 1..=4096
+# max_depth = 16                     # ancestry depth; valid range 1..=64
 
 [storage]
 # backend = "s3"                     # STORAGE_BACKEND — "s3" or "local" (gcs/azure planned)

@@ -6,12 +6,13 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 usage() {
     cat <<'USAGE'
-Usage: scripts/perf-contract.sh [--capture] [--nightly]
+Usage: scripts/perf-contract.sh [--capture] [--nightly] [--branching]
 
 Runs the deterministic performance-contract catalog against MinIO. The normal
 mode is gating. --capture writes run-local proposals for human review and never
 modifies checked-in contracts. --nightly runs Tier 1 contracts, Tier 2
 prediction validation, and advisory Tier 3 latency validation in order.
+--branching runs only the frozen Phase 10 branching object-operation census.
 
 CI gating command:
   TEST_BACKEND=minio cargo test --test perf_contract_tests contracts -- --ignored
@@ -69,6 +70,7 @@ entry_report() {
 main() {
     local capture="false"
     local nightly="false"
+    local branching="false"
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --capture)
@@ -76,6 +78,9 @@ main() {
                 ;;
             --nightly)
                 nightly="true"
+                ;;
+            --branching)
+                branching="true"
                 ;;
             -h|--help)
                 usage
@@ -89,6 +94,10 @@ main() {
         esac
         shift
     done
+    if [ "$branching" = "true" ] && { [ "$capture" = "true" ] || [ "$nightly" = "true" ]; }; then
+        echo "--branching cannot be combined with --capture or --nightly." >&2
+        return 2
+    fi
     if [ "$capture" = "true" ] && [ "$nightly" = "true" ]; then
         echo "--capture and --nightly cannot be combined." >&2
         return 2
@@ -102,6 +111,21 @@ main() {
     echo "Building tests before performance-contract execution..."
     if ! cargo build --tests; then
         return 1
+    fi
+
+    if [ "$branching" = "true" ]; then
+        local branching_root="$invocation_root/branching"
+        echo "Running the frozen branching object-operation census..."
+        TEST_BACKEND=minio \
+        ZEPPELIN_PERF_ARTIFACTS="$branching_root" \
+            cargo test --test perf_contract_tests branching_census -- --ignored --nocapture
+        local branching_status="$?"
+        if ! entry_report "$branching_root" >/dev/null; then
+            echo "Branching census did not produce a report for this invocation." >&2
+            return 1
+        fi
+        echo "Branching census: $branching_root/branching-census.json"
+        return "$branching_status"
     fi
 
     if [ "$nightly" = "true" ]; then

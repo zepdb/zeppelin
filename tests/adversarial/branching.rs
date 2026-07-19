@@ -1,4 +1,6 @@
-//! Branch-deletion operations and bookkeeping for the deterministic adversarial profile.
+//! Branch operations and lifecycle bookkeeping for the deterministic adversarial profile.
+
+use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -41,6 +43,31 @@ pub enum BranchDeleteViolation {
     },
     RootReleaseObservedOutsideDeletion,
     MissingReaderSafetyDeadline,
+    ActiveBranchMissingMatchingRoot,
+    BranchIdentityMismatch {
+        field: String,
+        expected: String,
+        observed: Option<String>,
+    },
+    ForkSnapshotChanged {
+        namespace: String,
+        expected_ids: BTreeSet<String>,
+        observed_ids: BTreeSet<String>,
+    },
+    SourceTargetWritesCrossed {
+        namespace: String,
+        unexpected_ids: BTreeSet<String>,
+    },
+    ForeignArtifactDelete {
+        key: String,
+        target_namespace: String,
+    },
+    RootReleasedBeforeVisibilityRemoval,
+    MaterializationReleasedRoot,
+    RestartMaintenanceDidNotConverge,
+    MergeOperationGenerated {
+        kind: String,
+    },
     BookkeepingOverflow,
 }
 
@@ -63,6 +90,24 @@ pub struct BranchDeleteBookkeeping {
     root_retained: bool,
     reader_safety_not_before: Option<DateTime<Utc>>,
     expected_source_conflicts: u64,
+    #[serde(default)]
+    fork_snapshot_ids: BTreeSet<String>,
+    #[serde(default)]
+    expected_source_ids: BTreeSet<String>,
+    #[serde(default)]
+    expected_target_ids: BTreeSet<String>,
+    #[serde(default)]
+    source_only_ids: BTreeSet<String>,
+    #[serde(default)]
+    target_only_ids: BTreeSet<String>,
+    #[serde(default)]
+    matching_root_observed: bool,
+    #[serde(default)]
+    visibility_removed: bool,
+    #[serde(default)]
+    materialized: bool,
+    #[serde(default)]
+    restart_pending: bool,
 }
 
 impl BranchDeleteBookkeeping {
@@ -89,7 +134,190 @@ impl BranchDeleteBookkeeping {
             root_retained: true,
             reader_safety_not_before: None,
             expected_source_conflicts: 0,
+            fork_snapshot_ids: BTreeSet::new(),
+            expected_source_ids: BTreeSet::new(),
+            expected_target_ids: BTreeSet::new(),
+            source_only_ids: BTreeSet::new(),
+            target_only_ids: BTreeSet::new(),
+            matching_root_observed: false,
+            visibility_removed: false,
+            materialized: false,
+            restart_pending: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_fork_snapshot(mut self, ids: impl IntoIterator<Item = String>) -> Self {
+        self.fork_snapshot_ids = ids.into_iter().collect();
+        self.expected_source_ids = self.fork_snapshot_ids.clone();
+        self.expected_target_ids = self.fork_snapshot_ids.clone();
+        self
+    }
+
+    pub fn observe_matching_root(
+        &mut self,
+        source_incarnation: &str,
+        target_incarnation: &str,
+        branch_id: &str,
+        fork_generation: u64,
+        depth: u16,
+    ) -> Result<(), BranchDeleteViolation> {
+        for (field, expected, observed) in [
+            (
+                "source_incarnation",
+                self.source_incarnation.clone(),
+                source_incarnation.to_string(),
+            ),
+            (
+                "target_incarnation",
+                self.target_incarnation.clone(),
+                target_incarnation.to_string(),
+            ),
+            ("branch_id", self.branch_id.clone(), branch_id.to_string()),
+            (
+                "fork_generation",
+                self.fork_generation.to_string(),
+                fork_generation.to_string(),
+            ),
+            ("depth", self.depth.to_string(), depth.to_string()),
+        ] {
+            if expected != observed {
+                return Err(BranchDeleteViolation::BranchIdentityMismatch {
+                    field: field.to_string(),
+                    expected,
+                    observed: Some(observed),
+                });
+            }
+        }
+        self.matching_root_observed = true;
+        Ok(())
+    }
+
+    pub fn require_matching_root(&self) -> Result<(), BranchDeleteViolation> {
+        if self.lifecycle == BranchLifecycle::Active && !self.matching_root_observed {
+            return Err(BranchDeleteViolation::ActiveBranchMissingMatchingRoot);
+        }
+        Ok(())
+    }
+
+    pub fn observe_source_upserts(&mut self, ids: impl IntoIterator<Item = String>) {
+        for id in ids {
+            self.expected_source_ids.insert(id.clone());
+            self.source_only_ids.insert(id);
+        }
+    }
+
+    pub fn observe_target_upserts(&mut self, ids: impl IntoIterator<Item = String>) {
+        for id in ids {
+            self.expected_target_ids.insert(id.clone());
+            self.target_only_ids.insert(id);
+        }
+    }
+
+    pub fn observe_source_deletes<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
+        for id in ids {
+            self.expected_source_ids.remove(id);
+            self.source_only_ids.remove(id);
+        }
+    }
+
+    pub fn observe_target_deletes<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
+        for id in ids {
+            self.expected_target_ids.remove(id);
+            self.target_only_ids.remove(id);
+        }
+    }
+
+    pub fn observe_namespace_view(
+        &self,
+        namespace: &str,
+        observed_ids: BTreeSet<String>,
+    ) -> Result<(), BranchDeleteViolation> {
+        let expected_ids = if namespace == self.source_namespace {
+            &self.expected_source_ids
+        } else if namespace == self.target_namespace {
+            &self.expected_target_ids
+        } else {
+            return Ok(());
+        };
+        let crossed: BTreeSet<String> = if namespace == self.source_namespace {
+            observed_ids
+                .intersection(&self.target_only_ids)
+                .cloned()
+                .collect()
+        } else {
+            observed_ids
+                .intersection(&self.source_only_ids)
+                .cloned()
+                .collect()
+        };
+        if !crossed.is_empty() {
+            return Err(BranchDeleteViolation::SourceTargetWritesCrossed {
+                namespace: namespace.to_string(),
+                unexpected_ids: crossed,
+            });
+        }
+        if &observed_ids != expected_ids {
+            return Err(BranchDeleteViolation::ForkSnapshotChanged {
+                namespace: namespace.to_string(),
+                expected_ids: expected_ids.clone(),
+                observed_ids,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn observe_target_delete_key(&self, key: &str) -> Result<(), BranchDeleteViolation> {
+        let target_prefix = format!("{}/", self.target_namespace);
+        if !key.starts_with(&target_prefix) {
+            return Err(BranchDeleteViolation::ForeignArtifactDelete {
+                key: key.to_string(),
+                target_namespace: self.target_namespace.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn observe_materialized(
+        &mut self,
+        root_retained: bool,
+    ) -> Result<(), BranchDeleteViolation> {
+        if !root_retained {
+            return Err(BranchDeleteViolation::MaterializationReleasedRoot);
+        }
+        self.materialized = true;
+        self.root_retained = true;
+        Ok(())
+    }
+
+    pub fn observe_restart(&mut self) {
+        self.restart_pending = self.lifecycle == BranchLifecycle::Deleting;
+    }
+
+    pub fn observe_restart_maintenance(
+        &mut self,
+        converged: bool,
+    ) -> Result<(), BranchDeleteViolation> {
+        if self.restart_pending && !converged {
+            return Err(BranchDeleteViolation::RestartMaintenanceDidNotConverge);
+        }
+        self.restart_pending = false;
+        Ok(())
+    }
+
+    pub fn observe_generated_operation_kind(kind: &str) -> Result<(), BranchDeleteViolation> {
+        if kind.contains("merge") || kind.contains("rebase") || kind.contains("diff_branch") {
+            return Err(BranchDeleteViolation::MergeOperationGenerated {
+                kind: kind.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn begin_branch_delete_without_deadline(&mut self) {
+        self.lifecycle = BranchLifecycle::Deleting;
+        self.root_retained = true;
+        self.visibility_removed = true;
     }
 
     pub fn observe_branch_delete_accepted(
@@ -102,6 +330,7 @@ impl BranchDeleteBookkeeping {
         }
         self.lifecycle = BranchLifecycle::Deleting;
         self.root_retained = true;
+        self.visibility_removed = true;
         self.reader_safety_not_before = Some(not_before);
         Ok(())
     }
@@ -117,6 +346,9 @@ impl BranchDeleteBookkeeping {
         if root_retained {
             self.root_retained = true;
             return Ok(());
+        }
+        if !self.visibility_removed {
+            return Err(BranchDeleteViolation::RootReleasedBeforeVisibilityRemoval);
         }
         let not_before = self
             .reader_safety_not_before
@@ -177,6 +409,21 @@ impl BranchDeleteBookkeeping {
     #[must_use]
     pub const fn expected_source_conflicts(&self) -> u64 {
         self.expected_source_conflicts
+    }
+
+    #[must_use]
+    pub const fn root_retained(&self) -> bool {
+        self.root_retained
+    }
+
+    #[must_use]
+    pub const fn matching_root_observed(&self) -> bool {
+        self.matching_root_observed
+    }
+
+    #[must_use]
+    pub const fn materialized(&self) -> bool {
+        self.materialized
     }
 }
 
@@ -490,6 +737,9 @@ mod smoke {
         // worker race the explicit retry over the same visibility marker. A
         // restart preserves S3 authority and the caller credential while
         // giving this sequential smoke a deterministic recovery boundary.
+        model.observe_branch_restart(&target).map_err(|violation| {
+            branch_oracle_error("pre-restart branch model", next_index, &target, violation)
+        })?;
         server.shutdown().await;
         let server = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
             harness.store.clone(),
@@ -645,6 +895,16 @@ mod smoke {
                 "resumed branch DELETE returned 202 but retained the exact parent root".to_string(),
             );
         }
+        model
+            .observe_branch_restart_maintenance(&target, true)
+            .map_err(|violation| {
+                branch_oracle_error(
+                    "post-restart branch convergence",
+                    resumed_delete_index,
+                    &target,
+                    violation,
+                )
+            })?;
 
         let source_delete_after_release = Op::Branching(BranchingOp::DeleteSourceWithBranches {
             actor: ActorSel::ADMIN,
@@ -958,6 +1218,8 @@ pub async fn run_branching_delete_smoke(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use chrono::{Duration, TimeZone, Utc};
 
     use super::{
@@ -1078,6 +1340,83 @@ mod tests {
             .expect("source deletion may succeed after exact root release");
 
         assert_eq!(model.lifecycle(), BranchLifecycle::Released);
+    }
+
+    #[test]
+    fn active_branch_without_matching_root_fires_i30() {
+        assert_eq!(
+            active_branch().require_matching_root(),
+            Err(BranchDeleteViolation::ActiveBranchMissingMatchingRoot)
+        );
+    }
+
+    #[test]
+    fn fork_snapshot_stability_oracle_rejects_changed_target_view() {
+        let branch = active_branch().with_fork_snapshot(["inherited".to_string()]);
+        assert!(matches!(
+            branch.observe_namespace_view("target", BTreeSet::new()),
+            Err(BranchDeleteViolation::ForkSnapshotChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn divergence_oracle_rejects_target_only_write_in_source() {
+        let mut branch = active_branch().with_fork_snapshot(["inherited".to_string()]);
+        branch.observe_target_upserts(["target-only".to_string()]);
+        assert!(matches!(
+            branch.observe_namespace_view(
+                "source",
+                ["inherited".to_string(), "target-only".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+            Err(BranchDeleteViolation::SourceTargetWritesCrossed { .. })
+        ));
+    }
+
+    #[test]
+    fn foreign_delete_oracle_rejects_source_owned_key() {
+        let branch = active_branch();
+        assert!(matches!(
+            branch.observe_target_delete_key("source/segments/foreign/cluster_0.bin"),
+            Err(BranchDeleteViolation::ForeignArtifactDelete { .. })
+        ));
+        branch
+            .observe_target_delete_key("target/segments/local/cluster_0.bin")
+            .expect("target-owned cleanup must remain valid");
+    }
+
+    #[test]
+    fn visibility_must_precede_root_release_and_materialization_keeps_root() {
+        let deadline = Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap();
+        let mut branch = active_branch();
+        branch.lifecycle = BranchLifecycle::Deleting;
+        branch.reader_safety_not_before = Some(deadline);
+        assert_eq!(
+            branch.observe_branch_delete_progress(deadline, false),
+            Err(BranchDeleteViolation::RootReleasedBeforeVisibilityRemoval)
+        );
+
+        let mut materializing = active_branch();
+        assert_eq!(
+            materializing.observe_materialized(false),
+            Err(BranchDeleteViolation::MaterializationReleasedRoot)
+        );
+    }
+
+    #[test]
+    fn restart_and_no_merge_oracles_fail_closed() {
+        let mut branch = active_branch();
+        branch.begin_branch_delete_without_deadline();
+        branch.observe_restart();
+        assert_eq!(
+            branch.observe_restart_maintenance(false),
+            Err(BranchDeleteViolation::RestartMaintenanceDidNotConverge)
+        );
+        assert!(matches!(
+            BranchDeleteBookkeeping::observe_generated_operation_kind("merge_namespace"),
+            Err(BranchDeleteViolation::MergeOperationGenerated { .. })
+        ));
     }
 
     #[test]

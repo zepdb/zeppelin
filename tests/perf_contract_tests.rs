@@ -38,6 +38,12 @@ async fn latency_validate() {
 }
 
 #[tokio::test]
+#[ignore = "requires MinIO and explicit branching performance-contract invocation"]
+async fn branching_census() {
+    perf_contract::run_branching_census_entry().await;
+}
+
+#[tokio::test]
 #[ignore = "requires MinIO and an explicit exhaustive ideal-analysis budget"]
 async fn ideal_analysis() {
     let summary = perf_contract::run_ideal_analysis_entry().await;

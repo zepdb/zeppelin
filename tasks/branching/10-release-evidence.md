@@ -1,10 +1,12 @@
 # Branching release-gate evidence
 
-This is an evidence ledger, not an enablement claim. Branching remains disabled
-by default until every required contract in plan 10 is green. The deletion
-unification baseline recorded here is `937f84d` (`Guard ungoverned deletes and
-legacy resume`). Slice 10 is still in progress and is therefore identified by
-its planned commit subject, not by an uncommitted or provisional hash.
+This is an implementation and evidence ledger, not an enablement claim.
+Branching remains disabled by default until every required release contract in
+plan 10 is green. Deletion unification is complete through `3db63c4` (`Complete
+branching Slice 10 recovery readiness`), writable materialization is complete
+through `f9c6712` (`Materialize writable namespace branches`), and the final
+Phase 10 implementation bundle is identified by its planned subject `Verify
+namespace branching rollout` until that bundle is committed.
 
 ## Deletion-unification slices
 
@@ -19,7 +21,7 @@ its planned commit subject, not by an uncommitted or provisional hash.
 | 7 | Governed cancellation of never-active forks | `19fcbf8` (`Cancel never-active forks through graph`) | Implemented with parent-lease ordering, fail-closed proof, crash recovery, and maintenance regressions |
 | 8 | Origin-checked owned cleanup and foreign-artifact protection | `5969d9c` (`Enforce owned-key cleanup for branch deletes`) | Implemented in current history; exact validation output was not found in a durable evidence file |
 | 9 | Ungoverned-path child-root guard and legacy/downgrade compatibility | `937f84d` (`Guard ungoverned deletes and legacy resume`) | Implemented with legacy intent/destruction-record compatibility and fail-closed downgrade documentation |
-| 10 | Disclosure-filtered list/409 details, root-release audit progress, and adversarial deletion bookkeeping | In progress: `Wire disclosure, audit, adversarial deletes` | Not complete and not release evidence; the required two-seed smoke and full plan 07/08 validation lists are not yet recorded green |
+| 10 | Disclosure-filtered list/409 details, root-release audit progress, adversarial deletion bookkeeping, and recovery readiness | `b604d5d` (`Wire disclosure, audit, adversarial deletes`) through `3db63c4` (`Complete branching Slice 10 recovery readiness`) | Implemented; full release validation remains a separate Phase 10 gate |
 
 The Slice 2 entry deliberately describes the actual linear history. The plan
 required one commit named `Route governed root deletion through graph`, but no
@@ -50,24 +52,17 @@ the final Slice 10 commit.
 
 ## Current validation status
 
-- The exact Slice 10 RED was reproduced against `937f84d` with:
-
-  ```bash
-  cargo test --lib \
-    server::tests::phase_eight_audited_action_inventory_is_exact \
-    -- --exact
-  ```
-
-  It fails because the runtime audited-action inventory contains
-  `NamespaceFork` while the expected inventory omits it. This is RED evidence,
-  not a green gate. The durable must-audit inventory must also require
-  `NamespaceFork` before Slice 10 can claim audit completeness.
-
-- No post-Slice-9 run of the complete plan 07 validation list, plan 08
-  validation list, branching integration gate, or plan 10 release matrix was
-  found in a durable evidence file. Those commands must be rerun and recorded
-  against the final Slice 10 commit.
-- No new Cargo command was run while preparing this ledger update.
+- The final implementation bundle passed `cargo fmt --all -- --check`,
+  `git diff --check`, shell syntax checks for both perf-contract drivers, and
+  `cargo check --tests --features branching-test-support` in 5m39s.
+- The new adversarial branching invariant self-tests passed 12/12. The
+  performance-contract target compiled, its branching census unit checks
+  passed, and the perf-contract driver self-test passed. The ignored MinIO
+  branching census was not run.
+- The full plan 07/08/10 MinIO matrix, formal reruns, recall gate, deterministic
+  fault campaign, independent reviews, and 1,800-second soak were deliberately
+  not run in this implementation pass. They remain release evidence, not a
+  reason to reopen already implemented phase architecture.
 
 ## Historical adversarial findings preserved
 
@@ -86,42 +81,42 @@ the final Slice 10 commit.
   branching-vocabulary failure. Neither historical smoke is evidence for the
   final branching profile required by plan 10.
 
-## Remaining original Phase 10 blockers
+## Phase 10 implementation closure
 
-- **Production activation/security governance:** public fork handling prepares a
-  target but has no production policy-publication lease, activation guard or
-  nonce, activation evidence, or activation-time no-widening recheck. Test
-  support activation is not a production integration.
-- **Slice 10 completion:** disclosure-denied children must be absent from list
-  results and 409 names/counts/details; root-release progress must be fully
-  represented in durable audit parameters; adversarial `DeleteBranch` and
-  `DeleteSourceWithBranches` must model the legitimate 409-until-grace window.
-- **Clone/materialization contract:** clone from an unmaterialized
-  foreign-backed branch still fails closed; the owned-view builder and accurate
-  persisted/public materialization status are incomplete.
-- **Public HTTP/security matrix:** the complete real-MinIO branch API,
-  authorization, disclosure, entitlement, no-widening, audit, preservation, and
-  restart matrix has not been recorded green. Planned test targets
-  `branching_tests`, `branch_compaction_tests`, `branch_api_tests`, and
-  `security_branching_tests` do not exist under those names on this baseline;
-  the final report must use the actual targets created by the implementation.
-- **Adversarial/fault matrix:** branching operations are not yet wired through a
-  complete state model, invariant oracle, remote-mutation/lost-ack fault matrix,
-  branching profile, retained replay, and deterministic two-seed smoke.
-- **Performance:** no frozen tiny/corpus-scale fork scenario proves zero artifact
-  copying, corpus-size-independent fork cost, ancestry-read behavior, or full
-  materialization cost.
-- **Formal/recall/release evidence:** the invariant traceability table, current
-  default TLA+ runs, all twelve intended-negative model variants, both-dataset
-  IVF recall gate, full release validation matrix, and artifact-backed results
-  are outstanding.
-- **Operational enablement:** stalled `Creating`/`Deleting` and root-count
-  readiness/metrics, explicit config/entitlement instructions, source-delete
-  blocking, clone alternative, materialization cost, child/depth limits, and
-  the explicit “fork only; no merge” documentation remain incomplete.
-- **Final gates:** independent standards/spec reviews and the single 1,800-second
-  branching soak must happen only after every focused, formal, adversarial,
-  performance, recall, and validation gate is green.
+- **Production governance:** fork activation now uses the persisted activation
+  nonce, global policy-publication lease, policy-head CAS guard, durable
+  activation evidence, activation-time no-widening reauthorization, and guarded
+  cancellation/recovery paths.
+- **Deletion and disclosure:** Slice 10 is committed through `3db63c4`; filtered
+  child disclosure, root-release audit progress, grace-aware deletion
+  bookkeeping, and recovery readiness are wired.
+- **Writable materialization and clone:** `f9c6712` builds an exact authenticated
+  logical view into target-owned artifacts, preserves concurrent target WAL,
+  makes no-WAL manual materialization work, and supports copy clone from a
+  foreign-backed branch.
+- **Adversarial harness:** the stable branching profile generates fork, list,
+  ordinary divergent source/target writes and queries, compact, branch delete,
+  and blocked source delete. Its model tracks incarnations, roots, generation,
+  depth, materialization, lifecycle, grace, restart, foreign deletes, and the
+  no-merge invariant; replay metadata and oracle self-tests are wired.
+- **Performance contract:** frozen tiny and one-million-logical-row fork census
+  scenarios assert zero artifact reads/copies/uploads, bounded control work,
+  physical-key query parity, ordinary branch WAL cost, first materialization
+  cost, subsequent local compaction, and separate product versus oracle counts.
+- **Operations:** `/readyz` exposes aggregate stalled Creating/Deleting intent
+  counts and total roots, Prometheus exports only bounded branch-state labels,
+  and the operator guide documents config plus entitlement activation,
+  source-delete blocking, copy clone, materialization cost, limits, and “fork
+  only; no merge.”
+
+## Release gates intentionally not claimed
+
+- The complete named remote-mutation/lost-ack fault campaign and deterministic
+  two-seed MinIO smoke were not executed in this pass.
+- The full HTTP/security/engine MinIO matrix, TLA variants, both-dataset recall
+  gate, independent reviews, and 1,800-second soak were not executed.
+- Branching therefore remains default-disabled. Explicit configuration and a
+  valid branching entitlement are still required for route exposure.
 - Optional SDK repositories remain out of scope because phase 09 was not
   separately authorized in this checkout.
 

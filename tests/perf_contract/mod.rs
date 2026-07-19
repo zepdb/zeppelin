@@ -1,5 +1,6 @@
 //! Deterministic object-store performance contracts.
 
+pub mod branching;
 pub mod contract;
 pub mod dataset;
 pub mod depth;
@@ -16,6 +17,7 @@ mod security;
 
 use std::path::PathBuf;
 
+pub use branching::run_branching_census_entry;
 pub use ideal::run_ideal_analysis_entry;
 pub use latency::run_latency_validate_entry;
 pub use predict::run_predict_entry;

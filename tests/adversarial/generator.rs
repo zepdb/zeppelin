@@ -23,6 +23,7 @@ const FTS_TAG: &str = "fts";
 const PAGINATION_TAG: &str = "pagination";
 const BATCH_TAG: &str = "batch";
 const SKETCH_ADC_TAG: &str = "sketch-adc-v4";
+pub const BRANCHING_PROFILE_TAG: &str = "branching";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Coverage {
@@ -171,6 +172,19 @@ impl AdversarialGenerator {
     #[must_use]
     pub fn new(seed: u64, namespace_prefix: &str) -> Self {
         Self::new_with_security(seed, namespace_prefix, false, false)
+    }
+
+    /// Construct the stable Phase 10 branching workload profile.
+    ///
+    /// The ordinary seeded workload establishes the source namespace and WAL
+    /// state first. This appended deterministic trace then exercises every
+    /// public branching operation plus normal source/target writes and exact
+    /// queries. It deliberately contains no merge/rebase/diff operation.
+    #[must_use]
+    pub fn new_branching(seed: u64, namespace_prefix: &str) -> Self {
+        let mut generator = Self::new(seed, namespace_prefix);
+        generator.enqueue_branching_profile(seed);
+        generator
     }
 
     #[must_use]
@@ -354,6 +368,94 @@ impl AdversarialGenerator {
         generator.enqueue_phase2_script(exact_ns, &exact_vectors);
         generator.enqueue_sketch_adc_script(namespace_count);
         generator
+    }
+
+    fn enqueue_branching_profile(&mut self, seed: u64) {
+        let source = self.namespaces[0].clone();
+        let target = format!("{}-branch-{seed}", source.name);
+        let target_only = GenVector {
+            id: format!("branch-target-only-{seed}"),
+            values: branching_vector(source.spec.dims, 0),
+            attributes: None,
+        };
+        let source_only = GenVector {
+            id: format!("branch-source-only-{seed}"),
+            values: branching_vector(source.spec.dims, 1),
+            attributes: None,
+        };
+        let query = branching_exact_query(&source.spec);
+
+        self.pending.extend([
+            Op::Branching(BranchingOp::ForkNamespace {
+                actor: ActorSel::ADMIN,
+                source: source.name.clone(),
+                target: target.clone(),
+            }),
+            Op::Branching(BranchingOp::ListBranches {
+                actor: ActorSel::ADMIN,
+                source: source.name.clone(),
+            }),
+            Op::Query {
+                actor: ActorSel::ADMIN,
+                ns: target.clone(),
+                q: query.clone(),
+                as_of: None,
+            },
+            Op::Upsert {
+                actor: ActorSel::ADMIN,
+                ns: target.clone(),
+                vectors: vec![target_only],
+            },
+            Op::Query {
+                actor: ActorSel::ADMIN,
+                ns: target.clone(),
+                q: query.clone(),
+                as_of: None,
+            },
+            Op::Query {
+                actor: ActorSel::ADMIN,
+                ns: source.name.clone(),
+                q: query.clone(),
+                as_of: None,
+            },
+            Op::Upsert {
+                actor: ActorSel::ADMIN,
+                ns: source.name.clone(),
+                vectors: vec![source_only],
+            },
+            Op::Query {
+                actor: ActorSel::ADMIN,
+                ns: source.name.clone(),
+                q: query.clone(),
+                as_of: None,
+            },
+            Op::Query {
+                actor: ActorSel::ADMIN,
+                ns: target.clone(),
+                q: query,
+                as_of: None,
+            },
+            Op::Branching(BranchingOp::CompactBranch {
+                actor: ActorSel::ADMIN,
+                namespace: target.clone(),
+            }),
+            Op::Branching(BranchingOp::ListBranches {
+                actor: ActorSel::ADMIN,
+                source: source.name.clone(),
+            }),
+            Op::Branching(BranchingOp::DeleteSourceWithBranches {
+                actor: ActorSel::ADMIN,
+                source: source.name.clone(),
+            }),
+            Op::Branching(BranchingOp::DeleteBranch {
+                actor: ActorSel::ADMIN,
+                namespace: target,
+            }),
+            Op::Branching(BranchingOp::DeleteSourceWithBranches {
+                actor: ActorSel::ADMIN,
+                source: source.name,
+            }),
+        ]);
     }
 
     #[must_use]
@@ -1648,9 +1750,41 @@ impl AdversarialGenerator {
     }
 }
 
+fn branching_vector(dims: usize, axis: usize) -> Vec<f32> {
+    let mut vector = vec![0.0; dims];
+    if dims != 0 {
+        vector[axis % dims] = 1.0;
+    }
+    vector
+}
+
+fn branching_exact_query(spec: &NamespaceSpec) -> GeneratedQuery {
+    GeneratedQuery {
+        body: json!({
+            "sources": [{
+                "type": "ann",
+                "vector": branching_vector(spec.dims, 0),
+                "nprobe": spec.num_centroids,
+            }],
+            "fusion": { "type": "none" },
+            "top_k": 64,
+            "candidate_k": 64,
+            "consistency": ConsistencyLevel::Strong,
+            "include_attributes": true,
+        }),
+        class: QueryOracleClass::ExactAnn {
+            top_k: 64,
+            consistency: ConsistencyLevel::Strong,
+            filter: None,
+        },
+        pattern_tags: vec![BRANCHING_PROFILE_TAG.to_string()],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adversarial::branching::BranchDeleteBookkeeping;
 
     #[test]
     fn branching_delete_schedule_is_seeded_and_uses_runner_ops() {
@@ -1667,6 +1801,40 @@ mod tests {
             Op::Branching(BranchingOp::DeleteSourceWithBranches { source, .. })
                 if source == "source"
         )));
+    }
+
+    #[test]
+    fn stable_branching_profile_generates_full_fork_lifecycle_without_merge() {
+        let first = AdversarialGenerator::new_branching(11, "stable");
+        let second = AdversarialGenerator::new_branching(11, "stable");
+        let first_json = serde_json::to_value(&first.pending).unwrap();
+        let second_json = serde_json::to_value(&second.pending).unwrap();
+        assert_eq!(first_json, second_json);
+
+        let operations = first.pending.iter().collect::<Vec<_>>();
+        for kind in [
+            "fork_namespace",
+            "list_branches",
+            "compact_branch",
+            "delete_branch",
+            "delete_source_with_branches",
+        ] {
+            assert!(operations.iter().any(|operation| operation.kind() == kind));
+        }
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            Op::Upsert { ns, .. } if ns.contains("-branch-")
+        )));
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            Op::Query { ns, q, .. }
+                if ns.contains("-branch-")
+                    && q.pattern_tags.iter().any(|tag| tag == BRANCHING_PROFILE_TAG)
+        )));
+        for operation in operations {
+            BranchDeleteBookkeeping::observe_generated_operation_kind(operation.kind())
+                .expect("stable branching profile must remain fork-only");
+        }
     }
 
     #[test]

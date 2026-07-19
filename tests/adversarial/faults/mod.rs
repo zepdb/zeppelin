@@ -54,6 +54,10 @@ pub enum FaultProfile {
     Clock,
     SupportedFull,
     Security,
+    /// Stable deterministic namespace-branching workload; it schedules no
+    /// generic fault family because the branch program carries its own replay
+    /// and lifecycle boundaries.
+    Branching,
     ProviderContractAbuse,
     FutureArchitecture,
     // Legacy Phase 5-7 profiles remain decodable and explicitly runnable for
@@ -76,6 +80,7 @@ impl FaultProfile {
             "clock" => Self::Clock,
             "supported_full" => Self::SupportedFull,
             "security" => Self::Security,
+            "branching" => Self::Branching,
             "provider_contract_abuse" => Self::ProviderContractAbuse,
             "future_architecture" => Self::FutureArchitecture,
             "content" => Self::Content,
@@ -97,6 +102,7 @@ impl FaultProfile {
             Self::Clock => "clock",
             Self::SupportedFull => "supported_full",
             Self::Security => "security",
+            Self::Branching => "branching",
             Self::ProviderContractAbuse => "provider_contract_abuse",
             Self::FutureArchitecture => "future_architecture",
             Self::Content => "content",
@@ -116,6 +122,7 @@ impl FaultProfile {
             Self::Clock => "clock",
             Self::SupportedFull => "supported-full",
             Self::Security => "security",
+            Self::Branching => "branching",
             Self::ProviderContractAbuse => "provider-contract-abuse",
             Self::FutureArchitecture => "future-architecture",
             Self::Content => "content",
@@ -1693,6 +1700,7 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
     let mut events = Vec::new();
     match profile {
         FaultProfile::LegacyChaos => {}
+        FaultProfile::Branching => {}
         FaultProfile::PostCommit => {
             let selectors = [
                 (StoreOp::Put, ".wal"),

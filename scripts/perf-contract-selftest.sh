@@ -50,6 +50,7 @@ if [[ " $* " == *" build --tests "* ]]; then
     exit 0
 fi
 case " $* " in
+    *" branching_census "*) title="Branching" ;;
     *" contracts "*) title="Tier 1" ;;
     *" predict "*) title="Tier 2" ;;
     *" latency_validate "*) title="Tier 3" ;;
@@ -70,6 +71,13 @@ PATH="$root/bin:$PATH" main --nightly
 copied="$PROJECT_ROOT/tasks/perf-contract-report.md"
 if ! grep -q '^# Tier 1$' "$copied"; then
     echo "nightly copied a non-gating report: $copied" >&2
+    exit 1
+fi
+
+PROJECT_ROOT="$root/project"
+PATH="$root/bin:$PATH" main --branching
+if ! grep -q '^# Branching$' "$PROJECT_ROOT/target/perf-contract"/invocation-*/branching/run-fake/report.md; then
+    echo "branching mode did not preserve its dedicated report" >&2
     exit 1
 fi
 

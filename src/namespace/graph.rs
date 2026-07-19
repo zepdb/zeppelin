@@ -54,6 +54,7 @@ use crate::wal::{Lease, LeaseManager, Manifest};
 const MAX_PREPARE_ATTEMPTS: usize = 16;
 const NEVER_ACTIVE_CLEANUP_BUDGET: Duration = Duration::from_secs(25);
 const ORPHAN_BRANCH_ROOT_READINESS_LIMIT: usize = 16;
+const BRANCH_INTENT_STALL_THRESHOLD_SECS: i64 = 300;
 
 /// Operator-safe identity and digest projection for one orphan branch root.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -89,6 +90,10 @@ pub(crate) struct BranchGraphReadinessReport {
     orphan_branch_roots: Vec<OrphanBranchRootRepairSummary>,
     has_additional_orphan_branch_roots: bool,
     orphan_branch_roots_limit: usize,
+    stalled_creating_intents: usize,
+    stalled_deleting_intents: usize,
+    branch_roots_total: usize,
+    intent_stall_threshold_seconds: i64,
 }
 
 impl BranchGraphReadinessReport {
@@ -98,12 +103,44 @@ impl BranchGraphReadinessReport {
             orphan_branch_roots: Vec::new(),
             has_additional_orphan_branch_roots: false,
             orphan_branch_roots_limit: ORPHAN_BRANCH_ROOT_READINESS_LIMIT,
+            stalled_creating_intents: 0,
+            stalled_deleting_intents: 0,
+            branch_roots_total: 0,
+            intent_stall_threshold_seconds: BRANCH_INTENT_STALL_THRESHOLD_SECS,
         }
     }
 
     #[must_use]
     pub(crate) fn is_healthy(&self) -> bool {
         self.orphan_branch_roots.is_empty()
+            && self.stalled_creating_intents == 0
+            && self.stalled_deleting_intents == 0
+    }
+
+    fn publish_metrics(&self) -> Result<()> {
+        let creating = i64::try_from(self.stalled_creating_intents).map_err(|_| {
+            ZeppelinError::Validation(
+                "stalled creating-intent count exceeds Prometheus gauge range".to_string(),
+            )
+        })?;
+        let deleting = i64::try_from(self.stalled_deleting_intents).map_err(|_| {
+            ZeppelinError::Validation(
+                "stalled deleting-intent count exceeds Prometheus gauge range".to_string(),
+            )
+        })?;
+        let roots = i64::try_from(self.branch_roots_total).map_err(|_| {
+            ZeppelinError::Validation(
+                "branch-root count exceeds Prometheus gauge range".to_string(),
+            )
+        })?;
+        crate::metrics::BRANCH_INTENTS_STALLED
+            .with_label_values(&["creating"])
+            .set(creating);
+        crate::metrics::BRANCH_INTENTS_STALLED
+            .with_label_values(&["deleting"])
+            .set(deleting);
+        crate::metrics::BRANCH_ROOTS.set(roots);
+        Ok(())
     }
 }
 
@@ -4989,13 +5026,16 @@ impl NamespaceGraph {
         }
     }
 
-    /// Inspect authoritative parent roots for child lifetimes whose metadata is absent.
+    /// Inspect branch roots and lifecycle intents for operator readiness.
     ///
     /// The scan is read-only. A missing child is reported only after a second
     /// strong parent-manifest read proves the exact root is still authoritative,
     /// preventing a completed concurrent root release from producing a false
-    /// readiness failure. Findings are projected to identities and digests and
-    /// capped independently of the number of namespaces in storage.
+    /// readiness failure. Orphan findings are projected to identities and
+    /// digests and capped independently of the number of namespaces in storage.
+    /// Creating and deleting stalls are aggregate counts. A persisted branch
+    /// deletion grace deadline becomes the progress baseline so an intentional
+    /// reader-safety wait does not make readiness flap.
     pub(crate) async fn inspect_readiness(
         &self,
         namespace_prefix: Option<&str>,
@@ -5023,6 +5063,29 @@ impl NamespaceGraph {
                 Err(ZeppelinError::NamespaceNotFound { .. }) => continue,
                 Err(error) => return Err(error),
             };
+            let deleting_intent =
+                parent.deletion_intent.is_some() || parent.state == NamespaceState::Deleting;
+            let progress_at = parent
+                .deletion_intent
+                .as_ref()
+                .and_then(|intent| intent.visibility.as_ref())
+                .map_or(parent.updated_at, |visibility| {
+                    parent.updated_at.max(visibility.not_before)
+                });
+            let intent_is_stalled = self
+                .clock
+                .now()
+                .signed_duration_since(progress_at)
+                .num_seconds()
+                >= BRANCH_INTENT_STALL_THRESHOLD_SECS;
+            if deleting_intent && intent_is_stalled {
+                report.stalled_deleting_intents += 1;
+            } else if parent.state == NamespaceState::Creating
+                && matches!(&parent.creation_kind, NamespaceCreationKind::Fork(_))
+                && intent_is_stalled
+            {
+                report.stalled_creating_intents += 1;
+            }
             let manifest = match parent.incarnation_id.as_ref() {
                 Some(incarnation) => {
                     Manifest::read_versioned_required_for_incarnation(
@@ -5043,6 +5106,7 @@ impl NamespaceGraph {
                 ) if parent.state == NamespaceState::Deleting => continue,
                 Err(error) => return Err(error),
             };
+            report.branch_roots_total += manifest.branch_roots().len();
 
             for root in manifest.branch_roots().values() {
                 match self
@@ -5059,9 +5123,9 @@ impl NamespaceGraph {
                         if !self.orphan_root_still_authoritative(&parent, root).await? {
                             continue;
                         }
-                        if report.orphan_branch_roots.len() == ORPHAN_BRANCH_ROOT_READINESS_LIMIT {
+                        if report.orphan_branch_roots.len() >= ORPHAN_BRANCH_ROOT_READINESS_LIMIT {
                             report.has_additional_orphan_branch_roots = true;
-                            return Ok(report);
+                            continue;
                         }
                         report
                             .orphan_branch_roots
@@ -5074,6 +5138,7 @@ impl NamespaceGraph {
                 }
             }
         }
+        report.publish_metrics()?;
         Ok(report)
     }
 

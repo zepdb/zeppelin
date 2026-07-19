@@ -2602,7 +2602,8 @@ fn wrap_chaos_store(
 }
 
 fn scheduled_profile(profile: Option<FaultProfile>) -> Option<FaultProfile> {
-    profile.filter(|profile| *profile != FaultProfile::LegacyChaos)
+    profile
+        .filter(|profile| !matches!(profile, FaultProfile::LegacyChaos | FaultProfile::Branching))
 }
 
 fn test_clock_for_scheduler(scheduler: Option<&FaultScheduler>) -> Option<Arc<TestClock>> {
@@ -3559,6 +3560,7 @@ async fn run_seed(
     let swallow_corruption_selftest = mutation == Some(OracleMutation::SwallowCorruption);
     let misdirected_write_selftest = mutation == Some(OracleMutation::MisdirectedWriteReachability);
     let assignment = effective_seed_assignment(env.mode, env.profile, seed);
+    let branching_profile = assignment.profile == Some(FaultProfile::Branching);
     let profile = scheduled_profile(assignment.profile);
     let mode = if profile.is_some()
         || mutation == Some(OracleMutation::ChaosLostWrite)
@@ -3580,7 +3582,9 @@ async fn run_seed(
     let harness = TestHarness::new().await;
     let prefix = harness.prefix.clone();
     clear_receipt_evidence_for_prefix(&prefix);
-    let mut generator = if profile == Some(FaultProfile::Security) {
+    let mut generator = if branching_profile {
+        AdversarialGenerator::new_branching(seed, &prefix)
+    } else if profile == Some(FaultProfile::Security) {
         AdversarialGenerator::new_security_profile(seed, &prefix)
     } else if security_program_enabled {
         AdversarialGenerator::new_security(seed, &prefix)
@@ -3641,7 +3645,8 @@ async fn run_seed(
     let active_profile = scheduler
         .as_ref()
         .map(|scheduler| scheduler.schedule().profile)
-        .or_else(|| chaos_plan.as_ref().map(|_| FaultProfile::LegacyChaos));
+        .or_else(|| chaos_plan.as_ref().map(|_| FaultProfile::LegacyChaos))
+        .or_else(|| branching_profile.then_some(FaultProfile::Branching));
     let (legacy_instrumented_store, chaos_handle) =
         wrap_chaos_store(&harness.store, chaos_plan.clone());
     let instrumented_store = scheduler
@@ -3657,7 +3662,10 @@ async fn run_seed(
         || store.clone(),
         |observer| operational_store_proxy(&store, observer.clone(), 0),
     );
-    let config = config_for_mode(mode, seed, scheduler.as_ref().map(FaultScheduler::schedule));
+    let mut config = config_for_mode(mode, seed, scheduler.as_ref().map(FaultScheduler::schedule));
+    if branching_profile {
+        config.branching.enabled = true;
+    }
     let recorded_ops = recorded_seed_ops_if_requested(env, seed, &prefix);
     let mut artifacts = artifacts.seed_with_security(
         seed,

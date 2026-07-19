@@ -269,6 +269,47 @@ async fn branching_delete_smoke() {
     );
 }
 
+/// Stable replayable Phase 10 profile. The normal runner executes the full
+/// fork/list/diverge/materialize/delete vocabulary and writes canonical
+/// `ops.jsonl` artifacts that can be replayed with the existing replay test.
+#[tokio::test]
+#[ignore]
+async fn branching_profile() {
+    let env = adversarial::RunnerEnv::from_env();
+    assert_eq!(
+        env.profile,
+        Some(adversarial::faults::FaultProfile::Branching),
+        "branching profile requires ZEPPELIN_ADVERSARIAL_PROFILE=branching"
+    );
+    let summary = adversarial::runner::run_smoke(env).await;
+    assert_eq!(
+        summary.failed_seeds, 0,
+        "branching profile reported failures"
+    );
+    for kind in [
+        "fork_namespace",
+        "list_branches",
+        "compact_branch",
+        "delete_branch",
+        "delete_source_with_branches",
+    ] {
+        assert!(
+            summary.coverage.op_counts.get(kind).copied().unwrap_or(0) > 0,
+            "branching profile did not cover {kind}"
+        );
+    }
+    assert!(
+        summary
+            .coverage
+            .tag_counts
+            .get(adversarial::generator::BRANCHING_PROFILE_TAG)
+            .copied()
+            .unwrap_or(0)
+            >= 5,
+        "branching profile must query both source and target across divergence"
+    );
+}
+
 #[test]
 fn smoke_coverage_contract_is_mode_aware() {
     for mode in [

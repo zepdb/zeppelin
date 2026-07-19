@@ -24,7 +24,7 @@
 //! ```
 //!
 //! Operational endpoints have narrower contracts. `/healthz` proves only that
-//! the process can answer; `/readyz` performs an object-store list operation;
+//! the process can answer; `/readyz` performs object-store and branch-graph scans;
 //! `/metrics` exports process metrics; and the feature-gated profiling route
 //! performs blocking CPU sampling off the Tokio worker pool. Their success and
 //! failure bodies are not all canonical domain-error envelopes, so callers
@@ -459,9 +459,10 @@ pub async fn health_check() -> Json<Value> {
 ///
 /// Readiness lists an intentionally unlikely prefix through
 /// [`crate::storage::ZeppelinStore`], then performs a read-only graph scan for
-/// parent roots whose exact child metadata is absent. Failure text from
-/// `object_store` may include an endpoint, port, or bucket, so only a generic
-/// reason reaches the caller.
+/// parent roots whose exact child metadata is absent and branch lifecycle
+/// intents that have made no durable progress beyond the bounded stall
+/// threshold. Failure text from `object_store` may include an endpoint, port,
+/// or bucket, so only a generic reason reaches the caller.
 ///
 /// # Parameters
 ///
@@ -472,9 +473,10 @@ pub async fn health_check() -> Json<Value> {
 /// `Ok` with JSON `{"status":"ready","s3_connected":true}` and status 200
 /// when listing and graph inspection succeed. Returns a direct `(503, JSON)`
 /// rejection with `s3_connected:false` when the reachability probe fails. An
-/// orphan root returns `s3_connected:true` plus a bounded identities-and-digests
-/// operator repair summary; this operational body is intentionally distinct
-/// from the canonical domain-error envelope.
+/// branch-graph failure returns `s3_connected:true` plus aggregate lifecycle
+/// counts and, for orphan roots, a bounded identities-and-digests operator
+/// repair summary. This operational body is intentionally distinct from the
+/// canonical domain-error envelope.
 ///
 /// # Errors
 ///
@@ -487,13 +489,15 @@ pub async fn health_check() -> Json<Value> {
 ///
 /// Checks the process-local durable-audit health latch, performs the existing
 /// object-store list request, then strongly reads namespace metadata and
-/// manifests. It logs full failures and `/readyz` bypasses rate-limit charging.
+/// manifests, then refreshes the bounded branch lifecycle and total-root
+/// gauges. It logs full failures and `/readyz` bypasses rate-limit charging.
 ///
 /// # Consistency
 ///
 /// Success means the audit actor has not failed, S3 is reachable, and the
-/// completed graph scan found no authoritative orphan root at that instant. It
-/// is not a promise that a later request cannot fail.
+/// completed graph scan found no authoritative orphan root or stalled branch
+/// lifecycle intent at that instant. It is not a promise that a later request
+/// cannot fail.
 ///
 /// # Examples
 ///
