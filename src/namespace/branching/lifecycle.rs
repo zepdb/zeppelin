@@ -396,6 +396,8 @@ pub struct BranchDescriptor {
     pub created_at: DateTime<Utc>,
     /// Redacted lifecycle state.
     pub state: BranchLifecycleState,
+    /// Whether the current active view contains only target-owned artifacts.
+    pub materialized: bool,
 }
 
 /// Complete proof returned after prepare reaches `manifest_published`.

@@ -310,6 +310,16 @@ pub async fn create_branch(
         .map_err(ApiError::from)?;
     let created = outcome.created();
     let branch = outcome.branch();
+    let (target_manifest, _) = Manifest::read_versioned_required_for_incarnation(
+        &state.store,
+        branch.identity.target_namespace.as_str(),
+        branch.identity.target_incarnation.as_uuid(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+    let materialized = target_manifest
+        .visible_refs_are_local()
+        .map_err(ApiError::from)?;
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -332,7 +342,7 @@ pub async fn create_branch(
                 generation: branch.identity.target_generation.get(),
             },
             depth: branch.identity.depth,
-            materialized: false,
+            materialized,
             created_at: branch.identity.created_at,
         }),
     ))
@@ -386,7 +396,7 @@ pub async fn list_branches(
             depth: descriptor.depth,
             lifecycle,
             health,
-            materialized: false,
+            materialized: descriptor.materialized,
             created_at: descriptor.created_at,
         });
     }
@@ -840,15 +850,26 @@ impl NamespaceResponse {
     /// references into the borrowed manifest. In C terms, the borrows resemble
     /// non-null `const` pointers with checked lifetimes; Java has no direct
     /// equivalent of consuming the metadata value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an artifact-origin validation error when an active branch's
+    /// visible manifest cannot prove whether every live ref is target-owned.
     #[must_use]
     pub fn from_manifest(
         meta: NamespaceMetadata,
         manifest: &Manifest,
         default_indexing: &crate::config::IndexingConfig,
-    ) -> Self {
+    ) -> Result<Self, ZeppelinError> {
         let index_kind = namespace_index_kind(&meta, manifest);
         let active_segment = active_segment_ref(manifest);
         let compaction_health = meta.compaction_health.clone();
+        let materialized = if meta.branch_identity.is_some() && meta.state == NamespaceState::Active
+        {
+            manifest.visible_refs_are_local()?
+        } else {
+            false
+        };
         let branch = meta
             .branch_identity
             .as_ref()
@@ -866,10 +887,10 @@ impl NamespaceResponse {
                 } else {
                     BranchHealth::Ready
                 },
-                materialized: false,
+                materialized,
                 created_at: identity.created_at,
             });
-        Self {
+        Ok(Self {
             name: meta.name,
             dimensions: meta.dimensions,
             distance_metric: meta.distance_metric,
@@ -899,7 +920,7 @@ impl NamespaceResponse {
             state: meta.state.as_str().to_string(),
             full_text_search: meta.full_text_search,
             branch,
-        }
+        })
     }
 }
 
@@ -1336,7 +1357,8 @@ pub async fn create_namespace(
                     meta,
                     &Manifest::new_at(state.clock.now()),
                     &state.config.indexing,
-                ),
+                )
+                .map_err(ApiError::from)?,
                 warning:
                     "Client-specified namespace names are idempotent for identical configuration."
                         .to_string(),
@@ -1380,7 +1402,8 @@ pub async fn create_namespace(
                 meta,
                 &Manifest::new_at(state.clock.now()),
                 &state.config.indexing,
-            ),
+            )
+            .map_err(ApiError::from)?,
             warning: "Save this namespace name. It cannot be recovered if lost.".to_string(),
         }),
     ))
@@ -1646,7 +1669,8 @@ pub async fn clone_namespace(
                 target_meta,
                 &target_manifest,
                 &state.config.indexing,
-            ),
+            )
+            .map_err(ApiError::from)?,
         }),
     ))
 }
@@ -2251,11 +2275,22 @@ pub async fn list_namespaces(
         .map_err(ApiError::from)?;
 
     info!(count = namespaces.len(), "listed namespaces");
-    let empty_manifest = Manifest::new_at(state.clock.now());
-    let responses: Vec<NamespaceResponse> = namespaces
-        .into_iter()
-        .map(|meta| NamespaceResponse::from_manifest(meta, &empty_manifest, &state.config.indexing))
-        .collect();
+    let mut responses = Vec::with_capacity(namespaces.len());
+    for meta in namespaces {
+        let manifest = if meta.state == NamespaceState::Active {
+            state
+                .manifest_cache
+                .get_strong_required(&state.store, &meta.name)
+                .await
+                .map_err(ApiError::from)?
+        } else {
+            Manifest::new_at(state.clock.now())
+        };
+        responses.push(
+            NamespaceResponse::from_manifest(meta, &manifest, &state.config.indexing)
+                .map_err(ApiError::from)?,
+        );
+    }
     Ok(Json(responses))
 }
 
@@ -2337,11 +2372,10 @@ pub async fn get_namespace(
     }
     .map_err(ApiError::from)?;
 
-    Ok(Json(NamespaceResponse::from_manifest(
-        meta,
-        &manifest,
-        &state.config.indexing,
-    )))
+    Ok(Json(
+        NamespaceResponse::from_manifest(meta, &manifest, &state.config.indexing)
+            .map_err(ApiError::from)?,
+    ))
 }
 
 /// Reports compaction readiness from a strongly verified live manifest.

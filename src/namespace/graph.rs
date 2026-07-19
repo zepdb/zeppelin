@@ -3783,6 +3783,42 @@ impl NamespaceGraph {
                 NamespaceState::Active => BranchLifecycleState::Active,
                 NamespaceState::Deleting => BranchLifecycleState::Deleting,
             };
+            let materialized = if metadata.state == NamespaceState::Active {
+                let live = match Manifest::read_versioned_required_for_incarnation(
+                    &self.store,
+                    root.target_namespace.as_str(),
+                    root.target_incarnation.as_uuid(),
+                )
+                .await
+                {
+                    Ok((live, _)) => live,
+                    Err(error) => {
+                        warn!(
+                            source = %request.source,
+                            target = %root.target_namespace,
+                            branch_id = %root.branch_id,
+                            error = %error,
+                            "authorized branch manifest read failed integrity validation"
+                        );
+                        return Err(BranchError::BranchIntegrity.into());
+                    }
+                };
+                match live.visible_refs_are_local() {
+                    Ok(materialized) => materialized,
+                    Err(error) => {
+                        warn!(
+                            source = %request.source,
+                            target = %root.target_namespace,
+                            branch_id = %root.branch_id,
+                            error = %error,
+                            "authorized branch artifact origins failed integrity validation"
+                        );
+                        return Err(BranchError::BranchIntegrity.into());
+                    }
+                }
+            } else {
+                false
+            };
             children.push(BranchDescriptor {
                 target: root.target_namespace.clone(),
                 branch_id: root.branch_id,
@@ -3790,6 +3826,7 @@ impl NamespaceGraph {
                 depth: reservation.depth,
                 created_at: reservation.created_at,
                 state,
+                materialized,
             });
         }
         children.sort_by(|left, right| {

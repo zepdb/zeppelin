@@ -7,15 +7,9 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use zeppelin::config::Config;
 
-async fn wait_for_compaction(
-    client: &reqwest::Client,
-    base_url: &str,
-    namespace: &str,
-) {
+async fn wait_for_compaction(client: &reqwest::Client, base_url: &str, namespace: &str) {
     let accepted = client
-        .post(format!(
-            "{base_url}/v1/namespaces/{namespace}/compact"
-        ))
+        .post(format!("{base_url}/v1/namespaces/{namespace}/compact"))
         .send()
         .await
         .expect("manual branch compaction request must complete");
