@@ -7,12 +7,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use crate::config::{SecurityConfig, SecurityMode};
 use crate::error::Result as ZeppelinResult;
 use crate::namespace::branching::activation::{
-    AuthorizedForkNamespace, BranchActivationGovernance, BranchActivationGuard,
-    BranchActivationPermit, BranchActivationRecovery,
+    AuthorizedForkNamespace, BranchActivationAttempt, BranchActivationGovernance,
+    BranchActivationGuard, BranchActivationPermit, BranchActivationRecovery,
+    BranchActivationTarget,
 };
 use crate::namespace::branching::deletion::{
     deletion_decision_evidence_key, persist_deletion_lifecycle_audit, AuthorizedBranchList,
@@ -25,6 +25,7 @@ use crate::namespace::branching::{
 use crate::storage::store::ObjectSigner;
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
+use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
 use super::{
@@ -36,12 +37,10 @@ use super::{
     Obligation, PolicyActivationGuardPermit, PolicyGrant, PolicyPrincipal, PolicySnapshot,
     PolicyStore, PreservationLockId, PreservationLockRecord, PreservationService, Principal,
     PrincipalId, PrincipalKind, RequestContext, Resource, ResourceRef, SecurityError,
-    SecurityOperationError, SecurityOperationResult,
-    MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS,
+    SecurityOperationError, SecurityOperationResult, MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS,
 };
 
-const BRANCH_ACTIVATION_GUARD_TTL_SECS: i64 =
-    MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS / 2;
+const BRANCH_ACTIVATION_GUARD_TTL_SECS: i64 = MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS / 2;
 
 #[derive(Debug)]
 struct BootstrapGrant {
@@ -145,6 +144,7 @@ struct PolicyBranchActivationPermit {
 struct PolicyRetainedBranchActivationGuard {
     cache: Arc<PolicyCache>,
     guard: PolicyActivationGuardPermit,
+    attempt: BranchActivationAttempt,
 }
 
 struct NamespaceBranchActivationRecovery {
@@ -1515,9 +1515,7 @@ impl SecurityKernel {
             .map_err(|error| SecurityOperationError::after_allow(error, fork.clone()))?;
         compiled
             .validate_namespace_copy_no_widening(&admission.source, &admission.target)
-            .map_err(|error| {
-                SecurityOperationError::after_allow(error.into(), fork.clone())
-            })?;
+            .map_err(|error| SecurityOperationError::after_allow(error.into(), fork.clone()))?;
 
         let approval_required = fork.obligations.contains(&Obligation::Approval);
         let approver = match admission.approver.as_ref() {
@@ -1711,9 +1709,7 @@ impl BranchActivationGovernance for NamespaceForkGovernance {
                     .admission
                     .clock
                     .now()
-                    .checked_add_signed(ChronoDuration::seconds(
-                        BRANCH_ACTIVATION_GUARD_TTL_SECS,
-                    ))
+                    .checked_add_signed(ChronoDuration::seconds(BRANCH_ACTIVATION_GUARD_TTL_SECS))
                     .ok_or_else(|| {
                         SecurityError::InvalidPolicy(
                             "branch activation guard expiry overflow".to_string(),
@@ -1766,19 +1762,22 @@ impl BranchActivationGovernance for NamespaceForkGovernance {
     async fn retain_guard(
         &self,
         prepared: &PreparedBranch,
-        nonce: ActivationNonce,
+        expected_nonce: Option<ActivationNonce>,
     ) -> ZeppelinResult<Option<Box<dyn BranchActivationGuard>>> {
         validate_prepared_fork(&self.admission, prepared)?;
+        let target = BranchActivationTarget::from_identity(&prepared.identity);
         match &self.kernel.authority {
             SecurityAuthority::Bootstrap(_) => Ok(None),
             SecurityAuthority::Policy(cache) => cache
-                .retain_pending_branch_activation(prepared.identity.branch_id, nonce)
+                .retain_pending_branch_activation(&target, expected_nonce)
                 .await
                 .map(|guard| {
                     guard.map(|guard| {
+                        let attempt = guard.attempt();
                         Box::new(PolicyRetainedBranchActivationGuard {
                             cache: Arc::clone(cache),
                             guard,
+                            attempt,
                         }) as Box<dyn BranchActivationGuard>
                     })
                 }),
@@ -1875,6 +1874,10 @@ impl BranchActivationPermit for PolicyBranchActivationPermit {
 
 #[async_trait]
 impl BranchActivationGuard for PolicyRetainedBranchActivationGuard {
+    fn attempt(&self) -> &BranchActivationAttempt {
+        &self.attempt
+    }
+
     async fn finalize(self: Box<Self>) -> ZeppelinResult<()> {
         let guard = *self;
         guard.cache.finalize_branch_activation(guard.guard).await
@@ -1888,21 +1891,41 @@ impl BranchActivationGuard for PolicyRetainedBranchActivationGuard {
 
 #[async_trait]
 impl BranchActivationRecovery for NamespaceBranchActivationRecovery {
-    async fn retain_guard(
+    async fn retain_branch(
         &self,
-        branch_id: crate::namespace::BranchId,
-        nonce: ActivationNonce,
+        target: &BranchActivationTarget,
     ) -> ZeppelinResult<Option<Box<dyn BranchActivationGuard>>> {
         match &self.kernel.authority {
             SecurityAuthority::Bootstrap(_) => Ok(None),
             SecurityAuthority::Policy(cache) => cache
-                .retain_pending_branch_activation(branch_id, nonce)
+                .retain_pending_branch_activation(target, None)
                 .await
                 .map(|guard| {
                     guard.map(|guard| {
+                        let attempt = guard.attempt();
                         Box::new(PolicyRetainedBranchActivationGuard {
                             cache: Arc::clone(cache),
                             guard,
+                            attempt,
+                        }) as Box<dyn BranchActivationGuard>
+                    })
+                }),
+        }
+    }
+
+    async fn retain_next_expired(&self) -> ZeppelinResult<Option<Box<dyn BranchActivationGuard>>> {
+        match &self.kernel.authority {
+            SecurityAuthority::Bootstrap(_) => Ok(None),
+            SecurityAuthority::Policy(cache) => cache
+                .retain_next_expired_branch_activation()
+                .await
+                .map(|guard| {
+                    guard.map(|guard| {
+                        let attempt = guard.attempt();
+                        Box::new(PolicyRetainedBranchActivationGuard {
+                            cache: Arc::clone(cache),
+                            guard,
+                            attempt,
                         }) as Box<dyn BranchActivationGuard>
                     })
                 }),

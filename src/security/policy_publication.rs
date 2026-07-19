@@ -16,6 +16,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use ulid::Ulid;
 
 use crate::error::{Result, ZeppelinError};
+use crate::namespace::branching::activation::{BranchActivationAttempt, BranchActivationTarget};
 use crate::namespace::branching::ActivationNonce;
 use crate::namespace::{BranchId, NamespaceId, NamespaceIncarnationId};
 use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, ZeppelinStore};
@@ -244,6 +245,22 @@ impl PendingBranchActivation {
     #[must_use]
     pub const fn activation_nonce(&self) -> ActivationNonce {
         self.activation_nonce
+    }
+
+    /// Exact target identity independently usable by background recovery.
+    #[must_use]
+    pub(crate) fn target(&self) -> BranchActivationTarget {
+        BranchActivationTarget::new(
+            self.branch_id,
+            self.target_namespace.clone(),
+            self.target_incarnation.clone(),
+        )
+    }
+
+    /// Exact target and nonce covered by this persisted guard.
+    #[must_use]
+    pub(crate) fn attempt(&self) -> BranchActivationAttempt {
+        BranchActivationAttempt::new(self.target(), self.activation_nonce)
     }
 
     /// Semantic policy version re-proved before guard insertion.
@@ -600,6 +617,12 @@ impl PolicyActivationGuardPermit {
     #[must_use]
     pub const fn activation_nonce(&self) -> ActivationNonce {
         self.guard.activation_nonce
+    }
+
+    /// Exact target and nonce retained by this permit.
+    #[must_use]
+    pub(crate) fn attempt(&self) -> BranchActivationAttempt {
+        self.guard.attempt()
     }
 }
 

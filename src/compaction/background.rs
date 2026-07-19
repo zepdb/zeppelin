@@ -149,7 +149,7 @@ use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
 use crate::namespace::branching::activation::BranchActivationRecovery;
 use crate::namespace::branching::deletion::DeletionGovernance;
-use crate::namespace::branching::NamespaceDeleteOutcome;
+use crate::namespace::branching::{BranchMaintenanceReport, NamespaceDeleteOutcome};
 use crate::namespace::graph::NamespaceGraph;
 use crate::namespace::manager::{NamespaceMetadata, NamespaceState};
 use crate::namespace::{NamespaceId, NamespaceManager};
@@ -668,6 +668,16 @@ impl GovernedDeletionWorker {
     ) -> Result<()> {
         self.graph
             .confirm_missing_after_resume(namespace, metadata)
+            .await
+    }
+
+    async fn maintain(&self, budget: Duration) -> Result<BranchMaintenanceReport> {
+        self.graph
+            .maintain(
+                Arc::clone(&self.governance),
+                Arc::clone(&self.activation_recovery),
+                budget,
+            )
             .await
     }
 }
@@ -1944,6 +1954,36 @@ async fn compaction_loop_with_lifecycle_inner(
                         );
                     }
                     warn!(namespace = %ns.name, error = %e, "failed to check compaction status");
+                }
+            }
+        }
+
+        if let Some(deletion_worker) = deletion_worker {
+            match deletion_worker.maintain(Duration::from_secs(25)).await {
+                Ok(report)
+                    if report.activation_guards_inspected > 0
+                        || report.deletions_completed > 0
+                        || report.deletions_in_progress > 0
+                        || report.rooted_repaired > 0
+                        || report.manifests_published > 0 =>
+                {
+                    info!(
+                        activation_guards_inspected = report.activation_guards_inspected,
+                        activation_guards_finalized = report.activation_guards_finalized,
+                        activation_guards_aborted = report.activation_guards_aborted,
+                        deletions_completed = report.deletions_completed,
+                        deletions_in_progress = report.deletions_in_progress,
+                        rooted_repaired = report.rooted_repaired,
+                        manifests_published = report.manifests_published,
+                        "namespace graph maintenance completed"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "namespace graph maintenance failed"
+                    );
                 }
             }
         }

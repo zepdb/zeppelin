@@ -20,6 +20,7 @@ use super::{
     PrincipalKind, Resource, SecurityError, SecurityOperationError, SecurityOperationResult,
 };
 use crate::error::Result;
+use crate::namespace::branching::activation::BranchActivationTarget;
 use crate::namespace::branching::ActivationNonce;
 use crate::namespace::{BranchId, NamespaceIncarnationId};
 use crate::time::Clock;
@@ -440,13 +441,33 @@ impl PolicyCache {
     /// inspection during crash recovery or prepared cancellation.
     pub(crate) async fn retain_pending_branch_activation(
         &self,
-        branch_id: BranchId,
-        activation_nonce: ActivationNonce,
+        target: &BranchActivationTarget,
+        expected_nonce: Option<ActivationNonce>,
     ) -> Result<Option<PolicyActivationGuardPermit>> {
         let session = self.store.acquire_claimed_publication().await?;
         let retained = self
             .store
-            .retain_pending_branch_activation(session, branch_id, activation_nonce)
+            .retain_pending_branch_activation(session, target, expected_nonce)
+            .await?;
+        let Some((loaded, permit)) = retained else {
+            return Ok(None);
+        };
+        if let Err(error) = self.install(loaded) {
+            self.store.release_branch_activation_permit(permit).await;
+            return Err(error);
+        }
+        Ok(Some(permit))
+    }
+
+    /// Retain the deterministic next expired guard under one newly claimed
+    /// publication lease. This path is mechanical and performs no authz.
+    pub(crate) async fn retain_next_expired_branch_activation(
+        &self,
+    ) -> Result<Option<PolicyActivationGuardPermit>> {
+        let session = self.store.acquire_claimed_publication().await?;
+        let retained = self
+            .store
+            .retain_next_expired_branch_activation(session, self.clock.now())
             .await?;
         let Some((loaded, permit)) = retained else {
             return Ok(None);

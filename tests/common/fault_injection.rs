@@ -111,6 +111,7 @@ pub struct ToggleCasPreconditionFailureStore {
 pub struct CasPairBarrierHandle {
     enabled: Arc<AtomicBool>,
     arrivals: Arc<AtomicUsize>,
+    arrived: Arc<tokio::sync::Notify>,
     conflicts: Arc<AtomicUsize>,
 }
 
@@ -126,6 +127,17 @@ impl CasPairBarrierHandle {
         self.arrivals.load(Ordering::SeqCst)
     }
 
+    /// Wait until at least `expected` matching CAS calls reach the wrapper.
+    pub async fn wait_until_arrivals(&self, expected: usize) {
+        loop {
+            let notified = self.arrived.notified();
+            if self.arrivals.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Return how many inner CAS calls lost with an ETag precondition error.
     #[must_use]
     pub fn conflicts(&self) -> usize {
@@ -138,10 +150,15 @@ impl CasPairBarrierHandle {
 pub struct CasPairBarrierStore {
     inner: Arc<dyn ObjectStore>,
     needle: String,
+    payload_needles: Option<(Vec<u8>, Vec<u8>)>,
+    winner_payload_needle: Option<Vec<u8>>,
     enabled: Arc<AtomicBool>,
     arrivals: Arc<AtomicUsize>,
+    arrived: Arc<tokio::sync::Notify>,
     conflicts: Arc<AtomicUsize>,
     barrier: Arc<tokio::sync::Barrier>,
+    winner_done: Arc<AtomicBool>,
+    winner_done_notify: Arc<tokio::sync::Notify>,
 }
 
 /// Controller for a one-shot matching CAS publication pause.
@@ -509,20 +526,72 @@ pub fn synchronize_cas_pair_matching(
 ) -> (ZeppelinStore, CasPairBarrierHandle) {
     let enabled = Arc::new(AtomicBool::new(false));
     let arrivals = Arc::new(AtomicUsize::new(0));
+    let arrived = Arc::new(tokio::sync::Notify::new());
     let conflicts = Arc::new(AtomicUsize::new(0));
+    let winner_done = Arc::new(AtomicBool::new(false));
+    let winner_done_notify = Arc::new(tokio::sync::Notify::new());
     let wrapper = CasPairBarrierStore {
         inner: store.inner(),
         needle: needle.into(),
+        payload_needles: None,
+        winner_payload_needle: None,
         enabled: Arc::clone(&enabled),
         arrivals: Arc::clone(&arrivals),
+        arrived: Arc::clone(&arrived),
         conflicts: Arc::clone(&conflicts),
         barrier: Arc::new(tokio::sync::Barrier::new(2)),
+        winner_done,
+        winner_done_notify,
     };
     (
         ZeppelinStore::new(Arc::new(wrapper)),
         CasPairBarrierHandle {
             enabled,
             arrivals,
+            arrived,
+            conflicts,
+        },
+    )
+}
+
+/// Synchronize two exact CAS payload families and force one family to publish first.
+///
+/// Both writers reach the barrier with their already-read ETags before either
+/// request reaches S3. The payload containing `winner_payload_needle` then
+/// publishes first, and the other request is released only after that write
+/// returns. This gives race tests both linearization orderings without sleeps.
+pub fn synchronize_cas_pair_matching_payloads_with_winner(
+    store: &ZeppelinStore,
+    key_needle: impl Into<String>,
+    first_payload_needle: impl Into<Vec<u8>>,
+    second_payload_needle: impl Into<Vec<u8>>,
+    winner_payload_needle: impl Into<Vec<u8>>,
+) -> (ZeppelinStore, CasPairBarrierHandle) {
+    let enabled = Arc::new(AtomicBool::new(false));
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let conflicts = Arc::new(AtomicUsize::new(0));
+    let winner_done = Arc::new(AtomicBool::new(false));
+    let winner_done_notify = Arc::new(tokio::sync::Notify::new());
+    let wrapper = CasPairBarrierStore {
+        inner: store.inner(),
+        needle: key_needle.into(),
+        payload_needles: Some((first_payload_needle.into(), second_payload_needle.into())),
+        winner_payload_needle: Some(winner_payload_needle.into()),
+        enabled: Arc::clone(&enabled),
+        arrivals: Arc::clone(&arrivals),
+        arrived: Arc::clone(&arrived),
+        conflicts: Arc::clone(&conflicts),
+        barrier: Arc::new(tokio::sync::Barrier::new(2)),
+        winner_done,
+        winner_done_notify,
+    };
+    (
+        ZeppelinStore::new(Arc::new(wrapper)),
+        CasPairBarrierHandle {
+            enabled,
+            arrivals,
+            arrived,
             conflicts,
         },
     )
@@ -2091,16 +2160,42 @@ impl ObjectStore for CasPairBarrierStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> OsResult<PutResult> {
+        let payload_matches = self
+            .payload_needles
+            .as_ref()
+            .map_or(true, |(first, second)| {
+                put_payload_contains(&payload, first) || put_payload_contains(&payload, second)
+            });
         let synchronize = self.enabled.load(Ordering::SeqCst)
             && location.as_ref().contains(&self.needle)
-            && matches!(&opts.mode, PutMode::Update(_));
+            && matches!(&opts.mode, PutMode::Update(_))
+            && payload_matches;
+        let ordered_winner = synchronize
+            && self
+                .winner_payload_needle
+                .as_ref()
+                .is_some_and(|needle| put_payload_contains(&payload, needle));
         if synchronize {
             let arrival = self.arrivals.fetch_add(1, Ordering::SeqCst);
+            self.arrived.notify_waiters();
             if arrival < 2 {
                 self.barrier.wait().await;
             }
+            if self.winner_payload_needle.is_some() && !ordered_winner {
+                loop {
+                    let notified = self.winner_done_notify.notified();
+                    if self.winner_done.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    notified.await;
+                }
+            }
         }
         let result = self.inner.put_opts(location, payload, opts).await;
+        if ordered_winner {
+            self.winner_done.store(true, Ordering::SeqCst);
+            self.winner_done_notify.notify_waiters();
+        }
         if synchronize && matches!(&result, Err(object_store::Error::Precondition { .. })) {
             self.conflicts.fetch_add(1, Ordering::SeqCst);
         }
@@ -2142,6 +2237,17 @@ impl ObjectStore for CasPairBarrierStore {
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
         self.inner.copy_if_not_exists(from, to).await
     }
+}
+
+fn put_payload_contains(payload: &PutPayload, needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let body = payload
+        .iter()
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect::<Vec<_>>();
+    body.windows(needle.len()).any(|window| window == needle)
 }
 
 #[async_trait]

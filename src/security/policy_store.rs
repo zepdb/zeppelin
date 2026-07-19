@@ -1,5 +1,6 @@
 //! S3-authoritative loading and atomic bootstrap of security policy.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,9 @@ use ulid::Ulid;
 
 use crate::config::SecurityConfig;
 use crate::error::{Result, ZeppelinError};
+use crate::namespace::branching::activation::BranchActivationTarget;
+use crate::namespace::branching::ActivationNonce;
+use crate::namespace::BranchId;
 use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, ZeppelinStore};
 
 use super::{Entitlements, Feature, PolicyHead, PolicySnapshot, SecurityError};
@@ -452,24 +456,50 @@ impl PolicyStore {
     pub(crate) async fn retain_pending_branch_activation(
         &self,
         session: ClaimedPolicyPublication,
-        branch_id: crate::namespace::BranchId,
-        activation_nonce: crate::namespace::branching::ActivationNonce,
+        target: &BranchActivationTarget,
+        expected_nonce: Option<ActivationNonce>,
     ) -> Result<Option<(LoadedPolicy, PolicyActivationGuardPermit)>> {
         let pending = session.loaded.head().pending_branch_activations();
-        let guard = pending
-            .get(&branch_id)
-            .filter(|guard| guard.activation_nonce() == activation_nonce)
-            .cloned();
+        let guard = match select_pending_branch_activation(pending, target, expected_nonce) {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.release_publication_best_effort(&session.lease_claim)
+                    .await;
+                return Err(error.into());
+            }
+        };
         let Some(guard) = guard else {
             self.release_publication_best_effort(&session.lease_claim)
                 .await;
-            if pending.is_empty() {
-                // Claiming the head fenced every older holder. With no guard
-                // in that exact authoritative observation, the graph may
-                // safely revoke the target nonce without policy cleanup.
-                return Ok(None);
-            }
-            return Err(SecurityError::PolicyConflict.into());
+            // Claiming the head fenced every older holder. The branch-key
+            // absence is authoritative even when unrelated guards remain.
+            return Ok(None);
+        };
+        let loaded = session.loaded;
+        let permit = PolicyActivationGuardPermit {
+            guard,
+            lease_claim: session.lease_claim,
+            head_etag: loaded.head_etag().to_string(),
+            control_revision: loaded.head().control_revision(),
+        };
+        Ok(Some((loaded, permit)))
+    }
+
+    /// Take over publication authority and retain the deterministic next
+    /// expired guard from that same claimed head observation.
+    pub(crate) async fn retain_next_expired_branch_activation(
+        &self,
+        session: ClaimedPolicyPublication,
+        now: DateTime<Utc>,
+    ) -> Result<Option<(LoadedPolicy, PolicyActivationGuardPermit)>> {
+        let guard = select_next_expired_branch_activation(
+            session.loaded.head().pending_branch_activations(),
+            now,
+        );
+        let Some(guard) = guard else {
+            self.release_publication_best_effort(&session.lease_claim)
+                .await;
+            return Ok(None);
         };
         let loaded = session.loaded;
         let permit = PolicyActivationGuardPermit {
@@ -912,6 +942,38 @@ impl PolicyStore {
     }
 }
 
+fn select_pending_branch_activation(
+    pending: &BTreeMap<BranchId, PendingBranchActivation>,
+    target: &BranchActivationTarget,
+    expected_nonce: Option<ActivationNonce>,
+) -> std::result::Result<Option<PendingBranchActivation>, SecurityError> {
+    let Some(guard) = pending.get(&target.branch_id()) else {
+        return Ok(None);
+    };
+    if guard.target_namespace() != target.target_namespace()
+        || guard.target_incarnation() != target.target_incarnation()
+        || expected_nonce.is_some_and(|nonce| guard.activation_nonce() != nonce)
+    {
+        return Err(SecurityError::PolicyConflict);
+    }
+    Ok(Some(guard.clone()))
+}
+
+fn select_next_expired_branch_activation(
+    pending: &BTreeMap<BranchId, PendingBranchActivation>,
+    now: DateTime<Utc>,
+) -> Option<PendingBranchActivation> {
+    pending
+        .values()
+        .filter(|guard| guard.expires_at() <= now)
+        .min_by(|left, right| {
+            left.expires_at()
+                .cmp(&right.expires_at())
+                .then_with(|| left.branch_id().cmp(&right.branch_id()))
+        })
+        .cloned()
+}
+
 fn encode_policy_head(head: &PolicyHead) -> Result<Bytes> {
     serde_json::to_vec(head).map(Bytes::from).map_err(|error| {
         SecurityError::InvalidPolicy(format!("policy head encoding failed: {error}")).into()
@@ -1040,4 +1102,119 @@ fn normalize_grant_action_partitions(entries: &mut Vec<serde_json::Value>) -> Re
         })
         .collect();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use chrono::{TimeZone, Utc};
+    use ulid::Ulid;
+    use uuid::Uuid;
+
+    use crate::namespace::branching::activation::BranchActivationTarget;
+    use crate::namespace::branching::ActivationNonce;
+    use crate::namespace::{BranchId, NamespaceId, NamespaceIncarnationId};
+
+    use crate::security::{PolicyHeadDigest, PolicyLeaseFencingToken, PolicyVersion};
+
+    use super::{
+        select_next_expired_branch_activation, select_pending_branch_activation,
+        PendingBranchActivation,
+    };
+
+    fn pending_guard(
+        branch: u128,
+        target: &str,
+        incarnation: u128,
+        nonce: u128,
+    ) -> PendingBranchActivation {
+        pending_guard_expiring_after(branch, target, incarnation, nonce, 300)
+    }
+
+    fn pending_guard_expiring_after(
+        branch: u128,
+        target: &str,
+        incarnation: u128,
+        nonce: u128,
+        lifetime_secs: i64,
+    ) -> PendingBranchActivation {
+        let created_at = Utc
+            .with_ymd_and_hms(2026, 7, 18, 12, 0, 0)
+            .single()
+            .expect("guard time");
+        PendingBranchActivation::new(
+            BranchId::from_ulid(Ulid::from(branch)),
+            NamespaceId::new(target).expect("target namespace"),
+            NamespaceIncarnationId::from_uuid(Uuid::from_u128(incarnation)),
+            ActivationNonce::from_ulid(Ulid::from(nonce)),
+            PolicyVersion::persisted(7).expect("policy version"),
+            PolicyHeadDigest::new([0x5a; 32]),
+            PolicyLeaseFencingToken::new(11).expect("lease token"),
+            created_at,
+            created_at + chrono::Duration::seconds(lifetime_secs),
+        )
+        .expect("pending guard")
+    }
+
+    #[test]
+    fn claimed_lookup_treats_an_absent_branch_as_authoritative_despite_unrelated_guards() {
+        let unrelated = pending_guard(1, "other-target", 101, 201);
+        let pending = BTreeMap::from([(unrelated.branch_id(), unrelated)]);
+        let requested = BranchActivationTarget::new(
+            BranchId::from_ulid(Ulid::from(2_u128)),
+            NamespaceId::new("requested-target").expect("requested namespace"),
+            NamespaceIncarnationId::from_uuid(Uuid::from_u128(102)),
+        );
+
+        let selected = select_pending_branch_activation(&pending, &requested, None)
+            .expect("an absent branch is authoritative after the lease claim");
+
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn claimed_lookup_rejects_a_branch_key_bound_to_another_target_lifetime() {
+        let stored = pending_guard(7, "target", 107, 207);
+        let pending = BTreeMap::from([(stored.branch_id(), stored.clone())]);
+        let mismatched = BranchActivationTarget::new(
+            stored.branch_id(),
+            NamespaceId::new("target").expect("target namespace"),
+            NamespaceIncarnationId::from_uuid(Uuid::from_u128(108)),
+        );
+
+        let error = select_pending_branch_activation(&pending, &mismatched, None)
+            .expect_err("a reused branch key must not cross target lifetimes");
+
+        assert!(matches!(
+            error,
+            crate::security::SecurityError::PolicyConflict
+        ));
+    }
+
+    #[test]
+    fn claimed_expired_lookup_selects_oldest_expiry_then_branch_id() {
+        let unexpired = pending_guard_expiring_after(1, "unexpired", 101, 201, 360);
+        let tied_low = pending_guard_expiring_after(2, "tied-low", 102, 202, 120);
+        let tied_high = pending_guard_expiring_after(3, "tied-high", 103, 203, 120);
+        let later = pending_guard_expiring_after(4, "later", 104, 204, 240);
+        let pending = BTreeMap::from([
+            (unexpired.branch_id(), unexpired),
+            (later.branch_id(), later),
+            (tied_high.branch_id(), tied_high),
+            (tied_low.branch_id(), tied_low),
+        ]);
+        let now = Utc
+            .with_ymd_and_hms(2026, 7, 18, 12, 5, 0)
+            .single()
+            .expect("recovery time");
+
+        let selected = select_next_expired_branch_activation(&pending, now)
+            .expect("at least one guard is expired");
+
+        assert_eq!(
+            selected.branch_id(),
+            BranchId::from_ulid(Ulid::from(2_u128))
+        );
+    }
 }

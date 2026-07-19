@@ -443,6 +443,12 @@ pub struct BranchMaintenanceReport {
     pub deletions_in_progress: usize,
     /// Branch deletions still retaining their root through reader-safety grace.
     pub branch_grace_waiting: usize,
+    /// Expired policy-head activation guards inspected under publication fencing.
+    pub activation_guards_inspected: usize,
+    /// Guards finalized after exact matching Active evidence was proved.
+    pub activation_guards_finalized: usize,
+    /// Guards aborted after the target nonce was proved durably non-visible.
+    pub activation_guards_aborted: usize,
 }
 
 #[cfg(test)]

@@ -8,9 +8,89 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::namespace::{BranchId, NamespaceId};
+use crate::namespace::{BranchId, NamespaceId, NamespaceIncarnationId};
 
-use super::{ActivationNonce, BranchActivationEvidence, PreparedBranch};
+use super::{ActivationNonce, BranchActivationEvidence, ForkIdentity, PreparedBranch};
+
+/// Stable branch identity used to locate policy guards without trusting a
+/// stale activation nonce supplied by one crashed worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchActivationTarget {
+    branch_id: BranchId,
+    target_namespace: NamespaceId,
+    target_incarnation: NamespaceIncarnationId,
+}
+
+impl BranchActivationTarget {
+    /// Assemble the exact branch edge and target lifetime named by recovery.
+    #[must_use]
+    pub(crate) fn new(
+        branch_id: BranchId,
+        target_namespace: NamespaceId,
+        target_incarnation: NamespaceIncarnationId,
+    ) -> Self {
+        Self {
+            branch_id,
+            target_namespace,
+            target_incarnation,
+        }
+    }
+
+    /// Derive the recovery identity from one validated fork identity.
+    #[must_use]
+    pub(crate) fn from_identity(identity: &ForkIdentity) -> Self {
+        Self::new(
+            identity.branch_id,
+            identity.target_namespace.clone(),
+            identity.target_incarnation.clone(),
+        )
+    }
+
+    /// Stable parent-to-child branch edge.
+    #[must_use]
+    pub(crate) const fn branch_id(&self) -> BranchId {
+        self.branch_id
+    }
+
+    /// Exact target namespace named by the branch edge.
+    #[must_use]
+    pub(crate) fn target_namespace(&self) -> &NamespaceId {
+        &self.target_namespace
+    }
+
+    /// Exact target lifetime named by the branch edge.
+    #[must_use]
+    pub(crate) fn target_incarnation(&self) -> &NamespaceIncarnationId {
+        &self.target_incarnation
+    }
+}
+
+/// Exact persisted activation attempt returned by guard recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchActivationAttempt {
+    target: BranchActivationTarget,
+    nonce: ActivationNonce,
+}
+
+impl BranchActivationAttempt {
+    /// Bind one target lifetime to its one-shot metadata nonce.
+    #[must_use]
+    pub(crate) fn new(target: BranchActivationTarget, nonce: ActivationNonce) -> Self {
+        Self { target, nonce }
+    }
+
+    /// Branch target whose metadata must decide the recovery outcome.
+    #[must_use]
+    pub(crate) const fn target(&self) -> &BranchActivationTarget {
+        &self.target
+    }
+
+    /// One-shot target metadata fence carried by the policy guard.
+    #[must_use]
+    pub(crate) const fn nonce(&self) -> ActivationNonce {
+        self.nonce
+    }
+}
 
 /// Exact retained policy guard used only for crash recovery or cancellation.
 ///
@@ -18,6 +98,9 @@ use super::{ActivationNonce, BranchActivationEvidence, PreparedBranch};
 /// Active evidence, while `abort` follows a durable exact-nonce revocation.
 #[async_trait]
 pub(crate) trait BranchActivationGuard: Send {
+    /// Exact persisted target/nonce identity covered by this retained guard.
+    fn attempt(&self) -> &BranchActivationAttempt;
+
     /// Remove the guard after the matching activation is already visible.
     async fn finalize(self: Box<Self>) -> Result<()>;
 
@@ -28,13 +111,15 @@ pub(crate) trait BranchActivationGuard: Send {
 /// Restart-safe guard lookup used by cancellation and background recovery.
 #[async_trait]
 pub(crate) trait BranchActivationRecovery: Send + Sync {
-    /// Fence older policy writers and retain the exact guard when one exists.
-    /// `None` proves the newly claimed authoritative head has no guards.
-    async fn retain_guard(
+    /// Fence older policy writers and retain the guard for this exact target
+    /// lifetime. `None` proves the claimed head has no entry for its branch ID.
+    async fn retain_branch(
         &self,
-        branch_id: BranchId,
-        nonce: ActivationNonce,
+        target: &BranchActivationTarget,
     ) -> Result<Option<Box<dyn BranchActivationGuard>>>;
+
+    /// Retain the deterministic next expired guard from one claimed head.
+    async fn retain_next_expired(&self) -> Result<Option<Box<dyn BranchActivationGuard>>>;
 }
 
 /// One policy/audit permit retained across the target visibility CAS.
@@ -72,12 +157,12 @@ pub(crate) trait BranchActivationGovernance: Send + Sync {
         nonce: ActivationNonce,
     ) -> Result<Box<dyn BranchActivationPermit>>;
 
-    /// Fence older policy writers and retain a matching crash-stalled guard.
-    /// `None` is authoritative only when the claimed head contains no guards.
+    /// Fence older policy writers and retain this branch target's guard. An
+    /// expected nonce requests exact retry; `None` performs branch recovery.
     async fn retain_guard(
         &self,
         prepared: &PreparedBranch,
-        nonce: ActivationNonce,
+        expected_nonce: Option<ActivationNonce>,
     ) -> Result<Option<Box<dyn BranchActivationGuard>>>;
 }
 

@@ -27,7 +27,8 @@ use crate::namespace::branching::deletion::{
     DeletionGovernance, DeletionLifecycleAudit,
 };
 use crate::namespace::branching::activation::{
-    AuthorizedForkNamespace, BranchActivationPermit, BranchActivationRecovery, ForkOutcome,
+    AuthorizedForkNamespace, BranchActivationAttempt, BranchActivationGuard,
+    BranchActivationPermit, BranchActivationRecovery, BranchActivationTarget, ForkOutcome,
 };
 use crate::namespace::branching::{
     ActivationNonce, ArtifactOrigin, BranchDescriptor, BranchError, BranchLifecycleState,
@@ -101,6 +102,12 @@ enum BranchVisibilityResume {
     Deleted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchActivationResolution {
+    Finalized,
+    Aborted,
+}
+
 struct LiveChildDisclosure {
     visible_children: Vec<DisclosedBranchChild>,
     has_additional_children: bool,
@@ -162,7 +169,9 @@ impl NamespaceGraph {
     /// target to `Active` with retained activation evidence.
     pub(crate) async fn fork(&self, request: AuthorizedForkNamespace) -> Result<ForkOutcome> {
         let (source, target, governance) = request.into_parts();
-        if let Some(existing) = self.exact_active_fork(&source, &target).await? {
+        if let Some((existing, nonce)) = self.exact_active_fork(&source, &target).await? {
+            self.best_effort_finalize_active_guard(&existing, nonce, governance.as_ref())
+                .await;
             return Ok(ForkOutcome::Existing(existing));
         }
 
@@ -190,7 +199,12 @@ impl NamespaceGraph {
         let mut permit = match governance.begin(&branch, nonce).await {
             Ok(permit) => permit,
             Err(error) => {
-                self.revoke_activation_without_guard(&branch, nonce).await;
+                if let Some(existing) = self
+                    .recover_ambiguous_activation_begin(&branch, nonce, governance.as_ref())
+                    .await?
+                {
+                    return Ok(ForkOutcome::Existing(existing));
+                }
                 return Err(error);
             }
         };
@@ -251,22 +265,53 @@ impl NamespaceGraph {
             .0;
         if metadata.state == NamespaceState::Active {
             self.verify_active_branch(&metadata).await?;
-            return self.load_active_branch(&metadata).await.map(Some);
+            let existing = self.load_active_branch(&metadata).await?;
+            let nonce = metadata
+                .branch_activation
+                .as_ref()
+                .ok_or_else(|| {
+                    ZeppelinError::Serialization(format!(
+                        "active fork {} has no activation evidence",
+                        metadata.name
+                    ))
+                })?
+                .activation_nonce();
+            self.best_effort_finalize_active_guard(&existing, nonce, governance)
+                .await;
+            return Ok(Some(existing));
         }
         if metadata.state == NamespaceState::Deleting {
             return Err(ZeppelinError::NamespaceDeleting {
                 namespace: metadata.name,
             });
         }
-        let Some(BranchPrepareStage::ActivationPending { nonce }) = metadata
+        let stage = metadata
             .branch_prepare
             .as_ref()
-            .map(|prepare| prepare.stage)
-        else {
+            .ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "creating fork {} has no preparation milestone",
+                    metadata.name
+                ))
+            })?
+            .stage;
+        let expected_nonce = match stage {
+            BranchPrepareStage::ActivationPending { nonce } => Some(nonce),
+            BranchPrepareStage::ManifestPublished => None,
+            BranchPrepareStage::Reserved | BranchPrepareStage::Rooted => return Ok(None),
+        };
+        let retained = governance.retain_guard(branch, expected_nonce).await?;
+        if let Some(guard) = retained {
+            return match self.resolve_retained_activation_guard(guard).await? {
+                BranchActivationResolution::Finalized => {
+                    self.load_exact_active_branch(&branch.identity).await.map(Some)
+                }
+                BranchActivationResolution::Aborted => Ok(None),
+            };
+        }
+        let Some(nonce) = expected_nonce else {
             return Ok(None);
         };
-
-        let retained = governance.retain_guard(branch, nonce).await?;
         match self
             .namespace_manager
             .revoke_branch_activation(
@@ -277,31 +322,10 @@ impl NamespaceGraph {
             .await?
         {
             BranchActivationRevocationOutcome::ActivationCommitted => {
-                if let Some(guard) = retained {
-                    if let Err(error) = guard.finalize().await {
-                        warn!(
-                            target = %branch.identity.target_namespace,
-                            branch_id = %branch.identity.branch_id,
-                            error = %error,
-                            "recovered committed activation retained policy-guard cleanup"
-                        );
-                    }
-                }
-                let metadata = self
-                    .namespace_manager
-                    .read_metadata_versioned(branch.identity.target_namespace.as_str())
-                    .await?
-                    .0;
-                self.verify_active_branch(&metadata).await?;
-                self.load_active_branch(&metadata).await.map(Some)
+                self.load_exact_active_branch(&branch.identity).await.map(Some)
             }
             BranchActivationRevocationOutcome::Revoked
-            | BranchActivationRevocationOutcome::AlreadyPrepared => {
-                if let Some(guard) = retained {
-                    guard.abort().await?;
-                }
-                Ok(None)
-            }
+            | BranchActivationRevocationOutcome::AlreadyPrepared => Ok(None),
         }
     }
 
@@ -331,27 +355,207 @@ impl NamespaceGraph {
         Ok(())
     }
 
-    async fn revoke_activation_without_guard(
+    async fn recover_ambiguous_activation_begin(
         &self,
         branch: &PreparedBranch,
         nonce: ActivationNonce,
-    ) {
-        if let Err(error) = self
+        governance: &dyn crate::namespace::branching::activation::BranchActivationGovernance,
+    ) -> Result<Option<PreparedBranch>> {
+        let retained = governance.retain_guard(branch, Some(nonce)).await?;
+        if let Some(guard) = retained {
+            return match self.resolve_retained_activation_guard(guard).await? {
+                BranchActivationResolution::Finalized => {
+                    self.load_exact_active_branch(&branch.identity).await.map(Some)
+                }
+                BranchActivationResolution::Aborted => Ok(None),
+            };
+        }
+        match self
             .namespace_manager
             .revoke_branch_activation(
                 &branch.identity.target_namespace,
                 &branch.identity,
                 nonce,
             )
-            .await
+            .await?
         {
+            BranchActivationRevocationOutcome::ActivationCommitted => {
+                self.load_exact_active_branch(&branch.identity).await.map(Some)
+            }
+            BranchActivationRevocationOutcome::Revoked
+            | BranchActivationRevocationOutcome::AlreadyPrepared => Ok(None),
+        }
+    }
+
+    async fn best_effort_finalize_active_guard(
+        &self,
+        branch: &PreparedBranch,
+        nonce: ActivationNonce,
+        governance: &dyn crate::namespace::branching::activation::BranchActivationGovernance,
+    ) {
+        let result = async {
+            let Some(guard) = governance.retain_guard(branch, Some(nonce)).await? else {
+                return Ok(());
+            };
+            match self.resolve_retained_activation_guard(guard).await? {
+                BranchActivationResolution::Finalized => Ok(()),
+                BranchActivationResolution::Aborted => Err(ZeppelinError::Validation(format!(
+                    "active fork {} resolved its activation guard as aborted",
+                    branch.identity.target_namespace
+                ))),
+            }
+        }
+        .await;
+        if let Err(error) = result {
             warn!(
                 target = %branch.identity.target_namespace,
                 branch_id = %branch.identity.branch_id,
                 error = %error,
-                "failed to revoke unguarded branch activation nonce"
+                "active branch retry retained policy-guard cleanup for background recovery"
             );
         }
+    }
+
+    async fn load_exact_active_branch(&self, identity: &ForkIdentity) -> Result<PreparedBranch> {
+        let metadata = self
+            .namespace_manager
+            .read_metadata_versioned(identity.target_namespace.as_str())
+            .await?
+            .0;
+        if metadata.state != NamespaceState::Active
+            || metadata.branch_identity.as_ref() != Some(identity)
+        {
+            return Err(BranchError::IntentMismatch {
+                target: identity.target_namespace.clone(),
+            }
+            .into());
+        }
+        self.verify_active_branch(&metadata).await?;
+        self.load_active_branch(&metadata).await
+    }
+
+    async fn resolve_retained_activation_guard(
+        &self,
+        guard: Box<dyn BranchActivationGuard>,
+    ) -> Result<BranchActivationResolution> {
+        let attempt = guard.attempt().clone();
+        let target = attempt.target();
+        let namespace = target.target_namespace();
+        let metadata = self
+            .namespace_manager
+            .read_metadata_versioned(namespace.as_str())
+            .await?
+            .0;
+        let identity = metadata.branch_identity.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "guarded branch target {namespace} has no final branch identity"
+            ))
+        })?;
+        if BranchActivationTarget::from_identity(identity) != *target {
+            return Err(BranchError::IntentMismatch {
+                target: namespace.clone(),
+            }
+            .into());
+        }
+
+        match metadata.state {
+            NamespaceState::Active | NamespaceState::Deleting => {
+                let evidence = metadata.branch_activation.as_ref().ok_or_else(|| {
+                    ZeppelinError::Serialization(format!(
+                        "visible guarded branch {namespace} has no activation evidence"
+                    ))
+                })?;
+                if !evidence.matches_identity(identity)
+                    || evidence.activation_nonce() != attempt.nonce()
+                {
+                    return Err(BranchError::IntentMismatch {
+                        target: namespace.clone(),
+                    }
+                    .into());
+                }
+                guard.finalize().await?;
+                Ok(BranchActivationResolution::Finalized)
+            }
+            NamespaceState::Creating => {
+                let prepare = metadata.branch_prepare.as_ref().ok_or_else(|| {
+                    ZeppelinError::Serialization(format!(
+                        "guarded creating branch {namespace} has no preparation milestone"
+                    ))
+                })?;
+                if prepare.branch_id != target.branch_id()
+                    || prepare.target_incarnation != *target.target_incarnation()
+                {
+                    return Err(BranchError::IntentMismatch {
+                        target: namespace.clone(),
+                    }
+                    .into());
+                }
+                match prepare.stage {
+                    BranchPrepareStage::ActivationPending { nonce }
+                        if nonce == attempt.nonce() =>
+                    {
+                        match self
+                            .namespace_manager
+                            .revoke_branch_activation(namespace, identity, nonce)
+                            .await?
+                        {
+                            BranchActivationRevocationOutcome::ActivationCommitted => {
+                                guard.finalize().await?;
+                                Ok(BranchActivationResolution::Finalized)
+                            }
+                            BranchActivationRevocationOutcome::Revoked
+                            | BranchActivationRevocationOutcome::AlreadyPrepared => {
+                                self.require_guard_abort_state(&attempt).await?;
+                                guard.abort().await?;
+                                Ok(BranchActivationResolution::Aborted)
+                            }
+                        }
+                    }
+                    BranchPrepareStage::ManifestPublished => {
+                        self.require_guard_abort_state(&attempt).await?;
+                        guard.abort().await?;
+                        Ok(BranchActivationResolution::Aborted)
+                    }
+                    BranchPrepareStage::ActivationPending { .. }
+                    | BranchPrepareStage::Reserved
+                    | BranchPrepareStage::Rooted => Err(BranchError::IntentMismatch {
+                        target: namespace.clone(),
+                    }
+                    .into()),
+                }
+            }
+        }
+    }
+
+    async fn require_guard_abort_state(&self, attempt: &BranchActivationAttempt) -> Result<()> {
+        let target = attempt.target();
+        let namespace = target.target_namespace();
+        let metadata = self
+            .namespace_manager
+            .read_metadata_versioned(namespace.as_str())
+            .await?
+            .0;
+        let identity = metadata.branch_identity.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "revoked guarded branch {namespace} has no final branch identity"
+            ))
+        })?;
+        if metadata.state != NamespaceState::Creating
+            || BranchActivationTarget::from_identity(identity) != *target
+            || metadata
+                .branch_prepare
+                .as_ref()
+                .is_none_or(|prepare| prepare.stage != BranchPrepareStage::ManifestPublished)
+            || metadata.deletion_intent.as_ref().is_some_and(|intent| {
+                intent.branch_activation_nonce != Some(attempt.nonce())
+            })
+        {
+            return Err(BranchError::IntentMismatch {
+                target: namespace.clone(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     async fn revoke_and_abort_activation(
@@ -446,7 +650,7 @@ impl NamespaceGraph {
         &self,
         source: &NamespaceId,
         target: &NamespaceId,
-    ) -> Result<Option<PreparedBranch>> {
+    ) -> Result<Option<(PreparedBranch, ActivationNonce)>> {
         let metadata = match self
             .namespace_manager
             .read_metadata_versioned(target.as_str())
@@ -478,7 +682,18 @@ impl NamespaceGraph {
             .into());
         }
         self.verify_active_branch(&metadata).await?;
-        self.load_active_branch(&metadata).await.map(Some)
+        let nonce = metadata
+            .branch_activation
+            .as_ref()
+            .ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "active fork {target} has no activation evidence"
+                ))
+            })?
+            .activation_nonce();
+        self.load_active_branch(&metadata)
+            .await
+            .map(|branch| Some((branch, nonce)))
     }
 
     /// Delete through the graph guard, refusing to bypass live child roots.
@@ -532,6 +747,11 @@ impl NamespaceGraph {
                 )
                 .await;
         }
+        self.require_activation_guard_clear_for_deletion(
+            &metadata,
+            activation_recovery.as_ref(),
+        )
+        .await?;
         if metadata.state != NamespaceState::Active {
             return Err(ZeppelinError::Validation(format!(
                 "namespace {namespace} is not active for governed deletion"
@@ -1114,6 +1334,11 @@ impl NamespaceGraph {
             return Ok(());
         };
         let reservation = Self::cancellation_reservation(namespace, metadata)?;
+        let identity = metadata.branch_identity.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "activation-cancelled fork {namespace} has no final branch identity"
+            ))
+        })?;
         let prepare = metadata.branch_prepare.as_ref().ok_or_else(|| {
             ZeppelinError::Serialization(format!(
                 "activation-cancelled fork {namespace} has no preparation milestone"
@@ -1133,8 +1358,46 @@ impl NamespaceGraph {
         // The target CAS above already made the exact stale activation CAS
         // impossible. Claiming publication authority next fences any old
         // policy holder; only then may the matching guard be removed.
-        if let Some(guard) = recovery.retain_guard(reservation.branch_id, nonce).await? {
-            guard.abort().await?;
+        let target = BranchActivationTarget::from_identity(identity);
+        if let Some(guard) = recovery.retain_branch(&target).await? {
+            if guard.attempt().nonce() != nonce
+                || self.resolve_retained_activation_guard(guard).await?
+                    != BranchActivationResolution::Aborted
+            {
+                return Err(BranchError::IntentMismatch {
+                    target: namespace.clone(),
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    async fn require_activation_guard_clear_for_deletion(
+        &self,
+        metadata: &NamespaceMetadata,
+        recovery: &dyn BranchActivationRecovery,
+    ) -> Result<()> {
+        let NamespaceCreationKind::Fork(_) = &metadata.creation_kind else {
+            return Ok(());
+        };
+        let identity = metadata.branch_identity.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "visible branch {} has no final branch identity",
+                metadata.name
+            ))
+        })?;
+        let target = BranchActivationTarget::from_identity(identity);
+        let Some(guard) = recovery.retain_branch(&target).await? else {
+            return Ok(());
+        };
+        if self.resolve_retained_activation_guard(guard).await?
+            != BranchActivationResolution::Finalized
+        {
+            return Err(BranchError::IntentMismatch {
+                target: identity.target_namespace.clone(),
+            }
+            .into());
         }
         Ok(())
     }
@@ -2199,6 +2462,12 @@ impl NamespaceGraph {
                 )
                 .await;
         }
+
+        self.require_activation_guard_clear_for_deletion(
+            &metadata,
+            activation_recovery.as_ref(),
+        )
+        .await?;
 
         if metadata.state == NamespaceState::Active {
             let intent = metadata.deletion_intent.clone().ok_or_else(|| {
@@ -4609,8 +4878,8 @@ impl NamespaceGraph {
             .await
     }
 
-    /// Resume governed deletion and repair already-authorized branch state.
-    #[allow(dead_code)] // Feature support exercises this seam before Phase 10 readiness wiring.
+    /// Resolve expired activation guards, resume governed deletion, and repair
+    /// already-authorized branch state without authenticating or activating.
     pub(crate) async fn maintain(
         &self,
         governance: Arc<dyn DeletionGovernance>,
@@ -4622,6 +4891,20 @@ impl NamespaceGraph {
         }
         let started = Instant::now();
         let mut report = BranchMaintenanceReport::default();
+        while started.elapsed() < budget {
+            let Some(guard) = activation_recovery.retain_next_expired().await? else {
+                break;
+            };
+            report.activation_guards_inspected += 1;
+            match self.resolve_retained_activation_guard(guard).await? {
+                BranchActivationResolution::Finalized => {
+                    report.activation_guards_finalized += 1;
+                }
+                BranchActivationResolution::Aborted => {
+                    report.activation_guards_aborted += 1;
+                }
+            }
+        }
         let mut seen_targets = HashSet::new();
         let prefixes = self.store.list_common_prefixes("").await?;
         for prefix in prefixes {
