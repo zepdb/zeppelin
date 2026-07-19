@@ -207,6 +207,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use rand::Rng;
 use tracing::{debug, error, info, instrument, warn};
 use ulid::Ulid;
@@ -224,8 +225,12 @@ use crate::index::ivf_flat::build::{
 use crate::index::ivf_flat::membership::{
     build_membership_artifact, deserialize_membership, MembershipData,
 };
-use crate::namespace::manager::{NamespaceMetadata, NamespaceState};
-use crate::security::{NamespaceId, PreservationService};
+use crate::namespace::branching::{ArtifactOrigin, BranchError};
+use crate::namespace::manager::{
+    NamespaceMetadata, NamespaceState, NAMESPACE_INCARNATION_METADATA_KEY,
+};
+use crate::namespace::NamespaceIncarnationId;
+use crate::security::{AuthenticatedManifestArtifactInventory, NamespaceId, PreservationService};
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
 use crate::types::VectorEntry;
@@ -293,6 +298,19 @@ async fn get_compaction_read(
     key: &str,
     class: &str,
 ) -> Result<bytes::Bytes> {
+    get_compaction_read_with_verifier(store, namespace, key, class, None).await
+}
+
+type CompactionBodyVerifier<'a> = dyn Fn(&str, &[u8]) -> Result<()> + Sync + 'a;
+
+/// Fetches one compaction artifact and authenticates the exact returned body.
+async fn get_compaction_read_with_verifier(
+    store: &ZeppelinStore,
+    namespace: &str,
+    key: &str,
+    class: &str,
+    verify_body: Option<&CompactionBodyVerifier<'_>>,
+) -> Result<bytes::Bytes> {
     crate::metrics::COMPACTION_READ_OPS_TOTAL
         .with_label_values(&[namespace, class])
         .inc();
@@ -300,7 +318,21 @@ async fn get_compaction_read(
     crate::metrics::COMPACTION_READ_BYTES_TOTAL
         .with_label_values(&[namespace, class])
         .inc_by(data.len() as u64);
+    if let Some(verify_body) = verify_body {
+        verify_body(key, &data)?;
+    }
     Ok(data)
+}
+
+/// Converts authenticated foreign-view divergence into the public branch integrity class.
+fn map_foreign_source_integrity_error(error: ZeppelinError) -> ZeppelinError {
+    match error {
+        // Preserve genuine backend availability/I/O failures. Missing immutable
+        // objects and every decoding/hash/signature divergence are branch-state
+        // integrity failures, not caller-visible storage locations.
+        error @ (ZeppelinError::Storage(_) | ZeppelinError::Io(_)) => error,
+        _ => BranchError::BranchIntegrity.into(),
+    }
 }
 
 /// Resolves the manifest's active segment ID to its borrowed descriptor.
@@ -468,6 +500,89 @@ pub struct CompactionResult {
     pub old_segment_removed: Option<String>,
 }
 
+/// Complete target-owned segment artifacts awaiting one external visibility CAS.
+///
+/// Building this value uploads immutable objects beneath a fresh target-local
+/// segment ID, but does not add a WAL fragment or mutate a manifest. Clone
+/// publication can therefore perform its final authorization check after the
+/// expensive build and then install the segment and its inseparable routing-node
+/// inventory into the exact bootstrap manifest used as the CAS predecessor.
+///
+/// If that CAS fails, the objects remain unreferenced. This matches compaction's
+/// established safe failure convention: immutable orphans may be reclaimed by
+/// storage GC, while deleting a possibly live candidate eagerly is forbidden.
+#[derive(Debug)]
+pub(crate) struct UnpublishedOwnedSegment {
+    /// Complete manifest descriptor for the newly uploaded local segment.
+    segment: SegmentRef,
+    /// Exact hierarchical routing-node inventory, empty for flat segments.
+    hierarchical_routing_node_ids: Vec<String>,
+    /// Production compaction retention setting carried to manifest installation.
+    max_pending_deletes: usize,
+    /// Production compaction retention setting carried to manifest installation.
+    max_old_segments: usize,
+    /// Namespace whose immutable candidate keys were uploaded.
+    target_namespace: String,
+    /// Monotonic start of the unpublished upload window.
+    upload_phase_start: std::time::Instant,
+    /// Maximum safe interval from candidate upload to authoritative publication.
+    upload_window: Duration,
+}
+
+/// Final time-bound publication capability returned when a candidate is installed.
+#[derive(Debug)]
+pub(crate) struct OwnedSegmentPublicationGuard {
+    target_namespace: String,
+    upload_phase_start: std::time::Instant,
+    upload_window: Duration,
+}
+
+impl OwnedSegmentPublicationGuard {
+    /// Rejects publication after the GC-owned unpublished-artifact window.
+    pub(crate) fn require_current(&self) -> Result<()> {
+        check_upload_window(
+            &self.target_namespace,
+            self.upload_phase_start,
+            self.upload_window,
+        )
+    }
+}
+
+impl UnpublishedOwnedSegment {
+    /// Installs this already-uploaded candidate into one in-memory manifest.
+    ///
+    /// The operation consumes the candidate so a caller cannot accidentally
+    /// install it twice or forget its hierarchical routing-node inventory. It
+    /// performs no object-store write; the caller still owns the final policy
+    /// recheck, receipt hydration, and conditional manifest publication.
+    pub(crate) fn install_into_at(
+        self,
+        manifest: &mut Manifest,
+        now: DateTime<Utc>,
+    ) -> OwnedSegmentPublicationGuard {
+        let Self {
+            segment,
+            hierarchical_routing_node_ids,
+            max_pending_deletes,
+            max_old_segments,
+            target_namespace,
+            upload_phase_start,
+            upload_window,
+        } = self;
+        let segment_id = segment.id.clone();
+        let hierarchical = segment.hierarchical;
+        manifest.add_segment_with_limits_at(segment, max_pending_deletes, max_old_segments, now);
+        if hierarchical {
+            manifest.set_hierarchical_routing_nodes(&segment_id, hierarchical_routing_node_ids);
+        }
+        OwnedSegmentPublicationGuard {
+            target_namespace,
+            upload_phase_start,
+            upload_window,
+        }
+    }
+}
+
 /// Coordinates immutable WAL compaction, index construction, and manifest CAS.
 ///
 /// A compactor owns cheap-to-clone storage and WAL clients plus process-wide
@@ -531,6 +646,85 @@ struct IncrementalClusterState {
     touched: Vec<bool>,
 }
 
+/// Manifest-facing metadata emitted by one complete non-incremental index build.
+///
+/// Both ordinary compaction retrains and branch-clone materialization use this
+/// value, keeping the physical index implementation and descriptor projection
+/// identical across the two publication workflows.
+struct FullSegmentLayout {
+    cluster_count: usize,
+    hierarchical: bool,
+    bitmap_fields: Vec<String>,
+    sketch: Option<crate::wal::manifest::SketchRef>,
+    bootstrap: Option<BootstrapRef>,
+    membership: Option<MembershipRef>,
+    cluster_objects: Vec<ClusterDataObjectRef>,
+    hierarchical_routing_node_ids: Vec<String>,
+}
+
+impl FullSegmentLayout {
+    /// Converts build output into the local descriptor and routing inventory
+    /// that a manifest publication must install atomically.
+    fn into_manifest_parts(
+        self,
+        segment_id: String,
+        vector_count: usize,
+        indexing_config: &IndexingConfig,
+        fts_fields: Vec<String>,
+        has_global_fts: bool,
+    ) -> (SegmentRef, Vec<String>) {
+        (
+            SegmentRef {
+                id: segment_id,
+                vector_count,
+                cluster_count: self.cluster_count,
+                quantization: indexing_config.quantization,
+                hierarchical: self.hierarchical,
+                bitmap_fields: self.bitmap_fields,
+                fts_fields,
+                has_global_fts,
+                // A full rebuild owns every cluster under its fresh local
+                // segment ID; carry-over ownership is incremental-only.
+                cluster_owners: Vec::new(),
+                sketch: self.sketch,
+                cluster_objects: self.cluster_objects,
+                bootstrap: self.bootstrap,
+                membership: self.membership,
+                artifact_origin: None,
+            },
+            self.hierarchical_routing_node_ids,
+        )
+    }
+
+    /// Projects this common layout into the historical tuple consumed by the
+    /// mixed incremental/full compaction transaction.
+    fn into_compaction_parts(
+        self,
+    ) -> (
+        usize,
+        bool,
+        Vec<String>,
+        Vec<String>,
+        Option<crate::wal::manifest::SketchRef>,
+        Option<BootstrapRef>,
+        Option<MembershipRef>,
+        Vec<ClusterDataObjectRef>,
+        Vec<String>,
+    ) {
+        (
+            self.cluster_count,
+            self.hierarchical,
+            self.bitmap_fields,
+            Vec::new(),
+            self.sketch,
+            self.bootstrap,
+            self.membership,
+            self.cluster_objects,
+            self.hierarchical_routing_node_ids,
+        )
+    }
+}
+
 impl IncrementalClusterState {
     /// Counts membership rows across all rewritten and carried clusters.
     ///
@@ -552,6 +746,369 @@ impl IncrementalClusterState {
 }
 
 impl Compactor {
+    /// Builds a complete target-owned clone segment without publishing it.
+    ///
+    /// The supplied source manifest is the complete visibility snapshot: this
+    /// method never rereads the source head. Every source WAL and segment key is
+    /// resolved through its incarnation-qualified physical origin, then replayed
+    /// with the same latest-write/delete and finite-vector rules as compaction.
+    /// The resulting rows are rebuilt using the exact target namespace's current
+    /// production index and FTS configuration.
+    ///
+    /// `target_identity` binds the build to one namespace lifetime. A missing,
+    /// deleting, or recreated target fails before index construction. The fresh
+    /// segment ULID also makes any objects uploaded before a later target race
+    /// immutable orphans rather than aliases of another lifetime's live segment.
+    ///
+    /// # Returns
+    ///
+    /// `None` when the exact source view is empty. Otherwise returns a consumed-on-
+    /// install candidate containing a complete local [`SegmentRef`] and its exact
+    /// hierarchical routing inventory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid source origins, corrupt/missing source
+    /// artifacts, target identity or lifecycle mismatch, invalid target index/FTS
+    /// configuration, index construction, or any required object-store I/O.
+    /// Partial logical views are never returned or published.
+    ///
+    /// # Consistency
+    ///
+    /// This method uploads immutable target objects but performs no target WAL or
+    /// manifest write. The caller must recheck authorization and conditionally
+    /// publish against its exact bootstrap manifest version. If that CAS loses,
+    /// the candidate remains unreferenced for normal orphan GC.
+    pub(crate) async fn build_unpublished_owned_segment(
+        &self,
+        source_namespace: &str,
+        source_manifest: &Manifest,
+        target_identity: &ArtifactOrigin,
+        source_inventory: Option<&AuthenticatedManifestArtifactInventory>,
+    ) -> Result<Option<UnpublishedOwnedSegment>> {
+        let (indexing_config, fts_configs) =
+            self.owned_build_target_config(target_identity).await?;
+        let verify_source_body = |key: &str, body: &[u8]| {
+            source_inventory
+                .ok_or_else(|| {
+                    ZeppelinError::Config(
+                        "owned source verifier invoked without an authenticated inventory"
+                            .to_string(),
+                    )
+                })?
+                .verify_body(key, body)
+                .map_err(map_foreign_source_integrity_error)
+        };
+        let source_body_verifier =
+            source_inventory.map(|_| &verify_source_body as &CompactionBodyVerifier<'_>);
+        let vectors = self
+            .materialize_manifest_view(source_namespace, source_manifest, source_body_verifier)
+            .await?;
+        if vectors.is_empty() {
+            return Ok(None);
+        }
+
+        let target_namespace = target_identity.namespace.as_str();
+        let segment_id = format!("seg_{}", Ulid::new());
+        let upload_phase_start = std::time::Instant::now();
+        let layout = self
+            .build_full_segment_layout(target_namespace, &segment_id, &vectors, &indexing_config)
+            .await?;
+        let (fts_fields, has_global_fts) = self
+            .build_full_text_artifacts(
+                target_namespace,
+                &segment_id,
+                layout.cluster_count,
+                &fts_configs,
+                &indexing_config,
+            )
+            .await?;
+        check_upload_window(
+            target_namespace,
+            upload_phase_start,
+            self.compaction_upload_window(),
+        )?;
+        let (segment, hierarchical_routing_node_ids) = layout.into_manifest_parts(
+            segment_id,
+            vectors.len(),
+            &indexing_config,
+            fts_fields,
+            has_global_fts,
+        );
+        Ok(Some(UnpublishedOwnedSegment {
+            segment,
+            hierarchical_routing_node_ids,
+            max_pending_deletes: self.config.max_pending_deletes,
+            max_old_segments: self.config.max_old_segments,
+            target_namespace: target_namespace.to_string(),
+            upload_phase_start,
+            upload_window: self.compaction_upload_window(),
+        }))
+    }
+
+    /// Reads and validates the exact target lifetime's persisted build settings.
+    async fn owned_build_target_config(
+        &self,
+        target_identity: &ArtifactOrigin,
+    ) -> Result<(IndexingConfig, HashMap<String, FtsFieldConfig>)> {
+        let target_namespace = target_identity.namespace.as_str();
+        let key = NamespaceMetadata::s3_key(target_namespace);
+        let (data, object_metadata) = match self.store.get_with_object_metadata(&key).await {
+            Ok(value) => value,
+            Err(ZeppelinError::NotFound { .. }) => {
+                return Err(ZeppelinError::NamespaceNotFound {
+                    namespace: target_namespace.to_string(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let metadata = NamespaceMetadata::from_bytes(&data)?;
+        if metadata.name != target_namespace {
+            return Err(ZeppelinError::Serialization(format!(
+                "target metadata name {} does not match clone target {target_namespace}",
+                metadata.name
+            )));
+        }
+        let incarnation = object_metadata
+            .user_metadata
+            .get(NAMESPACE_INCARNATION_METADATA_KEY)
+            .ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "clone target {target_namespace} metadata omitted its incarnation"
+                ))
+            })?;
+        let incarnation = NamespaceIncarnationId::parse(incarnation)?;
+        if incarnation != target_identity.incarnation {
+            return Err(ZeppelinError::ManifestConflict {
+                namespace: target_namespace.to_string(),
+            });
+        }
+        match metadata.state {
+            // An unpublished build is safe for a reserved Creating target and
+            // remains compatible with the current Active bootstrap workflow.
+            NamespaceState::Creating | NamespaceState::Active => {}
+            NamespaceState::Deleting => {
+                return Err(ZeppelinError::NamespaceDeleting {
+                    namespace: target_namespace.to_string(),
+                });
+            }
+        }
+        for (field, config) in &metadata.full_text_search {
+            config.validate(&format!("full_text_search.{field}"))?;
+        }
+        let indexing_config = match metadata.index_config.as_ref() {
+            Some(namespace_config) => {
+                namespace_config.validate(metadata.dimensions)?;
+                namespace_config.apply_to_indexing_config(&self.indexing_config)
+            }
+            None => self.indexing_config.clone(),
+        };
+        Ok((indexing_config, metadata.full_text_search))
+    }
+
+    /// Materializes one supplied manifest's exact logical row view.
+    async fn materialize_manifest_view(
+        &self,
+        logical_namespace: &str,
+        manifest: &Manifest,
+        source_body_verifier: Option<&CompactionBodyVerifier<'_>>,
+    ) -> Result<Vec<VectorEntry>> {
+        let authoritative_origin = manifest.local_origin()?;
+        if authoritative_origin.namespace.as_str() != logical_namespace {
+            return Err(ZeppelinError::Validation(format!(
+                "manifest local origin {} does not match logical namespace {logical_namespace}",
+                authoritative_origin.namespace
+            )));
+        }
+        let origins = manifest.artifact_origin_resolver(&authoritative_origin)?;
+        let located_fragments = origins.uncompacted_located_fragments()?;
+        let active_segment = origins.active_located_segment()?;
+        let fragments = match source_body_verifier {
+            Some(verify_body) => {
+                self.wal_reader
+                    .read_located_fragments_strict_verified(
+                        &located_fragments,
+                        FragmentCachePolicy::Bypass,
+                        &|key, body| verify_body(key, body),
+                    )
+                    .await?
+            }
+            None => {
+                self.wal_reader
+                    .read_located_fragments_strict(&located_fragments, FragmentCachePolicy::Bypass)
+                    .await?
+            }
+        };
+
+        let mut latest_vectors = HashMap::new();
+        let mut deleted_ids = HashSet::new();
+        for fragment in fragments {
+            for deleted_id in fragment.deletes {
+                deleted_ids.insert(deleted_id.clone());
+                latest_vectors.remove(&deleted_id);
+            }
+            for vector in fragment.vectors {
+                deleted_ids.remove(&vector.id);
+                latest_vectors.insert(vector.id.clone(), vector);
+            }
+        }
+
+        load_full_surviving_vectors_for_fallback(
+            &self.store,
+            logical_namespace,
+            active_segment,
+            latest_vectors,
+            &deleted_ids,
+            source_body_verifier,
+        )
+        .await
+    }
+
+    /// Runs the production non-incremental index builder and projects its
+    /// complete manifest-facing artifact metadata.
+    async fn build_full_segment_layout(
+        &self,
+        namespace: &str,
+        segment_id: &str,
+        vectors: &[VectorEntry],
+        indexing_config: &IndexingConfig,
+    ) -> Result<FullSegmentLayout> {
+        if indexing_config.hierarchical {
+            let index =
+                build_hierarchical(vectors, indexing_config, &self.store, namespace, segment_id)
+                    .await?;
+            Ok(FullSegmentLayout {
+                cluster_count: index.num_leaf_clusters(),
+                hierarchical: true,
+                bitmap_fields: index.bitmap_fields.clone(),
+                sketch: None,
+                bootstrap: None,
+                membership: None,
+                cluster_objects: Vec::new(),
+                hierarchical_routing_node_ids: index.routing_node_ids().to_vec(),
+            })
+        } else {
+            let index =
+                build_ivf_flat(vectors, indexing_config, &self.store, namespace, segment_id)
+                    .await?;
+            Ok(FullSegmentLayout {
+                cluster_count: index.num_clusters(),
+                hierarchical: false,
+                bitmap_fields: index.bitmap_fields.clone(),
+                sketch: index.sketch_ref.clone(),
+                bootstrap: index.bootstrap_ref.clone(),
+                membership: index.membership_ref.clone(),
+                cluster_objects: index.cluster_objects.clone(),
+                hierarchical_routing_node_ids: Vec::new(),
+            })
+        }
+    }
+
+    /// Builds the production per-cluster and global FTS closure for one segment.
+    ///
+    /// The vector-index builder has already written each cluster's attribute
+    /// sidecar under `namespace/segment_id`. Required reads and writes fail the
+    /// entire build; no cluster is silently omitted from the returned descriptor.
+    async fn build_full_text_artifacts(
+        &self,
+        namespace: &str,
+        segment_id: &str,
+        cluster_count: usize,
+        fts_configs: &HashMap<String, FtsFieldConfig>,
+        indexing_config: &IndexingConfig,
+    ) -> Result<(Vec<String>, bool)> {
+        if fts_configs.is_empty() || !indexing_config.fts_index {
+            return Ok((Vec::new(), false));
+        }
+
+        let fts_start = std::time::Instant::now();
+        let attr_keys: Vec<String> = (0..cluster_count)
+            .map(|cluster_idx| attrs_key(namespace, segment_id, cluster_idx))
+            .collect();
+        let read_futures: Vec<_> = attr_keys
+            .iter()
+            .map(|key| {
+                get_compaction_read(&self.store, namespace, key, COMPACTION_READ_CLASS_ATTRS)
+            })
+            .collect();
+        let read_results = futures::future::join_all(read_futures).await;
+        let mut cluster_data = Vec::with_capacity(cluster_count);
+        for (cluster_idx, result) in read_results.into_iter().enumerate() {
+            cluster_data.push((cluster_idx, result?));
+        }
+
+        let fts_configs = fts_configs.clone();
+        let namespace_owned = namespace.to_string();
+        let segment_id_owned = segment_id.to_string();
+        let build_futures: Vec<_> = cluster_data
+            .into_iter()
+            .map(|(cluster_idx, data)| {
+                let configs = fts_configs.clone();
+                let namespace = namespace_owned.clone();
+                let segment_id = segment_id_owned.clone();
+                tokio::task::spawn_blocking(move || {
+                    let cluster_attrs = deserialize_attrs(&data)?;
+                    let attr_refs: Vec<Option<&HashMap<String, crate::types::AttributeValue>>> =
+                        cluster_attrs.iter().map(Option::as_ref).collect();
+                    let inverted_index = InvertedIndex::build(&attr_refs, &configs);
+                    let field_names = inverted_index.fields.keys().cloned().collect::<Vec<_>>();
+                    let bytes = inverted_index.to_bytes()?;
+                    let key = fts_index_key(&namespace, &segment_id, cluster_idx);
+                    Ok::<_, ZeppelinError>((cluster_idx, key, bytes, field_names, inverted_index))
+                })
+            })
+            .collect();
+
+        let build_results = futures::future::join_all(build_futures).await;
+        let mut field_names = std::collections::BTreeSet::new();
+        let mut write_payloads = Vec::new();
+        let mut cluster_indexes = Vec::new();
+        for result in build_results {
+            let (cluster_idx, key, bytes, cluster_fields, inverted_index) =
+                result.map_err(|error| {
+                    ZeppelinError::Index(format!("FTS build task failed: {error}"))
+                })??;
+            field_names.extend(cluster_fields);
+            write_payloads.push((key, bytes));
+            cluster_indexes.push((cluster_idx, inverted_index));
+        }
+
+        let has_global_fts = !cluster_indexes.is_empty();
+        if has_global_fts {
+            use crate::fts::global_index::{global_fts_key, GlobalInvertedIndex};
+
+            cluster_indexes.sort_by_key(|(cluster_idx, _)| *cluster_idx);
+            let refs = cluster_indexes
+                .iter()
+                .map(|(cluster_idx, index)| (*cluster_idx, index))
+                .collect::<Vec<_>>();
+            let global_index = GlobalInvertedIndex::build(&refs);
+            write_payloads.push((
+                global_fts_key(namespace, segment_id),
+                global_index.to_bytes()?,
+            ));
+        }
+
+        let write_futures = write_payloads
+            .iter()
+            .map(|(key, data)| self.store.put(key, data.clone()))
+            .collect::<Vec<_>>();
+        for result in futures::future::join_all(write_futures).await {
+            result?;
+        }
+
+        crate::metrics::FTS_INDEX_BUILD_DURATION
+            .with_label_values(&[namespace])
+            .observe(fts_start.elapsed().as_secs_f64());
+        debug!(
+            fts_fields = ?field_names,
+            fts_build_duration_ms = fts_start.elapsed().as_millis() as u64,
+            clusters = cluster_count,
+            "FTS inverted index build complete"
+        );
+        Ok((field_names.into_iter().collect(), has_global_fts))
+    }
+
     /// Creates a stateless compaction coordinator from shared infrastructure.
     ///
     /// # Parameters
@@ -1225,6 +1782,35 @@ impl Compactor {
         let rewrite_for_index_config = manifest_needs_index_rewrite(&manifest, &indexing_config);
         let materialize_foreign = manifest.has_foreign_visible_artifacts()?;
         let authoritative_origin = manifest.local_origin()?;
+        let authenticated_source_inventory =
+            if materialize_foreign && self.store.object_signer_node()?.is_some() {
+                Some(
+                    AuthenticatedManifestArtifactInventory::authenticate(
+                        &self.store,
+                        namespace,
+                        &manifest,
+                    )
+                    .await
+                    .map_err(map_foreign_source_integrity_error)?,
+                )
+            } else {
+                None
+            };
+        let verify_source_body = |key: &str, body: &[u8]| {
+            authenticated_source_inventory
+                .as_ref()
+                .ok_or_else(|| {
+                    ZeppelinError::Config(
+                        "foreign materialization verifier invoked without an authenticated inventory"
+                            .to_string(),
+                    )
+                })?
+                .verify_body(key, body)
+                .map_err(map_foreign_source_integrity_error)
+        };
+        let source_body_verifier = authenticated_source_inventory
+            .as_ref()
+            .map(|_| &verify_source_body as &CompactionBodyVerifier<'_>);
 
         // 2. If no uncompacted fragments → no-op
         if manifest.uncompacted_fragments().is_empty()
@@ -1300,10 +1886,28 @@ impl Compactor {
 
         // 3. Read fragments using snapshot refs (not re-reading manifest).
         // Uses unchecked read — fragments were validated on write.
-        let fragments = self
-            .wal_reader
-            .read_located_fragments_unchecked(&located_fragment_refs, fragment_cache)
-            .await?;
+        let fragments = if materialize_foreign {
+            match source_body_verifier {
+                Some(verify_body) => {
+                    self.wal_reader
+                        .read_located_fragments_strict_verified(
+                            &located_fragment_refs,
+                            fragment_cache,
+                            &|key, body| verify_body(key, body),
+                        )
+                        .await?
+                }
+                None => {
+                    self.wal_reader
+                        .read_located_fragments_strict(&located_fragment_refs, fragment_cache)
+                        .await?
+                }
+            }
+        } else {
+            self.wal_reader
+                .read_located_fragments_unchecked(&located_fragment_refs, fragment_cache)
+                .await?
+        };
 
         // 4. Merge vectors: process in manifest order (sequence number), latest wins.
         //
@@ -1435,7 +2039,7 @@ impl Compactor {
             // before until that cluster is rewritten or a retrain fires.
             if let Some(located) = old_segment {
                 let (existing_vecs, id_to_cluster) =
-                    load_segment_vectors(&self.store, located).await?;
+                    load_segment_vectors(&self.store, located, source_body_verifier).await?;
                 old_id_to_cluster = id_to_cluster;
                 for vec in existing_vecs {
                     // WAL overrides: only insert if not already in latest_vectors and not deleted
@@ -1505,7 +2109,16 @@ impl Compactor {
                 }
 
                 let manifest_stamp = self.clock.now();
-                if let Some(seg_id) = old_segment_id.as_deref() {
+                if materialize_foreign {
+                    let retired_segment_ids = fresh_manifest
+                        .segments
+                        .iter()
+                        .map(|segment| segment.id.clone())
+                        .collect::<Vec<_>>();
+                    for segment_id in retired_segment_ids {
+                        fresh_manifest.remove_segment_at(&segment_id, manifest_stamp);
+                    }
+                } else if let Some(seg_id) = old_segment_id.as_deref() {
                     fresh_manifest.remove_segment_at(seg_id, manifest_stamp);
                 }
                 fresh_manifest.remove_compacted_located_fragments_at(
@@ -1654,29 +2267,18 @@ impl Compactor {
                         old_segment,
                         latest_vectors.clone(),
                         &deleted_ids,
+                        source_body_verifier,
                     )
                     .await?;
                     vectors_compacted = full_vectors.len();
-                    let index = build_ivf_flat(
-                        &full_vectors,
-                        &indexing_config,
-                        &self.store,
+                    self.build_full_segment_layout(
                         namespace,
                         &segment_id,
+                        &full_vectors,
+                        &indexing_config,
                     )
-                    .await?;
-                    let bf = index.bitmap_fields.clone();
-                    (
-                        index.num_clusters(),
-                        false,
-                        bf,
-                        Vec::new(),
-                        index.sketch_ref.clone(),
-                        index.bootstrap_ref.clone(),
-                        index.membership_ref.clone(),
-                        index.cluster_objects.clone(),
-                        Vec::new(),
-                    )
+                    .await?
+                    .into_compaction_parts()
                 }
             }
         } else if incremental_candidate {
@@ -1747,70 +2349,20 @@ impl Compactor {
                         .with_label_values(&[namespace, "build_failed"])
                         .inc();
                     warn!(error = %e, "incremental build failed, falling back to full retrain");
-                    let index = build_ivf_flat(
-                        &vectors,
-                        &indexing_config,
-                        &self.store,
+                    self.build_full_segment_layout(
                         namespace,
                         &segment_id,
+                        &vectors,
+                        &indexing_config,
                     )
-                    .await?;
-                    let bf = index.bitmap_fields.clone();
-                    (
-                        index.num_clusters(),
-                        false,
-                        bf,
-                        Vec::new(),
-                        index.sketch_ref.clone(),
-                        index.bootstrap_ref.clone(),
-                        index.membership_ref.clone(),
-                        index.cluster_objects.clone(),
-                        Vec::new(),
-                    )
+                    .await?
+                    .into_compaction_parts()
                 }
             }
-        } else if indexing_config.hierarchical {
-            let h_index = build_hierarchical(
-                &vectors,
-                &indexing_config,
-                &self.store,
-                namespace,
-                &segment_id,
-            )
-            .await?;
-            let bf = h_index.bitmap_fields.clone();
-            (
-                h_index.num_leaf_clusters(),
-                true,
-                bf,
-                Vec::new(),
-                None,
-                None,
-                None,
-                Vec::new(),
-                h_index.routing_node_ids().to_vec(),
-            )
         } else {
-            let index = build_ivf_flat(
-                &vectors,
-                &indexing_config,
-                &self.store,
-                namespace,
-                &segment_id,
-            )
-            .await?;
-            let bf = index.bitmap_fields.clone();
-            (
-                index.num_clusters(),
-                false,
-                bf,
-                Vec::new(),
-                index.sketch_ref.clone(),
-                index.bootstrap_ref.clone(),
-                index.membership_ref.clone(),
-                index.cluster_objects.clone(),
-                Vec::new(),
-            )
+            self.build_full_segment_layout(namespace, &segment_id, &vectors, &indexing_config)
+                .await?
+                .into_compaction_parts()
         };
         let build_elapsed = build_start.elapsed();
         let index_type_label = if is_hierarchical {
@@ -1886,121 +2438,18 @@ impl Compactor {
             );
         }
 
-        // 8b. Build FTS inverted indexes (if FTS fields configured)
-        let mut has_global_fts = false;
-        let fts_fields: Vec<String> = if !fts_configs.is_empty() && indexing_config.fts_index {
-            let fts_start = std::time::Instant::now();
-            let mut fts_field_names = Vec::new();
-
-            // Phase 1: Parallel reads of cluster attributes.
-            let attr_keys: Vec<String> = (0..cluster_count)
-                .map(|i| attrs_key(namespace, &segment_id, i))
-                .collect();
-            let read_futs: Vec<_> = attr_keys
-                .iter()
-                .map(|k| {
-                    get_compaction_read(&self.store, namespace, k, COMPACTION_READ_CLASS_ATTRS)
-                })
-                .collect();
-            let read_results = futures::future::join_all(read_futs).await;
-
-            // Phase 2: CPU — build inverted indexes (parallelized via spawn_blocking).
-            let fts_configs_clone = fts_configs.clone();
-            let segment_id_clone = segment_id.clone();
-            let namespace_clone = namespace.to_string();
-
-            // These attrs blobs were written by this compaction moments ago —
-            // a read failure is transient storage trouble. Skipping a cluster
-            // would permanently drop its documents from the FTS index, so
-            // fail the cycle and let the next one rebuild.
-            let mut cluster_data: Vec<(usize, bytes::Bytes)> = Vec::new();
-            for (cluster_idx, result) in read_results.into_iter().enumerate() {
-                cluster_data.push((cluster_idx, result?));
-            }
-
-            // Build inverted indexes in parallel using spawn_blocking.
-            // Also collect InvertedIndex objects for global index construction.
-            let build_futs: Vec<_> = cluster_data
-                .into_iter()
-                .map(|(cluster_idx, data)| {
-                    let configs = fts_configs_clone.clone();
-                    let ns = namespace_clone.clone();
-                    let seg = segment_id_clone.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let cluster_attrs = deserialize_attrs(&data)?;
-                        let attr_refs: Vec<Option<&HashMap<String, crate::types::AttributeValue>>> =
-                            cluster_attrs.iter().map(|a| a.as_ref()).collect();
-                        let inv_index = InvertedIndex::build(&attr_refs, &configs);
-                        let field_names: Vec<String> = inv_index.fields.keys().cloned().collect();
-                        let fts_data = inv_index.to_bytes()?;
-                        let fts_key = fts_index_key(&ns, &seg, cluster_idx);
-                        Ok::<_, ZeppelinError>((
-                            cluster_idx,
-                            fts_key,
-                            fts_data,
-                            field_names,
-                            inv_index,
-                        ))
-                    })
-                })
-                .collect();
-
-            let build_results = futures::future::join_all(build_futs).await;
-            let mut write_payloads = Vec::new();
-            let mut cluster_inv_indexes: Vec<(usize, InvertedIndex)> = Vec::new();
-            for result in build_results {
-                let (cluster_idx, fts_key, fts_data, field_names, inv_index) = result
-                    .map_err(|e| ZeppelinError::Index(format!("FTS build task failed: {e}")))??;
-                for name in field_names {
-                    if !fts_field_names.contains(&name) {
-                        fts_field_names.push(name);
-                    }
-                }
-                write_payloads.push((fts_key, fts_data));
-                cluster_inv_indexes.push((cluster_idx, inv_index));
-            }
-
-            // Phase 2b: Build global FTS index from per-cluster indexes.
-            has_global_fts = if !cluster_inv_indexes.is_empty() {
-                use crate::fts::global_index::{global_fts_key, GlobalInvertedIndex};
-                let refs: Vec<(usize, &InvertedIndex)> = cluster_inv_indexes
-                    .iter()
-                    .map(|(idx, inv)| (*idx, inv))
-                    .collect();
-                let global_index = GlobalInvertedIndex::build(&refs);
-                let global_data = global_index.to_bytes()?;
-                let gkey = global_fts_key(namespace, &segment_id);
-                write_payloads.push((gkey, global_data));
-                true
-            } else {
-                false
-            };
-
-            // Phase 3: Parallel writes of FTS indexes (per-cluster + global).
-            let write_futs: Vec<_> = write_payloads
-                .iter()
-                .map(|(key, data)| self.store.put(key, data.clone()))
-                .collect();
-            let write_results = futures::future::join_all(write_futs).await;
-            for result in write_results {
-                result?;
-            }
-
-            let fts_elapsed = fts_start.elapsed();
-            crate::metrics::FTS_INDEX_BUILD_DURATION
-                .with_label_values(&[namespace])
-                .observe(fts_elapsed.as_secs_f64());
-            debug!(
-                fts_fields = ?fts_field_names,
-                fts_build_duration_ms = fts_elapsed.as_millis() as u64,
-                clusters = cluster_count,
-                "FTS inverted index build complete"
-            );
-
-            fts_field_names
-        } else {
-            Vec::new()
-        };
+        // 8b. Build the same complete FTS closure used by unpublished owned
+        // clone materialization. This helper fails the build if any required
+        // cluster is unreadable rather than publishing a partial text index.
+        let (fts_fields, has_global_fts) = self
+            .build_full_text_artifacts(
+                namespace,
+                &segment_id,
+                cluster_count,
+                fts_configs,
+                &indexing_config,
+            )
+            .await?;
 
         if let Some(token) = fencing_token {
             publish_compaction_staging(&self.store, namespace, &segment_id, token).await?;
@@ -2085,7 +2534,16 @@ impl Compactor {
                     artifact_origin: None,
                 },
                 self.config.max_pending_deletes,
-                self.config.max_old_segments,
+                if materialize_foreign {
+                    // The materialization generation is a minimal target-local
+                    // live closure. Foreign and previously retained descriptors
+                    // remain available only through immutable manifest history;
+                    // carrying them in the new live manifest would keep foreign
+                    // origin/routing/hash state after materialization.
+                    0
+                } else {
+                    self.config.max_old_segments
+                },
                 manifest_stamp,
             );
             if is_hierarchical {
@@ -3438,9 +3896,11 @@ async fn load_full_surviving_vectors_for_fallback(
     old_segment: Option<LocatedSegmentRef<'_>>,
     mut latest_vectors: HashMap<String, VectorEntry>,
     deleted_ids: &HashSet<String>,
+    source_body_verifier: Option<&CompactionBodyVerifier<'_>>,
 ) -> Result<Vec<VectorEntry>> {
     if let Some(located) = old_segment {
-        let (existing_vecs, _id_to_cluster) = load_segment_vectors(store, located).await?;
+        let (existing_vecs, _id_to_cluster) =
+            load_segment_vectors(store, located, source_body_verifier).await?;
         for vector in existing_vecs {
             if !latest_vectors.contains_key(&vector.id) && !deleted_ids.contains(&vector.id) {
                 latest_vectors.insert(vector.id.clone(), vector);
@@ -4125,6 +4585,7 @@ fn check_upload_window(
 async fn load_segment_vectors(
     store: &ZeppelinStore,
     located: LocatedSegmentRef<'_>,
+    source_body_verifier: Option<&CompactionBodyVerifier<'_>>,
 ) -> Result<(Vec<VectorEntry>, HashMap<String, usize>)> {
     let namespace = located.logical_namespace;
     let physical_namespace = located.physical_namespace();
@@ -4147,17 +4608,23 @@ async fn load_segment_vectors(
     // `segment_id` to sum vector counts, which would 404 on a segment whose
     // clusters were carried over to other keys. Centroids are segment-global
     // and always live under `segment_id`.
-    let num_clusters = if located.segment.hierarchical {
+    let num_clusters = if source_body_verifier.is_some() {
+        // The authenticated manifest execution digest binds this descriptor.
+        // Full materialization needs only row payloads, so avoid consuming an
+        // unverified centroid/tree sidecar merely to rediscover this count.
+        located.segment.cluster_count
+    } else if located.segment.hierarchical {
         // Compaction reads the segment once; no query cache involved here.
         let h_index = HierarchicalIndex::load_from_located_manifest(store, located, None).await?;
         h_index.num_leaf_clusters()
     } else {
         use crate::index::ivf_flat::build::{centroids_key, deserialize_centroids};
-        let centroids_data = get_compaction_read(
+        let centroids_data = get_compaction_read_with_verifier(
             store,
             namespace,
             &centroids_key(physical_namespace, segment_id),
             COMPACTION_READ_CLASS_CENTROIDS,
+            source_body_verifier,
         )
         .await?;
         let (centroids, _dim) = deserialize_centroids(&centroids_data)?;
@@ -4167,37 +4634,39 @@ async fn load_segment_vectors(
     let mut cluster_results = Vec::new();
     if cluster_objects.is_empty() {
         // Parallel fetch: 2 GETs per cluster via tokio::join!
-        cluster_results =
-            futures::future::join_all((0..num_clusters).map(|i| {
-                let cvec_key = cluster_key(physical_namespace, owner(i), i);
-                let cattr_key = attrs_key(physical_namespace, owner(i), i);
-                async move {
-                    let (cluster_res, attrs_res) = tokio::join!(
-                        get_compaction_read(
-                            store,
-                            namespace,
-                            &cvec_key,
-                            COMPACTION_READ_CLASS_CLUSTER,
-                        ),
-                        get_compaction_read(
-                            store,
-                            namespace,
-                            &cattr_key,
-                            COMPACTION_READ_CLASS_ATTRS,
-                        ),
-                    );
-                    (i, cluster_res, attrs_res)
-                }
-            }))
-            .await;
+        cluster_results = futures::future::join_all((0..num_clusters).map(|i| {
+            let cvec_key = cluster_key(physical_namespace, owner(i), i);
+            let cattr_key = attrs_key(physical_namespace, owner(i), i);
+            async move {
+                let (cluster_res, attrs_res) = tokio::join!(
+                    get_compaction_read_with_verifier(
+                        store,
+                        namespace,
+                        &cvec_key,
+                        COMPACTION_READ_CLASS_CLUSTER,
+                        source_body_verifier,
+                    ),
+                    get_compaction_read_with_verifier(
+                        store,
+                        namespace,
+                        &cattr_key,
+                        COMPACTION_READ_CLASS_ATTRS,
+                        source_body_verifier,
+                    ),
+                );
+                (i, cluster_res, attrs_res)
+            }
+        }))
+        .await;
     } else {
         let object_results =
             futures::future::join_all(cluster_objects.iter().map(|object_ref| async move {
-                let object_res = get_compaction_read(
+                let object_res = get_compaction_read_with_verifier(
                     store,
                     namespace,
                     &object_ref.key,
                     COMPACTION_READ_CLASS_CLUSTER,
+                    source_body_verifier,
                 )
                 .await;
                 (object_ref, object_res)
@@ -4223,9 +4692,14 @@ async fn load_segment_vectors(
                         ))
                     })?;
                 let cattr_key = attrs_key(physical_namespace, owner(cluster_idx), cluster_idx);
-                let attrs_res =
-                    get_compaction_read(store, namespace, &cattr_key, COMPACTION_READ_CLASS_ATTRS)
-                        .await;
+                let attrs_res = get_compaction_read_with_verifier(
+                    store,
+                    namespace,
+                    &cattr_key,
+                    COMPACTION_READ_CLASS_ATTRS,
+                    source_body_verifier,
+                )
+                .await;
                 cluster_results.push((
                     cluster_idx,
                     Ok(bytes::Bytes::copy_from_slice(section.data)),
@@ -4599,7 +5073,7 @@ mod tests {
             .unwrap()
             .expect("fixture has one active segment");
 
-        let (vectors, membership) = load_segment_vectors(&store, located).await.unwrap();
+        let (vectors, membership) = load_segment_vectors(&store, located, None).await.unwrap();
         assert_eq!(vectors.len(), 1);
         assert_eq!(vectors[0].id, "source-row");
         assert_eq!(membership.get("source-row"), Some(&0));

@@ -365,6 +365,28 @@ async fn clone_compacted_generation_is_writable_and_survives_source_delete() {
         .await
         .unwrap()
         .unwrap();
+    assert!(
+        target_manifest.artifact_origins.is_empty(),
+        "a raw clone must not retain an explicit source-incarnation origin table"
+    );
+    assert!(
+        target_manifest
+            .uncompacted_fragments()
+            .iter()
+            .all(|fragment| fragment.artifact_origin.is_none()),
+        "raw-cloned WAL must use implicit target-local ownership"
+    );
+    assert!(
+        target_manifest
+            .segments
+            .iter()
+            .all(|segment| segment.artifact_origin.is_none()),
+        "raw-cloned segments must use implicit target-local ownership"
+    );
+    let target_manifest_json = serde_json::to_value(&target_manifest).unwrap();
+    assert!(target_manifest_json["branch_lineage"].is_null());
+    assert_eq!(target_manifest_json["branch_roots"], json!({}));
+    assert!(target_manifest.visible_refs_are_local().unwrap());
     let target_prefix = format!("{target}/");
     let source_prefix = format!("{source}/");
     for key in reachable_keys(&target, &target_manifest).unwrap() {
@@ -403,6 +425,109 @@ async fn clone_compacted_generation_is_writable_and_survives_source_delete() {
     assert!(target_after_source_delete.contains("old-0"));
 
     cleanup_ns(&harness.store, &target).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn clone_materialized_branch_rebinds_copied_artifacts_to_the_target() {
+    let mut config = Config::default();
+    config.branching.enabled = true;
+    config.security.policy_refresh_secs = 3_600;
+    config.indexing.default_num_centroids = 2;
+    config.indexing.default_nprobe = 2;
+    config.indexing.max_nprobe = 8;
+    config.indexing.quantization = QuantizationType::None;
+    config.indexing.bitmap_index = false;
+    config.indexing.fts_index = false;
+
+    let (base_url, harness, _cache, _cache_dir, compactor, admin_bearer) =
+        start_test_server_with_compactor(Some(config)).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
+    let source = create_ns_api_with(
+        &client,
+        &base_url,
+        json!({
+            "dimensions": 2,
+            "distance_metric": "euclidean"
+        }),
+    )
+    .await;
+    let branch = api_ns(&harness, "materialized-branch-source");
+    let target = api_ns(&harness, "materialized-branch-clone");
+
+    upsert(
+        &client,
+        &base_url,
+        &source,
+        json!([
+            { "id": "branch-row-0", "values": [0.0, 0.0] },
+            { "id": "branch-row-1", "values": [0.1, 0.0] },
+            { "id": "branch-row-2", "values": [0.0, 0.1] },
+            { "id": "branch-row-3", "values": [1.0, 1.0] }
+        ]),
+    )
+    .await;
+    compactor.compact(&source).await.unwrap();
+
+    let fork = client
+        .post(format!("{base_url}/v1/namespaces/{source}/branches"))
+        .json(&json!({ "target": branch }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fork.status(), StatusCode::CREATED);
+
+    compactor.compact(&branch).await.unwrap();
+    let materialized = Manifest::read(&harness.store, &branch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(materialized.visible_refs_are_local().unwrap());
+    assert_eq!(
+        materialized.artifact_origins.len(),
+        1,
+        "ordinary compaction makes local ownership explicit before raw clone normalization"
+    );
+    assert!(materialized
+        .segments
+        .iter()
+        .all(|segment| segment.artifact_origin.is_some()));
+
+    let (status, body) = clone_namespace(
+        &client,
+        &base_url,
+        &branch,
+        &target,
+        &materialized.version().to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["mode"], "copy");
+    assert!(body["namespace"]["branch"].is_null());
+
+    let cloned = Manifest::read(&harness.store, &target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(cloned.artifact_origins.is_empty());
+    assert!(cloned
+        .segments
+        .iter()
+        .all(|segment| segment.artifact_origin.is_none()));
+    assert!(cloned.visible_refs_are_local().unwrap());
+    let cloned_json = serde_json::to_value(&cloned).unwrap();
+    assert!(cloned_json["branch_lineage"].is_null());
+    assert_eq!(cloned_json["branch_roots"], json!({}));
+    assert_eq!(
+        set(query_ids(&client, &base_url, &target, [0.0, 0.0]).await),
+        BTreeSet::from([
+            "branch-row-0".to_string(),
+            "branch-row-1".to_string(),
+            "branch-row-2".to_string(),
+            "branch-row-3".to_string(),
+        ])
+    );
+
     harness.cleanup().await;
 }
 

@@ -1467,7 +1467,29 @@ impl NamespaceManager {
                 })?
                 .as_uuid(),
         )?;
-        manifest.write(&self.store, name).await?;
+        match manifest
+            .publish_initial_create_only(&self.store, name)
+            .await
+        {
+            Ok(_) => {}
+            Err(ZeppelinError::ManifestConflict { .. }) => {
+                // A concurrent recovery may have published the identical
+                // bootstrap and activated the namespace while this creator was
+                // in flight. Adopt only that exact metadata incarnation; never
+                // rebase this empty candidate over the newer live manifest.
+                let current = self.read_metadata_from_s3(name).await?;
+                if current.incarnation_id != meta.incarnation_id {
+                    return Err(ZeppelinError::ManifestConflict {
+                        namespace: name.to_string(),
+                    });
+                }
+                let recovered = self.recover_creating_namespace(current).await?;
+                let recovered = self.ensure_active(recovered)?;
+                info!(namespace = name, dimensions, %distance_metric, "created namespace");
+                return Ok(recovered);
+            }
+            Err(error) => return Err(error),
+        }
 
         let meta = self.activate_created_namespace(name).await?;
         let meta = self.ensure_active(meta)?;
@@ -1518,73 +1540,94 @@ impl NamespaceManager {
         }
 
         let name = meta.name.clone();
-        match crate::wal::Manifest::read(&self.store, &name).await? {
-            Some(mut manifest) => {
-                let is_empty_bootstrap = manifest.fragments.is_empty()
-                    && manifest.segments.is_empty()
-                    && manifest.compaction_watermark.is_none()
-                    && manifest.active_segment.is_none()
-                    && manifest.next_sequence == 0
-                    && manifest.pending_deletes.is_empty()
-                    && manifest.fencing_token == 0;
-                if !is_empty_bootstrap {
-                    return Err(ZeppelinError::Serialization(format!(
+        const MAX_BOOTSTRAP_ATTEMPTS: usize = 10;
+        let mut bootstrap_ready = false;
+        for _ in 0..MAX_BOOTSTRAP_ATTEMPTS {
+            match crate::wal::Manifest::read(&self.store, &name).await? {
+                Some(mut manifest) => {
+                    let is_empty_bootstrap = manifest.fragments.is_empty()
+                        && manifest.segments.is_empty()
+                        && manifest.compaction_watermark.is_none()
+                        && manifest.active_segment.is_none()
+                        && manifest.next_sequence == 0
+                        && manifest.pending_deletes.is_empty()
+                        && manifest.fencing_token == 0;
+                    if !is_empty_bootstrap {
+                        return Err(ZeppelinError::Serialization(format!(
                         "creating namespace {name} has non-empty bootstrap manifest generation {}",
                         manifest.version()
                     )));
-                }
-                let expected_incarnation = meta
-                    .incarnation_id
-                    .as_ref()
-                    .ok_or_else(|| {
-                        ZeppelinError::Serialization(format!(
-                            "creating namespace {name} is missing its incarnation identity"
-                        ))
-                    })?
-                    .as_uuid();
-                match (manifest.version(), manifest.namespace_incarnation()) {
-                    (1, None) => {
-                        manifest = crate::wal::Manifest::read_versioned_required_for_incarnation(
-                            &self.store,
-                            &name,
-                            expected_incarnation,
-                        )
-                        .await?
-                        .0;
-                        if manifest.namespace_incarnation() != Some(expected_incarnation) {
-                            return Err(ZeppelinError::Serialization(format!(
-                                "creating namespace {name} manifest incarnation does not match metadata"
-                            )));
-                        }
                     }
-                    (1 | 2, Some(actual)) if actual == expected_incarnation => {}
-                    (_, Some(actual)) if actual != expected_incarnation => {
-                        return Err(ZeppelinError::Serialization(format!(
-                            "creating namespace {name} manifest incarnation does not match metadata"
-                        )));
-                    }
-                    _ => {
-                        return Err(ZeppelinError::Serialization(format!(
-                            "creating namespace {name} has non-bootstrap manifest generation {}",
-                            manifest.version()
-                        )));
-                    }
-                }
-            }
-            None => {
-                let mut manifest = crate::wal::Manifest::new_at(meta.created_at);
-                manifest.bind_namespace_incarnation(
-                    meta.incarnation_id
+                    let expected_incarnation = meta
+                        .incarnation_id
                         .as_ref()
                         .ok_or_else(|| {
                             ZeppelinError::Serialization(format!(
                                 "creating namespace {name} is missing its incarnation identity"
                             ))
                         })?
-                        .as_uuid(),
-                )?;
-                manifest.write(&self.store, &name).await?;
+                        .as_uuid();
+                    match (manifest.version(), manifest.namespace_incarnation()) {
+                        (1, None) => {
+                            manifest =
+                                crate::wal::Manifest::read_versioned_required_for_incarnation(
+                                    &self.store,
+                                    &name,
+                                    expected_incarnation,
+                                )
+                                .await?
+                                .0;
+                            if manifest.namespace_incarnation() != Some(expected_incarnation) {
+                                return Err(ZeppelinError::Serialization(format!(
+                                    "creating namespace {name} manifest incarnation does not match metadata"
+                                )));
+                            }
+                        }
+                        (1 | 2, Some(actual)) if actual == expected_incarnation => {}
+                        (_, Some(actual)) if actual != expected_incarnation => {
+                            return Err(ZeppelinError::Serialization(format!(
+                                "creating namespace {name} manifest incarnation does not match metadata"
+                            )));
+                        }
+                        _ => {
+                            return Err(ZeppelinError::Serialization(format!(
+                                "creating namespace {name} has non-bootstrap manifest generation {}",
+                                manifest.version()
+                            )));
+                        }
+                    }
+                    bootstrap_ready = true;
+                    break;
+                }
+                None => {
+                    let mut manifest = crate::wal::Manifest::new_at(meta.created_at);
+                    manifest.bind_namespace_incarnation(
+                        meta.incarnation_id
+                            .as_ref()
+                            .ok_or_else(|| {
+                                ZeppelinError::Serialization(format!(
+                                    "creating namespace {name} is missing its incarnation identity"
+                                ))
+                            })?
+                            .as_uuid(),
+                    )?;
+                    match manifest
+                        .publish_initial_create_only(&self.store, &name)
+                        .await
+                    {
+                        Ok(_) => {
+                            bootstrap_ready = true;
+                            break;
+                        }
+                        Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
             }
+        }
+
+        if !bootstrap_ready {
+            return Err(ZeppelinError::ManifestConflict { namespace: name });
         }
 
         let recovered = self.activate_created_namespace(&name).await?;

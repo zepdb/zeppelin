@@ -1,7 +1,9 @@
 mod common;
 
 use common::assertions::{assert_s3_object_exists, assert_s3_object_not_exists};
+use common::fault_injection::pause_first_create_matching;
 use common::harness::TestHarness;
+use common::vectors::random_vectors;
 
 use chrono::Utc;
 use zeppelin::config::IndexingConfig;
@@ -13,7 +15,7 @@ use zeppelin::namespace::NamespaceManager;
 use zeppelin::storage::ObjectUserMetadata;
 use zeppelin::types::DistanceMetric;
 use zeppelin::types::IndexType;
-use zeppelin::wal::{LeaseManager, Manifest};
+use zeppelin::wal::{LeaseManager, Manifest, WalWriter};
 
 /// Create a URL-safe namespace name scoped to this test's prefix (no slashes).
 fn ns(harness: &TestHarness, suffix: &str) -> String {
@@ -49,6 +51,80 @@ async fn test_create_namespace() {
     // Verify manifest.json exists on S3
     let manifest_key = Manifest::s3_key(&name);
     assert_s3_object_exists(&harness.store, &manifest_key).await;
+
+    cleanup_ns(&harness.store, &name).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_stale_namespace_bootstrap_cannot_overwrite_recovered_wal() {
+    let harness = TestHarness::new().await;
+    let name = ns(&harness, "stale-bootstrap-recovered-wal");
+    let manifest_key = Manifest::s3_key(&name);
+    let (paused_store, bootstrap_pause) = pause_first_create_matching(&harness.store, manifest_key);
+
+    let creator_name = name.clone();
+    let mut creator = tokio::spawn(async move {
+        NamespaceManager::new(paused_store)
+            .create(&creator_name, 4, DistanceMetric::Cosine)
+            .await
+    });
+
+    tokio::select! {
+        () = bootstrap_pause.wait_until_paused() => {}
+        outcome = &mut creator => {
+            panic!("original creator returned before the manifest bootstrap barrier: {outcome:?}");
+        }
+        () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
+            panic!("original creator must reach the manifest bootstrap barrier");
+        }
+    }
+
+    // A replacement node observes the durable `creating` reservation, wins the
+    // create-only manifest publication, and activates the namespace.
+    let recovered = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        NamespaceManager::new(harness.store.clone()).get(&name),
+    )
+    .await
+    .expect("independent recovery must not stall")
+    .expect("independent recovery must finish the interrupted create");
+    assert_eq!(recovered.state, NamespaceState::Active);
+
+    // This append returns only after its fragment is visible in the
+    // authoritative manifest. Releasing the original empty bootstrap must not
+    // let that stale candidate rebase over this acknowledged state.
+    let writer = WalWriter::new(harness.store.clone());
+    let (fragment, committed) = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        writer.append(&name, random_vectors(1, 4), Vec::new()),
+    )
+    .await
+    .expect("WAL append after recovery must not stall")
+    .expect("WAL append after recovery must be acknowledged");
+    assert!(committed
+        .fragments
+        .iter()
+        .any(|fragment_ref| fragment_ref.id == fragment.id));
+
+    bootstrap_pause.release();
+    let original = tokio::time::timeout(std::time::Duration::from_secs(15), creator)
+        .await
+        .expect("original creator must finish after its bootstrap is released")
+        .expect("original creator task must not panic")
+        .expect("original creator must adopt the recovered namespace");
+    assert_eq!(original.incarnation_id, recovered.incarnation_id);
+
+    let live = Manifest::read(&harness.store, &name)
+        .await
+        .expect("live manifest read must succeed")
+        .expect("active namespace must retain a live manifest");
+    assert!(
+        live.fragments
+            .iter()
+            .any(|fragment_ref| fragment_ref.id == fragment.id),
+        "the stale empty bootstrap must not overwrite an acknowledged WAL fragment"
+    );
 
     cleanup_ns(&harness.store, &name).await;
     harness.cleanup().await;

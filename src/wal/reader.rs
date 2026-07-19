@@ -480,6 +480,68 @@ impl WalReader {
         self.finish_located_fragment_results(refs, results).await
     }
 
+    /// Read an exact captured-manifest WAL selection without live-head reinterpretation.
+    ///
+    /// Callers use this after resolving one immutable manifest snapshot into
+    /// origin-qualified refs. Every requested object is read from its captured
+    /// physical namespace, decoded with checksum validation, and checked against
+    /// the fragment ID embedded in the selected descriptor. Results retain the
+    /// caller's replay order, including equal textual ULIDs owned by distinct
+    /// namespace lifetimes.
+    ///
+    /// Unlike ordinary query and compaction reads, this method has no
+    /// compaction/GC-race omission rule. A missing captured object is an
+    /// incomplete snapshot and fails directly; the reader never fetches the
+    /// current logical manifest to decide that the selected ref is no longer
+    /// live. This contract is required by clone materialization, where changing
+    /// the source view after authorization would produce a different clone.
+    ///
+    /// # Errors
+    ///
+    /// Returns origin-batch validation, object-store, decoding, checksum, or
+    /// fragment-identity errors. Any failed ref rejects the complete batch and
+    /// no partial fragment vector is returned.
+    pub(crate) async fn read_located_fragments_strict(
+        &self,
+        refs: &[LocatedFragmentRef<'_>],
+        cache_policy: FragmentCachePolicy<'_>,
+    ) -> Result<Vec<WalFragment>> {
+        Self::validate_located_batch(refs)?;
+        futures::future::join_all(
+            refs.iter()
+                .map(|located| self.read_located_fragment_with_cache(*located, cache_policy)),
+        )
+        .await
+        .into_iter()
+        .collect()
+    }
+
+    /// Reads an exact captured WAL selection and authenticates each raw body.
+    ///
+    /// The verifier receives the exact physical object key and bytes returned
+    /// by the cache/storage path before MessagePack decoding. This lets callers
+    /// bind a cross-namespace materialization read to an already authenticated
+    /// manifest inventory without coupling the WAL layer to receipt types.
+    /// Missing objects remain storage errors; verifier failures reject the
+    /// complete batch and no decoded fragment is returned.
+    pub(crate) async fn read_located_fragments_strict_verified<F>(
+        &self,
+        refs: &[LocatedFragmentRef<'_>],
+        cache_policy: FragmentCachePolicy<'_>,
+        verify_body: &F,
+    ) -> Result<Vec<WalFragment>>
+    where
+        F: Fn(&str, &[u8]) -> Result<()> + Sync,
+    {
+        Self::validate_located_batch(refs)?;
+        futures::future::join_all(refs.iter().map(|located| {
+            self.read_located_fragment_with_cache_verified(*located, cache_policy, verify_body)
+        }))
+        .await
+        .into_iter()
+        .collect()
+    }
+
     /// Read origin-resolved refs while retaining identities for derived caches.
     pub(crate) async fn read_located_query_fragments_unchecked(
         &self,
@@ -775,6 +837,47 @@ impl WalReader {
                         fragment_id = %located.fragment.id,
                         error = %error,
                         "failed to evict corrupt located WAL fragment cache entry"
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    async fn read_located_fragment_with_cache_verified<F>(
+        &self,
+        located: LocatedFragmentRef<'_>,
+        cache_policy: FragmentCachePolicy<'_>,
+        verify_body: &F,
+    ) -> Result<WalFragment>
+    where
+        F: Fn(&str, &[u8]) -> Result<()> + Sync,
+    {
+        let s3_key = WalFragment::s3_key(located.physical_origin.namespace(), &located.fragment.id);
+        let cache_key = located.cache_key(&s3_key);
+        let data = self
+            .read_fragment_bytes_at(
+                &s3_key,
+                &cache_key,
+                located.logical_namespace,
+                &located.fragment.id,
+                cache_policy,
+            )
+            .await?;
+        let result = verify_body(&s3_key, &data).and_then(|()| {
+            WalFragment::from_bytes(&data).and_then(|fragment| {
+                Self::validate_fragment_identity(fragment, &located.fragment.id)
+            })
+        });
+        if result.is_err() {
+            if let Some(cache) = cache_policy.cache() {
+                if let Err(error) = cache.invalidate(&cache_key).await {
+                    warn!(
+                        logical_namespace = located.logical_namespace,
+                        physical_namespace = located.physical_origin.namespace(),
+                        fragment_id = %located.fragment.id,
+                        error = %error,
+                        "failed to evict unauthenticated located WAL fragment cache entry"
                     );
                 }
             }
@@ -1154,5 +1257,174 @@ impl WalReader {
                 .inc();
         }
         Ok(fragments)
+    }
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(test)]
+mod tests {
+    //! Captured-manifest WAL read contract tests.
+    //!
+    //! These tests use the in-memory object-store backend because the seam under
+    //! test is selection stability after a manifest snapshot has already been
+    //! resolved. Real S3/MinIO tests cover the storage backend itself.
+
+    use std::sync::Arc;
+
+    use object_store::memory::InMemory;
+
+    use super::*;
+    use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
+    use crate::namespace::{NamespaceId, NamespaceIncarnationId};
+    use crate::types::VectorEntry;
+
+    async fn bound_empty_head(store: &ZeppelinStore, namespace: &str) -> Manifest {
+        let mut manifest = Manifest::new();
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .expect("captured-manifest fixture must bind an incarnation");
+        manifest
+            .write(store, namespace)
+            .await
+            .expect("captured-manifest fixture head must publish");
+        manifest
+    }
+
+    fn fragment_ref(id: Ulid) -> FragmentRef {
+        FragmentRef {
+            id,
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 1,
+            artifact_origin: None,
+        }
+    }
+
+    fn artifact_origin(namespace: &str, incarnation: u128) -> ArtifactOrigin {
+        ArtifactOrigin {
+            namespace: NamespaceId::parse(namespace)
+                .expect("physical-origin fixture namespace must be valid"),
+            incarnation: NamespaceIncarnationId::from_uuid(uuid::Uuid::from_u128(incarnation)),
+        }
+    }
+
+    fn located_fragment_ref(id: Ulid, origin: ArtifactOriginIndex) -> FragmentRef {
+        FragmentRef {
+            artifact_origin: Some(origin),
+            ..fragment_ref(id)
+        }
+    }
+
+    fn fragment_body(id: Ulid, row_id: &str) -> WalFragment {
+        let mut fragment = WalFragment::new(
+            vec![VectorEntry {
+                id: row_id.to_string(),
+                values: vec![1.0, 0.0],
+                attributes: None,
+            }],
+            Vec::new(),
+        );
+        // Fragment payload checksums deliberately exclude the key identity. The
+        // reader independently verifies this field against the selected ref.
+        fragment.id = id;
+        fragment
+    }
+
+    #[tokio::test]
+    async fn captured_missing_ref_fails_even_after_the_live_head_omits_it() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let reader = WalReader::new(store.clone());
+        let namespace = "captured-missing-wal";
+        let mut captured = bound_empty_head(&store, namespace).await;
+        let missing_id = Ulid::from_parts(1, 7);
+        captured.add_fragment(fragment_ref(missing_id));
+
+        let current = Manifest::read(&store, namespace)
+            .await
+            .expect("live head read must succeed")
+            .expect("live head must exist");
+        assert!(
+            current.uncompacted_fragments().is_empty(),
+            "the current live head must not authorize the captured ref"
+        );
+
+        let logical_origin = captured
+            .local_origin()
+            .expect("captured fixture must retain its logical origin");
+        let located = captured
+            .artifact_origin_resolver(&logical_origin)
+            .expect("captured fixture origins must resolve")
+            .uncompacted_located_fragments()
+            .expect("captured fixture refs must locate");
+        let expected_key = WalFragment::s3_key(namespace, &missing_id);
+
+        let error = reader
+            .read_located_fragments_strict(&located, FragmentCachePolicy::Bypass)
+            .await
+            .expect_err("a missing captured ref must fail without live-head reinterpretation");
+        assert!(
+            matches!(error, ZeppelinError::NotFound { ref key } if key == &expected_key),
+            "strict captured read returned an unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_same_ids_at_distinct_origins_remain_distinct_and_ordered() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let reader = WalReader::new(store.clone());
+        let mut captured = bound_empty_head(&store, "captured-cross-origin").await;
+        let origin_a = artifact_origin("physical-a", 2);
+        let origin_b = artifact_origin("physical-b", 3);
+        captured.artifact_origins = vec![origin_a.clone(), origin_b.clone()];
+
+        let shared_id = Ulid::from_parts(2, 11);
+        // Captured replay order intentionally opposes canonical origin-table
+        // order so a result sorted or deduplicated by textual ULID is visible.
+        captured.add_fragment(located_fragment_ref(shared_id, ArtifactOriginIndex::new(1)));
+        captured.add_fragment(located_fragment_ref(shared_id, ArtifactOriginIndex::new(0)));
+
+        let from_a = fragment_body(shared_id, "row-from-a");
+        let from_b = fragment_body(shared_id, "row-from-b");
+        store
+            .put(
+                &WalFragment::s3_key(origin_a.namespace.as_str(), &shared_id),
+                from_a.to_bytes().expect("origin-a fragment must encode"),
+            )
+            .await
+            .expect("origin-a fragment must upload");
+        store
+            .put(
+                &WalFragment::s3_key(origin_b.namespace.as_str(), &shared_id),
+                from_b.to_bytes().expect("origin-b fragment must encode"),
+            )
+            .await
+            .expect("origin-b fragment must upload");
+
+        let logical_origin = captured
+            .local_origin()
+            .expect("captured fixture must retain its logical origin");
+        let located = captured
+            .artifact_origin_resolver(&logical_origin)
+            .expect("captured fixture origins must resolve")
+            .uncompacted_located_fragments()
+            .expect("captured fixture refs must locate");
+        let read = reader
+            .read_located_fragments_strict(&located, FragmentCachePolicy::Bypass)
+            .await
+            .expect("both origin-qualified captured refs must read");
+
+        assert_eq!(
+            read.iter().map(|fragment| fragment.id).collect::<Vec<_>>(),
+            vec![shared_id, shared_id],
+            "equal textual IDs at different origins must not be deduplicated"
+        );
+        assert_eq!(
+            read.iter()
+                .map(|fragment| fragment.vectors[0].id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["row-from-b", "row-from-a"],
+            "physical-origin routing must preserve captured replay order"
+        );
     }
 }

@@ -76,7 +76,9 @@ pub use preservation::{
     PreservationState,
 };
 pub use principal::{AuthStrength, Principal, PrincipalId, PrincipalKind};
-pub(crate) use receipt::{issue_receipt, verify_receipt, ReceiptIssue};
+pub(crate) use receipt::{
+    issue_receipt, verify_receipt, AuthenticatedManifestArtifactInventory, ReceiptIssue,
+};
 pub use receipt::{
     PolicyFilterCheck, ReceiptDivergence, RetrievalReceipt, TouchedArtifact, TraversalMetric,
     TraversalParams, TraversalSourceKind, TraversalSourceParams, VerificationMode,

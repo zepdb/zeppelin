@@ -2979,6 +2979,44 @@ impl Manifest {
         self.clear_branch_control_for_new_namespace();
     }
 
+    /// Rebinds byte-copied source artifacts to implicit target-local ownership.
+    ///
+    /// Raw clone copies every retained immutable object beneath the target
+    /// namespace prefix. Explicit origin indices that named the source's own
+    /// incarnation must therefore not survive into the target manifest: after
+    /// the copy, `None` is the canonical representation of target-local
+    /// ownership. Foreign descriptors are rejected because their bytes were
+    /// not proven to have been copied from the source namespace prefix.
+    pub(crate) fn normalize_copy_clone_artifact_ownership(&mut self) -> Result<()> {
+        self.validate_artifact_origins()?;
+        let local = self.local_origin()?;
+        for fragment in &self.fragments {
+            if self.fragment_origin(fragment)? != local {
+                return Err(ZeppelinError::Validation(format!(
+                    "copy clone fragment {} is not owned by the source namespace incarnation",
+                    fragment.id
+                )));
+            }
+        }
+        for segment in &self.segments {
+            if self.segment_origin(segment)? != local {
+                return Err(ZeppelinError::Validation(format!(
+                    "copy clone segment {} is not owned by the source namespace incarnation",
+                    segment.id
+                )));
+            }
+        }
+
+        for fragment in &mut self.fragments {
+            fragment.artifact_origin = None;
+        }
+        for segment in &mut self.segments {
+            segment.artifact_origin = None;
+        }
+        self.artifact_origins.clear();
+        Ok(())
+    }
+
     /// Clear source-owned branch control before binding a different namespace.
     ///
     /// This is the only intentional root-map clearing path outside exact root
@@ -3352,23 +3390,58 @@ impl Manifest {
                     .to_string(),
             ));
         }
-        target_base.validate_namespace_binding(target_namespace)?;
-        if target_base.namespace_incarnation() != Some(target_incarnation)
-            || !target_base.fragments.is_empty()
-            || !target_base.segments.is_empty()
-            || target_base.active_segment.is_some()
-            || !target_base.pending_deletes.is_empty()
-            || target_base.deletion_fence.is_some()
-            || !target_base.branch_roots.is_empty()
+        target_base.require_empty_clone_state(target_namespace, target_incarnation)?;
+
+        self.version = target_base.version;
+        self.namespace = Some(target_namespace.to_string());
+        self.bind_namespace_incarnation(target_incarnation)
+    }
+
+    /// Validates the exact empty target generation used as a clone CAS base.
+    ///
+    /// Clone targets are active before potentially expensive artifact work. A
+    /// target write can therefore win before the clone captures its ETag. That
+    /// acknowledged state must make clone fail rather than become part of the
+    /// clone candidate. The final conditional manifest write independently
+    /// rejects every mutation that occurs after this exact base is captured.
+    pub(crate) fn require_empty_clone_base(
+        &self,
+        target_namespace: &str,
+        target_incarnation: uuid::Uuid,
+    ) -> Result<()> {
+        if self.version != 1 {
+            return Err(ZeppelinError::ManifestConflict {
+                namespace: target_namespace.to_string(),
+            });
+        }
+        self.require_empty_clone_state(target_namespace, target_incarnation)
+    }
+
+    /// Validates empty clone state without imposing the production bootstrap generation.
+    ///
+    /// Synthetic branching fixtures reuse clone normalization after explicitly
+    /// removing fixture WAL from an advanced manifest. Production HTTP callers
+    /// must use [`Self::require_empty_clone_base`] first so this compatibility
+    /// seam cannot weaken the fresh-target contract.
+    fn require_empty_clone_state(
+        &self,
+        target_namespace: &str,
+        target_incarnation: uuid::Uuid,
+    ) -> Result<()> {
+        self.validate_namespace_binding(target_namespace)?;
+        if self.namespace_incarnation() != Some(target_incarnation)
+            || !self.fragments.is_empty()
+            || !self.segments.is_empty()
+            || self.active_segment.is_some()
+            || !self.pending_deletes.is_empty()
+            || self.deletion_fence.is_some()
+            || !self.branch_roots.is_empty()
         {
             return Err(ZeppelinError::ManifestConflict {
                 namespace: target_namespace.to_string(),
             });
         }
-
-        self.version = target_base.version;
-        self.namespace = Some(target_namespace.to_string());
-        self.bind_namespace_incarnation(target_incarnation)
+        Ok(())
     }
 
     /// Computes the successor of a persisted generation without wrapping.
@@ -4633,6 +4706,34 @@ impl Manifest {
             });
         }
         self.write_conditional_candidate(store, namespace, version)
+            .await
+    }
+
+    /// Publishes the generation-one namespace bootstrap without discovery or rebasing.
+    ///
+    /// Namespace creation must never rewrite a newer live manifest with its
+    /// original empty candidate. This seam uses the ordinary conditional writer
+    /// with an absent-version capability, so the live PUT is create-only while
+    /// receipt finalization and immutable generation-one history remain shared
+    /// with every other manifest publication path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error when the candidate is not generation zero,
+    /// a manifest conflict when the live key already exists, or the underlying
+    /// storage/serialization error. A conflict leaves `self` unchanged.
+    pub(crate) async fn publish_initial_create_only(
+        &mut self,
+        store: &ZeppelinStore,
+        namespace: &str,
+    ) -> Result<ManifestVersion> {
+        if self.version != 0 {
+            return Err(ZeppelinError::Serialization(format!(
+                "initial manifest publication for namespace {namespace} requires generation zero, got {}",
+                self.version
+            )));
+        }
+        self.write_conditional(store, namespace, &ManifestVersion::unversioned())
             .await
     }
 

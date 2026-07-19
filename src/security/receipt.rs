@@ -269,6 +269,134 @@ pub(crate) struct ReceiptIssue<'a> {
     pub issued_at: DateTime<Utc>,
 }
 
+/// Authenticated immutable-object inventory carried by one exact manifest.
+///
+/// Construction verifies the manifest's complete receipt binding before any
+/// artifact body can be accepted: reachable-key/hash closure, Merkle root,
+/// execution digest, versioned control digest, and the published node
+/// signature over the complete root envelope. The inventory remains opaque so
+/// callers cannot accidentally treat its hashes as an unsigned key catalogue.
+///
+/// Artifact readers then pass each exact physical key and the exact bytes they
+/// consumed to [`Self::verify_body`]. Keeping storage I/O at the reader avoids a
+/// verify-then-reread race in workflows that rebuild or copy immutable data.
+#[derive(Debug, Clone)]
+pub(crate) struct AuthenticatedManifestArtifactInventory {
+    artifacts: BTreeMap<String, [u8; 32]>,
+}
+
+impl AuthenticatedManifestArtifactInventory {
+    /// Authenticate one manifest's exact immutable-artifact inventory.
+    ///
+    /// This performs signer-inventory reads but does not fetch data artifacts.
+    /// The caller must verify every body it consumes with [`Self::verify_body`].
+    pub(crate) async fn authenticate(
+        store: &ZeppelinStore,
+        namespace: &str,
+        manifest: &Manifest,
+    ) -> ZeppelinResult<Self> {
+        let artifacts = manifest.receipt_artifacts(namespace)?;
+        let rebuilt_root = MerkleTree::build(artifacts)?.root();
+        let manifest_root = manifest.merkle_root().ok_or_else(|| {
+            authenticated_manifest_error("manifest omitted its authenticated artifact root")
+        })?;
+        if manifest_root != rebuilt_root {
+            return Err(authenticated_manifest_error(
+                "manifest artifact inventory did not rebuild its authenticated root",
+            ));
+        }
+
+        let binding_version = manifest.receipt_binding_version().ok_or_else(|| {
+            authenticated_manifest_error("manifest omitted its receipt binding version")
+        })?;
+        let manifest_state_digest = manifest.receipt_state_digest().ok_or_else(|| {
+            authenticated_manifest_error("manifest omitted its execution-state digest")
+        })?;
+        if manifest.recompute_receipt_state_digest(namespace)? != manifest_state_digest {
+            return Err(authenticated_manifest_error(
+                "manifest execution state diverged from its authenticated digest",
+            ));
+        }
+
+        let control_state_digest = manifest.control_state_digest();
+        match binding_version {
+            ReceiptBindingVersion::V1 | ReceiptBindingVersion::V2Origins => {
+                if control_state_digest.is_some() {
+                    return Err(authenticated_manifest_error(
+                        "manifest binding version forbids a control-state digest",
+                    ));
+                }
+            }
+            ReceiptBindingVersion::V3Roots | ReceiptBindingVersion::V4Lineage => {
+                let expected = control_state_digest.ok_or_else(|| {
+                    authenticated_manifest_error(
+                        "manifest binding version omitted its control-state digest",
+                    )
+                })?;
+                if manifest.recompute_control_state_digest(namespace)? != expected {
+                    return Err(authenticated_manifest_error(
+                        "manifest control state diverged from its authenticated digest",
+                    ));
+                }
+            }
+        }
+
+        let signer_node = manifest.root_signer_node().ok_or_else(|| {
+            authenticated_manifest_error("manifest omitted its root signer identity")
+        })?;
+        let signature = manifest
+            .root_signature()
+            .ok_or_else(|| authenticated_manifest_error("manifest omitted its root signature"))?;
+        let signing_bytes = manifest_root_signing_bytes(
+            manifest_root,
+            manifest.version(),
+            manifest.fencing_token(),
+            binding_version,
+            manifest_state_digest,
+            control_state_digest,
+        )?;
+        if !super::delegation::verify_published_signature(
+            store,
+            signer_node,
+            &signing_bytes,
+            signature,
+        )
+        .await?
+        {
+            return Err(authenticated_manifest_error(
+                "manifest root signature did not verify",
+            ));
+        }
+
+        Ok(Self {
+            artifacts: artifacts.clone(),
+        })
+    }
+
+    /// Verify one exact physical key and the exact immutable body read for it.
+    ///
+    /// Keys outside the authenticated inventory and bodies whose SHA-256 does
+    /// not match the signed hash both fail closed. No storage read is performed.
+    pub(crate) fn verify_body(&self, key: &str, bytes: &[u8]) -> ZeppelinResult<()> {
+        let expected = self.artifacts.get(key).ok_or_else(|| {
+            authenticated_manifest_error(
+                "consumed artifact is outside the authenticated manifest inventory",
+            )
+        })?;
+        let observed = <[u8; 32]>::from(Sha256::digest(bytes));
+        if &observed != expected {
+            return Err(authenticated_manifest_error(
+                "consumed artifact body diverged from its authenticated hash",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn authenticated_manifest_error(reason: &'static str) -> ZeppelinError {
+    SecurityError::InvalidReceipt(reason.to_string()).into()
+}
+
 /// Issue one signed receipt over an already-completed single query.
 pub(crate) fn issue_receipt(issue: ReceiptIssue<'_>) -> ZeppelinResult<RetrievalReceipt> {
     let ReceiptIssue {
@@ -683,5 +811,128 @@ fn canonicalize_value(value: serde_json::Value) -> serde_json::Value {
             serde_json::Value::Object(ordered.into_iter().collect())
         }
         scalar => scalar,
+    }
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use object_store::memory::InMemory;
+    use ulid::Ulid;
+
+    use super::*;
+    use crate::security::delegation::PublishedObjectSigner;
+    use crate::storage::store::ObjectSigner;
+    use crate::wal::fragment::WalFragment;
+    use crate::wal::manifest::FragmentRef;
+
+    async fn signed_manifest_fixture() -> (
+        ZeppelinStore,
+        Arc<PublishedObjectSigner>,
+        Manifest,
+        String,
+        Bytes,
+    ) {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let key_file = tempfile::NamedTempFile::new().expect("signing-key fixture must create");
+        std::fs::write(key_file.path(), "11".repeat(32)).expect("signing-key fixture must write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(key_file.path(), std::fs::Permissions::from_mode(0o600))
+                .expect("signing-key fixture permissions must tighten");
+        }
+        let signer = PublishedObjectSigner::compose(
+            store.signer_detached_clone(),
+            key_file.path().to_path_buf(),
+        )
+        .await
+        .expect("published object signer must compose");
+        let object_signer: Arc<dyn ObjectSigner> = signer.clone();
+        store
+            .install_object_signer(object_signer)
+            .expect("published object signer must install");
+
+        let namespace = "authenticated-manifest-inventory";
+        let fragment_id = Ulid::from_parts(1, 7);
+        let artifact_key = WalFragment::s3_key(namespace, &fragment_id);
+        let artifact_body = Bytes::from_static(b"exact immutable artifact body");
+        store
+            .put(&artifact_key, artifact_body.clone())
+            .await
+            .expect("artifact fixture must upload");
+        let mut manifest = Manifest::new();
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .expect("manifest fixture must bind an incarnation");
+        manifest.add_fragment(FragmentRef {
+            id: fragment_id,
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: artifact_body.len() as u64,
+            artifact_origin: None,
+        });
+        manifest
+            .write(&store, namespace)
+            .await
+            .expect("signed manifest fixture must publish");
+        (store, signer, manifest, artifact_key, artifact_body)
+    }
+
+    #[tokio::test]
+    async fn authenticated_inventory_accepts_only_exact_inventory_key_and_body() {
+        let (store, _signer, manifest, artifact_key, artifact_body) =
+            signed_manifest_fixture().await;
+        let inventory = AuthenticatedManifestArtifactInventory::authenticate(
+            &store,
+            "authenticated-manifest-inventory",
+            &manifest,
+        )
+        .await
+        .expect("signed manifest inventory must authenticate");
+
+        inventory
+            .verify_body(&artifact_key, &artifact_body)
+            .expect("exact physical key and bytes must verify");
+        assert!(matches!(
+            inventory.verify_body(&artifact_key, b"tampered"),
+            Err(ZeppelinError::Security(SecurityError::InvalidReceipt(_)))
+        ));
+        assert!(matches!(
+            inventory.verify_body("another/physical/key", &artifact_body),
+            Err(ZeppelinError::Security(SecurityError::InvalidReceipt(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn authenticated_inventory_rejects_execution_divergence_and_unknown_signer() {
+        let (store, _signer, manifest, _artifact_key, _artifact_body) =
+            signed_manifest_fixture().await;
+        let mut execution_tampered = manifest.clone();
+        execution_tampered.fragments[0].vector_count += 1;
+        assert!(matches!(
+            AuthenticatedManifestArtifactInventory::authenticate(
+                &store,
+                "authenticated-manifest-inventory",
+                &execution_tampered,
+            )
+            .await,
+            Err(ZeppelinError::Security(SecurityError::InvalidReceipt(_)))
+        ));
+
+        let unknown_signer_store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        assert!(matches!(
+            AuthenticatedManifestArtifactInventory::authenticate(
+                &unknown_signer_store,
+                "authenticated-manifest-inventory",
+                &manifest,
+            )
+            .await,
+            Err(ZeppelinError::Security(SecurityError::InvalidReceipt(_)))
+        ));
     }
 }

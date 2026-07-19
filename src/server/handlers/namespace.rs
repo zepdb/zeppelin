@@ -158,9 +158,9 @@ use crate::namespace::manager::{
     COMPACTION_DEGRADED_FAILURE_THRESHOLD,
 };
 use crate::security::{
-    Action, AllowDecision, AuditParams, Feature, IndexConfigValues, NamespaceDeleteAdmission,
-    NamespaceForkAdmission, NamespaceId, PreservationBlockedSurface, Principal, RequestContext,
-    SecurityError,
+    Action, AllowDecision, AuditParams, AuthenticatedManifestArtifactInventory, Feature,
+    IndexConfigValues, NamespaceDeleteAdmission, NamespaceForkAdmission, NamespaceId,
+    PreservationBlockedSurface, Principal, RequestContext, SecurityError,
 };
 use crate::server::{
     authorize_namespace_action, namespace_graph, AppState, AuditRequest, RateLimitIdentity,
@@ -1607,42 +1607,170 @@ pub async fn clone_namespace(
                 return Err(ApiError::from(e));
             }
         };
+    if let Err(error) = target_base_manifest.require_empty_clone_base(&target, target_incarnation) {
+        retain_failed_clone_target(&state, &target, "clone target changed before base capture");
+        release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+        return Err(ApiError::from(error));
+    }
 
-    let mut target_manifest =
-        match materialize_clone_manifest(&state, &source, &target, source_manifest).await {
-            Ok(manifest) => manifest,
-            Err(e) => {
-                retain_failed_clone_target(&state, &target, "artifact materialization failed");
+    let source_has_foreign_artifacts = match source_manifest.has_foreign_visible_artifacts() {
+        Ok(value) => value,
+        Err(error) => {
+            retain_failed_clone_target(&state, &target, "source origin validation failed");
+            release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+            return Err(ApiError::from(error));
+        }
+    };
+    let target_manifest = if source_has_foreign_artifacts {
+        let signing_enabled = match state.store.object_signer_node() {
+            Ok(signer) => signer.is_some(),
+            Err(error) => {
+                retain_failed_clone_target(&state, &target, "object signer lookup failed");
                 release_internal_clone_pin(&state, &source, &clone_pin_name).await;
-                return Err(ApiError::from(e));
+                return Err(ApiError::from(error));
             }
         };
-    if let Err(e) = target_manifest.prepare_clone_publication(
-        &target,
-        target_incarnation,
-        &target_base_manifest,
-    ) {
-        retain_failed_clone_target(&state, &target, "manifest preparation failed");
-        release_internal_clone_pin(&state, &source, &clone_pin_name).await;
-        return Err(ApiError::from(e));
-    }
-    if let Err(error) = state.security.validate_namespace_copy_no_widening(
-        clone_decision.policy_version,
-        &source_id,
-        &target_id,
-    ) {
-        retain_failed_clone_target(&state, &target, "authorization proof changed");
-        release_internal_clone_pin(&state, &source, &clone_pin_name).await;
-        return Err(ApiError(ZeppelinError::from(error)));
-    }
-    if let Err(e) = target_manifest
-        .write_conditional(&state.store, &target, &target_base_version)
-        .await
-    {
-        retain_failed_clone_target(&state, &target, "conditional manifest publication failed");
-        release_internal_clone_pin(&state, &source, &clone_pin_name).await;
-        return Err(ApiError::from(e));
-    }
+        let authenticated_source_inventory = if signing_enabled {
+            match AuthenticatedManifestArtifactInventory::authenticate(
+                &state.store,
+                &source,
+                &source_manifest,
+            )
+            .await
+            {
+                Ok(inventory) => Some(inventory),
+                Err(error) => {
+                    retain_failed_clone_target(
+                        &state,
+                        &target,
+                        "source receipt authentication failed",
+                    );
+                    release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+                    return Err(ApiError::from(map_clone_source_integrity_error(error)));
+                }
+            }
+        } else {
+            None
+        };
+        let target_origin = match target_base_manifest.local_origin() {
+            Ok(origin) => origin,
+            Err(error) => {
+                retain_failed_clone_target(&state, &target, "target origin validation failed");
+                release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+                return Err(ApiError::from(error));
+            }
+        };
+        let unpublished = match state
+            .compactor
+            .build_unpublished_owned_segment(
+                &source,
+                &source_manifest,
+                &target_origin,
+                authenticated_source_inventory.as_ref(),
+            )
+            .await
+        {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                retain_failed_clone_target(&state, &target, "owned segment build failed");
+                release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+                return Err(ApiError::from(error));
+            }
+        };
+
+        let mut manifest = target_base_manifest.clone();
+        let publication_guard = unpublished
+            .map(|candidate| candidate.install_into_at(&mut manifest, state.clock.now()));
+        if signing_enabled && manifest.receipt_upgrade_needed(&target) {
+            if let Err(error) = manifest
+                .hydrate_receipt_artifacts(&state.store, &target)
+                .await
+            {
+                retain_failed_clone_target(&state, &target, "receipt inventory failed");
+                release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+                return Err(ApiError::from(error));
+            }
+        }
+        if let Err(error) = state.security.validate_namespace_copy_no_widening(
+            clone_decision.policy_version,
+            &source_id,
+            &target_id,
+        ) {
+            retain_failed_clone_target(&state, &target, "authorization proof changed");
+            release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+            return Err(ApiError(ZeppelinError::from(error)));
+        }
+        let visible_refs_are_local = match manifest.visible_refs_are_local() {
+            Ok(local) => local,
+            Err(error) => {
+                retain_failed_clone_target(&state, &target, "owned manifest origin check failed");
+                release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+                return Err(ApiError::from(error));
+            }
+        };
+        if !visible_refs_are_local
+            || manifest.branch_lineage().is_some()
+            || !manifest.branch_roots().is_empty()
+            || !manifest.pending_deletes.is_empty()
+        {
+            retain_failed_clone_target(&state, &target, "owned manifest validation failed");
+            release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+            return Err(ApiError(ZeppelinError::Validation(format!(
+                "owned clone target {target} retained branch control or cleanup state"
+            ))));
+        }
+        if let Some(guard) = publication_guard.as_ref() {
+            if let Err(error) = guard.require_current() {
+                retain_failed_clone_target(&state, &target, "owned segment publication expired");
+                release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+                return Err(ApiError::from(error));
+            }
+        }
+        if let Err(error) = manifest
+            .write_conditional(&state.store, &target, &target_base_version)
+            .await
+        {
+            retain_failed_clone_target(&state, &target, "conditional manifest publication failed");
+            release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+            return Err(ApiError::from(error));
+        }
+        manifest
+    } else {
+        let mut manifest =
+            match materialize_clone_manifest(&state, &source, &target, source_manifest).await {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    retain_failed_clone_target(&state, &target, "artifact materialization failed");
+                    release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+                    return Err(ApiError::from(error));
+                }
+            };
+        if let Err(error) =
+            manifest.prepare_clone_publication(&target, target_incarnation, &target_base_manifest)
+        {
+            retain_failed_clone_target(&state, &target, "manifest preparation failed");
+            release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+            return Err(ApiError::from(error));
+        }
+        if let Err(error) = state.security.validate_namespace_copy_no_widening(
+            clone_decision.policy_version,
+            &source_id,
+            &target_id,
+        ) {
+            retain_failed_clone_target(&state, &target, "authorization proof changed");
+            release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+            return Err(ApiError(ZeppelinError::from(error)));
+        }
+        if let Err(error) = manifest
+            .write_conditional(&state.store, &target, &target_base_version)
+            .await
+        {
+            retain_failed_clone_target(&state, &target, "conditional manifest publication failed");
+            release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+            return Err(ApiError::from(error));
+        }
+        manifest
+    };
     state
         .manifest_cache
         .insert(&target, target_manifest.clone());
@@ -1787,6 +1915,14 @@ fn retain_failed_clone_target(state: &AppState, target: &str, stage: &'static st
         stage,
         "clone failed after target activation; target retained to preserve concurrent writes"
     );
+}
+
+/// Redacts authenticated source divergence behind the branch integrity contract.
+fn map_clone_source_integrity_error(error: ZeppelinError) -> ZeppelinError {
+    match error {
+        error @ (ZeppelinError::Storage(_) | ZeppelinError::Io(_)) => error,
+        _ => BranchError::BranchIntegrity.into(),
+    }
 }
 
 /// Resolves creation overrides against complete server indexing defaults.
@@ -2006,6 +2142,7 @@ async fn materialize_clone_manifest(
             .await?;
     }
     let copies = clone_copy_map(source, target, &manifest)?;
+    manifest.normalize_copy_clone_artifact_ownership()?;
     rewrite_manifest_stored_keys(source, target, &mut manifest)?;
     manifest.rewrite_receipt_artifacts_for_clone(source, target)?;
     manifest.fencing_token = 0;
@@ -2486,9 +2623,10 @@ fn require_unconstrained_namespace_operation(decision: &AllowDecision) -> Result
 ///
 /// # Returns
 ///
-/// HTTP 200 with `status = "noop"` when no fragment needs compaction, or HTTP
-/// 202 with `status = "accepted"` after lease acquisition and task spawn. Both
-/// bodies describe the manifest observed before work began.
+/// HTTP 200 with `status = "noop"` when no fragment, receipt upgrade, or
+/// foreign-backed view needs compaction, or HTTP 202 with `status = "accepted"`
+/// after lease acquisition and task spawn. Both bodies describe the manifest
+/// observed before work began.
 ///
 /// # Errors
 ///
@@ -2509,8 +2647,10 @@ fn require_unconstrained_namespace_operation(decision: &AllowDecision) -> Result
 ///
 /// The background path combines a lease/fencing token with manifest CAS; a
 /// stale writer must not publish over a newer lease holder. The initial
-/// no-fragment check is only an observation: publication authority remains in
-/// the lease-protected domain operation.
+/// no-work check is only an observation: publication authority remains in the
+/// lease-protected domain operation. A foreign-backed branch is always admitted
+/// because explicit compaction is its requested materialization boundary even
+/// when it has no target-local WAL.
 ///
 /// # Performance
 ///
@@ -2558,7 +2698,13 @@ pub async fn compact_namespace(
         .map_err(ApiError::from)?
         .is_some()
         && before.receipt_upgrade_needed(&ns);
-    if before.uncompacted_fragments().is_empty() && !receipt_upgrade_available {
+    let materialize_foreign = before
+        .has_foreign_visible_artifacts()
+        .map_err(ApiError::from)?;
+    if before.uncompacted_fragments().is_empty()
+        && !receipt_upgrade_available
+        && !materialize_foreign
+    {
         return Ok((
             StatusCode::OK,
             Json(CompactNamespaceResponse::from_status(
