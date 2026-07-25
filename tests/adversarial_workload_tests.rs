@@ -792,7 +792,7 @@ async fn wall_clock_jump_does_not_expire_compaction_upload_window() {
     use zeppelin::time::{Clock, TimeSource};
 
     let harness = common::harness::TestHarness::new().await;
-    let namespace = harness.key("clock-upload-window");
+    let namespace = harness.artifact_origin_namespace("clock-upload-window");
     let test_clock = Arc::new(adversarial::faults::clock::TestClock::default());
     let source: Arc<dyn TimeSource> = test_clock.clone();
     let clock = Clock::from_source(source);

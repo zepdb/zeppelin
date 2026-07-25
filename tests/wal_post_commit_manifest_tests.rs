@@ -10,7 +10,7 @@ use zeppelin::wal::{Manifest, WalFragment, WalReader, WalWriter};
 #[tokio::test]
 async fn lost_manifest_cas_acknowledgement_keeps_reachable_fragment() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("wal-post-commit-manifest");
+    let namespace = harness.artifact_origin_namespace("wal-post-commit-manifest");
     Manifest::new()
         .write(&harness.store, &namespace)
         .await
@@ -84,7 +84,7 @@ async fn lost_manifest_cas_acknowledgement_keeps_reachable_fragment() {
 #[tokio::test]
 async fn terminal_manifest_write_error_clears_group_commit_memo() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("wal-terminal-manifest-error");
+    let namespace = harness.artifact_origin_namespace("wal-terminal-manifest-error");
     Manifest::new()
         .write(&harness.store, &namespace)
         .await
@@ -168,7 +168,7 @@ async fn terminal_manifest_write_error_clears_group_commit_memo() {
 #[tokio::test]
 async fn failed_live_manifest_put_does_not_wedge_a_divergent_wal_retry() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("wal-divergent-history-retry");
+    let namespace = harness.artifact_origin_namespace("wal-divergent-history-retry");
     Manifest::new()
         .write(&harness.store, &namespace)
         .await

@@ -137,7 +137,7 @@ impl ObjectStore for StaleManifestOnceStore {
 #[tokio::test]
 async fn active_bounded_read_rejects_missing_manifest() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("required-missing");
+    let namespace = harness.artifact_origin_namespace("required-missing");
     let cache = ManifestCache::new(Duration::ZERO);
 
     let error = cache
@@ -152,7 +152,7 @@ async fn active_bounded_read_rejects_missing_manifest() {
 #[tokio::test]
 async fn active_required_reads_accept_published_legacy_generation_zero_manifest() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("published-legacy-generation-zero");
+    let namespace = harness.artifact_origin_namespace("published-legacy-generation-zero");
     let legacy = serde_json::to_vec(&json!({
         "fragments": [],
         "segments": [],
@@ -189,7 +189,7 @@ async fn active_required_reads_accept_published_legacy_generation_zero_manifest(
 #[tokio::test]
 async fn active_strong_read_rejects_missing_manifest() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("strong-required-missing");
+    let namespace = harness.artifact_origin_namespace("strong-required-missing");
     let cache = ManifestCache::new(Duration::from_secs(60));
 
     let error = cache
@@ -204,7 +204,7 @@ async fn active_strong_read_rejects_missing_manifest() {
 #[tokio::test]
 async fn lifecycle_bounded_read_accepts_missing_manifest() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("bounded-lifecycle-missing");
+    let namespace = harness.artifact_origin_namespace("bounded-lifecycle-missing");
     let cache = ManifestCache::new(Duration::from_secs(60));
 
     let manifest = cache
@@ -221,7 +221,7 @@ async fn lifecycle_bounded_read_accepts_missing_manifest() {
 #[tokio::test]
 async fn lifecycle_strong_read_accepts_missing_manifest() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("strong-lifecycle-missing");
+    let namespace = harness.artifact_origin_namespace("strong-lifecycle-missing");
     let cache = ManifestCache::new(Duration::from_secs(60));
 
     let manifest = cache
@@ -238,7 +238,7 @@ async fn lifecycle_strong_read_accepts_missing_manifest() {
 #[tokio::test]
 async fn lifecycle_reads_accept_generation_zero_manifest() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("lifecycle-generation-zero");
+    let namespace = harness.artifact_origin_namespace("lifecycle-generation-zero");
     harness
         .store
         .put(
@@ -266,7 +266,7 @@ async fn lifecycle_reads_accept_generation_zero_manifest() {
 #[tokio::test]
 async fn lifecycle_strong_read_accepts_deleted_manifest_after_warm_cache() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("deleting-warm-cache");
+    let namespace = harness.artifact_origin_namespace("deleting-warm-cache");
     let mut manifest = Manifest::new();
     manifest.write(&harness.store, &namespace).await.unwrap();
     let cache = ManifestCache::new(Duration::from_secs(60));

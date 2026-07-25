@@ -40,7 +40,7 @@ use zeppelin::wal::{Manifest, WalFragment, WalReader, WalWriter};
 #[tokio::test]
 async fn test_lease_acquire_and_release() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("lease-roundtrip");
+    let ns = harness.artifact_origin_namespace("lease-roundtrip");
 
     // Initialize namespace manifest
     let mut manifest = Manifest::new();
@@ -76,7 +76,7 @@ async fn test_lease_acquire_and_release() {
 #[tokio::test]
 async fn test_lease_double_acquire_rejected() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("lease-double");
+    let ns = harness.artifact_origin_namespace("lease-double");
 
     let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
@@ -114,7 +114,7 @@ async fn test_lease_double_acquire_rejected() {
 #[tokio::test]
 async fn test_lease_expired_takeover() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("lease-expiry");
+    let ns = harness.artifact_origin_namespace("lease-expiry");
 
     let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
@@ -152,7 +152,7 @@ async fn test_lease_expired_takeover() {
 #[tokio::test]
 async fn test_lease_renew_after_lease_object_deleted_returns_expired() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("lease-renew-deleted");
+    let ns = harness.artifact_origin_namespace("lease-renew-deleted");
 
     Manifest::new().write(&harness.store, &ns).await.unwrap();
 
@@ -183,7 +183,7 @@ async fn test_lease_renew_after_lease_object_deleted_returns_expired() {
 #[tokio::test]
 async fn test_fencing_rejects_zombie_writer() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("lease-zombie");
+    let ns = harness.artifact_origin_namespace("lease-zombie");
 
     // Set up initial manifest with fencing_token = 0
     let mut manifest = Manifest::new();
@@ -247,7 +247,7 @@ async fn test_fencing_rejects_zombie_writer() {
 #[tokio::test]
 async fn test_compactor_lease_prevents_double_compaction() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("lease-compactor");
+    let ns = harness.artifact_origin_namespace("lease-compactor");
 
     let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
@@ -283,7 +283,7 @@ async fn test_compactor_lease_prevents_double_compaction() {
 #[tokio::test]
 async fn test_sequential_writers_with_leases() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("lease-sequential");
+    let ns = harness.artifact_origin_namespace("lease-sequential");
 
     let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
@@ -334,7 +334,7 @@ async fn test_sequential_writers_with_leases() {
 #[tokio::test]
 async fn test_fragment_orphan_on_lease_expiry() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("lease-orphan");
+    let ns = harness.artifact_origin_namespace("lease-orphan");
 
     let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
@@ -419,7 +419,7 @@ fn slow_compactor(store: &zeppelin::storage::ZeppelinStore, pre_cas_delay: Durat
 #[tokio::test]
 async fn test_lease_renewed_during_long_compaction() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("lease-renew-long-compaction");
+    let ns = harness.artifact_origin_namespace("lease-renew-long-compaction");
     let store = harness.store.clone();
 
     common::write_active_namespace_metadata(
@@ -534,7 +534,7 @@ async fn test_lease_renewed_during_long_compaction() {
 #[tokio::test]
 async fn test_stolen_lease_aborts_compaction_before_cas() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("lease-stolen-abort");
+    let ns = harness.artifact_origin_namespace("lease-stolen-abort");
     let store = harness.store.clone();
 
     common::write_active_namespace_metadata(
@@ -634,7 +634,7 @@ async fn test_stolen_lease_aborts_compaction_before_cas() {
 #[tokio::test]
 async fn stolen_lease_aborts_legacy_receipt_hydration_before_cas() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("legacy-receipt-lease-stolen");
+    let ns = harness.artifact_origin_namespace("legacy-receipt-lease-stolen");
     let store = harness.store.clone();
     let mut security_config = Config::default();
     let (security, _adapter, _bearer) = test_security_runtime(
@@ -822,7 +822,7 @@ async fn stolen_lease_aborts_legacy_receipt_hydration_before_cas() {
 #[tokio::test]
 async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("tla-toctou-fencing");
+    let ns = harness.artifact_origin_namespace("tla-toctou-fencing");
     let store = &harness.store;
 
     // State 1: Init — manifest with fragments {1, 2}, fencing_token=0
@@ -1011,7 +1011,7 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
 #[tokio::test]
 async fn test_tla_graceful_release_after_lease_expiry() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("tla-graceful-release");
+    let ns = harness.artifact_origin_namespace("tla-graceful-release");
     let store = &harness.store;
 
     let mut manifest = Manifest::new();

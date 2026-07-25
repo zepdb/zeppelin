@@ -12812,7 +12812,7 @@ mod outcome_tests {
     async fn dual_writer_fencing_mutation_isolated_from_prior_same_generation_observation() {
         let harness = TestHarness::new().await;
         let store = harness.store.clone();
-        let namespace = harness.key("fenced");
+        let namespace = harness.artifact_origin_namespace("fenced");
         Manifest::new().write(&store, &namespace).await.unwrap();
         let key = Manifest::s3_key(&namespace);
         let original = store.get(&key).await.unwrap();
@@ -12889,7 +12889,7 @@ mod outcome_tests {
     async fn dual_writer_lease_activation_fires_and_releases_pinned_hold() {
         let harness = TestHarness::new().await;
         let bookkeeping_store = harness.store.clone();
-        let namespace = harness.key("fenced");
+        let namespace = harness.artifact_origin_namespace("fenced");
         let scheduler =
             FaultScheduler::from_schedule(FaultSchedule::dual_writer_fencing_selftest());
         let instrumented_store = store_fault_proxy(&bookkeeping_store, scheduler.clone());

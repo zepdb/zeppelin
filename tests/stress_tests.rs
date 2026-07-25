@@ -61,7 +61,7 @@ fn squared_l2_to_origin(values: &[f32]) -> f32 {
 #[tokio::test]
 async fn test_stress_large_uncompacted_wal_backlog_exact_topk() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("large-uncompacted-wal-backlog");
+    let namespace = harness.artifact_origin_namespace("large-uncompacted-wal-backlog");
     Manifest::new()
         .write(&harness.store, &namespace)
         .await

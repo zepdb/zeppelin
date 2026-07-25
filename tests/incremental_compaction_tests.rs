@@ -1032,7 +1032,7 @@ fn cluster_object_for(segment: &SegmentRef, cluster_idx: usize) -> Option<&Clust
 #[tokio::test]
 async fn test_incremental_rewrites_only_touched_cluster() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("incr-touched");
+    let ns = harness.artifact_origin_namespace("incr-touched");
     let store = &harness.store;
 
     let (seed_id, seed_vecs) = seed_segment(store, &ns).await;
@@ -1109,7 +1109,7 @@ async fn test_incremental_rewrites_only_touched_cluster() {
 #[tokio::test]
 async fn test_full_compaction_writes_segment_membership_artifact() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("full-membership");
+    let ns = harness.artifact_origin_namespace("full-membership");
     let store = &harness.store;
 
     Manifest::new().write(store, &ns).await.unwrap();
@@ -1157,7 +1157,7 @@ async fn test_full_compaction_writes_segment_membership_artifact() {
 #[tokio::test]
 async fn test_incremental_compaction_writes_segment_global_membership_artifact() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("incr-membership");
+    let ns = harness.artifact_origin_namespace("incr-membership");
     let store = &harness.store;
 
     let (_seed_id, seed_vecs) = seed_segment(store, &ns).await;
@@ -1209,7 +1209,7 @@ async fn test_incremental_compaction_writes_segment_global_membership_artifact()
 #[tokio::test]
 async fn test_incremental_stitched_v4_sketch_preserves_full_carried_rows() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("incr-sketch-v4-full-rows");
+    let ns = harness.artifact_origin_namespace("incr-sketch-v4-full-rows");
     let store = &harness.store;
 
     let (old_seg, seed_vecs) = seed_modern_segment(store, &ns).await;
@@ -1385,7 +1385,7 @@ async fn test_incremental_stitched_v4_sketch_preserves_full_carried_rows() {
 #[tokio::test]
 async fn test_incremental_compaction_rebuilds_v3_sketch_as_v4() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("incr-sketch-v3-to-v4");
+    let ns = harness.artifact_origin_namespace("incr-sketch-v3-to-v4");
     let store = &harness.store;
 
     let (_old_seg, seed_vecs) = seed_modern_segment(store, &ns).await;
@@ -1446,7 +1446,7 @@ async fn test_incremental_compaction_rebuilds_v3_sketch_as_v4() {
 #[tokio::test]
 async fn test_corrupt_v4_width_does_not_scan_or_publish_replacement_segment() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("corrupt-v4-width-fails-loud");
+    let ns = harness.artifact_origin_namespace("corrupt-v4-width-fails-loud");
     let store = &harness.store;
 
     let (_seed_segment, seed_vecs) = seed_modern_segment(store, &ns).await;
@@ -1520,7 +1520,7 @@ async fn test_corrupt_v4_width_does_not_scan_or_publish_replacement_segment() {
 #[tokio::test]
 async fn test_v4_manifest_seed_mismatch_fails_query_instead_of_scanning() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("v4-seed-ref-mismatch-fails-query");
+    let ns = harness.artifact_origin_namespace("v4-seed-ref-mismatch-fails-query");
     let store = &harness.store;
 
     let (_seed_segment, seed_vecs) = seed_modern_segment(store, &ns).await;
@@ -1564,7 +1564,7 @@ async fn test_v4_manifest_seed_mismatch_fails_query_instead_of_scanning() {
 #[tokio::test]
 async fn test_incremental_compaction_fails_when_referenced_sketch_is_missing() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("incr-sketch-missing-fails-loud");
+    let ns = harness.artifact_origin_namespace("incr-sketch-missing-fails-loud");
     let store = &harness.store;
 
     let (old_segment_id, seed_vecs) = seed_modern_segment(store, &ns).await;
@@ -1623,7 +1623,7 @@ async fn test_incremental_compaction_fails_when_referenced_sketch_is_missing() {
 #[tokio::test]
 async fn test_incremental_stitched_sketch_multicycle_carries_sections_stably() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("incr-sketch-multicycle");
+    let ns = harness.artifact_origin_namespace("incr-sketch-multicycle");
     let store = &harness.store;
 
     let (_seed_seg, seed_vecs) = seed_modern_segment(store, &ns).await;
@@ -1749,7 +1749,7 @@ async fn test_incremental_stitched_sketch_multicycle_carries_sections_stably() {
 async fn test_incremental_multicycle_bounded_reads_and_carried_object_fences() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("incr-bounded-multicycle-fences");
+    let ns = harness.artifact_origin_namespace("incr-bounded-multicycle-fences");
 
     let (_seed_segment, seed_vecs) = seed_modern_grouped_segment(&store, &ns, N_CLUSTERS, 20).await;
     let writer = WalWriter::new(store.clone());
@@ -1888,7 +1888,7 @@ async fn test_incremental_multicycle_bounded_reads_and_carried_object_fences() {
 async fn test_incremental_read_io_baseline_reads_all_clusters() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("incr-read-baseline");
+    let ns = harness.artifact_origin_namespace("incr-read-baseline");
 
     let (old_segment, seed_vecs) =
         seed_modern_flat_segment(&store, &ns, BASELINE_CLUSTERS, BASELINE_VECTORS_PER_CLUSTER)
@@ -1983,7 +1983,7 @@ async fn test_incremental_read_io_baseline_reads_all_clusters() {
 async fn test_incremental_grouped_read_io_baseline_reads_all_cluster_objects() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("incr-grouped-read-baseline");
+    let ns = harness.artifact_origin_namespace("incr-grouped-read-baseline");
 
     let (old_segment, seed_vecs) =
         seed_modern_grouped_segment(&store, &ns, BASELINE_CLUSTERS, BASELINE_VECTORS_PER_CLUSTER)
@@ -2070,7 +2070,7 @@ async fn test_incremental_grouped_read_io_baseline_reads_all_cluster_objects() {
 async fn test_incremental_membership_delete_reads_only_touched_object() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("incr-membership-delete-bounded");
+    let ns = harness.artifact_origin_namespace("incr-membership-delete-bounded");
 
     let (old_segment, seed_vecs) = seed_modern_grouped_segment(&store, &ns, N_CLUSTERS, 20).await;
     let (_membership, membership_map) =
@@ -2154,7 +2154,7 @@ async fn test_incremental_membership_delete_reads_only_touched_object() {
 async fn test_incremental_nonexistent_tombstone_reads_no_cluster_objects() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("incr-nonexistent-tombstone-bounded");
+    let ns = harness.artifact_origin_namespace("incr-nonexistent-tombstone-bounded");
 
     seed_modern_grouped_segment(&store, &ns, N_CLUSTERS, 20).await;
     WalWriter::new(store.clone())
@@ -2197,7 +2197,7 @@ async fn test_incremental_nonexistent_tombstone_reads_no_cluster_objects() {
 async fn test_incremental_membership_absent_self_heals_then_bounds_reads() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("incr-membership-self-heal");
+    let ns = harness.artifact_origin_namespace("incr-membership-self-heal");
 
     let (_seed_id, seed_vecs, _cluster_bytes, _attrs_bytes) =
         seed_legacy_flat_segment(&store, &ns, BASELINE_CLUSTERS, BASELINE_VECTORS_PER_CLUSTER)
@@ -2299,7 +2299,7 @@ async fn test_incremental_membership_absent_self_heals_then_bounds_reads() {
 #[tokio::test]
 async fn test_incremental_delete_forces_cluster_rewrite() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("incr-delete");
+    let ns = harness.artifact_origin_namespace("incr-delete");
     let store = &harness.store;
 
     let (seed_id, seed_vecs) = seed_segment(store, &ns).await;
@@ -2395,7 +2395,7 @@ async fn test_incremental_delete_forces_cluster_rewrite() {
 #[tokio::test]
 async fn test_incremental_carried_objects_not_deleted() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("incr-carry-nodelete");
+    let ns = harness.artifact_origin_namespace("incr-carry-nodelete");
     let store = &harness.store;
 
     let (seed_id, seed_vecs) = seed_segment(store, &ns).await;
@@ -2448,8 +2448,8 @@ async fn test_incremental_matches_full_rewrite_results() {
 
     // Two namespaces holding identical data; one compacted incrementally, one
     // via full retrain.
-    let ns_incr = harness.key("incr-golden-incr");
-    let ns_full = harness.key("incr-golden-full");
+    let ns_incr = harness.artifact_origin_namespace("incr-golden-incr");
+    let ns_full = harness.artifact_origin_namespace("incr-golden-full");
 
     let indexing_config = IndexingConfig {
         default_num_centroids: N_CLUSTERS,
@@ -2567,7 +2567,7 @@ async fn test_incremental_sq8_carryover_decodes_correctly() {
     use zeppelin::index::quantization::QuantizationType;
 
     let harness = TestHarness::new().await;
-    let ns = harness.key("incr-sq8-carry");
+    let ns = harness.artifact_origin_namespace("incr-sq8-carry");
     let store = &harness.store;
 
     let (seed_id, seed_vecs) = seed_legacy_sq8_segment(store, &ns).await;
@@ -2666,7 +2666,7 @@ async fn test_incremental_sq8_carryover_decodes_correctly() {
 #[tokio::test]
 async fn test_incremental_multigen_and_update_moves_cluster() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("incr-multigen");
+    let ns = harness.artifact_origin_namespace("incr-multigen");
     let store = &harness.store;
 
     let (_seed_id, seed_vecs) = seed_segment(store, &ns).await;

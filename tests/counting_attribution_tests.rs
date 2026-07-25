@@ -85,7 +85,7 @@ fn test_compactor(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
 async fn test_query_class_breakdown_is_sane() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("class-attribution");
+    let ns = harness.artifact_origin_namespace("class-attribution");
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 

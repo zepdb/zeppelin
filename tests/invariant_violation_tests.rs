@@ -68,7 +68,7 @@ fn make_vectors(prefix: &str, count: usize, dims: usize) -> Vec<VectorEntry> {
 #[tokio::test]
 async fn test_compaction_safety_cas_prevents_stale_overwrite() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("inv-compact-safety");
+    let ns = harness.artifact_origin_namespace("inv-compact-safety");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -126,7 +126,7 @@ async fn test_compaction_safety_cas_prevents_stale_overwrite() {
 #[tokio::test]
 async fn test_query_read_consistency_deferred_deletion() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("inv-query-404");
+    let ns = harness.artifact_origin_namespace("inv-query-404");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -239,7 +239,7 @@ async fn test_namespace_deletion_leaves_zero_keys() {
 #[tokio::test]
 async fn test_sequence_numbers_override_ulid_ordering() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("inv-ulid-order");
+    let ns = harness.artifact_origin_namespace("inv-ulid-order");
     let store = &harness.store;
 
     // 1. Construct two fragments with controlled ULIDs for the same vector ID.

@@ -31,7 +31,7 @@ async fn history_versions(store: &zeppelin::storage::ZeppelinStore, ns: &str) ->
 #[tokio::test]
 async fn conditional_history_failure_does_not_advance_live_manifest_and_retry_is_clean() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("manifest-history-conditional");
+    let ns = harness.artifact_origin_namespace("manifest-history-conditional");
 
     Manifest::new().write(&harness.store, &ns).await.unwrap();
     let (mut manifest, version) = Manifest::read_versioned(&harness.store, &ns)
@@ -80,7 +80,7 @@ async fn conditional_history_failure_does_not_advance_live_manifest_and_retry_is
 #[tokio::test]
 async fn write_history_failure_does_not_advance_live_manifest_and_retry_is_clean() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("manifest-history-write");
+    let ns = harness.artifact_origin_namespace("manifest-history-write");
 
     Manifest::new().write(&harness.store, &ns).await.unwrap();
     let mut manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
@@ -120,7 +120,7 @@ async fn write_history_failure_does_not_advance_live_manifest_and_retry_is_clean
 #[tokio::test]
 async fn failed_live_put_does_not_reserve_the_candidate_history_generation() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("manifest-history-pointer-failure");
+    let ns = harness.artifact_origin_namespace("manifest-history-pointer-failure");
 
     Manifest::new().write(&harness.store, &ns).await.unwrap();
     let (mut manifest, version) = Manifest::read_versioned(&harness.store, &ns)
@@ -189,7 +189,7 @@ async fn failed_live_put_does_not_reserve_the_candidate_history_generation() {
 #[tokio::test]
 async fn competing_candidates_share_predecessor_history_and_one_wins_live_cas() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("manifest-history-orphan-toctou");
+    let ns = harness.artifact_origin_namespace("manifest-history-orphan-toctou");
     Manifest::new().write(&harness.store, &ns).await.unwrap();
 
     let (mut winner, winner_version) = Manifest::read_versioned(&harness.store, &ns)
@@ -268,7 +268,7 @@ async fn competing_candidates_share_predecessor_history_and_one_wins_live_cas() 
 #[tokio::test]
 async fn conditional_manifest_publication_has_no_success_readback() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("manifest-no-success-readback");
+    let ns = harness.artifact_origin_namespace("manifest-no-success-readback");
     Manifest::new().write(&harness.store, &ns).await.unwrap();
     let (mut manifest, version) = Manifest::read_versioned(&harness.store, &ns)
         .await

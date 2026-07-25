@@ -94,7 +94,7 @@ async fn strong_query_with_filter(
 async fn warm_strong_query_serves_uncompacted_wal_fragments_from_cache() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let namespace = harness.key("wal-fragment-cache");
+    let namespace = harness.artifact_origin_namespace("wal-fragment-cache");
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
     let cache_dir = TempDir::new().unwrap();
@@ -181,7 +181,7 @@ async fn warm_strong_query_serves_uncompacted_wal_fragments_from_cache() {
 #[tokio::test]
 async fn decoded_fragment_cache_preserves_overwrite_delete_filter_and_attributes() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("wal-decoded-result-invariance");
+    let namespace = harness.artifact_origin_namespace("wal-decoded-result-invariance");
     let writer = WalWriter::new(harness.store.clone());
     let wal_reader = WalReader::new(harness.store.clone());
     let cache_dir = TempDir::new().unwrap();
@@ -274,7 +274,7 @@ async fn decoded_fragment_cache_preserves_overwrite_delete_filter_and_attributes
 async fn zero_capacity_redecodes_from_cached_bytes_without_changing_results() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let namespace = harness.key("wal-decoded-zero-capacity");
+    let namespace = harness.artifact_origin_namespace("wal-decoded-zero-capacity");
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
     let cache_dir = TempDir::new().unwrap();
@@ -307,7 +307,7 @@ async fn zero_capacity_redecodes_from_cached_bytes_without_changing_results() {
 #[tokio::test]
 async fn post_compaction_query_evicts_retired_decoded_fragments() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("wal-decoded-compaction-eviction");
+    let namespace = harness.artifact_origin_namespace("wal-decoded-compaction-eviction");
     Manifest::new()
         .write(&harness.store, &namespace)
         .await
@@ -379,7 +379,7 @@ async fn post_compaction_query_evicts_retired_decoded_fragments() {
 #[tokio::test]
 async fn parallel_strong_queries_remain_correct_during_append() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("wal-decoded-concurrent-append");
+    let namespace = harness.artifact_origin_namespace("wal-decoded-concurrent-append");
     Manifest::new()
         .write(&harness.store, &namespace)
         .await

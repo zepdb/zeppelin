@@ -644,7 +644,7 @@ async fn test_concurrent_cold_index_searches_share_one_cluster_get() {
 
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("cache-singleflight-index");
+    let ns = harness.artifact_origin_namespace("cache-singleflight-index");
     let vectors = single_cluster_vectors("sf", 512);
     let index = Arc::new(
         IvfFlatIndex::build(&vectors, &single_cluster_config(), &store, &ns, "seg_sf")

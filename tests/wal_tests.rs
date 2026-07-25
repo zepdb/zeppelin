@@ -120,7 +120,7 @@ async fn test_fragment_serialize_deserialize_roundtrip() {
 #[tokio::test]
 async fn guarded_append_rejects_a_legacy_unbound_manifest() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("legacy-unbound-append-guard");
+    let namespace = harness.artifact_origin_namespace("legacy-unbound-append-guard");
     let mut manifest = Manifest::new();
     manifest.write(&harness.store, &namespace).await.unwrap();
     let (manifest, version) = Manifest::read_versioned(&harness.store, &namespace)
@@ -161,7 +161,7 @@ async fn test_fragment_checksum_corruption() {
 #[tokio::test]
 async fn test_wal_writer_append_single_fragment() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("wal-single");
+    let ns = harness.artifact_origin_namespace("wal-single");
 
     // Initialize namespace manifest so writer can read it
     let mut manifest = Manifest::new();
@@ -188,7 +188,7 @@ async fn test_wal_writer_append_single_fragment() {
 #[tokio::test]
 async fn test_wal_writer_append_multiple_fragments() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("wal-multi");
+    let ns = harness.artifact_origin_namespace("wal-multi");
 
     let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
@@ -222,7 +222,7 @@ async fn test_wal_writer_append_multiple_fragments() {
 #[tokio::test]
 async fn test_wal_reader_read_uncompacted_fragments() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("wal-read");
+    let ns = harness.artifact_origin_namespace("wal-read");
 
     let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
@@ -253,7 +253,7 @@ async fn test_wal_reader_read_uncompacted_fragments() {
 #[tokio::test]
 async fn test_wal_reader_empty_namespace() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("wal-empty");
+    let ns = harness.artifact_origin_namespace("wal-empty");
 
     // No manifest at all → should return empty
     let reader = WalReader::new(harness.store.clone());
@@ -266,7 +266,7 @@ async fn test_wal_reader_empty_namespace() {
 #[tokio::test]
 async fn test_wal_fragment_key_listing() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("wal-list");
+    let ns = harness.artifact_origin_namespace("wal-list");
 
     let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
@@ -294,7 +294,7 @@ async fn test_wal_fragment_key_listing() {
 #[tokio::test]
 async fn test_wal_writer_concurrent_appends() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("wal-concurrent");
+    let ns = harness.artifact_origin_namespace("wal-concurrent");
 
     let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
@@ -337,7 +337,7 @@ async fn test_wal_writer_concurrent_appends() {
 #[tokio::test]
 async fn test_wal_writer_sequential_consistency() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("wal-sequential");
+    let ns = harness.artifact_origin_namespace("wal-sequential");
 
     let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
@@ -374,7 +374,7 @@ async fn test_wal_writer_sequential_consistency() {
 #[tokio::test]
 async fn scoped_delete_append_rejects_a_changed_authority_manifest() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("wal-scoped-delete-authority");
+    let ns = harness.artifact_origin_namespace("wal-scoped-delete-authority");
 
     let mut manifest = Manifest::new();
     manifest
@@ -425,7 +425,7 @@ async fn scoped_delete_append_rejects_a_changed_authority_manifest() {
 #[tokio::test]
 async fn scoped_delete_append_ignores_an_older_process_memo() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("wal-scoped-delete-stale-memo");
+    let ns = harness.artifact_origin_namespace("wal-scoped-delete-stale-memo");
 
     let mut manifest = Manifest::new();
     manifest
@@ -471,7 +471,7 @@ async fn scoped_delete_append_ignores_an_older_process_memo() {
 #[tokio::test]
 async fn scoped_delete_append_rejects_recreated_namespace_incarnation() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("wal-scoped-delete-incarnation");
+    let ns = harness.artifact_origin_namespace("wal-scoped-delete-incarnation");
 
     let fixed_time = chrono::Utc::now();
     let mut old_manifest = Manifest::new_at(fixed_time);
@@ -528,7 +528,7 @@ async fn scoped_delete_append_rejects_recreated_namespace_incarnation() {
 #[tokio::test]
 async fn legacy_manifest_incarnation_migration_is_cas_bound_and_idempotent() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("wal-legacy-incarnation-migration");
+    let ns = harness.artifact_origin_namespace("wal-legacy-incarnation-migration");
     let mut legacy = Manifest::new();
     legacy.write(&harness.store, &ns).await.unwrap();
     let legacy_generation = legacy.version();
@@ -567,7 +567,7 @@ async fn bound_manifest_read_rejects_missing_or_empty_get_etags_before_any_put()
     let incarnation = uuid::Uuid::from_u128(0xcafe);
 
     for (case, replacement) in [("missing", None), ("empty", Some(String::new()))] {
-        let ns = harness.key(&format!("wal-bound-{case}-get-etag"));
+        let ns = harness.artifact_origin_namespace(&format!("wal-bound-{case}-get-etag"));
         let mut manifest = Manifest::new();
         manifest.bind_namespace_incarnation(incarnation).unwrap();
         manifest.write(&harness.store, &ns).await.unwrap();
@@ -611,7 +611,7 @@ async fn legacy_manifest_migration_rejects_missing_or_empty_get_etags_before_any
     let incarnation = uuid::Uuid::from_u128(0xfeed);
 
     for (case, replacement) in [("missing", None), ("empty", Some(String::new()))] {
-        let ns = harness.key(&format!("wal-legacy-{case}-get-etag"));
+        let ns = harness.artifact_origin_namespace(&format!("wal-legacy-{case}-get-etag"));
         let mut manifest = Manifest::new();
         manifest.write(&harness.store, &ns).await.unwrap();
         let expected_generation = manifest.version();
@@ -649,7 +649,7 @@ async fn legacy_manifest_migration_rejects_missing_or_empty_get_etags_before_any
 #[tokio::test]
 async fn guarded_appends_from_one_snapshot_never_coalesce() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("wal-guarded-no-coalesce");
+    let ns = harness.artifact_origin_namespace("wal-guarded-no-coalesce");
     let mut manifest = Manifest::new();
     manifest
         .bind_namespace_incarnation(uuid::Uuid::from_u128(1))

@@ -105,7 +105,7 @@ fn bench_vectors() -> Vec<VectorEntry> {
 async fn compacted_fixture(label: &str) -> BenchFixture {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let namespace = harness.key(label);
+    let namespace = harness.artifact_origin_namespace(label);
     let writer = WalWriter::new(store.clone());
 
     common::write_active_namespace_metadata(&store, &namespace, DIM, DistanceMetric::Euclidean)
@@ -148,7 +148,7 @@ async fn compacted_fixture(label: &str) -> BenchFixture {
 async fn manual_sq_fixture(label: &str, layout: SqFixtureLayout) -> BenchFixture {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let namespace = harness.key(label);
+    let namespace = harness.artifact_origin_namespace(label);
     let segment_id = "seg_manual_sq";
     let vectors = bench_vectors();
     let query = vectors[0].values.clone();

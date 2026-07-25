@@ -168,7 +168,7 @@ async fn supported_backend_honors_exact_atomic_strong_object_semantics() {
 #[tokio::test]
 async fn supported_backend_keeps_user_metadata_atomic_with_body_and_cas() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("provider-conformance-user-metadata");
+    let namespace = harness.artifact_origin_namespace("provider-conformance-user-metadata");
     let key = format!("{namespace}/object.bin");
     let first_body = Bytes::from_static(b"first-body");
     let second_body = Bytes::from_static(b"second-body");

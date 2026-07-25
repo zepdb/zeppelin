@@ -92,7 +92,7 @@ async fn hydration_fixture_with(
 ) -> HydrationFixture {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let namespace = harness.key(name);
+    let namespace = harness.artifact_origin_namespace(name);
     let dimensions = vectors
         .first()
         .expect("hydration fixture requires at least one vector")

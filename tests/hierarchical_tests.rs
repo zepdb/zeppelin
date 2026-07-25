@@ -41,7 +41,7 @@ async fn seed_active_namespace(store: &ZeppelinStore, namespace: &str) {
 #[tokio::test]
 async fn test_build_hierarchical_basic() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("h-build-basic");
+    let ns = harness.artifact_origin_namespace("h-build-basic");
 
     let (vectors, _centroids) = clustered_vectors(4, 25, 32, 0.1);
     let config = hierarchical_test_config();
@@ -84,7 +84,7 @@ async fn test_build_hierarchical_basic() {
 #[tokio::test]
 async fn test_build_hierarchical_single_leaf() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("h-build-single-leaf");
+    let ns = harness.artifact_origin_namespace("h-build-single-leaf");
 
     // 8 vectors with large leaf_size → all fit in one leaf.
     let (vectors, _) = clustered_vectors(2, 4, 16, 0.1);
@@ -125,7 +125,7 @@ async fn test_build_hierarchical_single_leaf() {
 #[tokio::test]
 async fn test_build_hierarchical_errors() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("h-build-errors");
+    let ns = harness.artifact_origin_namespace("h-build-errors");
     let config = hierarchical_test_config();
 
     // Empty vectors → error.
@@ -188,7 +188,7 @@ async fn test_build_hierarchical_errors() {
 #[tokio::test]
 async fn test_search_hierarchical_recall() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("h-search-recall");
+    let ns = harness.artifact_origin_namespace("h-search-recall");
 
     let (vectors, centroids) = clustered_vectors(4, 50, 32, 0.05);
     let config = hierarchical_test_config();
@@ -237,7 +237,7 @@ async fn test_search_hierarchical_recall() {
 #[tokio::test]
 async fn test_search_hierarchical_with_filter() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("h-search-filter");
+    let ns = harness.artifact_origin_namespace("h-search-filter");
 
     let (vectors, _) = clustered_vectors(4, 50, 32, 0.1);
     let vectors = with_attributes(vectors, simple_attributes);
@@ -292,7 +292,7 @@ async fn test_search_hierarchical_with_filter() {
 #[tokio::test]
 async fn test_search_hierarchical_sq8() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("h-search-sq8");
+    let ns = harness.artifact_origin_namespace("h-search-sq8");
 
     let (vectors, centroids) = clustered_vectors(4, 50, 32, 0.05);
     let config = IndexingConfig {
@@ -352,7 +352,7 @@ async fn test_search_hierarchical_sq8() {
 #[tokio::test]
 async fn test_search_hierarchical_pq() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("h-search-pq");
+    let ns = harness.artifact_origin_namespace("h-search-pq");
 
     // PQ requires dim divisible by pq_m. Use dim=16, pq_m=4.
     let (vectors, centroids) = clustered_vectors(4, 50, 16, 0.05);
@@ -413,7 +413,7 @@ async fn test_search_hierarchical_pq() {
 #[tokio::test]
 async fn test_compact_hierarchical() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("h-compact");
+    let ns = harness.artifact_origin_namespace("h-compact");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -487,7 +487,7 @@ async fn test_compact_hierarchical() {
 #[tokio::test]
 async fn test_query_hierarchical_detection() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("h-query-detect");
+    let ns = harness.artifact_origin_namespace("h-query-detect");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -561,7 +561,7 @@ async fn test_query_hierarchical_detection() {
 async fn test_repeat_query_zero_tree_meta_gets() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("h-tree-meta-zero-gets");
+    let ns = harness.artifact_origin_namespace("h-tree-meta-zero-gets");
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
@@ -643,7 +643,7 @@ async fn test_repeat_query_zero_tree_meta_gets() {
 #[tokio::test]
 async fn test_load_hierarchical_index() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("h-load");
+    let ns = harness.artifact_origin_namespace("h-load");
 
     let (vectors, centroids) = clustered_vectors(4, 25, 32, 0.1);
     let config = hierarchical_test_config();

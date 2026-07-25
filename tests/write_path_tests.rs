@@ -132,7 +132,7 @@ async fn test_group_commit_mixed_fencing_tokens_no_deadlock() {
 #[tokio::test]
 async fn test_fencing_rejected_append_leaves_no_orphan() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("orphan-fencing");
+    let ns = harness.artifact_origin_namespace("orphan-fencing");
     let store = &harness.store;
 
     // Manifest already advanced to fencing_token = 5 (a newer lease holder).
@@ -171,7 +171,7 @@ async fn test_fencing_rejected_append_leaves_no_orphan() {
 #[tokio::test]
 async fn test_missing_manifest_append_leaves_no_orphan() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("orphan-nomanifest");
+    let ns = harness.artifact_origin_namespace("orphan-nomanifest");
     let store = &harness.store;
 
     // No manifest written for this namespace (simulates deleted namespace).
@@ -200,7 +200,7 @@ async fn test_missing_manifest_append_leaves_no_orphan() {
 #[tokio::test]
 async fn test_concurrent_writers_backoff_absorbs_conflicts() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("backoff-contention");
+    let ns = harness.artifact_origin_namespace("backoff-contention");
     let store = &harness.store;
     Manifest::new().write(store, &ns).await.unwrap();
 
@@ -255,7 +255,7 @@ async fn test_concurrent_writers_backoff_absorbs_conflicts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_group_commit_coalesces_manifest_puts() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("group-commit");
+    let ns = harness.artifact_origin_namespace("group-commit");
     let (store, counter) = counting_store(&harness.store);
     Manifest::new().write(&store, &ns).await.unwrap();
     counter.reset();
@@ -307,7 +307,7 @@ async fn test_group_commit_coalesces_manifest_puts() {
 #[tokio::test]
 async fn test_single_append_roundtrip_unchanged() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("single-append");
+    let ns = harness.artifact_origin_namespace("single-append");
     let (store, counter) = counting_store(&harness.store);
     Manifest::new().write(&store, &ns).await.unwrap();
     counter.reset();
@@ -353,7 +353,7 @@ async fn test_single_append_roundtrip_unchanged() {
 #[tokio::test]
 async fn test_sequential_group_commit_reuses_committed_manifest_etag() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("group-commit-manifest-memo");
+    let ns = harness.artifact_origin_namespace("group-commit-manifest-memo");
     let (store, counter) = counting_store(&harness.store);
     Manifest::new().write(&store, &ns).await.unwrap();
     counter.reset();
@@ -394,7 +394,7 @@ async fn test_sequential_group_commit_reuses_committed_manifest_etag() {
 #[tokio::test]
 async fn test_group_commit_manifest_memo_conflict_rebuilds_from_authority() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("group-commit-manifest-conflict");
+    let ns = harness.artifact_origin_namespace("group-commit-manifest-conflict");
     let (store, counter) = counting_store(&harness.store);
     Manifest::new().write(&store, &ns).await.unwrap();
 
@@ -470,7 +470,7 @@ async fn test_group_commit_manifest_memo_conflict_rebuilds_from_authority() {
 #[tokio::test]
 async fn test_group_commit_manifest_memo_preserves_fencing_after_takeover() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("group-commit-manifest-fencing");
+    let ns = harness.artifact_origin_namespace("group-commit-manifest-fencing");
     let (store, counter) = counting_store(&harness.store);
     Manifest::new().write(&store, &ns).await.unwrap();
 
@@ -562,7 +562,7 @@ async fn test_group_commit_manifest_memo_preserves_fencing_after_takeover() {
 #[tokio::test]
 async fn test_group_commit_manifest_memo_restart_is_cold() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("group-commit-manifest-restart");
+    let ns = harness.artifact_origin_namespace("group-commit-manifest-restart");
     let (store, counter) = counting_store(&harness.store);
     Manifest::new().write(&store, &ns).await.unwrap();
 
@@ -603,7 +603,7 @@ async fn test_group_commit_manifest_memo_restart_is_cold() {
 #[tokio::test]
 async fn test_group_commit_manifest_memo_namespace_recreate_is_cold() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("group-commit-manifest-recreate");
+    let ns = harness.artifact_origin_namespace("group-commit-manifest-recreate");
     let (store, counter) = counting_store(&harness.store);
     Manifest::new().write(&store, &ns).await.unwrap();
 

@@ -104,7 +104,8 @@ async fn test_compaction_fragment_cache_is_read_only_and_output_deterministic() 
     let mut outputs = Vec::new();
 
     for (label, warm_fragments) in [("cold", 0usize), ("partial", 2), ("warm", 4)] {
-        let namespace = harness.key(&format!("compaction-fragment-cache-{label}"));
+        let namespace =
+            harness.artifact_origin_namespace(&format!("compaction-fragment-cache-{label}"));
         Manifest::new().write(&store, &namespace).await.unwrap();
         common::write_active_namespace_metadata(&store, &namespace, 16, DistanceMetric::Euclidean)
             .await;
@@ -223,7 +224,7 @@ fn trigger_metadata(namespace: &str, dimensions: usize) -> NamespaceMetadata {
 #[tokio::test]
 async fn test_compact_single_fragment() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-single");
+    let ns = harness.artifact_origin_namespace("compact-single");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -261,7 +262,7 @@ async fn test_compact_single_fragment() {
 #[tokio::test]
 async fn test_failed_live_manifest_put_does_not_wedge_a_divergent_compaction_retry() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-divergent-history-retry");
+    let ns = harness.artifact_origin_namespace("compact-divergent-history-retry");
     Manifest::new().write(&harness.store, &ns).await.unwrap();
     common::write_active_namespace_metadata(&harness.store, &ns, 16, DistanceMetric::Euclidean)
         .await;
@@ -309,7 +310,7 @@ async fn test_failed_live_manifest_put_does_not_wedge_a_divergent_compaction_ret
 #[tokio::test]
 async fn test_compact_multiple_fragments() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-multi");
+    let ns = harness.artifact_origin_namespace("compact-multi");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -377,7 +378,7 @@ async fn test_compact_multiple_fragments() {
 #[tokio::test]
 async fn test_compact_with_deletes() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-del");
+    let ns = harness.artifact_origin_namespace("compact-del");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -410,7 +411,7 @@ async fn test_compact_with_deletes() {
 #[tokio::test]
 async fn test_compact_deduplication() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-dedup");
+    let ns = harness.artifact_origin_namespace("compact-dedup");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -488,7 +489,7 @@ async fn test_compact_deduplication() {
 #[tokio::test]
 async fn test_compact_updates_manifest() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-manifest");
+    let ns = harness.artifact_origin_namespace("compact-manifest");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -524,7 +525,7 @@ async fn test_compact_updates_manifest() {
 #[tokio::test]
 async fn test_compact_cleans_up_fragments() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-cleanup");
+    let ns = harness.artifact_origin_namespace("compact-cleanup");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -580,7 +581,7 @@ async fn test_compact_cleans_up_fragments() {
 #[tokio::test]
 async fn test_compact_preserves_new_fragments() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-preserve");
+    let ns = harness.artifact_origin_namespace("compact-preserve");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -619,7 +620,7 @@ async fn test_compact_preserves_new_fragments() {
 #[tokio::test]
 async fn test_compact_with_existing_segment() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-existing");
+    let ns = harness.artifact_origin_namespace("compact-existing");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -699,7 +700,7 @@ async fn test_compact_with_existing_segment() {
 #[tokio::test]
 async fn test_query_after_compaction() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-query");
+    let ns = harness.artifact_origin_namespace("compact-query");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
@@ -798,7 +799,7 @@ async fn test_query_after_compaction() {
 #[tokio::test]
 async fn test_delete_after_compaction_not_returned_strong() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("del-after-compact");
+    let ns = harness.artifact_origin_namespace("del-after-compact");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
@@ -903,7 +904,7 @@ async fn test_delete_after_compaction_not_returned_strong() {
 #[tokio::test]
 async fn test_compact_empty_namespace() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-empty");
+    let ns = harness.artifact_origin_namespace("compact-empty");
     let store = &harness.store;
 
     // Create manifest with no fragments
@@ -929,7 +930,7 @@ async fn test_compact_empty_namespace() {
 #[tokio::test]
 async fn test_compact_trigger_by_fragment_count() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-trigger");
+    let ns = harness.artifact_origin_namespace("compact-trigger");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -1156,7 +1157,7 @@ async fn test_leased_compaction_rejects_missing_authoritative_metadata() {
 #[tokio::test]
 async fn test_age_trigger_compacts_quiet_namespace() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("age-trigger");
+    let ns = harness.artifact_origin_namespace("age-trigger");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -1233,7 +1234,7 @@ async fn test_age_trigger_compacts_quiet_namespace() {
 #[tokio::test]
 async fn test_idle_namespace_untouched_across_intervals() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("idle-untouched");
+    let ns = harness.artifact_origin_namespace("idle-untouched");
     let store = &harness.store;
 
     let mut manifest = Manifest::new();
@@ -1288,7 +1289,7 @@ async fn test_idle_namespace_untouched_across_intervals() {
 #[tokio::test]
 async fn test_bytes_trigger_uses_recorded_sizes() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("bytes-trigger");
+    let ns = harness.artifact_origin_namespace("bytes-trigger");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -1346,7 +1347,7 @@ async fn test_bytes_trigger_uses_recorded_sizes() {
 #[tokio::test]
 async fn test_compaction_populates_cluster_object_size_bytes() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("cluster-object-size-bytes");
+    let ns = harness.artifact_origin_namespace("cluster-object-size-bytes");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -1438,7 +1439,7 @@ fn segment_index_meta_key(namespace: &str, segment: &SegmentRef) -> String {
 async fn test_repeat_query_zero_centroid_gets() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("centroid-zero-gets");
+    let ns = harness.artifact_origin_namespace("centroid-zero-gets");
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
@@ -1501,7 +1502,7 @@ async fn test_repeat_query_zero_centroid_gets() {
 async fn test_new_segment_never_serves_stale_centroids() {
     let harness = TestHarness::new().await;
     let store = harness.store.clone();
-    let ns = harness.key("centroid-seg-identity");
+    let ns = harness.artifact_origin_namespace("centroid-seg-identity");
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
@@ -1594,7 +1595,7 @@ async fn test_new_segment_never_serves_stale_centroids() {
 async fn test_pinned_centroids_survive_eviction_pressure() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("centroid-pin");
+    let ns = harness.artifact_origin_namespace("centroid-pin");
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
@@ -2603,7 +2604,7 @@ async fn test_background_compaction_discovery_is_delimited_and_prefix_scoped() {
 async fn test_query_path_stays_fail_loud_with_cache() {
     let harness = TestHarness::new().await;
     let store = harness.store.clone();
-    let ns = harness.key("centroid-fail-loud");
+    let ns = harness.artifact_origin_namespace("centroid-fail-loud");
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
@@ -2654,7 +2655,7 @@ async fn test_query_path_stays_fail_loud_with_cache() {
 #[tokio::test]
 async fn test_compaction_skips_non_finite_prefix_data() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-nonfinite");
+    let ns = harness.artifact_origin_namespace("compact-nonfinite");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
@@ -2745,7 +2746,7 @@ async fn test_compaction_skips_non_finite_prefix_data() {
 #[tokio::test]
 async fn test_compact_attributes_preserved() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("compact-attrs");
+    let ns = harness.artifact_origin_namespace("compact-attrs");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());

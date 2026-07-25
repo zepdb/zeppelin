@@ -143,7 +143,7 @@ fn test_filter_and() {
 #[tokio::test]
 async fn test_ivf_flat_build() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("idx-build");
+    let ns = harness.artifact_origin_namespace("idx-build");
 
     let (vectors, _centroids) = clustered_vectors(4, 50, 32, 0.1);
     let vectors = with_attributes(vectors, simple_attributes);
@@ -172,7 +172,7 @@ async fn test_ivf_flat_build() {
 #[tokio::test]
 async fn test_ivf_flat_search_recall() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("idx-recall");
+    let ns = harness.artifact_origin_namespace("idx-recall");
 
     let (vectors, centroids) = clustered_vectors(4, 50, 32, 0.05);
     let config = IndexingConfig {
@@ -223,7 +223,7 @@ async fn test_ivf_flat_search_recall() {
 #[tokio::test]
 async fn test_ivf_flat_load_from_s3() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("idx-load");
+    let ns = harness.artifact_origin_namespace("idx-load");
 
     let (vectors, _) = clustered_vectors(3, 30, 16, 0.1);
     let config = IndexingConfig {
@@ -252,7 +252,7 @@ async fn test_ivf_flat_load_from_s3() {
 #[tokio::test]
 async fn test_ivf_flat_search_with_filter() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("idx-filter");
+    let ns = harness.artifact_origin_namespace("idx-filter");
 
     let (vectors, _) = clustered_vectors(3, 30, 16, 0.1);
     let vectors = with_attributes(vectors, simple_attributes);
@@ -294,7 +294,7 @@ async fn test_ivf_flat_search_with_filter() {
 #[tokio::test]
 async fn test_ivf_flat_dimension_mismatch() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("idx-dim");
+    let ns = harness.artifact_origin_namespace("idx-dim");
 
     let (vectors, _) = clustered_vectors(2, 20, 16, 0.1);
     let config = IndexingConfig {

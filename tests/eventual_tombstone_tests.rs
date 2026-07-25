@@ -293,7 +293,7 @@ async fn test_eventual_bm25_query_filters_deleted_compacted_doc() {
 async fn test_eventual_query_gets_only_delete_fragments_not_vector_wal_fragments() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("eventual-delete-get-counts");
+    let ns = harness.artifact_origin_namespace("eventual-delete-get-counts");
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
@@ -416,7 +416,7 @@ async fn test_eventual_query_gets_only_delete_fragments_not_vector_wal_fragments
 async fn test_eventual_tombstone_ordering_across_fragments() {
     let harness = TestHarness::new().await;
     let (store, _counter) = counting_store(&harness.store);
-    let ns = harness.key("eventual-tombstone-ordering");
+    let ns = harness.artifact_origin_namespace("eventual-tombstone-ordering");
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
@@ -537,7 +537,7 @@ async fn test_eventual_tombstone_ordering_across_fragments() {
 async fn test_eventual_query_may_return_stale_updated_segment_vector() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("eventual-stale-update");
+    let ns = harness.artifact_origin_namespace("eventual-stale-update");
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 

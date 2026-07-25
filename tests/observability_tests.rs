@@ -532,7 +532,7 @@ async fn test_compaction_io_metrics_registered_and_incremented() {
     let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
     let client = crate::common::server::client_with_bearer(&admin_bearer);
-    let ns = harness.key("obs-compaction-io");
+    let ns = harness.artifact_origin_namespace("obs-compaction-io");
     let writer = WalWriter::new(harness.store.clone());
 
     common::write_active_namespace_metadata(

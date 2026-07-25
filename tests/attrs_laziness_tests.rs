@@ -405,7 +405,7 @@ async fn ivf_unfiltered_attrs_are_lazy_but_enrichment_is_identical() {
     ] {
         let harness = TestHarness::new().await;
         let (store, counter) = counting_store(&harness.store);
-        let ns = harness.key(&format!("ivf-lazy-{quantization:?}"));
+        let ns = harness.artifact_origin_namespace(&format!("ivf-lazy-{quantization:?}"));
         let vectors = ivf_vectors();
         let expected_attrs = attrs_by_id(&vectors);
 
@@ -449,7 +449,7 @@ async fn ivf_unfiltered_attrs_are_lazy_but_enrichment_is_identical() {
 async fn ivf_filtered_sq8_attrs_get_count_is_unchanged() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("ivf-filtered-sq8-unchanged");
+    let ns = harness.artifact_origin_namespace("ivf-filtered-sq8-unchanged");
     let vectors = ivf_vectors();
     let expected_attrs = attrs_by_id(&vectors);
     let index = IvfFlatIndex::build(
@@ -495,7 +495,7 @@ async fn ivf_filtered_sq8_attrs_get_count_is_unchanged() {
 async fn hierarchical_flat_unfiltered_attrs_are_lazy_but_enrichment_is_identical() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let ns = harness.key("hierarchical-flat-lazy");
+    let ns = harness.artifact_origin_namespace("hierarchical-flat-lazy");
     let vectors = hierarchical_vectors();
     let expected_attrs = attrs_by_id(&vectors);
     let config = IndexingConfig {

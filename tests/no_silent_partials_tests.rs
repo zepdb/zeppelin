@@ -192,7 +192,7 @@ async fn test_wal_fragment_notfound_tolerated_only_after_manifest_reread_and_met
     zeppelin::metrics::init();
 
     let harness = common::harness::TestHarness::new().await;
-    let ns = harness.key("wal-gc-race");
+    let ns = harness.artifact_origin_namespace("wal-gc-race");
     common::write_active_namespace_metadata(
         &harness.store,
         &ns,
@@ -271,7 +271,7 @@ async fn test_wal_fragment_notfound_still_referenced_is_error_not_skip() {
     zeppelin::metrics::init();
 
     let harness = common::harness::TestHarness::new().await;
-    let ns = harness.key("wal-notfound-live");
+    let ns = harness.artifact_origin_namespace("wal-notfound-live");
     Manifest::new().write(&harness.store, &ns).await.unwrap();
 
     let writer = WalWriter::new(harness.store.clone());
@@ -332,7 +332,7 @@ async fn test_wal_fragment_notfound_still_referenced_is_error_not_skip() {
 #[tokio::test]
 async fn test_consumed_wal_read_rejects_checksum_mismatch() {
     let harness = common::harness::TestHarness::new().await;
-    let ns = harness.key("wal-checksum-mismatch");
+    let ns = harness.artifact_origin_namespace("wal-checksum-mismatch");
     Manifest::new().write(&harness.store, &ns).await.unwrap();
 
     let writer = WalWriter::new(harness.store.clone());
@@ -386,7 +386,7 @@ async fn test_consumed_wal_read_rejects_checksum_mismatch() {
 #[tokio::test]
 async fn test_consumed_wal_read_rejects_payload_id_mismatch() {
     let harness = common::harness::TestHarness::new().await;
-    let ns = harness.key("wal-payload-id-mismatch");
+    let ns = harness.artifact_origin_namespace("wal-payload-id-mismatch");
     Manifest::new().write(&harness.store, &ns).await.unwrap();
 
     WalWriter::new(harness.store.clone())
@@ -429,7 +429,7 @@ async fn test_consumed_wal_read_rejects_payload_id_mismatch() {
 #[tokio::test]
 async fn test_checksum_failure_evicts_poisoned_wal_cache_entry() {
     let harness = common::harness::TestHarness::new().await;
-    let ns = harness.key("wal-cache-checksum-mismatch");
+    let ns = harness.artifact_origin_namespace("wal-cache-checksum-mismatch");
     Manifest::new().write(&harness.store, &ns).await.unwrap();
 
     WalWriter::new(harness.store.clone())

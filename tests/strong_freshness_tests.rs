@@ -179,7 +179,7 @@ fn manifest_get_attempts(counter: &GetCounter) -> u64 {
 async fn strong_query_within_ttl_observes_manifest_advanced_on_s3() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let namespace = harness.key("strong-fresh-wal");
+    let namespace = harness.artifact_origin_namespace("strong-fresh-wal");
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_secs(60)));
 
     compact_baseline_and_cache_manifest(&store, &namespace, &manifest_cache).await;
@@ -220,7 +220,7 @@ async fn strong_query_within_ttl_observes_manifest_advanced_on_s3() {
 async fn eventual_query_within_ttl_keeps_zero_manifest_get_fast_path() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let namespace = harness.key("eventual-stale-is-cheap");
+    let namespace = harness.artifact_origin_namespace("eventual-stale-is-cheap");
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_secs(60)));
 
     compact_baseline_and_cache_manifest(&store, &namespace, &manifest_cache).await;
@@ -250,7 +250,7 @@ async fn eventual_query_within_ttl_keeps_zero_manifest_get_fast_path() {
 async fn strong_query_with_unchanged_manifest_uses_one_bodyless_freshness_get() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let namespace = harness.key("strong-unchanged-304");
+    let namespace = harness.artifact_origin_namespace("strong-unchanged-304");
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_secs(60)));
 
     compact_baseline_and_cache_manifest(&store, &namespace, &manifest_cache).await;
@@ -294,7 +294,7 @@ async fn strong_query_with_unchanged_manifest_uses_one_bodyless_freshness_get() 
 #[tokio::test]
 async fn strong_wal_update_outside_topk_still_overrides_stale_segment_vector() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("strong-wal-topk-overrides-segment");
+    let namespace = harness.artifact_origin_namespace("strong-wal-topk-overrides-segment");
     let store = &harness.store;
     common::write_active_namespace_metadata(store, &namespace, DIM, DistanceMetric::Euclidean)
         .await;
@@ -335,7 +335,7 @@ async fn strong_wal_update_outside_topk_still_overrides_stale_segment_vector() {
 #[tokio::test]
 async fn strong_filtered_wal_update_still_overrides_stale_segment_attrs() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("strong-wal-filter-overrides-segment");
+    let namespace = harness.artifact_origin_namespace("strong-wal-filter-overrides-segment");
     let store = &harness.store;
     common::write_active_namespace_metadata(store, &namespace, DIM, DistanceMetric::Euclidean)
         .await;

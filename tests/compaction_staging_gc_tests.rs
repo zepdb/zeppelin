@@ -183,7 +183,7 @@ async fn assert_manifest_segment_objects_exist(store: &ZeppelinStore, namespace:
 #[tokio::test]
 async fn test_gc_does_not_delete_active_staged_compaction_uploads() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("gc-staging-break-b");
+    let ns = harness.artifact_origin_namespace("gc-staging-break-b");
     let store = harness.store.clone();
     common::write_active_namespace_metadata(
         &store,
@@ -248,7 +248,7 @@ async fn test_gc_does_not_delete_active_staged_compaction_uploads() {
 #[tokio::test]
 async fn test_stolen_lease_staging_drops_and_orphans_obey_horizon() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("gc-staging-stolen");
+    let ns = harness.artifact_origin_namespace("gc-staging-stolen");
     let store = harness.store.clone();
     common::write_active_namespace_metadata(
         &store,
@@ -348,7 +348,7 @@ async fn test_stolen_lease_staging_drops_and_orphans_obey_horizon() {
 #[tokio::test]
 async fn test_compaction_aborts_before_cas_when_upload_window_exceeds_horizon() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("gc-upload-window-abort");
+    let ns = harness.artifact_origin_namespace("gc-upload-window-abort");
     let store = harness.store.clone();
     common::write_active_namespace_metadata(
         &store,
@@ -392,7 +392,7 @@ async fn test_compaction_aborts_before_cas_when_upload_window_exceeds_horizon() 
 #[tokio::test]
 async fn test_active_staged_keys_excludes_expired_lease_staging() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("gc-staging-expired");
+    let ns = harness.artifact_origin_namespace("gc-staging-expired");
     let store = harness.store.clone();
     let staged_key = format!("{ns}/segments/seg_expired/centroids.bin");
     let lease = serde_json::json!({

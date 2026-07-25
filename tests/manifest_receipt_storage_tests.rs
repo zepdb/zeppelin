@@ -12,7 +12,7 @@ use common::harness::TestHarness;
 #[tokio::test]
 async fn receipt_publication_reuses_successful_put_hash_without_readback() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("receipt-put-hash");
+    let namespace = harness.artifact_origin_namespace("receipt-put-hash");
     let fragment_id = Ulid::new();
     let key = WalFragment::s3_key(&namespace, &fragment_id);
     let body = Bytes::from_static(b"fresh immutable artifact");
@@ -45,7 +45,7 @@ async fn receipt_publication_reuses_successful_put_hash_without_readback() {
 #[tokio::test]
 async fn put_hash_survives_manifest_conflict_and_is_consumed_after_retry_commit() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("receipt-put-hash-cas");
+    let namespace = harness.artifact_origin_namespace("receipt-put-hash-cas");
     let mut initial = Manifest::new();
     initial.write(&harness.store, &namespace).await.unwrap();
     let (base, stale_version) = Manifest::read_versioned(&harness.store, &namespace)

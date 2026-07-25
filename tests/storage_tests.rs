@@ -195,7 +195,7 @@ async fn test_put_and_put_if_match_return_authoritative_etags() {
 #[tokio::test]
 async fn test_fresh_manifest_write_conditional_returns_authoritative_etag() {
     let harness = TestHarness::new().await;
-    let namespace = harness.key("returned-manifest-etag");
+    let namespace = harness.artifact_origin_namespace("returned-manifest-etag");
     let mut manifest = Manifest::new();
     manifest
         .write(&harness.store, &namespace)

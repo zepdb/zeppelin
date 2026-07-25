@@ -274,7 +274,7 @@ async fn write_case(
 async fn assert_case(seed: u64, random_top_k: usize) -> Result<(), String> {
     let case = build_case(seed);
     let harness = TestHarness::new().await;
-    let namespace = harness.key(&format!("wal-scan-freshness-{seed}"));
+    let namespace = harness.artifact_origin_namespace(&format!("wal-scan-freshness-{seed}"));
 
     let result = async {
         write_case(&harness.store, &namespace, &case).await?;
