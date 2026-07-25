@@ -295,8 +295,8 @@ async fn conditional_manifest_publication_has_no_success_readback() {
 #[tokio::test]
 async fn successful_manifest_write_keeps_candidate_namespace_bound() {
     let harness = TestHarness::new().await;
-    let source = harness.key("manifest-bound-candidate-source");
-    let target = harness.key("manifest-bound-candidate-target");
+    let source = harness.artifact_origin_namespace("manifest-bound-candidate-source");
+    let target = harness.artifact_origin_namespace("manifest-bound-candidate-target");
     let manifest = common::publish_bound_manifest(
         &harness.store,
         &source,
@@ -323,8 +323,8 @@ async fn successful_manifest_write_keeps_candidate_namespace_bound() {
 #[tokio::test]
 async fn live_manifest_rejects_bytes_bound_to_another_namespace() {
     let harness = TestHarness::new().await;
-    let source = harness.key("manifest-binding-source");
-    let target = harness.key("manifest-binding-target");
+    let source = harness.artifact_origin_namespace("manifest-binding-source");
+    let target = harness.artifact_origin_namespace("manifest-binding-target");
     common::seed_bound_manifest(&harness.store, &source).await;
     common::seed_bound_manifest(&harness.store, &target).await;
 
