@@ -151,8 +151,20 @@ impl MaintenanceWorld {
         }
     }
 
+    /// Build a namespace name for one scenario.
+    ///
+    /// Must stay a single top-level segment. `harness.key` joins with `/`,
+    /// which `namespace_prefix` (`src/storage/namespace_key.rs`) rejects since
+    /// `6c850f5` made owned-key classification enforce the namespace grammar —
+    /// that mismatch took nine of the ten `gc.*` scenarios offline. Scenario
+    /// ids carry `.` and `_`, so normalize them the same way
+    /// [`Self::managed_namespace`] does.
     fn namespace(&self, suffix: &str) -> String {
-        self.harness.key(suffix)
+        format!(
+            "{}-{}",
+            self.harness.prefix,
+            suffix.replace(['.', '_'], "-")
+        )
     }
 
     fn managed_namespace(&mut self, suffix: &str) -> String {
