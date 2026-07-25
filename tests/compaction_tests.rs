@@ -110,30 +110,62 @@ async fn test_compaction_fragment_cache_is_read_only_and_output_deterministic() 
 
         let writer = WalWriter::new(store.clone());
         let vectors = random_vectors(24, 16);
-        for chunk in vectors.chunks(6) {
+        let chunks: Vec<Vec<_>> = vectors.chunks(6).map(<[_]>::to_vec).collect();
+        assert_eq!(chunks.len(), 4);
+
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = Arc::new(
+            DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 8 * 1024 * 1024).unwrap(),
+        );
+
+        // Warm through the path production warms through. WAL fragments have two
+        // cache-key derivations — the located one qualified by physical
+        // incarnation, and a ULID-only one — and compaction consumes the located
+        // keys. Warming via the ULID-keyed `read_fragments_from_refs_unchecked`
+        // writes entries compaction can never see, which is what this assertion
+        // used to be measuring.
+        //
+        // The warm read must be Strong: an Eventual query only scans fragments
+        // carrying deletes (`read_located_delete_ids_with_trace_unchecked` filters
+        // on `delete_count > 0` and early-returns), so it reads nothing for a
+        // delete-free fixture. Strong reads whole fragments and populates.
+        // Staging the appends warms exactly the intended prefix without reaching
+        // for a crate-private located-read seam.
+        for chunk in chunks.iter().take(warm_fragments) {
             writer
-                .append(&namespace, chunk.to_vec(), Vec::new())
+                .append(&namespace, chunk.clone(), Vec::new())
+                .await
+                .unwrap();
+        }
+        if warm_fragments > 0 {
+            execute_query(QueryParams {
+                store: &store,
+                wal_reader: &WalReader::new(store.clone()),
+                namespace: &namespace,
+                query: &vectors[0].values,
+                top_k: 1,
+                nprobe: 1,
+                filter: None,
+                consistency: ConsistencyLevel::Strong,
+                distance_metric: DistanceMetric::Euclidean,
+                oversample_factor: 1,
+                rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
+                cache: Some(&cache),
+                manifest_cache: None,
+                include_attributes: false,
+            })
+            .await
+            .unwrap();
+        }
+        for chunk in chunks.iter().skip(warm_fragments) {
+            writer
+                .append(&namespace, chunk.clone(), Vec::new())
                 .await
                 .unwrap();
         }
         let manifest = Manifest::read(&store, &namespace).await.unwrap().unwrap();
         let fragment_refs = manifest.uncompacted_fragments().to_vec();
         assert_eq!(fragment_refs.len(), 4);
-
-        let cache_dir = tempfile::TempDir::new().unwrap();
-        let cache = Arc::new(
-            DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 8 * 1024 * 1024).unwrap(),
-        );
-        if warm_fragments > 0 {
-            WalReader::new(store.clone())
-                .read_fragments_from_refs_unchecked(
-                    &namespace,
-                    &fragment_refs[..warm_fragments],
-                    FragmentCachePolicy::ReadWrite(&cache),
-                )
-                .await
-                .unwrap();
-        }
         let cache_size_before = cache.total_size();
         counter.reset();
 
