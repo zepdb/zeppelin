@@ -33,6 +33,63 @@ Zeppelin is an S3-native vector search engine. Object storage is the source of t
 - `src/cache/` — local disk cache. LRU eviction, pinned centroids.
 - `src/compaction/` — background WAL → segment compaction.
 - `src/server/` — axum HTTP handlers. Thin layer over domain logic.
+- `src/security/` — kernel, policy, entitlements, audit. Fail-closed.
+- `src/fts/` — BM25 lexical retrieval.
+
+### Per-module guides
+
+Each of these has its own `CLAUDE.md` with the traps and invariants that
+module's rustdoc doesn't cover. **Read the one for the directory you're editing
+before you start** — they exist to stop rediscovery of bugs already paid for.
+
+| Module | Read it for |
+| --- | --- |
+| [`src/storage/CLAUDE.md`](src/storage/CLAUDE.md) | backend CAS capabilities, owned-key classification |
+| [`src/wal/CLAUDE.md`](src/wal/CLAUDE.md) | MessagePack rules, checksum canonicalization, artifact origins |
+| [`src/namespace/CLAUDE.md`](src/namespace/CLAUDE.md) | governed deletion, the branch graph, `/readyz` cost |
+| [`src/index/CLAUDE.md`](src/index/CLAUDE.md) | the recall gate, IVF defaults, quantization findings |
+| [`src/compaction/CLAUDE.md`](src/compaction/CLAUDE.md) | GC ownership, branch materialization cost |
+| [`src/cache/CLAUDE.md`](src/cache/CLAUDE.md) | disposability, hydration's branch-safety contract |
+| [`src/server/CLAUDE.md`](src/server/CLAUDE.md) | axum 0.7 syntax, router split, gated routes |
+| [`src/security/CLAUDE.md`](src/security/CLAUDE.md) | entitlements, the policy publication lease |
+| [`tests/CLAUDE.md`](tests/CLAUDE.md) | `TEST_BACKEND`, MinIO setup, known-flaky list |
+
+Size hints for orientation: `wal/manifest.rs` (~9.5k), `compaction/gc.rs`
+(~6.8k), `query.rs`, `index/ivf_flat/{search,build}.rs` (~4.7k/4.3k),
+`server/handlers/query.rs` (~5.6k), `namespace/graph.rs` (~5.4k),
+`compaction/mod.rs` (~5.4k) are the large files — read their rustdoc headers
+rather than the whole file.
+
+## Build and test quickstart
+
+```bash
+cargo check --tests --features branching-test-support   # ~9 min cold
+cargo test --lib                                        # fast; see known failures below
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+Most integration tests need real object storage. `TEST_BACKEND` defaults to
+`memory`; use `minio` for anything CAS-, concurrency-, or origin-shaped. MinIO
+runs natively without Docker — see [`tests/CLAUDE.md`](tests/CLAUDE.md).
+
+**`cargo test --lib` is not green without MinIO.** Three tests
+(2× `security::policy_publication`, 1× `startup::licensed_file_boot_enables_rbac_routes`)
+fail with `Storage(NotImplemented)` because the `Local` backend has no ETag
+CAS. Confirm a failure isn't one of these before debugging it.
+
+## Where the plans live
+
+`tasks/` holds executable plan files, not scratch notes. Before designing
+something substantial, check whether a plan already exists there — several
+tracks (tokenizer Analysis-v2, storage-format redesign, memoization, security
+phases, multi-substrate) are fully designed and simply unexecuted.
+`tasks/learnings.md` (gitignored) is the running bug/pattern log — append to it.
+
+Branching specifically: `tasks/branching/` has 10 phase plans,
+`deletion-unification-design.md` (10 slices), and `10-release-evidence.md`,
+which is an **implementation ledger, not a release approval**. Branching is
+default-disabled and its MinIO/soak/recall/review gates are unrun.
 
 ## Testing
 
