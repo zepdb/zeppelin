@@ -277,6 +277,33 @@ pub async fn prepare_fork_for_test(
         .await
 }
 
+/// Stop deterministically at a retained activation attempt.
+///
+/// The target reaches [`BranchPrepareStage::ActivationPending`] and stays
+/// there, which is the exact state whose later cancellation records an
+/// activation nonce on the deletion intent. Tests use this to prove that
+/// unattended maintenance still recovers an activation-cancelled fork.
+pub async fn prepare_fork_until_activation_pending_for_test(
+    store: ZeppelinStore,
+    source: NamespaceId,
+    target: NamespaceId,
+    indexing: IndexingConfig,
+    branching: BranchingConfig,
+) -> Result<ActivationNonce> {
+    let outcome =
+        prepare_fork_for_test(store.clone(), source, target.clone(), indexing, branching).await?;
+    let identity = match &outcome {
+        PrepareForkOutcome::Prepared(branch) | PrepareForkOutcome::ExistingPrepared(branch) => {
+            branch.identity.clone()
+        }
+    };
+    let nonce = ActivationNonce::new();
+    NamespaceManager::new(store)
+        .begin_branch_activation(&target, &identity, nonce)
+        .await?;
+    Ok(nonce)
+}
+
 /// Prepare and activate a branch for compaction/query integration tests.
 /// Production callers must supply the security and approval proof separately.
 pub async fn activate_fork_for_test(

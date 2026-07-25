@@ -369,7 +369,8 @@ pub async fn list_branches(
     let source_id = NamespaceId::new(source).map_err(|error| ApiError(error.into()))?;
     let request = state
         .security
-        .authorize_branch_list(source_id, principal, context);
+        .authorize_branch_list(source_id, principal, context)
+        .map_err(ApiError::from)?;
     let descriptors = namespace_graph(&state)
         .list_children(request)
         .await

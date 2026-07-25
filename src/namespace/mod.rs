@@ -22,6 +22,8 @@ pub mod manager;
 /// Strong namespace identities shared by metadata, security, and manifests.
 pub mod types;
 
+/// Last completed branch-graph readiness scan, shared by maintenance and HTTP.
+pub use graph::{BranchGraphReadinessSnapshot, BranchReadinessObserver};
 /// Public namespace manager used by startup, HTTP handlers, and maintenance.
 pub use manager::NamespaceManager;
 pub use types::{

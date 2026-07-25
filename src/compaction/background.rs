@@ -152,7 +152,7 @@ use crate::namespace::branching::deletion::DeletionGovernance;
 use crate::namespace::branching::{BranchMaintenanceReport, NamespaceDeleteOutcome};
 use crate::namespace::graph::NamespaceGraph;
 use crate::namespace::manager::{NamespaceMetadata, NamespaceState};
-use crate::namespace::{NamespaceId, NamespaceManager};
+use crate::namespace::{BranchReadinessObserver, NamespaceId, NamespaceManager};
 use crate::security::SecurityKernel;
 use crate::storage::ZeppelinStore;
 use crate::wal::FragmentCachePolicy;
@@ -604,6 +604,8 @@ pub struct GovernedDeletionWorker {
     graph: Arc<NamespaceGraph>,
     governance: Arc<dyn DeletionGovernance>,
     activation_recovery: Arc<dyn BranchActivationRecovery>,
+    readiness: BranchReadinessObserver,
+    branching_enabled: bool,
 }
 
 impl std::fmt::Debug for GovernedDeletionWorker {
@@ -625,10 +627,12 @@ impl GovernedDeletionWorker {
         manifest_cache: Arc<ManifestCache>,
         config: &Config,
         security: Arc<SecurityKernel>,
+        readiness: BranchReadinessObserver,
     ) -> Self {
         let governance =
             security.namespace_delete_maintenance_governance(store.clone(), clock.clone());
         let activation_recovery = security.branch_activation_recovery();
+        let branching_enabled = config.branching.enabled;
         let graph = NamespaceGraph::new(
             store,
             namespace_manager,
@@ -643,7 +647,30 @@ impl GovernedDeletionWorker {
             graph: Arc::new(graph),
             governance,
             activation_recovery,
+            readiness,
+            branching_enabled,
         }
+    }
+
+    /// Refresh the process-local readiness snapshot and its Prometheus gauges.
+    ///
+    /// This owns the only strong branch-graph scan in the process. Readiness
+    /// requests read the stored result instead of repeating O(namespaces)
+    /// object-store work per probe. A disabled feature performs no scan at all,
+    /// so a deployment that never forks pays nothing for branch readiness.
+    ///
+    /// Public so integration tests can observe one scan deterministically
+    /// instead of waiting on a maintenance tick.
+    pub async fn refresh_readiness(&self) -> Result<()> {
+        if !self.branching_enabled {
+            return Ok(());
+        }
+        let report = self
+            .graph
+            .inspect_readiness(self.readiness.namespace_prefix.as_deref())
+            .await?;
+        self.readiness.snapshot.store(report);
+        Ok(())
     }
 
     async fn resume(
@@ -1984,6 +2011,16 @@ async fn compaction_loop_with_lifecycle_inner(
                         "namespace graph maintenance failed"
                     );
                 }
+            }
+            // Readiness observation follows maintenance so the snapshot
+            // reflects repairs this pass already made. A failed scan leaves the
+            // previous snapshot in place: stale evidence is a better readiness
+            // answer than an unobserved one, and the next tick retries.
+            if let Err(error) = deletion_worker.refresh_readiness().await {
+                warn!(
+                    error = %error,
+                    "branch graph readiness scan failed; retaining previous snapshot"
+                );
             }
         }
     }

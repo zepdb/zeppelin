@@ -122,7 +122,7 @@ use crate::compaction::Compactor;
 use crate::config::{Config, CpuBudget, SecurityMode, StorageBackend};
 use crate::error::{Result as ZeppelinResult, ZeppelinError};
 use crate::fts::wal_cache::WalFtsCache;
-use crate::namespace::NamespaceManager;
+use crate::namespace::{BranchReadinessObserver, NamespaceManager};
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::security::{
     AuditRecord, AuditRuntime, EntitlementResolver, Entitlements, Feature, FileLicenseResolver,
@@ -652,6 +652,8 @@ async fn build_app_with_entitlement_resolver(
         clock.clone(),
     ));
     let compaction_lifecycle = CompactionLifecycle::new();
+    // One snapshot shared by the scanning worker and the readiness handler.
+    let branch_readiness = BranchReadinessObserver::unscoped();
     let deletion_worker = GovernedDeletionWorker::new(
         store.clone(),
         namespace_manager.clone(),
@@ -660,6 +662,7 @@ async fn build_app_with_entitlement_resolver(
         manifest_cache.clone(),
         &config,
         security.clone(),
+        branch_readiness.clone(),
     );
 
     // Spawn background compaction on a dedicated runtime (CPU isolation from queries)
@@ -746,6 +749,7 @@ async fn build_app_with_entitlement_resolver(
         credential_adapter,
         namespace_manager,
         namespace_name_prefix: None,
+        branch_readiness: branch_readiness.snapshot,
         wal_writer,
         wal_reader,
         compactor,
@@ -1211,8 +1215,16 @@ mod tests {
 
     /// A cfg(test)-signed file traverses the real file resolver and production
     /// graph before exposing licensed RBAC routes.
+    ///
+    /// Boot bootstraps the policy head under the global publication lease,
+    /// which releases through an ETag compare-and-swap. `LocalFileSystem`
+    /// answers `PutMode::Update` with `NotImplemented`, so this case requires
+    /// a backend that actually implements conditional writes.
     #[tokio::test]
     async fn licensed_file_boot_enables_rbac_routes() {
+        if std::env::var("TEST_BACKEND").as_deref() != Ok("minio") {
+            return;
+        }
         let _startup_guard = LICENSE_STARTUP_LOCK.lock().await;
         let root = tempfile::TempDir::new().unwrap();
         let license_path = root.path().join("license.json");

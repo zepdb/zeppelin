@@ -7,7 +7,7 @@
 //! the sole visibility boundary.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -94,6 +94,75 @@ pub(crate) struct BranchGraphReadinessReport {
     stalled_deleting_intents: usize,
     branch_roots_total: usize,
     intent_stall_threshold_seconds: i64,
+}
+
+/// Process-local handle to the most recent completed readiness scan.
+///
+/// The scan is O(namespaces) in strong object-store reads, so it belongs to
+/// the budgeted background maintenance loop rather than the readiness request
+/// path. A probe reads whatever the last completed scan observed; it never
+/// issues object-store work of its own and therefore cannot turn a transient
+/// per-namespace read failure into a lost load-balancer target.
+///
+/// Absent means "no scan has completed yet", which is deliberately not an
+/// unhealthy answer. A process that has never finished a scan has also never
+/// observed a defect, and reporting one it has not seen would fail closed on
+/// no evidence.
+#[derive(Debug, Clone, Default)]
+pub struct BranchGraphReadinessSnapshot(Arc<RwLock<Option<BranchGraphReadinessReport>>>);
+
+/// Everything the maintenance loop needs to observe and publish readiness.
+///
+/// Grouping the sink with its discovery scope keeps them from drifting apart:
+/// a snapshot published from a differently scoped scan would describe a
+/// different graph than the one readiness claims to cover.
+#[derive(Debug, Clone, Default)]
+pub struct BranchReadinessObserver {
+    /// Where a completed scan is published for the readiness handler to read.
+    pub snapshot: BranchGraphReadinessSnapshot,
+    /// Name prefix bounding discovery. Production scans the whole root; test
+    /// servers restrict discovery to their harness prefix.
+    pub namespace_prefix: Option<String>,
+}
+
+impl BranchReadinessObserver {
+    /// Observe the entire storage root, as production does.
+    #[must_use]
+    pub fn unscoped() -> Self {
+        Self::default()
+    }
+
+    /// Observe only namespaces under one name prefix.
+    #[must_use]
+    pub fn scoped(namespace_prefix: Option<String>) -> Self {
+        Self {
+            snapshot: BranchGraphReadinessSnapshot::new(),
+            namespace_prefix,
+        }
+    }
+}
+
+impl BranchGraphReadinessSnapshot {
+    /// Create an empty snapshot for one process.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn store(&self, report: BranchGraphReadinessReport) {
+        let mut slot = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(report);
+    }
+
+    pub(crate) fn load(&self) -> Option<BranchGraphReadinessReport> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 impl BranchGraphReadinessReport {
@@ -5191,10 +5260,19 @@ impl NamespaceGraph {
             if started.elapsed() >= budget {
                 break;
             }
+            // A never-active fork is resumable here only when its intent
+            // carries the activation nonce, because that is the exact state
+            // whose retained policy guard this loop must release. An ordinary
+            // authorized cancellation intent is deliberately left alone:
+            // unattended maintenance must report it and wait for a fresh
+            // authorized request rather than finish the destruction itself.
             if metadata.state == NamespaceState::Deleting
                 || (metadata.state == NamespaceState::Active && metadata.deletion_intent.is_some())
                 || (metadata.state == NamespaceState::Creating
-                    && metadata.deletion_intent.is_some())
+                    && metadata
+                        .deletion_intent
+                        .as_ref()
+                        .is_some_and(|intent| intent.branch_activation_nonce.is_some()))
             {
                 report.deletions_inspected += 1;
                 let remaining = budget.saturating_sub(started.elapsed());

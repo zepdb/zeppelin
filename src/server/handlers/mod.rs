@@ -90,7 +90,7 @@ use prometheus::{Encoder, TextEncoder};
 use serde_json::{json, Value};
 
 use crate::error::ZeppelinError;
-use crate::server::{current_request_id, namespace_graph, AppState};
+use crate::server::{current_request_id, AppState};
 
 /// Adapts an owned Zeppelin domain failure to Axum's response protocol.
 ///
@@ -531,14 +531,21 @@ pub async fn readiness_check(
         ));
     }
 
-    match namespace_graph(&state)
-        .inspect_readiness(state.namespace_name_prefix.as_deref())
-        .await
-    {
-        Ok(report) if report.is_healthy() => {
+    // Branch-graph readiness is answered from the snapshot published by
+    // background maintenance, never by scanning here. The scan is
+    // O(namespaces) in strong reads, so running it per probe would make
+    // readiness cost scale with the deployment and would let one transient
+    // per-namespace read failure evict an otherwise healthy process.
+    //
+    // No snapshot means no scan has completed: with branching disabled none
+    // ever runs, and at boot none has run yet. Neither is an observation of a
+    // defect, so neither withholds readiness.
+    match state.branch_readiness.load() {
+        None => Ok(Json(json!({"status": "ready", "s3_connected": true}))),
+        Some(report) if report.is_healthy() => {
             Ok(Json(json!({"status": "ready", "s3_connected": true})))
         }
-        Ok(report) => {
+        Some(report) => {
             tracing::error!(
                 report = ?report,
                 "readiness check failed: branch graph requires operator repair"
@@ -562,21 +569,6 @@ pub async fn readiness_check(
                     "branch_graph_healthy": false,
                     "error": "branch graph integrity requires operator repair",
                     "operator_repair": report,
-                })),
-            ))
-        }
-        Err(error) => {
-            tracing::error!(
-                error = %error,
-                "readiness check failed: branch graph inspection failed"
-            );
-            Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "status": "not_ready",
-                    "s3_connected": true,
-                    "branch_graph_healthy": false,
-                    "error": "branch graph integrity check failed",
                 })),
             ))
         }

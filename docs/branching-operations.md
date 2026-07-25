@@ -82,13 +82,26 @@ maintenance work.
 
 ## Readiness and metrics
 
-`GET /readyz` strongly scans namespace metadata and parent manifests. It becomes
-not ready for an orphan root or for a branch lifecycle intent that has made no
-durable progress for five minutes. A branch deletion waiting for its persisted
-reader-safety `not_before` deadline is not considered stalled until five
-minutes after that deadline. Protected readiness returns bounded aggregate
-stalled-intent counts and at most 16 orphan-root repair identities; public
-readiness never returns those identities.
+Background maintenance strongly scans namespace metadata and parent manifests
+once per compaction tick and publishes the result as a process-local snapshot.
+`GET /readyz` answers from that snapshot and performs no object-store work of
+its own, so readiness cost does not grow with namespace count and a transient
+per-namespace read failure cannot evict an otherwise healthy process. A failed
+scan retains the previous snapshot and retries on the next tick.
+
+Readiness becomes not ready for an orphan root or for a branch lifecycle intent
+that has made no durable progress for five minutes. A branch deletion waiting
+for its persisted reader-safety `not_before` deadline is not considered stalled
+until five minutes after that deadline. Protected readiness returns bounded
+aggregate stalled-intent counts and at most 16 orphan-root repair identities;
+public readiness never returns those identities.
+
+Two consequences follow from the snapshot being the answer. A defect is visible
+one maintenance tick after it appears rather than instantly; against the
+five-minute stall threshold that lag is immaterial. And a process reports ready
+until its first scan completes, because a scan that has not run has not observed
+a defect. With `branching.enabled = false` no scan ever runs and branch
+readiness is permanently inert.
 
 The same successful scan refreshes these process-local Prometheus gauges:
 

@@ -112,7 +112,7 @@ use crate::error::ZeppelinError;
 use crate::fts::wal_cache::WalFtsCache;
 use crate::metrics::{HTTP_REQUESTS_TOTAL, RATE_LIMITED_TOTAL};
 use crate::namespace::graph::NamespaceGraph;
-use crate::namespace::NamespaceManager;
+use crate::namespace::{BranchGraphReadinessSnapshot, NamespaceManager};
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::security::{
     classify_route, Action, AllowDecision, AuditClient, AuditOutcome, AuditParams, AuditRecord,
@@ -340,6 +340,11 @@ pub struct AppState {
     pub query_semaphore: Arc<Semaphore>,
     /// Concurrent, process-local token buckets keyed by subject and traffic class.
     pub rate_limiters: Arc<DashMap<RateLimitKey, RateLimitBucket>>,
+    /// Last completed branch-graph readiness scan, refreshed by maintenance.
+    ///
+    /// Readiness reads this snapshot instead of scanning object storage per
+    /// probe. Background maintenance owns the scan and its budget.
+    pub branch_readiness: BranchGraphReadinessSnapshot,
 }
 
 /// Compose the namespace graph from the shared production service handles.

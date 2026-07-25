@@ -593,17 +593,24 @@ impl SecurityKernel {
     }
 
     /// Mint a source-authorized branch-list request with per-target disclosure.
-    #[must_use]
+    ///
+    /// Branch listing is part of the same licensed surface as forking, so the
+    /// entitlement is checked here rather than only at the route. A kernel-side
+    /// check cannot be bypassed by a future caller that reaches this seam
+    /// without repeating the handler's configuration guard.
     pub(crate) fn authorize_branch_list(
         self: &Arc<Self>,
         source: NamespaceId,
         principal: Principal,
         context: RequestContext,
-    ) -> AuthorizedBranchList {
-        AuthorizedBranchList::new(
+    ) -> ZeppelinResult<AuthorizedBranchList> {
+        if !self.entitlements.has(super::Feature::Branching) {
+            return Err(SecurityError::FeatureNotLicensed(super::Feature::Branching).into());
+        }
+        Ok(AuthorizedBranchList::new(
             source,
             self.namespace_disclosure_callback(Some((principal, context))),
-        )
+        ))
     }
 
     fn namespace_delete_governance(
