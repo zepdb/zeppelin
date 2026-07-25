@@ -1432,6 +1432,37 @@ impl Manifest {
         .into()
     }
 
+    /// Return the local cache key an immutable artifact of `segment` is stored under.
+    ///
+    /// Immutable artifacts are cached by **physical incarnation**, not by the
+    /// logical namespace, so two branches sharing a source segment share one
+    /// entry and neither can reconstruct a key from its own name. That makes
+    /// the raw object key the wrong thing to look up.
+    ///
+    /// This is the seam for tests and tooling that need to assert what the
+    /// cache should contain. It deliberately routes through the same origin
+    /// resolver the hydration and read paths use, so a caller can never carry
+    /// a divergent copy of the key format — the copy is what silently rots
+    /// when the derivation changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest has no namespace or incarnation
+    /// binding, or when `segment`'s origin index does not resolve.
+    pub fn segment_artifact_cache_key(
+        &self,
+        segment: &SegmentRef,
+        store_key: &str,
+    ) -> Result<String> {
+        let local = self.local_origin()?;
+        let resolver = self.artifact_origin_resolver(&local)?;
+        let located = resolver.locate_segment(segment)?;
+        Ok(immutable_artifact_cache_key(
+            located.physical_origin.as_origin(),
+            store_key,
+        ))
+    }
+
     /// Resolve the physical owner encoded by an absent origin index.
     pub(crate) fn local_origin(&self) -> Result<ArtifactOrigin> {
         let namespace = self.namespace.as_ref().ok_or_else(|| {

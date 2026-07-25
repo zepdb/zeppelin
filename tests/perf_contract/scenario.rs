@@ -1259,7 +1259,7 @@ async fn setup_world(
                 SetupPlan::Hydration => {
                     let manifest = live_manifest(server, namespace).await;
                     let segment = active_segment(&manifest, namespace);
-                    world.hydration_keys = hydration_keys(namespace, segment);
+                    world.hydration_keys = hydration_keys(&manifest, namespace, segment);
                     assert!(
                         !world.hydration_keys.is_empty(),
                         "hydration setup produced no cacheable artifacts"
@@ -1272,7 +1272,8 @@ async fn setup_world(
             }
             let manifest = live_manifest(server, namespace).await;
             let segment = active_segment(&manifest, namespace);
-            world.repeat_cache_keys = measured_sidecar_cache_keys(namespace, segment, spec);
+            world.repeat_cache_keys =
+                measured_sidecar_cache_keys(&manifest, namespace, segment, spec);
             world
         }
     }
@@ -1627,28 +1628,48 @@ fn active_segment<'a>(manifest: &'a Manifest, namespace: &str) -> &'a SegmentRef
         .unwrap_or_else(|| panic!("active segment {active_id} missing for {namespace}"))
 }
 
-fn hydration_keys(namespace: &str, segment: &SegmentRef) -> Vec<String> {
-    let mut keys = segment
+/// Cache keys hydration is expected to populate for one segment.
+///
+/// These are *cache* keys, not object keys. Immutable artifacts are cached by
+/// physical incarnation (`Manifest::segment_artifact_cache_key`), so asserting
+/// against raw store keys silently never matches — which is exactly how the
+/// hydration scenario broke after reads moved onto artifact origins.
+fn hydration_keys(manifest: &Manifest, namespace: &str, segment: &SegmentRef) -> Vec<String> {
+    let mut store_keys = segment
         .cluster_objects
         .iter()
         .map(|object| object.key.clone())
         .collect::<Vec<_>>();
     for cluster in 0..segment.cluster_count {
         let owner = segment.cluster_owner(cluster);
-        keys.push(attrs_key(namespace, owner, cluster));
+        store_keys.push(attrs_key(namespace, owner, cluster));
         if !segment.bitmap_fields.is_empty() {
-            keys.push(bitmap_key(namespace, owner, cluster));
+            store_keys.push(bitmap_key(namespace, owner, cluster));
         }
     }
     if segment.has_global_fts {
-        keys.push(global_fts_key(namespace, &segment.id));
+        store_keys.push(global_fts_key(namespace, &segment.id));
     }
+    let mut keys = store_keys
+        .iter()
+        .map(|store_key| segment_cache_key(manifest, segment, store_key))
+        .collect::<Vec<_>>();
     keys.sort();
     keys.dedup();
     keys
 }
 
+/// Resolve one immutable artifact's cache key through the production seam.
+fn segment_cache_key(manifest: &Manifest, segment: &SegmentRef, store_key: &str) -> String {
+    manifest
+        .segment_artifact_cache_key(segment, store_key)
+        .unwrap_or_else(|error| {
+            panic!("cache key for {store_key:?} must resolve through its artifact origin: {error}")
+        })
+}
+
 fn measured_sidecar_cache_keys(
+    manifest: &Manifest,
     namespace: &str,
     segment: &SegmentRef,
     spec: &ScenarioSpec,
@@ -1686,6 +1707,9 @@ fn measured_sidecar_cache_keys(
         _ => {}
     }
     keys
+        .iter()
+        .map(|store_key| segment_cache_key(manifest, segment, store_key))
+        .collect()
 }
 
 async fn compact_until_ready(
