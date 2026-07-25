@@ -6,7 +6,6 @@ use common::server::{
 };
 use common::vectors::{clustered_vectors, random_vectors};
 
-use zeppelin::wal::manifest::Manifest;
 use zeppelin::wal::{WalReader, WalWriter};
 
 #[derive(Clone)]
@@ -535,14 +534,13 @@ async fn test_compaction_io_metrics_registered_and_incremented() {
     let ns = harness.artifact_origin_namespace("obs-compaction-io");
     let writer = WalWriter::new(harness.store.clone());
 
-    common::write_active_namespace_metadata(
+    common::seed_active_namespace(
         &harness.store,
         &ns,
         16,
         zeppelin::types::DistanceMetric::Euclidean,
     )
     .await;
-    Manifest::new().write(&harness.store, &ns).await.unwrap();
     let (seed_vecs, _) = clustered_vectors(6, 20, 16, 0.01);
     writer.append(&ns, seed_vecs.clone(), vec![]).await.unwrap();
 

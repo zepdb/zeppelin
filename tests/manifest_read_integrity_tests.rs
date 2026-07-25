@@ -267,8 +267,7 @@ async fn lifecycle_reads_accept_generation_zero_manifest() {
 async fn lifecycle_strong_read_accepts_deleted_manifest_after_warm_cache() {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("deleting-warm-cache");
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &namespace).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &namespace).await;
     let cache = ManifestCache::new(Duration::from_secs(60));
     let warm = cache.get_strong(&harness.store, &namespace).await.unwrap();
     assert!(warm.version() > 0);

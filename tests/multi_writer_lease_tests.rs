@@ -43,8 +43,7 @@ async fn test_lease_acquire_and_release() {
     let ns = harness.artifact_origin_namespace("lease-roundtrip");
 
     // Initialize namespace manifest
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let manager = LeaseManager::new(
         harness.store.clone(),
@@ -78,8 +77,7 @@ async fn test_lease_double_acquire_rejected() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("lease-double");
 
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let manager1 = LeaseManager::new(
         harness.store.clone(),
@@ -116,8 +114,7 @@ async fn test_lease_expired_takeover() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("lease-expiry");
 
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let manager1 = LeaseManager::new(
         harness.store.clone(),
@@ -154,7 +151,7 @@ async fn test_lease_renew_after_lease_object_deleted_returns_expired() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("lease-renew-deleted");
 
-    Manifest::new().write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let manager = LeaseManager::new(
         harness.store.clone(),
@@ -186,8 +183,7 @@ async fn test_fencing_rejects_zombie_writer() {
     let ns = harness.artifact_origin_namespace("lease-zombie");
 
     // Set up initial manifest with fencing_token = 0
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let zombie_manager = LeaseManager::new(
         harness.store.clone(),
@@ -249,8 +245,7 @@ async fn test_compactor_lease_prevents_double_compaction() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("lease-compactor");
 
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let compactor1 = LeaseManager::new(
         harness.store.clone(),
@@ -285,8 +280,7 @@ async fn test_sequential_writers_with_leases() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("lease-sequential");
 
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let manager1 = LeaseManager::new(
         harness.store.clone(),
@@ -336,8 +330,7 @@ async fn test_fragment_orphan_on_lease_expiry() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("lease-orphan");
 
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     // Write a fragment directly to S3 (simulating a writer whose lease expired
     // before it could update the manifest)
@@ -422,14 +415,8 @@ async fn test_lease_renewed_during_long_compaction() {
     let ns = harness.artifact_origin_namespace("lease-renew-long-compaction");
     let store = harness.store.clone();
 
-    common::write_active_namespace_metadata(
-        &store,
-        &ns,
-        16,
-        zeppelin::types::DistanceMetric::Euclidean,
-    )
-    .await;
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_active_namespace(&store, &ns, 16, zeppelin::types::DistanceMetric::Euclidean)
+        .await;
     let writer = WalWriter::new(store.clone());
     writer
         .append(&ns, prefixed_vectors("renew_a", 20, 16), vec![])
@@ -537,14 +524,8 @@ async fn test_stolen_lease_aborts_compaction_before_cas() {
     let ns = harness.artifact_origin_namespace("lease-stolen-abort");
     let store = harness.store.clone();
 
-    common::write_active_namespace_metadata(
-        &store,
-        &ns,
-        16,
-        zeppelin::types::DistanceMetric::Euclidean,
-    )
-    .await;
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_active_namespace(&store, &ns, 16, zeppelin::types::DistanceMetric::Euclidean)
+        .await;
     let writer = WalWriter::new(store.clone());
     let (frag, _) = writer
         .append(&ns, prefixed_vectors("stolen", 20, 16), vec![])
@@ -647,14 +628,8 @@ async fn stolen_lease_aborts_legacy_receipt_hydration_before_cas() {
         .install_object_signer(&store)
         .expect("receipt signer must install on the test store");
 
-    common::write_active_namespace_metadata(
-        &store,
-        &ns,
-        16,
-        zeppelin::types::DistanceMetric::Euclidean,
-    )
-    .await;
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_active_namespace(&store, &ns, 16, zeppelin::types::DistanceMetric::Euclidean)
+        .await;
     WalWriter::new(store.clone())
         .append(&ns, prefixed_vectors("legacy", 20, 16), vec![])
         .await
@@ -862,7 +837,7 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
         size_bytes: 0,
         artifact_origin: None,
     });
-    manifest.write(store, &ns).await.unwrap();
+    common::publish_bound_manifest(store, &ns, manifest, uuid::Uuid::new_v4()).await;
 
     // State 2: W1 acquires lease (token=1)
     let w1_manager = LeaseManager::new(
@@ -1014,8 +989,7 @@ async fn test_tla_graceful_release_after_lease_expiry() {
     let ns = harness.artifact_origin_namespace("tla-graceful-release");
     let store = &harness.store;
 
-    let mut manifest = Manifest::new();
-    manifest.write(store, &ns).await.unwrap();
+    common::seed_bound_manifest(store, &ns).await;
 
     // State 2: W1 acquires lease (token=1, 1s duration)
     let w1_manager = LeaseManager::new(store.clone(), "w1".to_string(), Duration::from_secs(1));

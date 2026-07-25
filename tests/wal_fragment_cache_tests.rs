@@ -14,7 +14,6 @@ use zeppelin::query::{execute_query_with_fragment_cache, QueryParams, QueryRespo
 use zeppelin::types::{
     AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult, VectorEntry,
 };
-use zeppelin::wal::manifest::Manifest;
 use zeppelin::wal::{WalFragmentCache, WalReader, WalWriter};
 
 const DIM: usize = 4;
@@ -103,7 +102,7 @@ async fn warm_strong_query_serves_uncompacted_wal_fragments_from_cache() {
     );
     let fragment_cache = Arc::new(WalFragmentCache::new(100 * 1024 * 1024));
 
-    Manifest::new().write(&store, &namespace).await.unwrap();
+    common::seed_bound_manifest(&store, &namespace).await;
     writer
         .append(&namespace, vec![vector("v0", [0.0, 0.0, 0.0, 0.0])], vec![])
         .await
@@ -190,10 +189,7 @@ async fn decoded_fragment_cache_preserves_overwrite_delete_filter_and_attributes
     );
     let fragment_cache = Arc::new(WalFragmentCache::new(100 * 1024 * 1024));
 
-    Manifest::new()
-        .write(&harness.store, &namespace)
-        .await
-        .unwrap();
+    common::seed_bound_manifest(&harness.store, &namespace).await;
     writer
         .append(
             &namespace,
@@ -282,7 +278,7 @@ async fn zero_capacity_redecodes_from_cached_bytes_without_changing_results() {
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
     );
     let fragment_cache = Arc::new(WalFragmentCache::new(0));
-    Manifest::new().write(&store, &namespace).await.unwrap();
+    common::seed_bound_manifest(&store, &namespace).await;
     writer
         .append(&namespace, vec![vector("v0", [0.0, 0.0, 0.0, 0.0])], vec![])
         .await
@@ -308,17 +304,7 @@ async fn zero_capacity_redecodes_from_cached_bytes_without_changing_results() {
 async fn post_compaction_query_evicts_retired_decoded_fragments() {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("wal-decoded-compaction-eviction");
-    Manifest::new()
-        .write(&harness.store, &namespace)
-        .await
-        .unwrap();
-    common::write_active_namespace_metadata(
-        &harness.store,
-        &namespace,
-        DIM,
-        DistanceMetric::Euclidean,
-    )
-    .await;
+    common::seed_active_namespace(&harness.store, &namespace, DIM, DistanceMetric::Euclidean).await;
     let writer = WalWriter::new(harness.store.clone());
     writer
         .append(&namespace, vec![vector("v0", [0.0, 0.0, 0.0, 0.0])], vec![])
@@ -380,10 +366,7 @@ async fn post_compaction_query_evicts_retired_decoded_fragments() {
 async fn parallel_strong_queries_remain_correct_during_append() {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("wal-decoded-concurrent-append");
-    Manifest::new()
-        .write(&harness.store, &namespace)
-        .await
-        .unwrap();
+    common::seed_bound_manifest(&harness.store, &namespace).await;
     let writer = WalWriter::new(harness.store.clone());
     writer
         .append(

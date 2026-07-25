@@ -56,9 +56,7 @@ async fn warm_range_fixture(name: &str) -> WarmRangeFixture {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
     let namespace = harness.artifact_origin_namespace(name);
-    common::write_active_namespace_metadata(&store, &namespace, 32, DistanceMetric::Euclidean)
-        .await;
-    Manifest::new().write(&store, &namespace).await.unwrap();
+    common::seed_active_namespace(&store, &namespace, 32, DistanceMetric::Euclidean).await;
 
     let vectors = random_vectors(256, 32);
     let query = vectors[0].values.clone();

@@ -18,7 +18,6 @@ use zeppelin::namespace::manager::{
 };
 use zeppelin::security::Entitlements;
 use zeppelin::types::{DistanceMetric, IndexType};
-use zeppelin::wal::Manifest;
 
 const FIXTURE_VERSION: &str = "v0.3.0";
 const CONTRACT_FORBIDDEN_BEARER: &str =
@@ -2712,7 +2711,7 @@ async fn seed_deleting_namespace(store: &zeppelin::storage::ZeppelinStore, ns: &
         .put(&NamespaceMetadata::s3_key(ns), meta.to_bytes().unwrap())
         .await
         .unwrap();
-    Manifest::new().write(store, ns).await.unwrap();
+    common::seed_bound_manifest(store, ns).await;
 }
 
 fn normalize_contract_value(

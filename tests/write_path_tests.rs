@@ -83,7 +83,7 @@ async fn test_group_commit_mixed_fencing_tokens_no_deadlock() {
     let mem = Arc::new(object_store::memory::InMemory::new());
     let store = zeppelin::storage::ZeppelinStore::new(mem);
     let ns = "mixed-token-deadlock";
-    Manifest::new().write(&store, ns).await.unwrap();
+    common::seed_bound_manifest(&store, ns).await;
 
     let writer = Arc::new(WalWriter::new(store.clone()));
 
@@ -138,7 +138,7 @@ async fn test_fencing_rejected_append_leaves_no_orphan() {
     // Manifest already advanced to fencing_token = 5 (a newer lease holder).
     let mut manifest = Manifest::new();
     manifest.fencing_token = 5;
-    manifest.write(store, &ns).await.unwrap();
+    common::publish_bound_manifest(store, &ns, manifest, uuid::Uuid::new_v4()).await;
 
     let writer = WalWriter::new(store.clone());
     // A zombie writer with a stale token (3 < 5) — must be rejected.
@@ -202,7 +202,7 @@ async fn test_concurrent_writers_backoff_absorbs_conflicts() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("backoff-contention");
     let store = &harness.store;
-    Manifest::new().write(store, &ns).await.unwrap();
+    common::seed_bound_manifest(store, &ns).await;
 
     // Distinct writer instances = distinct group state = real S3 CAS contention.
     let n_per_task = 8;
@@ -257,7 +257,7 @@ async fn test_group_commit_coalesces_manifest_puts() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("group-commit");
     let (store, counter) = counting_store(&harness.store);
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_bound_manifest(&store, &ns).await;
     counter.reset();
 
     let writer = Arc::new(WalWriter::new(store.clone()));
@@ -309,7 +309,7 @@ async fn test_single_append_roundtrip_unchanged() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("single-append");
     let (store, counter) = counting_store(&harness.store);
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_bound_manifest(&store, &ns).await;
     counter.reset();
 
     let writer = WalWriter::new(store.clone());
@@ -355,7 +355,7 @@ async fn test_sequential_group_commit_reuses_committed_manifest_etag() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("group-commit-manifest-memo");
     let (store, counter) = counting_store(&harness.store);
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_bound_manifest(&store, &ns).await;
     counter.reset();
 
     let writer = WalWriter::new(store);
@@ -396,7 +396,7 @@ async fn test_group_commit_manifest_memo_conflict_rebuilds_from_authority() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("group-commit-manifest-conflict");
     let (store, counter) = counting_store(&harness.store);
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_bound_manifest(&store, &ns).await;
 
     let writer = WalWriter::new(store);
     writer
@@ -472,7 +472,7 @@ async fn test_group_commit_manifest_memo_preserves_fencing_after_takeover() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("group-commit-manifest-fencing");
     let (store, counter) = counting_store(&harness.store);
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_bound_manifest(&store, &ns).await;
 
     let source = Arc::new(AdjustableTimeSource::new(Utc::now()));
     let clock = Clock::from_source(source.clone());
@@ -564,7 +564,7 @@ async fn test_group_commit_manifest_memo_restart_is_cold() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("group-commit-manifest-restart");
     let (store, counter) = counting_store(&harness.store);
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_bound_manifest(&store, &ns).await;
 
     WalWriter::new(store.clone())
         .append(
@@ -605,7 +605,7 @@ async fn test_group_commit_manifest_memo_namespace_recreate_is_cold() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("group-commit-manifest-recreate");
     let (store, counter) = counting_store(&harness.store);
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_bound_manifest(&store, &ns).await;
 
     let writer = WalWriter::new(store);
     writer
@@ -627,7 +627,7 @@ async fn test_group_commit_manifest_memo_namespace_recreate_is_cold() {
         .delete_prefix(&format!("{ns}/"))
         .await
         .unwrap();
-    Manifest::new().write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     counter.reset();
     writer

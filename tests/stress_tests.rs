@@ -62,10 +62,7 @@ fn squared_l2_to_origin(values: &[f32]) -> f32 {
 async fn test_stress_large_uncompacted_wal_backlog_exact_topk() {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("large-uncompacted-wal-backlog");
-    Manifest::new()
-        .write(&harness.store, &namespace)
-        .await
-        .unwrap();
+    common::seed_bound_manifest(&harness.store, &namespace).await;
 
     let writer = WalWriter::new(harness.store.clone());
     let mut latest: HashMap<String, Vec<f32>> = HashMap::new();

@@ -13,7 +13,6 @@ use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::types::{ConsistencyLevel, DistanceMetric};
-use zeppelin::wal::manifest::Manifest;
 use zeppelin::wal::{WalReader, WalWriter};
 
 /// Bucketing unit test: every real key builder pattern maps to its class.
@@ -89,8 +88,7 @@ async fn test_query_class_breakdown_is_sane() {
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
-    common::write_active_namespace_metadata(&store, &ns, 16, DistanceMetric::Euclidean).await;
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_active_namespace(&store, &ns, 16, DistanceMetric::Euclidean).await;
     let vecs = random_vectors(100, 16);
     let query_vec = vecs[0].values.clone();
     writer.append(&ns, vecs, vec![]).await.unwrap();

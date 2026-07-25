@@ -108,9 +108,7 @@ async fn compacted_fixture(label: &str) -> BenchFixture {
     let namespace = harness.artifact_origin_namespace(label);
     let writer = WalWriter::new(store.clone());
 
-    common::write_active_namespace_metadata(&store, &namespace, DIM, DistanceMetric::Euclidean)
-        .await;
-    Manifest::new().write(&store, &namespace).await.unwrap();
+    common::seed_active_namespace(&store, &namespace, DIM, DistanceMetric::Euclidean).await;
     let vectors = bench_vectors();
     let query = vectors[0].values.clone();
     writer.append(&namespace, vectors, vec![]).await.unwrap();
@@ -237,7 +235,7 @@ async fn manual_sq_fixture(label: &str, layout: SqFixtureLayout) -> BenchFixture
         membership: None,
         artifact_origin: None,
     });
-    manifest.write(&store, &namespace).await.unwrap();
+    common::publish_bound_manifest(&store, &namespace, manifest, uuid::Uuid::new_v4()).await;
 
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_secs(60)));
     warm_manifest_cache(&store, &namespace, &manifest_cache, 0).await;

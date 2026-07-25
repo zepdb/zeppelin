@@ -11,10 +11,7 @@ use zeppelin::wal::{Manifest, WalFragment, WalReader, WalWriter};
 async fn lost_manifest_cas_acknowledgement_keeps_reachable_fragment() {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("wal-post-commit-manifest");
-    Manifest::new()
-        .write(&harness.store, &namespace)
-        .await
-        .unwrap();
+    common::seed_bound_manifest(&harness.store, &namespace).await;
 
     let (faulted_store, failure) =
         fail_after_put_once_matching(&harness.store, Manifest::s3_key(&namespace));
@@ -85,10 +82,7 @@ async fn lost_manifest_cas_acknowledgement_keeps_reachable_fragment() {
 async fn terminal_manifest_write_error_clears_group_commit_memo() {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("wal-terminal-manifest-error");
-    Manifest::new()
-        .write(&harness.store, &namespace)
-        .await
-        .unwrap();
+    common::seed_bound_manifest(&harness.store, &namespace).await;
 
     let failed_history = Manifest::history_key(&namespace, 3);
     let (faulted_store, failure) = fail_put_once_matching(&harness.store, &failed_history);
@@ -169,10 +163,7 @@ async fn terminal_manifest_write_error_clears_group_commit_memo() {
 async fn failed_live_manifest_put_does_not_wedge_a_divergent_wal_retry() {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("wal-divergent-history-retry");
-    Manifest::new()
-        .write(&harness.store, &namespace)
-        .await
-        .unwrap();
+    common::seed_bound_manifest(&harness.store, &namespace).await;
 
     let (faulted_store, failure) =
         fail_put_once_matching(&harness.store, Manifest::s3_key(&namespace));

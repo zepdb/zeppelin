@@ -33,7 +33,7 @@ async fn conditional_history_failure_does_not_advance_live_manifest_and_retry_is
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("manifest-history-conditional");
 
-    Manifest::new().write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
     let (mut manifest, version) = Manifest::read_versioned(&harness.store, &ns)
         .await
         .unwrap()
@@ -82,7 +82,7 @@ async fn write_history_failure_does_not_advance_live_manifest_and_retry_is_clean
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("manifest-history-write");
 
-    Manifest::new().write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
     let mut manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     assert_eq!(manifest.version(), 1);
     manifest.add_fragment(fragment(2, 5));
@@ -122,7 +122,7 @@ async fn failed_live_put_does_not_reserve_the_candidate_history_generation() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("manifest-history-pointer-failure");
 
-    Manifest::new().write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
     let (mut manifest, version) = Manifest::read_versioned(&harness.store, &ns)
         .await
         .unwrap()
@@ -190,7 +190,7 @@ async fn failed_live_put_does_not_reserve_the_candidate_history_generation() {
 async fn competing_candidates_share_predecessor_history_and_one_wins_live_cas() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("manifest-history-orphan-toctou");
-    Manifest::new().write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let (mut winner, winner_version) = Manifest::read_versioned(&harness.store, &ns)
         .await
@@ -269,7 +269,7 @@ async fn competing_candidates_share_predecessor_history_and_one_wins_live_cas() 
 async fn conditional_manifest_publication_has_no_success_readback() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("manifest-no-success-readback");
-    Manifest::new().write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
     let (mut manifest, version) = Manifest::read_versioned(&harness.store, &ns)
         .await
         .unwrap()
@@ -297,8 +297,13 @@ async fn successful_manifest_write_keeps_candidate_namespace_bound() {
     let harness = TestHarness::new().await;
     let source = harness.key("manifest-bound-candidate-source");
     let target = harness.key("manifest-bound-candidate-target");
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &source).await.unwrap();
+    let manifest = common::publish_bound_manifest(
+        &harness.store,
+        &source,
+        Manifest::new(),
+        uuid::Uuid::new_v4(),
+    )
+    .await;
 
     harness
         .store
@@ -320,14 +325,8 @@ async fn live_manifest_rejects_bytes_bound_to_another_namespace() {
     let harness = TestHarness::new().await;
     let source = harness.key("manifest-binding-source");
     let target = harness.key("manifest-binding-target");
-    Manifest::new()
-        .write(&harness.store, &source)
-        .await
-        .unwrap();
-    Manifest::new()
-        .write(&harness.store, &target)
-        .await
-        .unwrap();
+    common::seed_bound_manifest(&harness.store, &source).await;
+    common::seed_bound_manifest(&harness.store, &target).await;
 
     let wrong = harness.store.get(&Manifest::s3_key(&source)).await.unwrap();
     harness

@@ -587,15 +587,21 @@ async fn seed_segment(store: &ZeppelinStore, ns: &str) -> (String, Vec<VectorEnt
         membership: None,
         artifact_origin: None,
     });
-    manifest.write(store, ns).await.unwrap();
-    common::write_active_namespace_metadata(store, ns, DIM, DistanceMetric::Euclidean).await;
+    common::seed_active_namespace_with_manifest(
+        store,
+        ns,
+        DIM,
+        DistanceMetric::Euclidean,
+        manifest,
+    )
+    .await;
     (seg_id.to_string(), vectors)
 }
 
 /// Seed through the compactor so the active SegmentRef contains the modern
 /// sketch/bootstrap/membership refs that incremental stitching consumes.
 async fn seed_modern_segment(store: &ZeppelinStore, ns: &str) -> (String, Vec<VectorEntry>) {
-    Manifest::new().write(store, ns).await.unwrap();
+    common::seed_bound_manifest(store, ns).await;
     let (vectors, _centroids) = clustered_vectors(N_CLUSTERS, 20, DIM, 0.01);
     seed_modern_vectors(store, ns, vectors, N_CLUSTERS).await
 }
@@ -606,8 +612,7 @@ async fn seed_modern_vectors(
     vectors: Vec<VectorEntry>,
     n_clusters: usize,
 ) -> (String, Vec<VectorEntry>) {
-    Manifest::new().write(store, ns).await.unwrap();
-    common::write_active_namespace_metadata(store, ns, DIM, DistanceMetric::Euclidean).await;
+    common::seed_active_namespace(store, ns, DIM, DistanceMetric::Euclidean).await;
     WalWriter::new(store.clone())
         .append(ns, vectors.clone(), vec![])
         .await
@@ -803,8 +808,14 @@ async fn seed_legacy_flat_segment(
         membership: None,
         artifact_origin: None,
     });
-    manifest.write(store, ns).await.unwrap();
-    common::write_active_namespace_metadata(store, ns, DIM, DistanceMetric::Euclidean).await;
+    common::seed_active_namespace_with_manifest(
+        store,
+        ns,
+        DIM,
+        DistanceMetric::Euclidean,
+        manifest,
+    )
+    .await;
 
     (
         seg_id.to_string(),
@@ -924,8 +935,14 @@ async fn seed_legacy_sq8_segment(store: &ZeppelinStore, ns: &str) -> (String, Ve
         membership: None,
         artifact_origin: None,
     });
-    manifest.write(store, ns).await.unwrap();
-    common::write_active_namespace_metadata(store, ns, DIM, DistanceMetric::Euclidean).await;
+    common::seed_active_namespace_with_manifest(
+        store,
+        ns,
+        DIM,
+        DistanceMetric::Euclidean,
+        manifest,
+    )
+    .await;
     (seg_id.to_string(), vectors)
 }
 
@@ -1112,8 +1129,7 @@ async fn test_full_compaction_writes_segment_membership_artifact() {
     let ns = harness.artifact_origin_namespace("full-membership");
     let store = &harness.store;
 
-    Manifest::new().write(store, &ns).await.unwrap();
-    common::write_active_namespace_metadata(store, &ns, DIM, DistanceMetric::Euclidean).await;
+    common::seed_active_namespace(store, &ns, DIM, DistanceMetric::Euclidean).await;
     let (vectors, _centroids) = clustered_vectors(N_CLUSTERS, 10, DIM, 0.01);
     WalWriter::new(store.clone())
         .append(&ns, vectors.clone(), vec![])

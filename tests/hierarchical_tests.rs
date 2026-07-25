@@ -32,8 +32,7 @@ fn hierarchical_test_config() -> IndexingConfig {
 
 /// Seeds the manifest and authoritative metadata required by compaction.
 async fn seed_active_namespace(store: &ZeppelinStore, namespace: &str) {
-    Manifest::new().write(store, namespace).await.unwrap();
-    common::write_active_namespace_metadata(store, namespace, 16, DistanceMetric::Euclidean).await;
+    common::seed_active_namespace(store, namespace, 16, DistanceMetric::Euclidean).await;
 }
 
 // ─── Test 1: Build hierarchical basic ───

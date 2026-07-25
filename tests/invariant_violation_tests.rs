@@ -73,7 +73,7 @@ async fn test_compaction_safety_cas_prevents_stale_overwrite() {
     let writer = WalWriter::new(store.clone());
 
     // 1. Initialize namespace with empty manifest
-    Manifest::new().write(store, &ns).await.unwrap();
+    common::seed_bound_manifest(store, &ns).await;
 
     // 2. Append 2 fragments
     let _f1 = writer
@@ -131,8 +131,7 @@ async fn test_query_read_consistency_deferred_deletion() {
     let writer = WalWriter::new(store.clone());
 
     // 1. Initialize namespace and append 3 fragments
-    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
-    Manifest::new().write(store, &ns).await.unwrap();
+    common::seed_active_namespace(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     for i in 0..3 {
         let vecs = make_vectors(&format!("batch{i}"), 20, 16);
@@ -300,7 +299,7 @@ async fn test_sequence_numbers_override_ulid_ordering() {
         size_bytes: 0,
         artifact_origin: None,
     });
-    manifest.write(store, &ns).await.unwrap();
+    common::publish_bound_manifest(store, &ns, manifest, uuid::Uuid::new_v4()).await;
 
     // 4. Read fragments in manifest order (sequence order, NOT ULID order)
     let wal_reader = WalReader::new(store.clone());

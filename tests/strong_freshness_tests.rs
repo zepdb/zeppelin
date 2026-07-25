@@ -13,7 +13,6 @@ use zeppelin::index::quantization::QuantizationType;
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, VectorEntry};
-use zeppelin::wal::manifest::Manifest;
 use zeppelin::wal::{WalReader, WalWriter};
 
 const DIM: usize = 4;
@@ -60,8 +59,7 @@ async fn compact_baseline_and_cache_manifest(
     namespace: &str,
     manifest_cache: &Arc<ManifestCache>,
 ) {
-    common::write_active_namespace_metadata(store, namespace, DIM, DistanceMetric::Euclidean).await;
-    Manifest::new().write(store, namespace).await.unwrap();
+    common::seed_active_namespace(store, namespace, DIM, DistanceMetric::Euclidean).await;
 
     let writer = WalWriter::new(store.clone());
     writer
@@ -296,9 +294,7 @@ async fn strong_wal_update_outside_topk_still_overrides_stale_segment_vector() {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("strong-wal-topk-overrides-segment");
     let store = &harness.store;
-    common::write_active_namespace_metadata(store, &namespace, DIM, DistanceMetric::Euclidean)
-        .await;
-    Manifest::new().write(store, &namespace).await.unwrap();
+    common::seed_active_namespace(store, &namespace, DIM, DistanceMetric::Euclidean).await;
 
     let writer = WalWriter::new(store.clone());
     writer
@@ -337,9 +333,7 @@ async fn strong_filtered_wal_update_still_overrides_stale_segment_attrs() {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("strong-wal-filter-overrides-segment");
     let store = &harness.store;
-    common::write_active_namespace_metadata(store, &namespace, DIM, DistanceMetric::Euclidean)
-        .await;
-    Manifest::new().write(store, &namespace).await.unwrap();
+    common::seed_active_namespace(store, &namespace, DIM, DistanceMetric::Euclidean).await;
 
     let writer = WalWriter::new(store.clone());
     writer

@@ -185,14 +185,8 @@ async fn test_gc_does_not_delete_active_staged_compaction_uploads() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("gc-staging-break-b");
     let store = harness.store.clone();
-    common::write_active_namespace_metadata(
-        &store,
-        &ns,
-        16,
-        zeppelin::types::DistanceMetric::Euclidean,
-    )
-    .await;
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_active_namespace(&store, &ns, 16, zeppelin::types::DistanceMetric::Euclidean)
+        .await;
     WalWriter::new(store.clone())
         .append(&ns, prefixed_vectors("break_b", 24, 16), vec![])
         .await
@@ -250,14 +244,8 @@ async fn test_stolen_lease_staging_drops_and_orphans_obey_horizon() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("gc-staging-stolen");
     let store = harness.store.clone();
-    common::write_active_namespace_metadata(
-        &store,
-        &ns,
-        16,
-        zeppelin::types::DistanceMetric::Euclidean,
-    )
-    .await;
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_active_namespace(&store, &ns, 16, zeppelin::types::DistanceMetric::Euclidean)
+        .await;
     WalWriter::new(store.clone())
         .append(&ns, prefixed_vectors("stolen_staging", 24, 16), vec![])
         .await
@@ -350,14 +338,8 @@ async fn test_compaction_aborts_before_cas_when_upload_window_exceeds_horizon() 
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("gc-upload-window-abort");
     let store = harness.store.clone();
-    common::write_active_namespace_metadata(
-        &store,
-        &ns,
-        16,
-        zeppelin::types::DistanceMetric::Euclidean,
-    )
-    .await;
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_active_namespace(&store, &ns, 16, zeppelin::types::DistanceMetric::Euclidean)
+        .await;
     let (fragment_ref, _) = WalWriter::new(store.clone())
         .append(&ns, prefixed_vectors("window_abort", 24, 16), vec![])
         .await

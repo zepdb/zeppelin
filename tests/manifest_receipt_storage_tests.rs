@@ -32,7 +32,9 @@ async fn receipt_publication_reuses_successful_put_hash_without_readback() {
         size_bytes: 24,
         artifact_origin: None,
     });
-    manifest.write(&harness.store, &namespace).await.unwrap();
+    let manifest =
+        common::publish_bound_manifest(&harness.store, &namespace, manifest, uuid::Uuid::new_v4())
+            .await;
 
     let artifacts = manifest
         .receipt_artifacts(&namespace)
@@ -46,8 +48,7 @@ async fn receipt_publication_reuses_successful_put_hash_without_readback() {
 async fn put_hash_survives_manifest_conflict_and_is_consumed_after_retry_commit() {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("receipt-put-hash-cas");
-    let mut initial = Manifest::new();
-    initial.write(&harness.store, &namespace).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &namespace).await;
     let (base, stale_version) = Manifest::read_versioned(&harness.store, &namespace)
         .await
         .unwrap()

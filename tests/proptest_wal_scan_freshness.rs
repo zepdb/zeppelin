@@ -12,7 +12,7 @@ use zeppelin::index::quantization::QuantizationType;
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, VectorEntry};
-use zeppelin::wal::{Manifest, WalReader, WalWriter};
+use zeppelin::wal::{WalReader, WalWriter};
 
 use common::harness::TestHarness;
 
@@ -237,11 +237,7 @@ async fn write_case(
     namespace: &str,
     case: &WalFreshnessCase,
 ) -> Result<(), String> {
-    common::write_active_namespace_metadata(store, namespace, DIM, DistanceMetric::Euclidean).await;
-    Manifest::new()
-        .write(store, namespace)
-        .await
-        .map_err(|e| format!("write manifest: {e}"))?;
+    common::seed_active_namespace(store, namespace, DIM, DistanceMetric::Euclidean).await;
 
     let writer = WalWriter::new(store.clone());
     writer

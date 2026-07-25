@@ -196,11 +196,13 @@ async fn test_put_and_put_if_match_return_authoritative_etags() {
 async fn test_fresh_manifest_write_conditional_returns_authoritative_etag() {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("returned-manifest-etag");
-    let mut manifest = Manifest::new();
-    manifest
-        .write(&harness.store, &namespace)
-        .await
-        .expect("initial manifest publication should succeed");
+    let mut manifest = common::publish_bound_manifest(
+        &harness.store,
+        &namespace,
+        Manifest::new(),
+        uuid::Uuid::new_v4(),
+    )
+    .await;
     let (_, base_version) = Manifest::read_versioned(&harness.store, &namespace)
         .await
         .expect("initial manifest should be readable")

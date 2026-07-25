@@ -98,7 +98,7 @@ async fn hydration_fixture_with(
         .expect("hydration fixture requires at least one vector")
         .values
         .len();
-    common::write_active_namespace_metadata_with_fts(
+    common::seed_active_namespace_with_fts(
         &store,
         &namespace,
         dimensions,
@@ -106,7 +106,6 @@ async fn hydration_fixture_with(
         fts_configs.clone(),
     )
     .await;
-    Manifest::new().write(&store, &namespace).await.unwrap();
 
     let query = vectors[0].values.clone();
     WalWriter::new(store.clone())

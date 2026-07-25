@@ -13,7 +13,6 @@ use zeppelin::fts::FtsFieldConfig;
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, VectorEntry};
 use zeppelin::wal::fragment::WalFragment;
-use zeppelin::wal::manifest::Manifest;
 use zeppelin::wal::{WalReader, WalWriter};
 
 fn test_config(fts_index: bool) -> Config {
@@ -297,8 +296,7 @@ async fn test_eventual_query_gets_only_delete_fragments_not_vector_wal_fragments
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
-    common::write_active_namespace_metadata(&store, &ns, 4, DistanceMetric::Cosine).await;
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_active_namespace(&store, &ns, 4, DistanceMetric::Cosine).await;
 
     let target_id = "delete_me";
     let query_vec = vec![1.0, 0.0, 0.0, 0.0];
@@ -420,8 +418,7 @@ async fn test_eventual_tombstone_ordering_across_fragments() {
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
-    common::write_active_namespace_metadata(&store, &ns, 4, DistanceMetric::Cosine).await;
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_active_namespace(&store, &ns, 4, DistanceMetric::Cosine).await;
 
     // Segment contains x, z, and fillers.
     writer
@@ -541,8 +538,7 @@ async fn test_eventual_query_may_return_stale_updated_segment_vector() {
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
-    common::write_active_namespace_metadata(&store, &ns, 4, DistanceMetric::Cosine).await;
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_active_namespace(&store, &ns, 4, DistanceMetric::Cosine).await;
 
     let target_id = "update_me";
     let query_vec = vec![1.0, 0.0, 0.0, 0.0];

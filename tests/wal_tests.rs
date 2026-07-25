@@ -121,6 +121,8 @@ async fn test_fragment_serialize_deserialize_roundtrip() {
 async fn guarded_append_rejects_a_legacy_unbound_manifest() {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("legacy-unbound-append-guard");
+    // Deliberately legacy: this test asserts the guard that rejects appends
+    // against a manifest with no incarnation, so it must stay unbound.
     let mut manifest = Manifest::new();
     manifest.write(&harness.store, &namespace).await.unwrap();
     let (manifest, version) = Manifest::read_versioned(&harness.store, &namespace)
@@ -164,8 +166,7 @@ async fn test_wal_writer_append_single_fragment() {
     let ns = harness.artifact_origin_namespace("wal-single");
 
     // Initialize namespace manifest so writer can read it
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let writer = WalWriter::new(harness.store.clone());
     let vectors = random_vectors(3, 16);
@@ -190,8 +191,7 @@ async fn test_wal_writer_append_multiple_fragments() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("wal-multi");
 
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let writer = WalWriter::new(harness.store.clone());
 
@@ -224,8 +224,7 @@ async fn test_wal_reader_read_uncompacted_fragments() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("wal-read");
 
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let writer = WalWriter::new(harness.store.clone());
     let (f1, _) = writer
@@ -268,8 +267,7 @@ async fn test_wal_fragment_key_listing() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("wal-list");
 
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let writer = WalWriter::new(harness.store.clone());
     writer
@@ -296,8 +294,7 @@ async fn test_wal_writer_concurrent_appends() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("wal-concurrent");
 
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let writer = Arc::new(WalWriter::new(harness.store.clone()));
 
@@ -339,8 +336,7 @@ async fn test_wal_writer_sequential_consistency() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("wal-sequential");
 
-    let mut manifest = Manifest::new();
-    manifest.write(&harness.store, &ns).await.unwrap();
+    common::seed_bound_manifest(&harness.store, &ns).await;
 
     let writer = WalWriter::new(harness.store.clone());
 
@@ -529,6 +525,8 @@ async fn scoped_delete_append_rejects_recreated_namespace_incarnation() {
 async fn legacy_manifest_incarnation_migration_is_cas_bound_and_idempotent() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("wal-legacy-incarnation-migration");
+    // Deliberately legacy: the migration under test is what binds this
+    // manifest, so seeding it bound would erase the case.
     let mut legacy = Manifest::new();
     legacy.write(&harness.store, &ns).await.unwrap();
     let legacy_generation = legacy.version();
@@ -612,6 +610,8 @@ async fn legacy_manifest_migration_rejects_missing_or_empty_get_etags_before_any
 
     for (case, replacement) in [("missing", None), ("empty", Some(String::new()))] {
         let ns = harness.artifact_origin_namespace(&format!("wal-legacy-{case}-get-etag"));
+        // Deliberately legacy: this exercises the unbound-manifest migration
+        // path's ETag preconditions.
         let mut manifest = Manifest::new();
         manifest.write(&harness.store, &ns).await.unwrap();
         let expected_generation = manifest.version();

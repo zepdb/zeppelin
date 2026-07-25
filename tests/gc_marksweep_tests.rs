@@ -214,7 +214,7 @@ async fn gc_reclaims_orphaned_fragment_from_failed_write_cas() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("gc-19d-orphan-fragment");
     let store = harness.store.clone();
-    Manifest::new().write(&store, &ns).await.unwrap();
+    common::seed_bound_manifest(&store, &ns).await;
 
     let orphan_id = old_ulid(60, 42);
     let orphan_key = WalFragment::s3_key(&ns, &orphan_id);
@@ -251,6 +251,9 @@ async fn old_fragment_that_just_left_manifest_is_not_collected_before_horizon() 
         )
         .await
         .unwrap();
+    // Both generations belong to one namespace lifetime, so they share an
+    // incarnation — a second, freshly minted one would be a rebind.
+    let incarnation = uuid::Uuid::new_v4();
     let mut manifest = Manifest::new();
     manifest.add_fragment(FragmentRef {
         id: old_id,
@@ -260,9 +263,10 @@ async fn old_fragment_that_just_left_manifest_is_not_collected_before_horizon() 
         size_bytes: 28,
         artifact_origin: None,
     });
-    manifest.write(&store, &ns).await.unwrap();
+    common::publish_bound_manifest(&store, &ns, manifest, incarnation).await;
 
-    Manifest::new().write(&store, &ns).await.unwrap();
+    // Generation 2 drops the fragment: reachable a moment ago, unreachable now.
+    common::publish_bound_manifest(&store, &ns, Manifest::new(), incarnation).await;
     let config = unsafe_short_gc(2);
 
     run_gc_cycle(&store, &ns, &config).await.unwrap();
