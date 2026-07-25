@@ -2,123 +2,209 @@
 
 This is an implementation and evidence ledger, not an enablement claim.
 Branching remains disabled by default until every required release contract in
-plan 10 is green. Deletion unification is complete through `3db63c4` (`Complete
-branching Slice 10 recovery readiness`), writable materialization is complete
-through `f9c6712` (`Materialize writable namespace branches`), and the final
-Phase 10 implementation bundle is identified by its planned subject `Verify
-namespace branching rollout` until that bundle is committed.
+plan 10 is green.
+
+All hashes below are commits on `main` and were re-derived after the
+2026-07-24 commit-message reflow. Verify any of them with
+`git merge-base --is-ancestor <hash> main`. The previous revision of this file
+cited hashes from the pre-rebase `codex/branching` branch, none of which were
+ancestors of `main`; anyone holding only `main` could not resolve a single one.
+
+## Phase landmarks
+
+| Phase | Scope | Commit on `main` |
+| --- | --- | --- |
+| 1 | Namespace branching lifecycle and GC model | `475d5cf`; correction `63cbb32` |
+| 2 | Manifest artifact origins | `03bd4f9` |
+| 3 | Physical read routing through origins | `93ef3af` |
+| 4 | Branch roots and exact generations | `fc5e34b` |
+| 5 | Resumable fork preparation lifecycle | `fb333ac` |
+| 6 | Writable branch materialization | `eadbd04` |
+| 7 | Branch-aware deletion | initial checkpoint `7295141`, completed through deletion unification ending at `ae5627c` |
+| 8 | HTTP surface and activation governance | `b520ca3`, `936b82c`, `637fa6c`, `8bace74`; activation checkpoint `25fb950`, then recovery hardening |
+| 9 | Client SDKs | **Not implemented.** `d39e954` is an intentionally empty marker |
+| 10 | Integration, adversarial, performance | `ad77b75` |
 
 ## Deletion-unification slices
 
-| Slice | Scope | History/evidence | Status |
+| Slice | Scope | Commit(s) on `main` | Status |
 | --- | --- | --- | --- |
-| 1 | Strong preservation probe and incarnation-bound head proof | `52fd1b2` (`Add strong preservation head probe`), `c1bd80b`, and `a903b64` | Implemented in current history; focused strong-probe coverage landed, but no durable exact command/result was found for this ledger update |
-| 2 | Graph-owned governed root deletion, trailing intent ordering, fencing, governance envelope, and resumable primitives | Preparatory implementation series from `293ca35` through `8a33d45`, including `96295c5` (graph authorization envelope), `9c13bc8` (preservation boundary), `14ca4d4` (resume seam), `8da9ea8` (trailing intent), and `8a33d45` (evidence-bound lifecycle audit) | Implemented in current history; there is no single commit with the planned subject `Route governed root deletion through graph` |
-| 3 | HTTP, request cleanup, and background cleanup switched to the graph-owned governance seam | `22c26fd` (`Switch namespace deletion to graph governance`) | Implemented; commit records deterministic CAS-race and lifecycle fixture coverage, but no durable exact command/result was found |
-| 4 | Durable visibility removal marker and reader-safety grace | `e47afaf` (`Persist branch visibility removal and grace`) | Implemented with restart/config-change grace handling and typed grace-wait progress |
-| 5 | Exact root release, acknowledgement, convergence, and parent-incarnation integrity | `5d7a828` (`Release branch roots after durable grace`) | Implemented; commit records deterministic MinIO crash, lost-reply, absence, replacement-incarnation, and metadata-last coverage |
-| 6 | Budgeted deletion recovery from `NamespaceGraph::maintain` | `75ab434` (`Resume deletion intents in graph maintain`) | Implemented; commit records recovery-matrix, fault-injection, and production background-loop coverage |
-| 7 | Governed cancellation of never-active forks | `19fcbf8` (`Cancel never-active forks through graph`) | Implemented with parent-lease ordering, fail-closed proof, crash recovery, and maintenance regressions |
-| 8 | Origin-checked owned cleanup and foreign-artifact protection | `5969d9c` (`Enforce owned-key cleanup for branch deletes`) | Implemented in current history; exact validation output was not found in a durable evidence file |
-| 9 | Ungoverned-path child-root guard and legacy/downgrade compatibility | `937f84d` (`Guard ungoverned deletes and legacy resume`) | Implemented with legacy intent/destruction-record compatibility and fail-closed downgrade documentation |
-| 10 | Disclosure-filtered list/409 details, root-release audit progress, adversarial deletion bookkeeping, and recovery readiness | `b604d5d` (`Wire disclosure, audit, adversarial deletes`) through `3db63c4` (`Complete branching Slice 10 recovery readiness`) | Implemented; full release validation remains a separate Phase 10 gate |
+| 1 | Strong preservation probe and incarnation-bound head proof | `ca3c6b3`, `553314b`, `616fe78`; later proof `2029bd0` | Implemented |
+| 2 | Graph-owned governed root deletion, trailing intent ordering, fencing, governance envelope, resumable primitives | `3999936` through `8aaa1cc`, inclusive — 24 commits | Implemented |
+| 3 | HTTP, request cleanup, and background cleanup on the graph seam | `e232818` | Implemented |
+| 4 | Durable visibility-removal marker and reader-safety grace | `d0b791c` | Implemented |
+| 5 | Exact root release, acknowledgement, convergence, parent-incarnation integrity | `8406625` | Implemented |
+| 6 | Budgeted deletion recovery from `NamespaceGraph::maintain` | `44d754f` | Implemented |
+| 7 | Governed cancellation of never-active forks | `522eb56` | Implemented; invariant regressed and restored — see below |
+| 8 | Origin-checked owned cleanup and foreign-artifact protection | `6c850f5`; later proof `cfae399` | Implemented |
+| 9 | Ungoverned-path child-root guard and legacy/downgrade compatibility | `d4c79cd` | Implemented |
+| 10 | Disclosure-filtered list/409 details, root-release audit progress, adversarial deletion bookkeeping, recovery readiness | `e4e85b6` through `ae5627c` | Implemented |
 
 The Slice 2 entry deliberately describes the actual linear history. The plan
-required one commit named `Route governed root deletion through graph`, but no
-such commit exists in the current history; assigning an unrelated hash to that
-subject would overstate traceability.
+required one commit named `Route governed root deletion through graph`; no such
+commit exists, and assigning an unrelated hash to that subject would overstate
+traceability.
+
+## First execution of the branching gate — 2026-07-24
+
+The MinIO branching gate had never been executed before this pass. Running it
+found three failures, two of which had been red since the commit that
+introduced them.
+
+```bash
+TEST_BACKEND=minio cargo test --features branching-test-support \
+  --test artifact_origin_tests --test branch_root_tests \
+  --test branch_fork_tests --test branch_deletion_tests \
+  --test branching_tests --no-fail-fast -- --test-threads=1
+```
+
+`--no-fail-fast` is required. Without it cargo stops at the first failing
+binary, which is part of why these went unnoticed.
+
+### Findings
+
+1. **Never-active cancellation authority regressed.** `25fe84e` broadened the
+   `maintain()` resume condition to every `Creating` namespace holding a
+   deletion intent. That shadowed the Slice 7 guard, which became unreachable
+   dead code, and unattended maintenance began completing cancellations that
+   must await a freshly authorized request. `25fe84e` added no coverage for the
+   broadened behavior and broke
+   `branch_fork_tests::maintenance_reports_but_never_executes_an_authorized_cancellation_intent`.
+   Fixed in `4f8583c` by resuming only intents carrying the activation nonce —
+   the exact state whose retained policy guard maintenance must release.
+   `maintenance_resumes_an_activation_cancelled_fork` now covers the nonce path
+   that had none.
+2. **`branching_tests::owned_clone_survives_materialization_and_deletion_of_its_branch_ancestry`
+   had never run.** Added by `eadbd04`, it failed production
+   config validation before reaching any branching work, leaving copy clone over
+   a materialized branch unverified. Once running it exposed a second gap: the
+   bounded deletion loop rejected retryable 409s, though governed deletion
+   legitimately loses the namespace-lease and policy-head races to background
+   maintenance. Both fixed in `5821c5f`.
+3. **Stale owned-key assertion.** `artifact_origin_tests.rs` still expected the
+   message text that Slice 8 replaced when `TargetOwnedDeletionKey::classify`
+   began delegating to `NamespaceObjectKey::classify`. The guard itself was
+   never broken. Fixed in `5821c5f`.
+
+### Result after the fixes
+
+| Suite | Result |
+| --- | --- |
+| `cargo test --lib` | 638 passed, 0 failed (was 635 / 3) |
+| `artifact_origin_tests` | 17 passed, 0 failed |
+| `branch_root_tests` | 15 passed, 0 failed |
+| `branch_fork_tests` | 39 passed, 0 failed |
+| `branch_deletion_tests` | 31 passed, 0 failed |
+| `branching_tests` | 16 passed, 0 failed |
+| `security_branching_tests` | 12 passed, 0 failed |
+| `contract_tests` | 16 passed, 0 failed |
+| `namespace_lifecycle_tests` | 19 passed, 0 failed |
+| `security_preservation_tests` | 25 passed, 0 failed |
+| `storage_gc_tests` | 77 passed, 0 failed |
+
+Also clean: `cargo check --tests --features branching-test-support`,
+`cargo fmt --all -- --check`, `git diff --check`. Clippy introduced no new
+lints, verified by diffing against a clean `HEAD` worktree.
+
+## Collateral defects fixed in the same pass
+
+- **`cargo test --lib` was red on `main`.** `object_store` 0.11.2
+  `LocalFileSystem::put_opts` answers `PutMode::Update` with `NotImplemented`
+  (`local.rs:369`), so `StorageBackend::Local` cannot perform ETag CAS.
+  Branching's `PolicyPublicationLease` release requires it and
+  `PolicyStore::bootstrap` acquires that lease, so three cases failed —
+  including `startup::licensed_file_boot_enables_rbac_routes`, which predates
+  branching. The design's per-slice validation floor is `cargo test --lib`, so
+  that floor had not been met. Fixed in `5821c5f`.
+- **`/readyz` scanned the namespace graph on every probe.** `inspect_readiness`
+  ran unbudgeted regardless of `branching.enabled`: one root listing plus a
+  metadata *and* manifest read per namespace, plus a metadata read per branch
+  root, with any propagated error returning 503. Readiness now answers from a
+  snapshot published by the already budgeted maintenance pass, and performs no
+  object-store work of its own (`4f8583c`).
+  `branching_tests::readiness_probes_never_scan_the_namespace_graph` proves it:
+  the same test fails against unmodified `HEAD` with five root listings — one
+  per probe — and passes with zero listings, zero metadata reads, and zero
+  manifest reads.
+- **Branch listing did not require its entitlement.** `authorize_branch_list`
+  had no `Feature::Branching` check, unlike fork and both activation paths, so
+  an unlicensed deployment with `enabled = true` received 200s from a licensed
+  route. Fixed in `4f8583c`.
+
+## Open defects, not fixed
+
+- **Concurrent policy writes exceed the request timeout.**
+  `security_policy_tests::policy_cas_conflict_second_writer_retries` and
+  `policy_cas_conflict_storm_is_bounded_and_retryable` fail on clean `HEAD`
+  (confirmed in an unmodified worktree, so not a regression from this pass).
+  Two concurrent grants return **408** instead of 201:
+  `acquire_claimed_publication` calls `publication_lease.acquire()` with no
+  retry, and `acquire()` fails immediately while the lease is held and
+  unexpired, so the second writer blocks past the server request timeout. This
+  is fallout from the global policy-publication lease introduced by `e5d9b36`.
+  Choosing between a bounded wait and a fail-fast 409 carrying `Retry-After` is
+  a design decision and was left open.
+- **`cargo clippy --all-targets -- -D warnings` is red on `main`** with 58
+  errors, predating this pass. Plan 10 lists it as a gate; it has never passed.
 
 ## Earlier branching evidence preserved
 
-These records predate deletion unification unless stated otherwise. They remain
-useful focused evidence, but they are not a substitute for rerunning plan 10 on
-the final Slice 10 commit.
+These records predate deletion unification unless stated otherwise. They are
+useful focused evidence, not a substitute for the plan 10 gates.
 
 | Area | Evidence |
 | --- | --- |
-| Namespace metadata/lifecycle | `3b14787`, `cb967eb`; `branch_fork_tests` lifecycle and retry cases |
-| Artifact origins and physical reads | `4d30aaa`, `4612b7e`; manifest origin tests |
-| Branch roots and exact generations | `d608135`, `cb967eb`; root-crash/retry MinIO cases |
-| Foreign-branch materialization | `a5f82d0`, `a45c25f`; activated materialization MinIO case and compaction unit suite |
-| Earlier graph deletion/root release | `d9d1c71`, `625cfb7`, `e833fc9`, `919d627`, `0d6f693`; source-child blocking, target-drop, pre-tombstone guard, and manifest-tolerant retry coverage, now superseded by the unified deletion path above |
-| Direct-child ordering/list contracts | `33908b0`, `897ef9b`, `e8ecb73`, `fcae0a1`, `0f585a5`, `12cf7d7`, `b8eb8bf`, `b1c61db`; target-order MinIO case, route/OpenAPI parity, and redacted fork response fields including source/target generations, with focused JSON-shape coverage |
-| Fork security gates | `a8ac7b8`, `3df5c20`, `0d43b7e`, `720d81e`, `bd65c94`, `b669470`, `a6bfb04`, `94077da`; policy non-widening, branching entitlement, distinct authorization, audited fork events, delegated fork capability, and central route-map checks; focused route/audit/delegation tests passed |
-| Adversarial branching vocabulary | `43fc06d`; `BranchingOp` has stable replay kind, namespace, and actor accessors for all five planned operations; `cargo test --test adversarial_workload_tests adversarial::ops` passed 5/5 after `b210e0e` |
-| Recorded branching integration gate | `TEST_BACKEND=minio cargo test --features branching-test-support --test branch_fork_tests -- --test-threads=1`; 20 passed in 60.92s on the then-current pre-unification HEAD |
-| Target namespace branch status | `4e2122c`, `922da4b`; namespace metadata carries only redacted branch ID/mode/depth/lifecycle/health/materialized/created-at fields for branch targets, with focused redaction-shape coverage |
-| OpenAPI target branch status | `c421edf`; `NamespaceResponse.branch` and the redacted `BranchStatusDescriptor` schema are documented in the versioned API contract |
-| Branch auth contract | `9472471`, `6d97f9e`; branch-list GET and branch-create POST use canonical OpenAPI auth/error response references; `cargo test --test contract_tests openapi_documents_bearer_security_for_every_protected_operation -- --exact` passed 1/1 |
-| OpenAPI route parity | `cargo test --test contract_tests openapi_documents_exact_routed_surface -- --exact` passed 1/1 after the branch contract additions |
-
-## Current validation status
-
-- The final implementation bundle passed `cargo fmt --all -- --check`,
-  `git diff --check`, shell syntax checks for both perf-contract drivers, and
-  `cargo check --tests --features branching-test-support` in 5m39s.
-- The new adversarial branching invariant self-tests passed 12/12. The
-  performance-contract target compiled, its branching census unit checks
-  passed, and the perf-contract driver self-test passed. The ignored MinIO
-  branching census was not run.
-- The full plan 07/08/10 MinIO matrix, formal reruns, recall gate, deterministic
-  fault campaign, independent reviews, and 1,800-second soak were deliberately
-  not run in this implementation pass. They remain release evidence, not a
-  reason to reopen already implemented phase architecture.
-
-## Historical adversarial findings preserved
-
-- The harness serialization blocker was fixed in `b210e0e` by recording
-  `ZeppelinError` as text in the oracle evidence payload. The two branching
-  vocabulary tests passed, but the full adversarial fault matrix remained
-  outstanding.
-- A bounded two-seed MinIO release smoke reached workload execution but failed
-  in then-existing model bookkeeping (`tests/adversarial/model.rs:487`): a
-  maintenance acknowledgement arrived for an unmodelled generated clone
-  namespace.
-- After `29d06a3`, the same smoke advanced further but seed 0 still failed: the
-  clone request returned 500, then a follow-up compact request created/served an
-  empty target namespace and the model had no clone target to apply against.
-  This recorded a reproducible clone/compact contract issue, not a
-  branching-vocabulary failure. Neither historical smoke is evidence for the
-  final branching profile required by plan 10.
+| Namespace metadata/lifecycle | `475d5cf`, `fb333ac`; `branch_fork_tests` lifecycle and retry cases |
+| Artifact origins and physical reads | `03bd4f9`, `93ef3af`; manifest origin tests |
+| Branch roots and exact generations | `fc5e34b`, `fb333ac`; root-crash/retry MinIO cases |
+| Direct-child ordering/list contracts | route/OpenAPI parity and redacted fork response fields including source/target generations |
+| Fork security gates | policy non-widening, branching entitlement, distinct authorization, audited fork events, delegated fork capability, central route-map checks |
+| Adversarial branching vocabulary | `BranchingOp` exposes stable replay kind, namespace, and actor accessors for all five planned operations |
+| Target namespace branch status | namespace metadata carries only redacted branch ID/mode/depth/lifecycle/health/materialized/created-at fields |
+| OpenAPI parity | `openapi_documents_exact_routed_surface` and `openapi_documents_bearer_security_for_every_protected_operation` pass |
 
 ## Phase 10 implementation closure
 
-- **Production governance:** fork activation now uses the persisted activation
+- **Production governance:** fork activation uses the persisted activation
   nonce, global policy-publication lease, policy-head CAS guard, durable
   activation evidence, activation-time no-widening reauthorization, and guarded
   cancellation/recovery paths.
-- **Deletion and disclosure:** Slice 10 is committed through `3db63c4`; filtered
-  child disclosure, root-release audit progress, grace-aware deletion
-  bookkeeping, and recovery readiness are wired.
-- **Writable materialization and clone:** `f9c6712` builds an exact authenticated
-  logical view into target-owned artifacts, preserves concurrent target WAL,
-  makes no-WAL manual materialization work, and supports copy clone from a
-  foreign-backed branch.
+- **Deletion and disclosure:** filtered child disclosure, root-release audit
+  progress, grace-aware deletion bookkeeping, and recovery readiness are wired.
+- **Writable materialization and clone:** `eadbd04` builds an exact
+  authenticated logical view into target-owned artifacts, preserves concurrent
+  target WAL, makes no-WAL manual materialization work, and supports copy clone
+  from a foreign-backed branch. Verified end to end for the first time in this
+  pass.
 - **Adversarial harness:** the stable branching profile generates fork, list,
-  ordinary divergent source/target writes and queries, compact, branch delete,
-  and blocked source delete. Its model tracks incarnations, roots, generation,
-  depth, materialization, lifecycle, grace, restart, foreign deletes, and the
-  no-merge invariant; replay metadata and oracle self-tests are wired.
+  divergent source/target writes and queries, compact, branch delete, and
+  blocked source delete, with model tracking for incarnations, roots,
+  generation, depth, materialization, lifecycle, grace, restart, foreign
+  deletes, and the no-merge invariant.
 - **Performance contract:** frozen tiny and one-million-logical-row fork census
-  scenarios assert zero artifact reads/copies/uploads, bounded control work,
-  physical-key query parity, ordinary branch WAL cost, first materialization
-  cost, subsequent local compaction, and separate product versus oracle counts.
+  scenarios exist but remain `#[ignore]`d and unrun.
 - **Operations:** `/readyz` exposes aggregate stalled Creating/Deleting intent
-  counts and total roots, Prometheus exports only bounded branch-state labels,
-  and the operator guide documents config plus entitlement activation,
-  source-delete blocking, copy clone, materialization cost, limits, and “fork
-  only; no merge.”
+  counts and total roots from the published snapshot, Prometheus exports only
+  bounded branch-state labels, and the operator guide documents config plus
+  entitlement activation, source-delete blocking, copy clone, materialization
+  cost, limits, readiness refresh cadence, and "fork only; no merge."
 
-## Release gates intentionally not claimed
+## Release gates still not claimed
 
-- The complete named remote-mutation/lost-ack fault campaign and deterministic
-  two-seed MinIO smoke were not executed in this pass.
-- The full HTTP/security/engine MinIO matrix, TLA variants, both-dataset recall
-  gate, independent reviews, and 1,800-second soak were not executed.
-- Branching therefore remains default-disabled. Explicit configuration and a
-  valid branching entitlement are still required for route exposure.
-- Optional SDK repositories remain out of scope because phase 09 was not
-  separately authorized in this checkout.
+None of the following ran in this pass or any earlier one:
 
-Therefore this ledger must not be treated as release approval or as evidence
-that branching is ready for production enablement.
+- the named remote-mutation/lost-acknowledgement fault campaign;
+- the deterministic two-seed MinIO smoke and recorded-artifact replay;
+- the performance-contract branching census (`#[ignore]`d, MinIO-only), so
+  zero-artifact-copy and corpus-size independence remain unproven by execution;
+- the both-dataset IVF recall gate;
+- TLA variant reruns;
+- independent standards and spec reviews;
+- the 1,800-second soak.
+
+Branching therefore remains default-disabled, and explicit configuration plus a
+valid branching entitlement are still required for route exposure. Optional SDK
+work stays out of scope because phase 09 was never authorized in this checkout.
+
+**This ledger is not release approval and must not be read as evidence that
+branching is ready for production enablement.**
