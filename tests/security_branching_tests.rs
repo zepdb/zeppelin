@@ -11,7 +11,8 @@ use common::fault_injection::{
 use common::harness::TestHarness;
 use common::server::{
     client_with_bearer, scoped_test_security_store, start_test_server_full,
-    start_test_server_on_store_with_config, start_test_server_with_config,
+    start_test_server_on_store_with_config, start_test_server_on_store_with_readiness,
+    start_test_server_with_config,
 };
 use serde_json::{json, Value};
 use zeppelin::config::Config;
@@ -61,13 +62,14 @@ async fn readyz_reports_bounded_orphan_root_repair_identity_without_storage_or_p
     let mut config = Config::default();
     config.branching.enabled = true;
     config.security.policy_refresh_secs = 3_600;
-    let (base_url, _cache, _cache_dir, admin_bearer) = start_test_server_on_store_with_config(
-        &harness,
-        harness.store.clone(),
-        Some(harness.prefix.clone()),
-        config,
-    )
-    .await;
+    let (base_url, _cache, _cache_dir, admin_bearer, readiness) =
+        start_test_server_on_store_with_readiness(
+            &harness,
+            harness.store.clone(),
+            Some(harness.prefix.clone()),
+            config,
+        )
+        .await;
     let client = client_with_bearer(&admin_bearer);
     let source = harness.artifact_origin_namespace("ready-orphan-source");
     let target = harness.artifact_origin_namespace("ready-orphan-target");
@@ -93,6 +95,12 @@ async fn readyz_reports_bounded_orphan_root_repair_identity_without_storage_or_p
     assert_eq!(fork.status(), reqwest::StatusCode::CREATED);
     let fork_body: Value = fork.json().await.expect("fork response must decode");
 
+    // Readiness answers from the snapshot background maintenance publishes, so
+    // each assertion below observes an explicit scan rather than a tick.
+    readiness
+        .refresh_readiness()
+        .await
+        .expect("healthy branch graph must scan cleanly");
     let healthy = client
         .get(format!("{base_url}/readyz"))
         .send()
@@ -110,6 +118,10 @@ async fn readyz_reports_bounded_orphan_root_repair_identity_without_storage_or_p
         .await
         .expect("fixture must remove only the exact child metadata object");
 
+    readiness
+        .refresh_readiness()
+        .await
+        .expect("orphan-root scan must complete and publish its finding");
     let response = client
         .get(format!("{base_url}/readyz"))
         .send()
@@ -196,14 +208,19 @@ async fn readyz_reports_bounded_orphan_root_repair_identity_without_storage_or_p
     public_config.branching.enabled = true;
     public_config.security.readyz_public = true;
     public_config.security.policy_refresh_secs = 3_600;
-    let (public_base_url, _public_cache, _public_cache_dir, _public_admin_bearer) =
-        start_test_server_on_store_with_config(
+    let (public_base_url, _public_cache, _public_cache_dir, _public_admin_bearer, public_readiness) =
+        start_test_server_on_store_with_readiness(
             &harness,
             harness.store.clone(),
             Some(harness.prefix.clone()),
             public_config,
         )
         .await;
+    // A second process observes the same durable defect through its own scan.
+    public_readiness
+        .refresh_readiness()
+        .await
+        .expect("public server must publish its own orphan-root scan");
     let public_response = reqwest::Client::new()
         .get(format!("{public_base_url}/readyz"))
         .send()

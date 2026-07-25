@@ -81,6 +81,7 @@ async fn start_batch_server(mut config: Config, counted: bool) -> BatchApiServer
         credential_adapter,
         namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
         namespace_name_prefix: None,
+        branch_readiness: zeppelin::namespace::BranchGraphReadinessSnapshot::new(),
         wal_writer: Arc::new(WalWriter::new(store.clone())),
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor: compactor.clone(),

@@ -20,7 +20,8 @@ use zeppelin::index::quantization::QuantizationType;
 use zeppelin::namespace::branching::test_support::{
     activate_fork_for_test, branch_control_snapshot, branch_metadata_snapshot,
     delete_namespace_for_test, list_children_for_test, maintain_branches_for_test,
-    prepare_fork_for_test, prepare_fork_until_reserved_for_test, prepare_fork_until_root_for_test,
+    prepare_fork_for_test, prepare_fork_until_activation_pending_for_test,
+    prepare_fork_until_reserved_for_test, prepare_fork_until_root_for_test,
     prepared_manifest_snapshot, publish_deletion_fence, resume_delete_for_test,
 };
 use zeppelin::namespace::branching::{
@@ -1572,6 +1573,76 @@ async fn maintenance_reports_but_never_executes_an_authorized_cancellation_inten
     .expect("fresh authorized retry must finish cancellation");
     harness.cleanup().await;
     assert_eq!(retried, NamespaceDeleteOutcome::Deleted);
+}
+
+/// Maintenance must still finish a cancellation that revoked an activation.
+///
+/// This is the counterpart to the preceding test. An intent carrying the
+/// activation nonce owns a retained policy guard that only the graph can
+/// release, so leaving it for a fresh authorized request would strand the
+/// guard. The nonce is therefore the exact discriminator between the two
+/// cases, and narrowing maintenance to it must not re-strand this one.
+#[tokio::test]
+async fn maintenance_resumes_an_activation_cancelled_fork() {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let source = harness.artifact_origin_namespace("activation-cancel-source");
+    let target = harness.artifact_origin_namespace("activation-cancel-target");
+    NamespaceManager::new(store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .expect("activation cancellation fixture source must be created");
+    prepare_fork_until_activation_pending_for_test(
+        store.clone(),
+        NamespaceId::new(source.clone()).expect("source namespace must be valid"),
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .expect("fixture must retain an activation attempt");
+
+    let reservation = branch_metadata_snapshot(&store, &target)
+        .await
+        .expect("activation cancellation reservation must be readable")
+        .reservation;
+    let evidence_key = format!(
+        "_audit/destruction/{}.json",
+        reservation.target_incarnation.to_string().replace('-', "")
+    );
+
+    // Interrupt the authorized cancellation after it has durably recorded the
+    // intent and its activation nonce, but before destruction evidence lands.
+    let (faulted_store, evidence_failure) = fail_put_once_matching(&store, evidence_key);
+    let interrupted = delete_namespace_for_test(
+        faulted_store,
+        NamespaceId::new(target.clone()).expect("target namespace must be valid"),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await;
+    assert!(interrupted.is_err());
+    assert_eq!(evidence_failure.failures_injected(), 1);
+
+    let report = maintain_branches_for_test(
+        store.clone(),
+        fork_indexing(),
+        fork_limits(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("maintenance must resume an activation-cancelled fork");
+    let roots_after = branch_control_snapshot(&store, &source)
+        .await
+        .expect("source branch control must remain readable")
+        .roots;
+    let metadata_after = store.get(&NamespaceMetadata::s3_key(&target)).await;
+    harness.cleanup().await;
+
+    assert_eq!(report.awaiting_authorized_cancellation, 0);
+    assert!(report.deletions_completed >= 1);
+    assert!(roots_after.is_empty());
+    assert!(metadata_after.is_err());
 }
 
 #[tokio::test]

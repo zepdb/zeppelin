@@ -29,7 +29,9 @@ use zeppelin::compaction::background::{
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{ApiKeyConfig, Config, SecurityMode};
 use zeppelin::fts::wal_cache::WalFtsCache;
-use zeppelin::namespace::NamespaceManager;
+use zeppelin::namespace::{
+    BranchGraphReadinessSnapshot, BranchReadinessObserver, NamespaceManager,
+};
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use zeppelin::security::{
     ApiKeyAdapter, AuditClient, AuditRecord, AuditRuntime, CredentialAdapter, EntitlementLimits,
@@ -710,6 +712,7 @@ async fn start_test_server_with_config_inner(
         credential_adapter,
         namespace_manager: namespace_manager(&config, &harness.store, &clock, &security),
         namespace_name_prefix: Some(harness.prefix.clone()),
+        branch_readiness: BranchGraphReadinessSnapshot::new(),
         wal_writer: Arc::new(WalWriter::with_clock(harness.store.clone(), clock)),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         compactor,
@@ -766,8 +769,31 @@ pub async fn start_test_server_on_store_with_config(
     harness: &TestHarness,
     store: ZeppelinStore,
     namespace_name_prefix: Option<String>,
-    mut config: Config,
+    config: Config,
 ) -> (String, Arc<DiskCache>, tempfile::TempDir, String) {
+    let (base_url, cache, cache_dir, admin_bearer, _readiness) =
+        start_test_server_on_store_with_readiness(harness, store, namespace_name_prefix, config)
+            .await;
+    (base_url, cache, cache_dir, admin_bearer)
+}
+
+/// Same server, plus a worker that can publish one branch-readiness scan.
+///
+/// Readiness is answered from a snapshot that background maintenance owns.
+/// This helper hands tests the scanning seam so they can observe a graph defect
+/// deterministically instead of waiting on a maintenance tick.
+pub async fn start_test_server_on_store_with_readiness(
+    harness: &TestHarness,
+    store: ZeppelinStore,
+    namespace_name_prefix: Option<String>,
+    mut config: Config,
+) -> (
+    String,
+    Arc<DiskCache>,
+    tempfile::TempDir,
+    String,
+    GovernedDeletionWorker,
+) {
     zeppelin::metrics::init();
 
     configure_test_server_limits(&mut config);
@@ -799,6 +825,21 @@ pub async fn start_test_server_on_store_with_config(
         start_test_audit(&config, &store, Some(&harness.prefix), &security).await;
     let server_tasks = Arc::new(ServerTaskSupervisor::new());
     let compaction_lifecycle = CompactionLifecycle::new();
+    let manifest_cache_for_readiness = Arc::new(ManifestCache::new(Duration::from_millis(
+        config.cache.manifest_cache_ttl_ms,
+    )));
+    let namespace_manager_handle = namespace_manager(&config, &store, &clock, &security);
+    let readiness = BranchReadinessObserver::scoped(namespace_name_prefix.clone());
+    let readiness_worker = GovernedDeletionWorker::new(
+        store.clone(),
+        namespace_manager_handle.clone(),
+        lease_manager.clone(),
+        clock.clone(),
+        manifest_cache_for_readiness,
+        &config,
+        security.clone(),
+        readiness.clone(),
+    );
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
@@ -806,8 +847,9 @@ pub async fn start_test_server_on_store_with_config(
         security: Arc::clone(&security),
         audit,
         credential_adapter,
-        namespace_manager: namespace_manager(&config, &store, &clock, &security),
+        namespace_manager: namespace_manager_handle,
         namespace_name_prefix,
+        branch_readiness: readiness.snapshot,
         wal_writer: Arc::new(WalWriter::with_clock(store.clone(), clock)),
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor,
@@ -839,7 +881,7 @@ pub async fn start_test_server_on_store_with_config(
     )
     .await;
 
-    (base_url, cache, cache_dir, admin_bearer)
+    (base_url, cache, cache_dir, admin_bearer, readiness_worker)
 }
 
 /// Start a test server that also returns the `Arc<Compactor>` for manual compaction triggering.
@@ -895,6 +937,7 @@ pub async fn start_test_server_with_compactor(
         credential_adapter,
         namespace_manager: namespace_manager(&config, &harness.store, &clock, &security),
         namespace_name_prefix: None,
+        branch_readiness: BranchGraphReadinessSnapshot::new(),
         wal_writer: Arc::new(WalWriter::with_clock(harness.store.clone(), clock)),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         compactor: compactor.clone(),
@@ -968,6 +1011,7 @@ pub async fn start_test_server_with_compaction(
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(500)));
     let lease_manager = lease_manager(&config, &harness.store, &clock);
     let compaction_lifecycle = CompactionLifecycle::new();
+    let branch_readiness = BranchReadinessObserver::scoped(Some(harness.prefix.clone()));
     let deletion_worker = GovernedDeletionWorker::new(
         harness.store.clone(),
         namespace_manager.clone(),
@@ -976,6 +1020,7 @@ pub async fn start_test_server_with_compaction(
         manifest_cache.clone(),
         &config,
         security.clone(),
+        branch_readiness.clone(),
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let gc_config = config.gc.clone();
@@ -1024,6 +1069,7 @@ pub async fn start_test_server_with_compaction(
         credential_adapter,
         namespace_manager: Arc::clone(&namespace_manager),
         namespace_name_prefix: Some(harness.prefix.clone()),
+        branch_readiness: branch_readiness.snapshot,
         wal_writer: Arc::new(WalWriter::with_clock(harness.store.clone(), clock)),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         compactor,
@@ -1588,6 +1634,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(
         config.cache.manifest_cache_ttl_ms,
     )));
+    let branch_readiness = BranchReadinessObserver::scoped(namespace_name_prefix.clone());
     let deletion_worker = GovernedDeletionWorker::new(
         store.clone(),
         namespace_manager.clone(),
@@ -1596,6 +1643,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         manifest_cache.clone(),
         &config,
         security.clone(),
+        branch_readiness.clone(),
     );
 
     let mut compaction_loop_task = None;
@@ -1666,6 +1714,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         credential_adapter,
         namespace_manager: Arc::clone(&namespace_manager),
         namespace_name_prefix,
+        branch_readiness: branch_readiness.snapshot,
         wal_writer: wal_writer.clone(),
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor: compactor.clone(),

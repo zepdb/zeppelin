@@ -678,7 +678,6 @@ fn decode_digest(encoded: &str) -> std::result::Result<[u8; 32], &'static str> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use crate::config::{StorageBackend, StorageConfig};
     use crate::time::TimeSource;
 
     use super::*;
@@ -709,13 +708,15 @@ mod tests {
         }
     }
 
-    fn local_store() -> (tempfile::TempDir, ZeppelinStore) {
-        let directory = tempfile::tempdir().expect("policy lease tempdir");
-        let mut config = StorageConfig::default();
-        config.backend = StorageBackend::Local;
-        config.bucket = directory.path().to_string_lossy().into_owned();
-        let store = ZeppelinStore::from_config(&config).expect("local ZeppelinStore");
-        (directory, store)
+    /// Build a store whose backend actually implements ETag compare-and-swap.
+    ///
+    /// `object_store`'s `LocalFileSystem` returns `NotImplemented` for
+    /// `PutMode::Update`, so a local-backed store fails these cases before
+    /// they can assert anything about lease acquisition or release. The
+    /// in-memory backend supports conditional writes and therefore exercises
+    /// the exact create-only and CAS semantics this lease depends on.
+    fn cas_store() -> ZeppelinStore {
+        ZeppelinStore::new(Arc::new(object_store::memory::InMemory::new()))
     }
 
     #[test]
@@ -728,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_acquisition_is_create_only_and_release_keeps_a_cas_record() {
-        let (_directory, store) = local_store();
+        let store = cas_store();
         let now = Utc::now();
         let clock = Clock::from_source(Arc::new(AdjustableClock::new(now)));
         let first = PolicyPublicationLease::with_clock(
@@ -775,7 +776,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_takeover_increments_token_and_stale_release_cannot_overwrite() {
-        let (_directory, store) = local_store();
+        let store = cas_store();
         let source = Arc::new(AdjustableClock::new(Utc::now()));
         let clock = Clock::from_source(source.clone());
         let first = PolicyPublicationLease::with_clock(

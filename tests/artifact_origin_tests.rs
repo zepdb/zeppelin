@@ -458,7 +458,7 @@ async fn synthetic_target_routes_flat_sq_bitmap_attrs_bm25_cache_and_reachabilit
         let error = view
             .classify_target_sweep_candidate(key.clone())
             .expect_err("foreign reachable artifacts must never enter the target sweep");
-        assert!(error.to_string().contains("cannot delete foreign key"));
+        assert!(error.to_string().contains("cannot delete unowned key"));
     }
     let target_owned_candidate = format!("{target}/segments/local-probe/manifest.json");
     assert_eq!(

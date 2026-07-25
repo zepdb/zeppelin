@@ -2225,6 +2225,7 @@ async fn test_background_compaction_accepts_missing_manifest_while_deleting() {
         manifest_cache.clone(),
         &config,
         security,
+        zeppelin::namespace::BranchReadinessObserver::unscoped(),
     );
     let compaction_lifecycle = zeppelin::compaction::background::CompactionLifecycle::new();
     let failures =
@@ -2360,6 +2361,7 @@ async fn test_background_compaction_resumes_active_governed_deletion_intent() {
         manifest_cache.clone(),
         &worker_config,
         security,
+        zeppelin::namespace::BranchReadinessObserver::scoped(Some(harness.prefix.clone())),
     );
     let compaction_lifecycle = zeppelin::compaction::background::CompactionLifecycle::new();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

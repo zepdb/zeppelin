@@ -195,7 +195,9 @@ async fn create_compacted_source_and_fresh_branch(
 }
 
 async fn delete_until_missing(client: &reqwest::Client, base_url: &str, namespace: &str) {
-    for _ in 0..20 {
+    // Bounded generously: each pass may legitimately lose a lease or policy-head
+    // race to background maintenance before deletion can make progress.
+    for _ in 0..120 {
         let status = client
             .get(format!("{base_url}/v1/namespaces/{namespace}"))
             .send()
@@ -215,6 +217,24 @@ async fn delete_until_missing(client: &reqwest::Client, base_url: &str, namespac
             .send()
             .await
             .expect("namespace deletion retry must complete");
+        // Governed deletion competes for the namespace write lease and CASes
+        // the global policy head to release branch activation guards, so it
+        // legitimately loses both races against concurrent background
+        // maintenance and compaction. Those conflicts are advertised as
+        // retryable; this bounded loop is the caller that honors that contract.
+        // A conflict that is *not* retryable is a real defect and still fails.
+        if response.status() == StatusCode::CONFLICT {
+            let body: serde_json::Value = response
+                .json()
+                .await
+                .expect("namespace deletion conflict body must be readable");
+            assert_eq!(
+                body["retryable"], true,
+                "a non-retryable conflict must never interrupt deletion: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
         assert!(
             matches!(
                 response.status(),
@@ -260,6 +280,65 @@ async fn strong_query_ids(
                 .to_string()
         })
         .collect()
+}
+
+/// Readiness must not scan the namespace graph on the request path.
+///
+/// The scan is O(namespaces) in strong reads. Charging it to every probe made
+/// readiness cost scale with deployment size and let one transient
+/// per-namespace read failure evict an otherwise healthy process. Background
+/// maintenance owns the scan now, so a probe issues no namespace work at all —
+/// and with branching disabled no scan ever runs.
+#[tokio::test]
+async fn readiness_probes_never_scan_the_namespace_graph() {
+    let harness = TestHarness::new().await;
+    let (counting, counter) = common::counting::counting_store(&harness.store);
+    let mut config = Config::default();
+    // Explicitly the default posture: branching off.
+    config.branching.enabled = false;
+    config.security.readyz_public = true;
+    let (base_url, _cache, _cache_dir, admin_bearer) = start_test_server_on_store_with_config(
+        &harness,
+        counting,
+        Some(harness.prefix.clone()),
+        config,
+    )
+    .await;
+    let client = client_with_bearer(&admin_bearer);
+
+    // Several namespaces exist, so a per-probe scan would be clearly visible.
+    for suffix in ["readyz-cost-one", "readyz-cost-two", "readyz-cost-three"] {
+        let namespace = harness.artifact_origin_namespace(suffix);
+        create_namespace(&client, &base_url, &namespace).await;
+    }
+
+    counter.reset();
+    for _ in 0..5 {
+        let response = client
+            .get(format!("{base_url}/readyz"))
+            .send()
+            .await
+            .expect("readiness probe must complete");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let root_listings = counter.delimiter_list_calls_for_prefix("");
+    let metadata_gets = counter.gets_matching("meta.json");
+    let manifest_gets = counter.gets_matching("manifest.json");
+    harness.cleanup().await;
+
+    assert_eq!(
+        root_listings, 0,
+        "readiness must not enumerate namespaces at the storage root"
+    );
+    assert_eq!(
+        metadata_gets, 0,
+        "readiness must not read namespace metadata"
+    );
+    assert_eq!(
+        manifest_gets, 0,
+        "readiness must not read namespace manifests"
+    );
 }
 
 #[tokio::test]
@@ -830,6 +909,9 @@ async fn owned_clone_survives_materialization_and_deletion_of_its_branch_ancestr
     let mut config = Config::default();
     config.branching.enabled = true;
     config.security.policy_refresh_secs = 3_600;
+    // Enforced security mode requires a cursor HMAC key. Without it this
+    // config fails production validation before any branching work runs.
+    config.security.set_cursor_hmac_key_hex("42".repeat(32));
     config.cache.manifest_cache_ttl_ms = 0;
     config.cache.namespace_registry_ttl_ms = 0;
     config.server.request_timeout_secs = 30;
