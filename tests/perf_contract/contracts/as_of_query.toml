@@ -28,10 +28,10 @@ top_k = 10
 query_index = 0
 
 [baseline]
-git_rev = "ade36ce7c6f22c91ba8ee0cf5d74796f448ebca8"
-captured = "2026-07-12T04:41:16Z"
+git_rev = "437e9ffeafba7a5e34ed1e0a7df6914330f6f6e0"
+captured = "2026-07-25T06:10:54Z"
 approved_by = "anup"
-reason = "Rebaseline after ade36ce preserves manifest namespace identity while removing verification GETs; operations, depth, and quantized artifact bytes are unchanged."
+reason = "Byte-only rebaseline at 437e9ff. The security and branching tracks add 13 persisted manifest fields; the receipt artifact inventory (`artifact_hashes`, bb51e04) dominates and is populated unconditionally, roughly doubling serialized manifest size. Accepted as the intended cost of receipts. Operation counts, key counts, critical-path depth, and quantized artifact bytes are unchanged and were NOT re-approved."
 
 [assert.depth.get]
 mode = "exact"
@@ -85,10 +85,14 @@ exact = 429027
 exact = 0
 
 [assert.get_bytes.manifest]
-exact = 2545
+min = 5534
+max = 5678
+why = "manifest-shaped objects encode timestamps at variable width, so this count is not byte-deterministic: 5 samples on 437e9ff spanned 5598..5614 (16 B). Band is 4x the observed spread (min 32 B), which absorbs the jitter while still failing on a doubling or a disappearance."
 
 [assert.get_bytes.other]
-exact = 2511
+min = 5301
+max = 5571
+why = "manifest-shaped objects encode timestamps at variable width, so this count is not byte-deterministic: 5 samples on 437e9ff spanned 5421..5451 (30 B). Band is 4x the observed spread (min 32 B), which absorbs the jitter while still failing on a doubling or a disappearance."
 
 [assert.get_bytes.sketch]
 exact = 0
@@ -97,7 +101,9 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-exact = 434083
+min = 439878
+max = 440256
+why = "manifest-shaped objects encode timestamps at variable width, so this count is not byte-deterministic: 5 samples on 437e9ff spanned 440046..440088 (42 B). Band is 4x the observed spread (min 32 B), which absorbs the jitter while still failing on a doubling or a disappearance."
 
 [assert.get_bytes.wal]
 exact = 0

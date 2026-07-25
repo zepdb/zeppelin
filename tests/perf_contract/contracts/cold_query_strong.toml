@@ -28,10 +28,10 @@ top_k = 10
 query_index = 0
 
 [baseline]
-git_rev = "ade36ce7c6f22c91ba8ee0cf5d74796f448ebca8"
-captured = "2026-07-12T04:41:16Z"
+git_rev = "437e9ffeafba7a5e34ed1e0a7df6914330f6f6e0"
+captured = "2026-07-25T06:10:54Z"
 approved_by = "anup"
-reason = "Rebaseline after ade36ce preserves manifest namespace identity while removing verification GETs; operations, depth, and quantized artifact bytes are unchanged."
+reason = "Byte-only rebaseline at 437e9ff. The security and branching tracks add 13 persisted manifest fields; the receipt artifact inventory (`artifact_hashes`, bb51e04) dominates and is populated unconditionally, roughly doubling serialized manifest size. Accepted as the intended cost of receipts. Operation counts, key counts, critical-path depth, and quantized artifact bytes are unchanged and were NOT re-approved."
 
 [assert.depth.get]
 mode = "max"
@@ -87,11 +87,12 @@ why = "capture pins the seven measured cluster GETs"
 exact = 0
 
 [assert.get_bytes.manifest]
-exact = 2655
-why = "fresh manifest serialization includes generation and timestamps"
+min = 5643
+max = 5715
+why = "manifest-shaped objects encode timestamps at variable width, so this count is not byte-deterministic: 5 samples on 437e9ff spanned 5675..5683 (8 B). Band is 4x the observed spread (min 32 B), which absorbs the jitter while still failing on a doubling or a disappearance."
 
 [assert.get_bytes.other]
-exact = 648
+exact = 693
 why = "fresh namespace metadata GET"
 
 [assert.get_bytes.sketch]
@@ -101,7 +102,9 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-exact = 730219
+min = 733252
+max = 733324
+why = "manifest-shaped objects encode timestamps at variable width, so this count is not byte-deterministic: 5 samples on 437e9ff spanned 733284..733292 (8 B). Band is 4x the observed spread (min 32 B), which absorbs the jitter while still failing on a doubling or a disappearance."
 
 [assert.get_bytes.wal]
 exact = 0
