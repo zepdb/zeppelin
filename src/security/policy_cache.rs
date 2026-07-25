@@ -1,4 +1,153 @@
 //! Disposable compiled-policy cache with bounded S3 revalidation.
+//!
+//! Authorization runs on every protected request, but the authoritative policy
+//! lives in object storage. This file is the seam between those two facts: it
+//! holds one compiled generation of the policy in memory, revalidates it
+//! against S3 on a bounded interval, and refuses to answer once that copy is
+//! older than its budget. The cached copy is an accelerator with an expiry
+//! date, never an authority — it can only ever be a faithful echo of a head
+//! that [`PolicyStore`] already verified.
+//!
+//! What this file deliberately does **not** own:
+//!
+//! - authoritative state, key layout, or CAS discipline — that is
+//!   `policy_store.rs`, reached only through [`PolicyStore`];
+//! - the authorization rules themselves. [`CompiledPolicy`] (in `policy.rs`)
+//!   evaluates a principal against an action and resource; this file only
+//!   decides *which* compiled generation is allowed to answer;
+//! - the admission decision, its obligations, and its audit record — that is
+//!   `kernel.rs`;
+//! - lease and fencing mechanics — that is `policy_publication.rs`;
+//! - HTTP concerns. No handler touches this file directly.
+//!
+//! ## Where this sits
+//!
+//! `SecurityKernel::from_store` builds the cache once at boot with
+//! [`PolicyCache::start`], handing it the [`LoadedPolicy`] that bootstrap
+//! already verified. From then on there are three classes of caller:
+//!
+//! - **read path** — `SecurityKernel` authorizes an action through
+//!   [`PolicyCache::current`] plus [`PolicyCache::is_fresh`], and
+//!   [`super::ApiKeyAdapter`] authenticates a bearer digest through
+//!   [`PolicyCache::current`] and reports staleness through
+//!   [`PolicyCache::freshness`]. Neither performs any object-store I/O.
+//! - **administration path** — `create_principal`, `create_key`, `revoke_key`,
+//!   `rotate_key`, `add_grant`, and `remove_grant` authorize the mutation
+//!   against the freshly reloaded authoritative snapshot, publish a new version
+//!   through [`PolicyStore`], and write the result back through the cache.
+//! - **branch activation path** — `begin_branch_activation` and its
+//!   finalize/abort/recovery counterparts hold the global publication lease
+//!   across caller-supplied validation so namespace branch activation
+//!   linearizes against policy.
+//!
+//! ## Authority versus cache
+//!
+//! ```text
+//!  authoritative (S3 / MinIO)              disposable (this process)
+//!  --------------------------              -------------------------
+//!  _security/heads/policy.json  ---------> CachedPolicy {
+//!    version, checksum, ETag,                  policy:   CompiledPolicy
+//!    control revision                          snapshot: PolicySnapshot
+//!         | selects exactly one                head, head_etag
+//!         v                                    last_confirmed: Instant
+//!  _security/policies/<ulid>.json  ------> }
+//!                                              ^
+//!            conditional GET (If-None-Match)   |
+//!            every refresh_interval  ----------+
+//!
+//!  last_confirmed older than 2x refresh_interval
+//!            |
+//!            v
+//!  is_fresh() == false  ->  DenyReason::SecurityStale
+//!  (the kernel denies; it never serves the stale copy)
+//! ```
+//!
+//! A refresh that fails leaves the previously verified generation in place and
+//! logs an error. That is not silent degradation: the freshness budget keeps
+//! running, so a cache that cannot revalidate stops authorizing on its own.
+//!
+//! ## Reading map
+//!
+//! 1. [`CachedPolicy`] — one installed generation: compiled rules, the snapshot
+//!    behind them, the head and its ETag, and the monotonic instant at which
+//!    that head was last confirmed authoritative.
+//! 2. [`PolicyCache::start`] and `refresh_loop` — construction and the owned
+//!    background revalidation task.
+//! 3. [`PolicyCache::current`] / [`PolicyCache::is_fresh`] — the short read
+//!    path every request takes.
+//! 4. `PolicyCache::install_into` and `PolicyCache::install_refreshed_into` —
+//!    the two monotonicity gates. Read these before changing anything else.
+//! 5. `PolicyCache::publish_mutation` — the bounded read-authorize-build-CAS
+//!    retry loop shared by all administrative mutations.
+//! 6. The `*_branch_activation` family — lease-held activation guards.
+//! 7. [`PolicyCache::shutdown_refresh_task`] and the [`Drop`] impl — task
+//!    lifetime.
+//!
+//! ## Invariants
+//!
+//! - **Cache never outranks S3.** Every installed generation originates from a
+//!   [`LoadedPolicy`] that [`PolicyStore`] verified against the authoritative
+//!   head. Nothing is synthesized locally.
+//! - **Staleness denies; it does not degrade.** Beyond twice the refresh
+//!   interval the kernel returns `DenyReason::SecurityStale` and administration
+//!   reads refuse outright.
+//! - **Installation is monotonic.** A head whose control revision regressed is
+//!   rejected on both install paths. A version reused with a different checksum
+//!   is rejected on both paths too — that would mean the authoritative history
+//!   forked. The two paths differ only on an older version: a background
+//!   refresh that observes one treats it as an authority regression and errors,
+//!   while a write-through install of a version already superseded locally is a
+//!   harmless no-op.
+//! - **A write-through install inherits the CAS completion instant**, not the
+//!   moment of installation, so publishing cannot silently extend the freshness
+//!   budget past the point where the head was actually confirmed.
+//! - **Administrative mutations re-authorize per attempt.** Each CAS attempt
+//!   reloads the authoritative snapshot and re-checks `SecurityAdminWrite`
+//!   against it, so a revocation that lands mid-retry takes effect immediately.
+//! - **Failures keep their decision.** [`SecurityOperationError`] carries the
+//!   exact allow or deny that was evaluated, so an operation that fails after
+//!   authorization still produces a truthful audit record.
+//! - **Secrets are never cached.** `generate_api_key` returns the plaintext key
+//!   to its one caller; only the SHA-256 digest is persisted or stored here.
+//! - **A poisoned lock panics.** Recovering a possibly-torn security cache is
+//!   not a supported degraded mode.
+//!
+//! ## Cost
+//!
+//! The read path is one `RwLock` read plus one `Arc` clone — no allocation of
+//! policy data and no I/O. Revalidation is one conditional GET per interval
+//! when nothing changed, and one additional GET plus a recompile when it did.
+//! An administrative mutation costs a full [`PolicyStore`] publication
+//! (lease, snapshot PUT, head CAS) and recompiles the policy once.
+//!
+//! ## Rust concepts used here
+//!
+//! The cache is `RwLock<Arc<CachedPolicy>>`, not `RwLock<CachedPolicy>`.
+//! Readers take the lock only long enough to bump a reference count, then
+//! evaluate against their own `Arc` after the guard is dropped. A generation
+//! installed mid-request therefore cannot tear a decision in progress, and no
+//! lock is ever held across an `.await`. Java's nearest analogy is publishing
+//! an immutable object through a volatile field; C's is a refcounted
+//! read-copy-update pointer swap — except the Rust compiler, not convention,
+//! enforces that nobody mutates the shared generation in place.
+//!
+//! `refresh_loop` receives a [`Weak`] handle to the cache rather than an
+//! [`Arc`]. A
+//! spawned Tokio task outlives its spawner unless something stops it, and an
+//! owning handle would make the cache immortal: it would keep its
+//! [`PolicyStore`] and object-store client alive forever. With a `Weak`, the
+//! upgrade fails once the last real owner drops, and the task returns on its
+//! own. The [`Drop`] impl aborts the task as a backstop, and
+//! [`PolicyCache::shutdown_refresh_task`] is the deterministic path used when a
+//! kernel retires while the process keeps running.
+//!
+//! `publish_mutation` takes `F: Fn(&PolicySnapshot, DateTime<Utc>) -> Result<PolicySnapshot>`.
+//! `Fn` rather than `FnOnce` is the contract that matters: after a CAS
+//! conflict, the loop must rebuild the candidate against a newly reloaded base,
+//! so the closure has to be callable more than once. `begin_branch_activation`
+//! is the opposite case — its validator runs exactly once and is therefore
+//! `FnOnce` returning a `Future`, which lets a caller `.await` object-store work
+//! while this cache still holds the publication lease.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock, Weak};

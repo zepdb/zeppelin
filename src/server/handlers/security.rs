@@ -1,4 +1,193 @@
 //! Thin HTTP administration over the S3-authoritative security kernel.
+//!
+//! Every `/v1/security/*` request lands here. This file is transport only: it
+//! decodes a JSON body, converts raw strings into the security newtypes,
+//! invokes exactly one [`SecurityKernel`](crate::security::SecurityKernel) operation, annotates
+//! the request-scoped [`AuditRequest`](crate::server::AuditRequest), and chooses a status code. It owns the
+//! wire shapes (the request/response structs below) and nothing else.
+//!
+//! It deliberately does **not** own:
+//!
+//! - **Authentication or authorization.** `secure_route` in [`server`](crate::server)
+//!   wraps each route with the `authenticate` then `authorize` middleware.
+//!   Authorization consults the central route map
+//!   ([`classify_route`](crate::security::classify_route) over
+//!   [`ROUTE_ACTIONS`](crate::security::ROUTE_ACTIONS)); a route absent from that map fails
+//!   closed with [`SecurityError::UnmappedRoute`](crate::security::SecurityError::UnmappedRoute) rather than defaulting to
+//!   public. Adding a handler here without a route-map entry and an
+//!   `api/zeppelin-api.yaml` entry breaks `tests/contract_tests.rs`.
+//! - **Policy state or its publication.** The authoritative policy document
+//!   lives in `_security/` on S3/MinIO. `crate::security::policy_cache`
+//!   re-loads the head, re-authorizes the mutation against the exact snapshot
+//!   it is about to replace, and publishes with a bounded-retry ETag CAS. This
+//!   layer never touches [`storage`](crate::storage) and holds no policy of its own.
+//! - **Credential material.** Key and token secrets are generated, hashed, and
+//!   signed inside `crate::security`; this file only relays the one-time
+//!   plaintext to the caller.
+//! - **Audit delivery.** Handlers annotate; the `authorize` middleware submits
+//!   the record after the response settles.
+//!
+//! ## Routes
+//!
+//! All are registered by `security_routes`, merged into the non-query router in
+//! [`build_router`](crate::server::build_router). `:key_id` and `:lock_id` use axum 0.7
+//! parameter syntax.
+//!
+//! | Method and path | [`Action`](crate::security::Action) | Handler | Success |
+//! | --- | --- | --- | --- |
+//! | `GET /v1/security/principals` | `SecurityAdminRead` | [`list_principals`](crate::server::handlers::security::list_principals) | 200 |
+//! | `POST /v1/security/principals` | `SecurityAdminWrite` | [`create_principal`](crate::server::handlers::security::create_principal) | 201 |
+//! | `GET /v1/security/keys` | `SecurityAdminRead` | [`list_keys`](crate::server::handlers::security::list_keys) | 200 |
+//! | `POST /v1/security/keys` | `SecurityAdminWrite` | [`create_key`](crate::server::handlers::security::create_key) | 201 |
+//! | `DELETE /v1/security/keys/:key_id` | `SecurityAdminWrite` | [`revoke_key`](crate::server::handlers::security::revoke_key) | 200 |
+//! | `POST /v1/security/keys/:key_id/rotate` | `SecurityAdminWrite` | [`rotate_key`](crate::server::handlers::security::rotate_key) | 201 |
+//! | `GET /v1/security/grants` | `SecurityAdminRead` | [`list_grants`](crate::server::handlers::security::list_grants) | 200 |
+//! | `POST /v1/security/grants` | `SecurityAdminWrite` | [`create_grant`](crate::server::handlers::security::create_grant) | 201 |
+//! | `DELETE /v1/security/grants` | `SecurityAdminWrite` | [`delete_grant`](crate::server::handlers::security::delete_grant) | 200 |
+//! | `GET /v1/security/policy` | `SecurityAdminRead` | [`get_policy`](crate::server::handlers::security::get_policy) | 200 |
+//! | `POST /v1/security/tokens` | `CredentialDelegate` | [`mint_token`](crate::server::handlers::security::mint_token) | 201 |
+//! | `GET /v1/security/preservation` | `PreservationAdmin` | [`list_preservation_locks`](crate::server::handlers::security::list_preservation_locks) | 200 |
+//! | `POST /v1/security/preservation` | `PreservationAdmin` | [`create_preservation_lock`](crate::server::handlers::security::create_preservation_lock) | 201 |
+//! | `POST /v1/security/preservation/:lock_id/release` | `PreservationRelease` | [`release_preservation_lock`](crate::server::handlers::security::release_preservation_lock) | 200 |
+//!
+//! `DELETE /v1/security/grants` carries a JSON body ([`GrantRemovalRequest`](crate::server::handlers::security::GrantRemovalRequest)),
+//! because a grant is identified by its principal/scope/actions binding rather
+//! than by a path-addressable ID.
+//!
+//! ## Licensing and registration gates
+//!
+//! The paths always exist; only the service behind them changes, so an
+//! unlicensed deployment returns 403 rather than 404.
+//!
+//! - RBAC paths are bound to these handlers only when the boot-time
+//!   entitlement set has [`Feature::Rbac`](crate::security::Feature::Rbac); otherwise every
+//!   method is bound to a stub returning `feature_not_licensed` (403). The
+//!   same pattern gates `/v1/security/tokens` on `Feature::Delegation` and the
+//!   preservation paths on `Feature::Preservation`.
+//! - Every **mutating** route additionally carries the
+//!   `enforce_security_management_license` layer, which rejects with
+//!   [`SecurityError::LicenseExpired`](crate::security::SecurityError::LicenseExpired) (403) while management is frozen. That
+//!   check is per-request; the route-selection gate above is evaluated once at
+//!   router build, so a license change requires a restart to remount handlers.
+//!
+//! ## Validation here versus in the kernel
+//!
+//! This layer performs only syntactic validation:
+//!
+//! - `#[serde(deny_unknown_fields)]` on every request body. An unknown or
+//!   ill-typed field is rejected by the axum extractor before the handler runs
+//!   (415/422 per `tests/contract_tests.rs`), never silently ignored.
+//! - Newtype parsing through `parse_principal_id`, `parse_api_key_id`, and
+//!   [`NamespaceId::new`](crate::security::NamespaceId::new), each mapped to
+//!   [`SecurityError::InvalidPolicyRequest`](crate::security::SecurityError::InvalidPolicyRequest) (400 `invalid_security_request`),
+//!   and through [`PreservationLockId::new`](crate::security::PreservationLockId::new), which surfaces
+//!   [`SecurityError::InvalidPreservationRequest`](crate::security::SecurityError::InvalidPreservationRequest) (400
+//!   `invalid_preservation_request`).
+//!
+//! Everything semantic belongs to the kernel and is *not* duplicated here:
+//! whether the actor may administer policy, whether the principal exists,
+//! whether a delegated narrowing stays inside its parent's authority, whether
+//! a key is already revoked, and whether the CAS publication won.
+//!
+//! ## Error mapping
+//!
+//! Handlers return [`ApiError`], which renders through the shared canonical
+//! envelope; the status comes from `SecurityError::status_code`. The mapping
+//! that matters on this surface:
+//!
+//! | Condition | Status | Code |
+//! | --- | --- | --- |
+//! | Unauthenticated or unknown/expired credential | 401 | authn code |
+//! | Not granted, unlicensed feature, expired license, approval missing | 403 | `forbidden`, `feature_not_licensed`, `license_expired`, `approval_required` |
+//! | Stale policy cache (`SecurityStale`) | 403 | fail-closed, never served stale |
+//! | Malformed ID, delegation exceeding parent, already-revoked key | 400 | `invalid_security_request`, `delegation_scope_exceeds_parent` |
+//! | Unknown principal, key, grant, or lock | 404 | `security_entity_not_found`, `preservation_lock_not_found` |
+//! | Duplicate entity, exhausted CAS retries, lock conflict | 409 | `security_entity_exists`, `security_conflict`, `preservation_conflict` |
+//! | Preservation state could not be refreshed | 503 | `preservation_state_unavailable` |
+//!
+//! Retrying a successful mutation is **not** safe: there is no request-ID
+//! dedup, each success publishes a new [`PolicyVersion`](crate::security::PolicyVersion), and the minting
+//! routes return fresh secret material every time. Repeating a completed
+//! mutation surfaces the domain's own answer instead — 409 for a duplicate
+//! principal or grant, 404 for an already-removed grant, 400 for an
+//! already-revoked key.
+//!
+//! ## Request path
+//!
+//! ```text
+//! POST /v1/security/...
+//!        |
+//!        v
+//! authenticate  -- no/!bad credential --> 401
+//!        |
+//!        v
+//! authorize (route map -> kernel decision)
+//!        |  |-- deny ---------------------> 403 + audited denial
+//!        |  |-- Approval obligation -------> second approver header or 403
+//!        |  inserts AllowDecision + AuditRequest extensions
+//!        v
+//! license layer (mutations only) -- frozen --> 403 license_expired
+//!        |
+//!        v
+//! this handler: decode JSON, parse newtypes -- invalid --> 400
+//!        |
+//!        v
+//! SecurityKernel op: re-authorize against the freshly loaded
+//! policy head, then ETag-CAS publish to S3/MinIO
+//!        |  |-- CAS lost after bounded retries --> 409 security_conflict
+//!        v
+//! write new snapshot through to this node's cache; annotate AuditRequest
+//!        |
+//!        v
+//! authorize middleware submits the audit record with the response
+//! ```
+//!
+//! ## Authority invariants
+//!
+//! - **Authorization is central, and this file must never be the only place a
+//!   check exists.** Each handler binds `Extension<AllowDecision>` as
+//!   `_decision` purely as proof that the `authorize` middleware ran: if the
+//!   extension is absent the request fails before any domain code executes.
+//!   The kernel then authorizes again against the snapshot it is about to read
+//!   or replace, so a bypassed middleware cannot mutate policy.
+//! - **Preservation release is always two-person.** The obligation is attached
+//!   by the middleware outside persisted grants, so no administrator can mint a
+//!   one-person release grant. [`release_preservation_lock`](crate::server::handlers::security::release_preservation_lock) must not acquire
+//!   its own approval semantics.
+//! - **Entitlements belong in the kernel, not only in the router.** Delegation
+//!   and preservation operations re-check their feature inside the kernel.
+//!   RBAC administration does not check `Feature::Rbac` directly; its
+//!   independent backstop is that an unlicensed deployment builds a bootstrap
+//!   authority whose administration methods reject with
+//!   [`SecurityError::InvalidPolicyRequest`](crate::security::SecurityError::InvalidPolicyRequest) (400). Prefer adding a kernel-side
+//!   check to relying on route selection — see `src/security/CLAUDE.md`.
+//! - **Secrets are returned exactly once.** [`CreateKeyResponse`](crate::server::handlers::security::CreateKeyResponse),
+//!   [`RotateKeyResponse`](crate::server::handlers::security::RotateKeyResponse), and [`MintTokenResponse`](crate::server::handlers::security::MintTokenResponse) carry plaintext material
+//!   that is never retrievable again; the listing views ([`PolicyKeyView`](crate::server::handlers::security::PolicyKeyView)) are
+//!   redacted and expose no digest.
+//! - **Failure still audits.** `security_operation_api_error` unpacks the
+//!   [`Decision`](crate::security::Decision) the kernel attached to a [`SecurityOperationError`](crate::security::SecurityOperationError) and
+//!   records it, so a denial or post-allow failure is audited with its real
+//!   decision instead of a synthesized one.
+//!
+//! ## Rust concepts used here
+//!
+//! Handler parameters are axum *extractors*: [`State`] hands over a cloned
+//! [`AppState`] (whose [`SecurityKernel`](crate::security::SecurityKernel) is shared through an
+//! `Arc`, so the clone bumps a refcount rather than copying the kernel),
+//! [`Extension`](axum::Extension) pulls typed values the middleware inserted into the request,
+//! [`Path`](axum::extract::Path) binds URL segments, and [`Json`] owns the decoded body. Java's
+//! nearest analogue is annotation-driven argument binding, but here each
+//! extractor is a trait implementation checked at compile time: forgetting the
+//! authorization middleware for a route that extracts `Extension<AllowDecision>`
+//! is a runtime rejection, not a silently missing check.
+//!
+//! [`AuditRequest`](crate::server::AuditRequest) is `Arc<Mutex<..>>` inside, so the handler and the
+//! surrounding middleware annotate one shared record; the mutex is never held
+//! across an `.await`. Errors travel as [`ApiError`], a newtype whose
+//! `IntoResponse` implementation is the single place a domain error becomes an
+//! HTTP status — the C analogue would be a global errno-to-status table, except
+//! the compiler forces every fallible handler through it.
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;

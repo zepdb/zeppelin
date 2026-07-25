@@ -1,4 +1,176 @@
 //! Full-shaped allow and deny values returned before domain work.
+//!
+//! This file owns the *vocabulary of an authorization outcome*. Every protected
+//! request in Zeppelin passes through the security kernel, which produces
+//! exactly one [`Decision`] before any namespace, WAL, index, or storage code
+//! runs. That decision is not a boolean: an allow carries the complete set of
+//! server-owned restrictions and pre-success obligations the rest of the request
+//! must honor, and a deny carries a stable reason code that audit and the HTTP
+//! error mapping both consume.
+//!
+//! It deliberately does **not** own:
+//!
+//! - *evaluation* — grants, scopes, and freshness live in `policy.rs` and
+//!   `kernel.rs`; this module only shapes what they return;
+//! - *enforcement* — the constraints on an allow are applied downstream:
+//!   [`apply_field_mask`](crate::security::apply_field_mask) strips masked attributes from
+//!   responses, `src/server/handlers/vectors.rs` rejects forbidden fields and
+//!   applies server stamps on upsert, the query planner ANDs
+//!   `mandatory_filter` into the caller's filter, and `src/server/handlers/query.rs`
+//!   uses the cursor binding key when minting and validating continuation tokens;
+//! - *audit emission* — [`Obligation::DurableAudit`] states that a durable
+//!   record must settle before success; `audit.rs` and `audit_sink.rs` do it.
+//!
+//! ## Where this sits
+//!
+//! ```text
+//!   HTTP request (axum)
+//!         |
+//!         v
+//!   crate::server::authorize  --- classify_route -> Action
+//!         |
+//!         v
+//!   SecurityKernel::authorize*      (policy.rs evaluates grants)
+//!         |
+//!         +-- Decision::Deny(DenyDecision) --> audit the denial, return 4xx
+//!         |                                   (domain code never runs)
+//!         v
+//!   Decision::Allow(Box<AllowDecision>)
+//!         |
+//!         |   wire-visible          server-only (#[serde(skip)])
+//!         |   decision_id           policy_checksum
+//!         |   policy_version        cursor_binding_key
+//!         |   mandatory_filter      policy_filter
+//!         |   field_mask            attribute_admin_write
+//!         |   write_constraints
+//!         |   obligations
+//!         v
+//!   handler runs, then settles obligations before reporting success
+//! ```
+//!
+//! ## Reading map
+//!
+//! 1. [`Decision`] — the two-variant outcome every caller must `match`.
+//! 2. [`AllowDecision`] and [`AllowDecision::for_policy`] — the full allow shape
+//!    and the action-driven baseline obligations attached to it.
+//! 3. [`DenyDecision`] and [`DenyReason`] — the stable denial vocabulary.
+//! 4. [`FieldMask`] and [`WriteConstraints`] — the validated, non-empty-by-
+//!    construction constraint blocks a grant can attach.
+//! 5. [`PolicyVersion`] — how a boot-config decision is kept distinguishable
+//!    from one backed by the authoritative policy document.
+//!
+//! ## State and persisted artifacts
+//!
+//! Nothing here touches object storage. [`FieldMask`], [`WriteConstraints`], and
+//! [`PolicyVersion`] are, however, embedded in the authoritative policy document
+//! under `_security/` and in audit records, so their wire shapes are a
+//! compatibility surface. Both constraint types use a private wire struct with
+//! `#[serde(deny_unknown_fields)]`, so an unrecognized policy field is rejected
+//! rather than ignored.
+//!
+//! The security-sensitive fields of [`AllowDecision`] are `#[serde(skip)]`: the
+//! policy checksum, the cursor binding key, the pre-narrowing `policy_filter`,
+//! and the attribute-admin marker never leave the process. `mandatory_filter` is
+//! the *effective* predicate (policy filter combined with any delegated-token
+//! narrowing) and may be observed; `policy_filter` is the policy-owned component
+//! alone, kept private so a retrieval receipt can bind and later re-verify the
+//! historical predicate without disclosing it.
+//!
+//! Because those fields are skipped, a deserialized [`AllowDecision`] comes back
+//! with an all-zero cursor binding key, no policy checksum, no policy filter, and
+//! `attribute_admin_write` cleared. A round-tripped allow is therefore evidence,
+//! not authority: only a decision produced by the kernel in this process may be
+//! used to authorize work.
+//!
+//! ## Invariants
+//!
+//! - **Fail closed by shape.** [`Decision`] has exactly two variants and no
+//!   "unknown" state, so a caller cannot forget to handle denial. The kernel
+//!   returns a decision *before* domain work starts; there is no path that runs
+//!   the operation first and checks afterwards.
+//! - **Boot and persisted policy versions are distinguishable.**
+//!   [`PolicyVersion::BOOT`] is `0` and [`PolicyVersion::persisted`] rejects `0`,
+//!   so a decision made from boot configuration can never be mistaken for one
+//!   backed by an authoritative S3 policy document.
+//!   [`PolicyVersion::checked_next`] fails with `PolicyVersionOverflow` instead
+//!   of wrapping.
+//! - **Constraint blocks cannot be vacuous.** [`FieldMask::new`] rejects an empty
+//!   deny set and blank names; [`WriteConstraints::new`] rejects a wholly empty
+//!   block, blank names, and non-finite floats in server stamps (a `NaN` stamp
+//!   would not survive canonical serialization). Deserialization additionally
+//!   rejects duplicate names, which the collection types would otherwise absorb
+//!   silently. [`WriteConstraints::none`] is the one explicit empty value.
+//! - **A server stamp always wins.** `stamp` and `forbid_set` may overlap: the
+//!   server sets a field that ordinary callers may not.
+//!   [`WriteConstraints::with_forbid_set_bypassed`] — the `AttributeAdmin`
+//!   exception — clears only `forbid_set` and preserves every stamp, so a
+//!   privileged caller can set caller-forbidden attributes but still cannot
+//!   overwrite a server-owned one.
+//! - **Privileged writes are never unaudited.** Marking a decision as an
+//!   attribute-admin write also appends [`Obligation::DurableAudit`] if it is not
+//!   already present.
+//! - **Obligations are additive and idempotent.** Both mutators check for the
+//!   obligation before pushing, so repeated application by the kernel and by the
+//!   middleware cannot duplicate an entry. Obligations are only ever added after
+//!   construction, never removed.
+//! - **The baseline audit inventory is action-driven and pinned.**
+//!   [`AllowDecision::for_policy`] attaches [`Obligation::DurableAudit`] to a
+//!   fixed set of eleven actions, asserted exactly by
+//!   `durable_audit_obligation_inventory_is_exact_through_phase_ten`. Note that
+//!   `SecurityAdminRead` is in that set: reading principals, keys, grants, and
+//!   policy metadata is itself sensitive. A failed audit writer marks `/readyz`
+//!   unavailable rather than letting the obligation be skipped.
+//! - **Approval is two-person and can be imposed outside the grant.** A grant may
+//!   request approval, delegated-parent authorization adds it for destructive
+//!   actions, and `crate::server::authorize` unconditionally adds it for
+//!   `Action::PreservationRelease` so no administrator can mint a one-person
+//!   release grant.
+//! - **Cursor binding material stays opaque.** `CursorBindingKey` requires
+//!   exactly 64 hexadecimal characters, distinguishes "missing" from "malformed"
+//!   with separate typed errors, and has a hand-written `Debug` that prints
+//!   `[REDACTED]` so it cannot reach a log through a derived formatter.
+//!
+//! ## Rust concepts used here
+//!
+//! **An enum instead of a boolean.** [`Decision`] makes "allowed but I forgot
+//! the field mask" unrepresentable: the constraints are inside the `Allow`
+//! variant, so obtaining them requires having matched on it. A Java engineer
+//! would reach for an interface plus `instanceof`, or a nullable result; Rust's
+//! exhaustive `match` means adding a third outcome later would be a compile error
+//! at every call site rather than a silently unhandled branch.
+//!
+//! **`Box<AllowDecision>` inside the enum.** [`AllowDecision`] is large — several
+//! collections, an optional [`Filter`], and a 32-byte key. Rust sizes an enum to
+//! its largest variant, so an unboxed allow would make every [`DenyDecision`]
+//! carry that footprint too. Boxing keeps `Decision` small on the hot path, at
+//! the cost of one heap allocation on the (already expensive) allow path.
+//!
+//! **Newtypes with `#[serde(transparent)]`.** [`DecisionId`] wraps a ULID and
+//! [`PolicyVersion`] wraps a `u64`. On the wire they are a bare string and a bare
+//! number, so nothing about the stored format changes; in code the compiler
+//! refuses to let a policy version be passed where a fencing token or a count is
+//! expected. This is the repository's "make invalid states unrepresentable" rule
+//! applied to identifiers.
+//!
+//! **Parse, don't validate.** [`FieldMask`] and [`WriteConstraints`] keep their
+//! fields private and expose only checked constructors and borrowing accessors.
+//! Once you hold one, it is known-valid — there is no "did someone validate this
+//! yet?" question anywhere downstream. This is why both types implement
+//! `Deserialize` by hand over a private wire struct: a derived implementation
+//! would build the collections directly and bypass the constructor, and
+//! `BTreeSet`/`BTreeMap` would silently collapse duplicate policy entries instead
+//! of failing loudly.
+//!
+//! **`Copy` plus a redacting `Debug`.** `CursorBindingKey` is a `[u8; 32]`, so it
+//! is copied by value into handlers with no allocation and no shared mutable
+//! state — but its `Debug` is written by hand rather than derived, which is the
+//! only reason a `tracing` field or a `{:?}` in an error path cannot leak it.
+//!
+//! **Borrowing accessors and `#[must_use]`.** [`FieldMask::denied_fields`] and
+//! [`WriteConstraints::stamp`] return shared references into the decision rather
+//! than clones, so enforcement code reads the authoritative constraint in place;
+//! `#[must_use]` on the predicates ensures a check like `is_empty()` cannot be
+//! called and discarded.
 
 use std::collections::{BTreeMap, BTreeSet};
 

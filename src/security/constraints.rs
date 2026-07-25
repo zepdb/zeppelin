@@ -1,4 +1,67 @@
 //! Pure helpers for applying server-owned observation constraints.
+//!
+//! When [`super::kernel`] allows a request, the allow decision can carry
+//! *obligations*: server-owned narrowings the handler must apply before the
+//! caller observes anything. This module owns the pure evaluation of two such
+//! obligations — attribute field masks and mandatory write scopes. It reaches
+//! no verdict of its own; it holds no policy, performs no I/O, and cannot
+//! decide whether an operation is permitted. It only enforces a narrowing that
+//! authorization already decided on.
+//!
+//! Callers are the handlers that touch user attributes:
+//! [`server`](crate::server)'s vector and query handlers apply
+//! [`apply_field_mask`] to response attributes, screen caller-supplied
+//! predicates with [`filter_references_denied_field`], and gate writes with
+//! `filter_matches_write_scope`.
+//!
+//! ## A field mask is an authorization boundary, not a serializer
+//!
+//! Removing a denied attribute from a response body is not sufficient. A
+//! predicate over a denied field leaks that field through membership, result
+//! counts, and destructive side effects even when the field never appears in a
+//! response. That is why [`filter_references_denied_field`] rejects such a
+//! query outright rather than filtering it silently — consistent with the
+//! repository's fail-loud rule.
+//!
+//! [`apply_field_mask`] is deliberately subtractive. It never substitutes a
+//! null or placeholder value, because a marker where a denied field used to be
+//! reveals that the field existed.
+//!
+//! ## Why writes use three-valued logic
+//!
+//! Query evaluation is open-world: a row missing a field still satisfies a
+//! negative leaf such as `not_eq`. A write boundary cannot inherit that
+//! behavior. If it did, an empty attribute object would satisfy a mandatory
+//! scope and create a row inside a policy scope without carrying the scoped
+//! field.
+//!
+//! So the write-scope evaluator propagates a missing leaf as `Unknown` through
+//! boolean operators and accepts only a definite match:
+//!
+//! ```text
+//! leaf over a present field   -> Matches / DoesNotMatch  (ordinary evaluation)
+//! leaf over a missing field   -> Unknown                 (not "matches")
+//!
+//! And : any DoesNotMatch -> DoesNotMatch; else any Unknown -> Unknown
+//! Or  : any Matches      -> Matches;      else any Unknown -> Unknown
+//! Not : Matches <-> DoesNotMatch; Unknown stays Unknown
+//!
+//! accepted only when the result is exactly Matches
+//! ```
+//!
+//! Query evaluation is untouched by this: the three-valued walk lives only on
+//! the write path, and [`evaluate_filter`] still decides
+//! present-field leaves.
+//!
+//! ## Rust concepts used here
+//!
+//! The private `WriteScopeMatch` enum makes the third state explicit in the
+//! type system rather than encoding it as a `bool` plus a side flag. Rust's
+//! exhaustive `match` then forces every combining rule above to state what it
+//! does with `Unknown` — a new variant or a forgotten branch is a compile
+//! error, not a silently permissive write. In Java this resembles a
+//! three-valued enum with a switch, but without a `default:` arm quietly
+//! absorbing the case someone forgot to think about.
 
 use std::collections::{BTreeSet, HashMap};
 

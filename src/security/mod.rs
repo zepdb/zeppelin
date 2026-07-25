@@ -1,8 +1,177 @@
 //! Central authentication, authorization, and decision vocabulary.
 //!
 //! Transport adapters resolve credentials to typed principals. The security
-//! kernel then evaluates one exhaustive [`Action`] against a typed resource and
+//! kernel then evaluates one exhaustive [`Action`](crate::security::Action) against a typed resource and
 //! returns an explicit decision before domain work can begin.
+//!
+//! Everything in this subsystem is **fail-closed**. When state is missing,
+//! stale, unverifiable, or unlicensed, the answer is a typed denial. There are
+//! no permissive defaults and no degraded modes: a policy cache that cannot
+//! revalidate stops authorizing, and an audit writer that cannot durably record
+//! a mutation withholds `/readyz` rather than letting the mutation go
+//! unrecorded.
+//!
+//! ## What this subsystem owns
+//!
+//! - the identity vocabulary ([`Principal`](crate::security::Principal), [`PrincipalId`](crate::security::PrincipalId), [`AuthStrength`](crate::security::AuthStrength))
+//!   and the credential adapters that produce it;
+//! - the closed inventory of operations ([`Action`](crate::security::Action)) and the resources they act
+//!   on ([`Resource`](crate::security::Resource)), plus the route table ([`classify_route`](crate::security::classify_route)) that maps an
+//!   HTTP route onto them;
+//! - the decision values ([`Decision`](crate::security::Decision), [`AllowDecision`](crate::security::AllowDecision), [`DenyDecision`](crate::security::DenyDecision),
+//!   [`Obligation`](crate::security::Obligation)) that carry constraints downstream;
+//! - the authoritative policy document in the reserved `_security/` keyspace,
+//!   and its cache;
+//! - licensed feature authority ([`Entitlements`](crate::security::Entitlements), [`Feature`](crate::security::Feature));
+//! - durable, hash-chained audit evidence and signed retrieval receipts;
+//! - preservation locks that veto destruction.
+//!
+//! It does **not** own HTTP plumbing (that is `src/server/`), domain work such
+//! as namespace or WAL mutation, or object-store access, which always goes
+//! through `src/storage/`. Authorization decides; it does not perform.
+//!
+//! ## Request admission
+//!
+//! ```text
+//!            HTTP request
+//!                 |
+//!                 v
+//!  server middleware: CredentialAdapter (ApiKeyAdapter)
+//!                 |  bearer digest -> Principal, never a stored secret
+//!                 v
+//!  classify_route(method, matched path) -> RouteClass
+//!                 |  Protected(Action) | Public | (unmapped => denied)
+//!                 v
+//!  SecurityKernel::authorize_* / guard_*        <-- the admission point
+//!         |                        |
+//!         | Bootstrap authority    | Policy authority (licensed RBAC)
+//!         | grants compiled from   | compiled from the S3-authoritative
+//!         | boot config            | policy head, revalidated on an interval
+//!         v                        v
+//!            Decision::Allow(..)  |  Decision::Deny(..)
+//!                 |                        |
+//!                 | obligations:           +--> typed error, no domain work
+//!                 |   mandatory filter,
+//!                 |   field mask,
+//!                 |   write constraints,
+//!                 |   two-person approval
+//!                 v
+//!         domain work runs, then durable audit records the outcome
+//! ```
+//!
+//! The two authorities are selected at boot by resolved entitlements. Without
+//! [`Feature::Rbac`](crate::security::Feature::Rbac), the kernel compiles immutable grants from validated boot
+//! configuration and never constructs the object-store policy registry. With
+//! it, the authoritative policy in `_security/` takes over and boot credentials
+//! become advisory only.
+//!
+//! ## Persisted artifacts
+//!
+//! All authoritative security state lives under the reserved `_security/`
+//! prefix: `heads/policy.json` and immutable `policies/<ulid>.json` (policy),
+//! `leases/policy-publication.json` ([`POLICY_PUBLICATION_LEASE_KEY`](crate::security::POLICY_PUBLICATION_LEASE_KEY)),
+//! `preservation/`, `signers/` and `signer-slots/` (delegation),
+//! `audit-writers/`, and `migrations/`. S3 or MinIO is authoritative for every
+//! one of them; process memory only caches what it has verified.
+//!
+//! ## Reading map
+//!
+//! Approach the subsystem in this order; each layer assumes the previous one.
+//!
+//! 1. **Vocabulary** — `action.rs` ([`Action`](crate::security::Action)), `resource.rs` ([`Resource`](crate::security::Resource)),
+//!    `principal.rs` ([`Principal`](crate::security::Principal)), `context.rs` ([`RequestContext`](crate::security::RequestContext)),
+//!    `decision.rs` ([`Decision`](crate::security::Decision)). Nothing else makes sense first.
+//! 2. **Route mapping** — `route_map.rs` ([`classify_route`](crate::security::classify_route),
+//!    [`ROUTE_ACTIONS`](crate::security::ROUTE_ACTIONS)): how an Axum route becomes an [`Action`](crate::security::Action), and why an
+//!    unmapped protected route is an error rather than a pass.
+//! 3. **Authentication** — `authn.rs` ([`CredentialAdapter`](crate::security::CredentialAdapter),
+//!    [`ApiKeyAdapter`](crate::security::ApiKeyAdapter), [`AuthenticationOutcome`](crate::security::AuthenticationOutcome)): credentials to principals,
+//!    digest-only, never retaining secret material.
+//! 4. **The kernel** — `kernel.rs` ([`SecurityKernel`](crate::security::SecurityKernel)): the single admission
+//!    point every protected route passes through, and the place entitlements
+//!    are meant to be enforced.
+//! 5. **Authoritative policy** — `policy.rs` ([`PolicyHead`](crate::security::PolicyHead),
+//!    [`PolicySnapshot`](crate::security::PolicySnapshot), [`canonical_policy_checksum`](crate::security::canonical_policy_checksum)) for the persisted
+//!    vocabulary, then `policy_store.rs` ([`PolicyStore`](crate::security::PolicyStore), [`LoadedPolicy`](crate::security::LoadedPolicy))
+//!    for load/bootstrap/CAS publication, then `policy_cache.rs` for the
+//!    disposable read cache and its staleness rule, then
+//!    `policy_publication.rs` ([`PolicyPublicationLease`](crate::security::PolicyPublicationLease)) for the global
+//!    fenced publication lease and branch-activation guards.
+//! 6. **Licensing** — `entitlements.rs` ([`Entitlements`](crate::security::Entitlements), [`Feature`](crate::security::Feature)) and
+//!    `license.rs` ([`SignedLicense`](crate::security::SignedLicense), [`EntitlementResolver`](crate::security::EntitlementResolver),
+//!    [`FileLicenseResolver`](crate::security::FileLicenseResolver)): offline Ed25519 verification of which surfaces
+//!    exist at all.
+//! 7. **Audit** — `audit.rs` ([`AuditRecord`](crate::security::AuditRecord), [`AuditParams`](crate::security::AuditParams)),
+//!    `audit_sink.rs` ([`AuditClient`](crate::security::AuditClient), [`AuditRuntime`](crate::security::AuditRuntime)), `audit_chain.rs`
+//!    ([`verify_audit_day`](crate::security::verify_audit_day)), `merkle.rs` ([`MerkleTree`](crate::security::MerkleTree)).
+//! 8. **Constraint enforcement** — `constraints.rs` ([`apply_field_mask`](crate::security::apply_field_mask),
+//!    [`filter_references_denied_field`](crate::security::filter_references_denied_field)): the server-owned obligations an
+//!    allow decision carries into the query and write paths.
+//! 9. **Licensed surfaces** — `delegation.rs` ([`DelegationContext`](crate::security::DelegationContext),
+//!    [`IssuedDelegatedToken`](crate::security::IssuedDelegatedToken)) for short-lived credentials that can only
+//!    narrow parent authority; `receipt.rs` ([`RetrievalReceipt`](crate::security::RetrievalReceipt)) for signed
+//!    structural proof of what a query touched; `preservation.rs`
+//!    ([`PreservationService`](crate::security::PreservationService), [`PreservationGuard`](crate::security::PreservationGuard)) for legal-hold vetoes
+//!    over destruction.
+//!
+//! ## Invariants
+//!
+//! - **Deny by default.** An unmapped protected route, a missing principal, a
+//!   missing request context, a stale policy cache, and an unresolvable
+//!   preservation state all deny. See [`SecurityError`](crate::security::SecurityError) for the exhaustive
+//!   failure vocabulary and its stable machine-readable codes.
+//! - **Decisions precede work.** The kernel is consulted before domain logic
+//!   runs, and an allow decision carries obligations the caller must apply.
+//! - **S3 is authoritative for policy.** Once a policy head exists, boot
+//!   configuration is ignored; drift is warned about, never reconciled by
+//!   overwriting.
+//! - **Entitlements belong in the kernel.** A handler-only feature check is
+//!   bypassable from a new call site. [`Feature`](crate::security::Feature) variants have a stable
+//!   bit-assignment order (`Feature::ALL`); append, never reorder, or existing
+//!   signed licenses become invalid.
+//! - **Audit is not best effort where policy says it must be durable.** A
+//!   failed audit writer withholds readiness deliberately.
+//! - **Errors carry their decision.** [`SecurityOperationError`](crate::security::SecurityOperationError) pairs a
+//!   failure with the exact [`Decision`](crate::security::Decision) already evaluated, so a mutation that
+//!   fails after authorization still produces a truthful audit record.
+//! - **Redaction at the boundary.** [`SecurityError::client_message`](crate::security::SecurityError::client_message) and
+//!   [`SecurityError::code`](crate::security::SecurityError::code) are the only shapes that reach a client; internal
+//!   detail stays in structured logs.
+//!
+//! ## Known limitation
+//!
+//! Policy publication requires ETag compare-and-swap. `object_store`'s
+//! `LocalFileSystem` does not implement conditional update, so on
+//! `StorageBackend::Local` the publication-lease renew and release fail with
+//! `Storage(NotImplemented)` and **first boot against a `Local`-backed store
+//! currently fails**. `Local` is development/testing only and S3/MinIO are
+//! unaffected; see `src/security/CLAUDE.md` for the three unit tests that are
+//! red for exactly this reason.
+//!
+//! ## Rust concepts used here
+//!
+//! The submodules are all private and this file re-exports their public surface
+//! with `pub use`. That is deliberate: callers depend on
+//! `crate::security::Action`, not on a file layout, so internals can move
+//! without breaking anything outside. A handful of items are exported
+//! `pub(crate)` instead — the cursor binding key, delegated-fork admission
+//! types, receipt issuance — because they are seams between Zeppelin's own
+//! modules rather than API for external users. Java's package-private is the
+//! closest analogy, but `pub(crate)` is enforced across the whole crate rather
+//! than one namespace.
+//!
+//! [`Action`](crate::security::Action) and [`Resource`](crate::security::Resource) are enums, not strings. An action that is not in
+//! the inventory cannot be constructed, so "unknown action" is a parse-time
+//! error ([`SecurityError::UnknownAction`](crate::security::SecurityError::UnknownAction)) rather than a silent mismatch, and
+//! adding an operation forces every exhaustive `match` in the subsystem to be
+//! updated. This is the type system carrying an invariant that a string-keyed
+//! permission table in Java or C would leave to review discipline.
+//!
+//! [`SecurityOperationError`](crate::security::SecurityOperationError) boxes both its [`Decision`](crate::security::Decision) and its underlying
+//! error. Boxing keeps the `Result` return values small on hot paths where
+//! nearly every call succeeds, at the cost of one allocation on the rare
+//! failure — the opposite tradeoff from an exception-based design, where the
+//! failure path is the expensive one and the success path is free.
 
 mod action;
 mod audit;

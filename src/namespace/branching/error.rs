@@ -1,4 +1,130 @@
 //! Typed namespace-branching failures.
+//!
+//! This module owns the closed set of conditions that abort a branch operation,
+//! and the redaction rules those conditions must obey when they travel back to a
+//! caller. It owns nothing else: no HTTP status, no retry policy, no
+//! authorization decision, and no repair action. Every variant here means *stop
+//! and surface the failure* — none of them describes a fallback or a degraded
+//! mode.
+//!
+//! ## Where this sits
+//!
+//! [`BranchError`] is produced by the layers that manipulate branch state and is
+//! consumed one level up as [`ZeppelinError::Branch`](crate::error::ZeppelinError::Branch):
+//!
+//! ```text
+//! src/wal/manifest.rs        origin-table and root/lineage validation
+//! src/namespace/branch_root.rs   lease-fenced parent-root mutation
+//! src/namespace/graph.rs     fork, activation, delete state machines
+//! src/namespace/manager.rs   meta.json lifecycle validation
+//! src/compaction/{mod,gc}.rs materialization and owned-key cleanup
+//! src/security/kernel.rs     branch admission
+//!            |
+//!            |  From<BranchError> for ZeppelinError  (boxed)
+//!            v
+//!    ZeppelinError::Branch
+//!            |
+//!            |  status_code() / code() in src/error.rs
+//!            v
+//!    src/server/handlers/  ->  HTTP response envelope
+//! ```
+//!
+//! This module does not depend on `axum` or on the security kernel; it names
+//! only namespace identities and the artifact-origin types from
+//! [`branching`](crate::namespace::branching).
+//!
+//! ## Failure families
+//!
+//! The variants group into five concerns worth recognizing on sight:
+//!
+//! - **Reservation and retry conflicts** — [`BranchError::TargetAlreadyExists`],
+//!   [`BranchError::IntentMismatch`], [`BranchError::CreatingRecoveryRequired`],
+//!   [`BranchError::CancellationInProgress`]. A fork retry that does not match
+//!   the persisted reservation byte-for-byte is a conflict, never an update.
+//! - **Lifetime and liveness races** —
+//!   [`BranchError::SourceIncarnationChanged`], [`BranchError::SourceDeleting`],
+//!   [`BranchError::RootReleaseIntentChanged`]. These fire when the namespace
+//!   name still resolves but now names a different lifetime or a fenced one.
+//! - **Configured bounds** — [`BranchError::BranchDepthExceeded`],
+//!   [`BranchError::BranchLimitExceeded`],
+//!   [`BranchError::BranchRootLimitExceeded`]. Ancestry depth and direct-child
+//!   count are capped by configuration; exceeding a cap is refused, not clamped.
+//! - **Persisted-state integrity** — [`BranchError::BranchRootInvalid`],
+//!   [`BranchError::BranchRootMismatch`], [`BranchError::BranchRootConflict`],
+//!   [`BranchError::BranchRootMissing`], [`BranchError::OrphanBranchRoot`],
+//!   [`BranchError::ManifestDigestMismatch`],
+//!   [`BranchError::ArtifactOriginInvalid`], [`BranchError::BranchIntegrity`].
+//!   These describe object-storage state that violates an invariant. The
+//!   authoritative object is never rewritten to make the error go away.
+//! - **Deletion blockers and gating** —
+//!   [`BranchError::NamespaceHasLiveBranches`],
+//!   [`BranchError::BranchHasLiveChildren`], [`BranchError::SecurityWouldWiden`],
+//!   [`BranchError::BranchingNotReady`].
+//!
+//! ## Invariants
+//!
+//! - **A live child pins its parent.** A source namespace that still has a live
+//!   direct child root cannot be deleted; the graph raises
+//!   [`BranchError::NamespaceHasLiveBranches`], which `src/error.rs` maps to HTTP
+//!   409. The documented alternative for the operator is a copy-clone, not a
+//!   forced delete. Deletion is never partially applied to work around this.
+//! - **Child listings in errors are authorized, not exhaustive.** Both
+//!   liveness blockers carry `visible_children` — only the children the current
+//!   principal already passed a disclosure check for — plus a
+//!   `has_additional_children` boolean. There is deliberately **no count**, so
+//!   the error cannot be used as an enumeration oracle for namespaces the caller
+//!   may not read. [`DisclosedBranchChild`] is the only shape allowed through
+//!   that boundary.
+//! - **Diagnostics are secret-free and low-cardinality.**
+//!   [`BranchError::ArtifactOriginInvalid`] carries a structural `reason` string,
+//!   a `descriptor_kind` restricted to `&'static str` values (`manifest`,
+//!   `fragment`, `segment`), and the offending index or key. It never carries
+//!   object bytes, credentials, or policy content.
+//! - **Repair identities are explicit.** [`BranchError::OrphanBranchRoot`]
+//!   returns the whole [`BranchRoot`] because an operator
+//!   needs the exact digest proof to reconcile a parent that outlived its child.
+//!   This is the one variant that deliberately widens disclosure. It is raised
+//!   to a caller only through the graph; the readiness path reports the same
+//!   condition through a separate operator-safe projection, which
+//!   `security.readyz_public` withholds from an unauthenticated `/readyz` body.
+//!
+//! ## Status mapping lives in `src/error.rs`, and is narrow
+//!
+//! Only four variants currently receive a non-500 status and a stable machine
+//! code: [`BranchError::TargetAlreadyExists`],
+//! [`BranchError::NamespaceHasLiveBranches`],
+//! [`BranchError::BranchHasLiveChildren`], and
+//! [`BranchError::CancellationInProgress`] map to 409.
+//! [`BranchError::BranchIntegrity`] gets the `branch_integrity_error` code but
+//! keeps a 500. Every other variant — including
+//! [`BranchError::BranchingNotReady`], which is what the handlers return when
+//! `config.branching.enabled` is false — falls through to HTTP 500 with the
+//! generic `INTERNAL_ERROR` code. Read `ZeppelinError::status_code` before
+//! assuming a variant is client-visible as anything other than a server error.
+//!
+//! ## Rust concepts used here
+//!
+//! **`thiserror` instead of a message string.** `#[derive(Error)]` generates the
+//! `Display` implementation from the `#[error("...")]` attributes, so the
+//! human-readable text lives beside the structured fields it interpolates and
+//! cannot drift from them. The nearest Java analogue is a checked-exception
+//! hierarchy; the difference is that a Rust `match` over this enum is
+//! exhaustively checked, so adding a variant breaks every incomplete handler at
+//! compile time rather than at runtime.
+//!
+//! **`Clone + PartialEq + Eq` on an error type.** This is unusual and
+//! deliberate: it lets tests assert an exact expected failure, and lets the
+//! graph compare a persisted failure against a freshly derived one. The cost is
+//! that no variant may hold a non-comparable source such as `std::io::Error`, so
+//! this enum has no `#[source]` chain — storage failures stay in their own
+//! [`ZeppelinError`](crate::error::ZeppelinError) variants instead of being wrapped here.
+//!
+//! **Boxed at the crate boundary.** [`BranchError`] is a large enum (several
+//! variants own `String`s and a `Vec`), so `ZeppelinError::Branch` stores it as
+//! `Box<BranchError>`. Without that, every `Result` in the crate would grow to
+//! this enum's size, which is why the origin builder in `super::types` carries an
+//! explicit `clippy::result_large_err` allowance where it returns the unboxed
+//! form.
 
 use thiserror::Error;
 

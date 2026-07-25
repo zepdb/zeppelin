@@ -81,19 +81,70 @@ curl -s -X DELETE http://localhost:8080/v1/namespaces/<ns>/vectors \
 
 ## API Reference
 
-| Method   | Path                              | Description            |
-|----------|-----------------------------------|------------------------|
-| `GET`    | `/healthz`                        | Liveness probe         |
-| `GET`    | `/readyz`                         | Readiness probe        |
-| `GET`    | `/metrics`                        | Prometheus metrics     |
-| `POST`   | `/v1/namespaces`                  | Create a namespace (returns UUID) |
-| `GET`    | `/v1/namespaces/:ns`              | Get namespace metadata |
-| `DELETE` | `/v1/namespaces/:ns`              | Delete a namespace     |
-| `GET/POST` | `/v1/namespaces/:ns/branches`  | List/create direct branches (when enabled) |
-| `POST`   | `/v1/namespaces/:ns/clone`        | Create an independent copy clone |
-| `POST`   | `/v1/namespaces/:ns/vectors`      | Upsert vectors         |
-| `DELETE` | `/v1/namespaces/:ns/vectors`      | Delete vectors         |
-| `POST`   | `/v1/namespaces/:ns/query`        | Query nearest neighbors|
+The canonical definition is the [OpenAPI 3.1 spec](api/zeppelin-api.yaml). The
+tables below are a complete index of the served routes.
+
+### Operational
+
+| Method   | Path                | Description                                   |
+|----------|---------------------|-----------------------------------------------|
+| `GET`    | `/healthz`          | Liveness probe                                |
+| `GET`    | `/readyz`           | Readiness probe                               |
+| `GET`    | `/metrics`          | Prometheus metrics                            |
+| `GET`    | `/debug/pprof/cpu`  | CPU profile — `profiling` build feature only  |
+
+### Namespaces
+
+| Method            | Path                                   | Description                                      |
+|-------------------|----------------------------------------|--------------------------------------------------|
+| `POST`            | `/v1/namespaces`                       | Create a namespace (returns UUID)                |
+| `GET`             | `/v1/namespaces/:ns`                   | Get namespace metadata                           |
+| `DELETE`          | `/v1/namespaces/:ns`                   | Delete a namespace                               |
+| `POST`            | `/v1/namespaces/:ns/clone`             | Create an independent copy clone                 |
+| `GET/POST`        | `/v1/namespaces/:ns/branches`          | List/create direct branches — registered only when branching is enabled |
+| `PATCH`           | `/v1/namespaces/:ns/index_config`      | Update index configuration                       |
+| `POST`            | `/v1/namespaces/:ns/compact`           | Trigger compaction                               |
+| `GET`             | `/v1/namespaces/:ns/compact/status`    | Compaction status                                |
+| `POST`            | `/v1/namespaces/:ns/hydrate`           | Trigger cache hydration                          |
+| `GET`             | `/v1/namespaces/:ns/snapshots`         | List snapshots                                   |
+| `GET/PUT/DELETE`  | `/v1/namespaces/:ns/snapshots/:name`   | Read, create, or delete one named snapshot       |
+| `GET`             | `/v1/namespaces/:ns/manifest/root`     | Signed manifest root — requires the receipts entitlement |
+
+### Data
+
+| Method   | Path                                | Description             |
+|----------|-------------------------------------|-------------------------|
+| `POST`   | `/v1/namespaces/:ns/vectors`        | Upsert vectors          |
+| `DELETE` | `/v1/namespaces/:ns/vectors`        | Delete vectors          |
+| `POST`   | `/v1/namespaces/:ns/vectors/get`    | Fetch vectors by ID     |
+| `POST`   | `/v1/namespaces/:ns/query`          | Query nearest neighbors |
+| `POST`   | `/v1/namespaces/:ns/query/batch`    | Batch query             |
+
+### Runtime configuration
+
+| Method            | Path                | Description                              |
+|-------------------|---------------------|------------------------------------------|
+| `GET`             | `/v1/config/query`  | Read live query configuration            |
+| `PATCH`/`PUT`     | `/v1/config/query`  | Update live query configuration          |
+
+### Security
+
+These routes are always registered, but each is gated by a licensed feature and
+returns a not-licensed error without it. See the
+[security deployment guide](docs/security-deployment.md).
+
+| Method             | Path                                            | Entitlement  |
+|--------------------|-------------------------------------------------|--------------|
+| `GET/POST`         | `/v1/security/principals`                       | RBAC         |
+| `GET/POST`         | `/v1/security/keys`                             | RBAC         |
+| `DELETE`           | `/v1/security/keys/:key_id`                     | RBAC         |
+| `POST`             | `/v1/security/keys/:key_id/rotate`              | RBAC         |
+| `GET/POST/DELETE`  | `/v1/security/grants`                           | RBAC         |
+| `GET`              | `/v1/security/policy`                           | RBAC         |
+| `POST`             | `/v1/security/tokens`                           | Delegation   |
+| `GET/POST`         | `/v1/security/preservation`                     | Preservation |
+| `POST`             | `/v1/security/preservation/:lock_id/release`    | Preservation |
+| `POST`             | `/v1/verify`                                    | Receipts     |
 
 ## API Clients
 
@@ -162,10 +213,12 @@ cargo clippy -- -D warnings
 src/
   storage/     Object store abstraction (S3, S3-compatible)
   wal/         Write-ahead log: fragments, manifest, reader/writer
-  namespace/   Namespace CRUD and metadata
-  index/       Vector indexing (IVF-Flat with k-means)
-  cache/       Local disk cache with LRU eviction
+  namespace/   Namespace CRUD, metadata, and the branch graph
+  index/       Vector indexing (IVF-Flat with k-means, quantization)
+  fts/         BM25 lexical retrieval: tokenizer, inverted indexes
+  cache/       Local disk and memory cache with LRU eviction
   compaction/  Background WAL-to-segment compaction
+  security/    Authorization kernel, policy, entitlements, audit
   server/      Axum HTTP handlers, routes, middleware
 ```
 

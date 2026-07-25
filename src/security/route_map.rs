@@ -1,4 +1,132 @@
 //! Mechanically enumerable mapping from Axum routes to security actions.
+//!
+//! This file owns the single, auditable table that answers one question: *given
+//! an HTTP method and the route template axum matched, is this endpoint
+//! anonymous, or which [`Action`] does it require?* It is the bridge between the
+//! transport layer in `src/server/` and the security vocabulary in
+//! `src/security/`, and it is deliberately a flat `static` so the entire
+//! authorization surface of the server can be read top to bottom as a document.
+//!
+//! It deliberately does **not** own:
+//!
+//! - *route registration* — the axum `Router` is built in `src/server/mod.rs`;
+//!   this table mirrors it and a test proves the mirror is exact;
+//! - *resource extraction* — turning `/v1/namespaces/:ns/query` into a typed
+//!   [`Resource`](crate::security::Resource) is `route_resource` in `src/server/mod.rs`;
+//! - *the decision* — whether the authenticated principal actually holds the
+//!   action is [`SecurityKernel`](crate::security::SecurityKernel)'s job;
+//! - *licensing* — a route naming `Action::NamespaceFork` says nothing about
+//!   whether `Feature::Branching` is entitled; that check belongs in the kernel;
+//! - *rate limiting* — `rate_limit_class` in `src/server/mod.rs` classifies
+//!   independently.
+//!
+//! ## Where this sits
+//!
+//! ```text
+//!   axum Router  --matches-->  MatchedPath ("/v1/namespaces/:ns/query")
+//!                                    |
+//!                                    v
+//!   crate::server::authenticate --> classify_route(method, matched_path, readyz_public)
+//!                                    |
+//!            +-----------------------+-----------------------+
+//!            |                       |                       |
+//!            v                       v                       v
+//!       Some(Public)        Some(Protected(action))         None
+//!            |                       |                       |
+//!   anonymous principal      authenticate, then       SecurityError::UnmappedRoute
+//!   inserted; continue       crate::server::authorize      (fail closed)
+//!                            -> SecurityKernel -> Decision
+//! ```
+//!
+//! ## Reading map
+//!
+//! 1. [`RouteClass`] — the two possible classifications. `Public` is explicit;
+//!    there is no implicit third state.
+//! 2. [`ROUTE_ACTIONS`] — the inventory itself, ordered to mirror router
+//!    declaration order.
+//! 3. [`classify_route`] — the lookup, plus the two rules that are not visible
+//!    in the table: implicit `HEAD` and the configurable `/readyz` exception.
+//!
+//! ## State and artifacts
+//!
+//! None. This module performs no I/O, holds no cache, and allocates nothing per
+//! request. It is pure data plus one lookup function, which is precisely why it
+//! can be trusted as the authorization index.
+//!
+//! ## Invariants
+//!
+//! - **Completeness is mechanically enforced.** `route_map_complete` in
+//!   `tests/security_api_tests.rs` parses the router registrations out of
+//!   `src/server/mod.rs` and asserts set equality with [`ROUTE_ACTIONS`]. Adding
+//!   a route without adding an entry fails the test suite. At runtime a matched
+//!   path with no entry yields `None`, which both middlewares turn into
+//!   [`SecurityError::UnmappedRoute`](crate::security::SecurityError::UnmappedRoute) — an unmapped route is
+//!   rejected, never allowed by default.
+//! - **Classification is driven by the matched template, never the raw URI.**
+//!   [`RouteAction::path`] is an axum `MatchedPath` template containing `:ns`,
+//!   `:name`, `:key_id`, or `:lock_id` placeholders. A caller controls the
+//!   concrete path but not which template axum matched, so path trickery cannot
+//!   move a request into a weaker class.
+//! - **Axum 0.7 parameter syntax.** These templates use `:param`, not `{param}`.
+//!   Axum 0.8 changed the spelling; mixing them makes parameterized routes fail
+//!   to match while static routes keep working, and here that failure surfaces as
+//!   `UnmappedRoute` rather than as an obvious 404.
+//! - **`HEAD` inherits its `GET` class.** Axum 0.7 dispatches `HEAD` through the
+//!   registered `GET` handler and strips the body. That implicit route is never
+//!   written in the table, so [`classify_route`] maps `HEAD` onto `GET` before
+//!   lookup; otherwise every `HEAD` would be unmapped.
+//!   `implicit_head_inherits_every_get_classification` pins this for every `GET`
+//!   entry.
+//! - **`Public` is rare, explicit, and configurable in exactly one place.** Only
+//!   `/healthz` is unconditionally public. `/readyz` is
+//!   `Protected(Action::SystemRead)` by default and downgrades to `Public` only
+//!   when `security.readyz_public` is set, and only for `GET`/`HEAD` on that
+//!   exact path. The override is applied *after* the table lookup, so it cannot
+//!   introduce a route that is not otherwise mapped.
+//! - **No duplicate `(method, path)` pairs.** [`classify_route`] takes the first
+//!   match, so a duplicate entry could shadow a stricter one.
+//!   `route_inventory_has_no_duplicate_method_path_pairs` forbids it.
+//! - **Every `/v1/security/*` route is protected.** The exact method, path, and
+//!   action triple for all fourteen security-administration routes is pinned by
+//!   `security_route_inventory_is_exact_through_phase_ten`, and the test panics
+//!   if any of them is ever classified `Public`.
+//! - **Read and write are separated per resource.**
+//!   `GET /v1/namespaces/:ns/branches` requires `Action::NamespaceRead` while
+//!   `POST` on the same path requires the destructive, delegatable
+//!   `Action::NamespaceFork`; the same split appears for snapshots, runtime
+//!   config, and security administration. `Action::AttributeAdmin` appears
+//!   nowhere here on purpose — it is a kernel-evaluated capability with no route
+//!   of its own.
+//! - **Conditional compilation is part of the surface.** The `/debug/pprof/cpu`
+//!   entry exists only under the `profiling` feature and inherits
+//!   `Action::MetricsRead`. Compiling that feature in without the entry would make
+//!   the endpoint unmapped, not open.
+//!
+//! ## Rust concepts used here
+//!
+//! **A `static` table of `&'static str`.** [`ROUTE_ACTIONS`] is baked into the
+//! binary: no lazy initialization, no lock, no allocation, and no reflective scan
+//! of annotations as a Java framework would perform at startup. A C engineer can
+//! read it as a `const` array of structs in `.rodata`. Because the paths are
+//! `&'static str`, every entry outlives every request and can be borrowed freely
+//! across `.await` points in the middleware.
+//!
+//! **`Copy` on [`RouteClass`], `Clone` on [`RouteAction`].** [`RouteClass`] is two
+//! words and derives `Copy`, so `find(...).map(|entry| entry.class)` copies the
+//! classification out and immediately ends the borrow of the static table. The
+//! surrounding [`RouteAction`] is only `Clone` because [`Method`] owns a possible
+//! heap-allocated extension method name; nothing on the request path clones one.
+//!
+//! **`Option<RouteClass>` as a fail-closed return.** [`classify_route`] returns
+//! `None` for "not in the map" rather than a default class. Rust forces the caller
+//! to destructure it, and both call sites in `src/server/mod.rs` do so with
+//! `let ... else` and return an error. There is no `orElse(Public)` to write by
+//! accident.
+//!
+//! **Comparison against a borrowed [`Method`].** The parameter is `&Method` and
+//! the `HEAD` remapping produces `&Method::GET` — a reference to a `const`
+//! constant — so the normalization step neither clones nor allocates, which
+//! matters because it runs on every request including the query hot path.
 
 use axum::http::Method;
 

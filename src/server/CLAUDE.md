@@ -51,12 +51,17 @@ cargo test --test contract_tests openapi_documents_bearer_security_for_every_pro
 existence depends on config. Handlers still re-check the flag as defense in
 depth — keep that belt-and-suspenders check when adding gated routes.
 
-## `/readyz` is expensive
+## `/readyz` is cheap — it reads a snapshot
 
-`readiness_check` calls `NamespaceGraph::inspect_readiness`, which does an
-unbudgeted O(namespaces) S3 scan on **every** probe, branching enabled or not,
-and returns 503 on any error. See `../namespace/CLAUDE.md`. Be aware before
-pointing an aggressive load-balancer health check at it.
+`readiness_check` reads a published `BranchGraphReadinessSnapshot` and issues
+no object-store work of its own. The O(namespaces) scan
+(`NamespaceGraph::inspect_readiness`) runs only on the budgeted background
+maintenance pass, and not at all when `branching.enabled = false`. An
+aggressive load-balancer health check is fine here. See
+`../namespace/CLAUDE.md` for the lag/threshold trade.
+
+> Corrected 2026-07-24. An earlier revision said the scan ran on every probe,
+> unbudgeted. That was true when written and was fixed in `4f8583c`.
 
 `security.readyz_public` controls whether the endpoint is unauthenticated and
 whether repair identities are redacted from the body.

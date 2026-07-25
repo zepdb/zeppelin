@@ -1,4 +1,167 @@
 //! Signed structural retrieval receipts.
+//!
+//! This file owns the receipt lifecycle: assembling a [`RetrievalReceipt`] over
+//! an already-completed query, signing it with the node's published Ed25519
+//! key, and verifying one later in a stable first-divergence order. It also
+//! owns `AuthenticatedManifestArtifactInventory`, the related primitive that
+//! lets non-query callers authenticate a manifest's immutable-artifact
+//! inventory before they consume any artifact body. Finally, it owns the
+//! canonical JSON encoding (`canonical_json_bytes`) that every hash in the
+//! security subsystem is computed over — `audit_chain.rs` uses it too.
+//!
+//! It deliberately does **not** own the things it attests to. Query execution
+//! collects the traversal parameters and the touched-artifact set; `merkle.rs`
+//! owns tree construction and inclusion-path checking; `wal/manifest.rs` owns
+//! the artifact hash inventory, the root envelope, and history retention;
+//! `delegation.rs` owns the keys and signature checking; `kernel.rs` owns
+//! whether the verifying caller may resolve historical policy at all. This file
+//! binds those pieces together and reports exactly where they disagree.
+//!
+//! ## Where this sits
+//!
+//! - `server/handlers/query.rs` calls `issue_receipt` after the query has
+//!   finished, then emits an `AuditParams::ReceiptIssued` audit record.
+//! - `server/handlers/receipt.rs` (`/v1/verify`) calls `verify_receipt` with a
+//!   caller-supplied [`VerifyReceiptRequest`].
+//! - `compaction/mod.rs` and `server/handlers/namespace.rs` use
+//!   `AuthenticatedManifestArtifactInventory` when they read another
+//!   namespace's immutable artifacts during branch materialization or copy.
+//!
+//! ```text
+//! issue (query path, after execution)     verify (/v1/verify, in this order)
+//! ----------------------------------      ----------------------------------
+//! manifest artifact inventory             1. receipt signature
+//!   key -> sha256(object body)            2. result digest
+//!         |                               3. query hash
+//!         v                               4. touched Merkle paths
+//!  MerkleTree::build -> manifest_root     5. derived Merkle paths
+//!         |                               6. manifest root signature
+//!         | must equal manifest's own     7. retained generation agreement
+//!         | signed root, or fail closed   8. policy filter hash
+//!         v                               9. optional artifact re-fetch
+//!  inclusion path per touched key                     |
+//!         |                                           v
+//!         v                              valid, or the first divergence
+//!  canonical JSON -> Ed25519 (node key)
+//! ```
+//!
+//! ## What a receipt actually proves
+//!
+//! Accept these claims and no more. [`VerificationMode`] has exactly one
+//! variant, `Structural`, and the name is the contract.
+//!
+//! Proven when verification returns `valid`:
+//!
+//! - A holder of the private key behind the published signer `signer_node`
+//!   attested to every other field of the receipt. The signature covers
+//!   recursively key-sorted canonical JSON of the receipt with `signature`
+//!   cleared, so `signer_node` itself is bound.
+//! - The results and query the caller supplied are identical, under that same
+//!   canonicalization, to the ones the issuer hashed.
+//! - Every key in `touched` is a member of the artifact inventory whose Merkle
+//!   root is `manifest_root`, at exactly the content hash recorded, with
+//!   duplicate keys rejected. The same holds for `derived_touched` against
+//!   `derived_root`.
+//! - That `manifest_root` — bound together with the manifest version, fencing
+//!   token, binding version, execution-state digest, and optional control-state
+//!   digest — was signed by a published manifest signer.
+//! - If the named generation is still readable (retained history, or the live
+//!   manifest at that version), it agrees with the receipt field for field and
+//!   rebuilds the same root and execution digest.
+//! - With `refetch`, the named objects still hold bytes hashing to the recorded
+//!   digests.
+//!
+//! **Not** proven, and important to say out loud:
+//!
+//! - *Not* that the search was executed correctly, or that the results are the
+//!   true top-k. The traversal parameters are attested claims about routing, not
+//!   a replayable proof of retrieval.
+//! - *Not* that `touched` is complete. Membership of each listed key is proven;
+//!   an unlisted read is not detectable from the receipt.
+//! - *Not* independent of the issuing node. The same node signs both the
+//!   manifest root envelope and the receipt, so possession of that key is enough
+//!   to produce a fully self-consistent receipt. There is no external witness or
+//!   transparency log; the trust root is the signer inventory published under
+//!   `_security/signers/`.
+//! - *Not* freshness or single-use. `receipt_id` and `issued_at` are attested
+//!   claims; nothing here prevents replaying an old, still-valid receipt.
+//! - *Not* the manifest binding, when `manifest_history_checked` is `false`.
+//!   That means the generation was no longer retained, the check was skipped,
+//!   and the result can still be `valid` on the node signature alone.
+//! - *Not* the policy binding, when `policy_filter_check` is `Unchecked` — the
+//!   verifier lacked `SecurityAdminRead`, or the deployment had no policy
+//!   authority or checksum to resolve against.
+//! - For `CheckedDelegatedPolicyComponent`, only the *parent's* policy predicate
+//!   was resolved. A delegated token's own narrowing stays redacted, so
+//!   `enforced_filter_hash` is intentionally not required to equal the policy
+//!   hash for a delegated principal.
+//!
+//! ## Fail-closed issuance
+//!
+//! A receipt is never weakened to make issuance succeed. If the manifest lacks a
+//! complete artifact-hash inventory, a Merkle root, a root signature, a signer
+//! identity, a binding version, or a matching execution digest — or if the query
+//! could not hash every derived artifact it consumed — `issue_receipt` returns
+//! `SecurityError::ReceiptsUnavailableUnhashed` and the caller gets no receipt at
+//! all. Legacy manifests reach receipt-capable state only through an explicit
+//! compaction upgrade; the query path never backfills hashes.
+//!
+//! ## Reading map
+//!
+//! 1. [`RetrievalReceipt`] — every field that the signature binds.
+//! 2. `issue_receipt` — assembly order, and each fail-closed precondition.
+//! 3. `verify_receipt` — the checks in exactly the order
+//!    [`ReceiptDivergence`] documents.
+//! 4. `retained_manifest_matches_receipt` — what "the retained generation
+//!    agrees" concretely means.
+//! 5. `AuthenticatedManifestArtifactInventory` — the separate authenticate-then-
+//!    `verify_body` contract used outside the query path.
+//! 6. `canonical_json_bytes` and `canonicalize_value` — the crate's hashing
+//!    canonicalization, shared with `audit_chain.rs`.
+//!
+//! ## Invariants
+//!
+//! - **Canonicalize before hashing.** Every digest goes through
+//!   `canonical_json_bytes`, which recursively sorts object keys through a
+//!   `BTreeMap`. Hashing `serde_json` output directly would make a digest depend
+//!   on map iteration order.
+//! - **Receipts stay self-describing.** `manifest_control_state_digest` carries
+//!   `skip_serializing_if`, and omitting it is precisely what lets a legacy V1
+//!   receipt reserialize to its exact already-signed bytes. This type must never
+//!   move to a non-self-describing format.
+//! - **Artifact bodies are verified at the reader.**
+//!   `AuthenticatedManifestArtifactInventory::authenticate` performs signer
+//!   reads only; it never fetches data artifacts. Callers pass the exact key and
+//!   the exact bytes they consumed to `verify_body`, which closes the
+//!   verify-then-reread window in workflows that copy or rebuild immutable data.
+//!   A key outside the inventory and a body whose digest disagrees both fail.
+//! - **Divergences are outcomes; failures are errors.** A structural
+//!   disagreement returns `Ok(VerifyReceiptResponse { valid: false, .. })` with
+//!   `first_divergence` set. Storage failures and undecodable input propagate as
+//!   errors instead of being reported as a clean "invalid".
+//! - **Immutability is assumed, not enforced here.** The content hashes are only
+//!   meaningful because WAL fragments and segments are write-once. `refetch`
+//!   detects a violation after the fact; it does not prevent one.
+//!
+//! ## Rust concepts used here
+//!
+//! `ReceiptIssue<'a>` is a struct of borrows rather than a long argument list.
+//! The lifetime makes the contract explicit: `issue_receipt` may read all of it
+//! during the call and may not retain any of it afterwards, which the compiler
+//! checks. In Java this would be a parameter object holding references with no
+//! such guarantee; in C, a `const`-qualified struct of pointers whose validity
+//! nobody verifies.
+//!
+//! Digests are `[u8; 32]` — fixed-size arrays that are `Copy`, so passing one
+//! around moves 32 bytes on the stack with no allocation and no shared
+//! ownership. `BTreeSet` and `BTreeMap` are chosen over their hashing
+//! counterparts specifically because their iteration order is deterministic and
+//! that order feeds a signature.
+//!
+//! `AuthenticatedManifestArtifactInventory` keeps its map private and is
+//! `pub(crate)`. That is the type system carrying an invariant: a caller cannot
+//! reach in and treat authenticated hashes as an ordinary key catalogue, and
+//! cannot construct the type without passing the full authentication path.
 
 use std::collections::{BTreeMap, BTreeSet};
 

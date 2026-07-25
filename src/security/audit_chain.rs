@@ -1,4 +1,155 @@
 //! Hash-chain and signed-anchor verification for durable audit streams.
+//!
+//! This file owns the tamper-evidence layer over durable audit: the per-record
+//! chaining rule, the deterministic object-key layout that makes stream order
+//! recoverable from a LIST, the create-only terminal seal that closes a day, the
+//! signed day anchor that commits to the whole day, the crash-recovery tail
+//! load, and the offline verifier [`verify_audit_day`].
+//!
+//! It deliberately does **not** own audit itself. `audit.rs` owns the
+//! [`AuditRecord`] schema and its redaction rules; `audit_sink.rs` owns
+//! delivery, batching, the writer lease, and every object write; `delegation.rs`
+//! owns the signing keys and signature checking; `receipt.rs` owns the canonical
+//! JSON encoding that record hashing depends on. Nothing here writes an audit
+//! object — it computes hashes and keys, and it checks.
+//!
+//! ## Where this sits
+//!
+//! - `audit_sink.rs` is the only production writer. On startup it calls
+//!   `load_chain_tail` to recover where the stream left off, `advance_tail_body`
+//!   and `record_hash` while staging each batch, `audit_slot_key` to allocate
+//!   the next immutable object, `AuditTerminalSeal` to close the day, and
+//!   `anchor_key` to place the signed anchor.
+//! - [`verify_audit_day`] is the read side, exposed publicly and driven by the
+//!   `zeppelin_audit_verify` binary, the security integration tests, and the
+//!   adversarial runner's `audit_chain_check` operation.
+//!
+//! Audit delivery is durable and blocking where policy requires it, and a failed
+//! audit writer takes `/readyz` to 503 through `AuditClient::is_healthy`. That
+//! is deliberate design, not a bug: a node that cannot record evidence must
+//! leave the load balancer rather than keep serving unrecorded requests. Do not
+//! make audit best-effort to make a readiness failure go away.
+//!
+//! ## Persisted artifacts and the chain
+//!
+//! One stream is one `(UTC day, node id)` pair. Batch objects are immutable and
+//! create-only, and their ULID is derived deterministically from the batch's
+//! first chain position, so lexicographic key order equals numeric position
+//! order — sorting one recursive LIST recovers the stream.
+//!
+//! ```text
+//! _audit/2026-07-24/node-a/
+//!   <ulid(1)>.jsonl   r1  prev_hash=None  position=1   h1 = H(r1)
+//!                     r2  prev_hash=h1    position=2   h2 = H(r2)
+//!   <ulid(3)>.jsonl   r3  prev_hash=h2    position=3   h3 = H(r3)
+//!   <ulid(4)>.jsonl   TERMINAL SEAL { last_hash = h3, record_count = 3 }
+//!                     create-only, in the slot batch 4 would have used
+//!
+//! _audit/anchors/2026-07-24/node-a.json
+//!                     Ed25519 over { day, node, last_hash = h3,
+//!                                    record_count = 3, signer_node }
+//! ```
+//!
+//! `H(r)` is SHA-256 over the record's recursively key-sorted canonical JSON,
+//! which includes that record's own `prev_hash` and `chain_position`. Placing
+//! the seal in the *next* batch's slot is what excludes an expired writer whose
+//! final PUT is still in flight: both would have to create the same key.
+//!
+//! ## Reading map
+//!
+//! 1. `advance_chain` — the single acceptance rule for one record; every other
+//!    path in this file is built on it.
+//! 2. `load_chain_tail` — bounded crash recovery: one LIST, then one GET of the
+//!    lexicographically last object (two when that object is the seal).
+//! 3. `AuditTerminalSeal` and `validate_terminal_seal` — how a day is closed and
+//!    why the seal's key is checked, not just its contents.
+//! 4. [`verify_audit_day`] — full-stream verification and the order in which
+//!    [`AuditChainDivergence`] values are reported.
+//! 5. [`AuditDayAnchor`] — the signed commitment, and `unsigned_bytes` for what
+//!    the signature actually covers.
+//!
+//! ## What the chain proves
+//!
+//! Against a valid signed anchor, for one `(day, node)` stream:
+//!
+//! - Any mutation, deletion, reordering, or truncation of the persisted records
+//!   is detected. The recomputed tail hash or record count will disagree with
+//!   the anchor. The property test at the bottom of this file exercises exactly
+//!   those three mutations.
+//! - Appending after a day closes is detected: the seal must be the
+//!   lexicographically last object and must match the recomputed tail, so any
+//!   object beyond it reports `TerminalSealInvalid`.
+//! - Every record's position is explicit, so a gap cannot be papered over. A
+//!   record with no `chain_position` is rejected outright — pre-Phase-10 streams
+//!   need an explicit offline migration, and recovery never guesses zero or
+//!   scans older objects as a fallback.
+//!
+//! What it does **not** prove:
+//!
+//! - **Nothing links days or nodes.** Each `(day, node)` stream is anchored
+//!   independently; there is no chain from one day's anchor to the next and no
+//!   registry of which streams should exist. Deleting an entire stream together
+//!   with its anchor is only detectable by someone who independently knows that
+//!   stream existed.
+//! - **The anchor is self-signed by the same node that wrote the records.**
+//!   A node holding its own signing key can produce a wholly fabricated but
+//!   internally consistent stream. The chain proves after-the-fact tampering by
+//!   a party *without* that key; it is not a proof of what actually happened.
+//! - **The trust root is the S3-published signer inventory**, resolved through
+//!   `delegation::verify_published_signature`, not an external CA or
+//!   transparency log.
+//! - **An unsealed day is reported invalid, which is not the same as tampered.**
+//!   The writer seals and anchors at UTC day rollover and at graceful shutdown,
+//!   so verifying the currently open day legitimately yields
+//!   `TerminalSealMissing`. An aborted writer also intentionally leaves an
+//!   unsealed tail.
+//!
+//! ## Invariants
+//!
+//! - **One acceptance rule, applied everywhere.** `advance_chain` requires the
+//!   record's node id and UTC date to match the stream, its `prev_hash` to equal
+//!   the running tail hash (`None` only at position 1), and its `chain_position`
+//!   to be exactly the running count plus one.
+//! - **The seal is validated by key as well as content.**
+//!   `validate_terminal_seal` checks format, day, node, tail hash, count, *and*
+//!   that the object sits at the slot key its recorded count implies.
+//! - **Divergences are outcomes; failures are errors.** [`verify_audit_day`]
+//!   returns `Ok(AuditChainVerification { valid: false, .. })` for structural
+//!   disagreement, locating it by object key and JSONL line. Storage failures,
+//!   and an anchor object that exists but cannot be decoded, propagate as
+//!   errors instead. Note the asymmetry: an undecodable *record* is the
+//!   `RecordDecode` divergence, while an undecodable *anchor* is an error.
+//! - **`verified_records` counts what was accepted before the first
+//!   divergence**, so a truncation report still says how much of the stream
+//!   remains trustworthy.
+//! - **Blank lines are tolerated, empty objects are not.** Empty JSONL lines are
+//!   skipped so a trailing newline is not a record, but an audit object
+//!   containing no records at all is rejected as unsupported.
+//!
+//! ## Cost
+//!
+//! `load_chain_tail` is one recursive LIST plus one GET — two when the last
+//! object is the seal — regardless of how long the day is. That bound is the
+//! reason every record carries its own cumulative position: startup must not
+//! replay the day. [`verify_audit_day`] is deliberately the opposite: one LIST,
+//! one GET per object, plus the anchor GET, so it is O(stream) and belongs
+//! offline or in a scheduled check, never on a request path.
+//!
+//! ## Rust concepts used here
+//!
+//! `AuditRecord::chain_position` is an `Option<AuditChainPosition>` wrapping a
+//! `NonZeroU64`. Position zero is unrepresentable rather than merely invalid, so
+//! "absent" and "zero" cannot be confused — the distinction that separates a
+//! legacy record from a corrupt one. Every count step uses `checked_add`, so
+//! overflow becomes a typed failure rather than a wrap that would silently
+//! restart the chain.
+//!
+//! `advance_chain` returns `Result<(), AuditChainDivergence>` while its callers
+//! return `ZeppelinResult`. That is two error channels on purpose: the inner one
+//! is a classification the verifier reports to a caller, and the outer one is a
+//! genuine failure. Recovery paths convert the classification into a
+//! `Serialization` error because a writer that cannot trust its own tail must
+//! stop, whereas the verifier reports the same condition as data.
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};

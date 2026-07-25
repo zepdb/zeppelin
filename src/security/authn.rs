@@ -1,4 +1,122 @@
 //! Credential adapters that resolve transport headers to typed principals.
+//!
+//! This file owns *authentication only*: turning an untrusted
+//! `Authorization` header into either a typed
+//! [`Principal`] or a redacted [`AuthnFailure`]. It answers
+//! "who is calling?" and never "may they do this?".
+//!
+//! It deliberately does **not** own:
+//!
+//! - authorization. Once a principal exists, the decision belongs to
+//!   [`SecurityKernel`][super::SecurityKernel];
+//! - the credential registry. Digests and key states live in the
+//!   S3-authoritative policy snapshot (`src/security/policy.rs`), reached
+//!   through the read cache in `src/security/policy_cache.rs`;
+//! - delegated-token cryptography. `Bearer zpt1_…` is forwarded verbatim to
+//!   the `DelegationVerifier` in `src/security/delegation.rs`;
+//! - HTTP concerns. Extracting the header, mapping failures to status codes,
+//!   rate limiting, and audit emission all live in `src/server/mod.rs`.
+//!
+//! ## Where this sits
+//!
+//! `src/server/mod.rs` runs one authentication middleware in front of every
+//! protected route. It calls [`CredentialAdapter::authenticate_with_policy`]
+//! with a server-derived instant, never a client-supplied one, then inserts the
+//! resolved principal into request extensions for the authorization layer.
+//! [`build_app`](crate::startup::build_app) chooses the concrete adapter:
+//! [`ApiKeyAdapter`] built from boot configuration when RBAC is unlicensed, or
+//! one bound to the live policy cache when it is licensed.
+//!
+//! ```text
+//! Authorization header (untrusted)
+//!         |
+//!         | exactly one header value, valid UTF-8, else unknown-profile work
+//!         v
+//!   "Bearer zpt1_…" ---------> DelegationVerifier (delegation.rs)
+//!         |                          |
+//!         | "Bearer zpk1_<id>.<secret>"
+//!         v                          |
+//!   parse_bearer -> CredentialCandidate                 |
+//!         |   malformed => fixed dummy id + dummy secret|
+//!         v                                             |
+//!   SHA-256(secret), constant-time compare vs stored digest
+//!         |                                             |
+//!         v                                             v
+//!   AuthenticationOutcome { result, policy_version, policy_fresh }
+//!         |
+//!         +-- policy_fresh == false => middleware denies with SecurityStale
+//!         +-- Ok(Principal) ........ authorization proceeds
+//!         +-- Err(AuthnFailure) .... audited, request rejected
+//! ```
+//!
+//! ## Invariants this file protects
+//!
+//! - **No secret is ever stored.** Both credential sources hold a SHA-256
+//!   digest. [`ApiKeyAdapter::from_config`] hashes nothing itself — it decodes
+//!   an operator-supplied hex digest and rejects anything that is not exactly
+//!   32 hex-encoded bytes.
+//! - **Comparison is constant-time and shape-normalizing.** Digest equality
+//!   uses `subtle`'s `ct_eq`. Every rejected shape — no header, several
+//!   headers, a non-UTF-8 value, a bad prefix, a wrong-length secret — is
+//!   routed through the *same* amount of work against a fixed dummy key id and
+//!   a dummy secret of exactly the canonical length, so an attacker cannot
+//!   distinguish "unknown key" from "malformed header" by timing. The
+//!   `black_box` call in `consume_unknown_profile` exists so the optimizer
+//!   cannot delete that work.
+//! - **Failure families are redacted on purpose.** [`AuthnFailure`] has three
+//!   variants and [`AuthnFailure::code`] gives each a stable string for
+//!   envelopes and audit. A revoked key deliberately reports
+//!   `credential_unknown`, not `credential_expired`; the distinction would
+//!   confirm the key had once existed.
+//! - **Expiry is evaluated against the caller-supplied `now`,** which the HTTP
+//!   layer derives from the server clock. An expired credential is
+//!   `CredentialExpired`; a revoked one whose revocation time has arrived is
+//!   `CredentialUnknown`.
+//! - **The evaluated policy version travels with the result.**
+//!   [`AuthenticationOutcome`] reports the exact
+//!   [`PolicyVersion`] used for the lookup *and* whether
+//!   that snapshot is still inside its freshness bound. This is the
+//!   fail-closed hinge: a stale cache denies the request rather than
+//!   authenticating against possibly-revoked credentials. The bootstrap source
+//!   reports `PolicyVersion::BOOT` and is always fresh, because configuration
+//!   cannot go stale relative to itself.
+//! - **One token grammar.** [`ApiKeyAdapter::authenticate_bearer`] is the
+//!   single production parser, shared by middleware and fuzz targets, so a
+//!   second grammar cannot drift into existence.
+//!
+//! ## Where to start reading
+//!
+//! [`ApiKeyAdapter::authenticate_bearer_with_policy`] is the whole decision.
+//! Read it, then the private `credential_candidate` and `parse_bearer` helpers
+//! for the accepted shape, then [`CredentialAdapter`] for the boundary the HTTP
+//! layer depends on.
+//!
+//! ## Rust concepts used here
+//!
+//! The private `ApiKeySource` enum makes an invalid combination
+//! unrepresentable: an adapter is *either* a fixed bootstrap map *or* a live
+//! policy cache, never both and never neither. An exhaustive `match` on it
+//! means adding a third credential source will not compile until every branch
+//! is handled — the compiler enforces what a Java `instanceof` chain would only
+//! suggest.
+//!
+//! `CredentialCandidate<'a>` borrows slices *into* the caller's header string
+//! rather than allocating owned `String`s per request. The lifetime `'a` ties
+//! the candidate to the header buffer, so the compiler guarantees it cannot
+//! outlive the bytes it points at. In C this would be two `const char *` plus a
+//! length and an unwritten rule about the buffer's lifetime; here the rule is
+//! checked.
+//!
+//! [`CredentialAdapter`] is `Send + Sync` because a single adapter instance is
+//! shared behind an `Arc` by every concurrent request handler. Note that the
+//! trait's methods take `&self` and are *not* `async`: the policy cache read is
+//! a short lock-and-clone of an `Arc<CachedPolicy>`, so no guard is held across
+//! an `.await`.
+//!
+//! `Result<Principal, AuthnFailure>` stored *inside*
+//! [`AuthenticationOutcome`] is deliberate. The policy version and freshness
+//! flag are needed on the failure path too — for audit and for the stale-policy
+//! denial — so the error cannot be the outer type.
 
 use std::collections::HashMap;
 use std::sync::Arc;

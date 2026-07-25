@@ -1,4 +1,132 @@
 //! Exhaustive operation inventory used by central authorization.
+//!
+//! This file owns the closed vocabulary of *what a caller can ask Zeppelin to
+//! do*: one [`Action`] variant per independently grantable operation, the
+//! stable string spelling each variant carries into persisted policy documents
+//! and audit records, and the small predicates other security modules use to
+//! classify an action. It is the leaf of the security subsystem — it depends on
+//! nothing but [`SecurityError`], and everything else in `src/security/` names
+//! it.
+//!
+//! It deliberately does **not** own:
+//!
+//! - *who* may perform an action — that is `policy.rs` (grants) and `kernel.rs`
+//!   (evaluation), reached through [`SecurityKernel`](crate::security::SecurityKernel);
+//! - *which HTTP route* requires an action — that is
+//!   [`ROUTE_ACTIONS`](crate::security::ROUTE_ACTIONS);
+//! - *what must happen* once an action is allowed — obligations, mandatory
+//!   filters, field masks, and write constraints live on
+//!   [`AllowDecision`](crate::security::AllowDecision);
+//! - *whether the feature is licensed* — entitlement checks against
+//!   [`Feature`](crate::security::Feature) happen in the kernel, not here.
+//!
+//! ## Reading map
+//!
+//! 1. [`Action`] — the inventory itself. The variant list is the contract.
+//! 2. [`Action::ALL`] — every variant in declaration order, used for parsing
+//!    and for completeness tests in this and other modules.
+//! 3. The three frozen expansion sets (`POLICY_ALL_V1`, `POLICY_SAFE_ALL_V2`,
+//!    `BOOTSTRAP_ADMIN_V1`) — the reason a wildcard grant does not silently
+//!    widen when a variant is appended.
+//! 4. [`Action::is_destructive`] and [`Action::is_delegatable`] — the
+//!    classification predicates consumed by grant validation, approval
+//!    obligations, and delegated-token narrowing.
+//!
+//! ## The four action sets
+//!
+//! Four distinct subsets exist because "all actions" means something different
+//! depending on who wrote the word. Widening any of them is a privilege
+//! escalation, so each is a fixed-length array whose length is asserted by
+//! tests in this file.
+//!
+//! ```text
+//! Action::ALL (27)                       every variant; parsing + completeness
+//!  |
+//!  +-- BOOTSTRAP_ADMIN_V1 (23)           boot-config `actions = ["*"]`
+//!  |     keeps SecurityAdminWrite so a bootstrap operator can publish policy
+//!  |     at all; excludes AttributeAdmin, CredentialDelegate, Preservation*
+//!  |
+//!  +-- POLICY_ALL_V1 (21)                FROZEN: persisted GrantActions::All
+//!  |     what an already-stored wildcard grant expands to, forever
+//!  |
+//!  +-- POLICY_SAFE_ALL_V2 (20)           normalization target for NEW wildcards
+//!        drops SecurityAdminWrite as well, so a wildcard published today
+//!        cannot mutate the policy that governs it
+//! ```
+//!
+//! `POLICY_ALL_V1` is the immutability rule made concrete: an operator who
+//! stored `"*"` under Phase 3 consented to those 21 actions and nothing more.
+//! Appending `NamespaceFork`, `CredentialDelegate`, `PreservationRelease`, or
+//! `AttributeAdmin` to [`Action`] must never retroactively grant them, so the
+//! expansion set is copied and pinned rather than derived from `ALL`.
+//! `POLICY_SAFE_ALL_V2` is the forward-looking version: `policy.rs` rewrites an
+//! incoming `GrantActions::All` request into this explicit list before
+//! publication, and separately re-issues a narrow `SecurityAdminWrite` grant
+//! only for global-scope wildcards, so wildcard authority is visible in the
+//! stored document instead of hiding behind a symbol.
+//!
+//! ## State and persisted artifacts
+//!
+//! This module reads and writes no object-store state, but its spellings are
+//! persisted by others and are therefore a compatibility surface:
+//!
+//! - [`Action::as_str`] values appear inside the authoritative policy document
+//!   under `_security/` and inside every durable audit record. Renaming a
+//!   variant's string invalidates stored grants and breaks audit history.
+//! - The `Serialize`/`Deserialize` derives use the Rust variant names, which
+//!   currently match [`Action::as_str`]. There is no catch-all variant: an
+//!   unrecognized name fails loudly, either as a serde error or as
+//!   [`SecurityError::UnknownAction`] through [`FromStr`].
+//! - `Ord` follows declaration order. `GrantDefinition` sorts and dedupes its
+//!   action list, so declaration order is also the canonical order actions take
+//!   inside a stored grant. Append new variants at the end; inserting one in the
+//!   middle reorders existing documents and shifts the frozen sets' meaning.
+//!
+//! ## Invariants
+//!
+//! - [`Action::ALL`] contains every variant exactly once, in declaration order.
+//!   `action_inventory_has_exact_phase_ten_variants` pins the full list, so
+//!   adding a variant without updating `ALL` fails the test suite rather than
+//!   silently producing an unparseable action.
+//! - The frozen expansion sets are append-hostile by design. Their lengths are
+//!   asserted; growing one requires a deliberate edit and a security review.
+//! - `AttributeAdmin` is intentionally absent from every wildcard set and from
+//!   [`ROUTE_ACTIONS`](crate::security::ROUTE_ACTIONS). It is a kernel-evaluated capability
+//!   that lets a caller override server-owned protected attributes on a vector
+//!   write; it can only be held through an explicitly selected grant.
+//! - [`Action::is_destructive`] drives two independent controls: grant
+//!   validation rejects a `require_approval` entry that names a non-destructive
+//!   action, and delegated-parent authorization forces an approval obligation on
+//!   destructive actions. `NamespaceFork` is classed destructive because a fork
+//!   participates in the branch lifecycle and its deletion semantics.
+//! - [`Action::is_delegatable`] gates what a short-lived delegated credential
+//!   may carry. Control-plane actions (`SystemRead`, `MetricsRead`,
+//!   `RuntimeConfig*`, `SecurityAdmin*`, `CredentialDelegate`, `Preservation*`,
+//!   `ReceiptVerify`) and `NamespaceCreate`/`NamespaceClone` are excluded
+//!   because their real authorization resource is not a single existing
+//!   namespace, and the delegation shape narrows by namespace list only.
+//!
+//! ## Rust concepts used here
+//!
+//! [`Action`] is a fieldless enum that is `Copy`, so passing it to the kernel,
+//! the route map, and audit costs nothing and never allocates. A Java engineer
+//! can read it as an `enum` constant, but with two differences that matter here:
+//! the `match` in [`Action::as_str`] is *exhaustive*, so adding a variant is a
+//! compile error at every classification site rather than a runtime
+//! `IllegalArgumentException`; and there is no `values()` reflection, which is
+//! why [`Action::ALL`] is written out by hand and test-pinned. In C terms this
+//! is an `enum` plus a hand-maintained name table, with the compiler checking
+//! that the table is total.
+//!
+//! The frozen sets are `const` arrays with explicit lengths (`[Self; 21]`).
+//! Changing the number of elements without changing the declared length does not
+//! compile — the type system, not a code review, is what stops a wildcard grant
+//! from quietly gaining a variant.
+//!
+//! [`FromStr`] returns `Result<Self, SecurityError>` rather than an `Option`, so
+//! an unknown action name propagates a typed, reportable failure instead of
+//! degrading to a permissive default. That is the fail-closed rule expressed in
+//! the type signature.
 
 use std::str::FromStr;
 

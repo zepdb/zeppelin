@@ -1,4 +1,170 @@
 //! Short-lived Ed25519 credentials that can only narrow current parent grants.
+//!
+//! This file owns two related responsibilities. First, delegated bearer tokens:
+//! minting a `zpt1_` credential that carries a signed authority *ceiling*, and
+//! verifying one on the request path. Second, node signing identity: reading the
+//! node's Ed25519 private key from disk, publishing only its public half to
+//! object storage, and resolving any published signer's key so other modules can
+//! check signatures. Every signature Zeppelin produces — delegated tokens,
+//! manifest root envelopes, retrieval receipts, audit day anchors — is made and
+//! checked through the primitives here.
+//!
+//! It deliberately does **not** own policy or authorization. A token never
+//! carries grants of its own; it carries a ceiling that is intersected with the
+//! parent principal's *current* policy authority at every use. Policy documents
+//! live in `policy.rs`/`policy_store.rs`, the decision itself lives in
+//! `kernel.rs`, and what gets signed lives in `receipt.rs`, `audit_chain.rs`,
+//! and `wal/manifest.rs`. This module signs bytes and answers "did this
+//! published signer sign these bytes?"
+//!
+//! ## Where this sits
+//!
+//! - `authn.rs` routes any `Authorization: Bearer zpt1_…` header to
+//!   `DelegationVerifier::verify_authorization`; everything else stays on the
+//!   API-key path.
+//! - `kernel.rs` composes `DelegationAuthority` (or the lighter
+//!   `PublishedObjectSigner`, used when audit must be signed but delegation is
+//!   not licensed) at boot, installs it into [`ZeppelinStore`]
+//!   as a `dyn ObjectSigner`, and calls `mint` only after it has confirmed the
+//!   parent's current grants cover every action/namespace pair in the request.
+//! - `receipt.rs` and `audit_chain.rs` call `verify_published_signature` to
+//!   check receipt, manifest-root, and audit-anchor signatures.
+//!
+//! ## Narrowing: a token can only ever subtract
+//!
+//! ```text
+//! parent principal + parent api key
+//!         |
+//!         | kernel pre-checks the parent's CURRENT grants for
+//!         | every (action, namespace) in the requested ceiling
+//!         v
+//! DelegationAuthority::mint  -- Ed25519 over the canonical payload
+//!         |
+//!         v
+//! zpt1_<base64url payload>.<base64url signature>      returned exactly once
+//!         |
+//!         | Authorization: Bearer zpt1_...
+//!         v
+//! DelegationVerifier::verify_authorization
+//!         |  signature by a known published signer
+//!         |  payload re-canonicalizes to itself
+//!         |  signed TTL <= configured maximum
+//!         |  monotonic now within [issued_at, expires_at)
+//!         |  policy cache fresh
+//!         |  parent credential still active in that policy
+//!         v
+//! Principal::delegated
+//!         |
+//!         v
+//! effective authority = signed ceiling AND parent's CURRENT grants
+//! ```
+//!
+//! The final line is the whole security argument, implemented by
+//! [`DelegationNarrowing::effective_allows`]. A token cannot widen, cannot
+//! outlive its ceiling, and cannot survive its parent: revoking or expiring the
+//! parent API key immediately makes every token minted from it useless, with no
+//! revocation list and no token store to update.
+//!
+//! That is also the limitation to state plainly. There is **no per-token
+//! revocation**. Nothing about an issued token is persisted, so an individual
+//! token can only be retired by waiting out its TTL or by revoking the parent
+//! credential. Bounding the maximum TTL is the deliberate mitigation.
+//!
+//! ## Persisted artifacts
+//!
+//! | Key | Role |
+//! | --- | --- |
+//! | `_security/signers/<node_id>.json` | create-only public-key document for one node signer |
+//! | `_security/signer-slots/<NN>.json` | create-only slot claiming membership in the trusted signer set |
+//!
+//! The slot objects, not the signer documents, define the inventory: loading
+//! lists the slot prefix and follows each slot to its document. That bounds the
+//! trusted set at `MAX_PUBLISHED_SIGNERS` and makes the enumeration a fixed,
+//! small LIST. The private key is never written anywhere by this module.
+//!
+//! ## Reading map
+//!
+//! 1. [`DelegationNarrowing`] — the signed ceiling, its canonical form, and
+//!    [`DelegationNarrowing::effective_allows`], which is the intersection rule.
+//! 2. `DelegationAuthority::mint` — how a token is built and signed.
+//! 3. `DelegationVerifier::verify_authorization_against` — the complete
+//!    request-path acceptance check, in order.
+//! 4. `SignerCache` and `signer_refresh_loop` — the disposable public-key cache
+//!    and its freshness bound.
+//! 5. `read_signing_key`, `publish_signer`, and `claim_signer_slot` — boot-time
+//!    key hygiene and signer publication.
+//! 6. `verify_published_signature` and `load_signers_allow_empty` — the seam the
+//!    receipt and audit-chain verifiers depend on.
+//!
+//! ## Invariants
+//!
+//! - **Only narrowing.** `effective_allows` is `parent_allows && allows(...)`.
+//!   There is no code path where a token grants something the parent lacks.
+//! - **Only namespace-bound actions are delegatable.** `Action::is_delegatable`
+//!   is enforced at construction, so a token can never carry an administrative
+//!   or process-wide action.
+//! - **A signed payload still has to be canonical.** `DelegationNarrowing`
+//!   deserializes through its validating constructor, and
+//!   `validate_payload_shape` rebuilds the canonical narrowing and rejects the
+//!   token if it differs. A hand-crafted payload with duplicate, unsorted, or
+//!   oversized entries fails even when the signature is genuine.
+//! - **Two independent freshness bounds, both fail closed.** A signer cache
+//!   older than twice its refresh interval returns no key at all, and a policy
+//!   cache that is not fresh rejects the credential. Both surface as
+//!   `AuthnFailure::CredentialUnknown`; neither degrades to "allow".
+//! - **Wall-clock time never moves backwards.** `MonotonicWall` clamps observed
+//!   time to a monotonic floor derived from `Instant`, so a clock rollback
+//!   cannot un-expire a token. It is fixed size regardless of how many
+//!   observations pass through it.
+//! - **Key material must be exactly right or boot fails.** The signing key must
+//!   be a regular file of exactly 64 ASCII hex characters with mode `0600`;
+//!   anything else is a typed error, and non-Unix platforms refuse outright
+//!   rather than skip the permission check.
+//! - **Signer identity is derived, not asserted.** `zsn1_…` is a digest of the
+//!   public key, and loading recomputes it, so a published document cannot claim
+//!   an identity that does not match its own key.
+//! - **Publication is create-only and immutable.** Republishing identical bytes
+//!   is idempotent; different bytes under the same node id is
+//!   `SecurityError::DelegationSignerCollision`. There is no automated
+//!   retirement — a full inventory is a hard configuration error that asks the
+//!   operator to retire a signer out of band.
+//! - **Verification failures are data, storage failures are errors.**
+//!   `verify_published_signature` returns `Ok(false)` for an unknown node id, a
+//!   malformed signature, or a bad identity prefix, and propagates only genuine
+//!   storage failures. It reads through the store's detached signer-inventory
+//!   view, which stays usable after the live signing root has retired.
+//!
+//! ## Cost
+//!
+//! Loading the inventory is one LIST plus two GETs per occupied slot. It runs at
+//! boot and on the refresh tick, never per request. Request-path verification is
+//! pure CPU: one Ed25519 verification and a hash-map lookup under a read lock.
+//! `verify_published_signature`, by contrast, reloads the inventory on every
+//! call — it is a verification-path helper, not a request-path one.
+//!
+//! ## Rust concepts used here
+//!
+//! The signer cache is shared as `Arc<SignerCache>` while its refresh loop holds
+//! only a `Weak`, so the task cannot keep the cache alive and exits as soon as
+//! the upgrade fails. `Drop` aborts the task as a backstop;
+//! `shutdown_refresh_task` aborts and joins deliberately and panics if the loop
+//! ever returned on its own, since that would mean key revalidation silently
+//! stopped while the authority was still serving requests. Both the `RwLock`
+//! over the key map and the `Mutex` over `MonotonicWall` guard pure-CPU work
+//! only and are never held across an `.await`.
+//!
+//! [`IssuedDelegatedToken`] implements `Debug` by hand so the bearer prints as
+//! `<redacted>`. Deriving `Debug` would put live credential material into any
+//! log line or panic message that formats the value — a Java or C engineer used
+//! to a default `toString`/struct dump should read this as the opposite default:
+//! secrets opt out explicitly.
+//!
+//! `DelegationAuthority` and `PublishedObjectSigner` both implement the
+//! `ObjectSigner` trait and are installed into the store as `dyn ObjectSigner`.
+//! That is Rust's dynamic dispatch, closest to a Java interface reference: the
+//! storage layer can sign manifest roots and audit anchors without depending on
+//! the security module's concrete types or knowing whether delegation is
+//! licensed at all.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;

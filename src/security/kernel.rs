@@ -1,4 +1,223 @@
-//! Pure-CPU phase-1 authorization over validated boot grants.
+//! The authorization admission point every protected route must pass through.
+//!
+//! This file owns one question: *may this principal perform this action on this
+//! resource, right now?* [`SecurityKernel`] answers it with a typed [`Decision`]
+//! **before** any namespace, WAL, index, or storage work begins. The kernel is
+//! fail-closed in every direction — an unknown credential, an unmapped grant, a
+//! stale policy cache, an unlicensed feature, and a missing approver all produce
+//! a [`Decision::Deny`] or a typed [`SecurityError`], never a permissive default.
+//!
+//! It deliberately does **not** own:
+//!
+//! - **Authentication.** Turning a bearer credential into a [`Principal`] belongs
+//!   to `authn.rs` ([`ApiKeyAdapter`]). The kernel only consumes an already-typed
+//!   principal.
+//! - **Route classification.** Deciding which [`Action`] and [`Resource`] a URL
+//!   maps to belongs to `route_map.rs`; an unmapped route fails closed there.
+//! - **The persisted policy vocabulary.** `policy.rs` defines `PolicySnapshot`,
+//!   `PolicyGrant`, and the compiled evaluator; `policy_store.rs` reads and
+//!   publishes it on S3; `policy_cache.rs` holds the revalidated copy. The kernel
+//!   selects among those authorities and translates their verdicts.
+//! - **Constraint enforcement.** The kernel *returns* a mandatory filter, field
+//!   mask, and write constraints inside [`AllowDecision`]; query, upsert, and
+//!   response code enforce them. A handler that ignores those fields silently
+//!   widens access, which is why the middleware rejects an allow carrying data
+//!   constraints on an action that cannot consume them.
+//! - **Audit durability.** `audit_sink.rs` owns delivery; the kernel only submits
+//!   records and refuses to proceed when a required record has not settled.
+//!
+//! ## Where this sits
+//!
+//! ```text
+//!  HTTP request
+//!      |
+//!      v
+//!  authn: ApiKeyAdapter -> Principal            (authn.rs)
+//!      |
+//!      v
+//!  route_map::classify_route -> Action, Resource  (route_map.rs)
+//!      |                              unmapped route -> DENY, fail closed
+//!      v
+//!  server::authorize middleware                 (src/server/mod.rs)
+//!      |
+//! ====== this file ==========================================================
+//!      v
+//!  SecurityKernel::authorize        (or ::authorize_action when the namespace
+//!      |                             is only known after body parsing)
+//!      +--> Bootstrap authority: grants compiled from boot config, pure CPU
+//!      +--> Policy authority: PolicyCache -> CompiledPolicy
+//!      |         S3 head is authoritative; a cache older than its freshness
+//!      |         bound denies with DenyReason::SecurityStale
+//!      v
+//!  Decision
+//!      |                                    \
+//!      | Allow(AllowDecision)                 Deny -> denial audit, 403
+//!      |   mandatory_filter, field_mask,
+//!      |   write_constraints, obligations
+//!      v
+//!  obligations discharged by the middleware:
+//!      Approval    -> second authorized principal, distinct from the actor
+//!      DurableAudit-> audit record must settle
+//! ===========================================================================
+//!      |
+//!      v
+//!  domain work: namespace / wal / index / query
+//!
+//!
+//!  Fork and delete take a second pass through this file, because an HTTP-time
+//!  decision is not sufficient authority to mutate the branch graph:
+//!
+//!  authorize_namespace_fork(admission)   -- entitlement + structural checks
+//!      |
+//!      v
+//!  AuthorizedForkNamespace -> graph reserves a target
+//!      |
+//!      v
+//!  NamespaceForkGovernance::begin  -- re-authorize against the freshly loaded
+//!      |                              policy head, park an activation guard
+//!      v                              in the head under the publication lease
+//!  settle_audit  ->  revalidate  ->  finalize | abort
+//!   (durable)       (guard renew,     (guard removed from the head)
+//!                    re-authorize)
+//! ```
+//!
+//! ## Reading map
+//!
+//! 1. [`SecurityKernel`] and the private `SecurityAuthority` enum: the whole file
+//!    branches on whether authority is boot configuration or the S3-backed
+//!    [`PolicyCache`]. Every method is written twice, once per arm.
+//! 2. [`SecurityKernel::from_config`], [`SecurityKernel::from_store`], and
+//!    [`SecurityKernel::from_resolved_entitlements`]: composition. The last one
+//!    holds the licensed-feature dependency rules.
+//! 3. [`SecurityKernel::authorize`] and [`SecurityKernel::authorize_action`]: the
+//!    hot admission path. `authorize_action` exists for routes whose namespace is
+//!    only known after the body is parsed (namespace create).
+//! 4. `authorize_delegated` and `authorize_delegated_action`: the same path for a
+//!    short-lived delegated token, which can never exceed its parent's grants.
+//! 5. [`SecurityKernel::mint_delegated_token`]: issuance, and the structural
+//!    narrowing proof that must hold before a token exists.
+//! 6. Preservation seams — [`SecurityKernel::guard_namespace_destruction`],
+//!    [`SecurityKernel::guard_namespace_destruction_strong`], and
+//!    [`SecurityKernel::guard_vector_destruction`] — which block destruction
+//!    while a legal hold is active.
+//! 7. The branch/fork half of the file, which is the most intricate:
+//!    [`SecurityKernel::authorize_namespace_fork`] mints an
+//!    [`AuthorizedForkNamespace`], and `NamespaceForkGovernance` performs the
+//!    *second*, authoritative authorization later under the policy-publication
+//!    interlock. Follow `begin` -> `settle_audit` -> `revalidate` ->
+//!    `finalize`/`abort` across [`BootstrapBranchActivationPermit`] and
+//!    [`PolicyBranchActivationPermit`].
+//! 8. [`SecurityKernel::authorize_namespace_delete`] and
+//!    `namespace_delete_governance`, which wire preservation, per-target
+//!    disclosure, and deletion-lifecycle audit into one governance adapter.
+//!
+//! ## State this file touches
+//!
+//! The kernel holds no durable state of its own. It reads and mutates state that
+//! other modules own:
+//!
+//! - **Read.** The compiled policy and its snapshot checksum, borrowed from
+//!   [`PolicyCache`]. S3 remains authoritative; the cache is a disposable copy
+//!   with an explicit staleness bound.
+//! - **Published.** Principal, key, grant, revoke, and rotate mutations are
+//!   forwarded to the cache's compare-and-swap publication path. The kernel never
+//!   writes a policy object directly.
+//! - **Published (branch activation).** A pending activation guard is inserted
+//!   into the policy head under the publication lease, then removed on finalize
+//!   or abort. That guard is what makes a crashed fork recoverable.
+//! - **Published (audit).** Fork activation submits a durable [`AuditRecord`]
+//!   before the branch may be revalidated and finalized.
+//! - **Published (preservation).** A blocked delete records a durable deferral
+//!   through [`PreservationService`].
+//!
+//! ## Invariants
+//!
+//! - **Deny by default.** An anonymous principal is denied unless the process runs
+//!   in `SecurityMode::OpenUnsafe`, which is the only mode that returns a boot
+//!   allow for anonymous callers.
+//! - **Stale authority denies.** When [`PolicyCache`] has not confirmed its head
+//!   within its freshness bound, every policy-backed decision returns
+//!   [`DenyReason::SecurityStale`]. An old allow is never replayed.
+//! - **Bootstrap authority cannot administer policy.** Every administrative
+//!   method returns `InvalidPolicyRequest` on the `Bootstrap` arm; security
+//!   administration requires the S3 policy authority.
+//! - **Entitlements are checked here, not only at the route.** Branching is
+//!   verified inside [`SecurityKernel::authorize_namespace_fork`],
+//!   [`SecurityKernel::authorize_branch_list`], and again in both fresh
+//!   re-authorization paths, so a new call site cannot reach fork or branch-list
+//!   authority by skipping the handler's config flag. Preservation and delegation
+//!   APIs return `FeatureNotLicensed` when their feature is absent.
+//! - **Licensed features have ordering dependencies.** Composition rejects
+//!   delegation or preservation without RBAC, receipts without delegation, and
+//!   delegation or preservation in `OpenUnsafe` mode.
+//! - **Delegation cannot widen.** A delegated token may not be re-delegated, may
+//!   only descend from a human or service principal, and is authorized by
+//!   re-checking *both* the narrowing and the live parent grants for every
+//!   narrowed action/namespace pair. Every destructive action performed through a
+//!   delegated token carries the approval obligation.
+//! - **Fork admission is structurally exact.** The three HTTP decisions (fork,
+//!   source read, target create) must share one policy version, must carry the
+//!   durable-audit obligation, and must carry no data constraints — a filtered or
+//!   masked principal cannot fork a raw copy. Under policy authority, a delegated
+//!   principal is refused outright during re-authorization.
+//! - **Approval is two-person.** An approver is required exactly when the allow
+//!   carries [`Obligation::Approval`], must differ from the actor and from the
+//!   actor's delegation parent, and must itself be authorized at the same policy
+//!   version without its own approval obligation.
+//! - **A copy may not widen access.** `validate_namespace_copy_no_widening`
+//!   fails closed unless every principal's authority over the target is no
+//!   broader than over the source, under the same verified policy version.
+//! - **Admission is not activation.** The decision made at HTTP time only
+//!   *reserves* the attempt. The governance adapter re-authorizes against the
+//!   freshly loaded policy head, and `revalidate` refuses to proceed until the
+//!   activation audit record has settled ([`SecurityError::AuditUnavailable`]).
+//! - **Signing capability is fail-closed.** `install_object_signer` errors when
+//!   receipts or S3 audit are licensed but no signer was composed.
+//!
+//! ## Concurrency
+//!
+//! One [`SecurityKernel`] is shared as an `Arc` across every request task; all
+//! authorization is read-only against an `Arc`-shared cache snapshot, so
+//! decisions never block each other. The long-lived authorities it composes
+//! ([`PolicyCache`], [`DelegationAuthority`], [`PreservationService`]) each own a
+//! background revalidation task. [`SecurityKernel::shutdown_refresh_tasks`] must
+//! be called only after HTTP has stopped accepting work, so a retired node cannot
+//! keep revalidating authority a replacement now owns.
+//!
+//! ## Rust concepts used here
+//!
+//! **Exhaustive `match` as a safety net.** [`Action`] is a fieldless enum, and
+//! every authority arm matches on it or on `SecurityAuthority`. Adding an action
+//! or a third authority kind turns "we forgot to handle this" into a compile
+//! error rather than a silent allow. Java's `switch` over an enum has no such
+//! guarantee unless exhaustiveness is opted into; C's `switch` over an `int` has
+//! none at all.
+//!
+//! **A returned decision that cannot be ignored.** [`SecurityKernel::authorize`]
+//! is `#[must_use]` and returns [`Decision`], not `bool`. A caller cannot
+//! accidentally drop the result, and cannot read a filter or field mask without
+//! first destructuring the `Allow` arm — the deny path has no such fields to read.
+//! [`AllowDecision`] is boxed inside the enum so the common deny value stays
+//! small.
+//!
+//! **`Arc<Self>` receivers.** [`SecurityKernel::authorize_namespace_fork`] and
+//! [`SecurityKernel::authorize_namespace_delete`] take `self: &Arc<Self>` because
+//! the governance adapters they mint outlive the calling stack frame and must
+//! keep the kernel alive. In Java every object reference is implicitly shared and
+//! GC-managed; here the sharing is explicit and refcounted, and cloning the `Arc`
+//! is a counter increment, not a copy of the kernel.
+//!
+//! **`Box<dyn Trait>` with consuming methods.** [`BranchActivationPermit`]'s
+//! `finalize` and `abort` take `self: Box<Self>`. Ownership moves into the call,
+//! so the permit cannot be finalized twice or used afterwards — the type system
+//! encodes a state machine that C would express with a manual "already released"
+//! flag. `#[async_trait]` supplies the boxed futures that make such an async
+//! trait object possible on stable Rust.
+//!
+//! **Closures captured into shared callbacks.** `namespace_disclosure_callback`
+//! moves an `Arc<SecurityKernel>` and the request's principal into a closure
+//! stored behind an `Arc`, letting the deletion graph ask "may this caller see
+//! this branch?" without knowing anything about the security subsystem.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;

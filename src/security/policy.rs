@@ -1,4 +1,225 @@
-//! Strict persisted vocabulary for S3-authoritative security policy.
+//! The persisted vocabulary of security policy, and its compiled evaluator.
+//!
+//! Everything an operator can say about who may do what lives in the types
+//! defined here: stable principals, hashed API credentials, and typed grants that
+//! bind a principal to an action set at one scope, optionally narrowed by a
+//! mandatory filter, a response field mask, and write constraints. These types
+//! are the wire format of the objects stored under `_security/` on S3, so their
+//! serde shape is a compatibility contract, not an implementation detail.
+//!
+//! The file also owns the *other* half of that story: turning a verified
+//! [`PolicySnapshot`] into `CompiledPolicy`, the index the kernel evaluates on
+//! every request. Compilation is where lookup structures are built and where
+//! cross-grant conflicts are rejected once, instead of on each request.
+//!
+//! It deliberately does **not** own:
+//!
+//! - **Object-store IO.** Reading the head, fetching a snapshot, and publishing a
+//!   new version belong to `policy_store.rs`. Nothing here performs a GET or PUT.
+//! - **Caching, freshness, and CAS orchestration.** `policy_cache.rs` decides
+//!   when a compiled policy is too stale to trust; `policy_publication.rs` owns
+//!   the fencing-token lease that serializes publications.
+//! - **The action inventory.** `action.rs` defines [`Action`] and the frozen
+//!   `POLICY_ALL_V1` / `POLICY_SAFE_ALL_V2` / `BOOTSTRAP_ADMIN_V1` sets this file
+//!   expands and migrates against.
+//! - **Admission policy.** `kernel.rs` decides anonymous handling, security mode,
+//!   entitlement gating, staleness, and delegation. This file answers only "what
+//!   do the grants say", returning a [`DenyReason`] rather than a decision.
+//! - **Constraint enforcement.** A compiled authorization *reports* a mandatory
+//!   filter, field mask, and write constraints; query and upsert code applies
+//!   them.
+//! - **Entitlement checks.** `policy_store.rs` calls the feature predicates here
+//!   ([`PolicySnapshot::has_constraints`],
+//!   [`PolicySnapshot::has_delegation_features`],
+//!   [`PolicySnapshot::has_preservation_features`],
+//!   [`PolicySnapshot::principal_count`]) to refuse publishing a snapshot the
+//!   license does not cover.
+//!
+//! ## Two representations, one authority
+//!
+//! ```text
+//!  S3 / MinIO  (authoritative)
+//!  ---------------------------
+//!  _security/heads/policy.json                _security/policies/<ULID>.json
+//!    PolicyHead                                 PolicySnapshot  (write-once)
+//!    +-------------------------+                +------------------------+
+//!    | version                 |--- selects --->| version                |
+//!    | object_key              |                | created_at, created_by |
+//!    | checksum                |                | checksum (canonical)   |
+//!    +-------------------------+                | principals[]           |
+//!    | control_revision        |  not covered   | keys[]                 |
+//!    | publication_fence_token |  by the        | grants[]               |
+//!    | pending_branch_activs.  |  semantic      +------------------------+
+//!    +-------------------------+  digest                    |
+//!         semantic_digest = SHA-256(version,                |
+//!                                   object_key, checksum)   |
+//!                                                           v
+//!  memory (disposable)                            verify_checksum()
+//!  -------------------                              |          |
+//!                                            mismatch          | ok
+//!                                                 |            v
+//!                       PolicyChecksumMismatch <--'        compile()
+//!                                                              |     |
+//!                                       conflicting stamps <---'     | ok
+//!                                       (InvalidPolicy)              v
+//!                                                            CompiledPolicy
+//!                                                    keys:   key_id -> CompiledKey
+//!                                                    grants: principal -> grants
+//!                                                                 |
+//!            authorize(principal, now, action, resource)  <--------'
+//!                                 |
+//!             Ok(CompiledAuthorization)  |  Err(DenyReason)
+//! ```
+//!
+//! The head is small and compare-and-swapped; snapshots are immutable and never
+//! rewritten. Changing policy means writing a new snapshot object and swinging
+//! the head, exactly as the manifest works for data.
+//!
+//! ## Reading map
+//!
+//! 1. [`PolicySnapshot`]: the complete persisted authority — principals, keys,
+//!    grants, version, and canonical checksum. Start with
+//!    [`PolicySnapshot::verify_checksum`] and `validate_structure` to see which
+//!    shapes are legal at rest.
+//! 2. [`PolicyGrant`] with [`GrantScope`] and [`GrantActions`]: one independently
+//!    evaluated binding, plus `validate_constraints`, which is the single place
+//!    that decides whether a grant's optional narrowing is coherent.
+//! 3. [`PolicyHead`]: the CAS-published pointer, [`PolicyHead::semantic_digest`],
+//!    and the four transition helpers — `claim_publication`, `advance_semantic`,
+//!    `insert_pending_branch_activation`, `remove_pending_branch_activation` —
+//!    which are the only legal ways the head may change.
+//! 4. `CompiledPolicy` and [`PolicySnapshot::compile`]: how a verified snapshot
+//!    becomes an evaluator, and where duplicate keys and conflicting stamps are
+//!    rejected.
+//! 5. `CompiledPolicy::authorize` and `authorize_grants`: the merge rules that
+//!    combine every applicable grant into one [`CompiledAuthorization`].
+//! 6. `CompiledPolicy::validate_namespace_copy_no_widening` with
+//!    `DERIVED_NAMESPACE_ACTIONS`: the conservative proof that publishing a raw
+//!    namespace copy cannot broaden anyone's authority.
+//! 7. [`PolicySnapshot::migrate_phase_seven_all`]: the one-way migration that
+//!    retires the legacy wildcard grant.
+//! 8. [`canonical_policy_checksum`] and `write_canonical_json`: the deterministic
+//!    encoder every checksum depends on.
+//!
+//! ## Invariants
+//!
+//! - **A snapshot is evaluated only after it verifies.** [`PolicySnapshot::compile`]
+//!   calls [`PolicySnapshot::verify_checksum`] first, so a corrupted or tampered
+//!   object can never authorize anything. There is no lenient path.
+//! - **Checksums are computed over canonical JSON.** `write_canonical_json` sorts
+//!   object keys through a `BTreeMap` and the collections are kept sorted
+//!   (principals by id, keys by key id, grants by `grant_order`, actions sorted
+//!   and deduplicated), so the digest is reproducible across processes. The
+//!   checksum field itself is excluded from its own input.
+//! - **Persisted version zero does not exist.** `PolicyVersion::BOOT` marks
+//!   boot-config authority; both a snapshot and a head reject it, and
+//!   `finalize_next` advances the version monotonically on every mutation.
+//! - **The head's semantic identity excludes its control fields.** Claiming the
+//!   publication lease or parking a pending branch activation bumps
+//!   `control_revision` without changing `semantic_digest`, which is what lets an
+//!   activation guard be recorded against an unchanged policy generation.
+//! - **A publication is exactly one version forward.** `advance_semantic` refuses
+//!   unless the caller holds the current fencing token, no branch activation is
+//!   pending, and the candidate version is precisely `current + 1`.
+//! - **Legacy wildcard grants cannot be compiled.** `GrantActions::All` is a
+//!   read-only legacy shape; compilation rejects it, forcing migration to the
+//!   explicit `POLICY_SAFE_ALL_V2` set. The migration deliberately splits a global
+//!   wildcard into a safe action set plus a separate explicit `SecurityAdminWrite`
+//!   grant, so authority is neither silently dropped nor silently widened, and
+//!   never picks up later capabilities such as `AttributeAdmin`,
+//!   `CredentialDelegate`, or the preservation actions.
+//! - **Grants union on actions and intersect on constraints.** Any applicable
+//!   grant that names the action permits it, but every applicable grant's
+//!   narrowing applies: mandatory filters are `And`-combined, field-mask denials
+//!   union, write-constraint stamps and forbidden fields merge, and approval is
+//!   required if any applicable grant requires it for that action. Adding a grant
+//!   for the same action and scope therefore tightens rather than relaxes.
+//! - **`AttributeAdmin` is the one deliberate relaxation.** When the principal
+//!   holds `AttributeAdmin` at a scope matching the resource, the merged write
+//!   constraints have their forbidden-field set cleared, for every action
+//!   authorized at that scope — that is what makes attribute administration
+//!   possible. Server-owned stamps are *not* cleared, and the grant validator
+//!   refuses a constrained `AttributeAdmin` grant that does not also name
+//!   `VectorUpsert`, so the bypass cannot be granted without the write action it
+//!   is meant to accompany.
+//! - **Conflicting server stamps are a publication error, not a runtime one.**
+//!   `validate_compiled_grant_conflicts` rejects two overlapping grants that stamp
+//!   the same attribute with different values at compile time. If such a policy
+//!   somehow reached evaluation, `authorize_grants` panics rather than choosing a
+//!   value — an invariant violation must be loud.
+//! - **Credential state is evaluated against the request clock.** A revoked key
+//!   with no `revokes_at`, or whose `revokes_at` has passed, is
+//!   `CredentialUnknown`; an expired key is `CredentialExpired`. A key revoked as
+//!   part of rotation stays usable until its overlap deadline, which is the only
+//!   case where `KeyState::Revoked` still authenticates.
+//! - **Credentials must belong to their principal.** A key whose `principal_id`
+//!   does not match the presented principal, or whose principal is absent from the
+//!   snapshot, is unknown — not merely ungranted.
+//! - **Rotation lineage is acyclic and well-formed.** A `rotated_from` reference
+//!   must name an existing predecessor of the same principal, created no later
+//!   than its successor, with no cycle in the chain.
+//! - **Delegation authority is restricted by principal kind.** A grant naming
+//!   `CredentialDelegate` is rejected unless its principal is `Human` or
+//!   `Service`, both when added and when a persisted snapshot is validated.
+//! - **Approval must be attached to destructive actions in the same grant.**
+//!   `require_approval` may only name destructive actions that grant also
+//!   contains, and must be sorted and unique.
+//! - **A namespace copy may not widen access.** The no-widening proof is
+//!   deliberately syntactic: a target scope is accepted only when every source
+//!   filter conjunct, denied field, stamp, and forbidden field is also present on
+//!   the target, and a target grant with no corresponding source grant fails
+//!   closed. Semantically equivalent but structurally different predicates are
+//!   rejected.
+//! - **Plaintext secrets never persist.** [`PolicyKey`] stores only a lowercase
+//!   SHA-256 digest; the full credential exists once, in the transient
+//!   [`IssuedApiKey`], and is never written into a snapshot or cache entry.
+//!
+//! ## Rust concepts used here
+//!
+//! **Serde attributes as a persisted-format contract.** Every stored type carries
+//! `#[serde(deny_unknown_fields)]`, so an object written by a newer node with an
+//! unknown field is rejected rather than silently losing meaning — fail loudly
+//! instead of degrading. The newer [`PolicyHead`] control fields carry
+//! `#[serde(default)]` instead, which is what lets a head written before branching
+//! existed still decode and still produce the same semantic digest.
+//! [`PolicyGrant`] uses `skip_serializing_if` on its optional narrowing fields to
+//! keep unconstrained grants at their original wire shape; that attribute is only
+//! safe because policy is stored as JSON, a self-describing format. Do not move
+//! these types to a non-self-describing encoding such as bincode.
+//!
+//! **Newtypes with validating constructors.** [`ApiKeyId`] wraps a `String` but
+//! implements `Deserialize` by routing through [`ApiKeyId::new`], so an invalid
+//! identifier cannot exist even when it arrives from disk. A Java engineer can
+//! read this as a value class whose only constructor validates, except that here
+//! the deserializer cannot bypass it; in C the equivalent would be a `typedef` to
+//! `char *` with no such guarantee at all.
+//!
+//! **`BTreeMap`/`BTreeSet` chosen for determinism, not speed.** Ordered
+//! collections appear wherever a value feeds a checksum, a digest, or a
+//! structural comparison. A `HashMap` would be faster and would also make the
+//! checksum depend on iteration order, which is exactly the bug this repository
+//! has paid for before. `HashMap`/`HashSet` appear only on the compiled side,
+//! where nothing is hashed for integrity.
+//!
+//! **Two error types for two audiences.** Evaluation returns
+//! `Result<_, DenyReason>` — a small, `Copy`, auditable reason a request was
+//! refused. Structural problems return `Result<_, SecurityError>`, because a
+//! malformed policy is an operator or integrity failure, not a denied request.
+//! Keeping them distinct stops a corrupted snapshot from being reported as a
+//! routine authorization denial.
+//!
+//! **Hand-written `PartialEq`.** [`PolicyGrant`] compares its mandatory filter
+//! through canonical JSON rather than deriving equality, because the filter tree
+//! carries floating-point values and has no meaningful derived equality. The same
+//! encode-then-compare technique gives grants a stable identity for deduplication
+//! during migration.
+//!
+//! **Copy-on-write mutation.** Every snapshot mutator
+//! ([`PolicySnapshot::add_principal`], `add_key`, `revoke_key`, `rotate_key`,
+//! `add_grant`, `remove_grant`) clones, edits, re-validates, and re-checksums a
+//! *new* value rather than mutating in place. The caller keeps the old snapshot
+//! intact, which is what makes an optimistic compare-and-swap publication safe to
+//! retry after a lost race.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 

@@ -20,23 +20,60 @@ typed error; do not add a permissive default.
 ## Entitlements
 
 `Feature` has 9 variants in a **stable bit-assignment order** (`Feature::ALL`).
-Append new variants at the end; reordering invalidates existing licenses.
+Append new variants at the end.
+
+Be precise about what breaks what. A signed license carries feature *names*
+(serde `rename_all = "snake_case"`), and `feature_bits` is recomputed from
+those names on every boot — it is never persisted or signed. So:
+
+- **Renaming** a variant invalidates every issued license naming that feature.
+- **Reordering** does *not* break signature verification. It silently
+  reassigns every in-memory bit index, and it breaks the `#[repr(C)]` layout
+  mirror that `tests/common/server.rs` transmutes into. Still forbidden — the
+  failure is just quieter than a signature error.
+- The `u16` mask caps the inventory at **16** features.
+
+> Corrected 2026-07-24. An earlier revision said "reordering invalidates
+> existing licenses." That conflates the two failure modes; renaming is what
+> invalidates a license.
 
 Enforce entitlements in the **kernel**, not only in the handler — a handler-only
-check is easy to bypass from a new call site. Current state is inconsistent
-here: `authorize_namespace_fork` checks `Feature::Branching` in the kernel,
-but `authorize_branch_list` does not and relies on the handler's config flag
-alone. Prefer the kernel-side check.
+check is easy to bypass from a new call site.
+
+Branching is currently symmetric and kernel-enforced. `Feature::Branching` is
+checked in four `kernel.rs` functions: `authorize_namespace_fork`,
+`authorize_branch_list`, `fresh_current_fork_authorization`, and
+`fresh_loaded_policy_fork_authorization`. The handler-side config flag in
+`server/handlers/namespace.rs` is a second, independent gate — not the only
+one. Keep any new branch-adjacent authority on the same pattern.
+
+Not every feature is kernel-enforced, though. `Feature::Rbac` is gated **only**
+by route selection in `server/mod.rs::security_routes`; the kernel's admin
+methods carry no `Rbac` check. The backstop is indirect: an unlicensed boot
+builds `SecurityAuthority::Bootstrap`, whose admin arms return
+`InvalidPolicyRequest` → 400, not 403 `feature_not_licensed`. Delegation and
+preservation *do* re-check their feature in the kernel.
+
+> Corrected 2026-07-24. An earlier revision of this file claimed
+> `authorize_branch_list` relied on the handler's config flag alone. That was
+> already false when written: the kernel check landed in `4f8583c`. Verify
+> against the code before trusting a gap claim here.
 
 ## The policy publication lease and the `Local` backend
 
-`PolicyPublicationLease` acquires create-only and **releases via ETag CAS**.
-`object_store`'s `LocalFileSystem` does not implement conditional update, so on
-`StorageBackend::Local` the release returns `Storage(NotImplemented)`.
+`PolicyPublicationLease` acquires create-only, then **renews and releases via
+ETag CAS**. `object_store`'s `LocalFileSystem` does not implement conditional
+update, so on `StorageBackend::Local` every conditional PUT returns
+`Storage(NotImplemented)`.
 
 Because `PolicyStore::bootstrap` acquires this lease, **first boot on a
-`Local`-backed store currently fails**. That is why these are red without
-MinIO:
+`Local`-backed store currently fails**. The failure is on **renew**, not
+release: `publish_bootstrap_claimed` propagates `publication_lease.renew(..)?`,
+so bootstrap cannot renew the lease it just acquired. Release could not cause
+this — `release_publication_best_effort` only logs a warning. If you are
+debugging a Local-backend boot failure, look at renew first.
+
+That is why these are red without MinIO:
 
 - `security::policy_publication::tests::missing_acquisition_is_create_only_and_release_keeps_a_cas_record`
 - `security::policy_publication::tests::expired_takeover_increments_token_and_stale_release_cannot_overwrite`

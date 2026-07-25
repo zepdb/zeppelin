@@ -1,4 +1,134 @@
 //! Offline Ed25519 license parsing, canonicalization, and resolution.
+//!
+//! This file is the single trust boundary between an untrusted file on disk and
+//! the process-wide feature authority in
+//! [`Entitlements`]. It owns the license wire format
+//! ([`SignedLicense`], [`LicensePayload`]), the canonical byte sequence the
+//! Ed25519 signature covers ([`canonical_payload_bytes`]), schema validation
+//! ([`validate_license_payload`]), verification
+//! ([`verify_signed_license_bytes`]), and the boot-time resolver seam
+//! ([`EntitlementResolver`], [`FileLicenseResolver`]).
+//!
+//! It deliberately does **not** own:
+//!
+//! - the meaning of a feature or its bit position — that is
+//!   `src/security/entitlements.rs`, which this module calls into through a
+//!   crate-private constructor;
+//! - enforcement. Verifying a license grants nothing by itself; denial happens
+//!   later in [`SecurityKernel`][super::SecurityKernel] and
+//!   [`PolicyStore`][super::PolicyStore];
+//! - key custody. The private half of [`LICENSE_PUBKEY`] is never in this
+//!   repository and is never read by the server.
+//!
+//! ## Where this sits
+//!
+//! [`build_app`](crate::startup::build_app) constructs a [`FileLicenseResolver`] from
+//! `security.license_path` and resolves it exactly once, on a blocking thread,
+//! before any request can be served. Nothing above this layer touches the file.
+//! The `zeppelin_license` binary shares the *same* functions so that issuance
+//! and runtime acceptance cannot diverge.
+//!
+//! ```text
+//! LICENSE.json on disk  (untrusted; may be absent, truncated, or forged)
+//!        |
+//!        | FileLicenseResolver::resolve  — empty path => community floor
+//!        v
+//!   serde_json parse, deny_unknown_fields ------------------> LicenseError::Json
+//!        |
+//!        v
+//!   validate_license_payload  (schema, not signature) ------> LicenseError::InvalidField
+//!        |
+//!        v
+//!   canonical_payload_bytes   (recursively key-sorted JSON)
+//!        |
+//!        v
+//!   Ed25519 verify against embedded LICENSE_PUBKEY --------> LicenseError::InvalidSignature
+//!        |
+//!        v  the only path that produces a licensed value
+//!   Entitlements  (immutable, Arc-shared for the process lifetime)
+//! ```
+//!
+//! Every branch on the right is fatal to boot: [`LicenseError`] converts into
+//! `ZeppelinError::License`, and startup refuses to serve. There is no fallback
+//! to the community floor on a *bad* license — only on an *unconfigured* one.
+//! That distinction is deliberate: an operator who configured a license and got
+//! a corrupt file must be told, not quietly downgraded.
+//!
+//! ## What the signature actually proves
+//!
+//! A successful verification proves exactly one thing: the canonical JSON bytes
+//! of the payload fields were signed by the holder of the private key matching
+//! the [`LICENSE_PUBKEY`] compiled into *this binary*. It proves nothing about
+//! freshness, revocation, or uniqueness. Concretely:
+//!
+//! - **No revocation, no replay protection.** A license file is a bearer
+//!   artifact. Copying it to another host, or restoring an old one, verifies
+//!   just as well. Expiry is the only time bound, and expiry does not disable
+//!   enforcement (see `src/security/entitlements.rs`).
+//! - **The signature covers the payload only, never the `signature` field.**
+//!   [`SignedLicense::payload`] projects the covered subset;
+//!   [`SignedLicense`] is the flat on-disk document that adds `signature`
+//!   alongside those same fields.
+//! - **Canonicalization is what makes the proof stable.** The private
+//!   `canonicalize` helper rebuilds every JSON object through a
+//!   `BTreeMap` so map ordering cannot
+//!   change the signed bytes. Array order is preserved and *is* covered, so the
+//!   `features` list is signed in the order it appears in the file. This is the
+//!   repository's "canonicalize before hashing" rule applied to signatures.
+//! - **Trust is rooted in the binary, not in configuration.** There is no
+//!   operator-supplied trust anchor. Rotating the verification key is an
+//!   intentional, reviewed source change and a rebuild.
+//!
+//! Validation runs *before* signature verification, so a structurally invalid
+//! payload is rejected even when correctly signed — an issuer cannot sign its
+//! way past the schema. Duplicate entries in `features`, a non-positive
+//! validity window, an out-of-grammar `customer_id`, and
+//! `limits.max_principals == 0` are all rejected here rather than being
+//! normalized.
+//!
+//! ## Artifacts and state
+//!
+//! Reads one local file (`security.license_path`) and, via
+//! [`read_key_file`], key material for the issuance tool. Creates nothing,
+//! writes nothing, and never touches object storage. There is no cache: the
+//! resolver reads the file once at boot and the resulting authority is
+//! immutable thereafter.
+//!
+//! ## Test-key substitution
+//!
+//! [`LICENSE_PUBKEY`] is `#[cfg]`-selected: the unit-test build compiles a
+//! throwaway key so tests can sign fixtures, and the release build compiles the
+//! production key. Because the selection is a compile-time attribute rather
+//! than a runtime setting, a release binary has no code path that accepts the
+//! test key.
+//!
+//! ## Where to start reading
+//!
+//! [`verify_signed_license_bytes`] is the whole contract in one function; read
+//! it, then [`validate_license_payload`] for the schema rules and
+//! [`canonical_payload_bytes`] for the signed byte sequence.
+//!
+//! ## Rust concepts used here
+//!
+//! [`EntitlementResolver`] is a `dyn`-dispatched trait bound by `Send + Sync`
+//! so startup can hold `Arc<dyn EntitlementResolver>` and hand it across a
+//! `spawn_blocking` boundary. It resembles a Java interface, with the bounds
+//! made explicit: `Send` means the value may cross threads, `Sync` that `&T`
+//! may be shared across them — the compiler checks both rather than leaving
+//! thread-safety to documentation. This is also why the file read is
+//! deliberately synchronous and pushed onto a blocking thread instead of being
+//! made `async`: blocking I/O must never run on a Tokio runtime thread.
+//!
+//! Every failure is a typed [`LicenseError`] variant built with `thiserror`,
+//! and `?` propagates it. There is no sentinel return and no partially
+//! populated [`Entitlements`] — a `Result` makes the
+//! all-or-nothing outcome unrepresentable otherwise, which a C function
+//! returning `-1` and an out-parameter cannot.
+//!
+//! `Signature::from_slice`, `VerifyingKey::from_bytes`, and the base64 decode
+//! all map their errors to the same opaque
+//! [`LicenseError::InvalidSignature`]. That collapsing is intentional: a
+//! caller learns *that* the proof failed, not which byte betrayed it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

@@ -1,4 +1,192 @@
-//! S3-authoritative loading and atomic bootstrap of security policy.
+//! S3-authoritative loading, bootstrap, and CAS publication of security policy.
+//!
+//! Zeppelin's authorization rules live in object storage, not in process memory
+//! and not in the boot configuration file. This file is the only place that
+//! reads or writes the reserved `_security/` policy keyspace, and the only
+//! place that turns raw objects into a [`LoadedPolicy`]: one verified head
+//! observation, the exact immutable snapshot that head selects, and the head
+//! ETag that authorizes the next publication.
+//!
+//! What this file deliberately does **not** own:
+//!
+//! - the persisted policy vocabulary, its strict validation, its canonical
+//!   checksum, and its compiled evaluation form — that is `policy.rs`, which
+//!   defines [`PolicyHead`] and [`PolicySnapshot`];
+//! - lease mechanics, fencing-token arithmetic, and guard records — that is
+//!   `policy_publication.rs`, which defines [`PolicyPublicationLease`],
+//!   [`PolicyPublicationLeaseClaim`], and [`PendingBranchActivation`];
+//! - request-path caching, refresh scheduling, and the staleness rule — that is
+//!   `policy_cache.rs`;
+//! - the authorization decision itself and its audit record — that is
+//!   `kernel.rs`;
+//! - `object_store` access. Every request goes through [`ZeppelinStore`], the
+//!   single object-store boundary.
+//!
+//! ## Where this sits
+//!
+//! `SecurityKernel::from_store` constructs one [`PolicyStore`] during boot and
+//! calls [`PolicyStore::load_or_bootstrap`] before the server accepts traffic.
+//! The resulting [`LoadedPolicy`] seeds the process-local policy cache, which
+//! afterwards owns every subsequent call into this file: periodic
+//! revalidation, administrative mutations, and the branch-activation guard
+//! lifecycle. No HTTP handler reaches this file directly.
+//!
+//! ## Persisted artifacts
+//!
+//! Everything below is authoritative object-store state. Nothing here is a
+//! cache, and nothing local may override it.
+//!
+//! | Key | Mutability | Written by |
+//! | --- | --- | --- |
+//! | `_security/heads/policy.json` | mutable; ETag CAS only | bootstrap (create-only), then every publication |
+//! | `_security/policies/<ulid>.json` | immutable; create-only | every publication, including bootstrap |
+//! | `_security/migrations/phase7-safe-all-v2/<old>-<new>.json` | immutable; create-only | the legacy-wildcard migration |
+//! | `_security/leases/policy-publication.json` | mutable; create-only then CAS | `policy_publication.rs`, on behalf of this file |
+//!
+//! The head is small and names one snapshot by object key, version, and
+//! checksum. Snapshots are the full policy documents and are never modified
+//! after creation. Both are plain JSON (`serde_json`), so an operator can read
+//! authoritative security state without a decoder.
+//!
+//! ## Publication path
+//!
+//! Writing a snapshot object does not change any decision. Only a successful
+//! conditional PUT of the head does. Two independent defenses guard that PUT:
+//! the single global publication lease, and the ETag of the exact head this
+//! caller observed.
+//!
+//! ```text
+//! acquire global publication lease         (create-only, or CAS takeover)
+//!              |
+//!              v
+//! GET  _security/heads/policy.json         (ETag becomes the CAS token)
+//! GET  _security/policies/<ulid>.json      (snapshot the head selects)
+//!              |
+//!              | verify head/snapshot version + checksum agree
+//!              v
+//! CAS the lease fencing token INTO the head
+//!              |
+//!              v
+//! PUT  _security/policies/<new ulid>.json  (create-only; object exists,
+//!              |                            but authorizes nothing yet)
+//!              v
+//! renew lease, then CAS the head on the observed ETag
+//!              |
+//!       +------+---------------------------+
+//!       | Updated                          | Conflict
+//!       v                                  v
+//! PolicyPublication::Published       PolicyPublication::Conflict
+//! (new rules are now authoritative)  (reload and retry; never overwrite;
+//!       |                             the new snapshot stays an orphan)
+//!       v
+//! release lease (best effort, warn on failure)
+//! ```
+//!
+//! A pending branch-activation guard in the head blocks semantic publication
+//! entirely: [`PolicyStore::publish`] returns `PolicyPublication::Guarded`
+//! rather than racing a half-finished branch activation.
+//!
+//! ## Reading map
+//!
+//! 1. [`LoadedPolicy`] — the unit of authority every other entry point returns.
+//! 2. [`PolicyStore::load_or_bootstrap`] — the boot entry point, including the
+//!    first-boot race and the ignored-bootstrap-config drift warning.
+//! 3. `PolicyStore::load_head_bytes` — the verification pipeline that every
+//!    head observation must pass before it can authorize anything.
+//! 4. [`PolicyStore::publish`] — lease claim, immutable snapshot write, and
+//!    head CAS.
+//! 5. `PolicyStore::bootstrap` and its helpers — how version 1 is created
+//!    exactly once across concurrent cold starts.
+//! 6. [`PolicyStore::acquire_claimed_publication`] and the
+//!    `*_branch_activation` family — the crash-recoverable guard lifecycle that
+//!    linearizes namespace branch activation against policy.
+//! 7. [`PolicyStore::refresh`] and [`PolicyStore::load_current`] — the
+//!    revalidation paths the cache drives.
+//! 8. `bootstrap_config_drifted` and its normalizers — comparison only; they
+//!    never write.
+//!
+//! ## Invariants
+//!
+//! - **S3 is authoritative.** Once `_security/heads/policy.json` exists, boot
+//!   configuration is advisory only. Semantic drift emits a redacted
+//!   structured warning and is ignored; it never rewrites the head.
+//! - **A stale ETag never overwrites a newer head.** Every mutation is a
+//!   conditional PUT on the exact observed ETag. A `Conflict` reloads.
+//! - **A CAS that reports success without an ETag is not trusted.** Those paths
+//!   re-read the head and compare identity before returning success.
+//! - **Snapshots are immutable.** They are written create-only. A colliding key
+//!   with different bytes is [`SecurityError::PolicyObjectCollision`], never an
+//!   overwrite.
+//! - **Head and snapshot must agree.** A head whose version or checksum
+//!   disagrees with the snapshot it names is rejected as
+//!   [`SecurityError::InvalidPolicy`]; no repair is attempted.
+//! - **Two-layer concurrency defense.** The lease serializes head writers and
+//!   its fencing token is claimed into the head; ETag CAS then catches any
+//!   writer whose claim went stale. Neither layer alone is sufficient.
+//! - **Lease release is best effort.** Failure is logged and swallowed so a
+//!   process cannot deadlock on a lease it already lost; the lease expiry and
+//!   fencing token remain the real authority.
+//! - **Fail closed on entitlements.** A policy that uses constraints,
+//!   delegation, or preservation without the matching [`Feature`] is rejected
+//!   on both load and publish, so an unlicensed node cannot silently enforce
+//!   less than the authoritative document requires.
+//! - **Legacy wildcard grants must migrate before use.** A snapshot with
+//!   `GrantActions::All` cannot compile; every load path drives a bounded
+//!   migration that publishes a new version, and refuses to claim publication
+//!   authority over an unmigrated head.
+//! - **Bounded retries, then a typed error.** Migration, bootstrap-lease
+//!   acquisition, and head claiming all give up with
+//!   [`SecurityError::PolicyConflict`] rather than looping.
+//!
+//! ## Backend requirement
+//!
+//! Publication requires ETag compare-and-swap, which
+//! `object_store`'s `LocalFileSystem` does not implement. Acquiring the
+//! publication lease is create-only and succeeds on any backend, but renewing
+//! and releasing it are conditional PUTs. On `StorageBackend::Local` the first
+//! such PUT fails with `Storage(NotImplemented)`, so **first boot against a
+//! `Local`-backed store currently fails outright** — `bootstrap` cannot renew
+//! the lease it just acquired. This is a known and accepted limitation:
+//! `Local` is documented as development/testing only, and S3/MinIO are
+//! unaffected. See `src/security/CLAUDE.md` and `src/storage/CLAUDE.md`; three
+//! `cargo test --lib` tests are red for exactly this reason.
+//!
+//! ## Cost
+//!
+//! Nothing here is on the query path. A head load is two sequential GETs (head,
+//! then the snapshot it names). [`PolicyStore::refresh`] is one conditional GET
+//! when nothing changed. A publication is a bounded sequence of lease, GET, and
+//! conditional PUT roundtrips. [`PolicyStore::load_version`] is the expensive
+//! outlier: it LISTs `_security/policies/` and GETs every object, so it belongs
+//! only on privileged receipt-verification paths.
+//!
+//! ## Rust concepts used here
+//!
+//! [`PolicyStore`] derives `Clone`, but cloning it copies no policy data: the
+//! entitlement set and the publication lease are `Arc`s, so a clone is two
+//! reference-count bumps over the same shared authority. Java's nearest analogy
+//! is sharing one object reference; the difference is that `Arc` makes the
+//! sharing and its thread-safety explicit in the type.
+//!
+//! `claim_current_head` returns
+//! `Result<Option<ClaimedPolicyPublication>, (ZeppelinError, PolicyPublicationLeaseClaim)>`.
+//! The unusual error type exists because a [`PolicyPublicationLeaseClaim`] is an
+//! owned obligation: whoever holds it must attempt release. Rust's move
+//! semantics mean an early `?` would silently drop that obligation, so the
+//! failing path hands the claim back to the caller instead. In Java this would
+//! be a `try`/`finally`; in C, a `goto cleanup`. Here the compiler makes the
+//! handoff visible in the signature.
+//!
+//! [`CreateOnlyOutcome`] and [`ConditionalPutOutcome`] are enums rather than
+//! booleans or exceptions, so an exhaustive `match` forces every caller to
+//! decide what a lost race means. "Someone else won" is a normal outcome of
+//! this file's protocol, not an error.
+//!
+//! [`LoadedPolicy`] stores `observed_at: Instant`, not a wall-clock timestamp.
+//! `Instant` is monotonic and immune to clock adjustment, which is what a
+//! freshness budget needs; the `DateTime<Utc>` values threaded through this
+//! file are domain timestamps recorded inside policy documents, and the two are
+//! deliberately not interchangeable.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

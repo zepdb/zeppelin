@@ -50,6 +50,7 @@ before you start** — they exist to stop rediscovery of bugs already paid for.
 | [`src/index/CLAUDE.md`](src/index/CLAUDE.md) | the recall gate, IVF defaults, quantization findings |
 | [`src/compaction/CLAUDE.md`](src/compaction/CLAUDE.md) | GC ownership, branch materialization cost |
 | [`src/cache/CLAUDE.md`](src/cache/CLAUDE.md) | disposability, hydration's branch-safety contract |
+| [`src/fts/CLAUDE.md`](src/fts/CLAUDE.md) | `bm25_term_score` arg order, the two index shapes, tokenizer rules |
 | [`src/server/CLAUDE.md`](src/server/CLAUDE.md) | axum 0.7 syntax, router split, gated routes |
 | [`src/security/CLAUDE.md`](src/security/CLAUDE.md) | entitlements, the policy publication lease |
 | [`tests/CLAUDE.md`](tests/CLAUDE.md) | `TEST_BACKEND`, MinIO setup, known-flaky list |

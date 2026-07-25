@@ -56,21 +56,41 @@ Branching is **off by default** and needs *two* independent things:
    at all (`server/mod.rs:2742`);
 2. a valid `Feature::Branching` entitlement.
 
-Known asymmetry: `create_branch` checks both, but `list_branches` and
-`authorize_branch_list` check only the config flag. If you touch this, make it
-symmetric rather than copying the existing shape.
+Both paths enforce both gates. `create_branch` and `list_branches` each check
+`config.branching.enabled` in the handler, and `authorize_namespace_fork` /
+`authorize_branch_list` each check the entitlement in `security/kernel.rs`.
+Keep new branch routes on this shape.
 
-## `/readyz` cost warning
+> Corrected 2026-07-24. An earlier revision claimed `list_branches` and
+> `authorize_branch_list` checked only the config flag. That was already false
+> when written: the kernel check landed in `4f8583c`.
 
-`inspect_readiness` runs on **every** `/readyz` request, regardless of whether
-branching is enabled, and it is **unbudgeted**: one `list_common_prefixes("")`
-plus a metadata GET *and* a manifest GET per namespace, plus a metadata GET per
-branch root. That is O(namespaces) S3 round-trips per readiness probe, and any
-propagated error takes the process out of the load balancer.
+## `/readyz` reads a snapshot; it does not scan
 
-Contrast `maintain()`, which does similar work but takes a `budget: Duration`
-(25s in production) and runs on the background compaction loop. If you extend
-readiness scanning, give it a budget and/or a cache first.
+`inspect_readiness` is O(namespaces) in strong reads: one
+`list_common_prefixes("")`, a metadata *and* manifest read per namespace, plus
+a metadata read per branch root. **It runs only on the background maintenance
+pass**, which publishes its result into `BranchGraphReadinessSnapshot`.
+`readiness_check` reads that snapshot and issues no object-store work of its
+own. With `branching.enabled = false` the scan never runs at all.
+
+Two consequences to keep in mind when changing this:
+
+- **Absent snapshot means ready, not unhealthy.** A scan that never ran
+  observed no defect, so withholding readiness on it would fail closed on no
+  evidence.
+- **Detection lags one maintenance tick** (~30s default) against a 300s stall
+  threshold. That margin is what makes the trade sound; shrinking the threshold
+  or lengthening the compaction interval erodes it.
+
+`GovernedDeletionWorker::refresh_readiness` is public so tests can observe one
+scan deterministically instead of sleeping on a tick — use it rather than
+polling. `branching_tests::readiness_probes_never_scan_the_namespace_graph`
+pins the zero-cost property.
+
+> Corrected 2026-07-24. An earlier revision of this file said the scan ran on
+> every probe, unbudgeted. That was true when written and was fixed in
+> `4f8583c`.
 
 ## Backward compatibility
 

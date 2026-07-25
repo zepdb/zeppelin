@@ -1,4 +1,183 @@
 //! Persisted namespace-fork lifecycle identities and prepare outcomes.
+//!
+//! Everything a fork durably records is declared here as a strong type: the
+//! create-only reservation written into the target's `meta.json`, the ancestry
+//! proof signed into the target's manifest, and the evidence installed by the
+//! single visibility compare-and-swap that turns a hidden reservation into a
+//! usable namespace. This file owns the *vocabulary* and the cross-record
+//! equality rules that bind those three independent objects to one fork. It
+//! performs no I/O, holds no lease, takes no CAS, and makes no authorization
+//! decision.
+//!
+//! ## Where this sits
+//!
+//! The crate-private namespace graph (`NamespaceGraph`, `src/namespace/graph.rs`)
+//! is the only coordinator that advances these values. It reads and writes them
+//! through three persistence owners, none of which live here:
+//!
+//! - [`NamespaceMetadata`](crate::namespace::manager::NamespaceMetadata) persists the reservation,
+//!   the prepare intent, the final identity, and the activation evidence in
+//!   `meta.json` (JSON).
+//! - [`Manifest`](crate::wal::Manifest) persists [`BranchLineage`] in the
+//!   target's manifest and [`BranchRoot`] in the *parent's*
+//!   manifest (MessagePack).
+//! - `src/namespace/branch_root.rs` performs the lease-fenced root mutation.
+//!
+//! Above the graph, `crate::server::handlers::namespace::create_branch` and
+//! `list_branches` project a redacted subset onto the wire types in
+//! [`http`](crate::namespace::branching::http). Below it, `src/storage/` is reached
+//! only by those persistence owners — never from this module.
+//!
+//! Branching is fork-only. There is no merge, rebase, diff, or promote state in
+//! this vocabulary because those operations do not exist in the product; that is
+//! a locked decision, not a missing variant.
+//!
+//! ## Reading map
+//!
+//! 1. [`NamespaceCreationKind`] — which lifecycle family a `meta.json` record
+//!    belongs to. `Root` is the pre-branching default; `Fork` carries the
+//!    reservation.
+//! 2. [`ForkReservationIdentity`] — the create-only edge minted when the target
+//!    name is claimed.
+//! 3. [`BranchPrepareStage`] and [`ForkPrepareIntent`] — the monotonic,
+//!    never-visible preparation milestone.
+//! 4. [`ForkIdentity`] — the final immutable creation proof, plus the three
+//!    predicates that reconcile it against the other persisted records:
+//!    [`ForkIdentity::matches_reservation`], [`ForkIdentity::matches_root`],
+//!    and [`ForkIdentity::matches_lineage`].
+//! 5. [`BranchLineage`] — the manifest-side half of the same proof.
+//! 6. [`ActivationNonce`], [`PolicyHeadIdentity`], and
+//!    [`BranchActivationEvidence`] — the fencing and proof material for the sole
+//!    visibility CAS.
+//! 7. [`PrepareForkRequest`], [`PrepareForkOutcome`], [`PreparedBranch`],
+//!    [`BranchDescriptor`], and [`BranchLifecycleState`] — in-process request
+//!    and result shapes that are never persisted.
+//! 8. [`NamespaceDeleteRequest`], [`NamespaceDeleteOutcome`], and
+//!    [`BranchMaintenanceReport`] — the deletion and background-maintenance
+//!    vocabulary.
+//!
+//! ## Fork lifecycle state machine
+//!
+//! Each arrow is a durable boundary. A crash between any two of them leaves a
+//! record that background maintenance can resume; nothing is visible to readers
+//! until the final CAS.
+//!
+//! ```text
+//! reserve target name (meta.json, state = creating)
+//!   creation_kind  = Fork(ForkReservationIdentity)
+//!   branch_prepare = ForkPrepareIntent {
+//!       stage       = Reserved,
+//!       provisional = Some(ForkDataPlaneConfig) }   <- copied from parent
+//!   branch_identity = None
+//!         |
+//!         | publish BranchRoot into the PARENT manifest
+//!         | (lease-fenced + ETag CAS); parent now pins the forked generation
+//!         v
+//!   stage           = Rooted
+//!   branch_identity = Some(ForkIdentity)   <- digests are now frozen
+//!   provisional     = None
+//!         |
+//!         | create-only PUT of the target's generation-1 manifest,
+//!         | signed with BranchLineage; still zero artifact bytes copied
+//!         v
+//!   stage = ManifestPublished
+//!         |
+//!         | mint ActivationNonce; install the policy-head guard
+//!         v
+//!   stage = ActivationPending { nonce }
+//!         |                         \
+//!         |                          \ crash / guard expiry
+//!         |                           v
+//!         |                    guard recovery proves the target outcome:
+//!         |                    finalize (evidence exists) or abort (nonce
+//!         |                    durably revoked). Never "assume success".
+//!         |
+//!         | sole target-visibility CAS on meta.json
+//!         v
+//! state = active
+//!   branch_prepare    = None              <- preparation state is cleared
+//!   branch_identity   = Some(ForkIdentity)
+//!   branch_activation = Some(BranchActivationEvidence)
+//! ```
+//!
+//! ## Invariants
+//!
+//! - **Visibility is the CAS, not the artifacts.** A rooted, manifest-published
+//!   fork is fully durable and still invisible. Only the metadata CAS that sets
+//!   `state = active` and installs [`BranchActivationEvidence`] exposes it.
+//! - **Preparation is monotonic.** [`BranchPrepareStage`] only advances.
+//!   Recovery re-derives the current stage from persisted state; it never
+//!   rewinds a milestone or infers one from a timestamp.
+//! - **Timestamps are audit, not order.** `created_at` on
+//!   [`ForkReservationIdentity`], [`ForkIdentity`], and [`BranchLineage`] is
+//!   reporting material. Ordering authority is
+//!   [`ManifestGeneration`] plus ETag CAS.
+//! - **Identity is a lifetime, not a name.** Every cross-record predicate
+//!   compares `NamespaceIncarnationId` as well as `NamespaceId`, so a
+//!   deleted-and-recreated namespace can never silently satisfy a stale proof.
+//! - **A reservation is create-only.** `matches_reservation` requires every
+//!   reservation field, including `created_at` and `depth`, to be byte-identical
+//!   in the final identity. A retry that differs is a conflict, not an update.
+//! - **The nonce fences workers, it does not authorize them.**
+//!   [`ActivationNonce`] is an ordering identity; authority comes from the
+//!   freshly re-checked policy head carried by [`PolicyHeadIdentity`].
+//! - **BOOT is never dressed up as a fenced publication.**
+//!   [`PolicyHeadIdentity::Persisted`] is rejected by
+//!   [`PolicyHeadIdentity::is_valid_for_activation`] when it names the BOOT
+//!   policy version or an unadvanced control revision.
+//! - **Cleared state is part of the contract.** Once active, `branch_prepare`
+//!   must be absent and both the identity and the evidence present; the
+//!   validator in `NamespaceMetadata::validate_creation_lifecycle` rejects any
+//!   other combination rather than repairing it.
+//!
+//! ## Serialization compatibility
+//!
+//! Two different persisted formats read these types, and the rules differ.
+//!
+//! - `meta.json` is JSON. `#[serde(default)]` lets pre-branching records decode
+//!   as [`NamespaceCreationKind::Root`], and `skip_serializing_if` is safe on
+//!   optional fields such as `BranchActivationEvidence::approver` and
+//!   `ForkPrepareIntent::provisional`.
+//! - The manifest is MessagePack. [`BranchLineage`] is the only type here that
+//!   is persisted there, and it deliberately uses `#[serde(default)]` alone.
+//!   **Do not add `skip_serializing_if` to it** — MessagePack is not
+//!   self-describing enough for an omitted field in that position.
+//! - `#[serde(deny_unknown_fields)]` on the persisted records makes a foreign or
+//!   corrupted field a loud decode failure rather than a silent drop.
+//! - [`BranchPrepareStage::ActivationPending`] is an intentional forward
+//!   incompatibility: an older reader that predates the nonce fails closed on it
+//!   instead of mistaking a fenced attempt for a plain `manifest_published`
+//!   record. A unit test in this file pins that behavior.
+//!
+//! ## Rust concepts used here
+//!
+//! **Newtypes over raw values.** [`ActivationNonce`] wraps a `Ulid` and is
+//! `#[serde(transparent)]`, so it costs nothing on the wire but cannot be
+//! confused with a `BranchId` or a policy token at a call site. In Java this
+//! would be a wrapper class you would be tempted to skip for performance; in
+//! Rust the wrapper is erased at runtime. It is `Copy` because a ULID is 16
+//! plain bytes — passing one moves nothing and allocates nothing.
+//!
+//! **Enums that make invalid states unrepresentable.** [`PolicyHeadIdentity`]
+//! is the clearest case. A struct with nullable lease fields would let a BOOT
+//! deployment be described with a fabricated fencing token; the two-variant enum
+//! makes that shape impossible to construct. Likewise
+//! [`BranchPrepareStage::ActivationPending`] carries its nonce *inside* the
+//! variant, so "pending activation without a fence" cannot be spelled. A C
+//! tagged union offers the same layout but no compiler-checked exhaustiveness;
+//! Rust's `match` forces every reader to handle a newly added stage.
+//!
+//! **Predicates instead of `PartialEq` on whole records.** `matches_root` and
+//! `matches_lineage` deliberately compare *subsets* of [`ForkIdentity`], because
+//! the parent root and the child lineage each legitimately omit fields the other
+//! carries. Deriving equality across records would have forced those differences
+//! into the type layout.
+//!
+//! **In-process versus persisted types.** Only the `Serialize`/`Deserialize`
+//! types in this file reach object storage. [`PrepareForkOutcome`],
+//! [`BranchDescriptor`], [`NamespaceDeleteOutcome`], and
+//! [`BranchMaintenanceReport`] have no serde derives at all — that absence is
+//! the signal that changing them cannot break an existing `meta.json`.
 
 use std::collections::BTreeMap;
 
@@ -301,7 +480,7 @@ pub enum NamespaceCreationKind {
     /// Ordinary empty-root namespace creation.
     #[default]
     Root,
-    /// Zero-copy fork reservation owned only by [`crate::namespace::graph::NamespaceGraph`].
+    /// Zero-copy fork reservation owned only by `NamespaceGraph`.
     Fork(ForkReservationIdentity),
 }
 

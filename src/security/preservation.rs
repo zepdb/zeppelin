@@ -1,4 +1,203 @@
 //! S3-authoritative preservation locks and fail-closed destruction guards.
+//!
+//! This file owns one deployment-wide question: *is destructive work currently
+//! forbidden for this namespace, and can the asker prove it checked recently
+//! enough?* It owns the authoritative lock head in object storage, the
+//! immutable create/release/transition records behind every head version, a
+//! freshness-bounded process cache over that head, and the
+//! [`PreservationGuard`] values that destructive call sites must consult.
+//!
+//! It deliberately does **not** own destruction. It never deletes a namespace,
+//! never runs GC or compaction, never authorizes a request, and never assigns
+//! legal meaning to a hold: [`PreservationReasonKind`] is an operator-chosen
+//! label with no behavior anywhere in this crate. Deployment policy owns the
+//! legal reading. This module answers only "protected or not", and the caller
+//! is responsible for stopping.
+//!
+//! ## Where this sits
+//!
+//! Preservation is a licensed feature. When `Feature::Preservation` is not
+//! entitled the security kernel composes no [`PreservationService`] at all and
+//! every guard the kernel hands out is `PreservationGuard::unlocked()` — this
+//! file is then never consulted. Everything below describes the entitled path.
+//!
+//! Two callers enter from different directions, at different costs:
+//!
+//! - **Governed namespace deletion** takes the strong path. `NamespaceGraph`
+//!   in `src/namespace/graph.rs` is the sole entry point for deleting *any*
+//!   namespace, branched or not, and its state machine calls
+//!   `DeletionGovernance::preservation_boundary` at every destructive boundary
+//!   (`CancellationIntent`, `Fence`, `Tombstone`, `VisibilityRemoval`,
+//!   `RootRelease`, `CleanupBatch`, `MetadataRemoval`). That callback lands in
+//!   [`SecurityKernel::guard_namespace_destruction_strong`](crate::security::SecurityKernel::guard_namespace_destruction_strong),
+//!   which calls [`PreservationService::guard_namespace_strong`] — an
+//!   authoritative read that bypasses the process cache entirely.
+//! - **Background maintenance** (GC in `src/compaction/gc.rs`, compaction in
+//!   `src/compaction/mod.rs`) takes the cheap path,
+//!   [`PreservationService::guard_namespace`], which reads the cached head and
+//!   fails closed if that cache has gone stale.
+//!
+//! ```text
+//! HTTP delete handler / request-scoped cleanup / background sweep
+//!                          |
+//!                          v
+//!            NamespaceGraph::delete   (sole deletion entry point)
+//!                          |
+//!                          | once per destructive boundary
+//!                          v
+//!            DeletionGovernance::preservation_boundary
+//!                          |
+//!                          v
+//!            SecurityKernel::guard_namespace_destruction_strong
+//!                          |
+//!                          v
+//!            PreservationService::guard_namespace_strong
+//!                          |
+//!             authoritative GET of the lock head (no cache)
+//!                          |
+//!             +------------+-------------------------+
+//!             v                                      v
+//!      PreservationGuard                     PreservationHeadProof
+//!      (matching lock ids)                   (head digest + ETag)
+//!             |                                      |
+//!        locked? --- no ---> boundary proceeds       |
+//!             |                                      v
+//!            yes                          recorded inside the durable
+//!             |                           destruction evidence record
+//!             v
+//!   _audit/preservation/<ulid>.json deferral evidence,
+//!   then SecurityError::PreservationLocked stops the boundary
+//! ```
+//!
+//! Most boundaries discard the proof and keep only the locked/unlocked answer.
+//! Two retain it: the `Fence` boundary of an ordinary destruction and the
+//! `CancellationIntent` boundary of a never-active fork both bind their proof
+//! into `NamespaceDestructionRecord::preservation_head`. Later validation
+//! requires that field to be *present*. Nothing in the codebase re-derives or
+//! re-compares the digest afterwards, so the proof is durable evidence that a
+//! strong observation happened — not a re-checkable commitment.
+//!
+//! ## Persisted artifacts
+//!
+//! Everything below is JSON in the authoritative object store. Records are
+//! write-once; only the head is replaced, and only by ETag compare-and-swap.
+//!
+//! | Key | Role |
+//! | --- | --- |
+//! | `_security/preservation/heads/locks.json` | the authoritative head: version, sorted active lock ids, last transition key |
+//! | `_security/preservation/<lock_id>.json` | immutable `Active` record created before the head names it |
+//! | `_security/preservation/releases/<lock_id>/<ulid>.json` | immutable `Released` record created before the head drops the id |
+//! | `_security/preservation/transitions/<ulid>.json` | immutable proof of which lock record one head version committed |
+//! | `_audit/preservation/<ulid>.json` | deferral evidence written when locked maintenance or delete exits early |
+//!
+//! ## Lock lifecycle
+//!
+//! ```text
+//! create_lock                            release_lock
+//!     |                                       |
+//!     | create-only PUT                       | create-only PUT
+//!     | _security/preservation/<lock>.json    | .../releases/<lock>/<ulid>.json
+//!     v                                       v
+//!  immutable Active record                immutable Released record
+//!     |                                       |
+//!     | create-only PUT of a transition record naming that key
+//!     v                                       v
+//!     +------ ETag CAS on .../heads/locks.json, version + 1 ------+
+//!     |                                                           |
+//!  Updated: lock is active and visible to guards      Conflict: reload
+//!           (cache installed from the committed state) and retry, up
+//!                                                      to 5 attempts
+//! ```
+//!
+//! A crash between the record PUT and a winning CAS leaves an orphan immutable
+//! record. That is the intended direction: the head can never name a record
+//! that does not exist, and an unreferenced record has no authority.
+//!
+//! ## Reading map
+//!
+//! 1. [`PreservationScope`] and [`PreservationLockRecord`] — the persisted data
+//!    model and what a lock actually protects.
+//! 2. [`PreservationService::guard_namespace`] and
+//!    [`PreservationService::guard_vector_delete`] — the cached read path every
+//!    maintenance surface uses.
+//! 3. [`PreservationService::guard_namespace_strong`] — the authoritative read
+//!    used by governed deletion, and the only producer of
+//!    [`PreservationHeadProof`].
+//! 4. [`PreservationService::create_lock`] and
+//!    [`PreservationService::release_lock`] — the record-then-CAS write path.
+//! 5. `load_existing` and `validate_committed_transition` — how a loaded head is
+//!    proven consistent before anything trusts it.
+//! 6. `install_refreshed_state` and `install_committed` — the two ways cache
+//!    state is replaced, and why they differ.
+//!
+//! ## Invariants
+//!
+//! - **The head object is authoritative; the cache is disposable but bounded.**
+//!   `require_fresh` rejects a cache older than twice the refresh interval with
+//!   `SecurityError::PreservationStateUnavailable`. A broken refresh loop
+//!   therefore *blocks* destruction rather than permitting it. The background
+//!   loop logs the failure and lets the freshness bound do the enforcement.
+//! - **Head versions never move backwards.** `install_refreshed_state` errors on
+//!   a lower version and on an equal version with different content;
+//!   `install_committed` ignores an older observation and asserts that an equal
+//!   version carries identical content.
+//! - **Records exist before the head references them.** Create and release both
+//!   PUT their immutable record, then PUT a transition record, then CAS the
+//!   head.
+//! - **Every load re-proves the current transition.** The head's
+//!   `last_transition_record` must exist, must be under the transitions prefix,
+//!   must name the head's own version, and its lock record must agree with the
+//!   active set. This proves the *current* head version was committed by a real
+//!   create or release of a real lock record. It does **not** walk
+//!   `previous_transition_record` backwards, so it is not a proof that the full
+//!   transition history is complete or unmodified.
+//! - **Uncertain overlap counts as overlap.** `protects_vector_delete` ignores
+//!   the caller's filter and blocks on namespace match alone. Until filter
+//!   disjointness is structurally provable for the whole `Filter` AST,
+//!   over-retention is the only safe direction.
+//! - **The head proof is a re-serialization, not the observed bytes.**
+//!   [`PreservationService::guard_namespace_strong`] digests
+//!   `serde_json::to_vec` of the decoded head, alongside the ETag actually
+//!   observed. It does not use the receipt module's recursive key-sorting
+//!   canonicalizer; determinism comes from struct field declaration order plus
+//!   the head validation that forces `active_lock_ids` to be strictly
+//!   ascending. It matches the stored bytes because every writer in this file
+//!   produces them through the same `encode_json` seam.
+//! - **Lock identifiers are audit evidence, never response bodies.** A guard
+//!   carries the matching ids so a deferral record can name them; handlers must
+//!   not echo them to callers.
+//! - **Identifiers cannot escape their key component.** [`PreservationLockId`]
+//!   parses through a validating constructor on both construction and
+//!   deserialization, so a value such as `../escape` can never become part of an
+//!   object key.
+//!
+//! ## Cost
+//!
+//! Loading the head is one GET for `locks.json`, one GET per *active* lock, and
+//! up to two more GETs to validate the committed transition — sequential, and
+//! O(active locks). That cost is paid on every refresh tick and on every strong
+//! guard, which is why governed deletion, not routine maintenance, is what pays
+//! it. Cached guards are pure CPU over a `BTreeMap`.
+//!
+//! ## Rust concepts used here
+//!
+//! [`PreservationService`] holds `RwLock<Arc<CachedPreservation>>`, not
+//! `RwLock<CachedPreservation>`. Readers take the lock only long enough to clone
+//! an `Arc` — a reference-count bump, not a copy of the lock table — and then
+//! work from that immutable snapshot with no lock held. In Java this resembles a
+//! volatile reference to an immutable snapshot object; in C, an atomically
+//! swapped pointer to a refcounted struct. The important consequence is that no
+//! guard ever holds a lock across an `.await`.
+//!
+//! The background refresh task holds a `Weak<PreservationService>`, so the task
+//! cannot keep the service alive; it returns as soon as the upgrade fails.
+//! `Drop` aborts the task as a backstop, and `shutdown_refresh_task` aborts and
+//! joins it deliberately, panicking if the loop ever exited on its own — that
+//! would mean revalidation silently stopped while the authority was still live.
+//!
+//! These records use serde with `#[serde(tag = ...)]`, `deny_unknown_fields`,
+//! and `skip_serializing_if`, so they must stay in a self-describing format.
+//! JSON is correct here; do not move them to bincode.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock, Weak};
