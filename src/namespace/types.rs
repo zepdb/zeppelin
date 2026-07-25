@@ -224,8 +224,14 @@ impl NamespaceIncarnationId {
     }
 
     /// Wrap an already validated manifest UUID without changing its bytes.
+    ///
+    /// Public so fixtures and tooling can seed a namespace with a deterministic
+    /// lifetime identity. Every namespace that owns objects must carry one:
+    /// `local_origin` refuses to resolve an artifact origin without it, so
+    /// metadata written with no incarnation produces a namespace whose
+    /// manifests cannot be published.
     #[must_use]
-    pub(crate) const fn from_uuid(value: uuid::Uuid) -> Self {
+    pub const fn from_uuid(value: uuid::Uuid) -> Self {
         Self(value)
     }
 

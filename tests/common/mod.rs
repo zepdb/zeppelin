@@ -61,15 +61,34 @@ pub async fn write_active_namespace_metadata_with_fts(
         branch_identity: None,
         branch_prepare: None,
         branch_activation: None,
-        incarnation_id: None,
+        // A namespace that owns objects must carry a lifetime identity.
+        // `local_origin` refuses to resolve an artifact origin without one, so
+        // metadata written with `None` yields a namespace whose manifests
+        // cannot be published — `compact`, `WalWriter::append` and
+        // `Manifest::write` all fail with "local artifact origin requires an
+        // incarnation binding".
+        incarnation_id: Some(zeppelin::namespace::NamespaceIncarnationId::from_uuid(
+            uuid::Uuid::new_v4(),
+        )),
     };
-    store
-        .put(
+    // The incarnation rides in S3 user metadata, not the JSON body, so this
+    // must go through a user-metadata write exactly as the create path does.
+    let user_metadata = metadata.user_metadata();
+    match store
+        .put_if_not_exists_with_user_metadata(
             &zeppelin::namespace::manager::NamespaceMetadata::s3_key(namespace),
             metadata.to_bytes().unwrap(),
+            namespace,
+            &user_metadata,
         )
         .await
-        .unwrap();
+    {
+        Ok(()) => {}
+        // Seeding the same fixture namespace twice is a no-op, matching the
+        // unconditional `put` this replaced.
+        Err(zeppelin::error::ZeppelinError::NamespaceAlreadyExists { .. }) => {}
+        Err(error) => panic!("fixture namespace metadata write failed: {error}"),
+    }
 }
 
 #[allow(dead_code)]

@@ -882,7 +882,14 @@ impl NamespaceMetadata {
         Ok(metadata)
     }
 
-    fn user_metadata(&self) -> ObjectUserMetadata {
+    /// Project the S3 user metadata that must accompany this object.
+    ///
+    /// The namespace incarnation rides in object user metadata rather than the
+    /// JSON body, so writing `meta.json` without it silently produces a
+    /// namespace that cannot publish a manifest. Public so fixtures persist
+    /// metadata the same way the create path does instead of reproducing the
+    /// key name.
+    pub fn user_metadata(&self) -> ObjectUserMetadata {
         let mut metadata = ObjectUserMetadata::new();
         if let Some(incarnation_id) = self.incarnation_id.as_ref() {
             metadata.insert(
