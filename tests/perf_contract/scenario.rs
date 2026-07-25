@@ -1706,8 +1706,7 @@ fn measured_sidecar_cache_keys(
         }
         _ => {}
     }
-    keys
-        .iter()
+    keys.iter()
         .map(|store_key| segment_cache_key(manifest, segment, store_key))
         .collect()
 }
