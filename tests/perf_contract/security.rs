@@ -153,6 +153,14 @@ pub async fn measure(input: SecurityMeasureInput<'_>) -> SecurityMeasurement {
     }
     let mut security_config = config.security.clone();
     security_config.token_signing_key_path = delegation_key.path().to_string_lossy().into_owned();
+    // A licensed kernel spawns a policy refresh loop, and this measurement runs
+    // hundreds of thousands of authenticate calls across many seconds of wall
+    // clock. At the 5s default a refresh lands mid-sample and the credential
+    // under measurement stops resolving, so the run dies with
+    // `CredentialUnknown` partway through. Background I/O has no place in a CPU
+    // benchmark regardless; the branching census pins it the same way
+    // (`branching.rs:204`).
+    security_config.policy_refresh_secs = 3_600;
     let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
         security_store.clone(),
         &security_config,
