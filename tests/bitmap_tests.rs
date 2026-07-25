@@ -626,3 +626,136 @@ async fn test_bitmap_list_contains() {
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
 }
+
+// ---------------------------------------------------------------------------
+// Test 8: the prefilter must actually engage, and its absence must be caching
+//
+// Regression guard for the 2026-07-24 perf-contract finding, where
+// `filtered_query_bitmap` dropped from 7 bitmap GETs to 0 on every repeat.
+// Fewer GETs on a bitmap-filtered query is only a win if the bitmap is still
+// being consulted; the alternative is that the prefilter silently stopped
+// engaging and the query is scanning clusters it used to skip. The tests above
+// prove bitmap artifacts are *written* and that results are correct. Neither
+// property distinguishes those two worlds. This one does.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bitmap_prefilter_engages_and_is_only_elided_by_cache() {
+    use common::counting::{counting_store, ArtifactClass};
+    use common::harness::TestHarness;
+    use common::server::{client_with_bearer, start_test_server_on_store_with_config};
+
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let (base_url, _cache, _dir, admin_bearer) = start_test_server_on_store_with_config(
+        &harness,
+        store.clone(),
+        None,
+        bitmap_test_config(true),
+    )
+    .await;
+    let client = client_with_bearer(&admin_bearer);
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({ "dimensions": 16, "distance_metric": "euclidean" }),
+    )
+    .await;
+
+    let vectors = status_vectors("bmengage", 120, 16);
+    let query_vec = vectors[0].values.clone();
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&serde_json::json!({ "vectors": vectors }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Drive compaction directly rather than through the HTTP endpoint, which
+    // is accepted-and-asynchronous. The compactor shares the counting store so
+    // the bitmap sidecars it writes are the ones the query path later reads.
+    let compactor = zeppelin::compaction::Compactor::new(
+        store.clone(),
+        zeppelin::wal::WalReader::new(store.clone()),
+        CompactionConfig {
+            max_wal_fragments_before_compact: 1,
+            ..Default::default()
+        },
+        bitmap_test_config(true).indexing,
+        common::default_gc_upload_window(),
+    );
+    let compacted = compactor.compact(&ns).await.unwrap();
+    assert!(
+        compacted.segment_id.is_some(),
+        "compaction must publish a segment"
+    );
+
+    // The segment must actually advertise bitmaps, or every assertion below
+    // would pass vacuously against a namespace that never had any.
+    let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    let active = manifest.active_segment.clone().expect("active segment");
+    let segment = manifest
+        .segments
+        .iter()
+        .find(|segment| segment.id == active)
+        .expect("active segment ref");
+    assert!(
+        !segment.bitmap_fields.is_empty(),
+        "fixture must advertise bitmap fields, otherwise prefilter engagement is untestable"
+    );
+
+    let filtered = serde_json::json!({
+        "vector": query_vec,
+        "top_k": 10,
+        "filter": { "op": "eq", "field": "status", "value": "active" }
+    });
+
+    // 1. First filtered query against a cold server cache: an engaged
+    //    prefilter has nowhere to read a bitmap from except object storage.
+    counter.reset();
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&filtered)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let cold_body: serde_json::Value = resp.json().await.unwrap();
+    let cold_hits = cold_body["results"].as_array().unwrap().len();
+    let cold_bitmap_gets = counter.gets_for(ArtifactClass::Bitmap);
+    assert!(
+        cold_bitmap_gets > 0,
+        "bitmap prefilter did not engage: a filtered query over a segment advertising \
+         bitmap_fields performed {cold_bitmap_gets} bitmap GETs against a cold cache. \
+         Either has_bitmaps is false, try_bitmap_prefilter is being skipped, or the \
+         bitmap key no longer resolves."
+    );
+    assert!(cold_hits > 0, "filtered query must return matching rows");
+
+    // 2. The identical query, now warm. Dropping to zero bitmap GETs is
+    //    benign *only* because the cache serves them. If this ever fails
+    //    while (1) passes, the artifact cache key is unstable across queries.
+    counter.reset();
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&filtered)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let warm_body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Bitmap),
+        0,
+        "a warm cache must serve bitmaps without an object-store GET"
+    );
+    assert_eq!(
+        warm_body["results"].as_array().unwrap().len(),
+        cold_hits,
+        "cached and uncached filtered queries must agree on result count"
+    );
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
