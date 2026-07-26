@@ -249,6 +249,12 @@ struct PreparedCandidate {
     publication: PreparedManifestPublication,
 }
 
+// One variant legitimately carries a prepared candidate. Boxing it is a
+// real improvement -- GC's future graph already sits close to the debug
+// stack limit -- but it touches every construction and match site in this
+// 5.4k-line file, so it is tracked as follow-up rather than done in a
+// lint pass.
+#[allow(clippy::large_enum_variant)]
 enum RootedProgress {
     Candidate(PreparedCandidate),
     #[cfg(feature = "branching-test-support")]
@@ -266,6 +272,12 @@ enum CancellationParentObservation {
     PublicationImpossible,
 }
 
+// One variant legitimately carries a prepared candidate. Boxing it is a
+// real improvement -- GC's future graph already sits close to the debug
+// stack limit -- but it touches every construction and match site in this
+// 5.4k-line file, so it is tracked as follow-up rather than done in a
+// lint pass.
+#[allow(clippy::large_enum_variant)]
 enum BranchVisibilityResume {
     Metadata(NamespaceMetadata),
     Deleted,
@@ -294,6 +306,9 @@ impl LiveChildDisclosure {
 impl NamespaceGraph {
     /// Compose the graph from the concrete authoritative services it coordinates.
     #[must_use]
+    // Dependency wiring: every argument is a distinct collaborator passed
+    // once. A params struct would rename the same fields, not reduce them.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         store: ZeppelinStore,
         namespace_manager: Arc<NamespaceManager>,
@@ -1051,6 +1066,9 @@ impl NamespaceGraph {
         })
     }
 
+    // Dependency wiring: every argument is a distinct collaborator passed
+    // once. A params struct would rename the same fields, not reduce them.
+    #[allow(clippy::too_many_arguments)]
     async fn cancel_never_active_with_parent_proof(
         &self,
         namespace: &NamespaceId,
@@ -4208,13 +4226,12 @@ impl NamespaceGraph {
             NamespaceCreationKind::Root => 0,
             NamespaceCreationKind::Fork(reservation) => reservation.depth,
         };
-        let depth =
-            source_depth
-                .checked_add(1)
-                .ok_or_else(|| BranchError::BranchDepthExceeded {
-                    depth: u16::MAX,
-                    limit: self.branching.max_depth,
-                })?;
+        let depth = source_depth
+            .checked_add(1)
+            .ok_or(BranchError::BranchDepthExceeded {
+                depth: u16::MAX,
+                limit: self.branching.max_depth,
+            })?;
         if depth > self.branching.max_depth {
             return Err(BranchError::BranchDepthExceeded {
                 depth,
@@ -4633,7 +4650,7 @@ impl NamespaceGraph {
         let root = source_live
             .branch_roots()
             .get(&reservation.branch_id)
-            .ok_or_else(|| BranchError::BranchRootMissing {
+            .ok_or(BranchError::BranchRootMissing {
                 branch_id: reservation.branch_id,
             })?;
         self.rebuild_candidate_from_root(target, root).await
@@ -4850,7 +4867,7 @@ impl NamespaceGraph {
         let root = source_live
             .branch_roots()
             .get(&reservation.branch_id)
-            .ok_or_else(|| BranchError::BranchRootMissing {
+            .ok_or(BranchError::BranchRootMissing {
                 branch_id: reservation.branch_id,
             })?;
         if !identity.matches_root(root) {
@@ -4898,12 +4915,11 @@ impl NamespaceGraph {
             identity.source_incarnation.as_uuid(),
         )
         .await?;
-        let root = source_live
-            .branch_roots()
-            .get(&identity.branch_id)
-            .ok_or_else(|| BranchError::BranchRootMissing {
+        let root = source_live.branch_roots().get(&identity.branch_id).ok_or(
+            BranchError::BranchRootMissing {
                 branch_id: identity.branch_id,
-            })?;
+            },
+        )?;
         let (target_live, _) = Manifest::read_versioned_required_for_incarnation(
             &self.store,
             &metadata.name,
@@ -5422,7 +5438,7 @@ impl NamespaceGraph {
                         let current_root = source_live
                             .branch_roots()
                             .get(&reservation.branch_id)
-                            .ok_or_else(|| BranchError::BranchRootMissing {
+                            .ok_or(BranchError::BranchRootMissing {
                             branch_id: reservation.branch_id,
                         })?;
                         if current_root != &root {

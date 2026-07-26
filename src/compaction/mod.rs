@@ -662,6 +662,26 @@ struct FullSegmentLayout {
     hierarchical_routing_node_ids: Vec<String>,
 }
 
+/// The positional tuple the mixed incremental/full compaction transaction
+/// still consumes: cluster count, hierarchical flag, bitmap fields, FTS
+/// fields, sketch, bootstrap, membership, cluster objects, attribute
+/// objects, and removed keys.
+///
+/// Named so the shape is reviewable and `clippy::type_complexity` has a
+/// definition to point at. Collapsing it into a struct changes the
+/// transaction signature and is deliberately left out of this lint pass.
+type CompactionParts = (
+    usize,
+    bool,
+    Vec<String>,
+    Vec<String>,
+    Option<crate::wal::manifest::SketchRef>,
+    Option<BootstrapRef>,
+    Option<MembershipRef>,
+    Vec<ClusterDataObjectRef>,
+    Vec<String>,
+);
+
 impl FullSegmentLayout {
     /// Converts build output into the local descriptor and routing inventory
     /// that a manifest publication must install atomically.
@@ -698,19 +718,7 @@ impl FullSegmentLayout {
 
     /// Projects this common layout into the historical tuple consumed by the
     /// mixed incremental/full compaction transaction.
-    fn into_compaction_parts(
-        self,
-    ) -> (
-        usize,
-        bool,
-        Vec<String>,
-        Vec<String>,
-        Option<crate::wal::manifest::SketchRef>,
-        Option<BootstrapRef>,
-        Option<MembershipRef>,
-        Vec<ClusterDataObjectRef>,
-        Vec<String>,
-    ) {
+    fn into_compaction_parts(self) -> CompactionParts {
         (
             self.cluster_count,
             self.hierarchical,

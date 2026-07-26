@@ -2475,7 +2475,9 @@ async fn execute_measure_operation(
             delete_rows(client, server, namespace, &ids).await;
         }
         MeasureOp::Compact {
-            fragments,
+            // The fragment-count precondition moved ahead of the measured
+            // window in f42b368, so this arm no longer reads it.
+            fragments: _,
             incremental,
         } => {
             let result = server

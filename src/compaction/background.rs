@@ -377,7 +377,7 @@ impl CompactionLifecycle {
         state.next_run_id = state
             .next_run_id
             .checked_add(1)
-            .expect("compaction lifecycle run ID overflow");
+            .unwrap_or_else(|| panic!("compaction lifecycle run ID overflow"));
         let publication_aborted = Arc::new(AtomicBool::new(false));
         state.runs.insert(
             run_id,
@@ -406,7 +406,7 @@ impl CompactionRunReservation {
     fn into_active(mut self) -> ActiveCompaction {
         self.active
             .take()
-            .expect("compaction run reservation consumed more than once")
+            .unwrap_or_else(|| panic!("compaction run reservation consumed more than once"))
     }
 }
 
@@ -619,6 +619,9 @@ impl std::fmt::Debug for GovernedDeletionWorker {
 impl GovernedDeletionWorker {
     /// Compose periodic deletion from the same boot snapshots as the server.
     #[must_use]
+    // Dependency wiring: every argument is a distinct collaborator passed
+    // once. A params struct would rename the same fields, not reduce them.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: ZeppelinStore,
         namespace_manager: Arc<NamespaceManager>,
@@ -1404,6 +1407,9 @@ async fn warm_segment_index_meta(store: ZeppelinStore, cache: Arc<DiskCache>, na
 /// process exit, rather than same-process replacement, contains any remaining
 /// OS-thread work.
 #[allow(clippy::expect_used)]
+// Dependency wiring: every argument is a distinct collaborator passed
+// once. A params struct would rename the same fields, not reduce them.
+#[allow(clippy::too_many_arguments)]
 pub fn start_compaction_thread(
     compactor: Arc<Compactor>,
     namespace_manager: Arc<NamespaceManager>,
@@ -1618,6 +1624,9 @@ pub async fn compaction_loop(
 /// from server construction so one crash-retirement barrier owns every lease
 /// heartbeat. Direct callers that do not have a server owner use
 /// [`compaction_loop`], which creates an isolated lifecycle.
+// Dependency wiring: every argument is a distinct collaborator passed
+// once. A params struct would rename the same fields, not reduce them.
+#[allow(clippy::too_many_arguments)]
 pub async fn compaction_loop_with_lifecycle(
     compactor: Arc<Compactor>,
     namespace_manager: Arc<NamespaceManager>,
@@ -1647,6 +1656,9 @@ pub async fn compaction_loop_with_lifecycle(
 /// Production and production-like server tests use this entry point. Callers
 /// that omit the worker can still exercise compaction/GC, but a discovered
 /// deletion tombstone fails loudly and remains untouched.
+// Dependency wiring: every argument is a distinct collaborator passed
+// once. A params struct would rename the same fields, not reduce them.
+#[allow(clippy::too_many_arguments)]
 pub async fn compaction_loop_with_governed_deletion(
     compactor: Arc<Compactor>,
     namespace_manager: Arc<NamespaceManager>,
@@ -1672,6 +1684,9 @@ pub async fn compaction_loop_with_governed_deletion(
     .await;
 }
 
+// Dependency wiring: every argument is a distinct collaborator passed
+// once. A params struct would rename the same fields, not reduce them.
+#[allow(clippy::too_many_arguments)]
 async fn compaction_loop_with_lifecycle_inner(
     compactor: Arc<Compactor>,
     namespace_manager: Arc<NamespaceManager>,

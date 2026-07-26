@@ -4734,6 +4734,9 @@ fn fuse_source_responses(
 /// exercise the real score-direction, receipt-artifact, scan-counter, and debug
 /// aggregation without opening foreign-origin HTTP admission.
 #[cfg(feature = "branching-test-support")]
+// Dependency wiring: every argument is a distinct collaborator passed
+// once. A params struct would rename the same fields, not reduce them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fuse_ann_bm25_for_test_support(
     ann: QueryResponse,
     bm25: QueryResponse,

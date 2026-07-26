@@ -419,7 +419,8 @@ pub async fn delete_namespace_for_test(
         .delete(AuthorizedNamespaceDelete {
             namespace,
             decision: DeletionDecision {
-                actor: PrincipalId::new("test-delete-actor").expect("valid principal"),
+                actor: PrincipalId::new("test-delete-actor")
+                    .unwrap_or_else(|_| panic!("test delete actor must be a valid principal")),
                 approver: None,
                 decision_id,
                 policy_version: PolicyVersion::BOOT,

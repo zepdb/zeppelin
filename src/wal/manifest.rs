@@ -1962,13 +1962,13 @@ impl Manifest {
                     .is_ok_and(|origin| origin != local)
             })
         });
-        if foreign_fragment.is_some() || foreign_segment.is_some() {
-            if self.branch_lineage.is_none() {
-                return Err(BranchError::BranchingNotReady {
-                    feature: "foreign artifact origin admission",
-                }
-                .into());
+        if (foreign_fragment.is_some() || foreign_segment.is_some())
+            && self.branch_lineage.is_none()
+        {
+            return Err(BranchError::BranchingNotReady {
+                feature: "foreign artifact origin admission",
             }
+            .into());
         }
         Ok(())
     }

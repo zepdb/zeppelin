@@ -177,6 +177,11 @@
 //! mutation and lock lifetime visible in the type system.
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
+// Test modules assert with expect/unwrap by design: a failed assertion
+// should abort the test loudly. The denies above exist to keep that
+// style out of production paths, where the house idiom is an explicit
+// `unwrap_or_else(|_| panic!("..."))` carrying context.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![deny(missing_docs)]
 
 /// Disposable memory/disk caches, manifest freshness caching, and segment hydration.

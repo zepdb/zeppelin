@@ -237,6 +237,9 @@ pub struct ForkTargetIdentity {
 
 /// Create a live-head copy-on-write fork when branching is enabled.
 #[instrument(skip(state, decision, principal, context, audit, rate_identity), fields(source = %source))]
+// Dependency wiring: every argument is a distinct collaborator passed
+// once. A params struct would rename the same fields, not reduce them.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_branch(
     State(state): State<AppState>,
     Extension(decision): Extension<AllowDecision>,
@@ -303,7 +306,7 @@ pub async fn create_branch(
             source_ip: rate_identity.ip,
             clock: state.clock.clone(),
         })
-        .map_err(|error| ApiError(error.into()))?;
+        .map_err(ApiError)?;
     let outcome = namespace_graph(&state)
         .fork(authorized)
         .await
@@ -856,7 +859,6 @@ impl NamespaceResponse {
     ///
     /// Returns an artifact-origin validation error when an active branch's
     /// visible manifest cannot prove whether every live ref is target-owned.
-    #[must_use]
     pub fn from_manifest(
         meta: NamespaceMetadata,
         manifest: &Manifest,
@@ -2162,65 +2164,6 @@ async fn materialize_clone_manifest(
     Ok(manifest)
 }
 
-#[cfg(test)]
-mod fork_response_tests {
-    use super::{
-        BranchHealth, BranchLifecycle, BranchMode, BranchStatusDescriptor, ForkResponse,
-        ForkSourceIdentity, ForkTargetIdentity,
-    };
-
-    #[test]
-    fn response_contains_only_redacted_public_fork_fields() {
-        let response = ForkResponse {
-            branch_id: "branch-1".to_string(),
-            created: true,
-            mode: BranchMode::CopyOnWrite,
-            source: ForkSourceIdentity {
-                namespace: "source".to_string(),
-                incarnation: "source-inc".to_string(),
-                generation: 42,
-            },
-            target: ForkTargetIdentity {
-                namespace: "target".to_string(),
-                incarnation: "target-inc".to_string(),
-                generation: 1,
-            },
-            depth: 1,
-            materialized: false,
-            created_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
-        };
-        let value = serde_json::to_value(response).unwrap();
-        assert_eq!(value["source"]["generation"], 42);
-        assert_eq!(value["target"]["generation"], 1);
-        assert_eq!(value["mode"], "copy_on_write");
-        assert_eq!(value["materialized"], false);
-        assert!(value.get("source_manifest_sha256").is_none());
-        assert!(value.get("fencing_token").is_none());
-    }
-
-    #[test]
-    fn target_status_contains_no_parent_identity() {
-        let status = BranchStatusDescriptor {
-            branch_id: "branch-1".to_string(),
-            mode: BranchMode::CopyOnWrite,
-            depth: 2,
-            lifecycle: BranchLifecycle::Active,
-            health: BranchHealth::Ready,
-            materialized: false,
-            created_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
-        };
-        let value = serde_json::to_value(status).unwrap();
-        assert_eq!(value["branch_id"], "branch-1");
-        assert_eq!(value["lifecycle"], "active");
-        assert!(value.get("source").is_none());
-        assert!(value.get("parent_namespace").is_none());
-    }
-}
-
 /// Maps every manifest-reachable source key to its target-prefixed destination.
 ///
 /// # Parameters
@@ -3218,5 +3161,64 @@ fn namespace_index_kind(meta: &NamespaceMetadata, manifest: &Manifest) -> IndexT
         IndexType::Hierarchical
     } else {
         meta.index_type
+    }
+}
+
+#[cfg(test)]
+mod fork_response_tests {
+    use super::{
+        BranchHealth, BranchLifecycle, BranchMode, BranchStatusDescriptor, ForkResponse,
+        ForkSourceIdentity, ForkTargetIdentity,
+    };
+
+    #[test]
+    fn response_contains_only_redacted_public_fork_fields() {
+        let response = ForkResponse {
+            branch_id: "branch-1".to_string(),
+            created: true,
+            mode: BranchMode::CopyOnWrite,
+            source: ForkSourceIdentity {
+                namespace: "source".to_string(),
+                incarnation: "source-inc".to_string(),
+                generation: 42,
+            },
+            target: ForkTargetIdentity {
+                namespace: "target".to_string(),
+                incarnation: "target-inc".to_string(),
+                generation: 1,
+            },
+            depth: 1,
+            materialized: false,
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["source"]["generation"], 42);
+        assert_eq!(value["target"]["generation"], 1);
+        assert_eq!(value["mode"], "copy_on_write");
+        assert_eq!(value["materialized"], false);
+        assert!(value.get("source_manifest_sha256").is_none());
+        assert!(value.get("fencing_token").is_none());
+    }
+
+    #[test]
+    fn target_status_contains_no_parent_identity() {
+        let status = BranchStatusDescriptor {
+            branch_id: "branch-1".to_string(),
+            mode: BranchMode::CopyOnWrite,
+            depth: 2,
+            lifecycle: BranchLifecycle::Active,
+            health: BranchHealth::Ready,
+            materialized: false,
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["branch_id"], "branch-1");
+        assert_eq!(value["lifecycle"], "active");
+        assert!(value.get("source").is_none());
+        assert!(value.get("parent_namespace").is_none());
     }
 }
