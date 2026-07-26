@@ -24,14 +24,14 @@ op = "delete"
 count = 1
 
 [baseline]
-git_rev = "ade36ce7c6f22c91ba8ee0cf5d74796f448ebca8"
-captured = "2026-07-12T04:41:16Z"
+git_rev = "23accb3534f02dd47885495cc1eb65279da91f87"
+captured = "2026-07-26T05:30:14.010052+00:00"
 approved_by = "anup"
-reason = "Rebaseline after ade36ce preserves manifest namespace identity while removing verification GETs; operations, depth, and quantized artifact bytes are unchanged."
+reason = "D9 acceptance, 2026-07-26 at 23accb3, after Anup reviewed the before/after table. Per COLD writer round the manifest-history work adds one manifest GET, one PUT, a second manifests/ history object, and two critical-path levels (put_get depth 4 -> 6). This is a first-write-after-start cost, NOT a per-write tax: the warm shape is unaffected and stays pinned at 0 GETs / 3 physical ops (tests/perf_contract/ideal/direct.rs:264, assert_group_commit_warm_shape), which passes. The harness forces the cold pre-state deliberately (scenario.rs:915). Manifest-shaped bytes grow ~3.5x from the receipt artifact inventory accepted in a887d3c. Captured in release; the security latency budgets in this catalog are release-calibrated."
 
 [assert.depth.put_get]
 mode = "exact"
-value = 4
+value = 6
 why = "manifest read, tombstone WAL write, history write, and manifest CAS form exact depth four."
 
 [assert.gets]
@@ -42,10 +42,10 @@ centroids = 0
 cluster = 0
 fts = 0
 manifest = 1
-other = 0
+other = 1
 sketch = 0
 sq = 0
-total = 1
+total = 2
 wal = 0
 
 [assert.puts]
@@ -56,10 +56,10 @@ centroids = 0
 cluster = 0
 fts = 0
 manifest = 1
-other = 1
+other = 2
 sketch = 0
 sq = 0
-total = 3
+total = 4
 wal = 1
 
 [assert.get_bytes.attrs]
@@ -81,13 +81,13 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.manifest]
-min = 1039
-max = 1263
-why = "manifest serialization grows as measured tombstones append history across repeats"
-
+min = 2909
+max = 4672
+why = "manifest and history bytes grow as measured tombstones append history across repeats Widened 256 B each side: manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance."
 [assert.get_bytes.other]
-exact = 0
-
+min = 2909
+max = 4672
+why = "manifest and history bytes grow as measured tombstones append history across repeats Widened 256 B each side: manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance."
 [assert.get_bytes.sketch]
 exact = 0
 
@@ -95,10 +95,9 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-min = 1039
-max = 1263
-why = "manifest serialization grows as measured tombstones append history across repeats"
-
+min = 6074
+max = 9088
+why = "manifest and history bytes grow as measured tombstones append history across repeats Widened 256 B each side: manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance."
 [assert.get_bytes.wal]
 exact = 0
 
@@ -121,15 +120,13 @@ exact = 0
 exact = 0
 
 [assert.put_bytes.manifest]
-min = 1071
-max = 1295
-why = "manifest and history serialization grow with each measured tombstone commit"
-
+min = 3089
+max = 4841
+why = "manifest and history serialization grow with each measured tombstone commit Widened 256 B each side: manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance."
 [assert.put_bytes.other]
-min = 1071
-max = 1295
-why = "manifest and history serialization grow with each measured tombstone commit"
-
+min = 6254
+max = 9257
+why = "manifest and history serialization grow with each measured tombstone commit Widened 256 B each side: manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance."
 [assert.put_bytes.sketch]
 exact = 0
 
@@ -137,15 +134,14 @@ exact = 0
 exact = 0
 
 [assert.put_bytes.total]
-min = 2196
-max = 2644
-why = "manifest and history serialization grow with each measured tombstone commit"
-
+min = 9653
+max = 13896
+why = "manifest and history serialization grow with each measured tombstone commit Widened 256 B each side: manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance."
 [assert.put_bytes.wal]
 exact = 54
 
 [assert.put_keys]
-"manifests/" = 1
+"manifests/" = 2
 
 [assert.ops]
 copy = 0

@@ -742,7 +742,16 @@ async fn execute_trigger_manifest_changed(case: &IdealCase) -> IdealSample {
     );
     let sample = world.snapshot(case).await;
     assert_eq!(sample.total_get_ops, 1);
-    assert_eq!(sample.total_get_bytes, 146);
+    // One conditional GET of a receipt-bearing manifest. Manifest-shaped
+    // objects encode timestamps at variable width, so this is not
+    // byte-deterministic: 3 samples on 23accb3 spanned 449..464 (15 B). The
+    // frozen 146 predates the receipt artifact inventory accepted in a887d3c
+    // and was unreachable behind an earlier assertion until 2026-07-25.
+    assert!(
+        (389..=524).contains(&sample.total_get_bytes),
+        "changed-trigger manifest GET bytes outside the banded range: {}",
+        sample.total_get_bytes
+    );
     assert_eq!(sample.serial_get_chain.depth, 1);
     assert_single_manifest_get(
         &sample,

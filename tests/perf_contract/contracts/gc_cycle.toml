@@ -25,10 +25,10 @@ repeats = 1
 op = "gc"
 
 [baseline]
-git_rev = "ade36ce7c6f22c91ba8ee0cf5d74796f448ebca8"
-captured = "2026-07-12T04:41:16Z"
+git_rev = "23accb3534f02dd47885495cc1eb65279da91f87"
+captured = "2026-07-26T05:30:14.010052+00:00"
 approved_by = "anup"
-reason = "Rebaseline after ade36ce preserves manifest namespace identity while removing verification GETs; operations, depth, and quantized artifact bytes are unchanged."
+reason = "D9 acceptance, 2026-07-26 at 23accb3, after Anup reviewed the before/after table. BYTES ONLY: operation counts and critical-path depth are unchanged and were restored by 34dd8ca, which stopped GC's mark phase re-reading a live manifest the branch-root observation had already proven current. The growth is the receipt artifact inventory accepted in a887d3c, amplified here because a cycle reads 18 retained history generations: manifest 2.18x, history bodies 3.90x, total 3.53x. Captured in release."
 
 [assert.depth.get]
 mode = "exact"
@@ -82,10 +82,14 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.manifest]
-exact = 7317
+min = 15852
+max = 16014
+why = "three live-manifest GETs of a receipt-bearing manifest. Manifest-shaped objects encode timestamps at variable width, so this is not byte-deterministic: 4 release samples on 23accb3 spanned 15924..15942 (18 B). Band pads 4x the observed spread (min 32 B) each side, absorbing jitter while still failing on a doubling or a disappearance."
 
 [assert.get_bytes.other]
-exact = 27417
+min = 103767
+max = 110004
+why = "eighteen retained history generations, each manifest-shaped and therefore not byte-deterministic: 3 release samples spanned 106539..107232 (693 B). Same 4x-spread padding."
 
 [assert.get_bytes.sketch]
 exact = 0
@@ -94,7 +98,9 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-exact = 34734
+min = 119706
+max = 125943
+why = "sum of the two manifest-shaped bands above; inherits their jitter and padding."
 
 [assert.get_bytes.wal]
 exact = 0

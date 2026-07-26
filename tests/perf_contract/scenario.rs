@@ -19,6 +19,7 @@ use zeppelin::index::ivf_flat::membership::deserialize_membership;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::namespace::manager::NamespaceMetadata;
 use zeppelin::time::{Clock, TimeSource};
+use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::manifest::SegmentRef;
 use zeppelin::wal::Manifest;
 
@@ -1309,11 +1310,23 @@ async fn post_prime_setup(
         }
         assert_manifest_fragment_count(server, namespace, *fragments).await;
         let manifest = live_manifest(server, namespace).await;
+        // Route through the manifest's own resolver. Fragment bytes are cached
+        // by physical incarnation, so a hand-built `wal_fragments/{ulid}.wal`
+        // invalidates a key no reader consults: the located entries survive
+        // and every repeat after the first serves from cache, which is what
+        // made this contract look like it had drifted.
         world.eventual_wal_keys = manifest
             .fragments
             .iter()
             .filter(|fragment| fragment.delete_count > 0)
-            .map(|fragment| format!("wal_fragments/{}.wal", fragment.id))
+            .map(|fragment| {
+                let store_key = WalFragment::s3_key(namespace, &fragment.id);
+                manifest
+                    .fragment_artifact_cache_key(fragment, &store_key)
+                    .unwrap_or_else(|error| {
+                        panic!("eventual setup could not resolve a fragment cache key: {error}")
+                    })
+            })
             .collect();
         assert_eq!(
             world.eventual_wal_keys.len(),

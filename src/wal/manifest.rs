@@ -1463,6 +1463,37 @@ impl Manifest {
         ))
     }
 
+    /// Return the local cache key a WAL fragment's bytes are stored under.
+    ///
+    /// The fragment counterpart of [`Self::segment_artifact_cache_key`], and
+    /// it exists for the same reason. Every reader that consults the byte
+    /// cache for a fragment — the query path, fetch-by-id, compaction — keys
+    /// by physical incarnation. A caller that rebuilds
+    /// `wal_fragments/{ulid}.wal` by hand addresses a namespace nothing else
+    /// reads, so its lookups and invalidations silently do nothing.
+    ///
+    /// Three separate harnesses have made exactly that mistake, each time
+    /// producing a measurement that looked like a product change. Route
+    /// through this seam rather than formatting the key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest has no namespace or incarnation
+    /// binding, or when `fragment`'s origin index does not resolve.
+    pub fn fragment_artifact_cache_key(
+        &self,
+        fragment: &FragmentRef,
+        store_key: &str,
+    ) -> Result<String> {
+        let local = self.local_origin()?;
+        let resolver = self.artifact_origin_resolver(&local)?;
+        let located = resolver.locate_fragment(fragment)?;
+        Ok(immutable_artifact_cache_key(
+            located.physical_origin.as_origin(),
+            store_key,
+        ))
+    }
+
     /// Resolve the physical owner encoded by an absent origin index.
     pub(crate) fn local_origin(&self) -> Result<ArtifactOrigin> {
         let namespace = self.namespace.as_ref().ok_or_else(|| {

@@ -28,14 +28,14 @@ fragments = 4
 incremental = false
 
 [baseline]
-git_rev = "ade36ce7c6f22c91ba8ee0cf5d74796f448ebca8"
-captured = "2026-07-12T04:41:16Z"
+git_rev = "23accb3534f02dd47885495cc1eb65279da91f87"
+captured = "2026-07-26T05:30:14.010052+00:00"
 approved_by = "anup"
-reason = "Rebaseline after ade36ce preserves manifest namespace identity while removing verification GETs; operations, depth, and quantized artifact bytes are unchanged."
+reason = "D9 acceptance, 2026-07-26 at 23accb3, after Anup reviewed the before/after table. Two independent changes: (1) manifest GETs DROP 3 -> 2 because f42b368 moved assert_manifest_fragment_count out of the measured window - a harness artifact removal, not a product change, and the reason the old baseline was above reality; (2) the manifest-history work adds one other GET, one PUT, a second manifests/ history object, and one critical-path level. Byte growth is the receipt artifact inventory accepted in a887d3c and is small in relative terms here (+0.2% GET / +0.3% PUT for the full cycle) because artifact bytes dominate. Captured in release."
 
 [assert.depth.put_get]
 mode = "exact"
-value = 12
+value = 13
 why = "four WAL reads, the full artifact census, history write, and manifest CAS form exact depth twelve."
 
 [assert.gets]
@@ -45,8 +45,8 @@ bootstrap = 0
 centroids = 0
 cluster = 0
 fts = 0
-manifest = 3
-other = 1
+manifest = 2
+other = 2
 sketch = 0
 sq = 0
 total = 8
@@ -60,10 +60,10 @@ centroids = 1
 cluster = 4
 fts = 0
 manifest = 1
-other = 2
+other = 3
 sketch = 1
 sq = 0
-total = 18
+total = 19
 wal = 0
 
 [assert.get_bytes.attrs]
@@ -85,11 +85,13 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.manifest]
-exact = 750
-
+min = 1962
+max = 2474
+why = "manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance."
 [assert.get_bytes.other]
-exact = 647
-
+min = 1545
+max = 2057
+why = "manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance."
 [assert.get_bytes.sketch]
 exact = 0
 
@@ -97,8 +99,9 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-exact = 1386013
-
+min = 1388379
+max = 1388891
+why = "manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance."
 [assert.get_bytes.wal]
 exact = 1384616
 
@@ -121,11 +124,13 @@ exact = 1450432
 exact = 0
 
 [assert.put_bytes.manifest]
-exact = 1489
-
+min = 4240
+max = 4752
+why = "manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance."
 [assert.put_bytes.other]
-exact = 79333
-
+min = 83193
+max = 83705
+why = "manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance."
 [assert.put_bytes.sketch]
 exact = 294989
 
@@ -133,13 +138,14 @@ exact = 294989
 exact = 0
 
 [assert.put_bytes.total]
-exact = 2146928
-
+min = 2153795
+max = 2154307
+why = "manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance."
 [assert.put_bytes.wal]
 exact = 0
 
 [assert.put_keys]
-"manifests/" = 1
+"manifests/" = 2
 
 [assert.ops]
 copy = 0
