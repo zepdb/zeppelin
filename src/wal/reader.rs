@@ -428,6 +428,25 @@ impl WalReader {
     /// Returns storage, decoding, checksum, or still-referenced `NotFound`
     /// failures.
     ///
+    /// # Cache keys — do not use this to pre-warm for another reader
+    ///
+    /// This path keys entries by ULID alone (`wal_fragments/{ulid}.wal`). Every
+    /// other fragment reader — the query path, fetch-by-id, and compaction —
+    /// keys by *physical incarnation* via `LocatedFragmentRef::cache_key`, so
+    /// two branches sharing a source fragment share one entry. The two
+    /// derivations never see each other's entries, and a miss is silent.
+    ///
+    /// Passing a populating [`FragmentCachePolicy::ReadWrite`] here therefore
+    /// writes entries no production reader will ever find. Two separate tests
+    /// warmed a cache this way and then asserted compaction reused it; both
+    /// measured full refetches (`f3f881d`, and the ideal-analysis copy). To
+    /// warm a cache that compaction consumes, issue a **Strong** query with
+    /// the cache attached — an Eventual one only scans fragments carrying
+    /// deletes and reads nothing from a delete-free namespace.
+    ///
+    /// This entry point has no production caller; it exists for tests that
+    /// want ULID-keyed reads in isolation.
+    ///
     /// # Performance
     ///
     /// Runs cache/S3 reads concurrently. Memory remains proportional to the

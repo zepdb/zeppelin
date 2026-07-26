@@ -33,9 +33,10 @@ use zeppelin::error::ZeppelinError;
 use zeppelin::fts::FtsFieldConfig;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::namespace::manager::{NamespaceIndexConfig, NamespaceManager};
+use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::{Clock, TimeSource};
-use zeppelin::types::{AttributeValue, DistanceMetric, VectorEntry};
+use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, VectorEntry};
 use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::manifest::FragmentRef;
 use zeppelin::wal::manifest::NamedSnapshot;
@@ -550,14 +551,33 @@ async fn execute_fragment_cache_warm(case: &IdealCase) -> IdealSample {
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 8 * 1024 * 1024)
             .expect("ideal cache-warm cache construction failed"),
     );
-    WalReader::new(world.store.clone())
-        .read_fragments_from_refs_unchecked(
-            &namespace,
-            &fragment_refs,
-            FragmentCachePolicy::ReadWrite(&cache),
-        )
-        .await
-        .expect("ideal cache-warm prime failed");
+    // Warm through the path production warms through. WAL fragments have two
+    // cache-key derivations — the located one qualified by physical incarnation,
+    // and a ULID-only one — and compaction consumes the located keys. Warming
+    // via `read_fragments_from_refs_unchecked` writes entries compaction can
+    // never see, which is what this assertion used to measure. Same defect
+    // f3f881d fixed in compaction_tests; this copy was missed.
+    //
+    // The warm read must be Strong: an Eventual query only scans fragments
+    // carrying deletes, so it reads nothing for this delete-free fixture.
+    execute_query(QueryParams {
+        store: &world.store,
+        wal_reader: &WalReader::new(world.store.clone()),
+        namespace: &namespace,
+        query: &maintenance_vectors("cache-warm-0", 1)[0].values,
+        top_k: 1,
+        nprobe: 1,
+        filter: None,
+        consistency: ConsistencyLevel::Strong,
+        distance_metric: DistanceMetric::Euclidean,
+        oversample_factor: 1,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
+        cache: Some(&cache),
+        manifest_cache: None,
+        include_attributes: false,
+    })
+    .await
+    .expect("ideal cache-warm prime query failed");
     let cache_size_before = cache.total_size();
     assert!(cache_size_before > 0);
 
