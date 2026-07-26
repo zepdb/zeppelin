@@ -112,7 +112,11 @@ jobs:
           mc alias set local http://localhost:9000 minioadmin minioadmin
           mc mb local/stormcrow-test
       - name: Gate object-store performance contracts
-        run: cargo test --test perf_contract_tests contracts -- --ignored
+        # --release is required: the security latency budgets are
+        # release-calibrated and an unoptimized build misses them by an order
+        # of magnitude (delegated token verification measures 260us debug vs
+        # 28us release against an 80us budget).
+        run: cargo test --release --test perf_contract_tests contracts -- --ignored
       - name: Generate analytic performance predictions
         continue-on-error: true
         run: cargo test --test perf_contract_tests predict -- --ignored --nocapture
