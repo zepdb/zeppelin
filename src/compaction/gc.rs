@@ -348,10 +348,15 @@ struct LiveRootIdentity {
 }
 
 /// One live-root observation plus the manifest used to validate rooted history.
+///
+/// The version is retained alongside the manifest so later phases of the same
+/// cycle can reuse this authoritative read instead of issuing an identical GET.
+/// [`LiveRootIdentity::matches_inventory`] decides when that reuse is sound.
 #[derive(Debug, Clone)]
 struct LiveRootObservation {
     identity: LiveRootIdentity,
     manifest: Manifest,
+    version: Box<ManifestVersion>,
     rooted_generations: BTreeMap<ManifestGeneration, ManifestDigest>,
 }
 
@@ -419,6 +424,7 @@ impl LiveRootObservation {
         Ok(Self {
             identity,
             manifest,
+            version: Box::new(version),
             rooted_generations,
         })
     }
@@ -3414,33 +3420,58 @@ async fn load_mark_read_inputs(
     }
 }
 
+/// Loads mark inputs from an inventory, optionally reusing an earlier read.
+///
+/// `observed_manifest` must have been proven current against this exact
+/// `inventory`. When supplied, the live-manifest GET is skipped: reading it
+/// again would be required to return the same bytes under the same LIST ETag,
+/// so the read carries no information.
+///
+/// The observation is boxed because it is held across the awaits of a deeply
+/// nested GC call graph, where an inline `Manifest` grows every enclosing
+/// future and overflows the stack.
 async fn load_mark_read_inputs_from_inventory(
     store: &ZeppelinStore,
     namespace: &str,
     now: DateTime<Utc>,
     inventory: &NamespaceInventory,
+    observed_manifest: Option<Box<(Manifest, ManifestVersion)>>,
 ) -> std::result::Result<MarkReadInputs, MarkReadFailure> {
     let (candidates, manifest, staging) = tokio::join!(
         load_candidates_from_inventory(store, namespace, inventory, false),
-        read_versioned_manifest_from_inventory(store, namespace, inventory),
+        async {
+            match observed_manifest {
+                Some(observed) => Ok(Some(*observed)),
+                None => read_versioned_manifest_from_inventory(store, namespace, inventory).await,
+            }
+        },
         active_staging_from_inventory(store, namespace, now, inventory, false),
     );
     assemble_mark_read_inputs(Ok(inventory.all_objects()), candidates, manifest, staging)
 }
 
+/// Loads mark inputs sequentially, optionally reusing an earlier read.
+///
+/// `observed_manifest` carries the same currency proof required by
+/// [`load_mark_read_inputs_from_inventory`]: it must have been shown current
+/// against this exact `inventory`.
 async fn load_sequential_mark_reads_from_inventory(
     store: &ZeppelinStore,
     namespace: &str,
     now: DateTime<Utc>,
     inventory: &NamespaceInventory,
+    observed_manifest: Option<Box<(Manifest, ManifestVersion)>>,
 ) -> std::result::Result<MarkReadInputs, MarkReadFailure> {
     let candidates = load_candidate_ledger(store, namespace)
         .await
         .map_err(MarkReadFailure::CandidateLedger)?;
-    let (manifest, manifest_version) = Manifest::read_versioned(store, namespace)
-        .await
-        .map_err(MarkReadFailure::Manifest)?
-        .ok_or(MarkReadFailure::ManifestMissing)?;
+    let (manifest, manifest_version) = match observed_manifest {
+        Some(observed) => *observed,
+        None => Manifest::read_versioned(store, namespace)
+            .await
+            .map_err(MarkReadFailure::Manifest)?
+            .ok_or(MarkReadFailure::ManifestMissing)?,
+    };
     let staging =
         active_staging_observation_at_with_mode(store, namespace, now, GcReadMode::Sequential)
             .await
@@ -3762,12 +3793,40 @@ async fn run_gc_cycle_at_inner(
         GcReadMode::Sequential
     };
     let mark_read_from_inventory = initial_inventory.is_some();
+    // The opening branch-root observation already read the live manifest and
+    // proved its bytes against a LIST ETag. When mark reads an inventory that
+    // still carries that same ETag, a second GET is constrained to return the
+    // identical bytes, so reuse the observation rather than pay for it. A
+    // changed ETag means the manifest moved and mark must read it again.
+    let reusable_live_manifest = initial_inventory
+        .as_ref()
+        .filter(|inventory| live_roots.identity.matches_inventory(namespace, inventory))
+        .map(|_| {
+            Box::new((
+                live_roots.manifest.clone(),
+                live_roots.version.as_ref().clone(),
+            ))
+        });
     let mark_inputs = match initial_inventory.as_ref() {
         Some(inventory) if read_mode.is_bounded() => {
-            load_mark_read_inputs_from_inventory(store, namespace, now, inventory).await
+            load_mark_read_inputs_from_inventory(
+                store,
+                namespace,
+                now,
+                inventory,
+                reusable_live_manifest,
+            )
+            .await
         }
         Some(inventory) => {
-            load_sequential_mark_reads_from_inventory(store, namespace, now, inventory).await
+            load_sequential_mark_reads_from_inventory(
+                store,
+                namespace,
+                now,
+                inventory,
+                reusable_live_manifest,
+            )
+            .await
         }
         None => load_mark_read_inputs(store, namespace, now, read_mode).await,
     };
