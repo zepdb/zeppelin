@@ -777,35 +777,49 @@ fn check_security_budget(
                     actual: actual.baseline_scenario.clone(),
                 });
             }
-            if actual.authn_authz_p50_delta_ns > expected.authn_authz_p50_delta_ns_max {
+            // These budgets are release-calibrated. An unoptimized build fails
+            // them by an order of magnitude that reads as a product regression:
+            // on 2026-07-25 the delegated path measured 260,862 ns in debug
+            // against an 80,000 ns budget, and 27,847 ns in release. Report the
+            // build regime instead of a number nobody can act on. Op counts,
+            // byte counts, and depth are build-independent and still checked.
+            if cfg!(debug_assertions) {
                 violations.push(CostViolation::SecurityBudget {
-                    metric: "authn_authz_p50_delta_ns".to_string(),
-                    expected: format!("<= {}", expected.authn_authz_p50_delta_ns_max),
-                    actual: actual.authn_authz_p50_delta_ns.to_string(),
+                    metric: "build_profile".to_string(),
+                    expected: "release (latency budgets are release-calibrated)".to_string(),
+                    actual: "debug; re-run with `cargo test --release`".to_string(),
                 });
-            }
-            match (
-                expected.delegated_authn_authz_p50_delta_ns_max,
-                actual.delegated_authn_authz_p50_delta_ns,
-            ) {
-                (Some(maximum), Some(measured)) if measured > maximum => {
+            } else {
+                if actual.authn_authz_p50_delta_ns > expected.authn_authz_p50_delta_ns_max {
                     violations.push(CostViolation::SecurityBudget {
-                        metric: "delegated_authn_authz_p50_delta_ns".to_string(),
-                        expected: format!("<= {maximum}"),
-                        actual: measured.to_string(),
+                        metric: "authn_authz_p50_delta_ns".to_string(),
+                        expected: format!("<= {}", expected.authn_authz_p50_delta_ns_max),
+                        actual: actual.authn_authz_p50_delta_ns.to_string(),
                     });
                 }
-                (Some(_), None) => violations.push(CostViolation::SecurityBudget {
-                    metric: "delegated_authn_authz_p50_delta_ns".to_string(),
-                    expected: "present".to_string(),
-                    actual: "missing".to_string(),
-                }),
-                (None, Some(measured)) => violations.push(CostViolation::SecurityBudget {
-                    metric: "delegated_authn_authz_p50_delta_ns".to_string(),
-                    expected: "absent".to_string(),
-                    actual: measured.to_string(),
-                }),
-                (Some(_), Some(_)) | (None, None) => {}
+                match (
+                    expected.delegated_authn_authz_p50_delta_ns_max,
+                    actual.delegated_authn_authz_p50_delta_ns,
+                ) {
+                    (Some(maximum), Some(measured)) if measured > maximum => {
+                        violations.push(CostViolation::SecurityBudget {
+                            metric: "delegated_authn_authz_p50_delta_ns".to_string(),
+                            expected: format!("<= {maximum}"),
+                            actual: measured.to_string(),
+                        });
+                    }
+                    (Some(_), None) => violations.push(CostViolation::SecurityBudget {
+                        metric: "delegated_authn_authz_p50_delta_ns".to_string(),
+                        expected: "present".to_string(),
+                        actual: "missing".to_string(),
+                    }),
+                    (None, Some(measured)) => violations.push(CostViolation::SecurityBudget {
+                        metric: "delegated_authn_authz_p50_delta_ns".to_string(),
+                        expected: "absent".to_string(),
+                        actual: measured.to_string(),
+                    }),
+                    (Some(_), Some(_)) | (None, None) => {}
+                }
             }
             let validated_query_regression = validate_direct_query_evidence(actual);
             if let Err(error) = &validated_query_regression {

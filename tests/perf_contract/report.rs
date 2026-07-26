@@ -553,7 +553,7 @@ fn build_report(artifacts: &RunArtifacts, scenarios: &BTreeMap<String, ScenarioR
         SOUNDNESS_PRECONDITION
     ));
     out.push_str(
-        "> CI command: `TEST_BACKEND=minio cargo test --test perf_contract_tests contracts -- --ignored`. Capture is never run in CI.\n\n",
+        "> CI command: `TEST_BACKEND=minio cargo test --release --test perf_contract_tests contracts -- --ignored`. `--release` is required: the security latency budgets are release-calibrated and a debug build misses them by an order of magnitude. Capture is never run in CI.\n\n",
     );
 
     let configuration_failures = scenarios

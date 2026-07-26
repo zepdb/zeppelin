@@ -920,6 +920,16 @@ async fn run_scenario_inner(
             // the separate warm 0-GET group-commit scenario.
             measured_server.reset_wal_writer_state(measured_namespace);
         }
+        if let MeasureOp::Compact { fragments, .. } = &spec.measure {
+            // Harness precondition, not product work. Verifying the manifest's
+            // fragment count issues a manifest GET, and running it inside the
+            // window made the frozen compaction contracts absorb that GET as
+            // product cost: they pin gets.manifest = 3 where compaction itself
+            // issues 2. Check before the window opens, then reopen it.
+            assert_manifest_fragment_count(measured_server, measured_namespace, *fragments).await;
+            counter.reset();
+            tracker.reset();
+        }
         let started = Instant::now();
         let mut measured = execute_measure_once(
             &measured_client,
@@ -2455,7 +2465,6 @@ async fn execute_measure_operation(
             fragments,
             incremental,
         } => {
-            assert_manifest_fragment_count(server, namespace, *fragments).await;
             let result = server
                 .compactor
                 .compact(namespace)

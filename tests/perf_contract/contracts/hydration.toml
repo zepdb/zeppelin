@@ -26,15 +26,15 @@ op = "hydrate"
 attempts = 2
 
 [baseline]
-git_rev = "ade36ce7c6f22c91ba8ee0cf5d74796f448ebca8"
-captured = "2026-07-12T04:41:16Z"
+git_rev = "34dd8cae09c61079d0a77c0537086c9644670cc0"
+captured = "2026-07-26T03:00:00Z"
 approved_by = "anup"
-reason = "Rebaseline after ade36ce preserves manifest namespace identity while removing verification GETs; operations, depth, and quantized artifact bytes are unchanged."
+reason = "Rebaseline at 34dd8ca accepting 6c850f5's per-job hydration authority revalidation. validate_hydration_job_authority (hydration.rs:862) re-reads the live manifest inside the worker's retry loop before any origin-qualified key is headed or fetched, checking namespace lifetime, deletion fence, manifest generation, and resolved physical owner. The queue separates the handler's read from the worker's execution, so unlike GC's mark-phase read this one is a genuine TOCTOU guard and cannot reuse the handler's observation. That adds one manifest GET and one critical-path level per hydration request: gets.manifest 2->4, gets.total 15->17, depth 31->33 for two requests. This rebaseline therefore accepts an OPERATION and DEPTH increase, a stronger claim than a887d3c's byte-only bands. Manifest bytes additionally carry the receipt artifact inventory growth already accepted in a887d3c, and are banded here because manifest-shaped objects are not byte-deterministic. Measured in release; the ns budgets in this catalog are release-calibrated."
 
 [assert.depth.get]
 mode = "exact"
-value = 31
-why = "two hydration requests include control reads, twelve first-pass artifact GETs, and sixteen cache-validation HEADs."
+value = 33
+why = "two hydration requests include control reads, one worker-side authority revalidation each, twelve first-pass artifact GETs, and sixteen cache-validation HEADs."
 
 [assert.gets]
 attrs = 8
@@ -43,11 +43,11 @@ bootstrap = 0
 centroids = 0
 cluster = 4
 fts = 0
-manifest = 2
+manifest = 4
 other = 1
 sketch = 0
 sq = 0
-total = 15
+total = 17
 wal = 0
 
 [assert.puts]
@@ -83,10 +83,13 @@ exact = 1450432
 exact = 0
 
 [assert.get_bytes.manifest]
-exact = 2463
+min = 15915
+max = 16212
+why = "four manifest GETs of a receipt-bearing manifest. Manifest-shaped objects encode timestamps at variable width, so this is not byte-deterministic: 4 release samples on 34dd8ca spanned 16047..16080 (33 B). Band pads 4x the observed spread (min 32 B) on each side, absorbing jitter while still failing on a doubling or a disappearance."
 
 [assert.get_bytes.other]
-exact = 640
+exact = 685
+why = "one namespace metadata GET"
 
 [assert.get_bytes.sketch]
 exact = 0
@@ -95,7 +98,9 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-exact = 1474023
+min = 1487520
+max = 1487817
+why = "dominated by fixed cluster and attrs bytes; inherits the manifest band above, same 4x-spread padding."
 
 [assert.get_bytes.wal]
 exact = 0
