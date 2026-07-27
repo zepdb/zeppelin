@@ -36,11 +36,16 @@ async fn test_create_namespace_returns_uuid_and_warning() {
 
     let body: serde_json::Value = resp.json().await.unwrap();
 
-    // Name should be a valid UUID v4
+    // Name should be a generated UUID v4. The test server sets
+    // `namespace_name_prefix` so concurrent suites cannot collide in one bucket,
+    // so the response carries that prefix ahead of the generated identifier.
     let name = body["name"].as_str().unwrap();
+    let generated = name
+        .strip_prefix(&format!("{}-", harness.prefix))
+        .unwrap_or_else(|| panic!("generated name must carry the isolation prefix, got: {name}"));
     assert!(
-        uuid::Uuid::parse_str(name).is_ok(),
-        "expected valid UUID, got: {name}"
+        uuid::Uuid::parse_str(generated).is_ok(),
+        "expected a valid UUID after the isolation prefix, got: {name}"
     );
 
     // Warning should be present
