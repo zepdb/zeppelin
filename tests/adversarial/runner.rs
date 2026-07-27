@@ -8259,11 +8259,10 @@ async fn inject_dual_writer_fencing_mutation(
     let mutation_scheduler =
         FaultScheduler::from_schedule(FaultSchedule::stale_manifest_cas_selftest());
     let mutation_store = stale_manifest_cas_selftest_proxy(store, mutation_scheduler.clone());
-    let stale_etag = stale_version
-        .e_tag()
-        .expect("dual-writer stale CAS requires a backend ETag");
+    let stale_identity = zeppelin::storage::StorageVersion::require(stale_version.version(), &key)
+        .expect("dual-writer stale CAS requires a backend version token");
     mutation_store
-        .put_if_match(&key, stale_bytes, stale_etag, namespace)
+        .put_if_match(&key, stale_bytes, stale_identity, namespace)
         .await
         .unwrap_or_else(|error| {
             panic!("dual-writer stale conditional CAS was not admitted: {error}")

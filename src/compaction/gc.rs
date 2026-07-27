@@ -2030,7 +2030,7 @@ async fn drain_pending_deletes_with_inventory_authority_from(
                 observed = Manifest::read_versioned(store, namespace).await?;
                 if observed
                     .as_ref()
-                    .is_some_and(|(_, version)| !version.has_e_tag())
+                    .is_some_and(|(_, version)| version.e_tag().is_none())
                 {
                     return Err(ZeppelinError::Serialization(format!(
                         "manifest {} has no ETag after pending-delete CAS conflict",
@@ -2097,10 +2097,13 @@ async fn prepare_warm_pending_delete_drain(
     let predelete_inventory =
         NamespaceInventory::from_listed(namespace, store.list_prefix_meta(&prefix).await?)?;
     let observations = predelete_inventory.history_observations(namespace)?;
-    if observations
-        .iter()
-        .any(|observation| !matches!(observation.storage_version, Some(StorageVersion::Etag(_))))
-    {
+    if observations.iter().any(|observation| {
+        observation
+            .storage_version
+            .as_ref()
+            .and_then(StorageVersion::etag)
+            .is_none()
+    }) {
         return Err(ZeppelinError::Serialization(format!(
             "namespace {namespace} history lacks ETags for pending-delete validation"
         )));
@@ -2648,24 +2651,31 @@ async fn load_history_observation_owned(
         ));
     }
 
-    let (bytes, get_etag) = store.get_with_meta(&observation.history.key).await?;
+    let (bytes, get_version) = store.get_with_meta(&observation.history.key).await?;
     let manifest = Manifest::decode_history_body(&bytes, namespace, &observation.history)?;
-    let cacheable = match observation.storage_version.as_ref() {
-        Some(StorageVersion::Etag(list_etag)) => {
-            if get_etag.as_deref() != Some(list_etag.as_str()) {
+    let listed_version = observation.storage_version.as_ref();
+    let cacheable = match listed_version.and_then(StorageVersion::etag) {
+        Some(list_etag) => {
+            let get_etag = get_version.as_ref().and_then(StorageVersion::etag);
+            if get_etag != Some(list_etag) {
                 return Err(ZeppelinError::Serialization(format!(
                     "manifest history {} changed between LIST ETag {:?} and GET ETag {:?}",
                     observation.history.key, list_etag, get_etag
                 )));
             }
             Some(CachedHistory {
-                storage_version: StorageVersion::Etag(list_etag.clone()),
+                storage_version: listed_version.cloned().ok_or_else(|| {
+                    ZeppelinError::Serialization(format!(
+                        "manifest history {} lost its LIST identity",
+                        observation.history.key
+                    ))
+                })?,
                 manifest: manifest.clone(),
                 stored_bytes: bytes.clone(),
                 reachable_keys: reachable_keys(namespace, &manifest)?,
             })
         }
-        Some(StorageVersion::BackendVersion(_)) | None => None,
+        None => None,
     };
     Ok((manifest, bytes, cacheable))
 }
@@ -3185,26 +3195,27 @@ async fn read_inventory_object(
     require_etag: bool,
 ) -> Result<Option<Bytes>> {
     match store.get_with_meta(key).await {
-        Ok((bytes, get_etag)) => {
+        Ok((bytes, get_version)) => {
             let object = listed.ok_or_else(|| {
                 ZeppelinError::Serialization(format!(
                     "object {key} appeared after the namespace inventory LIST"
                 ))
             })?;
-            match object.version.as_ref() {
-                Some(StorageVersion::Etag(list_etag)) => {
-                    if get_etag.as_deref() != Some(list_etag.as_str()) {
+            match object.version.as_ref().and_then(StorageVersion::etag) {
+                Some(list_etag) => {
+                    let get_etag = get_version.as_ref().and_then(StorageVersion::etag);
+                    if get_etag != Some(list_etag) {
                         return Err(ZeppelinError::Serialization(format!(
                             "object {key} changed between LIST ETag {list_etag:?} and GET ETag {get_etag:?}"
                         )));
                     }
                 }
-                Some(StorageVersion::BackendVersion(_)) | None if require_etag => {
+                None if require_etag => {
                     return Err(ZeppelinError::Serialization(format!(
                         "object {key} has no LIST ETag for pre-delete validation"
                     )));
                 }
-                Some(StorageVersion::BackendVersion(_)) | None => {}
+                None => {}
             }
             Ok(Some(bytes))
         }
@@ -3234,24 +3245,25 @@ async fn read_versioned_manifest_from_inventory(
     let key = Manifest::s3_key(namespace);
     let listed = inventory.object(&key);
     match store.get_with_meta(&key).await {
-        Ok((bytes, get_etag)) => {
+        Ok((bytes, get_version)) => {
             let object = listed.ok_or_else(|| {
                 ZeppelinError::Serialization(format!(
                     "manifest {key} appeared after the namespace inventory LIST"
                 ))
             })?;
-            let Some(StorageVersion::Etag(list_etag)) = object.version.as_ref() else {
+            let Some(list_etag) = object.version.as_ref().and_then(StorageVersion::etag) else {
                 return Err(ZeppelinError::Serialization(format!(
                     "manifest {key} has no LIST ETag for pending-delete validation"
                 )));
             };
-            if get_etag.as_deref() != Some(list_etag.as_str()) {
+            let get_etag = get_version.as_ref().and_then(StorageVersion::etag);
+            if get_etag != Some(list_etag) {
                 return Err(ZeppelinError::Serialization(format!(
                     "manifest {key} changed between LIST ETag {list_etag:?} and GET ETag {get_etag:?}"
                 )));
             }
             let manifest = Manifest::from_bytes_for_namespace(&bytes, namespace)?;
-            let version = ManifestVersion::for_manifest(get_etag, &manifest, bytes, false);
+            let version = ManifestVersion::for_manifest(get_version, &manifest, bytes, false);
             Ok(Some((manifest, version)))
         }
         Err(ZeppelinError::NotFound { .. }) if listed.is_none() => Ok(None),
@@ -4144,7 +4156,11 @@ async fn run_gc_cycle_at_inner(
             Ok(observations) => {
                 if used_fresh_inventory
                     && observations.iter().any(|observation| {
-                        !matches!(observation.storage_version, Some(StorageVersion::Etag(_)))
+                        observation
+                            .storage_version
+                            .as_ref()
+                            .and_then(StorageVersion::etag)
+                            .is_none()
                     })
                 {
                     Err(ZeppelinError::Serialization(format!(

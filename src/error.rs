@@ -102,6 +102,21 @@ pub enum ZeppelinError {
     #[error("storage path error: {0}")]
     StoragePath(#[from] object_store::path::Error),
 
+    /// A compare-and-swap was required but the backend reported no version token.
+    ///
+    /// Conditional writes are keyed on a backend identity — an ETag on S3,
+    /// MinIO and Azure, an object generation on GCS. A read that returns none
+    /// leaves the caller nothing to compare against, and substituting an empty
+    /// precondition would turn the CAS into an unconditional overwrite. That is
+    /// a backend contract violation, so it is raised rather than degraded.
+    #[error(
+        "storage backend returned no usable version token for {key} (backend requires one of etag/generation for CAS)"
+    )]
+    MissingVersionToken {
+        /// Object key whose read carried no backend identity.
+        key: String,
+    },
+
     // Serialization errors
     /// A JSON serialization or deserialization failure.
     #[error("json serialization error: {0}")]
@@ -565,6 +580,7 @@ impl ZeppelinError {
             ZeppelinError::NotFound { .. } => "INTERNAL_DATA_MISSING",
             ZeppelinError::Storage(_) => "STORAGE_ERROR",
             ZeppelinError::StoragePath(_) => "STORAGE_ERROR",
+            ZeppelinError::MissingVersionToken { .. } => "STORAGE_ERROR",
             ZeppelinError::Json(_) => "INTERNAL_ERROR",
             ZeppelinError::Bincode(_) => "INTERNAL_ERROR",
             ZeppelinError::Serialization(_) => "INTERNAL_ERROR",
@@ -732,6 +748,13 @@ impl ZeppelinError {
             }
             ZeppelinError::Storage(_) | ZeppelinError::StoragePath(_) => {
                 "a transient storage error occurred; please retry".to_string()
+            }
+            // Backend contract violation: the operator's substrate cannot supply
+            // the identity its own conditional writes require. Not retryable.
+            ZeppelinError::MissingVersionToken { .. } => {
+                "the storage backend did not supply a version token; this is a server-side \
+                 configuration error"
+                    .to_string()
             }
             ZeppelinError::Branch(error)
                 if matches!(

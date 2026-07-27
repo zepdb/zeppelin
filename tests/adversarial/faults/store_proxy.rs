@@ -1668,6 +1668,12 @@ mod tests {
         Boundary, ContentFault, FaultEvent, FaultProfile, FaultSchedule, TargetSelector,
     };
 
+    /// A syntactically valid token for an object that is not there.
+    fn absent_version() -> zeppelin::storage::StorageVersion {
+        zeppelin::storage::StorageVersion::from_parts(Some("absent-etag".to_string()), None)
+            .expect("a non-empty etag always yields a token")
+    }
+
     #[derive(Debug)]
     struct FirstGetGate {
         inner: Arc<InMemory>,
@@ -2231,7 +2237,7 @@ mod tests {
         let faulted = store_fault_proxy(&inner, scheduler.clone());
 
         assert!(faulted
-            .get_if_none_match("ns/object.bin", "absent-etag")
+            .get_if_none_match("ns/object.bin", &absent_version())
             .await
             .is_err());
         assert!(scheduler.timeline().is_empty());
@@ -2742,6 +2748,7 @@ mod tests {
             .await
             .unwrap()
             .e_tag
+            .and_then(|etag| zeppelin::storage::StorageVersion::from_parts(Some(etag), None))
             .expect("in-memory object must expose an etag");
         let scheduler = FaultScheduler::from_schedule(FaultSchedule {
             profile: FaultProfile::Semantic,
@@ -2791,6 +2798,7 @@ mod tests {
             .await
             .unwrap()
             .e_tag
+            .and_then(|etag| zeppelin::storage::StorageVersion::from_parts(Some(etag), None))
             .expect("in-memory object must expose an etag");
         inner
             .put_if_match(

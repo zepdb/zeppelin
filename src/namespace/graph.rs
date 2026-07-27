@@ -46,7 +46,7 @@ use crate::namespace::{
     BranchId, BranchRoot, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
 };
 use crate::security::{RootReleaseAuditProgress, RootReleaseFailureClass, SecurityError};
-use crate::storage::{CreateOnlyOutcome, NamespaceObjectKey, ZeppelinStore};
+use crate::storage::{CreateOnlyOutcome, NamespaceObjectKey, StorageVersion, ZeppelinStore};
 use crate::time::Clock;
 use crate::wal::manifest::{BranchLineageSeed, PreparedManifestPublication, PreparedZeroCopyFork};
 use crate::wal::{Lease, LeaseManager, Manifest};
@@ -1375,7 +1375,7 @@ impl NamespaceGraph {
         &self,
         namespace: &NamespaceId,
         mut metadata: NamespaceMetadata,
-        target_etag: &str,
+        target_version: &StorageVersion,
         observed_root: Option<&BranchRoot>,
         decision: &DeletionDecision,
     ) -> Result<NamespaceMetadata> {
@@ -1424,7 +1424,7 @@ impl NamespaceGraph {
         metadata.updated_at = self.clock.now();
         match self
             .namespace_manager
-            .cas_update_creating_intent(&metadata, target_etag)
+            .cas_update_creating_intent(&metadata, target_version)
             .await
         {
             Ok(_) => Ok(metadata),
@@ -3375,7 +3375,7 @@ impl NamespaceGraph {
             }
         };
         let result = async {
-            let mutation: Result<Option<(bool, NamespaceMetadata, String)>> = async {
+            let mutation: Result<Option<(bool, NamespaceMetadata, StorageVersion)>> = async {
                 self.require_unlocked_boundary(
                     governance.as_ref(),
                     namespace,
@@ -3393,13 +3393,11 @@ impl NamespaceGraph {
                     .namespace_manager
                     .read_metadata_versioned(namespace.as_str())
                     .await?;
-                let current_target_etag = current_target_etag
-                    .filter(|etag| !etag.is_empty())
-                    .ok_or_else(|| {
-                        ZeppelinError::Serialization(format!(
-                            "branch namespace {namespace} metadata has no ETag for root-release acknowledgement"
-                        ))
-                    })?;
+                let current_target_etag = StorageVersion::require(
+                    current_target_etag.as_ref(),
+                    &NamespaceMetadata::s3_key(namespace.as_str()),
+                )?
+                .clone();
                 let current_intent = current_target.deletion_intent.as_ref().ok_or_else(|| {
                     ZeppelinError::Validation(format!(
                         "branch namespace {namespace} lost its deletion intent before root release"

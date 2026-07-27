@@ -19,7 +19,7 @@ use crate::error::{Result, ZeppelinError};
 use crate::namespace::branching::activation::{BranchActivationAttempt, BranchActivationTarget};
 use crate::namespace::branching::ActivationNonce;
 use crate::namespace::{BranchId, NamespaceId, NamespaceIncarnationId};
-use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, ZeppelinStore};
+use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, StorageVersion, ZeppelinStore};
 use crate::time::Clock;
 
 use super::{PolicyVersion, SecurityError};
@@ -337,11 +337,11 @@ impl PolicyPublicationLeaseRecord {
     }
 }
 
-/// Owned, ETag-bearing observation of one acquired publication lease.
+/// Owned, identity-bearing observation of one acquired publication lease.
 #[derive(Debug)]
 pub struct PolicyPublicationLeaseClaim {
     record: PolicyPublicationLeaseRecord,
-    etag: String,
+    version: StorageVersion,
 }
 
 impl PolicyPublicationLeaseClaim {
@@ -421,33 +421,33 @@ impl PolicyPublicationLease {
                         .put_create_outcome(POLICY_PUBLICATION_LEASE_KEY, body)
                         .await?
                     {
-                        CreateOnlyOutcome::Created { e_tag } => {
-                            return self.claim_after_write(record, e_tag).await;
+                        CreateOnlyOutcome::Created { version } => {
+                            return self.claim_after_write(record, version).await;
                         }
                         CreateOnlyOutcome::AlreadyExists => continue,
                     }
                 }
-                Ok((body, etag)) => {
+                Ok((body, observed)) => {
                     let current = decode_record(&body)?;
                     if current.state == PolicyPublicationLeaseState::Held
                         && current.expires_at > now
                     {
                         return Err(SecurityError::PolicyConflict.into());
                     }
-                    let expected_etag = required_etag(etag)?;
+                    let expected = required_version(observed)?;
                     let record = self.held_record(current.fencing_token.next()?, now)?;
                     match self
                         .store
                         .put_if_match_outcome(
                             POLICY_PUBLICATION_LEASE_KEY,
                             encode_record(&record)?,
-                            &expected_etag,
+                            &expected,
                         )
                         .await?
                     {
                         ConditionalPutOutcome::Conflict => continue,
-                        ConditionalPutOutcome::Updated { e_tag } => {
-                            return self.claim_after_write(record, e_tag).await;
+                        ConditionalPutOutcome::Updated { version } => {
+                            return self.claim_after_write(record, version).await;
                         }
                     }
                 }
@@ -473,12 +473,14 @@ impl PolicyPublicationLease {
             .put_if_match_outcome(
                 POLICY_PUBLICATION_LEASE_KEY,
                 encode_record(&record)?,
-                &claim.etag,
+                &claim.version,
             )
             .await?
         {
             ConditionalPutOutcome::Conflict => Err(SecurityError::PolicyConflict.into()),
-            ConditionalPutOutcome::Updated { e_tag } => self.claim_after_write(record, e_tag).await,
+            ConditionalPutOutcome::Updated { version } => {
+                self.claim_after_write(record, version).await
+            }
         }
     }
 
@@ -500,7 +502,7 @@ impl PolicyPublicationLease {
             .put_if_match_outcome(
                 POLICY_PUBLICATION_LEASE_KEY,
                 encode_record(&released)?,
-                &claim.etag,
+                &claim.version,
             )
             .await?
         {
@@ -536,25 +538,25 @@ impl PolicyPublicationLease {
     async fn claim_after_write(
         &self,
         expected: PolicyPublicationLeaseRecord,
-        etag: Option<String>,
+        written: Option<StorageVersion>,
     ) -> Result<PolicyPublicationLeaseClaim> {
-        let etag = match etag.filter(|value| !value.is_empty()) {
-            Some(etag) => etag,
+        let version = match written {
+            Some(version) => version,
             None => {
-                let (body, etag) = self
+                let (body, observed) = self
                     .store
                     .get_with_meta(POLICY_PUBLICATION_LEASE_KEY)
                     .await?;
-                let observed = decode_record(&body)?;
-                if observed != expected {
+                let decoded = decode_record(&body)?;
+                if decoded != expected {
                     return Err(SecurityError::PolicyConflict.into());
                 }
-                required_etag(etag)?
+                required_version(observed)?
             }
         };
         Ok(PolicyPublicationLeaseClaim {
             record: expected,
-            etag,
+            version,
         })
     }
 
@@ -565,7 +567,6 @@ impl PolicyPublicationLease {
         claim.record.validate()?;
         if claim.record.state != PolicyPublicationLeaseState::Held
             || claim.record.holder_id != self.holder_id
-            || claim.etag.is_empty()
         {
             return Err(SecurityError::PolicyConflict);
         }
@@ -578,7 +579,7 @@ impl PolicyPublicationLease {
 pub struct PolicyActivationGuardPermit {
     pub(crate) guard: PendingBranchActivation,
     pub(crate) lease_claim: PolicyPublicationLeaseClaim,
-    pub(crate) head_etag: String,
+    pub(crate) head_version: StorageVersion,
     pub(crate) control_revision: PolicyControlRevision,
 }
 
@@ -626,9 +627,8 @@ impl PolicyActivationGuardPermit {
     }
 }
 
-fn required_etag(etag: Option<String>) -> Result<String> {
-    etag.filter(|value| !value.is_empty())
-        .ok_or_else(|| SecurityError::PolicyHeadMissingEtag.into())
+fn required_version(version: Option<StorageVersion>) -> Result<StorageVersion> {
+    version.ok_or_else(|| SecurityError::PolicyHeadMissingEtag.into())
 }
 
 fn encode_record(record: &PolicyPublicationLeaseRecord) -> Result<Bytes> {

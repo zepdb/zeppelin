@@ -82,7 +82,7 @@ use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
 use crate::security::{DecisionId, PreservationHeadProof, PreservationService, PrincipalId};
-use crate::storage::{DeletePrefixOutcome, ObjectUserMetadata, ZeppelinStore};
+use crate::storage::{DeletePrefixOutcome, ObjectUserMetadata, StorageVersion, ZeppelinStore};
 use crate::time::Clock;
 use crate::types::{DistanceMetric, IndexType};
 use crate::wal::LeaseManager;
@@ -1680,8 +1680,11 @@ impl NamespaceManager {
 
             meta.state = NamespaceState::Active;
             meta.updated_at = self.clock.now();
-            let etag = etag.unwrap_or_default();
-            match self.put_metadata_if_match(&key, &meta, &etag, name).await {
+            let observed = StorageVersion::require(etag.as_ref(), &key)?;
+            match self
+                .put_metadata_if_match(&key, &meta, observed, name)
+                .await
+            {
                 Ok(_) => {
                     self.insert_registry(meta.clone());
                     return Ok(meta);
@@ -1721,13 +1724,9 @@ impl NamespaceManager {
             if !changed {
                 return Ok(metadata);
             }
-            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
-                ZeppelinError::Serialization(format!(
-                    "authoritative branch metadata {key} has no non-empty ETag required for activation"
-                ))
-            })?;
+            let observed = StorageVersion::require(etag.as_ref(), &key)?;
             match self
-                .put_metadata_if_match(&key, &metadata, &etag, name)
+                .put_metadata_if_match(&key, &metadata, observed, name)
                 .await
             {
                 Ok(_) => {
@@ -1766,13 +1765,9 @@ impl NamespaceManager {
             if !changed {
                 return Ok(metadata);
             }
-            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
-                ZeppelinError::Serialization(format!(
-                    "authoritative branch metadata {key} has no non-empty ETag required for activation"
-                ))
-            })?;
+            let observed = StorageVersion::require(etag.as_ref(), &key)?;
             match self
-                .put_metadata_if_match(&key, &metadata, &etag, name)
+                .put_metadata_if_match(&key, &metadata, observed, name)
                 .await
             {
                 Ok(_) => {
@@ -1811,13 +1806,9 @@ impl NamespaceManager {
                 BranchActivationRevocationPlan::Outcome(outcome) => return Ok(outcome),
                 BranchActivationRevocationPlan::PublishPrepared => {}
             }
-            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
-                ZeppelinError::Serialization(format!(
-                    "authoritative branch metadata {key} has no non-empty ETag required for activation revocation"
-                ))
-            })?;
+            let observed = StorageVersion::require(etag.as_ref(), &key)?;
             match self
-                .put_metadata_if_match(&key, &metadata, &etag, name)
+                .put_metadata_if_match(&key, &metadata, observed, name)
                 .await
             {
                 Ok(_) => {
@@ -1870,7 +1861,7 @@ impl NamespaceManager {
     pub(crate) async fn read_creating_intent_strong(
         &self,
         name: &str,
-    ) -> Result<(NamespaceMetadata, String)> {
+    ) -> Result<(NamespaceMetadata, StorageVersion)> {
         let (meta, etag) = self.read_metadata_versioned(name).await?;
         if meta.state != NamespaceState::Creating
             || !matches!(meta.creation_kind, NamespaceCreationKind::Fork(_))
@@ -1880,20 +1871,16 @@ impl NamespaceManager {
             })?;
             return Err(BranchError::TargetAlreadyExists { target }.into());
         }
-        let etag = etag.filter(|etag| !etag.is_empty()).ok_or_else(|| {
-            ZeppelinError::Serialization(format!(
-                "authoritative creating metadata {name} has no non-empty ETag"
-            ))
-        })?;
-        Ok((meta, etag))
+        let observed = StorageVersion::require(etag.as_ref(), &NamespaceMetadata::s3_key(name))?;
+        Ok((meta, observed.clone()))
     }
 
     /// CAS-publish one monotonic update to an existing creating fork intent.
     pub(crate) async fn cas_update_creating_intent(
         &self,
         meta: &NamespaceMetadata,
-        etag: &str,
-    ) -> Result<Option<String>> {
+        version: &StorageVersion,
+    ) -> Result<Option<StorageVersion>> {
         if meta.state != NamespaceState::Creating
             || !matches!(meta.creation_kind, NamespaceCreationKind::Fork(_))
         {
@@ -1905,7 +1892,7 @@ impl NamespaceManager {
         meta.validate_creation_lifecycle()?;
         let key = NamespaceMetadata::s3_key(&meta.name);
         let next = self
-            .put_metadata_if_match(&key, meta, etag, &meta.name)
+            .put_metadata_if_match(&key, meta, version, &meta.name)
             .await?;
         self.insert_registry(meta.clone());
         Ok(next)
@@ -2147,14 +2134,7 @@ impl NamespaceManager {
                 return Ok(meta);
             }
 
-            let etag = object_metadata
-                .e_tag
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    ZeppelinError::Serialization(format!(
-                        "authoritative namespace metadata {key} has no non-empty ETag required for incarnation migration"
-                    ))
-                })?;
+            let observed = StorageVersion::require(object_metadata.version.as_ref(), &key)?.clone();
             // Mixed-version deployments may already have bound the manifest
             // before metadata received its header. Adopt that identity rather
             // than minting a conflicting lifetime. An active namespace without
@@ -2181,7 +2161,7 @@ impl NamespaceManager {
 
             match self
                 .store
-                .put_if_match_with_user_metadata(&key, body, &etag, name, &user_metadata)
+                .put_if_match_with_user_metadata(&key, body, &observed, name, &user_metadata)
                 .await
             {
                 Ok(_) => {
@@ -2293,24 +2273,24 @@ impl NamespaceManager {
     ///
     /// # Consistency
     ///
-    /// Callers must pass the returned ETag to a conditional PUT; loading a value
-    /// alone does not authorize an unconditional overwrite.
+    /// Callers must pass the returned identity to a conditional PUT; loading a
+    /// value alone does not authorize an unconditional overwrite.
     ///
     /// # Examples
     ///
-    /// An index-config update reads metadata at ETag `v12`, edits an owned clone,
-    /// and publishes only if `v12` remains current.
+    /// An index-config update reads metadata at identity `v12`, edits an owned
+    /// clone, and publishes only if `v12` remains current.
     pub(crate) async fn read_metadata_versioned(
         &self,
         name: &str,
-    ) -> Result<(NamespaceMetadata, Option<String>)> {
+    ) -> Result<(NamespaceMetadata, Option<StorageVersion>)> {
         let key = NamespaceMetadata::s3_key(name);
         match self.store.get_with_object_metadata(&key).await {
             Ok((data, object_metadata)) => {
                 let meta = NamespaceMetadata::from_bytes(&data)?
                     .attach_user_metadata(&object_metadata.user_metadata)?;
                 self.insert_registry(meta.clone());
-                Ok((meta, object_metadata.e_tag))
+                Ok((meta, object_metadata.version))
             }
             Err(ZeppelinError::NotFound { .. }) => Err(ZeppelinError::NamespaceNotFound {
                 namespace: name.to_string(),
@@ -2327,11 +2307,8 @@ impl NamespaceManager {
     ) -> Result<()> {
         for _attempt in 0..8 {
             let (mut meta, etag) = self.read_metadata_versioned(name).await?;
-            let etag = etag.ok_or_else(|| {
-                ZeppelinError::Serialization(format!(
-                    "namespace {name} metadata has no ETag for visibility CAS"
-                ))
-            })?;
+            let observed =
+                StorageVersion::require(etag.as_ref(), &NamespaceMetadata::s3_key(name))?;
             let intent = meta.deletion_intent.as_mut().ok_or_else(|| {
                 ZeppelinError::Validation(format!(
                     "namespace {name} has no deletion intent for visibility removal"
@@ -2353,7 +2330,7 @@ impl NamespaceManager {
             intent.visibility = Some(visibility.clone());
             meta.updated_at = self.clock.now();
             match self
-                .put_metadata_if_match(&NamespaceMetadata::s3_key(name), &meta, &etag, name)
+                .put_metadata_if_match(&NamespaceMetadata::s3_key(name), &meta, observed, name)
                 .await
             {
                 Ok(_) => return Ok(()),
@@ -2371,7 +2348,7 @@ impl NamespaceManager {
         &self,
         name: &str,
         expected_metadata: &NamespaceMetadata,
-        expected_etag: &str,
+        expected_version: &StorageVersion,
         release: RootReleaseState,
     ) -> Result<()> {
         let namespace = NamespaceId::new(name.to_string())?;
@@ -2381,12 +2358,6 @@ impl NamespaceManager {
                 expected_metadata.name
             )));
         }
-        if expected_etag.is_empty() {
-            return Err(ZeppelinError::Serialization(format!(
-                "namespace {name} metadata has no ETag for root-release CAS"
-            )));
-        }
-
         let mut updated = expected_metadata.clone();
         let expected_intent = expected_metadata.deletion_intent.as_ref().ok_or_else(|| {
             ZeppelinError::Validation(format!(
@@ -2438,7 +2409,7 @@ impl NamespaceManager {
             .put_metadata_if_match(
                 &NamespaceMetadata::s3_key(name),
                 &updated,
-                expected_etag,
+                expected_version,
                 name,
             )
             .await
@@ -2483,12 +2454,18 @@ impl NamespaceManager {
         &self,
         key: &str,
         meta: &NamespaceMetadata,
-        etag: &str,
+        version: &StorageVersion,
         namespace: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<StorageVersion>> {
         let user_metadata = meta.user_metadata();
         self.store
-            .put_if_match_with_user_metadata(key, meta.to_bytes()?, etag, namespace, &user_metadata)
+            .put_if_match_with_user_metadata(
+                key,
+                meta.to_bytes()?,
+                version,
+                namespace,
+                &user_metadata,
+            )
             .await
     }
 
@@ -2855,12 +2832,11 @@ impl NamespaceManager {
                 root_release: None,
             });
             meta.updated_at = self.clock.now();
-            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
-                ZeppelinError::Serialization(format!(
-                    "authoritative namespace metadata {key} has no ETag for deletion intent"
-                ))
-            })?;
-            match self.put_metadata_if_match(&key, &meta, &etag, name).await {
+            let observed = StorageVersion::require(etag.as_ref(), &key)?;
+            match self
+                .put_metadata_if_match(&key, &meta, observed, name)
+                .await
+            {
                 Ok(_) => {
                     self.insert_registry(meta.clone());
                     return Ok(meta);
@@ -2906,12 +2882,11 @@ impl NamespaceManager {
             meta.deletion_intent = None;
             meta.destruction_record_key = None;
             meta.updated_at = self.clock.now();
-            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
-                ZeppelinError::Serialization(format!(
-                    "authoritative namespace metadata {key} has no ETag for deletion intent clear"
-                ))
-            })?;
-            match self.put_metadata_if_match(&key, &meta, &etag, name).await {
+            let observed = StorageVersion::require(etag.as_ref(), &key)?;
+            match self
+                .put_metadata_if_match(&key, &meta, observed, name)
+                .await
+            {
                 Ok(_) => {
                     self.insert_registry(meta.clone());
                     return Ok(meta);
@@ -2955,12 +2930,11 @@ impl NamespaceManager {
                 None => intent.fenced_generation = Some(generation),
             }
             meta.updated_at = self.clock.now();
-            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
-                ZeppelinError::Serialization(format!(
-                    "authoritative namespace metadata {key} has no ETag for fence acknowledgement"
-                ))
-            })?;
-            match self.put_metadata_if_match(&key, &meta, &etag, name).await {
+            let observed = StorageVersion::require(etag.as_ref(), &key)?;
+            match self
+                .put_metadata_if_match(&key, &meta, observed, name)
+                .await
+            {
                 Ok(_) => {
                     self.insert_registry(meta.clone());
                     return Ok(meta);
@@ -3007,12 +2981,11 @@ impl NamespaceManager {
             meta.state = NamespaceState::Deleting;
             meta.destruction_record_key = Some(intent.destruction_record_key.clone());
             meta.updated_at = self.clock.now();
-            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
-                ZeppelinError::Serialization(format!(
-                    "authoritative namespace metadata {key} has no ETag for tombstone"
-                ))
-            })?;
-            match self.put_metadata_if_match(&key, &meta, &etag, name).await {
+            let observed = StorageVersion::require(etag.as_ref(), &key)?;
+            match self
+                .put_metadata_if_match(&key, &meta, observed, name)
+                .await
+            {
                 Ok(_) => {
                     self.insert_registry(meta.clone());
                     return Ok(meta);
@@ -3477,9 +3450,9 @@ impl NamespaceManager {
                 }
                 lease = renewed;
 
-                let etag = etag.unwrap_or_default();
+                let observed = StorageVersion::require(etag.as_ref(), &key)?;
                 match self
-                    .put_metadata_if_match(&key, &meta, &etag, &meta_name)
+                    .put_metadata_if_match(&key, &meta, observed, &meta_name)
                     .await
                 {
                     Ok(_) => {
@@ -3632,9 +3605,9 @@ impl NamespaceManager {
             meta.updated_at = self.clock.now();
             let degraded = meta.compaction_health.consecutive_failures
                 >= COMPACTION_DEGRADED_FAILURE_THRESHOLD;
-            let etag = etag.unwrap_or_default();
+            let observed = StorageVersion::require(etag.as_ref(), &key)?;
             match self
-                .put_metadata_if_match(&key, &meta, &etag, &meta_name)
+                .put_metadata_if_match(&key, &meta, observed, &meta_name)
                 .await
             {
                 Ok(_) => {
@@ -3700,12 +3673,11 @@ impl NamespaceManager {
             meta.state = NamespaceState::Deleting;
 
             meta.updated_at = self.clock.now();
-            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
-                ZeppelinError::Serialization(format!(
-                    "authoritative namespace metadata {key} has no non-empty ETag required for deletion"
-                ))
-            })?;
-            match self.put_metadata_if_match(&key, &meta, &etag, name).await {
+            let observed = StorageVersion::require(etag.as_ref(), &key)?;
+            match self
+                .put_metadata_if_match(&key, &meta, observed, name)
+                .await
+            {
                 Ok(_) => {
                     self.insert_registry(meta.clone());
                     return Ok(meta);

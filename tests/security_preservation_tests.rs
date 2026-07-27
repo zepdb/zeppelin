@@ -631,10 +631,10 @@ async fn governed_delete_migrates_legacy_incarnation_before_binding_evidence() {
         .get_with_object_metadata(&metadata_key)
         .await
         .unwrap();
-    let etag = object_metadata
-        .e_tag
-        .as_deref()
-        .expect("real object storage must return a metadata ETag");
+    let version = object_metadata
+        .version
+        .as_ref()
+        .expect("real object storage must return a metadata version token");
     let original_incarnation = object_metadata
         .user_metadata
         .get("zeppelin-namespace-incarnation")
@@ -645,7 +645,7 @@ async fn governed_delete_migrates_legacy_incarnation_before_binding_evidence() {
         .put_if_match_with_user_metadata(
             &metadata_key,
             body,
-            etag,
+            version,
             &namespace,
             &ObjectUserMetadata::new(),
         )

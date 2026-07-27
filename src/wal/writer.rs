@@ -161,7 +161,7 @@ impl ManifestAppendGuard {
         manifest: &Manifest,
         storage_version: ManifestVersion,
     ) -> Result<Self> {
-        storage_version.require_etag(namespace, "scoped manifest append")?;
+        storage_version.require_version(namespace, "scoped manifest append")?;
         let namespace_incarnation = manifest
             .namespace_incarnation()
             .ok_or_else(|| {
@@ -868,7 +868,7 @@ impl WalWriter {
                 .await
             {
                 Ok(new_version) => {
-                    let next_memo = if new_version.has_e_tag() {
+                    let next_memo = if new_version.has_version() {
                         Some((manifest.clone(), new_version))
                     } else {
                         None

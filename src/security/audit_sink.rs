@@ -55,7 +55,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use crate::error::ZeppelinError;
-use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, ZeppelinStore};
+use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, StorageVersion, ZeppelinStore};
 
 use super::audit_chain::{
     advance_tail_body, anchor_key, audit_slot_key, load_chain_tail, record_hash, AuditChainState,
@@ -90,7 +90,7 @@ impl AuditWriterHead {
 #[derive(Debug, Clone)]
 struct LoadedAuditWriterHead {
     key: String,
-    e_tag: String,
+    version: StorageVersion,
     document: AuditWriterHead,
 }
 
@@ -120,17 +120,17 @@ impl LoadedAuditWriterHead {
                     ))
                 })?,
         );
-        let next_e_tag = match store
-            .put_if_match_outcome(&self.key, encode_writer_head(&replacement)?, &self.e_tag)
+        let next_version = match store
+            .put_if_match_outcome(&self.key, encode_writer_head(&replacement)?, &self.version)
             .await
             .map_err(|error| AuditSinkError::Storage(error.to_string()))?
         {
-            ConditionalPutOutcome::Updated { e_tag } => e_tag,
+            ConditionalPutOutcome::Updated { version } => version,
             ConditionalPutOutcome::Conflict => return Err(AuditSinkError::WriterAlreadyActive),
         };
         self.document = replacement;
-        if let Some(e_tag) = next_e_tag.filter(|value| !value.is_empty()) {
-            self.e_tag = e_tag;
+        if let Some(version) = next_version {
+            self.version = version;
             return Ok(());
         }
         let reloaded = read_writer_head(store, &self.document.signer_node)
@@ -146,7 +146,7 @@ impl LoadedAuditWriterHead {
                 "renewed head diverged during ETag reconciliation".to_string(),
             ));
         }
-        self.e_tag = reloaded.e_tag;
+        self.version = reloaded.version;
         Ok(())
     }
 
@@ -162,12 +162,12 @@ impl LoadedAuditWriterHead {
             lease_owner: self.document.lease_owner.clone(),
             lease_expires_at: self.document.lease_expires_at,
         };
-        let e_tag = match store
-            .put_if_match_outcome(&self.key, encode_writer_head(&replacement)?, &self.e_tag)
+        let next_version = match store
+            .put_if_match_outcome(&self.key, encode_writer_head(&replacement)?, &self.version)
             .await
             .map_err(|error| AuditSinkError::WriterAuthorityLost(error.to_string()))?
         {
-            ConditionalPutOutcome::Updated { e_tag } => e_tag,
+            ConditionalPutOutcome::Updated { version } => version,
             ConditionalPutOutcome::Conflict => {
                 return Err(AuditSinkError::WriterAuthorityLost(
                     "head changed while advancing the UTC day".to_string(),
@@ -175,8 +175,8 @@ impl LoadedAuditWriterHead {
             }
         };
         self.document = replacement;
-        if let Some(e_tag) = e_tag.filter(|value| !value.is_empty()) {
-            self.e_tag = e_tag;
+        if let Some(version) = next_version {
+            self.version = version;
             return Ok(());
         }
 
@@ -193,7 +193,7 @@ impl LoadedAuditWriterHead {
                 "updated head diverged during ETag reconciliation".to_string(),
             ));
         }
-        self.e_tag = reloaded.e_tag;
+        self.version = reloaded.version;
         Ok(())
     }
 }
@@ -253,15 +253,14 @@ async fn read_writer_head(
     let document: AuditWriterHead = serde_json::from_slice(&body)
         .map_err(|error| AuditSinkError::Serialization(format!("invalid {key}: {error}")))?;
     let document = validate_writer_head(&key, signer_node, document)?;
-    let e_tag = metadata
-        .e_tag
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            AuditSinkError::Storage(format!("authoritative audit writer head {key} has no ETag"))
-        })?;
+    let version = metadata.version.ok_or_else(|| {
+        AuditSinkError::Storage(format!(
+            "authoritative audit writer head {key} has no version token"
+        ))
+    })?;
     Ok(Some(LoadedAuditWriterHead {
         key,
-        e_tag,
+        version,
         document,
     }))
 }
@@ -323,7 +322,7 @@ async fn resolve_writer_head(
                     .put_if_match_outcome(
                         &current.key,
                         encode_writer_head(&replacement)?,
-                        &current.e_tag,
+                        &current.version,
                     )
                     .await
                     .map_err(|error| AuditSinkError::Storage(error.to_string()))?
@@ -342,7 +341,7 @@ async fn resolve_writer_head(
             .put_if_match_outcome(
                 &current.key,
                 encode_writer_head(&replacement)?,
-                &current.e_tag,
+                &current.version,
             )
             .await
             .map_err(|error| AuditSinkError::Storage(error.to_string()))?

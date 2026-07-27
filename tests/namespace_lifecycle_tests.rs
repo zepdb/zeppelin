@@ -212,16 +212,16 @@ async fn old_format_governed_intent_and_evidence_resume_to_completion() {
     metadata["state"] = json!("deleting");
     metadata["destruction_record_key"] = json!(destruction_record_key.clone());
     metadata["deletion_intent"] = serde_json::from_str(&legacy_intent).unwrap();
-    let etag = object_metadata
-        .e_tag
-        .as_deref()
-        .expect("real object storage must return a metadata ETag");
+    let version = object_metadata
+        .version
+        .as_ref()
+        .expect("real object storage must return a metadata version token");
     harness
         .store
         .put_if_match_with_user_metadata(
             &metadata_key,
             Bytes::from(serde_json::to_vec_pretty(&metadata).unwrap()),
-            etag,
+            version,
             &name,
             &object_metadata.user_metadata,
         )
@@ -379,16 +379,16 @@ async fn old_format_branch_intent_and_evidence_resume_through_grace() {
     metadata["state"] = json!("deleting");
     metadata["destruction_record_key"] = json!(destruction_record_key.clone());
     metadata["deletion_intent"] = old_intent;
-    let etag = object_metadata
-        .e_tag
-        .as_deref()
-        .expect("real object storage must return a metadata ETag");
+    let version = object_metadata
+        .version
+        .as_ref()
+        .expect("real object storage must return a metadata version token");
     harness
         .store
         .put_if_match_with_user_metadata(
             &metadata_key,
             Bytes::from(serde_json::to_vec_pretty(&metadata).unwrap()),
-            etag,
+            version,
             &target,
             &object_metadata.user_metadata,
         )

@@ -93,16 +93,15 @@ async fn mutate_writer_head(
     let mut head: AuditWriterHeadFixture =
         serde_json::from_slice(&body).expect("authoritative writer head must decode");
     mutate(&mut head);
-    let e_tag = metadata
-        .e_tag
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .expect("authoritative writer head must carry an ETag");
+    let version = metadata
+        .version
+        .as_ref()
+        .expect("authoritative writer head must carry a version token");
     let outcome = store
         .put_if_match_outcome(
             &key,
             Bytes::from(serde_json::to_vec(&head).expect("writer head must encode")),
-            e_tag,
+            version,
         )
         .await
         .expect("writer head CAS mutation must execute");

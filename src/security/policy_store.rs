@@ -202,7 +202,7 @@ use crate::error::{Result, ZeppelinError};
 use crate::namespace::branching::activation::BranchActivationTarget;
 use crate::namespace::branching::ActivationNonce;
 use crate::namespace::BranchId;
-use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, ZeppelinStore};
+use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, StorageVersion, ZeppelinStore};
 
 use super::{Entitlements, Feature, PolicyHead, PolicySnapshot, SecurityError};
 use super::{
@@ -237,7 +237,7 @@ struct PhaseSevenMigrationRecord<'a> {
 pub struct LoadedPolicy {
     head: PolicyHead,
     snapshot: PolicySnapshot,
-    head_etag: String,
+    head_version: StorageVersion,
     observed_at: Instant,
 }
 
@@ -245,13 +245,13 @@ impl LoadedPolicy {
     fn from_head_observation(
         head: PolicyHead,
         snapshot: PolicySnapshot,
-        head_etag: String,
+        head_version: StorageVersion,
         observed_at: Instant,
     ) -> Self {
         Self {
             head,
             snapshot,
-            head_etag,
+            head_version,
             observed_at,
         }
     }
@@ -259,13 +259,13 @@ impl LoadedPolicy {
     pub(crate) fn from_publication(
         head: PolicyHead,
         snapshot: PolicySnapshot,
-        head_etag: String,
+        head_version: StorageVersion,
         cas_completed_at: Instant,
     ) -> Self {
         Self {
             head,
             snapshot,
-            head_etag,
+            head_version,
             observed_at: cas_completed_at,
         }
     }
@@ -282,10 +282,10 @@ impl LoadedPolicy {
         &self.snapshot
     }
 
-    /// Borrow the exact head ETag required for a later CAS publication.
+    /// Borrow the exact head identity required for a later CAS publication.
     #[must_use]
-    pub fn head_etag(&self) -> &str {
-        &self.head_etag
+    pub fn head_version(&self) -> &StorageVersion {
+        &self.head_version
     }
 
     /// Return when the authoritative head read or CAS publication completed.
@@ -380,9 +380,9 @@ impl PolicyStore {
 
     // Transitional raw load used only inside the bounded Phase 7 migration path.
     async fn load_current_unmigrated(&self) -> Result<LoadedPolicy> {
-        let (head_bytes, head_etag) = self.store.get_with_meta(POLICY_HEAD_KEY).await?;
+        let (head_bytes, head_version) = self.store.get_with_meta(POLICY_HEAD_KEY).await?;
         let observed_at = Instant::now();
-        self.load_head_bytes(head_bytes, head_etag, observed_at)
+        self.load_head_bytes(head_bytes, head_version, observed_at)
             .await
     }
 
@@ -424,12 +424,12 @@ impl PolicyStore {
 
     pub(crate) async fn refresh(
         &self,
-        head_etag: &str,
+        head_version: &StorageVersion,
         now: DateTime<Utc>,
     ) -> Result<PolicyRefresh> {
         let head = self
             .store
-            .get_if_none_match(POLICY_HEAD_KEY, head_etag)
+            .get_if_none_match(POLICY_HEAD_KEY, head_version)
             .await?;
         // This instant belongs to the authoritative head observation. Snapshot
         // loading may be delayed while a newer revoke head becomes CAS-visible.
@@ -460,7 +460,7 @@ impl PolicyStore {
             let candidate = loaded.snapshot().migrate_phase_seven_all(now)?;
             self.record_phase_seven_migration_candidate(loaded.snapshot(), &candidate)
                 .await?;
-            loaded = match self.publish(candidate, loaded.head_etag()).await? {
+            loaded = match self.publish(candidate, loaded.head_version()).await? {
                 PolicyPublication::Published(published) => *published,
                 PolicyPublication::Conflict => {
                     tokio::time::sleep(BOOTSTRAP_LEASE_RETRY_DELAY).await;
@@ -525,11 +525,11 @@ impl PolicyStore {
 
     async fn acquire_claimed_publication_from(
         &self,
-        expected_head_etag: Option<&str>,
+        expected_head_version: Option<&StorageVersion>,
     ) -> Result<Option<ClaimedPolicyPublication>> {
         let lease_claim = self.publication_lease.acquire().await?;
         match self
-            .claim_current_head(lease_claim, expected_head_etag)
+            .claim_current_head(lease_claim, expected_head_version)
             .await
         {
             Ok(session) => Ok(session),
@@ -543,7 +543,7 @@ impl PolicyStore {
     async fn claim_current_head(
         &self,
         mut lease_claim: PolicyPublicationLeaseClaim,
-        expected_head_etag: Option<&str>,
+        expected_head_version: Option<&StorageVersion>,
     ) -> std::result::Result<
         Option<ClaimedPolicyPublication>,
         (ZeppelinError, PolicyPublicationLeaseClaim),
@@ -553,7 +553,7 @@ impl PolicyStore {
                 Ok(current) => current,
                 Err(error) => return Err((error, lease_claim)),
             };
-            if expected_head_etag.is_some_and(|expected| expected != current.head_etag()) {
+            if expected_head_version.is_some_and(|expected| expected != current.head_version()) {
                 self.release_publication_best_effort(&lease_claim).await;
                 return Ok(None);
             }
@@ -583,7 +583,7 @@ impl PolicyStore {
             };
             let publication = match self
                 .store
-                .put_if_match_outcome(POLICY_HEAD_KEY, head_bytes, current.head_etag())
+                .put_if_match_outcome(POLICY_HEAD_KEY, head_bytes, current.head_version())
                 .await
             {
                 Ok(publication) => publication,
@@ -593,19 +593,19 @@ impl PolicyStore {
             match publication {
                 ConditionalPutOutcome::Conflict => continue,
                 ConditionalPutOutcome::Updated {
-                    e_tag: Some(head_etag),
+                    version: Some(head_version),
                 } => {
                     return Ok(Some(ClaimedPolicyPublication {
                         loaded: LoadedPolicy::from_publication(
                             claimed_head,
                             current.snapshot().clone(),
-                            head_etag,
+                            head_version,
                             observed_at,
                         ),
                         lease_claim,
                     }));
                 }
-                ConditionalPutOutcome::Updated { e_tag: None } => {
+                ConditionalPutOutcome::Updated { version: None } => {
                     let loaded = match self.load_current_unmigrated().await {
                         Ok(loaded) => loaded,
                         Err(error) => return Err((error, lease_claim)),
@@ -667,7 +667,7 @@ impl PolicyStore {
         let permit = PolicyActivationGuardPermit {
             guard,
             lease_claim: session.lease_claim,
-            head_etag: loaded.head_etag().to_string(),
+            head_version: loaded.head_version().clone(),
             control_revision: loaded.head().control_revision(),
         };
         Ok(Some((loaded, permit)))
@@ -693,7 +693,7 @@ impl PolicyStore {
         let permit = PolicyActivationGuardPermit {
             guard,
             lease_claim: session.lease_claim,
-            head_etag: loaded.head_etag().to_string(),
+            head_version: loaded.head_version().clone(),
             control_revision: loaded.head().control_revision(),
         };
         Ok(Some((loaded, permit)))
@@ -715,7 +715,7 @@ impl PolicyStore {
                 let permit = PolicyActivationGuardPermit {
                     guard,
                     lease_claim: session.lease_claim,
-                    head_etag: loaded.head_etag().to_string(),
+                    head_version: loaded.head_version().clone(),
                     control_revision: loaded.head().control_revision(),
                 };
                 Ok((loaded, permit))
@@ -743,21 +743,21 @@ impl PolicyStore {
             .put_if_match_outcome(
                 POLICY_HEAD_KEY,
                 encode_policy_head(&guarded_head)?,
-                session.loaded.head_etag(),
+                session.loaded.head_version(),
             )
             .await?;
         let observed_at = Instant::now();
         match publication {
             ConditionalPutOutcome::Conflict => Err(SecurityError::PolicyConflict.into()),
             ConditionalPutOutcome::Updated {
-                e_tag: Some(head_etag),
+                version: Some(head_version),
             } => Ok(LoadedPolicy::from_publication(
                 guarded_head,
                 session.loaded.snapshot().clone(),
-                head_etag,
+                head_version,
                 observed_at,
             )),
-            ConditionalPutOutcome::Updated { e_tag: None } => {
+            ConditionalPutOutcome::Updated { version: None } => {
                 let loaded = self.load_current_unmigrated().await?;
                 if loaded.head() != &guarded_head {
                     return Err(SecurityError::PolicyConflict.into());
@@ -775,7 +775,7 @@ impl PolicyStore {
     ) -> Result<LoadedPolicy> {
         permit.lease_claim = self.publication_lease.renew(&permit.lease_claim).await?;
         let loaded = self.load_current_unmigrated().await?;
-        if loaded.head_etag() != permit.head_etag
+        if *loaded.head_version() != permit.head_version
             || loaded.head().publication_fencing_token() != Some(permit.lease_claim.fencing_token())
             || loaded
                 .head()
@@ -820,7 +820,7 @@ impl PolicyStore {
                 .put_if_match_outcome(
                     POLICY_HEAD_KEY,
                     encode_policy_head(&resolved_head)?,
-                    current.head_etag(),
+                    current.head_version(),
                 )
                 .await?;
             let observed_at = Instant::now();
@@ -829,14 +829,14 @@ impl PolicyStore {
                     return Err(SecurityError::PolicyConflict.into());
                 }
                 ConditionalPutOutcome::Updated {
-                    e_tag: Some(head_etag),
+                    version: Some(head_version),
                 } => LoadedPolicy::from_publication(
                     resolved_head,
                     current.snapshot().clone(),
-                    head_etag,
+                    head_version,
                     observed_at,
                 ),
-                ConditionalPutOutcome::Updated { e_tag: None } => {
+                ConditionalPutOutcome::Updated { version: None } => {
                     let loaded = self.load_current_unmigrated().await?;
                     if loaded.head() != &resolved_head {
                         return Err(SecurityError::PolicyConflict.into());
@@ -871,12 +871,12 @@ impl PolicyStore {
     pub(crate) async fn publish(
         &self,
         candidate: PolicySnapshot,
-        expected_head_etag: &str,
+        expected_head_version: &StorageVersion,
     ) -> Result<PolicyPublication> {
         candidate.validate_for_use()?;
         self.validate_entitlements(&candidate)?;
         let mut session = match self
-            .acquire_claimed_publication_from(Some(expected_head_etag))
+            .acquire_claimed_publication_from(Some(expected_head_version))
             .await
         {
             Ok(Some(session)) => session,
@@ -933,18 +933,18 @@ impl PolicyStore {
             .put_if_match_outcome(
                 POLICY_HEAD_KEY,
                 encode_policy_head(&head)?,
-                session.loaded.head_etag(),
+                session.loaded.head_version(),
             )
             .await?;
         let observed_at = Instant::now();
         match publication {
             ConditionalPutOutcome::Conflict => Ok(PolicyPublication::Conflict),
             ConditionalPutOutcome::Updated {
-                e_tag: Some(head_etag),
+                version: Some(head_version),
             } => Ok(PolicyPublication::Published(Box::new(
-                LoadedPolicy::from_publication(head, candidate, head_etag, observed_at),
+                LoadedPolicy::from_publication(head, candidate, head_version, observed_at),
             ))),
-            ConditionalPutOutcome::Updated { e_tag: None } => {
+            ConditionalPutOutcome::Updated { version: None } => {
                 let loaded = self.load_current_unmigrated().await?;
                 if loaded.snapshot().version() != candidate.version()
                     || loaded.snapshot().checksum() != candidate.checksum()
@@ -963,14 +963,14 @@ impl PolicyStore {
     async fn load_head_bytes(
         &self,
         head_bytes: Bytes,
-        head_etag: Option<String>,
+        head_version: Option<StorageVersion>,
         observed_at: Instant,
     ) -> Result<LoadedPolicy> {
         let head: PolicyHead = serde_json::from_slice(&head_bytes).map_err(|error| {
             SecurityError::InvalidPolicy(format!("policy head JSON is invalid: {error}"))
         })?;
         head.validate(POLICY_ROOT)?;
-        let head_etag = head_etag.ok_or(SecurityError::PolicyHeadMissingEtag)?;
+        let head_version = head_version.ok_or(SecurityError::PolicyHeadMissingEtag)?;
 
         let snapshot_bytes = self.store.get(head.object_key()).await?;
         let snapshot: PolicySnapshot =
@@ -993,7 +993,7 @@ impl PolicyStore {
         Ok(LoadedPolicy::from_head_observation(
             head,
             snapshot,
-            head_etag,
+            head_version,
             observed_at,
         ))
     }
@@ -1095,14 +1095,14 @@ impl PolicyStore {
         let observed_at = Instant::now();
         match publication {
             CreateOnlyOutcome::Created {
-                e_tag: Some(head_etag),
+                version: Some(head_version),
             } => Ok(LoadedPolicy::from_publication(
                 head,
                 snapshot,
-                head_etag,
+                head_version,
                 observed_at,
             )),
-            CreateOnlyOutcome::Created { e_tag: None } | CreateOnlyOutcome::AlreadyExists => {
+            CreateOnlyOutcome::Created { version: None } | CreateOnlyOutcome::AlreadyExists => {
                 self.load_current_unmigrated().await
             }
         }

@@ -2,10 +2,17 @@ mod common;
 
 use bytes::Bytes;
 use common::harness::TestHarness;
+use futures::stream::BoxStream;
 use futures::StreamExt;
+use object_store::path::Path;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult, Result as OsResult,
+};
+use std::fmt;
 use std::time::Duration;
 use zeppelin::config::{StorageBackend, StorageConfig};
-use zeppelin::storage::ZeppelinStore;
+use zeppelin::storage::{StorageVersion, ZeppelinStore};
 use zeppelin::wal::Manifest;
 
 /// Smoke test: connect to S3, write an object, read it back, verify content, delete it.
@@ -156,36 +163,43 @@ async fn test_put_and_put_if_match_return_authoritative_etags() {
         harness.cleanup().await;
         return;
     };
-    let (_, observed_first_etag) = harness
+    let (_, observed_first_version) = harness
         .store
         .get_with_meta(&key)
         .await
         .expect("initial object should be readable with metadata");
-    assert_eq!(observed_first_etag.as_deref(), Some(first_etag.as_str()));
+    let observed_first_version =
+        observed_first_version.expect("a backend that returned a PUT ETag must return a read one");
+    assert_eq!(observed_first_version.etag(), Some(first_etag.as_str()));
 
-    let second_etag = harness
+    let second_version = harness
         .store
         .put_if_match(
             &key,
             Bytes::from_static(b"second"),
-            &first_etag,
+            &observed_first_version,
             "returned-put-etag",
         )
         .await
         .expect("matching conditional PUT should succeed");
-    let Some(second_etag) = second_etag else {
+    let Some(second_etag) = second_version.as_ref().and_then(StorageVersion::etag) else {
         eprintln!("backend omitted the conditional PUT ETag; skipping its equality assertion");
         harness.cleanup().await;
         return;
     };
-    let (body, observed_second_etag) = harness
+    let (body, observed_second_version) = harness
         .store
         .get_with_meta(&key)
         .await
         .expect("updated object should be readable with metadata");
 
     assert_eq!(body, Bytes::from_static(b"second"));
-    assert_eq!(observed_second_etag.as_deref(), Some(second_etag.as_str()));
+    assert_eq!(
+        observed_second_version
+            .as_ref()
+            .and_then(StorageVersion::etag),
+        Some(second_etag)
+    );
 
     harness.cleanup().await;
 }
@@ -572,8 +586,10 @@ async fn test_put_if_match_storage_error() {
     let store = ZeppelinStore::from_config(&config).unwrap();
     store.put("obj.bin", Bytes::from("data")).await.unwrap();
 
+    let fake_version = StorageVersion::from_parts(Some("fake-etag".to_string()), None)
+        .expect("a token with an ETag is constructible");
     let result = store
-        .put_if_match("obj.bin", Bytes::from("new"), "fake-etag", "test-ns")
+        .put_if_match("obj.bin", Bytes::from("new"), &fake_version, "test-ns")
         .await;
     match result {
         Err(zeppelin::error::ZeppelinError::Storage(_)) => {}
@@ -633,4 +649,122 @@ fn test_s3_build_error() {
         }
         Err(other) => panic!("expected Config error or Ok, got: {other}"),
     }
+}
+
+/// An object store that reports its identity only as a backend generation.
+///
+/// This is the shape GCS presents: conditional operations key on the object
+/// generation and the ETag is not the identity Zeppelin can send. No backend
+/// Zeppelin builds today behaves this way, so the version-only revalidation path
+/// in `get_if_none_match` is unreachable without modelling it here.
+#[derive(Debug)]
+struct GenerationOnlyStore {
+    inner: std::sync::Arc<dyn ObjectStore>,
+}
+
+impl fmt::Display for GenerationOnlyStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "GenerationOnlyStore({})", self.inner)
+    }
+}
+
+fn move_etag_to_generation(meta: &mut ObjectMeta) {
+    meta.version = meta.e_tag.take();
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for GenerationOnlyStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> OsResult<PutResult> {
+        let mut result = self.inner.put_opts(location, payload, options).await?;
+        result.version = result.e_tag.take();
+        Ok(result)
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        let mut result = self.inner.get_opts(location, options).await?;
+        move_etag_to_generation(&mut result.meta);
+        Ok(result)
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        let mut meta = self.inner.head(location).await?;
+        move_etag_to_generation(&mut meta);
+        Ok(meta)
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+/// Revalidation against a generation-only backend compares tokens locally.
+///
+/// `If-None-Match` is ETag-defined, so a token with no ETag cannot express the
+/// precondition. The seam degrades to a full authoritative GET and compares the
+/// tokens itself — the one place a missing field costs more work instead of
+/// raising an error, because revalidation is an optimization, not a correctness
+/// gate. Both outcomes must still be exact.
+#[tokio::test]
+async fn generation_only_revalidation_falls_back_to_a_local_comparison() {
+    let store = ZeppelinStore::new(std::sync::Arc::new(GenerationOnlyStore {
+        inner: std::sync::Arc::new(object_store::memory::InMemory::new()),
+    }));
+    let key = "ns/manifest.json";
+
+    store.put(key, Bytes::from_static(b"v1")).await.unwrap();
+    let (body, first) = store.get_with_meta(key).await.unwrap();
+    let first = first.expect("a generation-only backend still reports an identity");
+    assert_eq!(body, Bytes::from_static(b"v1"));
+    assert_eq!(first.etag(), None);
+    assert!(first.backend_version().is_some());
+
+    // Unchanged: no ETag to send, so the token comparison happens locally.
+    assert_eq!(store.get_if_none_match(key, &first).await.unwrap(), None);
+
+    // Changed: the same path must hand back the new body and the new identity.
+    store.put(key, Bytes::from_static(b"v2")).await.unwrap();
+    let (changed_body, second) = store
+        .get_if_none_match(key, &first)
+        .await
+        .unwrap()
+        .expect("a changed object must be returned, not reported unchanged");
+    let second = second.expect("the fresh read reports the current identity");
+    assert_eq!(changed_body, Bytes::from_static(b"v2"));
+    assert_ne!(second, first);
+
+    // And the CAS the whole refactor exists for: a generation alone authorizes it.
+    store
+        .put_if_match(key, Bytes::from_static(b"v3"), &second, "ns")
+        .await
+        .unwrap();
+    assert_eq!(store.get(key).await.unwrap(), Bytes::from_static(b"v3"));
 }

@@ -29,14 +29,16 @@ async fn list_metadata_preserves_version_token() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].key, key);
     assert_eq!(listed[0].size, first.len() as u64);
-    let first_etag = listed[0]
+    let first_version = listed[0]
         .version
-        .as_ref()
-        .and_then(zeppelin::storage::StorageVersion::etag)
+        .clone()
+        .expect("supported backend LIST must preserve the object version");
+    let first_etag = first_version
+        .etag()
         .expect("supported backend LIST must preserve the object ETag");
     assert!(harness
         .store
-        .get_if_none_match(&key, first_etag)
+        .get_if_none_match(&key, &first_version)
         .await
         .unwrap()
         .is_none());
@@ -85,7 +87,7 @@ async fn supported_backend_honors_exact_atomic_strong_object_semantics() {
     let old_etag = old_etag.expect("supported backend must return an object version token");
     let old_head = store.head(&key).await.unwrap();
     assert_eq!(old_head.size, old_body.len());
-    assert_eq!(old_head.e_tag.as_deref(), Some(old_etag.as_str()));
+    assert_eq!(old_head.e_tag.as_deref(), old_etag.etag());
 
     store.put(&key, new.clone()).await.unwrap();
     let (new_body, new_etag) = store.get_with_meta(&key).await.unwrap();
@@ -102,7 +104,7 @@ async fn supported_backend_honors_exact_atomic_strong_object_semantics() {
         .is_none());
     let new_head = store.head(&key).await.unwrap();
     assert_eq!(new_head.size, new.len());
-    assert_eq!(new_head.e_tag.as_deref(), Some(new_etag.as_str()));
+    assert_eq!(new_head.e_tag.as_deref(), new_etag.etag());
 
     let stale = store
         .put_if_match(&key, Bytes::from_static(b"stale"), &old_etag, &prefix)
@@ -117,7 +119,7 @@ async fn supported_backend_honors_exact_atomic_strong_object_semantics() {
         .unwrap();
     let (after_cas, after_cas_etag) = store.get_with_meta(&key).await.unwrap();
     assert_eq!(after_cas, cas_body);
-    assert_ne!(after_cas_etag.as_deref(), Some(new_etag.as_str()));
+    assert_ne!(after_cas_etag.as_ref(), Some(&new_etag));
 
     store
         .put_if_not_exists(&created, Bytes::from_static(b"created"), &prefix)
@@ -192,8 +194,8 @@ async fn supported_backend_keeps_user_metadata_atomic_with_body_and_cas() {
         Some("first")
     );
     let created_etag = created_metadata
-        .e_tag
-        .expect("supported backend must return an ETag with user metadata");
+        .version
+        .expect("supported backend must return a version token with user metadata");
 
     assert!(harness
         .store

@@ -4440,9 +4440,9 @@ impl Manifest {
         let data = committed.to_bytes()?;
         match current {
             Some((_, version)) => {
-                let etag = version.require_etag(namespace, "manifest recovery write")?;
+                let observed = version.require_version(namespace, "manifest recovery write")?;
                 store
-                    .put_if_match(&key, data.clone(), etag, namespace)
+                    .put_if_match(&key, data.clone(), observed, namespace)
                     .await?;
             }
             None => match store.put_create_outcome(&key, data.clone()).await? {
@@ -4617,9 +4617,9 @@ impl Manifest {
     ) -> Result<Option<(Self, ManifestVersion)>> {
         let key = Self::s3_key(namespace);
         match store.get_with_meta(&key).await {
-            Ok((data, etag)) => {
+            Ok((data, observed)) => {
                 let manifest = Self::from_bytes_for_namespace(&data, namespace)?;
-                let version = ManifestVersion::for_manifest(etag, &manifest, data, false);
+                let version = ManifestVersion::for_manifest(observed, &manifest, data, false);
                 Ok(Some((manifest, version)))
             }
             Err(crate::error::ZeppelinError::NotFound { .. }) => Ok(None),
@@ -4638,9 +4638,9 @@ impl Manifest {
         namespace: &str,
     ) -> Result<(Self, ManifestVersion)> {
         let key = Self::s3_key(namespace);
-        let (data, etag) = store.get_with_meta(&key).await?;
+        let (data, observed) = store.get_with_meta(&key).await?;
         let manifest = Self::from_bytes_for_namespace(&data, namespace)?;
-        let version = ManifestVersion::for_manifest(etag, &manifest, data, false);
+        let version = ManifestVersion::for_manifest(observed, &manifest, data, false);
         Ok((manifest, version))
     }
 
@@ -4663,7 +4663,7 @@ impl Manifest {
 
         for _ in 0..MAX_MIGRATION_ATTEMPTS {
             let (mut manifest, version) = Self::read_versioned_required(store, namespace).await?;
-            version.require_etag(namespace, "incarnation-bound manifest read")?;
+            version.require_version(namespace, "incarnation-bound manifest read")?;
             match manifest.namespace_incarnation() {
                 Some(actual) if actual == expected_incarnation => {
                     return Ok((manifest, version));
@@ -4806,7 +4806,7 @@ impl Manifest {
         version: &ManifestVersion,
     ) -> Result<ManifestVersion> {
         let key = Self::s3_key(namespace);
-        if version.has_e_tag() {
+        if version.has_version() {
             let predecessor_bytes = version.exact_manifest_bytes()?;
             let predecessor = Self::from_bytes_for_namespace(&predecessor_bytes, namespace)?;
             if predecessor.version != self.version {
@@ -4826,14 +4826,14 @@ impl Manifest {
         committed.namespace = Some(namespace.to_string());
         committed.finalize_receipt_root(store, namespace)?;
         let data = committed.to_bytes()?;
-        let new_etag = match &version.e_tag {
-            Some(etag) => {
+        let published = match &version.version {
+            Some(observed) => {
                 store
-                    .put_if_match(&key, data.clone(), etag, namespace)
+                    .put_if_match(&key, data.clone(), observed, namespace)
                     .await?
             }
             None => match store.put_create_outcome(&key, data.clone()).await? {
-                CreateOnlyOutcome::Created { e_tag } => e_tag,
+                CreateOnlyOutcome::Created { version } => version,
                 CreateOnlyOutcome::AlreadyExists => {
                     return Err(ZeppelinError::ManifestConflict {
                         namespace: namespace.to_string(),
@@ -4843,7 +4843,7 @@ impl Manifest {
         };
         Self::write_immutable_history_snapshot(store, namespace, committed.version(), data.clone())
             .await?;
-        let new_version = ManifestVersion::for_manifest(new_etag, &committed, data, true);
+        let new_version = ManifestVersion::for_manifest(published, &committed, data, true);
         store.forget_known_content_hashes(committed.artifact_hashes.keys());
         *self = committed;
         Ok(new_version)
@@ -4860,7 +4860,7 @@ impl Manifest {
         validate_destruction_record_key(destruction_record_key)?;
         for _ in 0..MAX_FENCE_ATTEMPTS {
             let (mut manifest, version) = Self::read_versioned_required(store, namespace).await?;
-            version.require_etag(namespace, "governed destruction fence")?;
+            version.require_version(namespace, "governed destruction fence")?;
             if !manifest.branch_roots.is_empty() {
                 return Err(BranchError::NamespaceHasLiveBranches {
                     namespace: namespace.to_string(),
@@ -4910,7 +4910,7 @@ impl Manifest {
         let mut current_lease = lease.clone();
         for _ in 0..MAX_FENCE_ATTEMPTS {
             let (mut manifest, version) = Self::read_versioned_required(store, namespace).await?;
-            version.require_etag(namespace, "governed destruction fence")?;
+            version.require_version(namespace, "governed destruction fence")?;
             if !manifest.branch_roots.is_empty() {
                 return Err(BranchError::NamespaceHasLiveBranches {
                     namespace: namespace.to_string(),
@@ -5259,9 +5259,9 @@ impl Manifest {
             ));
         }
         let (live, live_version) = Self::read_versioned_required(store, namespace).await?;
-        let observed_etag = live_version
-            .require_etag(namespace, "branch-root history retention")?
-            .to_string();
+        let observed_version = live_version
+            .require_version(namespace, "branch-root history retention")?
+            .clone();
         let rooted_generations = live.rooted_generations()?;
         let history = Self::list_history(store, namespace).await?;
         let keep_from = history.len().saturating_sub(retention.keep_count);
@@ -5303,9 +5303,9 @@ impl Manifest {
         if !prunable.is_empty() {
             let (revalidated, revalidated_version) =
                 Self::read_versioned_required(store, namespace).await?;
-            let revalidated_etag = revalidated_version
-                .require_etag(namespace, "branch-root history retention revalidation")?;
-            if revalidated_etag != observed_etag
+            let revalidated_identity = revalidated_version
+                .require_version(namespace, "branch-root history retention revalidation")?;
+            if *revalidated_identity != observed_version
                 || revalidated.namespace_incarnation != live.namespace_incarnation
                 || revalidated.branch_roots != live.branch_roots
             {
@@ -5863,9 +5863,10 @@ impl NamedSnapshot {
         object: ListedObject,
     ) -> Result<NamedSnapshotObservation> {
         let name = snapshot_name_from_key(namespace, &object.key)?;
-        let (data, get_etag) = store.get_with_meta(&object.key).await?;
-        if let Some(StorageVersion::Etag(list_etag)) = object.version.as_ref() {
-            if get_etag.as_deref() != Some(list_etag.as_str()) {
+        let (data, get_version) = store.get_with_meta(&object.key).await?;
+        if let Some(list_etag) = object.version.as_ref().and_then(StorageVersion::etag) {
+            let get_etag = get_version.as_ref().and_then(StorageVersion::etag);
+            if get_etag != Some(list_etag) {
                 return Err(ZeppelinError::Serialization(format!(
                     "snapshot pin {} changed between LIST ETag {:?} and GET ETag {:?}",
                     object.key, list_etag, get_etag
@@ -6048,8 +6049,8 @@ fn snapshot_name_from_key(namespace: &str, key: &str) -> Result<String> {
 /// [`Option`] encodes absence without a null `String`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestVersion {
-    /// Backend-provided ETag, or `None` only when no conditional version exists.
-    e_tag: Option<String>,
+    /// Backend identity, or `None` only when no conditional version exists.
+    version: Option<StorageVersion>,
     /// Whether the same authoritative read observed a governed-deletion fence.
     deletion_fenced: bool,
     /// Exact live bytes paired with this ETag for predecessor-history repair.
@@ -6060,13 +6061,13 @@ pub struct ManifestVersion {
 
 impl ManifestVersion {
     pub(crate) fn for_manifest(
-        e_tag: Option<String>,
+        version: Option<StorageVersion>,
         manifest: &Manifest,
         history_snapshot: Bytes,
         history_confirmed: bool,
     ) -> Self {
         Self {
-            e_tag,
+            version,
             deletion_fenced: manifest.deletion_fence.is_some(),
             history_snapshot: Some(history_snapshot),
             history_confirmed,
@@ -6075,7 +6076,7 @@ impl ManifestVersion {
 
     pub(crate) fn unversioned() -> Self {
         Self {
-            e_tag: None,
+            version: None,
             deletion_fenced: false,
             history_snapshot: None,
             history_confirmed: false,
@@ -6115,17 +6116,37 @@ impl ManifestVersion {
     }
 
     /// Borrow the backend ETag carried by this observation, when available.
+    ///
+    /// Narrower than [`Self::version`]: use this only to compare against a LIST
+    /// observation, which reports no other identity form. A conditional write
+    /// wants the whole token, because the backend chooses which form it needs.
     #[must_use]
     pub fn e_tag(&self) -> Option<&str> {
-        self.e_tag.as_deref()
+        self.version.as_ref().and_then(StorageVersion::etag)
     }
 
-    pub(crate) fn into_e_tag(self) -> Option<String> {
-        self.e_tag
+    /// Borrow the whole backend identity carried by this observation.
+    ///
+    /// `None` means the read observed no identity at all, which is not write
+    /// authority; pass the result through [`StorageVersion::require`] before
+    /// using it as a compare-and-swap precondition.
+    #[must_use]
+    pub fn version(&self) -> Option<&StorageVersion> {
+        self.version.as_ref()
     }
 
-    pub(crate) fn has_e_tag(&self) -> bool {
-        self.e_tag.is_some()
+    /// Consume this observation and yield the backend identity it carried.
+    pub(crate) fn into_storage_version(self) -> Option<StorageVersion> {
+        self.version
+    }
+
+    /// Returns whether this observation carries any backend identity.
+    ///
+    /// Deliberately not ETag-specific: a GCS generation is just as usable a
+    /// precondition, so a caller asking "can I CAS on this?" must not be told
+    /// no merely because the ETag form is absent.
+    pub(crate) fn has_version(&self) -> bool {
+        self.version.is_some()
     }
 
     /// Return whether the same authoritative read observed a deletion fence.
@@ -6135,15 +6156,34 @@ impl ManifestVersion {
         self.deletion_fenced
     }
 
-    /// Returns the backend version required to replace an existing manifest.
+    /// Returns the backend identity required to replace an existing manifest.
     ///
-    /// A missing or empty ETag is never converted into unconditional write
-    /// authority. Callers that derive a mutation from an existing live object
-    /// must stop before uploading history or replacing the live manifest.
+    /// A missing identity is never converted into unconditional write authority.
+    /// Callers that derive a mutation from an existing live object must stop
+    /// before uploading history or replacing the live manifest.
+    pub(crate) fn require_version(
+        &self,
+        namespace: &str,
+        operation: &str,
+    ) -> Result<&StorageVersion> {
+        self.version.as_ref().ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "{operation} for namespace {namespace} requires an object-store version token"
+            ))
+        })
+    }
+
+    /// Returns the ETag specifically, for callers that compare against a LIST.
+    ///
+    /// Distinct from [`Self::require_version`]: a conditional write accepts any
+    /// identity form the backend defines, but comparing a GET against a LIST
+    /// observation is only meaningful on the ETag, which is the one form both
+    /// responses report. Callers needing that comparison must fail rather than
+    /// silently accept a token they cannot compare.
     pub(crate) fn require_etag(&self, namespace: &str, operation: &str) -> Result<&str> {
-        self.e_tag
-            .as_deref()
-            .filter(|etag| !etag.is_empty())
+        self.version
+            .as_ref()
+            .and_then(StorageVersion::etag)
             .ok_or_else(|| {
                 ZeppelinError::Index(format!(
                     "{operation} for namespace {namespace} requires an object-store ETag"
@@ -6179,17 +6219,24 @@ mod tests {
 
     #[test]
     fn conditional_manifest_versions_reject_missing_or_empty_etags() {
+        // An empty ETag used to need its own arm here. It is now unrepresentable:
+        // `StorageVersion` has one constructor and it treats empty as absent, so
+        // the "empty token" case can only exist as `None`.
+        assert_eq!(StorageVersion::from_parts(Some(String::new()), None), None);
+        assert_eq!(StorageVersion::from_parts(None, Some(String::new())), None);
+        assert_eq!(StorageVersion::from_parts(None, None), None);
+
         for version in [
             ManifestVersion::unversioned(),
             ManifestVersion {
-                e_tag: Some(String::new()),
+                version: None,
                 deletion_fenced: false,
                 history_snapshot: None,
                 history_confirmed: false,
             },
         ] {
             let error = version
-                .require_etag("catalog", "legacy manifest incarnation migration")
+                .require_version("catalog", "legacy manifest incarnation migration")
                 .expect_err("existing-manifest migration must never fall back to a plain PUT");
             assert!(matches!(error, ZeppelinError::Index(_)));
         }
@@ -8087,7 +8134,7 @@ mod tests {
                 key: Manifest::history_key(ns, 10),
                 size: 10,
                 last_modified: now,
-                version: Some(StorageVersion::BackendVersion("v10".to_string())),
+                version: StorageVersion::from_parts(None, Some("v10".to_string())),
             },
             ListedObject {
                 key: Manifest::history_key(ns, 2),
@@ -8099,7 +8146,7 @@ mod tests {
                 key: Manifest::history_key(ns, 3),
                 size: 3,
                 last_modified: now,
-                version: Some(StorageVersion::Etag("etag-3".to_string())),
+                version: StorageVersion::from_parts(Some("etag-3".to_string()), None),
             },
         ];
 
@@ -8115,11 +8162,11 @@ mod tests {
         assert_eq!(observations[0].storage_version, None);
         assert_eq!(
             observations[1].storage_version,
-            Some(StorageVersion::Etag("etag-3".to_string()))
+            StorageVersion::from_parts(Some("etag-3".to_string()), None)
         );
         assert_eq!(
             observations[2].storage_version,
-            Some(StorageVersion::BackendVersion("v10".to_string()))
+            StorageVersion::from_parts(None, Some("v10".to_string()))
         );
     }
 
@@ -8443,13 +8490,13 @@ mod tests {
                 key: NamedSnapshot::key(namespace, "weekly").unwrap(),
                 size: 31,
                 last_modified: now,
-                version: Some(StorageVersion::BackendVersion("weekly-v1".to_string())),
+                version: StorageVersion::from_parts(None, Some("weekly-v1".to_string())),
             },
             ListedObject {
                 key: NamedSnapshot::key(namespace, "daily").unwrap(),
                 size: 29,
                 last_modified: now,
-                version: Some(StorageVersion::Etag("daily-etag".to_string())),
+                version: StorageVersion::from_parts(Some("daily-etag".to_string()), None),
             },
         ];
 
@@ -8467,7 +8514,7 @@ mod tests {
         );
         assert_eq!(
             validated[0].version,
-            Some(StorageVersion::Etag("daily-etag".to_string()))
+            StorageVersion::from_parts(Some("daily-etag".to_string()), None)
         );
         assert_eq!(validated[0].size, 29);
     }
@@ -8510,7 +8557,7 @@ mod tests {
             key: key.clone(),
             size: 31,
             last_modified: Utc::now(),
-            version: Some(StorageVersion::Etag("stale-list-etag".to_string())),
+            version: StorageVersion::from_parts(Some("stale-list-etag".to_string()), None),
         };
 
         let error = NamedSnapshot::read_listed_observation(&store, namespace, listed)

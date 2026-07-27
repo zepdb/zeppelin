@@ -48,7 +48,7 @@
 //!  _security/heads/policy.json  ---------> CachedPolicy {
 //!    version, checksum, ETag,                  policy:   CompiledPolicy
 //!    control revision                          snapshot: PolicySnapshot
-//!         | selects exactly one                head, head_etag
+//!         | selects exactly one                head, head_version
 //!         v                                    last_confirmed: Instant
 //!  _security/policies/<ulid>.json  ------> }
 //!                                              ^
@@ -172,6 +172,7 @@ use crate::error::Result;
 use crate::namespace::branching::activation::BranchActivationTarget;
 use crate::namespace::branching::ActivationNonce;
 use crate::namespace::{BranchId, NamespaceIncarnationId};
+use crate::storage::StorageVersion;
 use crate::time::Clock;
 
 const POLICY_CAS_ATTEMPTS: usize = 5;
@@ -187,7 +188,7 @@ pub(crate) struct CachedPolicy {
     pub(crate) policy: Arc<CompiledPolicy>,
     pub(crate) snapshot: Arc<PolicySnapshot>,
     head: PolicyHead,
-    head_etag: String,
+    head_version: StorageVersion,
     last_confirmed: Instant,
 }
 
@@ -210,7 +211,7 @@ impl PolicyCache {
             policy: Arc::new(loaded.snapshot().compile()?),
             snapshot: Arc::new(loaded.snapshot().clone()),
             head: loaded.head().clone(),
-            head_etag: loaded.head_etag().to_string(),
+            head_version: loaded.head_version().clone(),
             last_confirmed: loaded.observed_at(),
         });
         let cache = Arc::new(Self {
@@ -246,7 +247,7 @@ impl PolicyCache {
         let observed = self.current();
         let refresh = self
             .store
-            .refresh(&observed.head_etag, self.clock.now())
+            .refresh(&observed.head_version, self.clock.now())
             .await?;
         self.install_refresh(observed, refresh)
     }
@@ -258,12 +259,12 @@ impl PolicyCache {
                     .current
                     .write()
                     .unwrap_or_else(|_| panic!("security policy cache lock poisoned"));
-                if current.head_etag == observed.head_etag {
+                if current.head_version == observed.head_version {
                     *current = Arc::new(CachedPolicy {
                         policy: Arc::clone(&current.policy),
                         snapshot: Arc::clone(&current.snapshot),
                         head: current.head.clone(),
-                        head_etag: current.head_etag.clone(),
+                        head_version: current.head_version.clone(),
                         last_confirmed: observed_at,
                     });
                 }
@@ -670,7 +671,7 @@ impl PolicyCache {
             })?;
             match self
                 .store
-                .publish(candidate, base.head_etag())
+                .publish(candidate, base.head_version())
                 .await
                 .map_err(|error| {
                     SecurityOperationError::after_allow(error, authorization.clone())
@@ -746,7 +747,7 @@ impl PolicyCache {
                     policy: next_policy,
                     snapshot: Arc::new(loaded.snapshot().clone()),
                     head: loaded.head().clone(),
-                    head_etag: loaded.head_etag().to_string(),
+                    head_version: loaded.head_version().clone(),
                     last_confirmed: loaded.observed_at(),
                 });
             }
@@ -781,7 +782,7 @@ impl PolicyCache {
             policy: next_policy,
             snapshot: Arc::new(loaded.snapshot().clone()),
             head: loaded.head().clone(),
-            head_etag: loaded.head_etag().to_string(),
+            head_version: loaded.head_version().clone(),
             last_confirmed: loaded.observed_at(),
         });
         Ok(())
@@ -849,7 +850,7 @@ async fn refresh_loop(cache: Weak<PolicyCache>, refresh_interval: Duration) {
             };
             (cache.store.clone(), cache.clock.clone(), cache.current())
         };
-        let refresh = store.refresh(&observed.head_etag, clock.now()).await;
+        let refresh = store.refresh(&observed.head_version, clock.now()).await;
         let Some(cache) = cache.upgrade() else {
             return;
         };
@@ -873,6 +874,15 @@ mod tests {
     use crate::config::{ApiKeyConfig, SecurityConfig};
 
     use super::*;
+
+    fn test_version(etag: &str) -> StorageVersion {
+        StorageVersion::from_parts(Some(etag.to_string()), None)
+            .expect("a non-empty etag always yields a token")
+    }
+
+    fn initial_test_version() -> StorageVersion {
+        test_version("initial-etag")
+    }
 
     fn bootstrap_config() -> SecurityConfig {
         let mut config = SecurityConfig::default();
@@ -900,7 +910,7 @@ mod tests {
             policy: Arc::new(initial.compile().expect("initial policy must compile")),
             snapshot: Arc::new(initial.clone()),
             head: initial_head.clone(),
-            head_etag: "initial-etag".to_string(),
+            head_version: initial_test_version(),
             last_confirmed: Instant::now(),
         }));
         let claimed = initial_head
@@ -915,7 +925,7 @@ mod tests {
             LoadedPolicy::from_publication(
                 claimed,
                 initial,
-                "claimed-etag".to_string(),
+                test_version("claimed-etag"),
                 Instant::now(),
             ),
         )
@@ -926,7 +936,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("test policy cache lock poisoned"));
         assert_eq!(installed.policy.version().get(), 1);
         assert_eq!(installed.head.control_revision().get(), 1);
-        assert_eq!(installed.head_etag, "claimed-etag");
+        assert_eq!(installed.head_version, test_version("claimed-etag"));
     }
 
     #[test]
@@ -941,7 +951,7 @@ mod tests {
             policy: Arc::new(initial.compile().expect("initial policy must compile")),
             snapshot: Arc::new(initial.clone()),
             head: initial_head,
-            head_etag: "initial-etag".to_string(),
+            head_version: initial_test_version(),
             last_confirmed: Instant::now(),
         }));
         let candidate = initial
@@ -966,7 +976,7 @@ mod tests {
         let loaded = LoadedPolicy::from_publication(
             next_head,
             candidate,
-            "published-etag".to_string(),
+            test_version("published-etag"),
             cas_completed_at,
         );
 
@@ -996,7 +1006,7 @@ mod tests {
             policy: Arc::new(initial.compile().expect("initial policy must compile")),
             snapshot: Arc::new(initial.clone()),
             head: initial_head.clone(),
-            head_etag: "initial-etag".to_string(),
+            head_version: initial_test_version(),
             last_confirmed: Instant::now(),
         }));
         let candidate = initial
@@ -1022,7 +1032,7 @@ mod tests {
             LoadedPolicy::from_publication(
                 next_head,
                 candidate,
-                "version-2-etag".to_string(),
+                test_version("version-2-etag"),
                 Instant::now(),
             ),
         )
@@ -1033,7 +1043,7 @@ mod tests {
             LoadedPolicy::from_publication(
                 initial_head,
                 initial,
-                "regressing-etag".to_string(),
+                test_version("regressing-etag"),
                 Instant::now(),
             ),
         )

@@ -211,7 +211,7 @@ use tokio::task::JoinHandle;
 use ulid::Ulid;
 
 use crate::error::{Result, ZeppelinError};
-use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, ZeppelinStore};
+use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, StorageVersion, ZeppelinStore};
 use crate::time::Clock;
 use crate::types::Filter;
 
@@ -505,7 +505,7 @@ impl PreservationHead {
 #[derive(Debug)]
 struct CachedPreservation {
     head: PreservationHead,
-    head_etag: Option<String>,
+    head_version: Option<StorageVersion>,
     active: BTreeMap<PreservationLockId, PreservationLockRecord>,
     last_confirmed: Instant,
 }
@@ -697,19 +697,19 @@ impl PreservationService {
                     PRESERVATION_HEAD_KEY,
                     encode_json(&next_head)?,
                     current
-                        .head_etag
-                        .as_deref()
+                        .head_version
+                        .as_ref()
                         .ok_or(SecurityError::InvalidPreservationState)?,
                 )
                 .await?
             {
-                ConditionalPutOutcome::Updated { e_tag } => {
+                ConditionalPutOutcome::Updated { version } => {
                     let observed_at = Instant::now();
                     let mut active = current.active.clone();
                     active.insert(record.lock_id.clone(), record.clone());
                     self.install_committed(CachedPreservation {
                         head: next_head,
-                        head_etag: e_tag,
+                        head_version: version,
                         active,
                         last_confirmed: observed_at,
                     });
@@ -767,19 +767,19 @@ impl PreservationService {
                     PRESERVATION_HEAD_KEY,
                     encode_json(&next_head)?,
                     current
-                        .head_etag
-                        .as_deref()
+                        .head_version
+                        .as_ref()
                         .ok_or(SecurityError::InvalidPreservationState)?,
                 )
                 .await?
             {
-                ConditionalPutOutcome::Updated { e_tag } => {
+                ConditionalPutOutcome::Updated { version } => {
                     let observed_at = Instant::now();
                     let mut active = current.active.clone();
                     active.remove(lock_id);
                     self.install_committed(CachedPreservation {
                         head: next_head,
-                        head_etag: e_tag,
+                        head_version: version,
                         active,
                         last_confirmed: observed_at,
                     });
@@ -820,7 +820,13 @@ impl PreservationService {
             guard,
             PreservationHeadProof {
                 head_sha256,
-                e_tag: loaded.head_etag,
+                // The proof is persisted evidence, so it carries the ETag as a
+                // plain string. A live version token must never be serialized.
+                e_tag: loaded
+                    .head_version
+                    .as_ref()
+                    .and_then(StorageVersion::etag)
+                    .map(ToString::to_string),
             },
         ))
     }
@@ -1025,7 +1031,7 @@ async fn load_existing(store: &ZeppelinStore) -> Result<CachedPreservation> {
     let head: PreservationHead =
         serde_json::from_slice(&bytes).map_err(|_| SecurityError::InvalidPreservationState)?;
     head.validate()?;
-    let head_etag = Some(etag.ok_or(SecurityError::InvalidPreservationState)?);
+    let head_version = Some(etag.ok_or(SecurityError::InvalidPreservationState)?);
     let mut active = BTreeMap::new();
     for lock_id in &head.active_lock_ids {
         let bytes = store.get(&create_record_key(lock_id)).await?;
@@ -1040,7 +1046,7 @@ async fn load_existing(store: &ZeppelinStore) -> Result<CachedPreservation> {
     validate_committed_transition(store, &head, &active).await?;
     Ok(CachedPreservation {
         head,
-        head_etag,
+        head_version,
         active,
         last_confirmed: observed_at,
     })
@@ -1165,13 +1171,13 @@ mod tests {
                     "_security/preservation/transitions/current.json".to_string(),
                 ),
             },
-            head_etag: Some("current".to_string()),
+            head_version: StorageVersion::from_parts(Some("current".to_string()), None),
             active: BTreeMap::new(),
             last_confirmed: current_confirmed,
         });
         let regressing = CachedPreservation {
             head: PreservationHead::empty(),
-            head_etag: Some("stale".to_string()),
+            head_version: StorageVersion::from_parts(Some("stale".to_string()), None),
             active: BTreeMap::new(),
             last_confirmed: Instant::now(),
         };

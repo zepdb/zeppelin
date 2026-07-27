@@ -217,22 +217,22 @@ pub struct DeletePrefixOutcome {
 /// boundary. A collision never overwrites the existing object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateOnlyOutcome {
-    /// This caller created the object. The backend may omit its ETag.
+    /// This caller created the object. The backend may report no identity.
     Created {
         /// Backend-provided identity for the newly created object.
-        e_tag: Option<String>,
+        version: Option<StorageVersion>,
     },
     /// The destination already existed and remains unchanged.
     AlreadyExists,
 }
 
-/// Result of one domain-neutral ETag compare-and-swap PUT.
+/// Result of one domain-neutral compare-and-swap PUT.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConditionalPutOutcome {
-    /// The observed ETag matched and the replacement became authoritative.
+    /// The observed identity matched and the replacement became authoritative.
     Updated {
         /// Backend-provided identity for the replacement object.
-        e_tag: Option<String>,
+        version: Option<StorageVersion>,
     },
     /// Another writer changed the object first; no replacement occurred.
     Conflict,
@@ -240,16 +240,26 @@ pub enum ConditionalPutOutcome {
 
 /// One non-empty opaque backend identity observed for an object-store object.
 ///
-/// ETag takes precedence when a backend supplies both forms because S3 exposes
-/// it consistently on LIST and GET. Absence is represented by `None` on the
-/// containing [`ListedObject`], so two unversioned observations cannot compare
-/// equal as if they authorized cache reuse.
+/// Both forms are carried when a backend supplies both, because different
+/// substrates key their conditional operations on different ones: S3 and Azure
+/// require the ETag, while GCS requires the object generation and ignores ETags
+/// for conditional puts entirely. Keeping only the preferred form would make a
+/// GCS compare-and-swap inexpressible.
+///
+/// Absence is represented by `None` on the containing [`ListedObject`] or
+/// return value, never by an all-empty token: [`StorageVersion::from_parts`] is
+/// the only constructor and yields `None` when the backend supplied neither
+/// form. Two unversioned observations therefore cannot compare equal as if they
+/// authorized cache reuse.
+///
+/// This is a process-local concurrency token. It is never serialized into an
+/// artifact and never compared across substrates.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum StorageVersion {
-    /// Entity tag supplied by the backend.
-    Etag(String),
-    /// Backend-specific version used only when no ETag is available.
-    BackendVersion(String),
+pub struct StorageVersion {
+    /// Entity tag supplied by the backend, when it supplied one.
+    e_tag: Option<String>,
+    /// Backend-specific version identifier (GCS generation, Azure version ID).
+    backend_version: Option<String>,
 }
 
 /// User-defined object metadata carried through the storage boundary.
@@ -305,30 +315,80 @@ impl ObjectUserMetadata {
 /// Body-adjacent metadata returned by one authoritative object GET.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectReadMetadata {
-    /// ETag identifying the exact body returned by the same request.
-    pub e_tag: Option<String>,
+    /// Backend identity of the exact body returned by the same request.
+    pub version: Option<StorageVersion>,
     /// User-defined metadata headers attached to that object version.
     pub user_metadata: ObjectUserMetadata,
 }
 
 impl StorageVersion {
-    /// Returns the ETag when this identity came from an ETag observation.
+    /// Returns the ETag when the backend supplied one.
+    ///
+    /// Callers that need byte-identity against a LIST observation use this and
+    /// treat its absence as "cannot validate", because only the ETag is
+    /// comparable across a LIST and a GET on the backends Zeppelin supports.
     #[must_use]
     pub fn etag(&self) -> Option<&str> {
-        match self {
-            Self::Etag(etag) => Some(etag),
-            Self::BackendVersion(_) => None,
-        }
+        self.e_tag.as_deref()
     }
 
-    fn from_parts(etag: Option<String>, backend_version: Option<String>) -> Option<Self> {
-        etag.filter(|value| !value.is_empty())
-            .map(Self::Etag)
-            .or_else(|| {
-                backend_version
-                    .filter(|value| !value.is_empty())
-                    .map(Self::BackendVersion)
-            })
+    /// Returns the substrate-native version identifier, when the backend has one.
+    ///
+    /// GCS reports an object generation here and requires it for conditional
+    /// puts; S3 and MinIO leave it absent.
+    #[must_use]
+    pub fn backend_version(&self) -> Option<&str> {
+        self.backend_version.as_deref()
+    }
+
+    /// Borrows an observed token, or raises the loud error when there is none.
+    ///
+    /// Every conditional write is preceded by a read that either produced an
+    /// identity or did not. This is the single place that turns "did not" into
+    /// [`ZeppelinError::MissingVersionToken`], so no caller can quietly
+    /// substitute an empty precondition and convert its compare-and-swap into an
+    /// unconditional overwrite.
+    ///
+    /// # Errors
+    ///
+    /// [`ZeppelinError::MissingVersionToken`] when `version` is `None`.
+    pub fn require<'a>(version: Option<&'a Self>, key: &str) -> Result<&'a Self> {
+        version.ok_or_else(|| ZeppelinError::MissingVersionToken {
+            key: key.to_string(),
+        })
+    }
+
+    /// Builds a token from one backend observation, or `None` when it carries none.
+    ///
+    /// This is the only constructor, so the non-empty invariant holds
+    /// everywhere. Empty strings count as absent. Returning `Option` rather than
+    /// an all-empty token is what keeps an unversioned observation from
+    /// comparing equal to another unversioned observation.
+    #[must_use]
+    pub fn from_parts(etag: Option<String>, backend_version: Option<String>) -> Option<Self> {
+        let e_tag = etag.filter(|value| !value.is_empty());
+        let backend_version = backend_version.filter(|value| !value.is_empty());
+        if e_tag.is_none() && backend_version.is_none() {
+            return None;
+        }
+        Some(Self {
+            e_tag,
+            backend_version,
+        })
+    }
+
+    /// Lowers this token into the object-store precondition for a conditional put.
+    ///
+    /// Both fields pass through unchanged and the backend selects the one its
+    /// protocol defines: S3 and Azure read `e_tag`, GCS reads `version`. A
+    /// backend whose required field is absent fails loudly inside object_store
+    /// (`MissingVersion` / `MissingETag`) rather than degrading to an
+    /// unconditional write.
+    fn to_update_version(&self) -> UpdateVersion {
+        UpdateVersion {
+            e_tag: self.e_tag.clone(),
+            version: self.backend_version.clone(),
+        }
     }
 }
 
@@ -942,7 +1002,7 @@ impl ZeppelinStore {
             .await
         {
             Ok(result) => CreateOnlyOutcome::Created {
-                e_tag: result.e_tag,
+                version: StorageVersion::from_parts(result.e_tag, result.version),
             },
             Err(object_store::Error::AlreadyExists { .. }) => CreateOnlyOutcome::AlreadyExists,
             Err(error) => {
@@ -1250,9 +1310,9 @@ impl ZeppelinStore {
     /// put_if_match(..., "v12") -> succeeds only if v12 is still current
     /// ```
     #[instrument(skip(self), fields(key = key))]
-    pub async fn get_with_meta(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+    pub async fn get_with_meta(&self, key: &str) -> Result<(Bytes, Option<StorageVersion>)> {
         let (bytes, metadata) = self.get_with_object_metadata(key).await?;
-        Ok((bytes, metadata.e_tag))
+        Ok((bytes, metadata.version))
     }
 
     /// Downloads an object with its ETag and user-defined metadata headers.
@@ -1275,14 +1335,15 @@ impl ZeppelinStore {
                 other => ZeppelinError::Storage(other),
             }
         })?;
-        let etag = result.meta.e_tag.clone();
+        let version =
+            StorageVersion::from_parts(result.meta.e_tag.clone(), result.meta.version.clone());
         let user_metadata = ObjectUserMetadata::from_attributes(&result.attributes);
         let bytes = result.bytes().await?;
         let elapsed = start.elapsed();
         debug!(
             elapsed_ms = elapsed.as_millis(),
             size = bytes.len(),
-            etag = ?etag,
+            version = ?version,
             "s3 get_with_meta"
         );
         crate::metrics::S3_OPERATION_DURATION
@@ -1291,7 +1352,7 @@ impl ZeppelinStore {
         Ok((
             bytes,
             ObjectReadMetadata {
-                e_tag: etag,
+                version,
                 user_metadata,
             },
         ))
@@ -1344,19 +1405,39 @@ impl ZeppelinStore {
     /// ETag; if S3 is unavailable, it returns an error rather than declaring the
     /// cached `v12` authoritative.
     ///
+    /// # Substrates without an ETag
+    ///
+    /// `If-None-Match` is ETag-defined on every substrate Zeppelin targets, so a
+    /// token carrying only a backend version cannot express this request. Rather
+    /// than fail, this method falls back to an unconditional
+    /// [`Self::get_with_object_metadata`] and compares the returned token
+    /// locally, returning `None` when it is unchanged. That is a full body
+    /// transfer where a conditional GET would have transferred nothing: correct,
+    /// more expensive, and visible in the GET duration metric.
+    ///
+    /// This is the **only** place in the storage seam where an absent token
+    /// field degrades to a more expensive correct operation instead of raising
+    /// an error, and it is deliberate: revalidation is a bandwidth optimization,
+    /// not a correctness gate. Every conditional *write* raises instead, because
+    /// there the missing token would cost correctness.
+    ///
     /// # Rust Notes for Java/C Engineers
     ///
-    /// The nested `Option<(Bytes, Option<String>)>` separates two independent
-    /// facts: whether a body was transferred and whether that response included
-    /// an ETag. Unlike `null`, Rust forces callers to handle each absence. The
-    /// `match` also groups two concrete backend errors into the same deliberate
-    /// unchanged outcome while preserving every other error.
-    #[instrument(skip(self), fields(key = key, etag = %etag))]
+    /// The nested `Option<(Bytes, Option<StorageVersion>)>` separates two
+    /// independent facts: whether a body was transferred and whether that
+    /// response carried a backend identity. Unlike `null`, Rust forces callers
+    /// to handle each absence. The `match` also groups two concrete backend
+    /// errors into the same deliberate unchanged outcome while preserving every
+    /// other error.
+    #[instrument(skip(self), fields(key = key))]
     pub async fn get_if_none_match(
         &self,
         key: &str,
-        etag: &str,
-    ) -> Result<Option<(Bytes, Option<String>)>> {
+        version: &StorageVersion,
+    ) -> Result<Option<(Bytes, Option<StorageVersion>)>> {
+        let Some(etag) = version.etag() else {
+            return self.revalidate_without_etag(key, version).await;
+        };
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let options = GetOptions {
@@ -1393,46 +1474,73 @@ impl ZeppelinStore {
             }
         };
 
-        let next_etag = result.meta.e_tag.clone();
+        let next_version =
+            StorageVersion::from_parts(result.meta.e_tag.clone(), result.meta.version.clone());
         let bytes = result.bytes().await?;
         let elapsed = start.elapsed();
         debug!(
             elapsed_ms = elapsed.as_millis(),
             size = bytes.len(),
-            etag = ?next_etag,
+            version = ?next_version,
             "s3 get_if_none_match modified"
         );
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["get"])
             .observe(elapsed.as_secs_f64());
-        Ok(Some((bytes, next_etag)))
+        Ok(Some((bytes, next_version)))
     }
 
-    /// Replaces an object only when its current ETag matches the observed version.
+    /// Revalidates by full GET when the observed token has no ETag to send.
+    ///
+    /// Used only by [`Self::get_if_none_match`]; see its documentation for why
+    /// this path exists and why it is the sole degradation in the seam.
+    async fn revalidate_without_etag(
+        &self,
+        key: &str,
+        version: &StorageVersion,
+    ) -> Result<Option<(Bytes, Option<StorageVersion>)>> {
+        let (bytes, metadata) = self.get_with_object_metadata(key).await?;
+        if metadata.version.as_ref() == Some(version) {
+            debug!(key = key, "storage revalidate unchanged without etag");
+            return Ok(None);
+        }
+        Ok(Some((bytes, metadata.version)))
+    }
+
+    /// Replaces an object only when its backend identity still matches.
     ///
     /// This is the storage half of compare-and-swap publication. Manifest and
-    /// lease code first reads an object and ETag, derives a replacement, and then
-    /// calls this method. A competing update changes the ETag and turns this
-    /// request into an explicit conflict instead of a lost update.
+    /// lease code first reads an object and its version token, derives a
+    /// replacement, and then calls this method. A competing update changes the
+    /// token and turns this request into an explicit conflict instead of a lost
+    /// update.
+    ///
+    /// The token carries every identity form the backend reported and the
+    /// backend selects the one its protocol requires — ETag on S3, MinIO and
+    /// Azure, object generation on GCS. Taking `&StorageVersion` rather than a
+    /// string makes the empty-token case unrepresentable: a caller that observed
+    /// no identity holds `None` and cannot reach this method at all.
     ///
     /// # Parameters
     ///
     /// - `key`: Object key to replace conditionally.
     /// - `data`: Complete owned replacement payload.
-    /// - `etag`: Version on which the caller based the replacement.
+    /// - `version`: Identity on which the caller based the replacement.
     /// - `namespace`: Domain namespace reported if the precondition loses a race.
     ///
     /// # Returns
     ///
-    /// The new backend-provided ETag after the conditional replacement
-    /// succeeds. A backend may legally omit it, represented as `None`.
+    /// The new backend identity after the conditional replacement succeeds. A
+    /// backend may legally report none, represented as `None`.
     ///
     /// # Errors
     ///
-    /// An ETag precondition failure becomes
-    /// [`ZeppelinError::ManifestConflict`], telling the caller to reload and
-    /// rebase. Invalid keys and other backend failures remain storage errors.
-    /// The old authoritative object remains current after a conflict.
+    /// A precondition failure becomes [`ZeppelinError::ManifestConflict`],
+    /// telling the caller to reload and rebase. A backend that requires an
+    /// identity form this token does not carry fails inside object_store and
+    /// surfaces as a storage error rather than an unconditional write. Invalid
+    /// keys and other backend failures remain storage errors. The old
+    /// authoritative object remains current after a conflict.
     ///
     /// # Side Effects
     ///
@@ -1448,7 +1556,8 @@ impl ZeppelinStore {
     /// # Performance
     ///
     /// Uploads one complete replacement object. The method performs no preceding
-    /// read because the caller already supplies the observed ETag.
+    /// read because the caller already supplies the observed identity, and no
+    /// following read because it returns the new identity from the PUT result.
     ///
     /// # Examples
     ///
@@ -1472,29 +1581,32 @@ impl ZeppelinStore {
         &self,
         key: &str,
         data: Bytes,
-        etag: &str,
+        version: &StorageVersion,
         namespace: &str,
-    ) -> Result<Option<String>> {
-        self.put_if_match_with_user_metadata(key, data, etag, namespace, &ObjectUserMetadata::new())
-            .await
+    ) -> Result<Option<StorageVersion>> {
+        self.put_if_match_with_user_metadata(
+            key,
+            data,
+            version,
+            namespace,
+            &ObjectUserMetadata::new(),
+        )
+        .await
     }
 
-    /// Replace an object only when its current ETag matches, without attaching
-    /// namespace-manifest semantics to a precondition loss.
+    /// Replace an object only when its current identity matches, without
+    /// attaching namespace-manifest semantics to a precondition loss.
     #[instrument(skip(self, data), fields(key = key))]
     pub async fn put_if_match_outcome(
         &self,
         key: &str,
         data: Bytes,
-        etag: &str,
+        version: &StorageVersion,
     ) -> Result<ConditionalPutOutcome> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let options = PutOptions {
-            mode: PutMode::Update(UpdateVersion {
-                e_tag: Some(etag.to_string()),
-                version: None,
-            }),
+            mode: PutMode::Update(version.to_update_version()),
             ..PutOptions::default()
         };
         let outcome = match self
@@ -1503,7 +1615,7 @@ impl ZeppelinStore {
             .await
         {
             Ok(result) => ConditionalPutOutcome::Updated {
-                e_tag: result.e_tag,
+                version: StorageVersion::from_parts(result.e_tag, result.version),
             },
             Err(object_store::Error::Precondition { .. }) => ConditionalPutOutcome::Conflict,
             Err(error) => {
@@ -1530,17 +1642,14 @@ impl ZeppelinStore {
         &self,
         key: &str,
         data: Bytes,
-        etag: &str,
+        version: &StorageVersion,
         namespace: &str,
         user_metadata: &ObjectUserMetadata,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<StorageVersion>> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let options = PutOptions {
-            mode: PutMode::Update(UpdateVersion {
-                e_tag: Some(etag.to_string()),
-                version: None,
-            }),
+            mode: PutMode::Update(version.to_update_version()),
             attributes: user_metadata.to_attributes(),
             ..PutOptions::default()
         };
@@ -1564,7 +1673,7 @@ impl ZeppelinStore {
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
-        Ok(result.e_tag)
+        Ok(StorageVersion::from_parts(result.e_tag, result.version))
     }
 
     /// Creates an object only when its key does not already exist.
@@ -2645,6 +2754,94 @@ mod tests {
             store.get(key).await.unwrap(),
             Bytes::from_static(b"first\n")
         );
+    }
+
+    /// An observation carrying no usable identity is `None`, never an empty token.
+    ///
+    /// This is the invariant the whole seam rests on: because `from_parts` is the
+    /// only constructor and refuses to build an all-empty value, `&StorageVersion`
+    /// is proof that a real identity was observed, and two unversioned
+    /// observations cannot compare equal as if they authorized reuse.
+    #[test]
+    fn storage_version_is_absent_rather_than_empty() {
+        assert_eq!(StorageVersion::from_parts(None, None), None);
+        assert_eq!(
+            StorageVersion::from_parts(Some(String::new()), Some(String::new())),
+            None
+        );
+
+        let etag_only = StorageVersion::from_parts(Some("\"abc\"".to_string()), None)
+            .expect("an ETag alone is a usable identity");
+        assert_eq!(etag_only.etag(), Some("\"abc\""));
+        assert_eq!(etag_only.backend_version(), None);
+
+        let generation_only =
+            StorageVersion::from_parts(Some(String::new()), Some("17".to_string()))
+                .expect("a generation alone is a usable identity");
+        assert_eq!(generation_only.etag(), None);
+        assert_eq!(generation_only.backend_version(), Some("17"));
+
+        assert_ne!(etag_only, generation_only);
+    }
+
+    /// Both identity forms reach the backend precondition unchanged.
+    ///
+    /// S3 and Azure read `e_tag` while GCS reads `version`; dropping either here
+    /// is what would make a GCS compare-and-swap inexpressible.
+    #[test]
+    fn both_identity_forms_travel_into_the_backend_precondition() {
+        let version =
+            StorageVersion::from_parts(Some("\"abc\"".to_string()), Some("17".to_string()))
+                .expect("both forms present");
+        let update = version.to_update_version();
+
+        assert_eq!(update.e_tag.as_deref(), Some("\"abc\""));
+        assert_eq!(update.version.as_deref(), Some("17"));
+    }
+
+    /// A conditional write with nothing observed fails loudly instead of degrading.
+    #[test]
+    fn require_turns_an_unversioned_observation_into_a_loud_error() {
+        let observed = StorageVersion::from_parts(Some("\"abc\"".to_string()), None);
+        assert!(StorageVersion::require(observed.as_ref(), "ns/manifest.json").is_ok());
+
+        let error = StorageVersion::require(None, "ns/manifest.json")
+            .expect_err("an absent identity must not authorize a conditional write");
+        assert!(matches!(
+            error,
+            ZeppelinError::MissingVersionToken { ref key } if key == "ns/manifest.json"
+        ));
+    }
+
+    /// The identity a conditional PUT reports is directly usable as the next
+    /// precondition, which is what lets lease acquire and renew skip a re-read.
+    #[tokio::test]
+    async fn a_returned_put_token_is_accepted_by_the_next_conditional_put() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let key = "ns/manifest.json";
+
+        let created = store
+            .put_with_version(key, Bytes::from_static(b"v1"))
+            .await
+            .unwrap()
+            .expect("the in-memory backend reports an identity");
+        let after_first = store
+            .put_if_match(key, Bytes::from_static(b"v2"), &created, "ns")
+            .await
+            .unwrap()
+            .expect("a successful conditional PUT reports the identity it installed");
+
+        // The superseded identity must now lose, and only the reported one wins.
+        let stale = store
+            .put_if_match(key, Bytes::from_static(b"v3"), &created, "ns")
+            .await;
+        assert!(matches!(stale, Err(ZeppelinError::ManifestConflict { .. })));
+
+        store
+            .put_if_match(key, Bytes::from_static(b"v3"), &after_first, "ns")
+            .await
+            .unwrap();
+        assert_eq!(store.get(key).await.unwrap(), Bytes::from_static(b"v3"));
     }
 
     #[test]

@@ -257,10 +257,10 @@ async fn test_legacy_namespace_incarnation_migrates_once_without_changing_body()
 
     // Re-publish the exact body with an unrelated header but without the
     // incarnation to model a legacy namespace. Migration must preserve both.
-    let original_etag = original_object_metadata
-        .e_tag
-        .as_deref()
-        .expect("authoritative metadata fixture must have an ETag");
+    let original_version = original_object_metadata
+        .version
+        .as_ref()
+        .expect("authoritative metadata fixture must have a version token");
     let mut legacy_user_metadata = ObjectUserMetadata::new();
     legacy_user_metadata.insert("legacy-fixture-marker", "preserve-me");
     harness
@@ -268,7 +268,7 @@ async fn test_legacy_namespace_incarnation_migrates_once_without_changing_body()
         .put_if_match_with_user_metadata(
             &key,
             original_body.clone(),
-            original_etag,
+            original_version,
             &name,
             &legacy_user_metadata,
         )

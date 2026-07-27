@@ -761,7 +761,7 @@ impl ManifestCache {
                 .await;
         }
 
-        let Some(etag) = cached_version.into_e_tag() else {
+        let Some(cached_identity) = cached_version.into_storage_version() else {
             return self
                 .fetch_and_cache(
                     store,
@@ -778,7 +778,7 @@ impl ManifestCache {
         let key = Manifest::s3_key(namespace);
         #[cfg(test)]
         self.wait_before_remote_read().await;
-        let conditional = match store.get_if_none_match(&key, &etag).await {
+        let conditional = match store.get_if_none_match(&key, &cached_identity).await {
             Ok(conditional) => conditional,
             Err(crate::error::ZeppelinError::NotFound { .. }) if !required => {
                 let (_, retry_epoch) = self.cached_manifest_with_epoch(namespace);
@@ -793,9 +793,9 @@ impl ManifestCache {
             Err(error) => return Err(error),
         };
         match conditional {
-            Some((data, next_etag)) => {
+            Some((data, next_identity)) => {
                 let manifest = Manifest::from_bytes_for_namespace(&data, namespace)?;
-                let version = ManifestVersion::for_manifest(next_etag, &manifest, data, false);
+                let version = ManifestVersion::for_manifest(next_identity, &manifest, data, false);
                 #[cfg(test)]
                 self.wait_before_remote_replacement().await;
                 let now = Instant::now();

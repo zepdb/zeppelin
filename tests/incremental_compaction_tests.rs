@@ -102,14 +102,14 @@ async fn cluster_object_versions(
     store: &ZeppelinStore,
     ns: &str,
     seg_id: &str,
-) -> std::collections::HashMap<String, String> {
+) -> std::collections::HashMap<String, zeppelin::storage::StorageVersion> {
     let prefix = format!("{ns}/segments/{seg_id}/");
     let keys = store.list_prefix(&prefix).await.unwrap();
     let mut out = std::collections::HashMap::new();
     for key in keys {
-        let (_data, etag) = store.get_with_meta(&key).await.unwrap();
-        if let Some(etag) = etag {
-            out.insert(key, etag);
+        let (_data, version) = store.get_with_meta(&key).await.unwrap();
+        if let Some(version) = version {
+            out.insert(key, version);
         }
     }
     out
@@ -1112,10 +1112,10 @@ async fn test_incremental_rewrites_only_touched_cluster() {
         let owner = seg_ref.cluster_owner(i);
         assert_eq!(owner, seed_id, "cluster {i} must be carried from the seed");
         let cvec_key = cluster_data_key(&ns, seg_ref, i);
-        let (_d, etag) = store.get_with_meta(&cvec_key).await.unwrap();
+        let (_d, version) = store.get_with_meta(&cvec_key).await.unwrap();
         assert_eq!(
-            etag.as_deref(),
-            before.get(&cvec_key).map(|s| s.as_str()),
+            version.as_ref(),
+            before.get(&cvec_key),
             "B2: carried cluster {i} must keep its exact object (same ETag)"
         );
     }
@@ -1875,14 +1875,14 @@ async fn test_incremental_multicycle_bounded_reads_and_carried_object_fences() {
                 "cycle {cycle_no}: live carried object {key} must not be pending deletion"
             );
         }
-        for (key, old_etag) in old_object_etags {
+        for (key, old_version) in old_object_etags {
             if !live_cluster_object_keys.contains(&key) {
                 continue;
             }
-            let (_bytes, new_etag) = harness.store.get_with_meta(&key).await.unwrap();
+            let (_bytes, new_version) = harness.store.get_with_meta(&key).await.unwrap();
             assert_eq!(
-                new_etag.as_deref(),
-                Some(old_etag.as_str()),
+                new_version.as_ref(),
+                Some(&old_version),
                 "cycle {cycle_no}: carried object {key} must keep a stable ETag"
             );
         }
@@ -2395,10 +2395,10 @@ async fn test_incremental_delete_forces_cluster_rewrite() {
             continue;
         }
         let cvec_key = cluster_data_key(&ns, seg_ref, i);
-        let (_d, etag) = store.get_with_meta(&cvec_key).await.unwrap();
+        let (_d, version) = store.get_with_meta(&cvec_key).await.unwrap();
         assert_eq!(
-            etag.as_deref(),
-            before.get(&cvec_key).map(|s| s.as_str()),
+            version.as_ref(),
+            before.get(&cvec_key),
             "carried cluster {i} unchanged by an unrelated delete"
         );
     }

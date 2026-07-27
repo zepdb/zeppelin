@@ -19,6 +19,12 @@ use common::harness::TestHarness;
 use common::server::test_security_runtime;
 use common::vectors::random_vectors;
 
+use futures::stream::BoxStream;
+use object_store::path::Path;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult, Result as OsResult,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1060,6 +1066,191 @@ async fn test_tla_graceful_release_after_lease_expiry() {
          No deadlock, no stuck lease. Token {} > {}",
         fresh_lease.fencing_token,
         c_lease.fencing_token
+    );
+
+    harness.cleanup().await;
+}
+
+/// Acquisition takes its next CAS precondition from its own write.
+///
+/// Both acquire paths used to confirm their PUT with a re-read — an object-store
+/// roundtrip that told them nothing the PUT result had not already reported.
+/// This pins the removal: creation and takeover may each read the lease object
+/// exactly once, the opening probe that decides which path to run, and a
+/// fast-path renewal reads it not at all because it CASes on the identity the
+/// previous write handed back.
+#[tokio::test]
+async fn test_lease_acquire_and_renew_issue_no_confirming_read() {
+    let harness = TestHarness::new().await;
+    let ns = harness.artifact_origin_namespace("lease-no-confirming-read");
+
+    common::seed_bound_manifest(&harness.store, &ns).await;
+
+    let (counted, counter) = common::counting::counting_store(&harness.store);
+    let lease_key = format!("{ns}/lease.json");
+
+    let creator = LeaseManager::new(
+        counted.clone(),
+        "node-1".to_string(),
+        Duration::from_secs(1),
+    );
+    counter.reset();
+
+    let lease = creator.acquire(&ns).await.unwrap();
+    assert_eq!(
+        counter.gets_matching(&lease_key),
+        1,
+        "creation may read the lease object only to discover it is absent"
+    );
+
+    let renewed = creator.renew(&ns, &lease).await.unwrap();
+    assert_eq!(
+        counter.gets_matching(&lease_key),
+        1,
+        "a fast-path renewal CASes on the identity it already holds"
+    );
+
+    // Let the short lease expire so the next acquire runs the takeover path.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let taker = LeaseManager::new(
+        counted.clone(),
+        "node-2".to_string(),
+        Duration::from_secs(30),
+    );
+    let taken = taker.acquire(&ns).await.unwrap();
+    assert!(
+        taken.fencing_token > renewed.fencing_token,
+        "takeover token ({}) must exceed the expired one ({})",
+        taken.fencing_token,
+        renewed.fencing_token
+    );
+    assert_eq!(
+        counter.gets_matching(&lease_key),
+        2,
+        "takeover reads the expired lease once and does not re-read its own write"
+    );
+
+    harness.cleanup().await;
+}
+
+/// An object store whose reads report no backend identity at all.
+///
+/// Real S3, MinIO, and the in-memory backend always return an ETag, so the
+/// unversioned-observation branch is unreachable without modelling it. It is
+/// still the branch that matters most: before the version token existed, an
+/// absent ETag became an empty string and turned the takeover compare-and-swap
+/// into an unconditional overwrite of whoever currently held the lease.
+#[derive(Debug)]
+struct IdentitylessReadStore {
+    inner: Arc<dyn ObjectStore>,
+}
+
+impl std::fmt::Display for IdentitylessReadStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "IdentitylessReadStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for IdentitylessReadStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> OsResult<PutResult> {
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        let mut result = self.inner.get_opts(location, options).await?;
+        result.meta.e_tag = None;
+        result.meta.version = None;
+        Ok(result)
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        let mut meta = self.inner.head(location).await?;
+        meta.e_tag = None;
+        meta.version = None;
+        Ok(meta)
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+/// A takeover with nothing to compare against fails loudly, it does not overwrite.
+///
+/// This is guardrail one of the version-token work: no unconditional write may
+/// ever result from a missing token. The taker observes an expired lease whose
+/// backend reported no identity, so it has no precondition to present and must
+/// raise `MissingVersionToken` rather than replace the object outright.
+#[tokio::test]
+async fn test_lease_takeover_without_an_identity_fails_loudly() {
+    let harness = TestHarness::new().await;
+    let ns = harness.artifact_origin_namespace("lease-missing-identity");
+
+    common::seed_bound_manifest(&harness.store, &ns).await;
+
+    let identityless = zeppelin::storage::ZeppelinStore::new(Arc::new(IdentitylessReadStore {
+        inner: harness.store.inner(),
+    }));
+    let key = format!("{ns}/lease.json");
+
+    let creator = LeaseManager::new(
+        identityless.clone(),
+        "node-1".to_string(),
+        Duration::from_secs(1),
+    );
+    let held = creator.acquire(&ns).await.unwrap();
+    let published = identityless.get(&key).await.unwrap();
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let taker = LeaseManager::new(
+        identityless.clone(),
+        "node-2".to_string(),
+        Duration::from_secs(30),
+    );
+    let error = taker
+        .acquire(&ns)
+        .await
+        .expect_err("takeover with no observed identity must not proceed");
+
+    assert!(
+        matches!(error, ZeppelinError::MissingVersionToken { key: ref failed } if failed == &key),
+        "expected MissingVersionToken for {key}, got: {error:?}"
+    );
+    assert_eq!(
+        identityless.get(&key).await.unwrap(),
+        published,
+        "the refused takeover must leave node-{}'s lease object byte-identical",
+        held.fencing_token
     );
 
     harness.cleanup().await;
