@@ -244,6 +244,17 @@ pub struct MembershipRef {
     pub entry_count: u64,
 }
 
+/// Encoding stored in each cluster section's independently ranged coarse region.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CoarsePayloadEncoding {
+    /// Scalar-quantized codes stored by `ZCL2` sections.
+    #[default]
+    Sq8,
+    /// Two-bit RaBitQ codes stored by `ZCL3` sections.
+    TwoBit,
+}
+
 /// Manifest metadata for one immutable object containing one or more IVF
 /// cluster payloads.
 ///
@@ -890,6 +901,12 @@ pub struct Manifest {
     /// V4-bound even after all inherited artifacts have been materialized.
     #[serde(default)]
     branch_lineage: Option<BranchLineage>,
+    /// Coarse-region encoding keyed by segment ID.
+    ///
+    /// Missing entries identify SQ8, including manifests written before this
+    /// field existed. New persisted fields must remain after this position.
+    #[serde(default)]
+    coarse_payload_encodings: BTreeMap<String, CoarsePayloadEncoding>,
 }
 
 /// Stable manifest execution projection version used by signed receipts.
@@ -1376,6 +1393,30 @@ impl Manifest {
             control_state_digest: None,
             branch_roots: BTreeMap::new(),
             branch_lineage: None,
+            coarse_payload_encodings: BTreeMap::new(),
+        }
+    }
+
+    /// Returns the manifest-selected coarse decoder for one segment.
+    #[must_use]
+    pub fn coarse_payload_encoding(&self, segment_id: &str) -> CoarsePayloadEncoding {
+        self.coarse_payload_encodings
+            .get(segment_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Records the coarse decoder for one immutable segment.
+    pub fn set_coarse_payload_encoding(
+        &mut self,
+        segment_id: impl Into<String>,
+        encoding: CoarsePayloadEncoding,
+    ) {
+        let segment_id = segment_id.into();
+        if encoding == CoarsePayloadEncoding::Sq8 {
+            self.coarse_payload_encodings.remove(&segment_id);
+        } else {
+            self.coarse_payload_encodings.insert(segment_id, encoding);
         }
     }
 
@@ -3767,6 +3808,7 @@ impl Manifest {
             self.active_segment = None;
         }
         self.segments.retain(|segment| segment.id != segment_id);
+        self.coarse_payload_encodings.remove(segment_id);
         self.prune_hierarchical_routing_nodes();
         self.updated_at = now;
     }
@@ -3822,6 +3864,13 @@ impl Manifest {
             }
             self.segments = pruned;
         }
+        let retained = self
+            .segments
+            .iter()
+            .map(|segment| segment.id.as_str())
+            .collect::<HashSet<_>>();
+        self.coarse_payload_encodings
+            .retain(|segment_id, _| retained.contains(segment_id.as_str()));
         self.prune_hierarchical_routing_nodes();
     }
 

@@ -106,8 +106,9 @@
 //!   centroids blob for embedded calibration; when absent they read the legacy
 //!   `sq_calibration.bin` key.
 //! - Old `cluster_i.bin`: `[num_vectors:u32][dim:u32] ... full-precision rows`.
-//! - New scalar cluster sections: `[b"ZCL2"][sq_offset:u64][sq_len:u64]
-//!   [full_offset:u64][full_len:u64][sq_cluster bytes][full cluster bytes]`.
+//! - Quantized cluster sections: `[magic][coarse_offset:u64][coarse_len:u64]
+//!   [full_offset:u64][full_len:u64][coarse bytes][full cluster bytes]`.
+//!   `ZCL2` stores SQ8 coarse bytes and `ZCL3` stores two-bit RaBitQ bytes.
 //!   Section offsets are absolute byte offsets from the beginning of the
 //!   object. The coarse SQ path fetches this whole object through the normal
 //!   cache and parses only the SQ section; the rerank path later asks for the
@@ -151,7 +152,7 @@ use crate::error::{Result, ZeppelinError};
 use crate::index::quantization::QuantizationType;
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, VectorEntry};
-use crate::wal::manifest::{BootstrapRef, ClusterDataObjectRef};
+use crate::wal::manifest::{BootstrapRef, ClusterDataObjectRef, CoarsePayloadEncoding};
 
 use super::kmeans::{repair_cluster_balance, train_kmeans};
 use super::membership::build_membership_artifact;
@@ -163,6 +164,8 @@ use crate::index::distance;
 const CENTROIDS_V2_MAGIC: &[u8; 4] = b"ZCT2";
 /// Four-byte signature for one SQ-and-full-vector cluster section.
 const CLUSTER_V2_MAGIC: &[u8; 4] = b"ZCL2";
+/// Four-byte signature for one RQ-and-full-vector cluster section.
+const CLUSTER_V3_MAGIC: &[u8; 4] = b"ZCL3";
 /// Fixed bytes preceding the SQ and full-vector payloads in a v2 section.
 const CLUSTER_V2_HEADER_LEN: usize = 4 + 8 * 4;
 /// Four-byte signature for grouped objects containing unsplit cluster sections.
@@ -1519,6 +1522,52 @@ pub(crate) fn serialize_colocated_sq_cluster(
     Ok(Bytes::from(buf))
 }
 
+/// Serializes one `ZCL3` section containing RQ codes and exact vectors.
+///
+/// The coarse and full offsets use the same field order and widths as `ZCL2`.
+/// This function only builds immutable bytes; compaction does not select or
+/// write this format until the later configuration slice.
+#[allow(dead_code)]
+pub(crate) fn serialize_colocated_rq_cluster(
+    vectors: &[Vec<f32>],
+    rq_codes: &crate::index::quantization::rq::RqClusterCodes,
+    dim: usize,
+) -> Result<Bytes> {
+    if rq_codes.dim() != dim {
+        return Err(ZeppelinError::Index(format!(
+            "RQ cluster dimension mismatch: expected {dim}, got {}",
+            rq_codes.dim()
+        )));
+    }
+    if rq_codes.row_count() != vectors.len() {
+        return Err(ZeppelinError::Index(format!(
+            "RQ cluster row count mismatch: {} codes, {} vectors",
+            rq_codes.row_count(),
+            vectors.len()
+        )));
+    }
+
+    let coarse_data = rq_codes.to_bytes();
+    let full_data = serialize_cluster(rq_codes.ids(), vectors, dim)?;
+    let coarse_offset = CLUSTER_V2_HEADER_LEN as u64;
+    let coarse_len = coarse_data.len() as u64;
+    let full_offset = coarse_offset + coarse_len;
+    let full_len = full_data.len() as u64;
+
+    let total = CLUSTER_V2_HEADER_LEN + coarse_data.len() + full_data.len();
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(CLUSTER_V3_MAGIC);
+    buf.extend_from_slice(&coarse_offset.to_le_bytes());
+    buf.extend_from_slice(&coarse_len.to_le_bytes());
+    buf.extend_from_slice(&full_offset.to_le_bytes());
+    buf.extend_from_slice(&full_len.to_le_bytes());
+    buf.extend_from_slice(&coarse_data);
+    buf.extend_from_slice(&full_data);
+    debug_assert_eq!(buf.len(), total);
+
+    Ok(Bytes::from(buf))
+}
+
 /// Serialize one immutable object containing one or more cluster payloads.
 ///
 /// Each payload is a complete cluster section: either the legacy full-vector
@@ -1532,13 +1581,14 @@ pub(crate) fn serialize_colocated_sq_cluster(
 ///
 /// # Returns
 ///
-/// A v4 grouped object when every section is `ZCL2`; otherwise a v1 object that
-/// keeps each section contiguous.
+/// A v4 grouped object when every section is `ZCL2` or every section is
+/// `ZCL3`; otherwise a v1 object for homogeneous legacy sections.
 ///
 /// # Errors
 ///
 /// Returns an index error for no entries, a duplicate/oversized cluster index,
-/// malformed `ZCL2` sections, or any checked size/offset overflow.
+/// mixed quantized section magics, malformed quantized sections, or any checked
+/// size/offset overflow.
 ///
 /// # Examples
 ///
@@ -1571,11 +1621,21 @@ pub(crate) fn serialize_cluster_data_object(entries: &[(usize, Bytes)]) -> Resul
         }
     }
 
-    if entries
+    let all_zcl2 = entries
         .iter()
-        .all(|(_, bytes)| bytes.starts_with(CLUSTER_V2_MAGIC))
-    {
+        .all(|(_, bytes)| bytes.starts_with(CLUSTER_V2_MAGIC));
+    let all_zcl3 = entries
+        .iter()
+        .all(|(_, bytes)| bytes.starts_with(CLUSTER_V3_MAGIC));
+    if all_zcl2 || all_zcl3 {
         return serialize_cluster_data_object_v4(entries);
+    }
+    if entries.iter().any(|(_, bytes)| {
+        bytes.starts_with(CLUSTER_V2_MAGIC) || bytes.starts_with(CLUSTER_V3_MAGIC)
+    }) {
+        return Err(ZeppelinError::Index(
+            "cluster data object sections must use one homogeneous encoding".into(),
+        ));
     }
 
     serialize_cluster_data_object_v1(entries)
@@ -1641,12 +1701,13 @@ fn serialize_cluster_data_object_v1(entries: &[(usize, Bytes)]) -> Result<Bytes>
 /// Writes a v4 grouped object with all SQ ranges before all full-vector ranges.
 ///
 /// Separating blocks lets a coarse query range-read compact SQ data without
-/// pulling the usually larger exact-vector block. Each input `ZCL2` section is
-/// parsed and its child payloads are copied into the corresponding block.
+/// pulling the usually larger exact-vector block. Homogeneous `ZCL2` or `ZCL3`
+/// sections are parsed and copied into the corresponding blocks.
 ///
 /// # Parameters
 ///
-/// - `entries`: Prevalidated cluster indexes paired with valid `ZCL2` sections.
+/// - `entries`: Prevalidated cluster indexes paired with homogeneous quantized
+///   sections.
 ///
 /// # Returns
 ///
@@ -1662,11 +1723,11 @@ fn serialize_cluster_data_object_v1(entries: &[(usize, Bytes)]) -> Result<Bytes>
 /// Two scalar-quantized clusters become `directory | SQ0 | SQ1 | full0 |
 /// full1`; the largest SQ end is therefore no later than the first full start.
 fn serialize_cluster_data_object_v4(entries: &[(usize, Bytes)]) -> Result<Bytes> {
-    /// Borrowed child payloads extracted from one input `ZCL2` section.
+    /// Borrowed child payloads extracted from one quantized section.
     struct SplitSection<'a> {
         /// Logical cluster named in the grouped directory.
         cluster_idx: usize,
-        /// Compact scalar-quantized child artifact.
+        /// Compact SQ8 or two-bit child artifact.
         sq: &'a [u8],
         /// Exact full-vector child artifact.
         full: &'a [u8],
@@ -1678,7 +1739,7 @@ fn serialize_cluster_data_object_v4(entries: &[(usize, Bytes)]) -> Result<Bytes>
             let sections = colocated_cluster_sections(bytes)?;
             Ok(SplitSection {
                 cluster_idx: *cluster_idx,
-                sq: sections.sq,
+                sq: sections.coarse,
                 full: sections.full,
             })
         })
@@ -1771,7 +1832,7 @@ pub(crate) struct ClusterData {
     pub vectors: Vec<Vec<f32>>,
 }
 
-/// Decodes exact vectors from either a legacy or `ZCL2` cluster section.
+/// Decodes exact vectors from a legacy, `ZCL2`, or `ZCL3` cluster section.
 ///
 /// # Parameters
 ///
@@ -1779,8 +1840,8 @@ pub(crate) struct ClusterData {
 ///
 /// # Returns
 ///
-/// Owned IDs and full-precision vectors. SQ bytes in a `ZCL2` section are
-/// ignored by this exact-data path.
+/// Owned IDs and full-precision vectors. Coarse bytes in a quantized section
+/// are ignored by this exact-data path.
 ///
 /// # Errors
 ///
@@ -1913,6 +1974,65 @@ fn deserialize_legacy_cluster(data: &[u8]) -> Result<ClusterData> {
     Ok(ClusterData { ids, vectors })
 }
 
+/// Decoded coarse rows selected by manifest metadata.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum CoarseClusterData {
+    /// Scalar-quantized IDs and codes from a `ZCL2` section.
+    Sq8(crate::index::quantization::sq::SqClusterData),
+    /// Two-bit RaBitQ IDs and codes from a `ZCL3` section.
+    TwoBit(crate::index::quantization::rq::RqClusterCodes),
+}
+
+/// Decodes the coarse child selected by manifest metadata.
+///
+/// A recognized section magic that disagrees with `encoding` is an error. Raw
+/// legacy full-vector sections are accepted only for SQ8, whose historical
+/// sidecar reader may supply the coarse data separately.
+pub(crate) fn deserialize_colocated_coarse_cluster(
+    data: &[u8],
+    encoding: CoarsePayloadEncoding,
+) -> Result<Option<CoarseClusterData>> {
+    let section_encoding = cluster_section_encoding(data);
+    match (encoding, section_encoding) {
+        (CoarsePayloadEncoding::Sq8, Some(CoarsePayloadEncoding::Sq8)) => {
+            let sections = colocated_cluster_sections(data)?;
+            let codes = crate::index::quantization::sq::deserialize_sq_cluster(sections.coarse)?;
+            Ok(Some(CoarseClusterData::Sq8(codes)))
+        }
+        (CoarsePayloadEncoding::TwoBit, Some(CoarsePayloadEncoding::TwoBit)) => {
+            let sections = colocated_cluster_sections(data)?;
+            let codes =
+                crate::index::quantization::rq::RqClusterCodes::from_bytes(sections.coarse)?;
+            Ok(Some(CoarseClusterData::TwoBit(codes)))
+        }
+        (expected, Some(actual)) => Err(ZeppelinError::Index(format!(
+            "cluster coarse encoding mismatch: manifest={expected:?}, section={actual:?}"
+        ))),
+        (CoarsePayloadEncoding::Sq8, None) => Ok(None),
+        (CoarsePayloadEncoding::TwoBit, None) => Err(ZeppelinError::Index(
+            "two-bit manifest tag requires a ZCL3 cluster section".into(),
+        )),
+    }
+}
+
+/// Decodes a raw coarse range whose encoding came from manifest metadata.
+fn decode_coarse_payload(
+    data: &[u8],
+    encoding: CoarsePayloadEncoding,
+) -> Result<CoarseClusterData> {
+    match encoding {
+        CoarsePayloadEncoding::Sq8 => {
+            let codes = crate::index::quantization::sq::deserialize_sq_cluster(data)?;
+            Ok(CoarseClusterData::Sq8(codes))
+        }
+        CoarsePayloadEncoding::TwoBit => {
+            let codes = crate::index::quantization::rq::RqClusterCodes::from_bytes(data)?;
+            Ok(CoarseClusterData::TwoBit(codes))
+        }
+    }
+}
+
 /// Decodes the SQ child of a co-located cluster section when present.
 ///
 /// # Parameters
@@ -1935,13 +2055,39 @@ fn deserialize_legacy_cluster(data: &[u8]) -> Result<ClusterData> {
 pub(crate) fn deserialize_colocated_sq_cluster(
     data: &[u8],
 ) -> Result<Option<crate::index::quantization::sq::SqClusterData>> {
-    if !data.starts_with(CLUSTER_V2_MAGIC) {
-        return Ok(None);
+    match deserialize_colocated_coarse_cluster(data, CoarsePayloadEncoding::Sq8)? {
+        Some(CoarseClusterData::Sq8(codes)) => Ok(Some(codes)),
+        Some(CoarseClusterData::TwoBit(_)) => Err(ZeppelinError::Index(
+            "SQ8 decoder received two-bit cluster data".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Deserialize the manifest-selected coarse section from one cluster object.
+pub(crate) fn deserialize_colocated_coarse_cluster_from_object(
+    data: &[u8],
+    cluster_idx: usize,
+    encoding: CoarsePayloadEncoding,
+) -> Result<Option<CoarseClusterData>> {
+    if is_cluster_data_object_v4(data) {
+        let layout = cluster_object_layout_v4(data)?;
+        let section = layout.section(cluster_idx).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "cluster {cluster_idx} missing from v4 cluster data object"
+            ))
+        })?;
+        let coarse = section.sq.as_ref().ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "cluster {cluster_idx} missing coarse section in v4 cluster data object"
+            ))
+        })?;
+        validate_range_in_object(coarse, data.len(), "v4 cluster coarse section")?;
+        return decode_coarse_payload(&data[coarse.clone()], encoding).map(Some);
     }
 
-    let sections = colocated_cluster_sections(data)?;
-    let sq_cluster = crate::index::quantization::sq::deserialize_sq_cluster(sections.sq)?;
-    Ok(Some(sq_cluster))
+    let data = cluster_section_from_object(data, cluster_idx)?;
+    deserialize_colocated_coarse_cluster(data, encoding)
 }
 
 /// Deserialize the SQ section for one cluster in either a legacy per-cluster
@@ -1965,31 +2111,23 @@ pub(crate) fn deserialize_colocated_sq_cluster_from_object(
     data: &[u8],
     cluster_idx: usize,
 ) -> Result<Option<crate::index::quantization::sq::SqClusterData>> {
-    if is_cluster_data_object_v4(data) {
-        let layout = cluster_object_layout_v4(data)?;
-        let section = layout.section(cluster_idx).ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "cluster {cluster_idx} missing from v4 cluster data object"
-            ))
-        })?;
-        let sq = section.sq.as_ref().ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "cluster {cluster_idx} missing SQ section in v4 cluster data object"
-            ))
-        })?;
-        validate_range_in_object(sq, data.len(), "v4 cluster SQ section")?;
-        let sq_cluster = crate::index::quantization::sq::deserialize_sq_cluster(&data[sq.clone()])?;
-        return Ok(Some(sq_cluster));
+    match deserialize_colocated_coarse_cluster_from_object(
+        data,
+        cluster_idx,
+        CoarsePayloadEncoding::Sq8,
+    )? {
+        Some(CoarseClusterData::Sq8(codes)) => Ok(Some(codes)),
+        Some(CoarseClusterData::TwoBit(_)) => Err(ZeppelinError::Index(
+            "SQ8 decoder received two-bit cluster data".into(),
+        )),
+        None => Ok(None),
     }
-
-    let data = cluster_section_from_object(data, cluster_idx)?;
-    deserialize_colocated_sq_cluster(data)
 }
 
-/// Borrowed child payloads from one validated `ZCL2` cluster section.
+/// Borrowed child payloads from one validated quantized cluster section.
 struct ColocatedClusterSections<'a> {
-    /// Scalar-quantized cluster artifact bytes.
-    sq: &'a [u8],
+    /// Scalar-quantized or two-bit cluster artifact bytes.
+    coarse: &'a [u8],
     /// Legacy-format exact-vector cluster artifact bytes.
     full: &'a [u8],
 }
@@ -2417,20 +2555,31 @@ fn cluster_section_from_object(data: &[u8], cluster_idx: usize) -> Result<&[u8]>
 ///
 /// # Returns
 ///
-/// The `ZCL2` full-vector slice, or all input bytes for legacy full-only data.
+/// The quantized section's full-vector slice, or all legacy full-only bytes.
 ///
 /// # Errors
 ///
-/// Returns an index error when a recognized `ZCL2` header has invalid offsets
-/// or size.
+/// Returns an index error when a recognized quantized header has invalid
+/// offsets or size.
 fn full_cluster_section(data: &[u8]) -> Result<&[u8]> {
-    if !data.starts_with(CLUSTER_V2_MAGIC) {
+    if cluster_section_encoding(data).is_none() {
         return Ok(data);
     }
     Ok(colocated_cluster_sections(data)?.full)
 }
 
-/// Validates `ZCL2` offsets and borrows its SQ and exact-vector children.
+/// Returns the coarse encoding named by a recognized cluster-section magic.
+fn cluster_section_encoding(data: &[u8]) -> Option<CoarsePayloadEncoding> {
+    if data.starts_with(CLUSTER_V2_MAGIC) {
+        Some(CoarsePayloadEncoding::Sq8)
+    } else if data.starts_with(CLUSTER_V3_MAGIC) {
+        Some(CoarsePayloadEncoding::TwoBit)
+    } else {
+        None
+    }
+}
+
+/// Validates quantized offsets and borrows coarse and exact-vector children.
 ///
 /// # Parameters
 ///
@@ -2442,8 +2591,8 @@ fn full_cluster_section(data: &[u8]) -> Result<&[u8]> {
 ///
 /// # Errors
 ///
-/// Returns an index error for a short header, malformed integer, unexpected SQ
-/// start, non-contiguous full start, arithmetic overflow, or exact-size
+/// Returns an index error for a short header, malformed integer, unexpected
+/// coarse start, non-contiguous full start, arithmetic overflow, or exact-size
 /// mismatch.
 ///
 /// # Examples
@@ -2453,44 +2602,49 @@ fn full_cluster_section(data: &[u8]) -> Result<&[u8]> {
 fn colocated_cluster_sections(data: &[u8]) -> Result<ColocatedClusterSections<'_>> {
     if data.len() < CLUSTER_V2_HEADER_LEN {
         return Err(ZeppelinError::Index(
-            "v2 cluster blob too small for header".into(),
+            "quantized cluster blob too small for header".into(),
+        ));
+    }
+    if cluster_section_encoding(data).is_none() {
+        return Err(ZeppelinError::Index(
+            "unrecognized quantized cluster magic".into(),
         ));
     }
 
-    let sq_offset = read_u64_usize(data, 4, "v2 cluster SQ offset")?;
-    let sq_len = read_u64_usize(data, 12, "v2 cluster SQ length")?;
-    let full_offset = read_u64_usize(data, 20, "v2 cluster full offset")?;
-    let full_len = read_u64_usize(data, 28, "v2 cluster full length")?;
+    let coarse_offset = read_u64_usize(data, 4, "cluster coarse offset")?;
+    let coarse_len = read_u64_usize(data, 12, "cluster coarse length")?;
+    let full_offset = read_u64_usize(data, 20, "cluster full offset")?;
+    let full_len = read_u64_usize(data, 28, "cluster full length")?;
 
-    if sq_offset != CLUSTER_V2_HEADER_LEN {
+    if coarse_offset != CLUSTER_V2_HEADER_LEN {
         return Err(ZeppelinError::Index(format!(
-            "v2 cluster SQ offset mismatch: expected {CLUSTER_V2_HEADER_LEN}, got {sq_offset}"
+            "cluster coarse offset mismatch: expected {CLUSTER_V2_HEADER_LEN}, got {coarse_offset}"
         )));
     }
-    let expected_full_offset = sq_offset.checked_add(sq_len).ok_or_else(|| {
+    let expected_full_offset = coarse_offset.checked_add(coarse_len).ok_or_else(|| {
         ZeppelinError::Index(format!(
-            "v2 cluster SQ section overflows: offset={sq_offset}, len={sq_len}"
+            "cluster coarse section overflows: offset={coarse_offset}, len={coarse_len}"
         ))
     })?;
     if full_offset != expected_full_offset {
         return Err(ZeppelinError::Index(format!(
-            "v2 cluster full offset mismatch: expected {expected_full_offset}, got {full_offset}"
+            "cluster full offset mismatch: expected {expected_full_offset}, got {full_offset}"
         )));
     }
     let expected_len = full_offset.checked_add(full_len).ok_or_else(|| {
         ZeppelinError::Index(format!(
-            "v2 cluster full section overflows: offset={full_offset}, len={full_len}"
+            "cluster full section overflows: offset={full_offset}, len={full_len}"
         ))
     })?;
     if data.len() != expected_len {
         return Err(ZeppelinError::Index(format!(
-            "v2 cluster blob size mismatch: expected {expected_len}, got {}",
+            "quantized cluster blob size mismatch: expected {expected_len}, got {}",
             data.len()
         )));
     }
 
     Ok(ColocatedClusterSections {
-        sq: &data[sq_offset..full_offset],
+        coarse: &data[coarse_offset..full_offset],
         full: &data[full_offset..expected_len],
     })
 }
@@ -3959,6 +4113,92 @@ mod tests {
         let cluster = deserialize_cluster(&data).unwrap();
         assert_eq!(cluster.ids, ids);
         assert_eq!(cluster.vectors, vecs);
+    }
+
+    /// Proves a ZCL3 section preserves its two-bit rows and exact vectors.
+    #[test]
+    fn test_zcl3_section_round_trip() {
+        use crate::index::quantization::rabitq::StructuredRotation;
+        use crate::index::quantization::rq::RqClusterCodes;
+
+        const DIM: usize = 256;
+        const SEED: u64 = 0x5a43_4c33;
+
+        let ids = vec!["rq-0".to_string(), "rq-1".to_string()];
+        let vectors = vec![vec![0.5_f32; DIM], vec![-0.25_f32; DIM]];
+        let rows: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let centroid = vec![0.125_f32; DIM];
+        let rotation = StructuredRotation::new(DIM, SEED).unwrap();
+        let codes = RqClusterCodes::encode(&ids, &rows, &centroid, &rotation).unwrap();
+
+        let section = serialize_colocated_rq_cluster(&vectors, &codes, DIM).unwrap();
+        let Some(CoarseClusterData::TwoBit(decoded_codes)) =
+            deserialize_colocated_coarse_cluster(&section, CoarsePayloadEncoding::TwoBit).unwrap()
+        else {
+            panic!("ZCL3 section did not decode as two-bit");
+        };
+        let decoded_full = deserialize_cluster(&section).unwrap();
+
+        assert_eq!(decoded_codes.ids(), codes.ids());
+        assert_eq!(decoded_codes.packed_planes(), codes.packed_planes());
+        assert_eq!(decoded_codes.to_bytes(), codes.to_bytes());
+        assert_eq!(decoded_full.ids, ids);
+        assert_eq!(decoded_full.vectors, vectors);
+    }
+
+    /// Proves ZCL3 grouped ranges reuse the checked ZCL2 directory arithmetic.
+    #[test]
+    fn test_zcl3_grouped_offsets_and_overflow_rejection() {
+        use crate::index::quantization::rabitq::StructuredRotation;
+        use crate::index::quantization::rq::RqClusterCodes;
+
+        const DIM: usize = 256;
+        const SEED: u64 = 0x5a43_4c33;
+
+        let ids = vec!["rq-range".to_string()];
+        let vectors = vec![vec![0.75_f32; DIM]];
+        let rows: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let centroid = vec![0.0_f32; DIM];
+        let rotation = StructuredRotation::new(DIM, SEED).unwrap();
+        let codes = RqClusterCodes::encode(&ids, &rows, &centroid, &rotation).unwrap();
+        let section = serialize_colocated_rq_cluster(&vectors, &codes, DIM).unwrap();
+        let object = serialize_cluster_data_object(&[(7, section)]).unwrap();
+
+        let layout = cluster_object_layout(&object).unwrap().unwrap();
+        let range = layout.section(7).unwrap();
+        let coarse = range.sq.clone().unwrap();
+        let Some(CoarseClusterData::TwoBit(decoded_codes)) =
+            deserialize_colocated_coarse_cluster_from_object(
+                &object,
+                7,
+                CoarsePayloadEncoding::TwoBit,
+            )
+            .unwrap()
+        else {
+            panic!("ZCL3 grouped range did not decode as two-bit");
+        };
+        assert_eq!(decoded_codes.to_bytes(), codes.to_bytes());
+        assert_eq!(&object[coarse], &codes.to_bytes()[..]);
+        assert_eq!(
+            deserialize_legacy_cluster(&object[range.full.clone()])
+                .unwrap()
+                .vectors,
+            vectors
+        );
+
+        let payload_start = CLUSTER_DATA_OBJECT_HEADER_LEN + CLUSTER_DATA_OBJECT_V4_DIR_ENTRY_LEN;
+        let mut inside_directory = object.to_vec();
+        inside_directory[12..20].copy_from_slice(&((payload_start - 1) as u64).to_le_bytes());
+        assert!(cluster_object_layout(&inside_directory).is_err());
+
+        let mut coarse_overflow = object.to_vec();
+        coarse_overflow[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
+        coarse_overflow[20..28].copy_from_slice(&1_u64.to_le_bytes());
+        assert!(cluster_object_layout(&coarse_overflow).is_err());
+
+        let mut full_overflow = object.to_vec();
+        full_overflow[36..44].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(cluster_object_layout(&full_overflow).is_err());
     }
 
     /// Proves v4 grouped SQ objects expose valid, separable coarse/exact ranges.
