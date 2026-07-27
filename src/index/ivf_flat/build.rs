@@ -182,12 +182,14 @@ const CLUSTER_DATA_OBJECT_DIR_ENTRY_LEN: usize = 4 + 8 + 8;
 const CLUSTER_DATA_OBJECT_V4_DIR_ENTRY_LEN: usize = 4 + 8 + 8 + 8 + 8;
 /// Four-byte signature for a combined centroid-and-sketch bootstrap object.
 const BOOTSTRAP_MAGIC: &[u8; 4] = b"ZBS1";
-/// Only bootstrap format version currently accepted by the decoder.
-const BOOTSTRAP_VERSION: u32 = 1;
-/// Number of offset/length entries in a bootstrap header.
-const BOOTSTRAP_SECTION_COUNT: usize = 2;
-/// Fixed bootstrap header size before the first embedded artifact.
-const BOOTSTRAP_HEADER_LEN: usize = 4 + 4 + BOOTSTRAP_SECTION_COUNT * 16;
+/// Legacy bootstrap version containing centroids and resident sketch only.
+const BOOTSTRAP_VERSION_V1: u32 = 1;
+/// Current bootstrap version adding segment-wide complete bitmap fields.
+const BOOTSTRAP_VERSION: u32 = 2;
+/// Fixed v1 header size before the first embedded artifact.
+const BOOTSTRAP_V1_HEADER_LEN: usize = 4 + 4 + 2 * 16;
+/// Fixed current header size before the first embedded artifact.
+const BOOTSTRAP_HEADER_LEN: usize = 4 + 4 + 3 * 16;
 /// Object-count compromise used when no grouping cap is configured.
 const DEFAULT_MAX_CLUSTERS_PER_OBJECT: usize = 3;
 /// Environment variable overriding the maximum clusters in a grouped object.
@@ -772,6 +774,8 @@ pub(crate) struct BootstrapSections<'a> {
     pub sketch: &'a [u8],
     /// Absolute range of the sketch section in the source bootstrap bytes.
     pub sketch_range: Range<usize>,
+    /// Fields guaranteed to have a bitmap index in every logical cluster.
+    pub bitmap_complete_fields: BTreeSet<String>,
 }
 
 /// Serialize a segment bootstrap artifact from existing artifact bytes.
@@ -809,7 +813,11 @@ pub(crate) struct BootstrapSections<'a> {
 /// The parameters are temporary borrows; [`Bytes::from`] takes ownership of the
 /// completed `Vec<u8>` without copying it again. The result can outlive both
 /// input slices because their bytes were copied into the owned buffer.
-pub(crate) fn serialize_bootstrap(centroids: &[u8], sketch: &[u8]) -> Result<Bytes> {
+pub(crate) fn serialize_bootstrap(
+    centroids: &[u8],
+    sketch: &[u8],
+    bitmap_complete_fields: &BTreeSet<String>,
+) -> Result<Bytes> {
     if centroids.is_empty() {
         return Err(ZeppelinError::Index(
             "bootstrap centroids section cannot be empty".into(),
@@ -821,13 +829,19 @@ pub(crate) fn serialize_bootstrap(centroids: &[u8], sketch: &[u8]) -> Result<Byt
         ));
     }
 
+    let bitmap_complete_fields = serialize_bitmap_complete_fields(bitmap_complete_fields)?;
     let centroids_offset = BOOTSTRAP_HEADER_LEN;
     let sketch_offset = centroids_offset
         .checked_add(centroids.len())
         .ok_or_else(|| ZeppelinError::Index("bootstrap centroids section overflows".into()))?;
-    let total = sketch_offset
+    let bitmap_complete_fields_offset = sketch_offset
         .checked_add(sketch.len())
         .ok_or_else(|| ZeppelinError::Index("bootstrap sketch section overflows".into()))?;
+    let total = bitmap_complete_fields_offset
+        .checked_add(bitmap_complete_fields.len())
+        .ok_or_else(|| {
+            ZeppelinError::Index("bootstrap bitmap complete-fields section overflows".into())
+        })?;
 
     let mut buf = Vec::with_capacity(total);
     buf.extend_from_slice(BOOTSTRAP_MAGIC);
@@ -836,8 +850,11 @@ pub(crate) fn serialize_bootstrap(centroids: &[u8], sketch: &[u8]) -> Result<Byt
     buf.extend_from_slice(&(centroids.len() as u64).to_le_bytes());
     buf.extend_from_slice(&(sketch_offset as u64).to_le_bytes());
     buf.extend_from_slice(&(sketch.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&(bitmap_complete_fields_offset as u64).to_le_bytes());
+    buf.extend_from_slice(&(bitmap_complete_fields.len() as u64).to_le_bytes());
     buf.extend_from_slice(centroids);
     buf.extend_from_slice(sketch);
+    buf.extend_from_slice(&bitmap_complete_fields);
     debug_assert_eq!(buf.len(), total);
 
     Ok(Bytes::from(buf))
@@ -876,8 +893,9 @@ pub(crate) fn build_bootstrap_artifact(
     segment_id: &str,
     centroids: &[u8],
     sketch: &[u8],
+    bitmap_complete_fields: &BTreeSet<String>,
 ) -> Result<(BootstrapRef, Bytes)> {
-    let bytes = serialize_bootstrap(centroids, sketch)?;
+    let bytes = serialize_bootstrap(centroids, sketch, bitmap_complete_fields)?;
     let bootstrap_ref = BootstrapRef {
         key: bootstrap_key(namespace, segment_id),
         size_bytes: bytes.len() as u64,
@@ -917,7 +935,7 @@ pub(crate) fn build_bootstrap_artifact(
 /// `ByteBuffer.slice()` or C pointer/length pairs, but the borrow checker proves
 /// the views cannot survive after `data` is released.
 pub(crate) fn deserialize_bootstrap(data: &[u8]) -> Result<BootstrapSections<'_>> {
-    if data.len() < BOOTSTRAP_HEADER_LEN {
+    if data.len() < 8 {
         return Err(ZeppelinError::Index(
             "bootstrap blob too small for header".into(),
         ));
@@ -931,10 +949,20 @@ pub(crate) fn deserialize_bootstrap(data: &[u8]) -> Result<BootstrapSections<'_>
             .try_into()
             .map_err(|_| ZeppelinError::Index("bootstrap version parse error".into()))?,
     );
-    if version != BOOTSTRAP_VERSION {
+    if version != BOOTSTRAP_VERSION_V1 && version != BOOTSTRAP_VERSION {
         return Err(ZeppelinError::Index(format!(
             "unsupported bootstrap version: {version}"
         )));
+    }
+    let header_len = if version == BOOTSTRAP_VERSION_V1 {
+        BOOTSTRAP_V1_HEADER_LEN
+    } else {
+        BOOTSTRAP_HEADER_LEN
+    };
+    if data.len() < header_len {
+        return Err(ZeppelinError::Index(
+            "bootstrap blob too small for header".into(),
+        ));
     }
 
     let centroids_offset = read_u64_usize(data, 8, "bootstrap centroids offset")?;
@@ -945,7 +973,7 @@ pub(crate) fn deserialize_bootstrap(data: &[u8]) -> Result<BootstrapSections<'_>
         "centroids",
         centroids_offset,
         centroids_len,
-        BOOTSTRAP_HEADER_LEN,
+        header_len,
         data.len(),
     )?;
     let centroids_end = centroids_offset.checked_add(centroids_len).ok_or_else(|| {
@@ -953,9 +981,9 @@ pub(crate) fn deserialize_bootstrap(data: &[u8]) -> Result<BootstrapSections<'_>
             "bootstrap centroids section overflows: offset={centroids_offset}, len={centroids_len}"
         ))
     })?;
-    if centroids_offset != BOOTSTRAP_HEADER_LEN {
+    if centroids_offset != header_len {
         return Err(ZeppelinError::Index(format!(
-            "bootstrap centroids offset mismatch: expected {BOOTSTRAP_HEADER_LEN}, got {centroids_offset}"
+            "bootstrap centroids offset mismatch: expected {header_len}, got {centroids_offset}"
         )));
     }
     if sketch_offset != centroids_end {
@@ -963,21 +991,42 @@ pub(crate) fn deserialize_bootstrap(data: &[u8]) -> Result<BootstrapSections<'_>
             "bootstrap sketch offset mismatch: expected {centroids_end}, got {sketch_offset}"
         )));
     }
-    validate_bootstrap_section(
-        "sketch",
-        sketch_offset,
-        sketch_len,
-        BOOTSTRAP_HEADER_LEN,
-        data.len(),
-    )?;
+    validate_bootstrap_section("sketch", sketch_offset, sketch_len, header_len, data.len())?;
     let sketch_end = sketch_offset.checked_add(sketch_len).ok_or_else(|| {
         ZeppelinError::Index(format!(
             "bootstrap sketch section overflows: offset={sketch_offset}, len={sketch_len}"
         ))
     })?;
-    if sketch_end != data.len() {
+    let (bitmap_complete_fields, expected_end) = if version == BOOTSTRAP_VERSION_V1 {
+        (BTreeSet::new(), sketch_end)
+    } else {
+        let fields_offset = read_u64_usize(data, 40, "bootstrap bitmap complete-fields offset")?;
+        let fields_len = read_u64_usize(data, 48, "bootstrap bitmap complete-fields length")?;
+        if fields_offset != sketch_end {
+            return Err(ZeppelinError::Index(format!(
+                "bootstrap bitmap complete-fields offset mismatch: expected {sketch_end}, got {fields_offset}"
+            )));
+        }
+        validate_bootstrap_section(
+            "bitmap complete-fields",
+            fields_offset,
+            fields_len,
+            header_len,
+            data.len(),
+        )?;
+        let fields_end = fields_offset.checked_add(fields_len).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "bootstrap bitmap complete-fields section overflows: offset={fields_offset}, len={fields_len}"
+            ))
+        })?;
+        (
+            deserialize_bitmap_complete_fields(&data[fields_offset..fields_end])?,
+            fields_end,
+        )
+    };
+    if expected_end != data.len() {
         return Err(ZeppelinError::Index(format!(
-            "bootstrap blob size mismatch: expected {sketch_end}, got {}",
+            "bootstrap blob size mismatch: expected {expected_end}, got {}",
             data.len()
         )));
     }
@@ -986,7 +1035,75 @@ pub(crate) fn deserialize_bootstrap(data: &[u8]) -> Result<BootstrapSections<'_>
         centroids: &data[centroids_offset..centroids_end],
         sketch: &data[sketch_offset..sketch_end],
         sketch_range: sketch_offset..sketch_end,
+        bitmap_complete_fields,
     })
+}
+
+fn serialize_bitmap_complete_fields(fields: &BTreeSet<String>) -> Result<Vec<u8>> {
+    let field_count = u32::try_from(fields.len()).map_err(|_| {
+        ZeppelinError::Index("bootstrap bitmap complete-field count exceeds u32".into())
+    })?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&field_count.to_le_bytes());
+    for field in fields {
+        let field_len = u32::try_from(field.len()).map_err(|_| {
+            ZeppelinError::Index(format!(
+                "bootstrap bitmap complete-field length exceeds u32: {field}"
+            ))
+        })?;
+        bytes.extend_from_slice(&field_len.to_le_bytes());
+        bytes.extend_from_slice(field.as_bytes());
+    }
+    Ok(bytes)
+}
+
+fn deserialize_bitmap_complete_fields(data: &[u8]) -> Result<BTreeSet<String>> {
+    if data.len() < 4 {
+        return Err(ZeppelinError::Index(
+            "bootstrap bitmap complete-fields section is truncated".into(),
+        ));
+    }
+    let field_count = read_u32_usize(data, 0, "bootstrap bitmap complete-field count")?;
+    let mut offset = 4usize;
+    let mut fields = BTreeSet::new();
+    let mut previous: Option<String> = None;
+    for _ in 0..field_count {
+        let field_len = read_u32_usize(data, offset, "bootstrap bitmap complete-field length")?;
+        offset = offset.checked_add(4).ok_or_else(|| {
+            ZeppelinError::Index("bootstrap bitmap complete-field offset overflows".into())
+        })?;
+        let end = offset.checked_add(field_len).ok_or_else(|| {
+            ZeppelinError::Index("bootstrap bitmap complete-field bytes overflow".into())
+        })?;
+        let field_bytes = data.get(offset..end).ok_or_else(|| {
+            ZeppelinError::Index("bootstrap bitmap complete-field is truncated".into())
+        })?;
+        let field = std::str::from_utf8(field_bytes)
+            .map_err(|_| {
+                ZeppelinError::Index("bootstrap bitmap complete-field is not UTF-8".into())
+            })?
+            .to_string();
+        if field.is_empty() {
+            return Err(ZeppelinError::Index(
+                "bootstrap bitmap complete-field cannot be empty".into(),
+            ));
+        }
+        if previous.as_ref().is_some_and(|prior| prior >= &field) {
+            return Err(ZeppelinError::Index(
+                "bootstrap bitmap complete-fields are not sorted and unique".into(),
+            ));
+        }
+        previous = Some(field.clone());
+        fields.insert(field);
+        offset = end;
+    }
+    if offset != data.len() {
+        return Err(ZeppelinError::Index(format!(
+            "bootstrap bitmap complete-fields size mismatch: decoded={offset}, section={}",
+            data.len()
+        )));
+    }
+    Ok(fields)
 }
 
 /// Checks one bootstrap directory entry against header and object bounds.
@@ -1161,6 +1278,8 @@ struct LoadedIndexMetadata {
     sq_calibration: Option<crate::index::quantization::sq::SqCalibration>,
     /// Decoded resident sketch, absent for segments without a sketch ref.
     resident_sketch: Option<Arc<ResidentSketch>>,
+    /// Fields with bitmap coverage in every logical cluster.
+    bitmap_complete_fields: BTreeSet<String>,
 }
 
 /// Cacheable decoded contents of one immutable bootstrap object.
@@ -1181,6 +1300,8 @@ struct DecodedBootstrap {
     sq_calibration: Option<crate::index::quantization::sq::SqCalibration>,
     /// Shared decoded resident sketch.
     resident_sketch: Arc<ResidentSketch>,
+    /// Fields with bitmap coverage in every logical cluster.
+    bitmap_complete_fields: BTreeSet<String>,
 }
 
 /// Decodes centroid rows while discarding optional embedded calibration bytes.
@@ -2680,6 +2801,20 @@ fn read_u64_usize(data: &[u8], offset: usize, label: &str) -> Result<usize> {
         .map_err(|_| ZeppelinError::Index(format!("{label} does not fit in usize: {value}")))
 }
 
+fn read_u32_usize(data: &[u8], offset: usize, label: &str) -> Result<usize> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| ZeppelinError::Index(format!("{label} offset overflows")))?;
+    let bytes = data
+        .get(offset..end)
+        .ok_or_else(|| ZeppelinError::Index(format!("{label} is truncated")))?;
+    Ok(u32::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| ZeppelinError::Index(format!("{label} parse error")))?,
+    ) as usize)
+}
+
 /// Attributes blob: JSON-serialized `Vec<Option<HashMap<String, AttributeValue>>>`.
 ///
 /// We use JSON rather than bincode because `AttributeValue` uses
@@ -3046,6 +3181,7 @@ pub async fn build_ivf_flat(
 
     // CPU phase: pre-serialize all cluster sections and sidecars.
     let mut bitmap_fields_set = std::collections::HashSet::new();
+    let mut bitmap_complete_fields: Option<BTreeSet<String>> = None;
     let mut cluster_sections: Vec<Bytes> = Vec::with_capacity(num_clusters);
     let mut sidecar_payloads: Vec<(String, Bytes)> = Vec::new();
     for i in 0..num_clusters {
@@ -3089,15 +3225,23 @@ pub async fn build_ivf_flat(
             let attr_refs: Vec<Option<&HashMap<String, AttributeValue>>> =
                 cluster_attrs[i].iter().map(|a| a.as_ref()).collect();
             let bitmap_index = crate::index::bitmap::build::build_cluster_bitmaps(&attr_refs);
-            for field_name in bitmap_index.fields.keys() {
-                bitmap_fields_set.insert(field_name.clone());
-            }
+            let cluster_bitmap_fields: BTreeSet<String> =
+                bitmap_index.fields.keys().cloned().collect();
+            bitmap_fields_set.extend(cluster_bitmap_fields.iter().cloned());
+            bitmap_complete_fields = Some(match bitmap_complete_fields.take() {
+                Some(complete) => complete
+                    .intersection(&cluster_bitmap_fields)
+                    .cloned()
+                    .collect(),
+                None => cluster_bitmap_fields,
+            });
             let bitmap_data = bitmap_index.to_bytes()?;
             let bkey = crate::index::bitmap::bitmap_key(namespace, segment_id, i);
             sidecar_payloads.push((bkey, bitmap_data));
         }
     }
     let bitmap_fields: Vec<String> = bitmap_fields_set.into_iter().collect();
+    let bitmap_complete_fields = bitmap_complete_fields.unwrap_or_default();
 
     let mut cluster_objects = Vec::new();
     let mut cluster_object_payloads = Vec::new();
@@ -3162,8 +3306,13 @@ pub async fn build_ivf_flat(
     );
 
     // --- Step 6: Write segment bootstrap artifact ---
-    let (bootstrap_ref, bootstrap_data) =
-        build_bootstrap_artifact(namespace, segment_id, &centroids_data, &sketch_data)?;
+    let (bootstrap_ref, bootstrap_data) = build_bootstrap_artifact(
+        namespace,
+        segment_id,
+        &centroids_data,
+        &sketch_data,
+        &bitmap_complete_fields,
+    )?;
     store.put(&bootstrap_ref.key, bootstrap_data).await?;
     info!(
         key = %bootstrap_ref.key,
@@ -3239,6 +3388,7 @@ pub async fn build_ivf_flat(
         quantization,
         sq_calibration,
         bitmap_fields,
+        bitmap_complete_fields,
         // Freshly built segment: every cluster owned by this segment.
         cluster_owners: Vec::new(),
         cluster_objects,
@@ -3454,6 +3604,7 @@ async fn load_ivf_flat_from_manifest_routed(
                 dim: centroids_data.dim,
                 sq_calibration,
                 resident_sketch,
+                bitmap_complete_fields: BTreeSet::new(),
             }
         }
     };
@@ -3482,6 +3633,7 @@ async fn load_ivf_flat_from_manifest_routed(
         quantization,
         sq_calibration: metadata.sq_calibration,
         bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
+        bitmap_complete_fields: metadata.bitmap_complete_fields,
         cluster_owners,
         cluster_objects,
         cluster_object_by_cluster,
@@ -3605,6 +3757,7 @@ async fn load_bootstrap_artifacts(
     }
 
     let sections = deserialize_bootstrap(&data)?;
+    let bitmap_complete_fields = sections.bitmap_complete_fields.clone();
     if sketch_ref.size_bytes != sections.sketch.len() as u64 {
         return Err(ZeppelinError::Index(format!(
             "coarse sketch size mismatch inside bootstrap {}: manifest={}, section={}",
@@ -3635,6 +3788,7 @@ async fn load_bootstrap_artifacts(
         dim: centroids_data.dim,
         sq_calibration: sq_calibration.clone(),
         resident_sketch: Arc::clone(&sketch),
+        bitmap_complete_fields: bitmap_complete_fields.clone(),
     });
     if let Some(c) = cache {
         let cache_key = super::artifact_cache_key(physical_origin, &bootstrap_ref.key);
@@ -3647,6 +3801,7 @@ async fn load_bootstrap_artifacts(
         dim: centroids_data.dim,
         sq_calibration,
         resident_sketch: Some(sketch),
+        bitmap_complete_fields,
     })
 }
 
@@ -3704,6 +3859,7 @@ fn metadata_from_decoded_bootstrap(
         dim: decoded.dim,
         sq_calibration: decoded.sq_calibration.clone(),
         resident_sketch: Some(Arc::clone(&decoded.resident_sketch)),
+        bitmap_complete_fields: decoded.bitmap_complete_fields.clone(),
     })
 }
 
@@ -4011,6 +4167,7 @@ pub async fn load_ivf_flat(
         quantization,
         sq_calibration,
         bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
+        bitmap_complete_fields: BTreeSet::new(),
         // Probing loader is used by compaction to read a segment it will fully
         // rewrite, and by tests — legacy single-segment layout.
         cluster_owners: Vec::new(),
@@ -4113,10 +4270,27 @@ mod tests {
     fn test_serialize_deserialize_bootstrap_sections() {
         let centroids = b"centroid-bytes";
         let sketch = b"sketch-bytes";
-        let data = serialize_bootstrap(centroids, sketch).unwrap();
+        let complete_fields = BTreeSet::from(["color".to_string(), "tenant".to_string()]);
+        let data = serialize_bootstrap(centroids, sketch, &complete_fields).unwrap();
         let sections = deserialize_bootstrap(&data).unwrap();
         assert_eq!(sections.centroids, centroids);
         assert_eq!(sections.sketch, sketch);
+        assert_eq!(sections.bitmap_complete_fields, complete_fields);
+
+        let mut v1 = Vec::new();
+        let sketch_offset = BOOTSTRAP_V1_HEADER_LEN + centroids.len();
+        v1.extend_from_slice(BOOTSTRAP_MAGIC);
+        v1.extend_from_slice(&BOOTSTRAP_VERSION_V1.to_le_bytes());
+        v1.extend_from_slice(&(BOOTSTRAP_V1_HEADER_LEN as u64).to_le_bytes());
+        v1.extend_from_slice(&(centroids.len() as u64).to_le_bytes());
+        v1.extend_from_slice(&(sketch_offset as u64).to_le_bytes());
+        v1.extend_from_slice(&(sketch.len() as u64).to_le_bytes());
+        v1.extend_from_slice(centroids);
+        v1.extend_from_slice(sketch);
+        assert!(deserialize_bootstrap(&v1)
+            .unwrap()
+            .bitmap_complete_fields
+            .is_empty());
     }
 
     /// Proves malformed bootstrap identity, version, and bounds fail loudly.
@@ -4125,7 +4299,7 @@ mod tests {
     /// decoder or permit an out-of-bounds slice.
     #[test]
     fn test_deserialize_bootstrap_rejects_malformed_header() {
-        let data = serialize_bootstrap(b"centroids", b"sketch").unwrap();
+        let data = serialize_bootstrap(b"centroids", b"sketch", &BTreeSet::new()).unwrap();
 
         let mut bad_magic = data.to_vec();
         bad_magic[0] = b'X';
@@ -4436,8 +4610,14 @@ mod tests {
             &cluster_attrs,
         )
         .unwrap();
-        let (bootstrap_ref, bootstrap_data) =
-            build_bootstrap_artifact(namespace, segment_id, &centroids_data, &sketch_data).unwrap();
+        let (bootstrap_ref, bootstrap_data) = build_bootstrap_artifact(
+            namespace,
+            segment_id,
+            &centroids_data,
+            &sketch_data,
+            &BTreeSet::new(),
+        )
+        .unwrap();
         store.put(&bootstrap_ref.key, bootstrap_data).await.unwrap();
 
         let index = load_ivf_flat_from_manifest(
@@ -4500,8 +4680,14 @@ mod tests {
             &cluster_attrs,
         )
         .unwrap();
-        let (bootstrap_ref, bootstrap_data) =
-            build_bootstrap_artifact(namespace, segment_id, &centroids_data, &sketch_data).unwrap();
+        let (bootstrap_ref, bootstrap_data) = build_bootstrap_artifact(
+            namespace,
+            segment_id,
+            &centroids_data,
+            &sketch_data,
+            &BTreeSet::new(),
+        )
+        .unwrap();
         store.put(&bootstrap_ref.key, bootstrap_data).await.unwrap();
 
         let cache_dir = tempfile::TempDir::new().unwrap();

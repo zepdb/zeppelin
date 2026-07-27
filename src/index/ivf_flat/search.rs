@@ -111,7 +111,9 @@ use super::build::{
 use super::sketch::{AdaptiveClusterBudget, ClusterScore};
 use super::IvfFlatIndex;
 
-use crate::index::bitmap::evaluate::evaluate_filter_bitmap;
+use crate::index::bitmap::evaluate::{
+    evaluate_filter_bitmap, filter_is_guaranteed_by_complete_bitmaps,
+};
 use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 
 /// Row-aligned optional attribute maps for one logical cluster.
@@ -2143,9 +2145,9 @@ async fn scan_clusters_flat(
     use_live_range: bool,
 ) -> Result<Vec<Candidate>> {
     let has_bitmaps = !index.bitmap_fields.is_empty();
+    let filter_metadata_path = select_filter_metadata_path(index, filter, has_bitmaps);
 
     // Phase 1: Parallel prefetch — all S3 I/O fires concurrently.
-    let want_attrs = filter.is_some();
     let fetch_objects = cluster_fetch_objects(index, probe_clusters)?;
     let prefetched = futures::future::join_all(fetch_objects.iter().map(|object| {
         let object_key = object.key.clone();
@@ -2156,25 +2158,19 @@ async fn scan_clusters_flat(
             let cluster_meta =
                 futures::future::join_all(object_clusters.iter().map(|&cluster_idx| async move {
                     let owner = index.cluster_owner(cluster_idx);
-                    let (prefilter, attrs) = tokio::join!(
-                        try_bitmap_prefilter(
-                            index,
-                            owner,
-                            cluster_idx,
-                            filter,
-                            has_bitmaps,
-                            store,
-                            cache,
-                        ),
-                        async {
-                            if want_attrs {
-                                load_attrs(index, cluster_idx, filter, store, cache, None).await
-                            } else {
-                                Ok(None)
-                            }
-                        },
-                    );
-                    (cluster_idx, prefilter, attrs)
+                    let metadata = load_filter_metadata(
+                        index,
+                        owner,
+                        cluster_idx,
+                        filter,
+                        has_bitmaps,
+                        filter_metadata_path,
+                        store,
+                        cache,
+                        None,
+                    )
+                    .await;
+                    (cluster_idx, metadata)
                 }))
                 .await;
             (object_key, object_clusters, object_res, cluster_meta)
@@ -2193,14 +2189,13 @@ async fn scan_clusters_flat(
             )));
         }
 
-        for (cluster_idx, prefilter, attrs) in cluster_meta {
+        for (cluster_idx, metadata) in cluster_meta {
             if !object_clusters.contains(&cluster_idx) {
                 return Err(ZeppelinError::Index(format!(
                     "cluster metadata mismatch for object {object_key}: cluster {cluster_idx}"
                 )));
             }
-            let prefilter = prefilter?;
-            let attrs = attrs?;
+            let (prefilter, attrs) = metadata?;
             let cluster = deserialize_cluster_from_object(&object_data, cluster_idx)?;
 
             for (j, vec) in cluster.vectors.iter().enumerate() {
@@ -2354,6 +2349,7 @@ async fn scan_clusters_sq(
 
     // Phase 1: Coarse ranking with quantized distances — parallel prefetch.
     let has_bitmaps = !index.bitmap_fields.is_empty();
+    let filter_metadata_path = select_filter_metadata_path(index, filter, has_bitmaps);
 
     // When a filter is present but NOT resolved by a bitmap index, we must
     // apply it DURING the coarse scan — before truncating to `rerank_count`.
@@ -2362,8 +2358,6 @@ async fn scan_clusters_sq(
     // (Task 6). That needs the per-cluster attrs in the coarse phase, so fetch
     // them alongside the SQ codes whenever a filter is active. Bitmap-resolved
     // clusters (prefilter Some) keep their fast path and ignore attrs.
-    let want_attr_filter = filter.is_some();
-
     let fetch_objects = cluster_fetch_objects(index, probe_clusters)?;
     if let Some(stats) = &byte_stats {
         SqSearchByteStats::set_usize(&stats.selected_clusters, probe_clusters.len());
@@ -2389,17 +2383,19 @@ async fn scan_clusters_sq(
         let owner = index.cluster_owner(cluster_idx);
         let stats = byte_stats.clone();
         async move {
-            let (prefilter, attrs) = tokio::join!(
-                try_bitmap_prefilter(index, owner, cluster_idx, filter, has_bitmaps, store, cache,),
-                async {
-                    if want_attr_filter {
-                        load_attrs(index, cluster_idx, filter, store, cache, stats.as_deref()).await
-                    } else {
-                        Ok(None)
-                    }
-                },
-            );
-            (cluster_idx, prefilter, attrs)
+            let metadata = load_filter_metadata(
+                index,
+                owner,
+                cluster_idx,
+                filter,
+                has_bitmaps,
+                filter_metadata_path,
+                store,
+                cache,
+                stats.as_deref(),
+            )
+            .await;
+            (cluster_idx, metadata)
         }
     }))
     .await;
@@ -2432,9 +2428,8 @@ async fn scan_clusters_sq(
     }
 
     let mut meta_by_cluster = HashMap::new();
-    for (cluster_idx, prefilter, attrs) in meta_prefetched {
-        let prefilter = prefilter?;
-        let attrs = attrs?;
+    for (cluster_idx, metadata) in meta_prefetched {
+        let (prefilter, attrs) = metadata?;
         if meta_by_cluster
             .insert(cluster_idx, (prefilter, attrs))
             .is_some()
@@ -2542,7 +2537,7 @@ async fn scan_clusters_rq(
 
     // Phase 1: fetch only grouped coarse ranges and filter before truncation.
     let has_bitmaps = !index.bitmap_fields.is_empty();
-    let want_attr_filter = filter.is_some();
+    let filter_metadata_path = select_filter_metadata_path(index, filter, has_bitmaps);
     let fetch_objects = cluster_fetch_objects(index, probe_clusters)?;
     let rq_prefetched =
         futures::future::join_all(fetch_objects.iter().map(|object| async move {
@@ -2552,17 +2547,19 @@ async fn scan_clusters_rq(
     let meta_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
         let owner = index.cluster_owner(cluster_idx);
         async move {
-            let (prefilter, attrs) = tokio::join!(
-                try_bitmap_prefilter(index, owner, cluster_idx, filter, has_bitmaps, store, cache,),
-                async {
-                    if want_attr_filter {
-                        load_attrs(index, cluster_idx, filter, store, cache, None).await
-                    } else {
-                        Ok(None)
-                    }
-                },
-            );
-            (cluster_idx, prefilter, attrs)
+            let metadata = load_filter_metadata(
+                index,
+                owner,
+                cluster_idx,
+                filter,
+                has_bitmaps,
+                filter_metadata_path,
+                store,
+                cache,
+                None,
+            )
+            .await;
+            (cluster_idx, metadata)
         }
     }))
     .await;
@@ -2591,11 +2588,8 @@ async fn scan_clusters_rq(
     }
 
     let mut meta_by_cluster = HashMap::new();
-    for (cluster_idx, prefilter, attrs) in meta_prefetched {
-        if meta_by_cluster
-            .insert(cluster_idx, (prefilter?, attrs?))
-            .is_some()
-        {
+    for (cluster_idx, metadata) in meta_prefetched {
+        if meta_by_cluster.insert(cluster_idx, metadata?).is_some() {
             return Err(ZeppelinError::Index(format!(
                 "RQ coarse fetched duplicate metadata for cluster {cluster_idx}"
             )));
@@ -4229,38 +4223,39 @@ async fn scan_clusters_pq(
 
     // Phase 1: Coarse ranking with PQ distances — parallel prefetch.
     let has_bitmaps = !index.bitmap_fields.is_empty();
+    let filter_metadata_path = select_filter_metadata_path(index, filter, has_bitmaps);
 
     // Apply a non-bitmap attribute filter DURING the coarse scan so a selective
     // filter's matches survive truncation (Task 6). Fetch attrs alongside the
     // PQ codes whenever a filter is active.
-    let want_attr_filter = filter.is_some();
-
     let coarse_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
         let owner = index.cluster_owner(cluster_idx);
         let pq_key = pq_cluster_key(&index.physical_namespace, owner, cluster_idx);
         let pq_cache_key = index.artifact_cache_key(&pq_key);
         async move {
-            let (prefilter, pq_res, attrs) = tokio::join!(
-                try_bitmap_prefilter(index, owner, cluster_idx, filter, has_bitmaps, store, cache,),
+            let (metadata, pq_res) = tokio::join!(
+                load_filter_metadata(
+                    index,
+                    owner,
+                    cluster_idx,
+                    filter,
+                    has_bitmaps,
+                    filter_metadata_path,
+                    store,
+                    cache,
+                    None,
+                ),
                 fetch_with_cache(cache, store, &pq_key, &pq_cache_key),
-                async {
-                    if want_attr_filter {
-                        load_attrs(index, cluster_idx, filter, store, cache, None).await
-                    } else {
-                        Ok(None)
-                    }
-                },
             );
-            (cluster_idx, prefilter, pq_res, attrs)
+            (cluster_idx, metadata, pq_res)
         }
     }))
     .await;
 
     let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new();
-    for (cluster_idx, prefilter, pq_res, attrs) in coarse_prefetched {
-        let prefilter = prefilter?;
+    for (cluster_idx, metadata, pq_res) in coarse_prefetched {
+        let (prefilter, attrs) = metadata?;
         let pq_data = pq_res?;
-        let attrs = attrs?;
         let pq_cluster = deserialize_pq_cluster(&pq_data)?;
 
         for (j, codes) in pq_cluster.codes.iter().enumerate() {
@@ -4379,6 +4374,96 @@ async fn scan_clusters_pq(
 /// A bitmap-resolvable `color == "red"` predicate may return positions
 /// `{2, 9, 11}`. A token predicate absent from the bitmap index returns `None`,
 /// so exact row attributes decide matches.
+#[derive(Clone, Copy)]
+enum FilterMetadataPath {
+    Unfiltered,
+    BitmapOnly,
+    BitmapAndAttrs,
+}
+
+fn select_filter_metadata_path(
+    index: &IvfFlatIndex,
+    filter: Option<&Filter>,
+    has_bitmaps: bool,
+) -> FilterMetadataPath {
+    let (path, path_name, reason) = match filter {
+        None => (FilterMetadataPath::Unfiltered, "unfiltered", "no_filter"),
+        Some(filter)
+            if has_bitmaps
+                && filter_is_guaranteed_by_complete_bitmaps(
+                    filter,
+                    &index.bitmap_complete_fields,
+                ) =>
+        {
+            (
+                FilterMetadataPath::BitmapOnly,
+                "bitmap_only",
+                "complete_bitmap_coverage",
+            )
+        }
+        Some(_) if !has_bitmaps => (
+            FilterMetadataPath::BitmapAndAttrs,
+            "bitmap_and_attrs",
+            "bitmap_sidecars_unavailable",
+        ),
+        Some(_) => (
+            FilterMetadataPath::BitmapAndAttrs,
+            "bitmap_and_attrs",
+            "filter_not_bitmap_complete",
+        ),
+    };
+    debug!(
+        segment_id = %index.segment_id,
+        filter_metadata_path = path_name,
+        reason,
+        "selected coarse filter metadata path"
+    );
+    path
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn load_filter_metadata(
+    index: &IvfFlatIndex,
+    segment_id: &str,
+    cluster_idx: usize,
+    filter: Option<&Filter>,
+    has_bitmaps: bool,
+    path: FilterMetadataPath,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+    stats: Option<&SqSearchByteStats>,
+) -> Result<(Option<roaring::RoaringBitmap>, Option<ClusterAttrs>)> {
+    match path {
+        FilterMetadataPath::Unfiltered => Ok((None, None)),
+        FilterMetadataPath::BitmapOnly => {
+            let prefilter =
+                try_bitmap_prefilter(index, segment_id, cluster_idx, filter, true, store, cache)
+                    .await?;
+            let prefilter = prefilter.ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "segment {segment_id} cluster {cluster_idx} bitmap evaluation returned unavailable for a filter guaranteed by bootstrap metadata"
+                ))
+            })?;
+            Ok((Some(prefilter), None))
+        }
+        FilterMetadataPath::BitmapAndAttrs => {
+            let (prefilter, attrs) = tokio::join!(
+                try_bitmap_prefilter(
+                    index,
+                    segment_id,
+                    cluster_idx,
+                    filter,
+                    has_bitmaps,
+                    store,
+                    cache,
+                ),
+                load_attrs(index, cluster_idx, filter, store, cache, stats),
+            );
+            Ok((prefilter?, attrs?))
+        }
+    }
+}
+
 async fn try_bitmap_prefilter(
     index: &IvfFlatIndex,
     segment_id: &str,
@@ -4669,6 +4754,7 @@ mod tests {
             quantization: QuantizationType::None,
             sq_calibration: None,
             bitmap_fields: Vec::new(),
+            bitmap_complete_fields: BTreeSet::new(),
             cluster_owners: Vec::new(),
             cluster_objects: Vec::new(),
             cluster_object_by_cluster: Vec::new(),
@@ -4707,6 +4793,7 @@ mod tests {
         write_one_filtered_cluster(&store).await;
         let mut index = make_index();
         index.bitmap_fields = vec!["color".to_string()];
+        index.bitmap_complete_fields.insert("color".to_string());
         let filter = Filter::Eq {
             field: "color".to_string(),
             value: AttributeValue::String("blue".to_string()),
@@ -4744,6 +4831,7 @@ mod tests {
             .unwrap();
         let mut index = make_index();
         index.bitmap_fields = vec!["color".to_string()];
+        index.bitmap_complete_fields.insert("color".to_string());
         let filter = Filter::Eq {
             field: "color".to_string(),
             value: AttributeValue::String("blue".to_string()),

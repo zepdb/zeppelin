@@ -83,6 +83,7 @@ pub mod search;
 pub mod sketch;
 
 use async_trait::async_trait;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::config::IndexingConfig;
@@ -161,6 +162,11 @@ pub struct IvfFlatIndex {
     /// Manifest-aware query loading fills this after construction from the
     /// segment reference; an empty collection means no bitmap may be assumed.
     pub(crate) bitmap_fields: Vec<String>,
+    /// Fields with bitmap coverage in every logical cluster.
+    ///
+    /// This is decoded from the resident bootstrap before query I/O. An empty
+    /// set disables coarse attribute elision.
+    pub(crate) bitmap_complete_fields: BTreeSet<String>,
     /// Per-cluster owning segment identities for incremental carry-over.
     ///
     /// Entry `i` names the segment under which cluster `i`'s sidecar objects

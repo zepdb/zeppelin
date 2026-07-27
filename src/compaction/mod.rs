@@ -203,7 +203,7 @@ pub mod background;
 /// leaves the physical DELETE operations to [`gc`][crate::compaction::gc].
 pub mod gc;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -257,6 +257,8 @@ const COMPACTION_READ_CLASS_CENTROIDS: &str = "centroids";
 const COMPACTION_READ_CLASS_SQ: &str = "sq";
 /// Metrics label for bytes read from the resident coarse-search sketch.
 const COMPACTION_READ_CLASS_SKETCH: &str = "sketch";
+/// Metrics label for combined resident bootstrap metadata.
+const COMPACTION_READ_CLASS_BOOTSTRAP: &str = "bootstrap";
 /// Metrics label for bytes read from the vector-to-cluster membership map.
 const COMPACTION_READ_CLASS_MEMBERSHIP: &str = "membership";
 
@@ -678,6 +680,8 @@ struct IncrementalCentroidState {
     sq_calibration_bytes: Option<bytes::Bytes>,
     /// Decoded calibration used to encode rewritten cluster vectors.
     sq_calibration: Option<crate::index::quantization::sq::SqCalibration>,
+    /// Bitmap fields guaranteed complete across every old logical cluster.
+    bitmap_complete_fields: BTreeSet<String>,
 }
 
 /// Per-cluster rows and rewrite decisions for an incremental segment.
@@ -2834,6 +2838,7 @@ impl Compactor {
             dim,
             sq_calibration_bytes,
             sq_calibration,
+            bitmap_complete_fields,
         } = centroid_state;
         let num_clusters = centroids.len();
 
@@ -2890,6 +2895,7 @@ impl Compactor {
             dim,
             sq_calibration_bytes,
             sq_calibration,
+            bitmap_complete_fields,
         };
         let cluster_state = IncrementalClusterState {
             cluster_ids,
@@ -2962,7 +2968,9 @@ impl Compactor {
         old_segment: LocatedSegmentRef<'_>,
         indexing_config: &IndexingConfig,
     ) -> Result<IncrementalCentroidState> {
-        use crate::index::ivf_flat::build::{centroids_key, deserialize_centroids_data};
+        use crate::index::ivf_flat::build::{
+            centroids_key, deserialize_bootstrap, deserialize_centroids_data,
+        };
 
         let physical_namespace = old_segment.physical_namespace();
         let old_segment_id = &old_segment.segment.id;
@@ -2998,12 +3006,34 @@ impl Compactor {
             .as_ref()
             .map(|bytes| crate::index::quantization::sq::SqCalibration::from_bytes(bytes))
             .transpose()?;
+        let bitmap_complete_fields =
+            if let Some(bootstrap_ref) = old_segment.segment.bootstrap.as_ref() {
+                let bootstrap_data = get_compaction_read(
+                    &self.store,
+                    namespace,
+                    &bootstrap_ref.key,
+                    COMPACTION_READ_CLASS_BOOTSTRAP,
+                )
+                .await?;
+                if bootstrap_data.len() as u64 != bootstrap_ref.size_bytes {
+                    return Err(ZeppelinError::Index(format!(
+                        "bootstrap size mismatch for {}: manifest={}, object={}",
+                        bootstrap_ref.key,
+                        bootstrap_ref.size_bytes,
+                        bootstrap_data.len()
+                    )));
+                }
+                deserialize_bootstrap(&bootstrap_data)?.bitmap_complete_fields
+            } else {
+                BTreeSet::new()
+            };
 
         Ok(IncrementalCentroidState {
             centroids,
             dim,
             sq_calibration_bytes,
             sq_calibration,
+            bitmap_complete_fields,
         })
     }
 
@@ -3414,6 +3444,7 @@ impl Compactor {
             dim,
             sq_calibration_bytes,
             sq_calibration,
+            bitmap_complete_fields: old_bitmap_complete_fields,
         } = centroid_state;
         let IncrementalClusterState {
             cluster_ids,
@@ -3476,6 +3507,11 @@ impl Compactor {
             } else {
                 std::collections::HashSet::new()
             };
+        let mut bitmap_complete_fields = if carries_clusters && indexing_config.bitmap_index {
+            Some(old_bitmap_complete_fields)
+        } else {
+            None
+        };
         let mut payloads: Vec<(String, Bytes)> = vec![(new_ckey, new_centroids_data.clone())];
         let mut cluster_object_sizes: HashMap<String, u64> = HashMap::new();
 
@@ -3592,12 +3628,9 @@ impl Compactor {
                     &cluster_attrs,
                 )?
             };
-        let (bootstrap_ref, bootstrap_data) =
-            build_bootstrap_artifact(namespace, new_segment_id, &new_centroids_data, &sketch_data)?;
         let (membership_ref, membership_data) =
             build_membership_artifact(namespace, new_segment_id, &cluster_ids)?;
-        payloads.push((sketch_ref.key.clone(), sketch_data));
-        payloads.push((bootstrap_ref.key.clone(), bootstrap_data));
+        payloads.push((sketch_ref.key.clone(), sketch_data.clone()));
         payloads.push((membership_ref.key.clone(), membership_data));
         let rq_rotation = if indexing_config.quantization
             == crate::index::quantization::QuantizationType::TwoBit
@@ -3673,9 +3706,16 @@ impl Compactor {
                 let attr_refs: Vec<Option<&HashMap<String, crate::types::AttributeValue>>> =
                     cluster_attrs[i].iter().map(|a| a.as_ref()).collect();
                 let bitmap_index = crate::index::bitmap::build::build_cluster_bitmaps(&attr_refs);
-                for field_name in bitmap_index.fields.keys() {
-                    bitmap_fields_set.insert(field_name.clone());
-                }
+                let cluster_bitmap_fields: BTreeSet<String> =
+                    bitmap_index.fields.keys().cloned().collect();
+                bitmap_fields_set.extend(cluster_bitmap_fields.iter().cloned());
+                bitmap_complete_fields = Some(match bitmap_complete_fields.take() {
+                    Some(complete) => complete
+                        .intersection(&cluster_bitmap_fields)
+                        .cloned()
+                        .collect(),
+                    None => cluster_bitmap_fields,
+                });
                 let bitmap_data = bitmap_index.to_bytes()?;
                 let bkey = crate::index::bitmap::bitmap_key(namespace, new_segment_id, i);
                 payloads.push((bkey, bitmap_data));
@@ -3732,6 +3772,16 @@ impl Compactor {
             }
             crate::index::quantization::QuantizationType::None => {}
         }
+
+        let bitmap_complete_fields = bitmap_complete_fields.unwrap_or_default();
+        let (bootstrap_ref, bootstrap_data) = build_bootstrap_artifact(
+            namespace,
+            new_segment_id,
+            &new_centroids_data,
+            &sketch_data,
+            &bitmap_complete_fields,
+        )?;
+        payloads.push((bootstrap_ref.key.clone(), bootstrap_data));
 
         // I/O phase: write all new segment-global and rewritten-cluster payloads in parallel.
         let write_futs: Vec<_> = payloads

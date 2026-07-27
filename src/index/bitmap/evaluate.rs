@@ -80,10 +80,37 @@
 //! keys, while the exact attribute evaluator accepts only scalar integers/floats.
 
 use roaring::RoaringBitmap;
+use std::collections::BTreeSet;
 
 use crate::types::{AttributeValue, Filter};
 
 use super::{BitmapKey, ClusterBitmapIndex};
+
+/// Returns whether complete-field metadata guarantees bitmap evaluation.
+///
+/// This is a structural capability check only. It performs no artifact reads
+/// and deliberately excludes `Contains` because field presence does not prove
+/// that every cluster encoded the field as a list.
+#[must_use]
+pub fn filter_is_guaranteed_by_complete_bitmaps(
+    filter: &Filter,
+    complete_fields: &BTreeSet<String>,
+) -> bool {
+    match filter {
+        Filter::Eq { field, .. }
+        | Filter::NotEq { field, .. }
+        | Filter::Range { field, .. }
+        | Filter::In { field, .. }
+        | Filter::NotIn { field, .. } => complete_fields.contains(field),
+        Filter::And { filters } | Filter::Or { filters } => filters
+            .iter()
+            .all(|child| filter_is_guaranteed_by_complete_bitmaps(child, complete_fields)),
+        Filter::Not { filter } => filter_is_guaranteed_by_complete_bitmaps(filter, complete_fields),
+        Filter::Contains { .. }
+        | Filter::ContainsAllTokens { .. }
+        | Filter::ContainsTokenSequence { .. } => false,
+    }
+}
 
 /// Evaluates one complete filter expression against a cluster bitmap index.
 ///
@@ -322,7 +349,91 @@ mod tests {
 
     use super::*;
     use crate::index::bitmap::build::build_cluster_bitmaps;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn bitmap_filter_guarantee_truth_table() {
+        let complete_fields = BTreeSet::from(["color".to_string(), "size".to_string()]);
+        let value = AttributeValue::String("red".into());
+        let supported = [
+            Filter::Eq {
+                field: "color".into(),
+                value: value.clone(),
+            },
+            Filter::NotEq {
+                field: "color".into(),
+                value: value.clone(),
+            },
+            Filter::Range {
+                field: "size".into(),
+                gte: Some(1.0),
+                lte: None,
+                gt: None,
+                lt: None,
+            },
+            Filter::In {
+                field: "color".into(),
+                values: vec![value.clone()],
+            },
+            Filter::NotIn {
+                field: "color".into(),
+                values: vec![value.clone()],
+            },
+        ];
+        for filter in &supported {
+            assert!(filter_is_guaranteed_by_complete_bitmaps(
+                filter,
+                &complete_fields
+            ));
+        }
+
+        assert!(filter_is_guaranteed_by_complete_bitmaps(
+            &Filter::And {
+                filters: supported.to_vec(),
+            },
+            &complete_fields
+        ));
+        assert!(filter_is_guaranteed_by_complete_bitmaps(
+            &Filter::Or {
+                filters: Vec::new(),
+            },
+            &complete_fields
+        ));
+        assert!(filter_is_guaranteed_by_complete_bitmaps(
+            &Filter::Not {
+                filter: Box::new(supported[0].clone()),
+            },
+            &complete_fields
+        ));
+        assert!(!filter_is_guaranteed_by_complete_bitmaps(
+            &Filter::Eq {
+                field: "missing".into(),
+                value: value.clone(),
+            },
+            &complete_fields
+        ));
+        assert!(!filter_is_guaranteed_by_complete_bitmaps(
+            &Filter::Contains {
+                field: "color".into(),
+                value: value.clone(),
+            },
+            &complete_fields
+        ));
+        assert!(!filter_is_guaranteed_by_complete_bitmaps(
+            &Filter::ContainsAllTokens {
+                field: "color".into(),
+                tokens: vec!["red".into()],
+            },
+            &complete_fields
+        ));
+        assert!(!filter_is_guaranteed_by_complete_bitmaps(
+            &Filter::ContainsTokenSequence {
+                field: "color".into(),
+                tokens: vec!["red".into()],
+            },
+            &complete_fields
+        ));
+    }
 
     /// Builds the shared five-row fixture used to compare predicate semantics.
     ///

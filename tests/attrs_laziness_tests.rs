@@ -492,6 +492,107 @@ async fn ivf_filtered_sq8_attrs_get_count_is_unchanged() {
 }
 
 #[tokio::test]
+async fn bitmap_filter_elides_only_resolved_coarse_attrs() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let vectors = ivf_vectors();
+    let mut bitmap_config = ivf_config(QuantizationType::Scalar);
+    bitmap_config.bitmap_index = true;
+    let bitmap_index = IvfFlatIndex::build(
+        &vectors,
+        &bitmap_config,
+        &store,
+        &harness.artifact_origin_namespace("bitmap-filter"),
+        "seg_bitmap_filter",
+    )
+    .await
+    .unwrap();
+    let exact_index = IvfFlatIndex::build(
+        &vectors,
+        &ivf_config(QuantizationType::Scalar),
+        &store,
+        &harness.artifact_origin_namespace("exact-filter"),
+        "seg_exact_filter",
+    )
+    .await
+    .unwrap();
+
+    let cases = [
+        (
+            "resolved equality",
+            Filter::Eq {
+                field: "tenant".to_string(),
+                value: AttributeValue::String("keep".to_string()),
+            },
+            true,
+        ),
+        (
+            "unresolved string contains",
+            Filter::Contains {
+                field: "tenant".to_string(),
+                value: AttributeValue::String("kee".to_string()),
+            },
+            false,
+        ),
+    ];
+
+    for (label, filter, bitmap_only) in cases {
+        counter.reset();
+        let bitmap_results = bitmap_index
+            .search(
+                &vectors[0].values,
+                TOP_K,
+                NPROBE_ALL,
+                Some(&filter),
+                DistanceMetric::Euclidean,
+                &store,
+            )
+            .await
+            .unwrap();
+        let bitmap_attrs_gets = counter.gets_for(ArtifactClass::Attrs);
+        let bitmap_gets = counter.gets_for(ArtifactClass::Bitmap);
+
+        counter.reset();
+        let exact_results = exact_index
+            .search(
+                &vectors[0].values,
+                TOP_K,
+                NPROBE_ALL,
+                Some(&filter),
+                DistanceMetric::Euclidean,
+                &store,
+            )
+            .await
+            .unwrap();
+        let exact_attrs_gets = counter.gets_for(ArtifactClass::Attrs);
+
+        let bitmap_id_scores: Vec<_> = bitmap_results
+            .iter()
+            .map(|result| (&result.id, result.score.to_bits()))
+            .collect();
+        let exact_id_scores: Vec<_> = exact_results
+            .iter()
+            .map(|result| (&result.id, result.score.to_bits()))
+            .collect();
+        assert_eq!(bitmap_id_scores, exact_id_scores, "{label}");
+        assert!(bitmap_gets > 0, "{label} must read bitmap sidecars");
+        if bitmap_only {
+            assert!(
+                bitmap_attrs_gets > 0 && bitmap_attrs_gets < exact_attrs_gets,
+                "{label} must retain final attrs verification while removing coarse attrs GETs"
+            );
+        } else {
+            assert_eq!(
+                bitmap_attrs_gets, exact_attrs_gets,
+                "{label} must preserve coarse attrs GETs"
+            );
+        }
+    }
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn hierarchical_flat_unfiltered_attrs_are_lazy_but_enrichment_is_identical() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);

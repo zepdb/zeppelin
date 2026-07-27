@@ -285,6 +285,29 @@ fn read_u64(data: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
 }
 
+fn bootstrap_complete_fields(data: &[u8]) -> Vec<String> {
+    assert!(data.starts_with(b"ZBS1"));
+    assert_eq!(read_u32(data, 4), 2);
+    let offset = read_u64(data, 40) as usize;
+    let len = read_u64(data, 48) as usize;
+    let section = &data[offset..offset + len];
+    let count = read_u32(section, 0) as usize;
+    let mut cursor = 4usize;
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        let field_len = read_u32(section, cursor) as usize;
+        cursor += 4;
+        fields.push(
+            std::str::from_utf8(&section[cursor..cursor + field_len])
+                .unwrap()
+                .to_string(),
+        );
+        cursor += field_len;
+    }
+    assert_eq!(cursor, section.len());
+    fields
+}
+
 fn read_f32(data: &[u8], offset: usize) -> f32 {
     f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
 }
@@ -656,6 +679,31 @@ fn compactor_with_clusters(store: &ZeppelinStore, n_clusters: usize) -> Compacto
         kmeans_max_iterations: 25,
         quantization: zeppelin::index::quantization::QuantizationType::None,
         bitmap_index: false,
+        fts_index: false,
+        hierarchical: false,
+        ..Default::default()
+    };
+    Compactor::new(
+        store.clone(),
+        wal_reader,
+        compaction_config,
+        indexing_config,
+        common::default_gc_upload_window(),
+    )
+}
+
+fn bitmap_incremental_compactor(store: &ZeppelinStore) -> Compactor {
+    let wal_reader = WalReader::new(store.clone());
+    let compaction_config = CompactionConfig {
+        max_wal_fragments_before_compact: 1,
+        retrain_imbalance_threshold: 1000.0,
+        ..Default::default()
+    };
+    let indexing_config = IndexingConfig {
+        default_num_centroids: N_CLUSTERS,
+        kmeans_max_iterations: 25,
+        quantization: zeppelin::index::quantization::QuantizationType::None,
+        bitmap_index: true,
         fts_index: false,
         hierarchical: false,
         ..Default::default()
@@ -1042,6 +1090,120 @@ fn cluster_object_for(segment: &SegmentRef, cluster_idx: usize) -> Option<&Clust
         .cluster_objects
         .iter()
         .find(|object_ref| object_ref.clusters.contains(&cluster_idx))
+}
+
+#[tokio::test]
+async fn bitmap_complete_fields_intersect_rewritten_and_carried_clusters() {
+    for coverage_less_old_bootstrap in [false, true] {
+        let harness = TestHarness::new().await;
+        let ns = harness.artifact_origin_namespace(if coverage_less_old_bootstrap {
+            "bitmap-complete-legacy"
+        } else {
+            "bitmap-complete-current"
+        });
+        common::seed_bound_manifest(&harness.store, &ns).await;
+        common::seed_active_namespace(&harness.store, &ns, DIM, DistanceMetric::Euclidean).await;
+
+        let (mut vectors, _) = clustered_vectors(N_CLUSTERS, 8, DIM, 0.01);
+        for vector in &mut vectors {
+            vector.attributes = Some(HashMap::from([
+                (
+                    "common".to_string(),
+                    AttributeValue::String("yes".to_string()),
+                ),
+                (
+                    "old_only".to_string(),
+                    AttributeValue::String("yes".to_string()),
+                ),
+            ]));
+        }
+        WalWriter::new(harness.store.clone())
+            .append(&ns, vectors.clone(), vec![])
+            .await
+            .unwrap();
+        bitmap_incremental_compactor(&harness.store)
+            .compact(&ns)
+            .await
+            .unwrap();
+
+        let old_segment = active_segment_ref(&harness.store, &ns).await;
+        let old_bootstrap = old_segment.bootstrap.as_ref().unwrap();
+        assert_eq!(
+            bootstrap_complete_fields(&harness.store.get(&old_bootstrap.key).await.unwrap()),
+            vec!["common".to_string(), "old_only".to_string()]
+        );
+        let (_, membership) =
+            decoded_membership(&harness.store, old_segment.membership.as_ref().unwrap()).await;
+        let target_cluster = *membership.values().next().unwrap();
+        let deleted_ids: Vec<String> = membership
+            .iter()
+            .filter(|(_, cluster)| **cluster == target_cluster)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let replacement_values = vectors
+            .iter()
+            .find(|vector| vector.id == deleted_ids[0])
+            .unwrap()
+            .values
+            .clone();
+
+        if coverage_less_old_bootstrap {
+            let mut manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+            manifest
+                .segments
+                .iter_mut()
+                .find(|segment| segment.id == old_segment.id)
+                .unwrap()
+                .bootstrap = None;
+            manifest.write(&harness.store, &ns).await.unwrap();
+        }
+
+        WalWriter::new(harness.store.clone())
+            .append(
+                &ns,
+                vec![VectorEntry {
+                    id: "bitmap_replacement".to_string(),
+                    values: replacement_values,
+                    attributes: Some(HashMap::from([
+                        (
+                            "common".to_string(),
+                            AttributeValue::String("yes".to_string()),
+                        ),
+                        (
+                            "new_only".to_string(),
+                            AttributeValue::String("yes".to_string()),
+                        ),
+                    ])),
+                }],
+                deleted_ids,
+            )
+            .await
+            .unwrap();
+        bitmap_incremental_compactor(&harness.store)
+            .compact(&ns)
+            .await
+            .unwrap();
+
+        let new_segment = active_segment_ref(&harness.store, &ns).await;
+        assert!(
+            new_segment
+                .cluster_owners
+                .iter()
+                .any(|owner| owner != &new_segment.id),
+            "fixture must carry at least one old cluster"
+        );
+        let new_bootstrap = new_segment.bootstrap.as_ref().unwrap();
+        let actual =
+            bootstrap_complete_fields(&harness.store.get(&new_bootstrap.key).await.unwrap());
+        let expected = if coverage_less_old_bootstrap {
+            Vec::new()
+        } else {
+            vec!["common".to_string()]
+        };
+        assert_eq!(actual, expected);
+
+        harness.cleanup().await;
+    }
 }
 
 /// B1 + B2: appending vectors that all fall into ONE cluster rewrites exactly
