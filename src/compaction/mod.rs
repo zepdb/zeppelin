@@ -2936,13 +2936,15 @@ impl Compactor {
     ///
     /// # Errors
     ///
-    /// Propagates missing/corrupt centroid data, a required legacy calibration
-    /// GET, or calibration decoding failure.
+    /// Propagates missing/corrupt bootstrap or centroid data, a required legacy
+    /// calibration GET, or calibration decoding failure.
     ///
     /// # Side Effects
     ///
-    /// Performs one centroid GET and, for legacy scalar segments whose centroid
-    /// blob does not embed calibration, one additional calibration GET.
+    /// Performs one bootstrap GET when the segment advertises that combined
+    /// artifact, otherwise one centroid GET. Legacy scalar segments whose
+    /// centroid blob does not embed calibration require one additional
+    /// calibration GET.
     ///
     /// # Consistency
     ///
@@ -2974,15 +2976,42 @@ impl Compactor {
 
         let physical_namespace = old_segment.physical_namespace();
         let old_segment_id = &old_segment.segment.id;
-        let ckey = centroids_key(physical_namespace, old_segment_id);
-        let centroids_data = get_compaction_read(
-            &self.store,
-            namespace,
-            &ckey,
-            COMPACTION_READ_CLASS_CENTROIDS,
-        )
-        .await?;
-        let decoded_centroids = deserialize_centroids_data(&centroids_data)?;
+        let (decoded_centroids, bitmap_complete_fields) =
+            if let Some(bootstrap_ref) = old_segment.segment.bootstrap.as_ref() {
+                let bootstrap_data = get_compaction_read(
+                    &self.store,
+                    namespace,
+                    &bootstrap_ref.key,
+                    COMPACTION_READ_CLASS_BOOTSTRAP,
+                )
+                .await?;
+                if bootstrap_data.len() as u64 != bootstrap_ref.size_bytes {
+                    return Err(ZeppelinError::Index(format!(
+                        "bootstrap size mismatch for {}: manifest={}, object={}",
+                        bootstrap_ref.key,
+                        bootstrap_ref.size_bytes,
+                        bootstrap_data.len()
+                    )));
+                }
+                let bootstrap = deserialize_bootstrap(&bootstrap_data)?;
+                (
+                    deserialize_centroids_data(bootstrap.centroids)?,
+                    bootstrap.bitmap_complete_fields,
+                )
+            } else {
+                let ckey = centroids_key(physical_namespace, old_segment_id);
+                let centroids_data = get_compaction_read(
+                    &self.store,
+                    namespace,
+                    &ckey,
+                    COMPACTION_READ_CLASS_CENTROIDS,
+                )
+                .await?;
+                (
+                    deserialize_centroids_data(&centroids_data)?,
+                    BTreeSet::new(),
+                )
+            };
         let centroids = decoded_centroids.centroids;
         let dim = decoded_centroids.dim;
         let mut sq_calibration_bytes = decoded_centroids.sq_calibration;
@@ -3006,28 +3035,6 @@ impl Compactor {
             .as_ref()
             .map(|bytes| crate::index::quantization::sq::SqCalibration::from_bytes(bytes))
             .transpose()?;
-        let bitmap_complete_fields =
-            if let Some(bootstrap_ref) = old_segment.segment.bootstrap.as_ref() {
-                let bootstrap_data = get_compaction_read(
-                    &self.store,
-                    namespace,
-                    &bootstrap_ref.key,
-                    COMPACTION_READ_CLASS_BOOTSTRAP,
-                )
-                .await?;
-                if bootstrap_data.len() as u64 != bootstrap_ref.size_bytes {
-                    return Err(ZeppelinError::Index(format!(
-                        "bootstrap size mismatch for {}: manifest={}, object={}",
-                        bootstrap_ref.key,
-                        bootstrap_ref.size_bytes,
-                        bootstrap_data.len()
-                    )));
-                }
-                deserialize_bootstrap(&bootstrap_data)?.bitmap_complete_fields
-            } else {
-                BTreeSet::new()
-            };
-
         Ok(IncrementalCentroidState {
             centroids,
             dim,

@@ -2133,8 +2133,13 @@ async fn test_incremental_read_io_baseline_reads_all_clusters() {
     );
     assert_eq!(
         counter.gets_for(ArtifactClass::Centroids),
+        0,
+        "2C.3: bootstrap-backed segments do not reread the centroid object"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Bootstrap),
         1,
-        "2C.3: reused centroids are loaded once"
+        "2C.3: bootstrap supplies reused centroids and bitmap coverage in one GET"
     );
     assert_eq!(
         counter.gets_for(ArtifactClass::Sketch),
@@ -2222,8 +2227,13 @@ async fn test_incremental_grouped_read_io_baseline_reads_all_cluster_objects() {
     );
     assert_eq!(
         counter.gets_for(ArtifactClass::Centroids),
+        0,
+        "2C.3: bootstrap-backed segments do not reread the centroid object"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Bootstrap),
         1,
-        "2C.3: reused centroids are loaded once"
+        "2C.3: bootstrap supplies reused centroids and bitmap coverage in one GET"
     );
     assert_eq!(
         counter.gets_for(ArtifactClass::Sketch),
