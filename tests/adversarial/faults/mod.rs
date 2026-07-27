@@ -253,7 +253,7 @@ impl FaultEvent {
             | FaultKind::StaleRead
             | FaultKind::HeadGetDiverge => &[ProtectedAssumption::A2],
             FaultKind::StartSecondNode { .. } => &[ProtectedAssumption::A3],
-            FaultKind::AdmitStaleManifestCas => &[ProtectedAssumption::A3],
+            FaultKind::AdmitStaleManifestCas => &[ProtectedAssumption::A1],
             _ => &[],
         }
     }
@@ -3150,6 +3150,20 @@ mod tests {
                     && event.violated_assumptions() == [ProtectedAssumption::A3]
             }));
         }
+    }
+
+    #[test]
+    fn stale_manifest_cas_selftest_exercises_the_write_contract() {
+        let schedule = FaultSchedule::stale_manifest_cas_selftest();
+        assert_eq!(schedule.events.len(), 1);
+        assert_eq!(
+            schedule.events[0].contract_class(),
+            ContractClass::HarnessSelfTest
+        );
+        assert_eq!(
+            schedule.events[0].violated_assumptions(),
+            [ProtectedAssumption::A1]
+        );
     }
 
     #[test]

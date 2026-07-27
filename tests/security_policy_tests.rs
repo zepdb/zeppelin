@@ -1207,13 +1207,17 @@ async fn policy_cas_conflict_second_writer_gets_retryable_conflict() {
             .and_then(|value| value.to_str().ok()),
         Some("1")
     );
-    let conflict_body: serde_json::Value =
-        grant_b.json().await.expect("conflicting grant must be JSON");
+    let conflict_body: serde_json::Value = grant_b
+        .json()
+        .await
+        .expect("conflicting grant must be JSON");
     assert_eq!(conflict_body["code"], "security_conflict");
     assert_eq!(conflict_body["retryable"], true);
 
     publication.release();
-    let grant_a = grant_a.await.expect("first concurrent grant task must join");
+    let grant_a = grant_a
+        .await
+        .expect("first concurrent grant task must join");
     assert_eq!(grant_a.status(), 201);
     let published_body: serde_json::Value =
         grant_a.json().await.expect("published grant must be JSON");

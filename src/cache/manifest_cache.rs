@@ -102,6 +102,7 @@ use tokio::sync::Mutex;
 
 use crate::error::Result;
 use crate::storage::ZeppelinStore;
+use crate::time::Clock;
 use crate::wal::{Manifest, ManifestVersion};
 
 /// Process-local manifest snapshots with per-namespace TTL and singleflight.
@@ -129,10 +130,12 @@ pub struct ManifestCache {
     ttl: Duration,
     /// Per-namespace async mutexes that coalesce remote reads.
     inflight: DashMap<String, Arc<Mutex<()>>>,
-    /// Wall-clock invalidation time used to reject delayed write-throughs.
-    last_invalidated: DashMap<String, DateTime<Utc>>,
+    /// Wall-clock and generation evidence used to fence delayed write-throughs.
+    last_invalidated: DashMap<String, InvalidationFence>,
     /// Per-namespace lifecycle epochs that linearize invalidation and install.
     lifecycle_epochs: DashMap<String, Arc<std::sync::Mutex<u64>>>,
+    /// Wall clock shared by invalidation and write-through guardrails.
+    clock: Clock,
     /// One-shot synchronization seam before deterministic remote-read tests.
     #[cfg(test)]
     remote_read_pause: std::sync::Mutex<Option<ReplacementPause>>,
@@ -174,6 +177,15 @@ struct ManifestPosition {
     generation: u64,
     /// Sequence tie-break used only when both generations are zero.
     legacy_sequence: u64,
+}
+
+/// Process-local evidence retained across one or more invalidations.
+#[derive(Clone, Copy, Debug)]
+struct InvalidationFence {
+    /// Latest observed wall-clock invalidation stamp.
+    invalidated_at: DateTime<Utc>,
+    /// Highest resident position removed by an invalidation, when one existed.
+    minimum_position: Option<ManifestPosition>,
 }
 
 impl ManifestPosition {
@@ -247,12 +259,18 @@ impl ManifestCache {
     /// A 500 ms TTL lets queries arriving shortly after one remote read reuse
     /// its snapshot. Strong reads still verify S3/MinIO regardless of this value.
     pub fn new(ttl: Duration) -> Self {
+        Self::with_clock(ttl, Clock::system())
+    }
+
+    /// Creates an empty manifest cache with an explicit wall clock.
+    fn with_clock(ttl: Duration, clock: Clock) -> Self {
         Self {
             entries: DashMap::new(),
             ttl,
             inflight: DashMap::new(),
             last_invalidated: DashMap::new(),
             lifecycle_epochs: DashMap::new(),
+            clock,
             #[cfg(test)]
             remote_read_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -868,9 +886,9 @@ impl ManifestCache {
     /// # Parameters
     ///
     /// - `namespace`: Namespace whose entry may be advanced.
-    /// - `manifest`: Owned published snapshot. Its `updated_at` must be later
-    ///   than the last invalidation and its `next_sequence` must exceed the
-    ///   currently cached sequence.
+    /// - `manifest`: Owned published snapshot. Its wall time must normally be
+    ///   later than the last invalidation and its position must advance the
+    ///   currently cached position.
     ///
     /// # Returns
     ///
@@ -886,10 +904,11 @@ impl ManifestCache {
     /// # Consistency
     ///
     /// Timestamp fencing prevents a delayed WAL write-through from undoing a
-    /// newer invalidation. Atomic generation ordering prevents publication N
-    /// from replacing N+1. Legacy generation-zero manifests fall back to their
-    /// sequence ordering. The entry is marked unverified because it has no
-    /// associated ETag.
+    /// newer invalidation. When wall time freezes or moves backward, a candidate
+    /// must instead advance the invalidated resident's manifest position.
+    /// Atomic generation ordering prevents publication N from replacing N+1.
+    /// Legacy generation-zero manifests fall back to their sequence ordering.
+    /// The entry is marked unverified because it has no associated ETag.
     ///
     /// # Examples
     ///
@@ -899,13 +918,41 @@ impl ManifestCache {
     pub fn insert(&self, namespace: &str, manifest: Manifest) {
         let lifecycle_lock = self.lifecycle_epoch_lock(namespace);
         let _lifecycle_epoch = Self::lock_lifecycle_epoch(&lifecycle_lock);
-        // Reject if older than last invalidation
-        if let Some(inv_time) = self.last_invalidated.get(namespace) {
-            if manifest.updated_at <= *inv_time {
-                return;
+        let candidate_position = ManifestPosition::of(&manifest);
+        if let Some(fence) = self.last_invalidated.get(namespace) {
+            if manifest.updated_at <= fence.invalidated_at {
+                let observed_at = self.clock.now();
+                let wall_clock_non_monotonic = observed_at <= fence.invalidated_at;
+                let advances_invalidated_position = fence
+                    .minimum_position
+                    .is_some_and(|minimum| candidate_position.strictly_advances(minimum));
+                if wall_clock_non_monotonic && advances_invalidated_position {
+                    tracing::warn!(
+                        namespace,
+                        candidate_generation = candidate_position.generation,
+                        candidate_updated_at = %manifest.updated_at,
+                        invalidation_fence = %fence.invalidated_at,
+                        fence_position = ?fence.minimum_position,
+                        observed_at = %observed_at,
+                        "manifest cache accepted a newer write-through across a \
+                         non-monotonic wall-clock fence"
+                    );
+                } else {
+                    tracing::warn!(
+                        namespace,
+                        candidate_generation = candidate_position.generation,
+                        candidate_updated_at = %manifest.updated_at,
+                        invalidation_fence = %fence.invalidated_at,
+                        fence_position = ?fence.minimum_position,
+                        observed_at = %observed_at,
+                        wall_clock_non_monotonic,
+                        "manifest cache rejected a write-through behind its \
+                         invalidation fence"
+                    );
+                    return;
+                }
             }
         }
-        let candidate_position = ManifestPosition::of(&manifest);
         let candidate = CachedManifest {
             manifest,
             version: ManifestVersion::unversioned(),
@@ -954,7 +1001,7 @@ impl ManifestCache {
     /// the next query to discover that manifest instead of serving the old TTL
     /// entry. Invalidating an already-cold namespace is harmless.
     pub fn invalidate(&self, namespace: &str) {
-        self.invalidate_at(namespace, Utc::now());
+        self.invalidate_at(namespace, self.clock.now());
     }
 
     /// Removes one namespace snapshot and fences older write-throughs.
@@ -968,8 +1015,9 @@ impl ManifestCache {
     ///
     /// # Side Effects
     ///
-    /// Advances the namespace's invalidation fence and removes its resident
-    /// entry. A backward wall-clock jump cannot lower an existing fence.
+    /// Advances the namespace's invalidation fence, retains the removed
+    /// resident's ordering position, and removes the resident entry. A backward
+    /// wall-clock jump cannot lower an existing fence.
     ///
     /// # Consistency
     ///
@@ -982,15 +1030,28 @@ impl ManifestCache {
         *lifecycle_epoch = lifecycle_epoch
             .checked_add(1)
             .unwrap_or_else(|| panic!("manifest cache lifecycle epoch overflow for {namespace}"));
+        let invalidated_position = self
+            .entries
+            .remove(namespace)
+            .map(|(_, entry)| ManifestPosition::of(&entry.manifest));
         self.last_invalidated
             .entry(namespace.to_string())
             .and_modify(|current| {
-                if invalidated_at > *current {
-                    *current = invalidated_at;
+                if invalidated_at > current.invalidated_at {
+                    current.invalidated_at = invalidated_at;
+                }
+                if invalidated_position.is_some_and(|candidate| {
+                    current
+                        .minimum_position
+                        .is_none_or(|minimum| candidate.strictly_advances(minimum))
+                }) {
+                    current.minimum_position = invalidated_position;
                 }
             })
-            .or_insert(invalidated_at);
-        self.entries.remove(namespace);
+            .or_insert(InvalidationFence {
+                invalidated_at,
+                minimum_position: invalidated_position,
+            });
     }
 }
 
@@ -1004,6 +1065,17 @@ mod tests {
     //! Unit tests for local TTL, invalidation, and sequence-ordering behavior.
 
     use super::*;
+    use crate::time::TimeSource;
+
+    /// Wall clock that remains fixed across invalidation and publication.
+    #[derive(Debug)]
+    struct FixedTimeSource(DateTime<Utc>);
+
+    impl TimeSource for FixedTimeSource {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
 
     /// Creates an empty cache without allocating namespace state eagerly.
     #[test]
@@ -1382,20 +1454,47 @@ mod tests {
     #[test]
     fn test_insert_rejects_stale_after_invalidation() {
         let cache = ManifestCache::new(Duration::from_millis(500));
+        let host_now = Utc::now();
 
         // Insert then invalidate
         let mut v3 = Manifest::default();
         v3.next_sequence = 3;
         cache.insert("ns", v3);
-        cache.invalidate("ns");
+        cache.invalidate_at("ns", host_now - chrono::Duration::seconds(5));
 
         // Insert with updated_at before invalidation — should be rejected
         let mut stale = Manifest::default();
         stale.next_sequence = 4;
-        stale.updated_at = chrono::Utc::now() - chrono::Duration::seconds(10);
+        stale.updated_at = host_now - chrono::Duration::seconds(10);
         cache.insert("ns", stale);
 
         assert!(cache.entries.get("ns").is_none());
+    }
+
+    /// A frozen wall clock cannot hide a newer manifest generation.
+    #[tokio::test]
+    async fn insert_accepts_newer_generation_across_frozen_clock_fence() {
+        let store =
+            crate::storage::ZeppelinStore::new(Arc::new(object_store::memory::InMemory::new()));
+        let namespace = "frozen-clock-newer-generation";
+        let frozen_at = DateTime::from_timestamp(1_700_000_000, 0)
+            .expect("frozen test timestamp must be representable");
+        let clock = Clock::from_source(Arc::new(FixedTimeSource(frozen_at)));
+        let cache = ManifestCache::with_clock(Duration::from_secs(60), clock);
+
+        let mut generation_one = Manifest::new();
+        generation_one.write(&store, namespace).await.unwrap();
+        generation_one.updated_at = frozen_at;
+        cache.insert(namespace, generation_one.clone());
+        cache.invalidate(namespace);
+
+        let mut generation_two = generation_one;
+        generation_two.write(&store, namespace).await.unwrap();
+        generation_two.updated_at = frozen_at;
+        cache.insert(namespace, generation_two.clone());
+
+        let resident = cache.entries.get(namespace).unwrap();
+        assert_eq!(resident.manifest.version(), generation_two.version());
     }
 
     /// Uses the injected invalidation stamp to reject a delayed write-through.
