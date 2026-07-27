@@ -58,7 +58,7 @@
 //! 4. Follow `load_sq_object_for_coarse` through the range-read and rerank
 //!    helpers for current grouped SQ objects and legacy compatibility.
 //! 5. Finish with `try_bitmap_prefilter`, `coarse_row_passes`, and
-//!    `enrich_unfiltered_results` for metadata semantics.
+//!    `enrich_final_results` for metadata semantics.
 //!
 //! ## Invariants
 //!
@@ -1319,6 +1319,10 @@ async fn search_ivf_flat_with_trace_inner(
         "probing clusters"
     );
 
+    // Decided once, obeyed by every phase below: which metadata the scan reads,
+    // whether rerank reads attributes, and whether Step 5 post-filters at all.
+    let filter_metadata_path = select_filter_metadata_path(index, filter);
+
     // --- Step 3: Scan selected clusters ---
     // The resident sketch is only allowed to decide which cluster objects to
     // fetch. Scalar-quantized indexes still score every vector in those
@@ -1337,6 +1341,7 @@ async fn search_ivf_flat_with_trace_inner(
                 query,
                 distance_metric,
                 filter,
+                filter_metadata_path,
                 fetch_k,
                 store,
                 cache,
@@ -1352,6 +1357,7 @@ async fn search_ivf_flat_with_trace_inner(
                     query,
                     distance_metric,
                     filter,
+                    filter_metadata_path,
                     fetch_k,
                     store,
                     cache,
@@ -1371,6 +1377,7 @@ async fn search_ivf_flat_with_trace_inner(
                     query,
                     distance_metric,
                     filter,
+                    filter_metadata_path,
                     fetch_k,
                     store,
                     cache,
@@ -1394,6 +1401,7 @@ async fn search_ivf_flat_with_trace_inner(
                 query,
                 distance_metric,
                 filter,
+                filter_metadata_path,
                 fetch_k,
                 store,
                 cache,
@@ -1414,6 +1422,7 @@ async fn search_ivf_flat_with_trace_inner(
                 query,
                 distance_metric,
                 filter,
+                filter_metadata_path,
                 store,
                 cache,
                 index.resident_sketch.is_some() && filter.is_none(),
@@ -1428,16 +1437,26 @@ async fn search_ivf_flat_with_trace_inner(
         "scanned clusters"
     );
 
+    // A scan that already resolved the filter returns exactly the matching
+    // rows, so no post-filter runs and its attributes were never loaded.
+    // Re-applying the filter here would reject every row (see `coarse_row_passes`
+    // and the `None => false` arm below).
+    let post_filter = if filter_metadata_path.resolves_filter_completely() {
+        None
+    } else {
+        filter
+    };
+
     // --- Step 4: Retain candidates by distance ---
     let mut sorted = candidates;
-    if filter.is_some() {
+    if post_filter.is_some() {
         sorted.sort_by(candidate_distance_cmp);
     } else {
         partial_topk_by(&mut sorted, top_k, candidate_distance_cmp);
     }
 
     // --- Step 5: Apply post-filter if present ---
-    let results: Vec<SearchResult> = if let Some(f) = filter {
+    let results: Vec<SearchResult> = if let Some(f) = post_filter {
         sorted
             .into_iter()
             .filter(|c| {
@@ -1460,7 +1479,7 @@ async fn search_ivf_flat_with_trace_inner(
     } else {
         let top_candidates: Vec<Candidate> = sorted.into_iter().take(top_k).collect();
         if include_attributes {
-            enrich_unfiltered_results(
+            enrich_final_results(
                 index,
                 top_candidates,
                 store,
@@ -2140,13 +2159,11 @@ async fn scan_clusters_flat(
     query: &[f32],
     distance_metric: DistanceMetric,
     filter: Option<&Filter>,
+    filter_metadata_path: FilterMetadataPath,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
     use_live_range: bool,
 ) -> Result<Vec<Candidate>> {
-    let has_bitmaps = !index.bitmap_fields.is_empty();
-    let filter_metadata_path = select_filter_metadata_path(index, filter, has_bitmaps);
-
     // Phase 1: Parallel prefetch — all S3 I/O fires concurrently.
     let fetch_objects = cluster_fetch_objects(index, probe_clusters)?;
     let prefetched = futures::future::join_all(fetch_objects.iter().map(|object| {
@@ -2163,7 +2180,6 @@ async fn scan_clusters_flat(
                         owner,
                         cluster_idx,
                         filter,
-                        has_bitmaps,
                         filter_metadata_path,
                         store,
                         cache,
@@ -2320,6 +2336,7 @@ async fn scan_clusters_sq(
     query: &[f32],
     distance_metric: DistanceMetric,
     filter: Option<&Filter>,
+    filter_metadata_path: FilterMetadataPath,
     fetch_k: usize,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
@@ -2348,16 +2365,14 @@ async fn scan_clusters_sq(
     let prefer_colocated_clusters = index.sq_calibration.is_some();
 
     // Phase 1: Coarse ranking with quantized distances — parallel prefetch.
-    let has_bitmaps = !index.bitmap_fields.is_empty();
-    let filter_metadata_path = select_filter_metadata_path(index, filter, has_bitmaps);
-
+    //
     // When a filter is present but NOT resolved by a bitmap index, we must
     // apply it DURING the coarse scan — before truncating to `rerank_count`.
     // Otherwise a selective filter's matches get truncated away by
     // approximate-distance ranking and the query silently under-fills top_k
-    // (Task 6). That needs the per-cluster attrs in the coarse phase, so fetch
-    // them alongside the SQ codes whenever a filter is active. Bitmap-resolved
-    // clusters (prefilter Some) keep their fast path and ignore attrs.
+    // (Task 6). That needs the per-cluster attrs in the coarse phase, so
+    // `filter_metadata_path` fetches them alongside the SQ codes for every
+    // filter the bitmaps cannot fully resolve.
     let fetch_objects = cluster_fetch_objects(index, probe_clusters)?;
     if let Some(stats) = &byte_stats {
         SqSearchByteStats::set_usize(&stats.selected_clusters, probe_clusters.len());
@@ -2388,7 +2403,6 @@ async fn scan_clusters_sq(
                 owner,
                 cluster_idx,
                 filter,
-                has_bitmaps,
                 filter_metadata_path,
                 store,
                 cache,
@@ -2467,6 +2481,7 @@ async fn scan_clusters_sq(
         query,
         distance_metric,
         filter,
+        filter_metadata_path,
         fetch_k,
         store,
         cache,
@@ -2494,6 +2509,7 @@ async fn scan_clusters_rq(
     query: &[f32],
     distance_metric: DistanceMetric,
     filter: Option<&Filter>,
+    filter_metadata_path: FilterMetadataPath,
     fetch_k: usize,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
@@ -2536,8 +2552,6 @@ async fn scan_clusters_rq(
     };
 
     // Phase 1: fetch only grouped coarse ranges and filter before truncation.
-    let has_bitmaps = !index.bitmap_fields.is_empty();
-    let filter_metadata_path = select_filter_metadata_path(index, filter, has_bitmaps);
     let fetch_objects = cluster_fetch_objects(index, probe_clusters)?;
     let rq_prefetched =
         futures::future::join_all(fetch_objects.iter().map(|object| async move {
@@ -2552,7 +2566,6 @@ async fn scan_clusters_rq(
                 owner,
                 cluster_idx,
                 filter,
-                has_bitmaps,
                 filter_metadata_path,
                 store,
                 cache,
@@ -2675,6 +2688,7 @@ async fn scan_clusters_rq(
         query,
         distance_metric,
         filter,
+        filter_metadata_path,
         fetch_k,
         store,
         cache,
@@ -2695,6 +2709,7 @@ async fn rerank_quantized_candidates(
     query: &[f32],
     distance_metric: DistanceMetric,
     filter: Option<&Filter>,
+    filter_metadata_path: FilterMetadataPath,
     fetch_k: usize,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
@@ -2743,7 +2758,9 @@ async fn rerank_quantized_candidates(
             });
     }
 
-    let want_rerank_attrs = filter.is_some();
+    // Attributes here only feed the caller's post-filter. A fully resolved
+    // filter has no post-filter, so reading them would be pure waste.
+    let want_rerank_attrs = filter.is_some() && !filter_metadata_path.resolves_filter_completely();
     let rerank_cluster_ids: Vec<usize> = cluster_candidates.keys().copied().collect();
     let rerank_objects = cluster_fetch_objects(index, &rerank_cluster_ids)?;
     if let Some(stats) = &byte_stats {
@@ -4204,6 +4221,7 @@ async fn scan_clusters_pq(
     query: &[f32],
     distance_metric: DistanceMetric,
     filter: Option<&Filter>,
+    filter_metadata_path: FilterMetadataPath,
     fetch_k: usize,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
@@ -4222,12 +4240,11 @@ async fn scan_clusters_pq(
     let adc_table = codebook.build_adc_table(query, distance_metric);
 
     // Phase 1: Coarse ranking with PQ distances — parallel prefetch.
-    let has_bitmaps = !index.bitmap_fields.is_empty();
-    let filter_metadata_path = select_filter_metadata_path(index, filter, has_bitmaps);
-
+    //
     // Apply a non-bitmap attribute filter DURING the coarse scan so a selective
-    // filter's matches survive truncation (Task 6). Fetch attrs alongside the
-    // PQ codes whenever a filter is active.
+    // filter's matches survive truncation (Task 6). `filter_metadata_path`
+    // fetches attrs alongside the PQ codes for every filter the bitmaps cannot
+    // fully resolve.
     let coarse_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
         let owner = index.cluster_owner(cluster_idx);
         let pq_key = pq_cluster_key(&index.physical_namespace, owner, cluster_idx);
@@ -4239,7 +4256,6 @@ async fn scan_clusters_pq(
                     owner,
                     cluster_idx,
                     filter,
-                    has_bitmaps,
                     filter_metadata_path,
                     store,
                     cache,
@@ -4288,7 +4304,9 @@ async fn scan_clusters_pq(
             .push(id.clone());
     }
 
-    let want_rerank_attrs = filter.is_some();
+    // Attributes here only feed the caller's post-filter. A fully resolved
+    // filter has no post-filter, so reading them would be pure waste.
+    let want_rerank_attrs = filter.is_some() && !filter_metadata_path.resolves_filter_completely();
     let rerank_prefetched =
         futures::future::join_all(cluster_candidates.iter().map(|(&cluster_idx, needed_ids)| {
             let cluster_object = cluster_fetch_object(index, cluster_idx);
@@ -4374,18 +4392,79 @@ async fn scan_clusters_pq(
 /// A bitmap-resolvable `color == "red"` predicate may return positions
 /// `{2, 9, 11}`. A token predicate absent from the bitmap index returns `None`,
 /// so exact row attributes decide matches.
-#[derive(Clone, Copy)]
+async fn try_bitmap_prefilter(
+    index: &IvfFlatIndex,
+    segment_id: &str,
+    cluster_idx: usize,
+    filter: Option<&Filter>,
+    has_bitmaps: bool,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+) -> Result<Option<roaring::RoaringBitmap>> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    if !has_bitmaps {
+        return Ok(None);
+    }
+
+    let bkey = bitmap_key(&index.physical_namespace, segment_id, cluster_idx);
+    let data = fetch_with_cache(cache, store, &bkey, &index.artifact_cache_key(&bkey)).await?;
+    let bitmap_index = ClusterBitmapIndex::from_bytes(&data)?;
+
+    Ok(evaluate_filter_bitmap(filter, &bitmap_index))
+}
+
+/// How one search resolves a filter into per-row membership decisions.
+///
+/// The choice is made once per search from segment-wide bootstrap coverage and
+/// is then obeyed by every phase: coarse metadata loading, rerank attribute
+/// loading, and the final post-filter. Re-deriving it per phase is how a scan
+/// elides attributes that a later phase still requires.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FilterMetadataPath {
+    /// No filter, so no read is charged to filtering at all.
     Unfiltered,
+    /// Every predicate is bitmap-resolvable in every logical cluster, so the
+    /// bitmap alone decides membership and no attribute object is read.
     BitmapOnly,
+    /// At least one predicate needs exact attributes, so both are read.
     BitmapAndAttrs,
 }
 
+impl FilterMetadataPath {
+    /// Reports whether scan output is already exactly the matching rows.
+    ///
+    /// `true` forbids re-applying the filter afterwards: the attributes such a
+    /// re-application would need were deliberately never loaded, so it would
+    /// reject every row rather than confirm it.
+    fn resolves_filter_completely(self) -> bool {
+        matches!(self, Self::Unfiltered | Self::BitmapOnly)
+    }
+}
+
+/// Selects the metadata a search must read to apply one filter.
+///
+/// A filter is bitmap-only when the manifest advertises bitmap sidecars and
+/// every predicate names a field the bootstrap proves is indexed in *every*
+/// logical cluster. Any weaker coverage keeps exact attributes in the read set,
+/// because a single cluster missing the field would otherwise silently drop
+/// rows.
+///
+/// # Parameters
+///
+/// - `index`: Loaded segment handle carrying advertised and complete bitmap
+///   field sets.
+/// - `filter`: Optional metadata predicate for this search.
+///
+/// # Returns
+///
+/// The path every phase of this search must use.
 fn select_filter_metadata_path(
     index: &IvfFlatIndex,
     filter: Option<&Filter>,
-    has_bitmaps: bool,
 ) -> FilterMetadataPath {
+    let has_bitmaps = !index.bitmap_fields.is_empty();
     let (path, path_name, reason) = match filter {
         None => (FilterMetadataPath::Unfiltered, "unfiltered", "no_filter"),
         Some(filter)
@@ -4421,13 +4500,31 @@ fn select_filter_metadata_path(
     path
 }
 
+/// Loads exactly the per-cluster metadata the chosen path requires.
+///
+/// # Parameters
+///
+/// - `index`: Loaded segment handle.
+/// - `segment_id`: Owning segment of this cluster's sidecars.
+/// - `cluster_idx`: Logical cluster being prepared.
+/// - `filter`: Optional metadata predicate for this search.
+/// - `path`: Decision from [`select_filter_metadata_path`].
+/// - `store`: Authoritative object-store reader.
+/// - `cache`: Optional complete-object cache.
+/// - `stats`: Optional SQ diagnostics charged for attribute reads.
+///
+/// # Returns
+///
+/// The optional resolved bitmap and the optional row attributes. On
+/// [`FilterMetadataPath::BitmapOnly`] the attributes are always `None` and the
+/// bitmap is always `Some`; a bitmap that fails to resolve there contradicts
+/// the bootstrap and fails the scan.
 #[allow(clippy::too_many_arguments)]
 async fn load_filter_metadata(
     index: &IvfFlatIndex,
     segment_id: &str,
     cluster_idx: usize,
     filter: Option<&Filter>,
-    has_bitmaps: bool,
     path: FilterMetadataPath,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
@@ -4453,7 +4550,7 @@ async fn load_filter_metadata(
                     segment_id,
                     cluster_idx,
                     filter,
-                    has_bitmaps,
+                    !index.bitmap_fields.is_empty(),
                     store,
                     cache,
                 ),
@@ -4462,29 +4559,6 @@ async fn load_filter_metadata(
             Ok((prefilter?, attrs?))
         }
     }
-}
-
-async fn try_bitmap_prefilter(
-    index: &IvfFlatIndex,
-    segment_id: &str,
-    cluster_idx: usize,
-    filter: Option<&Filter>,
-    has_bitmaps: bool,
-    store: &ZeppelinStore,
-    cache: Option<&Arc<DiskCache>>,
-) -> Result<Option<roaring::RoaringBitmap>> {
-    let Some(filter) = filter else {
-        return Ok(None);
-    };
-    if !has_bitmaps {
-        return Ok(None);
-    }
-
-    let bkey = bitmap_key(&index.physical_namespace, segment_id, cluster_idx);
-    let data = fetch_with_cache(cache, store, &bkey, &index.artifact_cache_key(&bkey)).await?;
-    let bitmap_index = ClusterBitmapIndex::from_bytes(&data)?;
-
-    Ok(evaluate_filter_bitmap(filter, &bitmap_index))
 }
 
 /// Decides whether one row may enter a quantized coarse-ranking frontier.
@@ -4541,12 +4615,14 @@ pub(crate) fn coarse_row_passes(
     }
 }
 
-/// Loads attributes only for final unfiltered winners and builds API results.
+/// Loads attributes only for the final winners and builds API results.
 ///
-/// Unfiltered scans avoid attribute I/O during ranking. When the caller requests
-/// attributes, this helper deduplicates winner clusters, loads their immutable
-/// attribute objects concurrently, and joins maps back by retained cluster/row
-/// coordinates without changing candidate order.
+/// Scans that need no post-filter — unfiltered ones, and filtered ones whose
+/// predicates the cluster bitmaps fully resolved — avoid attribute I/O during
+/// ranking. When the caller requests attributes, this helper deduplicates
+/// winner clusters, loads their immutable attribute objects concurrently, and
+/// joins maps back by retained cluster/row coordinates without changing
+/// candidate order.
 ///
 /// # Parameters
 ///
@@ -4581,7 +4657,7 @@ pub(crate) fn coarse_row_passes(
 /// Ten winners spread across three clusters cause three concurrent attribute
 /// loads, not ten. A sketch proving one cluster has no non-null maps avoids that
 /// cluster's GET and returns `attributes: None` for its winners.
-async fn enrich_unfiltered_results(
+async fn enrich_final_results(
     index: &IvfFlatIndex,
     candidates: Vec<Candidate>,
     store: &ZeppelinStore,
@@ -4805,6 +4881,7 @@ mod tests {
             &[0.0, 0.0],
             DistanceMetric::Euclidean,
             Some(&filter),
+            select_filter_metadata_path(&index, Some(&filter)),
             &store,
             None,
             false,
@@ -4843,6 +4920,7 @@ mod tests {
             &[0.0, 0.0],
             DistanceMetric::Euclidean,
             Some(&filter),
+            select_filter_metadata_path(&index, Some(&filter)),
             &store,
             None,
             false,
