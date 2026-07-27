@@ -157,7 +157,9 @@ use crate::retrieval_scope::{
 };
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult};
-use crate::wal::manifest::{LocatedFragmentRef, LocatedSegmentRef, SegmentRef};
+use crate::wal::manifest::{
+    CoarsePayloadEncoding, LocatedFragmentRef, LocatedSegmentRef, SegmentRef,
+};
 use crate::wal::Manifest;
 use crate::wal::{FragmentCachePolicy, WalFragmentCache, WalReader};
 
@@ -1394,6 +1396,9 @@ async fn execute_query_with_manifest_scoped(
     let eventual_skipped_wal =
         consistency == ConsistencyLevel::Eventual && !manifest.uncompacted_fragments().is_empty();
     let segment_ref = origin_resolver.active_located_segment()?;
+    let coarse_payload_encoding = segment_ref.map_or(CoarsePayloadEncoding::Sq8, |located| {
+        manifest.coarse_payload_encoding(&located.segment.id)
+    });
 
     // WAL work and segment search are independent — they share only the
     // manifest snapshot — so run them concurrently. Strong scans and scores
@@ -1467,6 +1472,7 @@ async fn execute_query_with_manifest_scoped(
             let output = segment_search(
                 store,
                 seg_ref,
+                coarse_payload_encoding,
                 query,
                 top_k,
                 nprobe,
@@ -1565,6 +1571,7 @@ async fn execute_query_with_manifest_scoped(
             let refill = segment_search(
                 store,
                 seg_ref,
+                coarse_payload_encoding,
                 query,
                 refill_top_k,
                 nprobe,
@@ -2034,6 +2041,7 @@ struct SegmentSearchOutput {
 async fn segment_search(
     store: &ZeppelinStore,
     located: LocatedSegmentRef<'_>,
+    coarse_payload_encoding: CoarsePayloadEncoding,
     query: &[f32],
     top_k: usize,
     nprobe: usize,
@@ -2109,6 +2117,7 @@ async fn segment_search(
     use crate::index::ivf_flat::search::search_ivf_flat_with_trace;
     let output = search_ivf_flat_with_trace(
         &index,
+        coarse_payload_encoding,
         query,
         top_k,
         nprobe,

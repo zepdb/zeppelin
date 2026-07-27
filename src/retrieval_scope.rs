@@ -37,7 +37,7 @@ use crate::storage::{CreateOnlyOutcome, ZeppelinStore};
 use crate::types::{
     AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult, VectorEntry,
 };
-use crate::wal::manifest::LocatedSegmentRef;
+use crate::wal::manifest::{CoarsePayloadEncoding, LocatedSegmentRef};
 use crate::wal::Manifest;
 
 const CACHE_KEY_VERSION: &str = "v2";
@@ -346,6 +346,7 @@ impl ScopedAnnIndex {
                 ScopedAnnArtifact::Flat(index) => {
                     let output = search_ivf_flat_with_trace(
                         index,
+                        CoarsePayloadEncoding::Sq8,
                         query,
                         top_k,
                         nprobe,

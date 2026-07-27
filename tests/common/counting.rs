@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -224,6 +225,7 @@ impl ClassCounters {
 #[derive(Clone, Debug, Default)]
 pub struct GetCounter {
     gets: Arc<DashMap<String, u64>>,
+    ranges: Arc<DashMap<String, Vec<Range<usize>>>>,
     puts: Arc<DashMap<String, u64>>,
     create_puts: Arc<DashMap<String, u64>>,
     update_puts: Arc<DashMap<String, u64>>,
@@ -248,6 +250,15 @@ impl GetCounter {
     #[must_use]
     pub fn total_observed_gets(&self) -> u64 {
         self.gets.iter().map(|record| *record.value()).sum()
+    }
+
+    /// Returned byte ranges observed for one exact object key.
+    #[must_use]
+    pub fn ranges_for(&self, key: &str) -> Vec<Range<usize>> {
+        self.ranges
+            .get(key)
+            .map(|ranges| ranges.clone())
+            .unwrap_or_default()
     }
 
     /// Total number of PUTs whose key contains `substr`.
@@ -432,6 +443,7 @@ impl GetCounter {
     /// Reset all recorded counts.
     pub fn reset(&self) {
         self.gets.clear();
+        self.ranges.clear();
         self.puts.clear();
         self.create_puts.clear();
         self.update_puts.clear();
@@ -557,6 +569,11 @@ impl ObjectStore for CountingStore {
             self.counter.classes.record_get_attempt(class);
         }
         let result = self.inner.get_opts(location, options).await?;
+        self.counter
+            .ranges
+            .entry(location.to_string())
+            .or_default()
+            .push(result.range.clone());
         // `GetResult::range` is the byte range actually returned (the whole
         // object for plain GETs, the requested slice for range GETs).
         let bytes = (result.range.end - result.range.start) as u64;

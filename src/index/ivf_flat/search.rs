@@ -101,6 +101,7 @@ use crate::index::quantization::QuantizationType;
 use crate::index::topk::partial_topk_by;
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, DistanceMetric, Filter, SearchResult};
+use crate::wal::manifest::CoarsePayloadEncoding;
 
 use super::build::{
     attrs_key, cluster_key, cluster_object_header_range_len, cluster_object_layout,
@@ -224,7 +225,10 @@ fn candidate_distance_cmp(a: &Candidate, b: &Candidate) -> CmpOrdering {
     a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id))
 }
 
-/// Orders SQ coarse tuples by approximate distance and then identifier.
+/// One quantized coarse candidate before exact full-vector reranking.
+type QuantizedCoarseCandidate = (String, f32, usize, usize);
+
+/// Orders quantized coarse tuples by approximate distance and then identifier.
 ///
 /// # Parameters
 ///
@@ -238,13 +242,34 @@ fn candidate_distance_cmp(a: &Candidate, b: &Candidate) -> CmpOrdering {
 ///
 /// # Examples
 ///
-/// Two SQ rows with equal approximate scores are ordered by ID before exact
+/// Two quantized rows with equal approximate scores are ordered by ID before exact
 /// reranking, which makes truncation reproducible.
-fn coarse_sq_candidate_cmp(
-    a: &(String, f32, usize, usize),
-    b: &(String, f32, usize, usize),
+fn coarse_quantized_candidate_cmp(
+    a: &QuantizedCoarseCandidate,
+    b: &QuantizedCoarseCandidate,
 ) -> CmpOrdering {
     a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+}
+
+/// Hashes exact query bits without process-randomized state.
+fn stable_rq_query_hash(query: &[f32]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in query {
+        hash ^= u64::from(value.to_bits());
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Derives deterministic ADC dithering for one RQ query/cluster pair.
+fn rq_query_adc_seed(rotation_seed: u64, query_hash: u64, cluster_idx: usize) -> u64 {
+    let mut value = rotation_seed
+        ^ query_hash
+        ^ (cluster_idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ 0x5251_5f50_4159_4c44;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 /// Orders PQ coarse tuples by approximate distance and then identifier.
@@ -1151,6 +1176,7 @@ pub async fn search_ivf_flat(
 ) -> Result<Vec<SearchResult>> {
     Ok(search_ivf_flat_with_trace(
         index,
+        CoarsePayloadEncoding::Sq8,
         query,
         top_k,
         nprobe,
@@ -1178,6 +1204,7 @@ pub(crate) struct IvfFlatSearchOutput {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn search_ivf_flat_with_trace(
     index: &IvfFlatIndex,
+    coarse_payload_encoding: CoarsePayloadEncoding,
     query: &[f32],
     top_k: usize,
     nprobe: usize,
@@ -1195,6 +1222,7 @@ pub(crate) async fn search_ivf_flat_with_trace(
             trace.clone(),
             search_ivf_flat_with_trace_inner(
                 index,
+                coarse_payload_encoding,
                 query,
                 top_k,
                 nprobe,
@@ -1215,6 +1243,7 @@ pub(crate) async fn search_ivf_flat_with_trace(
 #[allow(clippy::too_many_arguments)]
 async fn search_ivf_flat_with_trace_inner(
     index: &IvfFlatIndex,
+    coarse_payload_encoding: CoarsePayloadEncoding,
     query: &[f32],
     top_k: usize,
     nprobe: usize,
@@ -1293,22 +1322,50 @@ async fn search_ivf_flat_with_trace_inner(
     // fetch. Scalar-quantized indexes still score every vector in those
     // selected clusters with SQ8 before exact rerank.
     let candidates = match index.quantization {
-        QuantizationType::Scalar => {
-            scan_clusters_sq(
-                index,
-                &scan_clusters,
-                query,
-                distance_metric,
-                filter,
-                fetch_k,
-                store,
-                cache,
-                sq_byte_stats.clone(),
-                rerank_coalesce_gap_bytes,
-            )
-            .await?
-        }
+        QuantizationType::Scalar => match coarse_payload_encoding {
+            CoarsePayloadEncoding::TwoBit => {
+                scan_clusters_rq(
+                    index,
+                    &scan_clusters,
+                    query,
+                    distance_metric,
+                    filter,
+                    fetch_k,
+                    store,
+                    cache,
+                    rerank_coalesce_gap_bytes,
+                )
+                .await?
+            }
+            CoarsePayloadEncoding::Sq8 => {
+                debug!(
+                    reason = "manifest_coarse_payload_is_sq8",
+                    segment_id = index.segment_id,
+                    "RQ scan precondition missed; using SQ8 scan path"
+                );
+                scan_clusters_sq(
+                    index,
+                    &scan_clusters,
+                    query,
+                    distance_metric,
+                    filter,
+                    fetch_k,
+                    store,
+                    cache,
+                    sq_byte_stats.clone(),
+                    rerank_coalesce_gap_bytes,
+                )
+                .await?
+            }
+        },
         QuantizationType::Product => {
+            if coarse_payload_encoding == CoarsePayloadEncoding::TwoBit {
+                debug!(
+                    reason = "product_quantization_uses_pq_scan",
+                    segment_id = index.segment_id,
+                    "RQ scan precondition missed; using existing scan path"
+                );
+            }
             scan_clusters_pq(
                 index,
                 &scan_clusters,
@@ -1322,6 +1379,13 @@ async fn search_ivf_flat_with_trace_inner(
             .await?
         }
         QuantizationType::None => {
+            if coarse_payload_encoding == CoarsePayloadEncoding::TwoBit {
+                debug!(
+                    reason = "unquantized_segment_uses_flat_scan",
+                    segment_id = index.segment_id,
+                    "RQ scan precondition missed; using existing scan path"
+                );
+            }
             scan_clusters_flat(
                 index,
                 &scan_clusters,
@@ -2361,7 +2425,7 @@ async fn scan_clusters_sq(
         }
     }
 
-    let mut coarse_candidates: Vec<(String, f32, usize, usize)> = Vec::new();
+    let mut coarse_candidates: Vec<QuantizedCoarseCandidate> = Vec::new();
     for &cluster_idx in probe_clusters {
         let sq_cluster = sq_by_cluster.remove(&cluster_idx).ok_or_else(|| {
             ZeppelinError::Index(format!(
@@ -2383,14 +2447,258 @@ async fn scan_clusters_sq(
         }
     }
 
+    rerank_quantized_candidates(
+        index,
+        query,
+        distance_metric,
+        filter,
+        fetch_k,
+        store,
+        cache,
+        byte_stats,
+        rerank_coalesce_gap_bytes,
+        coarse_candidates,
+        vector_ranges_by_cluster,
+        prefetched_objects,
+        "sq8",
+    )
+    .await
+}
+
+/// Uses two-bit RaBitQ codes for coarse ranking and exact vectors for reranking.
+///
+/// The query is rotated once. Euclidean and cosine then prepare one
+/// centroid-relative ADC per cluster because the persisted codes are residuals
+/// around that cluster's centroid; the prepared ADC is reused for every row in
+/// the cluster. Dot product can reuse one query ADC across all clusters and
+/// adds the centroid/query term before comparing candidates.
+#[allow(clippy::too_many_arguments)]
+async fn scan_clusters_rq(
+    index: &IvfFlatIndex,
+    probe_clusters: &[usize],
+    query: &[f32],
+    distance_metric: DistanceMetric,
+    filter: Option<&Filter>,
+    fetch_k: usize,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+    rerank_coalesce_gap_bytes: usize,
+) -> Result<Vec<Candidate>> {
+    use crate::index::quantization::rabitq::{self, StructuredRotation};
+
+    let sketch_ref = index.sketch_ref.as_ref().ok_or_else(|| {
+        ZeppelinError::Index(format!(
+            "two-bit segment {} is missing its rotation-bearing sketch reference",
+            index.segment_id
+        ))
+    })?;
+    let rotation_seed = sketch_ref.rotation_seed.ok_or_else(|| {
+        ZeppelinError::Index(format!(
+            "two-bit segment {} has no manifest rotation seed",
+            index.segment_id
+        ))
+    })?;
+    let code_dims = sketch_ref.code_dims;
+    if index.dim > code_dims {
+        return Err(ZeppelinError::Index(format!(
+            "two-bit query dimension {} exceeds encoded dimension {code_dims}",
+            index.dim
+        )));
+    }
+    let rotation = StructuredRotation::new(code_dims, rotation_seed)?;
+    let mut rotated_query = vec![0.0_f32; code_dims];
+    rotated_query[..query.len()].copy_from_slice(query);
+    let mut rotation_scratch = vec![0.0_f32; code_dims];
+    rotation.rotate_in_place(&mut rotated_query, &mut rotation_scratch)?;
+    let query_hash = stable_rq_query_hash(query);
+    let dot_query_adc = if distance_metric == DistanceMetric::DotProduct {
+        Some(rabitq::prepare_query_adc4(
+            &rotated_query,
+            rq_query_adc_seed(rotation_seed, query_hash, 0),
+        )?)
+    } else {
+        None
+    };
+
+    // Phase 1: fetch only grouped coarse ranges and filter before truncation.
+    let has_bitmaps = !index.bitmap_fields.is_empty();
+    let want_attr_filter = filter.is_some();
+    let fetch_objects = cluster_fetch_objects(index, probe_clusters)?;
+    let rq_prefetched =
+        futures::future::join_all(fetch_objects.iter().map(|object| async move {
+            load_rq_object_for_coarse(index, object, store, cache).await
+        }))
+        .await;
+    let meta_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
+        let owner = index.cluster_owner(cluster_idx);
+        async move {
+            let (prefilter, attrs) = tokio::join!(
+                try_bitmap_prefilter(index, owner, cluster_idx, filter, has_bitmaps, store, cache,),
+                async {
+                    if want_attr_filter {
+                        load_attrs(index, cluster_idx, filter, store, cache, None).await
+                    } else {
+                        Ok(None)
+                    }
+                },
+            );
+            (cluster_idx, prefilter, attrs)
+        }
+    }))
+    .await;
+
+    let mut rq_by_cluster = HashMap::new();
+    let mut vector_ranges_by_cluster: HashMap<usize, Vec<Range<usize>>> = HashMap::new();
+    for object_res in rq_prefetched {
+        let fetched = object_res?;
+        for (cluster_idx, ranges) in fetched.vector_ranges {
+            if vector_ranges_by_cluster
+                .insert(cluster_idx, ranges)
+                .is_some()
+            {
+                return Err(ZeppelinError::Index(format!(
+                    "RQ coarse fetched duplicate vector ranges for cluster {cluster_idx}"
+                )));
+            }
+        }
+        for (cluster_idx, rq_cluster) in fetched.rq_clusters {
+            if rq_by_cluster.insert(cluster_idx, rq_cluster).is_some() {
+                return Err(ZeppelinError::Index(format!(
+                    "RQ coarse fetched duplicate cluster {cluster_idx}"
+                )));
+            }
+        }
+    }
+
+    let mut meta_by_cluster = HashMap::new();
+    for (cluster_idx, prefilter, attrs) in meta_prefetched {
+        if meta_by_cluster
+            .insert(cluster_idx, (prefilter?, attrs?))
+            .is_some()
+        {
+            return Err(ZeppelinError::Index(format!(
+                "RQ coarse fetched duplicate metadata for cluster {cluster_idx}"
+            )));
+        }
+    }
+
+    let mut rotated_centroid = vec![0.0_f32; code_dims];
+    let mut query_residual = vec![0.0_f32; code_dims];
+    let mut coarse_candidates: Vec<QuantizedCoarseCandidate> = Vec::new();
+    for &cluster_idx in probe_clusters {
+        let rq_cluster = rq_by_cluster.remove(&cluster_idx).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "RQ coarse missing cluster data for cluster {cluster_idx}"
+            ))
+        })?;
+        if rq_cluster.dim() != code_dims {
+            return Err(ZeppelinError::Index(format!(
+                "RQ cluster {cluster_idx} dimension mismatch: manifest={code_dims}, object={}",
+                rq_cluster.dim()
+            )));
+        }
+        let (prefilter, attrs) = meta_by_cluster.remove(&cluster_idx).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "RQ coarse missing metadata for cluster {cluster_idx}"
+            ))
+        })?;
+        let centroid = index.centroids.get(cluster_idx).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "RQ coarse missing centroid for cluster {cluster_idx}"
+            ))
+        })?;
+        rotated_centroid.fill(0.0);
+        rotated_centroid[..centroid.len()].copy_from_slice(centroid);
+        rotation.rotate_in_place(&mut rotated_centroid, &mut rotation_scratch)?;
+
+        let (query_adc, cluster_score_offset) = match distance_metric {
+            DistanceMetric::Cosine | DistanceMetric::Euclidean => {
+                for ((residual, query_value), centroid_value) in query_residual
+                    .iter_mut()
+                    .zip(&rotated_query)
+                    .zip(&rotated_centroid)
+                {
+                    *residual = *query_value - *centroid_value;
+                }
+                let query_residual_norm_sq = query_residual.iter().map(|value| value * value).sum();
+                let adc = rabitq::prepare_query_adc4(
+                    &query_residual,
+                    rq_query_adc_seed(rotation_seed, query_hash, cluster_idx),
+                )?;
+                (std::borrow::Cow::Owned(adc), query_residual_norm_sq)
+            }
+            DistanceMetric::DotProduct => {
+                let adc = dot_query_adc.as_ref().ok_or_else(|| {
+                    ZeppelinError::Index("RQ dot-product ADC was not prepared".into())
+                })?;
+                let centroid_dot_query = rotated_centroid
+                    .iter()
+                    .zip(&rotated_query)
+                    .map(|(centroid, query)| centroid * query)
+                    .sum::<f32>();
+                (std::borrow::Cow::Borrowed(adc), -centroid_dot_query)
+            }
+        };
+
+        for row_idx in 0..rq_cluster.row_count() {
+            if !coarse_row_passes(filter, &prefilter, &attrs, row_idx) {
+                continue;
+            }
+            let approx_score =
+                rq_cluster.asymmetric_distance(query_adc.as_ref(), row_idx, distance_metric)?
+                    + cluster_score_offset;
+            coarse_candidates.push((
+                rq_cluster.ids()[row_idx].clone(),
+                approx_score,
+                cluster_idx,
+                row_idx,
+            ));
+        }
+    }
+
+    rerank_quantized_candidates(
+        index,
+        query,
+        distance_metric,
+        filter,
+        fetch_k,
+        store,
+        cache,
+        None,
+        rerank_coalesce_gap_bytes,
+        coarse_candidates,
+        vector_ranges_by_cluster,
+        HashMap::new(),
+        "two_bit",
+    )
+    .await
+}
+
+/// Applies the shared bounded exact-rerank phase after quantized coarse scoring.
+#[allow(clippy::too_many_arguments)]
+async fn rerank_quantized_candidates(
+    index: &IvfFlatIndex,
+    query: &[f32],
+    distance_metric: DistanceMetric,
+    filter: Option<&Filter>,
+    fetch_k: usize,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+    byte_stats: Option<Arc<SqSearchByteStats>>,
+    rerank_coalesce_gap_bytes: usize,
+    mut coarse_candidates: Vec<QuantizedCoarseCandidate>,
+    vector_ranges_by_cluster: HashMap<usize, Vec<Range<usize>>>,
+    prefetched_objects: HashMap<String, bytes::Bytes>,
+    coarse_encoding: &'static str,
+) -> Result<Vec<Candidate>> {
     // Rerank factor: take more candidates than needed for full-precision
-    // reranking. Truncation now happens AFTER filtering, so the survivors are
-    // real matches, not filtered-away noise (Task 6).
+    // reranking. Truncation happens after filtering, so the survivors are real
+    // matches rather than filtered-away coarse noise.
     let rerank_count = fetch_k * 4;
     partial_topk_by(
         &mut coarse_candidates,
         rerank_count,
-        coarse_sq_candidate_cmp,
+        coarse_quantized_candidate_cmp,
     );
     if let Some(stats) = &byte_stats {
         SqSearchByteStats::set_usize(&stats.coarse_candidates, coarse_candidates.len());
@@ -2398,9 +2706,10 @@ async fn scan_clusters_sq(
     }
 
     debug!(
+        coarse_encoding,
         coarse_candidates = coarse_candidates.len(),
-        rerank_count = rerank_count,
-        "SQ8 coarse ranking complete, starting rerank"
+        rerank_count,
+        "quantized coarse ranking complete, starting exact rerank"
     );
 
     // Phase 2: Rerank with full-precision vectors — parallel prefetch.
@@ -2502,6 +2811,14 @@ struct CoarseObjectSqFetch {
     vector_ranges: Vec<(usize, Vec<Range<usize>>)>,
     /// Complete bytes retained when a compatibility path had to download them.
     full_object: Option<bytes::Bytes>,
+}
+
+/// Two-bit coarse payloads and exact-vector ranges from one grouped object.
+struct CoarseObjectRqFetch {
+    /// Decoded compact rows keyed by logical cluster.
+    rq_clusters: Vec<(usize, crate::index::quantization::rq::RqClusterCodes)>,
+    /// Absolute full-vector byte ranges aligned with each cluster's RQ IDs.
+    vector_ranges: Vec<(usize, Vec<Range<usize>>)>,
 }
 
 #[derive(Clone)]
@@ -2642,7 +2959,7 @@ async fn load_sq_object_for_coarse(
 
     if let Some(layout) = load_cluster_object_layout(index, object, store, cache, stats).await? {
         if layout.sections.iter().all(|section| section.sq.is_some()) {
-            let sq_bytes = fetch_object_sq_range(
+            let sq_bytes = fetch_object_coarse_range(
                 &object.key,
                 &object.cache_key,
                 object.size_bytes,
@@ -2676,7 +2993,8 @@ async fn load_sq_object_for_coarse(
                     &object.key,
                 )?;
                 let sq_cluster = deserialize_sq_cluster(sq_slice)?;
-                let ranges = full_vector_ranges_from_sq_ids(section, &sq_cluster.ids, index.dim)?;
+                let ranges =
+                    full_vector_ranges_from_coarse_ids(section, &sq_cluster.ids, index.dim)?;
                 sq_clusters.push((cluster_idx, sq_cluster));
                 vector_ranges.push((cluster_idx, ranges));
             }
@@ -2741,6 +3059,77 @@ async fn load_sq_object_for_coarse(
     })
 }
 
+/// Fetches and decodes manifest-selected two-bit coarse regions.
+///
+/// ZCL3 is accepted only through a grouped ranged layout. Missing directories,
+/// missing coarse spans, malformed RQ bytes, and row/full-vector misalignment
+/// are index errors; there is no whole-object or SQ sidecar fallback.
+async fn load_rq_object_for_coarse(
+    index: &IvfFlatIndex,
+    object: &ClusterFetchObject,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+) -> Result<CoarseObjectRqFetch> {
+    use crate::index::quantization::rq::RqClusterCodes;
+
+    let layout = load_cluster_object_layout(index, object, store, cache, None)
+        .await?
+        .ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "two-bit cluster object {} is missing a grouped ranged layout",
+                object.key
+            ))
+        })?;
+    if layout.sections.iter().any(|section| section.sq.is_none()) {
+        return Err(ZeppelinError::Index(format!(
+            "two-bit cluster object {} is missing a coarse range",
+            object.key
+        )));
+    }
+    let coarse_bytes = fetch_object_coarse_range(
+        &object.key,
+        &object.cache_key,
+        object.size_bytes,
+        &layout,
+        &object.clusters,
+        store,
+        cache,
+        None,
+    )
+    .await?;
+    let mut rq_clusters = Vec::with_capacity(object.clusters.len());
+    let mut vector_ranges = Vec::with_capacity(object.clusters.len());
+    for &cluster_idx in &object.clusters {
+        let section = layout.section(cluster_idx).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "cluster {cluster_idx} missing from layout for {}",
+                object.key
+            ))
+        })?;
+        let coarse_range = section.sq.as_ref().ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "cluster {cluster_idx} missing coarse range in {}",
+                object.key
+            ))
+        })?;
+        let coarse_slice = slice_relative_range(
+            &coarse_bytes.bytes,
+            &coarse_range.clone(),
+            coarse_bytes.base_offset,
+            "coarse range",
+            &object.key,
+        )?;
+        let rq_cluster = RqClusterCodes::from_bytes(coarse_slice)?;
+        let ranges = full_vector_ranges_from_coarse_ids(section, rq_cluster.ids(), index.dim)?;
+        rq_clusters.push((cluster_idx, rq_cluster));
+        vector_ranges.push((cluster_idx, ranges));
+    }
+    Ok(CoarseObjectRqFetch {
+        rq_clusters,
+        vector_ranges,
+    })
+}
+
 /// Bytes fetched for one absolute object span plus their origin offset.
 struct RangeBytes {
     /// Absolute object offset corresponding to `bytes[0]`.
@@ -2788,7 +3177,7 @@ struct RangeBytes {
 /// SQ sections `100..180` and `200..260` produce one physical `100..260` read,
 /// 140 logical bytes, and 20 slack bytes.
 #[allow(clippy::too_many_arguments)]
-async fn fetch_object_sq_range(
+async fn fetch_object_coarse_range(
     object_key: &str,
     cache_key: &str,
     object_size_bytes: u64,
@@ -2892,7 +3281,7 @@ async fn fetch_object_sq_range(
 ///
 /// For dimension 128, each derived span is 512 bytes. The preceding ID length
 /// and bytes are skipped, so rerank can fetch only the floating-point payload.
-fn full_vector_ranges_from_sq_ids(
+fn full_vector_ranges_from_coarse_ids(
     section: &ClusterObjectRange,
     ids: &[String],
     dim: usize,
