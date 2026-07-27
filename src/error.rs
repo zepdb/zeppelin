@@ -274,6 +274,10 @@ pub enum ZeppelinError {
     #[error("RaBitQ error: {0}")]
     Rabitq(String),
 
+    /// A two-bit RaBitQ cluster payload is invalid or inconsistent.
+    #[error("RaBitQ cluster payload error: {0}")]
+    Rq(String),
+
     /// A segment membership artifact operation failed.
     #[error("membership artifact error: {0}")]
     Membership(String),
@@ -448,6 +452,12 @@ impl From<crate::index::quantization::rabitq::RabitqError> for ZeppelinError {
     }
 }
 
+impl From<crate::index::quantization::rq::RqError> for ZeppelinError {
+    fn from(error: crate::index::quantization::rq::RqError) -> Self {
+        Self::Rq(error.to_string())
+    }
+}
+
 /// The standard return shape for fallible Zeppelin operations.
 ///
 /// `Ok(T)` carries a successful value and `Err(ZeppelinError)` carries one
@@ -602,6 +612,7 @@ impl ZeppelinError {
             ZeppelinError::RetrievalScope(_) => "INTERNAL_ERROR",
             ZeppelinError::CoarseSketch(_) => "INTERNAL_ERROR",
             ZeppelinError::Rabitq(_) => "INTERNAL_ERROR",
+            ZeppelinError::Rq(_) => "INTERNAL_ERROR",
             ZeppelinError::Membership(_) => "INTERNAL_ERROR",
             ZeppelinError::KMeansConvergence { .. } => "INTERNAL_ERROR",
             ZeppelinError::DimensionMismatch { .. } => "DIMENSION_MISMATCH",
@@ -773,6 +784,7 @@ impl ZeppelinError {
             | ZeppelinError::RetrievalScope(_)
             | ZeppelinError::CoarseSketch(_)
             | ZeppelinError::Rabitq(_)
+            | ZeppelinError::Rq(_)
             | ZeppelinError::Membership(_)
             | ZeppelinError::KMeansConvergence { .. }
             | ZeppelinError::Config(_)
@@ -1031,6 +1043,7 @@ mod tests {
                 remaining_keys: 1,
             },
             ZeppelinError::Index("i".into()),
+            ZeppelinError::Rq("bad payload".into()),
             ZeppelinError::Membership("m".into()),
             ZeppelinError::KMeansConvergence { iterations: 3 },
             ZeppelinError::DimensionMismatch {
