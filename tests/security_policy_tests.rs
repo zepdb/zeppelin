@@ -18,7 +18,7 @@ use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::{Clock, TimeSource};
 
 use common::fault_injection::{
-    delay_get_matching, fail_get_after_cas_conflict_matching, synchronize_cas_pair_matching,
+    delay_get_matching, fail_get_after_cas_conflict_matching, pause_next_cas_matching,
     toggle_cas_precondition_failure_matching, toggle_get_failure_matching,
 };
 use common::harness::TestHarness;
@@ -1153,10 +1153,10 @@ async fn namespace_rbac_grants() {
 }
 
 #[tokio::test]
-async fn policy_cas_conflict_second_writer_retries() {
+async fn policy_cas_conflict_second_writer_gets_retryable_conflict() {
     let harness = TestHarness::new().await;
-    let (store, cas) =
-        synchronize_cas_pair_matching(&scoped_store(&harness), "_security/heads/policy.json");
+    let (store, publication) =
+        pause_next_cas_matching(&scoped_store(&harness), "_security/heads/policy.json");
     let server = start_test_server_full(store, None, Config::default(), false, None).await;
     let admin = client_with_bearer(&server.admin_bearer);
     for principal_id in ["service:cas-a", "service:cas-b"] {
@@ -1173,15 +1173,22 @@ async fn policy_cas_conflict_second_writer_retries() {
         assert_eq!(response.status(), 201);
     }
 
-    cas.enable();
-    let grant_a = admin
-        .post(format!("{}/v1/security/grants", server.base_url))
-        .json(&serde_json::json!({
-            "principal_id": "service:cas-a",
-            "scope": {"kind": "global"},
-            "actions": {"kind": "selected", "actions": ["SystemRead"]}
-        }))
-        .send();
+    publication.arm();
+    let grant_a_admin = admin.clone();
+    let grant_a_url = format!("{}/v1/security/grants", server.base_url);
+    let grant_a = tokio::spawn(async move {
+        grant_a_admin
+            .post(grant_a_url)
+            .json(&serde_json::json!({
+                "principal_id": "service:cas-a",
+                "scope": {"kind": "global"},
+                "actions": {"kind": "selected", "actions": ["SystemRead"]}
+            }))
+            .send()
+            .await
+            .expect("first concurrent grant must complete")
+    });
+    publication.wait_until_paused().await;
     let grant_b = admin
         .post(format!("{}/v1/security/grants", server.base_url))
         .json(&serde_json::json!({
@@ -1189,30 +1196,28 @@ async fn policy_cas_conflict_second_writer_retries() {
             "scope": {"kind": "global"},
             "actions": {"kind": "selected", "actions": ["MetricsRead"]}
         }))
-        .send();
-    let (grant_a, grant_b) = tokio::join!(grant_a, grant_b);
-    let grant_a = grant_a.expect("first concurrent grant must complete");
-    let grant_b = grant_b.expect("second concurrent grant must complete");
-    assert_eq!(grant_a.status(), 201);
-    assert_eq!(grant_b.status(), 201);
-    let mut published_versions = vec![
-        grant_a
-            .json::<serde_json::Value>()
-            .await
-            .expect("first 201 JSON")["policy_version"]
-            .as_u64()
-            .expect("first policy version"),
+        .send()
+        .await
+        .expect("second concurrent grant must complete");
+    assert_eq!(grant_b.status(), 409);
+    assert_eq!(
         grant_b
-            .json::<serde_json::Value>()
-            .await
-            .expect("second 201 JSON")["policy_version"]
-            .as_u64()
-            .expect("second policy version"),
-    ];
-    published_versions.sort_unstable();
-    assert_eq!(published_versions, vec![4, 5]);
-    assert_eq!(cas.arrivals(), 3);
-    assert_eq!(cas.conflicts(), 1);
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let conflict_body: serde_json::Value =
+        grant_b.json().await.expect("conflicting grant must be JSON");
+    assert_eq!(conflict_body["code"], "security_conflict");
+    assert_eq!(conflict_body["retryable"], true);
+
+    publication.release();
+    let grant_a = grant_a.await.expect("first concurrent grant task must join");
+    assert_eq!(grant_a.status(), 201);
+    let published_body: serde_json::Value =
+        grant_a.json().await.expect("published grant must be JSON");
+    assert_eq!(published_body["policy_version"], 4);
 
     let head: PolicyHead = serde_json::from_slice(
         &server
@@ -1222,7 +1227,7 @@ async fn policy_cas_conflict_second_writer_retries() {
             .expect("policy head must exist"),
     )
     .expect("strict policy head");
-    assert_eq!(head.version().get(), 5);
+    assert_eq!(head.version().get(), 4);
     let active: PolicySnapshot = serde_json::from_slice(
         &server
             .store
@@ -1231,12 +1236,14 @@ async fn policy_cas_conflict_second_writer_retries() {
             .expect("active policy snapshot must exist"),
     )
     .expect("strict active policy");
-    for principal_id in ["service:cas-a", "service:cas-b"] {
-        assert!(active
-            .grants()
-            .iter()
-            .any(|grant| grant.principal_id().as_str() == principal_id));
-    }
+    assert!(active
+        .grants()
+        .iter()
+        .any(|grant| grant.principal_id().as_str() == "service:cas-a"));
+    assert!(!active
+        .grants()
+        .iter()
+        .any(|grant| grant.principal_id().as_str() == "service:cas-b"));
 
     let policy_keys = server
         .store
@@ -1263,8 +1270,8 @@ async fn policy_cas_conflict_second_writer_retries() {
             _ => {}
         }
     }
-    assert_eq!(version_four_objects, 2);
-    assert_eq!(version_five_objects, 1);
+    assert_eq!(version_four_objects, 1);
+    assert_eq!(version_five_objects, 0);
 
     server.shutdown().await;
 }
@@ -1303,7 +1310,7 @@ async fn policy_cas_conflict_storm_is_bounded_and_retryable() {
     let body: serde_json::Value = response.json().await.expect("409 must be JSON");
     assert_eq!(body["code"], "security_conflict");
     assert_eq!(body["retryable"], true);
-    assert_eq!(faults.failures_injected(), 5);
+    assert_eq!(faults.failures_injected(), 25);
 
     let head: PolicyHead = serde_json::from_slice(
         &server
