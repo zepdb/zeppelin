@@ -5079,6 +5079,13 @@ mod tests {
             assert!(cap <= nprobe);
             prev = cap;
         }
+        let pruning_nprobes: Vec<usize> = (1..=256)
+            .filter(|&nprobe| adaptive_sketch_budget(nprobe).max_clusters() < nprobe)
+            .collect();
+        assert_eq!(
+            pruning_nprobes,
+            vec![13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 25]
+        );
 
         assert_eq!(adaptive_sketch_budget(8).max_clusters(), 8);
         assert_eq!(adaptive_sketch_budget(16).max_clusters(), 14);
