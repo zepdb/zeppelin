@@ -4071,6 +4071,13 @@ impl NamespaceGraph {
             let rooted = self
                 .root_and_install_identity(&request, &mut lease, stop)
                 .await?;
+            // `StoppedAfterRoot` only exists under `branching-test-support`, so
+            // without that feature this match has a single arm and clippy wants
+            // a `let`. Keep the match: it stays exhaustive either way.
+            #[cfg_attr(
+                not(feature = "branching-test-support"),
+                allow(clippy::infallible_destructuring_match)
+            )]
             let candidate = match rooted {
                 RootedProgress::Candidate(candidate) => candidate,
                 #[cfg(feature = "branching-test-support")]

@@ -6,6 +6,7 @@ use chrono::Utc;
 use common::counting::{counting_store, ArtifactClass};
 use common::fault_injection::fail_put_once_matching;
 use common::harness::TestHarness;
+#[cfg(feature = "branching-test-support")]
 use common::server::scoped_test_security_store;
 use common::vectors::{random_vectors, simple_attributes, with_attributes};
 
