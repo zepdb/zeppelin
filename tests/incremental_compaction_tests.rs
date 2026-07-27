@@ -1740,7 +1740,7 @@ async fn test_v4_manifest_seed_mismatch_fails_query_instead_of_scanning() {
 }
 
 #[tokio::test]
-async fn test_incremental_compaction_fails_when_referenced_sketch_is_missing() {
+async fn test_incremental_compaction_fails_when_legacy_sketch_is_missing() {
     let harness = TestHarness::new().await;
     let ns = harness.artifact_origin_namespace("incr-sketch-missing-fails-loud");
     let store = &harness.store;
@@ -1749,6 +1749,14 @@ async fn test_incremental_compaction_fails_when_referenced_sketch_is_missing() {
     let old_active = active_segment_ref(store, &ns).await;
     assert_eq!(old_active.id, old_segment_id);
     let old_sketch_ref = old_active.sketch.as_ref().unwrap().clone();
+    let mut manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    manifest
+        .segments
+        .iter_mut()
+        .find(|segment| segment.id == old_active.id)
+        .unwrap()
+        .bootstrap = None;
+    manifest.write(store, &ns).await.unwrap();
     store.delete(&old_sketch_ref.key).await.unwrap();
 
     let anchor = seed_vecs
@@ -2143,8 +2151,8 @@ async fn test_incremental_read_io_baseline_reads_all_clusters() {
     );
     assert_eq!(
         counter.gets_for(ArtifactClass::Sketch),
-        1,
-        "2C.3: old sketch is loaded once for stitching"
+        0,
+        "2C.3: bootstrap-backed stitching does not reread the sketch object"
     );
     assert_eq!(
         counter.get_bytes_for(ArtifactClass::Cluster),
@@ -2237,8 +2245,8 @@ async fn test_incremental_grouped_read_io_baseline_reads_all_cluster_objects() {
     );
     assert_eq!(
         counter.gets_for(ArtifactClass::Sketch),
-        1,
-        "2C.3: old sketch is loaded once for stitching"
+        0,
+        "2C.3: bootstrap-backed stitching does not reread the sketch object"
     );
     assert_eq!(
         counter.get_bytes_for(ArtifactClass::Cluster),

@@ -666,11 +666,13 @@ pub struct Compactor {
     test_pre_cas_delay: Option<Duration>,
 }
 
-/// Segment-global training state reused by an incremental IVF-Flat build.
+/// Segment-global state reused by an incremental IVF-Flat build.
 ///
 /// Calibration bytes are retained as well as their decoded form because the
 /// new segment must publish byte-compatible global metadata while encoding
 /// rewritten clusters against the same numeric scale as carried clusters.
+/// Bootstrap-backed segments also carry their embedded sketch bytes so
+/// downstream stitching does not fetch the standalone sketch object.
 struct IncrementalCentroidState {
     /// Borrow-independent owned centroid vectors, one per logical cluster.
     centroids: Vec<Vec<f32>>,
@@ -682,6 +684,8 @@ struct IncrementalCentroidState {
     sq_calibration: Option<crate::index::quantization::sq::SqCalibration>,
     /// Bitmap fields guaranteed complete across every old logical cluster.
     bitmap_complete_fields: BTreeSet<String>,
+    /// Validated embedded sketch bytes for bootstrap-backed segments.
+    bootstrap_sketch_bytes: Option<bytes::Bytes>,
 }
 
 /// Per-cluster rows and rewrite decisions for an incremental segment.
@@ -2839,6 +2843,7 @@ impl Compactor {
             sq_calibration_bytes,
             sq_calibration,
             bitmap_complete_fields,
+            bootstrap_sketch_bytes,
         } = centroid_state;
         let num_clusters = centroids.len();
 
@@ -2896,6 +2901,7 @@ impl Compactor {
             sq_calibration_bytes,
             sq_calibration,
             bitmap_complete_fields,
+            bootstrap_sketch_bytes,
         };
         let cluster_state = IncrementalClusterState {
             cluster_ids,
@@ -2932,11 +2938,13 @@ impl Compactor {
     /// # Returns
     ///
     /// Owned centroids and dimension plus both encoded and decoded SQ
-    /// calibration when scalar quantization is active.
+    /// calibration when scalar quantization is active. Bootstrap-backed
+    /// segments also return the validated embedded sketch bytes.
     ///
     /// # Errors
     ///
-    /// Propagates missing/corrupt bootstrap or centroid data, a required legacy
+    /// Propagates missing/corrupt bootstrap or centroid data, missing or
+    /// size-inconsistent embedded sketch metadata, a required legacy
     /// calibration GET, or calibration decoding failure.
     ///
     /// # Side Effects
@@ -2976,8 +2984,14 @@ impl Compactor {
 
         let physical_namespace = old_segment.physical_namespace();
         let old_segment_id = &old_segment.segment.id;
-        let (decoded_centroids, bitmap_complete_fields) =
+        let (decoded_centroids, bitmap_complete_fields, bootstrap_sketch_bytes) =
             if let Some(bootstrap_ref) = old_segment.segment.bootstrap.as_ref() {
+                let sketch_ref = old_segment.segment.sketch.as_ref().ok_or_else(|| {
+                    ZeppelinError::CoarseSketch(format!(
+                        "bootstrap {} present but segment is missing sketch ref",
+                        bootstrap_ref.key
+                    ))
+                })?;
                 let bootstrap_data = get_compaction_read(
                     &self.store,
                     namespace,
@@ -2994,9 +3008,19 @@ impl Compactor {
                     )));
                 }
                 let bootstrap = deserialize_bootstrap(&bootstrap_data)?;
+                if sketch_ref.size_bytes != bootstrap.sketch.len() as u64 {
+                    return Err(ZeppelinError::CoarseSketch(format!(
+                        "coarse sketch size mismatch inside bootstrap {}: manifest={}, section={}",
+                        bootstrap_ref.key,
+                        sketch_ref.size_bytes,
+                        bootstrap.sketch.len()
+                    )));
+                }
+                let sketch_range = bootstrap.sketch_range.clone();
                 (
                     deserialize_centroids_data(bootstrap.centroids)?,
                     bootstrap.bitmap_complete_fields,
+                    Some(bootstrap_data.slice(sketch_range)),
                 )
             } else {
                 let ckey = centroids_key(physical_namespace, old_segment_id);
@@ -3010,6 +3034,7 @@ impl Compactor {
                 (
                     deserialize_centroids_data(&centroids_data)?,
                     BTreeSet::new(),
+                    None,
                 )
             };
         let centroids = decoded_centroids.centroids;
@@ -3041,6 +3066,7 @@ impl Compactor {
             sq_calibration_bytes,
             sq_calibration,
             bitmap_complete_fields,
+            bootstrap_sketch_bytes,
         })
     }
 
@@ -3144,7 +3170,7 @@ impl Compactor {
     )> {
         use crate::index::ivf_flat::sketch::decode_resident_sketch;
 
-        let centroid_state = self
+        let mut centroid_state = self
             .load_incremental_centroid_state(namespace, old_segment, indexing_config)
             .await?;
         let num_clusters = centroid_state.centroids.len();
@@ -3161,27 +3187,32 @@ impl Compactor {
                 "bounded incremental requires an old resident sketch for carried clusters".into(),
             )
         })?;
-        let old_sketch_data = match get_compaction_read(
-            &self.store,
-            namespace,
-            &old_sketch_ref.key,
-            COMPACTION_READ_CLASS_SKETCH,
-        )
-        .await
-        {
-            Ok(data) => data,
-            Err(ZeppelinError::NotFound { key }) => {
-                warn!(
-                    key = %key,
-                    "old resident sketch missing for bounded incremental stitching"
-                );
-                meter_sketch_unavailable(namespace, "old_sketch_missing");
-                return Err(ZeppelinError::CoarseSketch(format!(
-                    "bounded incremental referenced resident sketch is missing: {key}"
-                )));
-            }
-            Err(error) => return Err(error),
-        };
+        let old_sketch_data =
+            if let Some(bootstrap_sketch_bytes) = centroid_state.bootstrap_sketch_bytes.take() {
+                bootstrap_sketch_bytes
+            } else {
+                match get_compaction_read(
+                    &self.store,
+                    namespace,
+                    &old_sketch_ref.key,
+                    COMPACTION_READ_CLASS_SKETCH,
+                )
+                .await
+                {
+                    Ok(data) => data,
+                    Err(ZeppelinError::NotFound { key }) => {
+                        warn!(
+                            key = %key,
+                            "old resident sketch missing for bounded incremental stitching"
+                        );
+                        meter_sketch_unavailable(namespace, "old_sketch_missing");
+                        return Err(ZeppelinError::CoarseSketch(format!(
+                            "bounded incremental referenced resident sketch is missing: {key}"
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
         let old_sketch = decode_resident_sketch(
             old_sketch_data,
             old_sketch_ref,
@@ -3452,6 +3483,7 @@ impl Compactor {
             sq_calibration_bytes,
             sq_calibration,
             bitmap_complete_fields: old_bitmap_complete_fields,
+            bootstrap_sketch_bytes,
         } = centroid_state;
         let IncrementalClusterState {
             cluster_ids,
@@ -3543,14 +3575,18 @@ impl Compactor {
                 }
             }
         } else if let Some(old_sketch_ref) = old_sketch_ref {
-            match get_compaction_read(
-                &self.store,
-                namespace,
-                &old_sketch_ref.key,
-                COMPACTION_READ_CLASS_SKETCH,
-            )
-            .await
-            {
+            let old_sketch_data = if let Some(bootstrap_sketch_bytes) = bootstrap_sketch_bytes {
+                Ok(bootstrap_sketch_bytes)
+            } else {
+                get_compaction_read(
+                    &self.store,
+                    namespace,
+                    &old_sketch_ref.key,
+                    COMPACTION_READ_CLASS_SKETCH,
+                )
+                .await
+            };
+            match old_sketch_data {
                 Ok(old_sketch_data) => {
                     match crate::index::ivf_flat::sketch::ResidentSketch::from_owned_bytes(
                         old_sketch_data,
