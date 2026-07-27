@@ -6,10 +6,11 @@
 //! through a kernel-minted governance permit. The target metadata CAS remains
 //! the sole visibility boundary.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -46,7 +47,9 @@ use crate::namespace::{
     BranchId, BranchRoot, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
 };
 use crate::security::{RootReleaseAuditProgress, RootReleaseFailureClass, SecurityError};
-use crate::storage::{CreateOnlyOutcome, NamespaceObjectKey, StorageVersion, ZeppelinStore};
+use crate::storage::{
+    CreateOnlyOutcome, ListedObject, NamespaceObjectKey, StorageVersion, ZeppelinStore,
+};
 use crate::time::Clock;
 use crate::wal::manifest::{BranchLineageSeed, PreparedManifestPublication, PreparedZeroCopyFork};
 use crate::wal::{Lease, LeaseManager, Manifest};
@@ -55,6 +58,101 @@ const MAX_PREPARE_ATTEMPTS: usize = 16;
 const NEVER_ACTIVE_CLEANUP_BUDGET: Duration = Duration::from_secs(25);
 const ORPHAN_BRANCH_ROOT_READINESS_LIMIT: usize = 16;
 const BRANCH_INTENT_STALL_THRESHOLD_SECS: i64 = 300;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchMaintenancePolicy {
+    fingerprint: BranchMaintenanceConfigFingerprint,
+    minimum_maturity_interval: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchMaintenanceConfigFingerprint {
+    max_children_per_namespace: usize,
+    max_depth: u16,
+    gc_horizon_secs: u64,
+    gc_horizon_floor_secs: Option<u64>,
+    minimum_maturity_interval_secs: u64,
+}
+
+impl BranchMaintenancePolicy {
+    #[must_use]
+    pub(crate) fn new(
+        branching: &BranchingConfig,
+        gc_horizon_secs: u64,
+        gc_horizon_floor_secs: Option<u64>,
+        minimum_maturity_interval_secs: u64,
+    ) -> Self {
+        Self {
+            fingerprint: BranchMaintenanceConfigFingerprint {
+                max_children_per_namespace: branching.max_children_per_namespace,
+                max_depth: branching.max_depth,
+                gc_horizon_secs,
+                gc_horizon_floor_secs,
+                minimum_maturity_interval_secs,
+            },
+            minimum_maturity_interval: Duration::from_secs(minimum_maturity_interval_secs),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BranchMaintenanceMemo {
+    inventory: BranchMaintenanceInventoryFingerprint,
+    incarnations: BTreeMap<String, Option<NamespaceIncarnationId>>,
+    namespace_prefix: Option<String>,
+    observed_delete_eligible: bool,
+    observed_fork_namespace: bool,
+    observed_branch_root: bool,
+    next_maturity_at: DateTime<Utc>,
+    last_now: DateTime<Utc>,
+    last_pass_complete: bool,
+    config: BranchMaintenanceConfigFingerprint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchMaintenanceInventoryFingerprint(BTreeMap<String, BranchMaintenanceObjectFingerprint>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchMaintenanceObjectFingerprint {
+    size: u64,
+    last_modified: DateTime<Utc>,
+    version: StorageVersion,
+}
+
+impl BranchMaintenanceInventoryFingerprint {
+    fn from_listed(listed: &[ListedObject]) -> Option<Self> {
+        let mut objects = BTreeMap::new();
+        for object in listed {
+            let version = object.version.clone()?;
+            if objects
+                .insert(
+                    object.key.clone(),
+                    BranchMaintenanceObjectFingerprint {
+                        size: object.size,
+                        last_modified: object.last_modified,
+                        version,
+                    },
+                )
+                .is_some()
+            {
+                return None;
+            }
+        }
+        Some(Self(objects))
+    }
+}
+
+struct ActiveGraphVerification {
+    completed: bool,
+    branch_roots: usize,
+}
+
+struct BranchMaintenanceAttempt<'a> {
+    policy: &'a BranchMaintenancePolicy,
+    namespace_prefix: Option<&'a str>,
+    previous: Option<&'a BranchMaintenanceMemo>,
+    now: DateTime<Utc>,
+}
 
 /// Operator-safe identity and digest projection for one orphan branch root.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -5029,9 +5127,12 @@ impl NamespaceGraph {
         parent: &NamespaceMetadata,
         started: &Instant,
         budget: Duration,
-    ) -> Result<bool> {
+    ) -> Result<ActiveGraphVerification> {
         if started.elapsed() >= budget {
-            return Ok(false);
+            return Ok(ActiveGraphVerification {
+                completed: false,
+                branch_roots: 0,
+            });
         }
         let (parent_manifest, _) = match parent.incarnation_id.as_ref() {
             Some(incarnation) => {
@@ -5044,10 +5145,14 @@ impl NamespaceGraph {
             }
             None => Manifest::read_versioned_required(&self.store, &parent.name).await?,
         };
+        let branch_roots = parent_manifest.branch_roots().len();
 
         for root in parent_manifest.branch_roots().values() {
             if started.elapsed() >= budget {
-                return Ok(false);
+                return Ok(ActiveGraphVerification {
+                    completed: false,
+                    branch_roots,
+                });
             }
             match self
                 .namespace_manager
@@ -5064,7 +5169,10 @@ impl NamespaceGraph {
                 Err(error) => return Err(error),
             }
         }
-        Ok(true)
+        Ok(ActiveGraphVerification {
+            completed: true,
+            branch_roots,
+        })
     }
 
     async fn verify_active_graph_state(
@@ -5072,9 +5180,12 @@ impl NamespaceGraph {
         metadata: &NamespaceMetadata,
         started: &Instant,
         budget: Duration,
-    ) -> Result<bool> {
+    ) -> Result<ActiveGraphVerification> {
         if started.elapsed() >= budget {
-            return Ok(false);
+            return Ok(ActiveGraphVerification {
+                completed: false,
+                branch_roots: 0,
+            });
         }
         self.verify_active_branch(metadata).await?;
         self.verify_live_child_roots(metadata, started, budget)
@@ -5234,14 +5345,96 @@ impl NamespaceGraph {
 
     /// Resolve expired activation guards, resume governed deletion, and repair
     /// already-authorized branch state without authenticating or activating.
+    #[cfg(feature = "branching-test-support")]
     pub(crate) async fn maintain(
         &self,
         governance: Arc<dyn DeletionGovernance>,
         activation_recovery: Arc<dyn BranchActivationRecovery>,
         budget: Duration,
     ) -> Result<BranchMaintenanceReport> {
+        let policy = BranchMaintenancePolicy::new(
+            &self.branching,
+            self.gc_horizon_floor_secs.unwrap_or_default(),
+            self.gc_horizon_floor_secs,
+            30,
+        );
+        let mut memo = None;
+        self.maintain_memoized(
+            governance,
+            activation_recovery,
+            budget,
+            &policy,
+            None,
+            &mut memo,
+        )
+        .await
+    }
+
+    pub(crate) async fn maintain_memoized(
+        &self,
+        governance: Arc<dyn DeletionGovernance>,
+        activation_recovery: Arc<dyn BranchActivationRecovery>,
+        budget: Duration,
+        policy: &BranchMaintenancePolicy,
+        namespace_prefix: Option<&str>,
+        memo: &mut Option<BranchMaintenanceMemo>,
+    ) -> Result<BranchMaintenanceReport> {
+        let now = self.clock.now();
+        let previous = memo.clone();
+        match self
+            .maintain_memoized_inner(
+                governance,
+                activation_recovery,
+                budget,
+                BranchMaintenanceAttempt {
+                    policy,
+                    namespace_prefix,
+                    previous: previous.as_ref(),
+                    now,
+                },
+            )
+            .await
+        {
+            Ok((report, Some(completed))) => {
+                *memo = Some(completed);
+                Ok(report)
+            }
+            Ok((report, None)) => {
+                Self::mark_maintenance_memo_incomplete(memo, now);
+                Ok(report)
+            }
+            Err(error) => {
+                Self::mark_maintenance_memo_incomplete(memo, now);
+                Err(error)
+            }
+        }
+    }
+
+    fn mark_maintenance_memo_incomplete(
+        memo: &mut Option<BranchMaintenanceMemo>,
+        now: DateTime<Utc>,
+    ) {
+        if let Some(memo) = memo.as_mut() {
+            memo.last_now = now;
+            memo.last_pass_complete = false;
+        }
+    }
+
+    async fn maintain_memoized_inner(
+        &self,
+        governance: Arc<dyn DeletionGovernance>,
+        activation_recovery: Arc<dyn BranchActivationRecovery>,
+        budget: Duration,
+        attempt: BranchMaintenanceAttempt<'_>,
+    ) -> Result<(BranchMaintenanceReport, Option<BranchMaintenanceMemo>)> {
+        let BranchMaintenanceAttempt {
+            policy,
+            namespace_prefix,
+            previous,
+            now,
+        } = attempt;
         if budget.is_zero() {
-            return Ok(BranchMaintenanceReport::default());
+            return Ok((BranchMaintenanceReport::default(), None));
         }
         let started = Instant::now();
         let mut report = BranchMaintenanceReport::default();
@@ -5259,26 +5452,101 @@ impl NamespaceGraph {
                 }
             }
         }
+        if started.elapsed() >= budget {
+            return Ok((report, None));
+        }
+
+        let mut listed = self.store.list_namespace_metadata_meta().await?;
+        if let Some(namespace_prefix) = namespace_prefix {
+            listed.retain(|metadata| {
+                metadata
+                    .key
+                    .strip_suffix("/meta.json")
+                    .is_some_and(|namespace| namespace.starts_with(namespace_prefix))
+            });
+        }
+        if started.elapsed() >= budget {
+            return Ok((report, None));
+        }
+        let inventory = BranchMaintenanceInventoryFingerprint::from_listed(&listed);
+        if report.activation_guards_inspected == 0 {
+            if let (Some(previous), Some(inventory)) = (previous, inventory.as_ref()) {
+                let incarnation_inventory_valid =
+                    previous
+                        .incarnations
+                        .iter()
+                        .all(|(namespace, incarnation)| {
+                            incarnation.is_some()
+                                && inventory
+                                    .0
+                                    .contains_key(&NamespaceMetadata::s3_key(namespace))
+                        });
+                if previous.last_pass_complete
+                    && previous.config == policy.fingerprint
+                    && previous.namespace_prefix.as_deref() == namespace_prefix
+                    && now >= previous.last_now
+                    && now < previous.next_maturity_at
+                    && !previous.observed_delete_eligible
+                    && !previous.observed_fork_namespace
+                    && !previous.observed_branch_root
+                    && incarnation_inventory_valid
+                    && &previous.inventory == inventory
+                {
+                    let mut completed = previous.clone();
+                    completed.last_now = now;
+                    return Ok((report, Some(completed)));
+                }
+            }
+        }
+
         let mut seen_targets = HashSet::new();
-        let prefixes = self.store.list_common_prefixes("").await?;
-        for prefix in prefixes {
+        let mut incarnations = BTreeMap::new();
+        let mut observed_delete_eligible = false;
+        let mut observed_fork_namespace = false;
+        let mut observed_branch_root = false;
+        let mut inventory_stable = inventory.is_some();
+        let mut completed = true;
+        for listed_metadata in &listed {
             if started.elapsed() >= budget {
+                completed = false;
                 break;
             }
-            let target_name = prefix.trim_end_matches('/');
-            if !seen_targets.insert(target_name.to_string()) {
+            let Some(target_name) = listed_metadata.key.strip_suffix("/meta.json") else {
+                inventory_stable = false;
+                continue;
+            };
+            if NamespaceId::new(target_name.to_string()).is_err() {
                 continue;
             }
-            let (metadata, _) = match self
+            if !seen_targets.insert(target_name.to_string()) {
+                inventory_stable = false;
+                continue;
+            }
+            let (metadata, metadata_version) = match self
                 .namespace_manager
                 .read_metadata_versioned(target_name)
                 .await
             {
                 Ok(value) => value,
-                Err(ZeppelinError::NamespaceNotFound { .. }) => continue,
+                Err(ZeppelinError::NamespaceNotFound { .. }) => {
+                    inventory_stable = false;
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
+            if listed_metadata
+                .version
+                .as_ref()
+                .zip(metadata_version.as_ref())
+                .is_none_or(|(listed, read)| listed != read)
+            {
+                inventory_stable = false;
+            }
+            incarnations.insert(target_name.to_string(), metadata.incarnation_id.clone());
+            observed_fork_namespace |=
+                matches!(metadata.creation_kind, NamespaceCreationKind::Fork(_));
             if started.elapsed() >= budget {
+                completed = false;
                 break;
             }
             // A never-active fork is resumable here only when its intent
@@ -5287,14 +5555,8 @@ impl NamespaceGraph {
             // authorized cancellation intent is deliberately left alone:
             // unattended maintenance must report it and wait for a fresh
             // authorized request rather than finish the destruction itself.
-            if metadata.state == NamespaceState::Deleting
-                || (metadata.state == NamespaceState::Active && metadata.deletion_intent.is_some())
-                || (metadata.state == NamespaceState::Creating
-                    && metadata
-                        .deletion_intent
-                        .as_ref()
-                        .is_some_and(|intent| intent.branch_activation_nonce.is_some()))
-            {
+            if Self::is_delete_eligible_maintenance_state(&metadata) {
+                observed_delete_eligible = true;
                 report.deletions_inspected += 1;
                 let remaining = budget.saturating_sub(started.elapsed());
                 match self
@@ -5329,10 +5591,12 @@ impl NamespaceGraph {
                 continue;
             }
             if metadata.state == NamespaceState::Active {
-                if !self
+                let verification = self
                     .verify_active_graph_state(&metadata, &started, budget)
-                    .await?
-                {
+                    .await?;
+                observed_branch_root |= verification.branch_roots > 0;
+                if !verification.completed {
+                    completed = false;
                     break;
                 }
                 if matches!(metadata.creation_kind, NamespaceCreationKind::Fork(_)) {
@@ -5523,6 +5787,37 @@ impl NamespaceGraph {
                 }
             }
         }
-        Ok(report)
+        let completed_memo = if completed && inventory_stable {
+            inventory.and_then(|inventory| {
+                chrono::Duration::from_std(policy.minimum_maturity_interval)
+                    .ok()
+                    .and_then(|interval| now.checked_add_signed(interval))
+                    .map(|next_maturity_at| BranchMaintenanceMemo {
+                        inventory,
+                        incarnations,
+                        namespace_prefix: namespace_prefix.map(str::to_string),
+                        observed_delete_eligible,
+                        observed_fork_namespace,
+                        observed_branch_root,
+                        next_maturity_at,
+                        last_now: now,
+                        last_pass_complete: true,
+                        config: policy.fingerprint.clone(),
+                    })
+            })
+        } else {
+            None
+        };
+        Ok((report, completed_memo))
+    }
+
+    fn is_delete_eligible_maintenance_state(metadata: &NamespaceMetadata) -> bool {
+        metadata.state == NamespaceState::Deleting
+            || (metadata.state == NamespaceState::Active && metadata.deletion_intent.is_some())
+            || (metadata.state == NamespaceState::Creating
+                && metadata
+                    .deletion_intent
+                    .as_ref()
+                    .is_some_and(|intent| intent.branch_activation_nonce.is_some()))
     }
 }

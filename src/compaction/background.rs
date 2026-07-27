@@ -150,7 +150,7 @@ use crate::fts::FtsFieldConfig;
 use crate::namespace::branching::activation::BranchActivationRecovery;
 use crate::namespace::branching::deletion::DeletionGovernance;
 use crate::namespace::branching::{BranchMaintenanceReport, NamespaceDeleteOutcome};
-use crate::namespace::graph::NamespaceGraph;
+use crate::namespace::graph::{BranchMaintenanceMemo, BranchMaintenancePolicy, NamespaceGraph};
 use crate::namespace::manager::{NamespaceMetadata, NamespaceState};
 use crate::namespace::{BranchReadinessObserver, NamespaceId, NamespaceManager};
 use crate::security::SecurityKernel;
@@ -604,6 +604,8 @@ pub struct GovernedDeletionWorker {
     graph: Arc<NamespaceGraph>,
     governance: Arc<dyn DeletionGovernance>,
     activation_recovery: Arc<dyn BranchActivationRecovery>,
+    maintenance_memo: Arc<tokio::sync::Mutex<Option<BranchMaintenanceMemo>>>,
+    maintenance_policy: BranchMaintenancePolicy,
     readiness: BranchReadinessObserver,
     branching_enabled: bool,
 }
@@ -636,6 +638,12 @@ impl GovernedDeletionWorker {
             security.namespace_delete_maintenance_governance(store.clone(), clock.clone());
         let activation_recovery = security.branch_activation_recovery();
         let branching_enabled = config.branching.enabled;
+        let maintenance_policy = BranchMaintenancePolicy::new(
+            &config.branching,
+            config.gc.horizon_secs,
+            config.gc_horizon_floor_secs(),
+            config.compaction.interval_secs,
+        );
         let graph = NamespaceGraph::new(
             store,
             namespace_manager,
@@ -650,6 +658,8 @@ impl GovernedDeletionWorker {
             graph: Arc::new(graph),
             governance,
             activation_recovery,
+            maintenance_memo: Arc::new(tokio::sync::Mutex::new(None)),
+            maintenance_policy,
             readiness,
             branching_enabled,
         }
@@ -702,11 +712,15 @@ impl GovernedDeletionWorker {
     }
 
     async fn maintain(&self, budget: Duration) -> Result<BranchMaintenanceReport> {
+        let mut memo = self.maintenance_memo.lock().await;
         self.graph
-            .maintain(
+            .maintain_memoized(
                 Arc::clone(&self.governance),
                 Arc::clone(&self.activation_recovery),
                 budget,
+                &self.maintenance_policy,
+                self.readiness.namespace_prefix.as_deref(),
+                &mut memo,
             )
             .await
     }

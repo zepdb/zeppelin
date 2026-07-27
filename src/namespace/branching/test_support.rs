@@ -52,7 +52,7 @@ use crate::namespace::branch_root::{
     insert_branch_root, remove_branch_root, source_data_plane_config_digest,
     InsertBranchRootRequest, RemoveBranchRootRequest,
 };
-use crate::namespace::graph::NamespaceGraph;
+use crate::namespace::graph::{BranchMaintenanceMemo, BranchMaintenancePolicy, NamespaceGraph};
 use crate::namespace::manager::NamespaceIndexConfig;
 use crate::namespace::{NamespaceId, NamespaceIncarnationId, NamespaceManager};
 use crate::security::{
@@ -224,6 +224,78 @@ fn graph_for_test_with_config_and_clock(
 struct TestDeletionGovernance;
 
 struct TestBranchActivationRecovery;
+
+/// Stateful feature-only branch-maintenance runner.
+///
+/// Integration tests retain this value across ticks to exercise the same
+/// process-local memo lifecycle as [`crate::compaction::background::GovernedDeletionWorker`]
+/// without starting the background scheduler.
+pub struct BranchMaintenanceRunnerForTest {
+    store: ZeppelinStore,
+    clock: Clock,
+    graph: NamespaceGraph,
+    policy: BranchMaintenancePolicy,
+    namespace_prefix: Option<String>,
+    memo: Option<BranchMaintenanceMemo>,
+}
+
+impl BranchMaintenanceRunnerForTest {
+    /// Compose one cold runner from an exact validated configuration.
+    pub fn new(store: ZeppelinStore, config: &Config, clock: Clock) -> Result<Self> {
+        Self::new_scoped(store, config, clock, None)
+    }
+
+    /// Compose one cold runner restricted to a lexical test namespace prefix.
+    pub fn new_scoped(
+        store: ZeppelinStore,
+        config: &Config,
+        clock: Clock,
+        namespace_prefix: Option<String>,
+    ) -> Result<Self> {
+        let graph = graph_for_test_with_config_and_clock(store.clone(), config, clock.clone())?;
+        let policy = BranchMaintenancePolicy::new(
+            &config.branching,
+            config.gc.horizon_secs,
+            config.gc_horizon_floor_secs(),
+            config.compaction.interval_secs,
+        );
+        Ok(Self {
+            store,
+            clock,
+            graph,
+            policy,
+            namespace_prefix,
+            memo: None,
+        })
+    }
+
+    /// Run one tick while retaining disposable memo state on success.
+    pub async fn run(&mut self, budget: Duration) -> Result<BranchMaintenanceReport> {
+        self.graph
+            .maintain_memoized(
+                Arc::new(TestDeletionGovernance),
+                Arc::new(TestBranchActivationRecovery),
+                budget,
+                &self.policy,
+                self.namespace_prefix.as_deref(),
+                &mut self.memo,
+            )
+            .await
+    }
+
+    /// Replace boot policy while retaining the prior memo for fail-cold testing.
+    pub fn update_config(&mut self, config: &Config) -> Result<()> {
+        self.graph =
+            graph_for_test_with_config_and_clock(self.store.clone(), config, self.clock.clone())?;
+        self.policy = BranchMaintenancePolicy::new(
+            &config.branching,
+            config.gc.horizon_secs,
+            config.gc_horizon_floor_secs(),
+            config.compaction.interval_secs,
+        );
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl BranchActivationRecovery for TestBranchActivationRecovery {
@@ -504,6 +576,17 @@ pub async fn branch_metadata_snapshot(
         branch_identity: metadata.branch_identity,
         reservation,
     })
+}
+
+/// Read the live manifest's namespace-lifetime binding without migrating it.
+pub async fn manifest_incarnation_for_test(
+    store: &ZeppelinStore,
+    namespace: &str,
+) -> Result<Option<NamespaceIncarnationId>> {
+    Ok(Manifest::read(store, namespace)
+        .await?
+        .and_then(|manifest| manifest.namespace_incarnation())
+        .map(NamespaceIncarnationId::from_uuid))
 }
 
 /// Resolve every visible descriptor to its exact physical namespace lifetime.
