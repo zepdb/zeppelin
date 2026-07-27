@@ -1697,6 +1697,11 @@ async fn constrained_write_migrates_a_legacy_namespace_and_manifest_once() {
     );
     harness
         .store
+        .delete(&Manifest::history_key(&namespace, legacy_generation))
+        .await
+        .expect("legacy manifest fixture must not retain immutable history");
+    harness
+        .store
         .put(
             &Manifest::s3_key(&namespace),
             Bytes::from(serde_json::to_vec(&legacy_value).unwrap()),

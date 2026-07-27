@@ -830,7 +830,7 @@ impl WalWriter {
                 expected.namespace != namespace
                     || manifest.namespace_incarnation() != Some(expected.namespace_incarnation)
                     || manifest.version() != expected.generation
-                    || version != expected.storage_version
+                    || !version.matches_live_authority(&expected.storage_version)
             }) {
                 group.clear_committed();
                 self.fail_batch(namespace, batch, |_| ZeppelinError::ManifestConflict {

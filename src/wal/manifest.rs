@@ -6200,6 +6200,32 @@ impl ManifestVersion {
         self.version.is_some()
     }
 
+    /// Returns whether two observations carry the same live write authority.
+    ///
+    /// `history_confirmed` records whether *this process* watched a history
+    /// publication succeed, so two honest reads of one unchanged object can
+    /// disagree on it. It is publication bookkeeping, not CAS identity, and a
+    /// guard that compares it rejects writes no concurrent writer touched.
+    /// Every other field is identity-bearing and is compared.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The destructuring binding is deliberate: adding a field to
+    /// [`ManifestVersion`] fails to compile here until the author decides
+    /// whether it belongs to write authority. A hand-listed comparison, or a
+    /// Java `equals` override, would silently keep answering the old question.
+    pub(crate) fn matches_live_authority(&self, other: &Self) -> bool {
+        let Self {
+            version,
+            deletion_fenced,
+            history_snapshot,
+            history_confirmed: _,
+        } = self;
+        *version == other.version
+            && *deletion_fenced == other.deletion_fenced
+            && *history_snapshot == other.history_snapshot
+    }
+
     /// Return whether the same authoritative read observed a deletion fence.
     #[must_use]
     #[allow(dead_code)] // Phase 04 root publication maps a fenced base before mutation.
