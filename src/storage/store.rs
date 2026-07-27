@@ -2064,56 +2064,6 @@ impl ZeppelinStore {
         self.list_prefix_meta_inner(prefix).await
     }
 
-    /// Lists top-level namespace metadata objects with their storage identity.
-    ///
-    /// Branch maintenance needs both namespace discovery and each
-    /// `{namespace}/meta.json` version from one authoritative observation.
-    /// Delimiter listings expose only common-prefix names, not the ETag of the
-    /// nested metadata object, so this purpose-built root inventory performs
-    /// one recursive LIST and retains only exact two-component metadata keys.
-    /// Reserved control-plane roots and nested `meta.json` artifacts are not
-    /// returned.
-    #[instrument(skip(self))]
-    pub(crate) async fn list_namespace_metadata_meta(&self) -> Result<Vec<ListedObject>> {
-        let start = std::time::Instant::now();
-        use futures::TryStreamExt;
-        let stream = self.inner.list(None);
-        let objects: Vec<_> = stream.try_collect().await?;
-        let mut metadata = Vec::new();
-        for object in objects {
-            let key = object.location.to_string();
-            let Some((namespace, suffix)) = key.split_once('/') else {
-                continue;
-            };
-            if namespace.is_empty() || suffix != "meta.json" {
-                continue;
-            }
-            let size = u64::try_from(object.size).map_err(|_| {
-                ZeppelinError::Validation(format!(
-                    "listed namespace metadata {key} size does not fit in u64: {}",
-                    object.size
-                ))
-            })?;
-            metadata.push(ListedObject {
-                key,
-                size,
-                last_modified: object.last_modified,
-                version: StorageVersion::from_parts(object.e_tag, object.version),
-            });
-        }
-        metadata.sort_unstable_by(|left, right| left.key.cmp(&right.key));
-        let elapsed = start.elapsed();
-        debug!(
-            elapsed_ms = elapsed.as_millis(),
-            count = metadata.len(),
-            "s3 list_namespace_metadata"
-        );
-        crate::metrics::S3_OPERATION_DURATION
-            .with_label_values(&["list_namespace_metadata"])
-            .observe(elapsed.as_secs_f64());
-        Ok(metadata)
-    }
-
     async fn list_prefix_meta_inner(&self, prefix: &str) -> Result<Vec<ListedObject>> {
         assert!(
             !prefix.is_empty(),

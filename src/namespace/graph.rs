@@ -6,7 +6,7 @@
 //! through a kernel-minted governance permit. The target metadata CAS remains
 //! the sole visibility boundary.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -47,9 +47,7 @@ use crate::namespace::{
     BranchId, BranchRoot, ManifestGeneration, NamespaceId, NamespaceIncarnationId,
 };
 use crate::security::{RootReleaseAuditProgress, RootReleaseFailureClass, SecurityError};
-use crate::storage::{
-    CreateOnlyOutcome, ListedObject, NamespaceObjectKey, StorageVersion, ZeppelinStore,
-};
+use crate::storage::{CreateOnlyOutcome, NamespaceObjectKey, StorageVersion, ZeppelinStore};
 use crate::time::Clock;
 use crate::wal::manifest::{BranchLineageSeed, PreparedManifestPublication, PreparedZeroCopyFork};
 use crate::wal::{Lease, LeaseManager, Manifest};
@@ -110,35 +108,20 @@ pub(crate) struct BranchMaintenanceMemo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BranchMaintenanceInventoryFingerprint(BTreeMap<String, BranchMaintenanceObjectFingerprint>);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BranchMaintenanceObjectFingerprint {
-    size: u64,
-    last_modified: DateTime<Utc>,
-    version: StorageVersion,
-}
+// Delimiter LIST results expose only top-level prefixes. In-place metadata
+// mutations and same-name recreation are therefore bounded by the memo's
+// maturity deadline rather than invalidating the memo immediately.
+struct BranchMaintenanceInventoryFingerprint(BTreeSet<String>);
 
 impl BranchMaintenanceInventoryFingerprint {
-    fn from_listed(listed: &[ListedObject]) -> Option<Self> {
-        let mut objects = BTreeMap::new();
-        for object in listed {
-            let version = object.version.clone()?;
-            if objects
-                .insert(
-                    object.key.clone(),
-                    BranchMaintenanceObjectFingerprint {
-                        size: object.size,
-                        last_modified: object.last_modified,
-                        version,
-                    },
-                )
-                .is_some()
-            {
+    fn from_prefixes(prefixes: &[String]) -> Option<Self> {
+        let mut inventory = BTreeSet::new();
+        for prefix in prefixes {
+            if !inventory.insert(prefix.trim_end_matches('/').to_string()) {
                 return None;
             }
         }
-        Some(Self(objects))
+        Some(Self(inventory))
     }
 }
 
@@ -5456,19 +5439,18 @@ impl NamespaceGraph {
             return Ok((report, None));
         }
 
-        let mut listed = self.store.list_namespace_metadata_meta().await?;
+        let mut prefixes = self.store.list_common_prefixes("").await?;
         if let Some(namespace_prefix) = namespace_prefix {
-            listed.retain(|metadata| {
-                metadata
-                    .key
-                    .strip_suffix("/meta.json")
-                    .is_some_and(|namespace| namespace.starts_with(namespace_prefix))
-            });
+            prefixes.retain(|prefix| prefix.trim_end_matches('/').starts_with(namespace_prefix));
         }
+        prefixes
+            .retain(|prefix| NamespaceId::new(prefix.trim_end_matches('/').to_string()).is_ok());
         if started.elapsed() >= budget {
             return Ok((report, None));
         }
-        let inventory = BranchMaintenanceInventoryFingerprint::from_listed(&listed);
+        // Keep the inventory O(namespaces): a recursive root LIST would make
+        // every stored artifact part of the cost of every maintenance tick.
+        let inventory = BranchMaintenanceInventoryFingerprint::from_prefixes(&prefixes);
         if report.activation_guards_inspected == 0 {
             if let (Some(previous), Some(inventory)) = (previous, inventory.as_ref()) {
                 let incarnation_inventory_valid =
@@ -5476,10 +5458,7 @@ impl NamespaceGraph {
                         .incarnations
                         .iter()
                         .all(|(namespace, incarnation)| {
-                            incarnation.is_some()
-                                && inventory
-                                    .0
-                                    .contains_key(&NamespaceMetadata::s3_key(namespace))
+                            incarnation.is_some() && inventory.0.contains(namespace)
                         });
                 if previous.last_pass_complete
                     && previous.config == policy.fingerprint
@@ -5506,23 +5485,17 @@ impl NamespaceGraph {
         let mut observed_branch_root = false;
         let mut inventory_stable = inventory.is_some();
         let mut completed = true;
-        for listed_metadata in &listed {
+        for prefix in &prefixes {
             if started.elapsed() >= budget {
                 completed = false;
                 break;
             }
-            let Some(target_name) = listed_metadata.key.strip_suffix("/meta.json") else {
-                inventory_stable = false;
-                continue;
-            };
-            if NamespaceId::new(target_name.to_string()).is_err() {
-                continue;
-            }
+            let target_name = prefix.trim_end_matches('/');
             if !seen_targets.insert(target_name.to_string()) {
                 inventory_stable = false;
                 continue;
             }
-            let (metadata, metadata_version) = match self
+            let (metadata, _) = match self
                 .namespace_manager
                 .read_metadata_versioned(target_name)
                 .await
@@ -5534,14 +5507,6 @@ impl NamespaceGraph {
                 }
                 Err(error) => return Err(error),
             };
-            if listed_metadata
-                .version
-                .as_ref()
-                .zip(metadata_version.as_ref())
-                .is_none_or(|(listed, read)| listed != read)
-            {
-                inventory_stable = false;
-            }
             incarnations.insert(target_name.to_string(), metadata.incarnation_id.clone());
             observed_fork_namespace |=
                 matches!(metadata.creation_kind, NamespaceCreationKind::Fork(_));

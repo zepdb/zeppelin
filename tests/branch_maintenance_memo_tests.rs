@@ -5,10 +5,12 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use common::counting::{counting_store, GetCounter};
 use common::fault_injection::toggle_get_failure_matching;
 use common::harness::TestHarness;
+use futures::StreamExt;
 use zeppelin::config::{Config, SecurityMode};
 use zeppelin::namespace::branching::test_support::{
     activate_fork_for_test, delete_namespace_for_test, manifest_incarnation_for_test,
@@ -68,6 +70,10 @@ struct MaintenanceFixture {
 
 impl MaintenanceFixture {
     async fn new(branching_enabled: bool, interval_secs: u64) -> Self {
+        Self::new_with_clock(branching_enabled, interval_secs, Clock::system()).await
+    }
+
+    async fn new_with_clock(branching_enabled: bool, interval_secs: u64, clock: Clock) -> Self {
         let harness = TestHarness::new().await;
         let namespace = harness.artifact_origin_namespace("branch-maintenance");
         let config = maintenance_config(branching_enabled, interval_secs);
@@ -75,7 +81,6 @@ impl MaintenanceFixture {
             .create(&namespace, 4, DistanceMetric::Cosine)
             .await
             .expect("maintenance namespace creation must succeed");
-        let clock = Clock::system();
         let (counted_store, counter) = counting_store(&harness.store);
         let runner = BranchMaintenanceRunnerForTest::new_scoped(
             counted_store.clone(),
@@ -129,13 +134,13 @@ fn maintenance_config(branching_enabled: bool, interval_secs: u64) -> Config {
 fn assert_idle_census(counter: &GetCounter) {
     assert_eq!(
         counter.list_calls_for_prefix(""),
-        1,
-        "an unchanged tick must issue one inventory LIST"
+        0,
+        "an unchanged tick must not recursively list the bucket"
     );
     assert_eq!(
         counter.delimiter_list_calls_for_prefix(""),
-        0,
-        "the memo inventory must not add a delimiter LIST"
+        1,
+        "an unchanged tick must issue one delimiter inventory LIST"
     );
     assert_eq!(
         counter.total_gets(),
@@ -147,8 +152,13 @@ fn assert_idle_census(counter: &GetCounter) {
 fn assert_cold_census(counter: &GetCounter) {
     assert_eq!(
         counter.list_calls_for_prefix(""),
+        0,
+        "a cold tick must not recursively list the bucket"
+    );
+    assert_eq!(
+        counter.delimiter_list_calls_for_prefix(""),
         1,
-        "a cold tick must begin with one inventory LIST"
+        "a cold tick must begin with one delimiter inventory LIST"
     );
     assert!(
         counter.gets_matching("meta.json") > 0,
@@ -170,6 +180,30 @@ async fn create_namespace(store: &ZeppelinStore, namespace: &str) {
 #[tokio::test]
 async fn unchanged_second_tick_costs_one_list_and_zero_gets() {
     let mut fixture = MaintenanceFixture::new(false, 60).await;
+    fixture.prime().await;
+
+    fixture.counter.reset();
+    fixture.runner.run(TICK_BUDGET).await.unwrap();
+    assert_idle_census(&fixture.counter);
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn many_namespace_objects_do_not_expand_idle_listing() {
+    let mut fixture = MaintenanceFixture::new(false, 60).await;
+    let puts = futures::stream::iter(0..1_025)
+        .map(|index| {
+            let store = fixture.harness.store.clone();
+            let key = format!("{}/segments/dense-{index:04}.bin", fixture.namespace);
+            async move { store.put(&key, Bytes::from_static(b"dense")).await }
+        })
+        .buffer_unordered(32)
+        .collect::<Vec<_>>()
+        .await;
+    for result in puts {
+        result.expect("dense namespace fixture PUT must succeed");
+    }
     fixture.prime().await;
 
     fixture.counter.reset();
@@ -230,8 +264,10 @@ async fn namespace_removal_invalidates_the_inventory() {
 }
 
 #[tokio::test]
-async fn namespace_metadata_identity_change_invalidates_the_inventory() {
-    let mut fixture = MaintenanceFixture::new(false, 60).await;
+async fn namespace_metadata_identity_change_is_bounded_by_maturity_deadline() {
+    let source = Arc::new(AdjustableClock::new(Utc::now()));
+    let mut fixture =
+        MaintenanceFixture::new_with_clock(false, 5, Clock::from_source(source.clone())).await;
     fixture.prime().await;
     NamespaceManager::new(fixture.harness.store.clone())
         .record_compaction_success(&fixture.namespace)
@@ -240,14 +276,21 @@ async fn namespace_metadata_identity_change_invalidates_the_inventory() {
 
     fixture.counter.reset();
     fixture.runner.run(TICK_BUDGET).await.unwrap();
+    assert_idle_census(&fixture.counter);
+
+    source.advance(ChronoDuration::seconds(5));
+    fixture.counter.reset();
+    fixture.runner.run(TICK_BUDGET).await.unwrap();
     assert_cold_census(&fixture.counter);
 
     fixture.cleanup().await;
 }
 
 #[tokio::test]
-async fn namespace_recreation_under_the_same_name_is_cold() {
-    let mut fixture = MaintenanceFixture::new(false, 60).await;
+async fn namespace_recreation_under_the_same_name_is_bounded_by_maturity_deadline() {
+    let source = Arc::new(AdjustableClock::new(Utc::now()));
+    let mut fixture =
+        MaintenanceFixture::new_with_clock(false, 5, Clock::from_source(source.clone())).await;
     fixture.prime().await;
     fixture
         .harness
@@ -259,14 +302,21 @@ async fn namespace_recreation_under_the_same_name_is_cold() {
 
     fixture.counter.reset();
     fixture.runner.run(TICK_BUDGET).await.unwrap();
+    assert_idle_census(&fixture.counter);
+
+    source.advance(ChronoDuration::seconds(5));
+    fixture.counter.reset();
+    fixture.runner.run(TICK_BUDGET).await.unwrap();
     assert_cold_census(&fixture.counter);
 
     fixture.cleanup().await;
 }
 
 #[tokio::test]
-async fn deleting_namespace_invalidates_and_resumes() {
-    let mut fixture = MaintenanceFixture::new(false, 60).await;
+async fn deleting_namespace_resumes_within_one_maturity_period() {
+    let source = Arc::new(AdjustableClock::new(Utc::now()));
+    let mut fixture =
+        MaintenanceFixture::new_with_clock(false, 5, Clock::from_source(source.clone())).await;
     fixture.prime().await;
     let outcome = delete_namespace_for_test(
         fixture.harness.store.clone(),
@@ -284,6 +334,12 @@ async fn deleting_namespace_invalidates_and_resumes() {
         "fixture must leave a crash-resumable deletion"
     );
 
+    fixture.counter.reset();
+    let report = fixture.runner.run(TICK_BUDGET).await.unwrap();
+    assert_eq!(report.deletions_inspected, 0);
+    assert_idle_census(&fixture.counter);
+
+    source.advance(ChronoDuration::seconds(5));
     fixture.counter.reset();
     let report = fixture.runner.run(TICK_BUDGET).await.unwrap();
     assert!(report.deletions_inspected > 0);
@@ -357,10 +413,10 @@ async fn errored_pass_does_not_publish_a_warm_memo() {
     )
     .unwrap();
     runner.run(TICK_BUDGET).await.unwrap();
-    NamespaceManager::new(harness.store.clone())
-        .record_compaction_success(&namespace)
-        .await
-        .unwrap();
+    let mut changed = config.clone();
+    changed.branching.max_children_per_namespace += 1;
+    changed.validate().unwrap();
+    runner.update_config(&changed).unwrap();
 
     fault.enable();
     runner
@@ -448,8 +504,10 @@ async fn backward_clock_step_never_admits_a_false_warm_tick() {
 }
 
 #[tokio::test]
-async fn non_branching_warm_runner_still_resumes_interrupted_delete() {
-    let mut fixture = MaintenanceFixture::new(false, 60).await;
+async fn non_branching_warm_runner_resumes_delete_within_one_maturity_period() {
+    let source = Arc::new(AdjustableClock::new(Utc::now()));
+    let mut fixture =
+        MaintenanceFixture::new_with_clock(false, 5, Clock::from_source(source.clone())).await;
     fixture.prime().await;
     assert!(!fixture.config.branching.enabled);
     delete_namespace_for_test(
@@ -461,6 +519,12 @@ async fn non_branching_warm_runner_still_resumes_interrupted_delete() {
     .await
     .unwrap();
 
+    fixture.counter.reset();
+    let report = fixture.runner.run(TICK_BUDGET).await.unwrap();
+    assert_eq!(report.deletions_inspected, 0);
+    assert_idle_census(&fixture.counter);
+
+    source.advance(ChronoDuration::seconds(5));
     let report = fixture.runner.run(TICK_BUDGET).await.unwrap();
     assert!(report.deletions_inspected > 0);
     assert!(
