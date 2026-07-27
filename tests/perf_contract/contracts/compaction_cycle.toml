@@ -28,10 +28,10 @@ fragments = 4
 incremental = false
 
 [baseline]
-git_rev = "23accb3534f02dd47885495cc1eb65279da91f87"
-captured = "2026-07-26T05:30:14.010052+00:00"
+git_rev = "2ed1b9b63b616828d2904424d3050848d93ee8b2"
+captured = "2026-07-27T19:49:38.222904+00:00"
 approved_by = "anup"
-reason = "D9 acceptance, 2026-07-26 at 23accb3, after Anup reviewed the before/after table. Two independent changes: (1) manifest GETs DROP 3 -> 2 because f42b368 moved assert_manifest_fragment_count out of the measured window - a harness artifact removal, not a product change, and the reason the old baseline was above reality; (2) the manifest-history work adds one other GET, one PUT, a second manifests/ history object, and one critical-path level. Byte growth is the receipt artifact inventory accepted in a887d3c and is small in relative terms here (+0.2% GET / +0.3% PUT for the full cycle) because artifact bytes dominate. Captured in release."
+reason = "G4 recapture at 2ed1b9b accepts the 20-byte bootstrap growth from 46bebaf: ZBS1 v2 adds the complete-bitmap-fields section to the compacted segment. Operation counts, critical-path depth, and all other immutable artifact bytes are unchanged."
 
 [assert.depth.put_get]
 mode = "exact"
@@ -112,7 +112,7 @@ exact = 20488
 exact = 0
 
 [assert.put_bytes.bootstrap]
-exact = 297613
+exact = 297633
 
 [assert.put_bytes.centroids]
 exact = 2584

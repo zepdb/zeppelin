@@ -28,10 +28,10 @@ top_k = 10
 query_index = 0
 
 [baseline]
-git_rev = "437e9ffeafba7a5e34ed1e0a7df6914330f6f6e0"
-captured = "2026-07-25T06:10:54Z"
+git_rev = "2ed1b9b63b616828d2904424d3050848d93ee8b2"
+captured = "2026-07-27T19:49:38.222904+00:00"
 approved_by = "anup"
-reason = "Byte-only rebaseline at 437e9ff. The security and branching tracks add 13 persisted manifest fields; the receipt artifact inventory (`artifact_hashes`, bb51e04) dominates and is populated unconditionally, roughly doubling serialized manifest size. Accepted as the intended cost of receipts. Operation counts, key counts, critical-path depth, and quantized artifact bytes are unchanged and were NOT re-approved."
+reason = "G4 recapture at 2ed1b9b accepts the 20-byte bootstrap growth from 46bebaf: ZBS1 v2 adds the complete-bitmap-fields section to every bootstrap. GET counts, critical-path depth, and all other immutable artifact bytes are unchanged. The existing timestamp-jitter total band moves by the same 20 bytes."
 
 [assert.depth.get]
 mode = "max"
@@ -73,7 +73,7 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.bootstrap]
-exact = 297613
+exact = 297633
 why = "capture pins the immutable bootstrap object size"
 
 [assert.get_bytes.centroids]
@@ -102,8 +102,8 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-min = 733252
-max = 733324
+min = 733272
+max = 733344
 why = "manifest-shaped objects encode timestamps at variable width, so this count is not byte-deterministic: 5 samples on 437e9ff spanned 733284..733292 (8 B). Band is 4x the observed spread (min 32 B), which absorbs the jitter while still failing on a doubling or a disappearance."
 
 [assert.get_bytes.wal]
