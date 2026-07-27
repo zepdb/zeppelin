@@ -992,6 +992,7 @@ pub fn reachable_keys_with_staging(
                 QuantizationType::Scalar => {
                     keys.insert(sq_cluster_key(physical_namespace, owner, cluster_idx));
                 }
+                QuantizationType::TwoBit => {}
                 QuantizationType::Product => {
                     keys.insert(pq_cluster_key(physical_namespace, owner, cluster_idx));
                 }
@@ -1003,6 +1004,7 @@ pub fn reachable_keys_with_staging(
             QuantizationType::Scalar => {
                 keys.insert(sq_calibration_key(physical_namespace, &segment.id));
             }
+            QuantizationType::TwoBit => {}
             QuantizationType::Product => {
                 keys.insert(pq_codebook_key(physical_namespace, &segment.id));
             }

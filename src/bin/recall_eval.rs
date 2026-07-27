@@ -3147,6 +3147,7 @@ fn quantization_name(value: QuantizationType) -> &'static str {
     match value {
         QuantizationType::None => "None",
         QuantizationType::Scalar => "Scalar",
+        QuantizationType::TwoBit => "TwoBit",
         QuantizationType::Product => "Product",
     }
 }

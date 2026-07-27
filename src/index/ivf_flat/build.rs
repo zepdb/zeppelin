@@ -3012,6 +3012,27 @@ pub async fn build_ivf_flat(
         None
     };
     let sq_calibration_bytes = sq_calibration.as_ref().map(|cal| cal.to_bytes());
+    let (sketch_ref, sketch_data, resident_sketch) = build_resident_sketch(
+        namespace,
+        segment_id,
+        dim,
+        &centroids,
+        &cluster_vecs,
+        &cluster_attrs,
+    )?;
+    let rq_rotation = if quantization == QuantizationType::TwoBit {
+        let rotation_seed = sketch_ref.rotation_seed.ok_or_else(|| {
+            ZeppelinError::Config(format!(
+                "namespace {namespace} configured quantization=two_bit but its resident sketch has no resolvable rotation seed"
+            ))
+        })?;
+        Some(crate::index::quantization::rabitq::StructuredRotation::new(
+            sketch_ref.code_dims,
+            rotation_seed,
+        )?)
+    } else {
+        None
+    };
 
     // Write centroids.
     let centroids_data = if let Some(bytes) = sq_calibration_bytes.as_ref() {
@@ -3028,12 +3049,35 @@ pub async fn build_ivf_flat(
     let mut cluster_sections: Vec<Bytes> = Vec::with_capacity(num_clusters);
     let mut sidecar_payloads: Vec<(String, Bytes)> = Vec::new();
     for i in 0..num_clusters {
-        let cvec_data = if let Some(cal) = &sq_calibration {
-            let cluster_refs: Vec<&[f32]> = cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
-            let codes = cal.encode_batch(&cluster_refs);
-            serialize_colocated_sq_cluster(&cluster_ids[i], &cluster_vecs[i], &codes, dim)?
-        } else {
-            serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?
+        let cvec_data = match quantization {
+            QuantizationType::Scalar => {
+                let calibration = sq_calibration.as_ref().ok_or_else(|| {
+                    ZeppelinError::Index("SQ8 build omitted its calibration".into())
+                })?;
+                let cluster_refs: Vec<&[f32]> =
+                    cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
+                let codes = calibration.encode_batch(&cluster_refs);
+                serialize_colocated_sq_cluster(&cluster_ids[i], &cluster_vecs[i], &codes, dim)?
+            }
+            QuantizationType::TwoBit => {
+                let rotation = rq_rotation.as_ref().ok_or_else(|| {
+                    ZeppelinError::Config(format!(
+                        "namespace {namespace} configured quantization=two_bit but no rotation was resolved"
+                    ))
+                })?;
+                let cluster_refs: Vec<&[f32]> =
+                    cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
+                let codes = crate::index::quantization::rq::RqClusterCodes::encode(
+                    &cluster_ids[i],
+                    &cluster_refs,
+                    &centroids[i],
+                    rotation,
+                )?;
+                serialize_colocated_rq_cluster(&cluster_vecs[i], &codes, dim)?
+            }
+            QuantizationType::None | QuantizationType::Product => {
+                serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?
+            }
         };
         cluster_sections.push(cvec_data);
 
@@ -3108,14 +3152,6 @@ pub async fn build_ivf_flat(
     );
 
     // --- Step 5: Write resident coarse sketch ---
-    let (sketch_ref, sketch_data, resident_sketch) = build_resident_sketch(
-        namespace,
-        segment_id,
-        dim,
-        &centroids,
-        &cluster_vecs,
-        &cluster_attrs,
-    )?;
     store.put(&sketch_ref.key, sketch_data.clone()).await?;
     info!(
         key = %sketch_ref.key,
@@ -3139,6 +3175,9 @@ pub async fn build_ivf_flat(
     match quantization {
         QuantizationType::Scalar => {
             info!("wrote SQ8 co-located clusters and embedded calibration");
+        }
+        QuantizationType::TwoBit => {
+            info!("wrote two-bit RaBitQ co-located clusters");
         }
         QuantizationType::Product => {
             use crate::index::quantization::pq::{

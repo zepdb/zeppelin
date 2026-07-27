@@ -236,8 +236,8 @@ use crate::time::Clock;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{
-    BootstrapRef, ClusterDataObjectRef, LocatedFragmentIdentity, LocatedFragmentRef,
-    LocatedSegmentRef, Manifest, MembershipRef, SegmentRef,
+    BootstrapRef, ClusterDataObjectRef, CoarsePayloadEncoding, LocatedFragmentIdentity,
+    LocatedFragmentRef, LocatedSegmentRef, Manifest, MembershipRef, SegmentRef,
 };
 use crate::wal::{FragmentCachePolicy, WalReader};
 
@@ -410,6 +410,44 @@ fn manifest_needs_index_rewrite(manifest: &Manifest, config: &IndexingConfig) ->
         .is_some_and(|segment| !segment_matches_index_config(segment, config))
 }
 
+/// Resolves the coarse payload encoding selected by one quantization mode.
+#[must_use]
+fn coarse_payload_encoding_for_quantization(
+    quantization: crate::index::quantization::QuantizationType,
+) -> CoarsePayloadEncoding {
+    if quantization == crate::index::quantization::QuantizationType::TwoBit {
+        CoarsePayloadEncoding::TwoBit
+    } else {
+        CoarsePayloadEncoding::Sq8
+    }
+}
+
+/// Rejects a two-bit namespace whose active segment cannot supply its seed.
+fn validate_two_bit_rotation_seed(
+    namespace: &str,
+    manifest: &Manifest,
+    config: &IndexingConfig,
+) -> Result<()> {
+    if config.quantization != crate::index::quantization::QuantizationType::TwoBit {
+        return Ok(());
+    }
+    let Some(segment) = active_segment_ref(manifest) else {
+        return Ok(());
+    };
+    if segment
+        .sketch
+        .as_ref()
+        .and_then(|sketch| sketch.rotation_seed)
+        .is_none()
+    {
+        return Err(ZeppelinError::Config(format!(
+            "namespace {namespace} configured quantization=two_bit but active segment {} has no resolvable rotation seed",
+            segment.id
+        )));
+    }
+    Ok(())
+}
+
 /// Resolves process defaults with one already-observed namespace overlay.
 ///
 /// The metadata snapshot may be stale when it is used only to decide whether
@@ -463,6 +501,15 @@ fn resolve_indexing_config(
 /// enabled.
 fn segment_matches_index_config(segment: &SegmentRef, config: &IndexingConfig) -> bool {
     if segment.quantization != config.quantization || segment.hierarchical != config.hierarchical {
+        return false;
+    }
+    if config.quantization == crate::index::quantization::QuantizationType::TwoBit
+        && segment
+            .sketch
+            .as_ref()
+            .and_then(|sketch| sketch.rotation_seed)
+            != Some(crate::index::ivf_flat::sketch::sketch_rotation_seed())
+    {
         return false;
     }
     if segment.hierarchical {
@@ -571,7 +618,10 @@ impl UnpublishedOwnedSegment {
         } = self;
         let segment_id = segment.id.clone();
         let hierarchical = segment.hierarchical;
+        let coarse_payload_encoding =
+            coarse_payload_encoding_for_quantization(segment.quantization);
         manifest.add_segment_with_limits_at(segment, max_pending_deletes, max_old_segments, now);
+        manifest.set_coarse_payload_encoding(&segment_id, coarse_payload_encoding);
         if hierarchical {
             manifest.set_hierarchical_routing_nodes(&segment_id, hierarchical_routing_node_ids);
         }
@@ -1433,6 +1483,7 @@ impl Compactor {
             }
             let indexing_config =
                 resolve_indexing_config(namespace, metadata, &self.indexing_config)?;
+            validate_two_bit_rotation_seed(namespace, manifest, &indexing_config)?;
             if manifest_needs_index_rewrite(manifest, &indexing_config) {
                 info!("compaction triggered by index config layout change");
                 return Ok(true);
@@ -1787,6 +1838,7 @@ impl Compactor {
                     error => error,
                 })?;
         let indexing_config = self.effective_indexing_config(namespace).await?;
+        validate_two_bit_rotation_seed(namespace, &manifest, &indexing_config)?;
         let rewrite_for_index_config = manifest_needs_index_rewrite(&manifest, &indexing_config);
         let materialize_foreign = manifest.has_foreign_visible_artifacts()?;
         let authoritative_origin = manifest.local_origin()?;
@@ -2553,6 +2605,10 @@ impl Compactor {
                     self.config.max_old_segments
                 },
                 manifest_stamp,
+            );
+            fresh_manifest.set_coarse_payload_encoding(
+                &segment_id,
+                coarse_payload_encoding_for_quantization(indexing_config.quantization),
             );
             if is_hierarchical {
                 fresh_manifest
@@ -3543,18 +3599,60 @@ impl Compactor {
         payloads.push((sketch_ref.key.clone(), sketch_data));
         payloads.push((bootstrap_ref.key.clone(), bootstrap_data));
         payloads.push((membership_ref.key.clone(), membership_data));
+        let rq_rotation = if indexing_config.quantization
+            == crate::index::quantization::QuantizationType::TwoBit
+        {
+            let rotation_seed = sketch_ref.rotation_seed.ok_or_else(|| {
+                ZeppelinError::Config(format!(
+                    "namespace {namespace} configured quantization=two_bit but its resident sketch has no resolvable rotation seed"
+                ))
+            })?;
+            Some(crate::index::quantization::rabitq::StructuredRotation::new(
+                sketch_ref.code_dims,
+                rotation_seed,
+            )?)
+        } else {
+            None
+        };
 
         for i in 0..num_clusters {
             if !touched[i] {
                 continue; // carried over by reference
             }
-            let cvec_data = if let Some(calibration) = &sq_calibration {
-                let cluster_refs: Vec<&[f32]> =
-                    cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
-                let codes = calibration.encode_batch(&cluster_refs);
-                serialize_colocated_sq_cluster(&cluster_ids[i], &cluster_vecs[i], &codes, dim)?
-            } else {
-                serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?
+            let cvec_data = match indexing_config.quantization {
+                crate::index::quantization::QuantizationType::Scalar => {
+                    let calibration = sq_calibration.as_ref().ok_or_else(|| {
+                        ZeppelinError::Index("incremental SQ8 build omitted its calibration".into())
+                    })?;
+                    let cluster_refs: Vec<&[f32]> =
+                        cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
+                    let codes = calibration.encode_batch(&cluster_refs);
+                    serialize_colocated_sq_cluster(&cluster_ids[i], &cluster_vecs[i], &codes, dim)?
+                }
+                crate::index::quantization::QuantizationType::TwoBit => {
+                    let rotation = rq_rotation.as_ref().ok_or_else(|| {
+                        ZeppelinError::Config(format!(
+                            "namespace {namespace} configured quantization=two_bit but no rotation was resolved"
+                        ))
+                    })?;
+                    let cluster_refs: Vec<&[f32]> =
+                        cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
+                    let codes = crate::index::quantization::rq::RqClusterCodes::encode(
+                        &cluster_ids[i],
+                        &cluster_refs,
+                        &centroids[i],
+                        rotation,
+                    )?;
+                    crate::index::ivf_flat::build::serialize_colocated_rq_cluster(
+                        &cluster_vecs[i],
+                        &codes,
+                        dim,
+                    )?
+                }
+                crate::index::quantization::QuantizationType::None
+                | crate::index::quantization::QuantizationType::Product => {
+                    serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?
+                }
             };
             let (cvec_key, cvec_payload) = if old_cluster_objects.is_empty() {
                 (cluster_key(namespace, new_segment_id, i), cvec_data)
@@ -3596,6 +3694,9 @@ impl Compactor {
                 debug!(
                     "incremental SQ8 build embedded calibration and co-located rewritten clusters"
                 );
+            }
+            crate::index::quantization::QuantizationType::TwoBit => {
+                debug!("incremental two-bit build co-located rewritten clusters");
             }
             crate::index::quantization::QuantizationType::Product => {
                 use crate::index::quantization::pq::{

@@ -3430,13 +3430,17 @@ impl Config {
                     self.indexing.quantization =
                         crate::index::quantization::QuantizationType::Scalar
                 }
+                "two_bit" => {
+                    self.indexing.quantization =
+                        crate::index::quantization::QuantizationType::TwoBit
+                }
                 "product" | "pq" => {
                     self.indexing.quantization =
                         crate::index::quantization::QuantizationType::Product
                 }
                 _ => {
                     return Err(ZeppelinError::Config(format!(
-                        "env var ZEPPELIN_QUANTIZATION={v} is not a valid quantization; expected one of none, scalar, sq8, product, pq"
+                        "env var ZEPPELIN_QUANTIZATION={v} is not a valid quantization; expected one of none, scalar, sq8, two_bit, product, pq"
                     )));
                 }
             }

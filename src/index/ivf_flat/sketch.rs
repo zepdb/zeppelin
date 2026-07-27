@@ -117,6 +117,12 @@ const SKETCH_ROTATION_SCHEME_VERSION: u32 = 1;
 /// ZSK1 v4 supports exactly the Phase-1 winning two-bit representation.
 const SKETCH_BIT_WIDTH: u32 = 2;
 
+/// Returns the global seed used by newly encoded resident sketches.
+#[must_use]
+pub(crate) const fn sketch_rotation_seed() -> u64 {
+    SKETCH_ROTATION_SEED
+}
+
 /// Constructs the object-store key for a segment's resident coarse sketch.
 ///
 /// # Parameters

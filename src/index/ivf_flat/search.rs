@@ -1322,6 +1322,26 @@ async fn search_ivf_flat_with_trace_inner(
     // fetch. Scalar-quantized indexes still score every vector in those
     // selected clusters with SQ8 before exact rerank.
     let candidates = match index.quantization {
+        QuantizationType::TwoBit => {
+            if coarse_payload_encoding != CoarsePayloadEncoding::TwoBit {
+                return Err(ZeppelinError::Index(format!(
+                    "two-bit segment {} is missing its two-bit coarse payload tag",
+                    index.segment_id
+                )));
+            }
+            scan_clusters_rq(
+                index,
+                &scan_clusters,
+                query,
+                distance_metric,
+                filter,
+                fetch_k,
+                store,
+                cache,
+                rerank_coalesce_gap_bytes,
+            )
+            .await?
+        }
         QuantizationType::Scalar => match coarse_payload_encoding {
             CoarsePayloadEncoding::TwoBit => {
                 scan_clusters_rq(

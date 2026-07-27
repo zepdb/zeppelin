@@ -714,6 +714,11 @@ async fn scan_leaf_clusters(
             )
             .await?
         }
+        QuantizationType::TwoBit => {
+            return Err(ZeppelinError::Config(
+                "two-bit quantization requires a flat IVF index".into(),
+            ));
+        }
         QuantizationType::Product => {
             scan_clusters_pq(
                 artifacts,

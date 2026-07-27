@@ -746,6 +746,11 @@ async fn write_quantized_artifacts(
         QuantizationType::Scalar => {
             info!("wrote SQ8 co-located leaf clusters for hierarchical index");
         }
+        QuantizationType::TwoBit => {
+            return Err(ZeppelinError::Config(
+                "two-bit quantization requires a flat IVF index".into(),
+            ));
+        }
         QuantizationType::Product => {
             use crate::index::quantization::pq::{
                 pq_cluster_key, pq_codebook_key, serialize_pq_cluster, PqCodebook,

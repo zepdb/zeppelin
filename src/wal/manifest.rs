@@ -2688,6 +2688,7 @@ impl Manifest {
                 quantization: match segment.quantization {
                     crate::index::quantization::QuantizationType::None => "none",
                     crate::index::quantization::QuantizationType::Scalar => "scalar",
+                    crate::index::quantization::QuantizationType::TwoBit => "two_bit",
                     crate::index::quantization::QuantizationType::Product => "product",
                 },
                 hierarchical: segment.hierarchical,
@@ -2779,6 +2780,7 @@ impl Manifest {
                 quantization: match segment.quantization {
                     crate::index::quantization::QuantizationType::None => "none",
                     crate::index::quantization::QuantizationType::Scalar => "scalar",
+                    crate::index::quantization::QuantizationType::TwoBit => "two_bit",
                     crate::index::quantization::QuantizationType::Product => "product",
                 },
                 hierarchical: segment.hierarchical,

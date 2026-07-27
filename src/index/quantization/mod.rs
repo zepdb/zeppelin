@@ -106,6 +106,9 @@ pub enum QuantizationType {
     /// Maps every vector dimension to one byte using segment-wide calibration,
     /// normally reducing the vector payload to one quarter of its `f32` size.
     Scalar,
+    /// Stores two-bit RaBitQ residual codes for the coarse scan while retaining
+    /// full-precision vectors for exact reranking.
+    TwoBit,
     /// Maps each learned subvector to one byte naming its nearest codebook
     /// centroid, trading more training work for substantially smaller codes.
     Product,
