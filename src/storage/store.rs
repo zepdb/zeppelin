@@ -95,6 +95,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 use tracing::{debug, instrument};
@@ -153,6 +154,8 @@ pub struct ZeppelinStore {
     /// Signing root and immutable signer-inventory view installed together by
     /// the live security composition root.
     object_signer: Arc<RwLock<ObjectSignerBinding>>,
+    /// Boot-time receipt publication switch shared by every store clone.
+    receipts_enabled: Arc<AtomicBool>,
 }
 
 /// Process-local signer backed by a public key published under `_security/signers/`.
@@ -558,6 +561,7 @@ impl ZeppelinStore {
             prefix_delete_mode,
             content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
             object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
+            receipts_enabled: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -699,6 +703,7 @@ impl ZeppelinStore {
             prefix_delete_mode: PrefixDeleteMode::LegacyPerKeyUnordered32,
             content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
             object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
+            receipts_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -715,7 +720,22 @@ impl ZeppelinStore {
             prefix_delete_mode: PrefixDeleteMode::NativeBatch,
             content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
             object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
+            receipts_enabled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Bind the process receipt-publication setting to this shared store.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_receipts_enabled(self, enabled: bool) -> Self {
+        self.receipts_enabled.store(enabled, Ordering::Relaxed);
+        self
+    }
+
+    /// Whether manifest publication may retain receipt-only metadata.
+    #[must_use]
+    pub(crate) fn receipts_enabled(&self) -> bool {
+        self.receipts_enabled.load(Ordering::Relaxed)
     }
 
     /// Clone this gateway for authority-side reads without inheriting application signing.
@@ -732,6 +752,7 @@ impl ZeppelinStore {
             prefix_delete_mode: self.prefix_delete_mode,
             content_hashes: Arc::clone(&self.content_hashes),
             object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
+            receipts_enabled: Arc::clone(&self.receipts_enabled),
         }
     }
 

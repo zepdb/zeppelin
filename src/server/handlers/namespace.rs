@@ -1625,14 +1625,7 @@ pub async fn clone_namespace(
         }
     };
     let target_manifest = if source_has_foreign_artifacts {
-        let signing_enabled = match state.store.object_signer_node() {
-            Ok(signer) => signer.is_some(),
-            Err(error) => {
-                retain_failed_clone_target(&state, &target, "object signer lookup failed");
-                release_internal_clone_pin(&state, &source, &clone_pin_name).await;
-                return Err(ApiError::from(error));
-            }
-        };
+        let signing_enabled = state.store.receipts_enabled();
         let authenticated_source_inventory = if signing_enabled {
             match AuthenticatedManifestArtifactInventory::authenticate(
                 &state.store,
@@ -2139,7 +2132,7 @@ async fn materialize_clone_manifest(
     mut manifest: Manifest,
 ) -> Result<Manifest, ZeppelinError> {
     manifest.pending_deletes.clear();
-    if manifest.receipt_artifacts(source).is_err() {
+    if state.store.receipts_enabled() && manifest.receipt_artifacts(source).is_err() {
         manifest
             .hydrate_receipt_artifacts(&state.store, source)
             .await?;
@@ -2201,9 +2194,8 @@ fn clone_copy_map(
     // before scheduling any copy; Phase 06 rebuilds such views through the
     // production owned-view materialization seam.
     let source_keys = manifest
-        .receipt_artifacts(source)?
-        .keys()
-        .cloned()
+        .receipt_reachable_keys(source)?
+        .into_iter()
         .collect::<Vec<_>>();
     let source_prefix = format!("{source}/");
     if source_keys
@@ -2636,12 +2628,8 @@ pub async fn compact_namespace(
         .await
         .map_err(ApiError::from)?;
 
-    let receipt_upgrade_available = state
-        .store
-        .object_signer_node()
-        .map_err(ApiError::from)?
-        .is_some()
-        && before.receipt_upgrade_needed(&ns);
+    let receipt_upgrade_available =
+        state.store.receipts_enabled() && before.receipt_upgrade_needed(&ns);
     let materialize_foreign = before
         .has_foreign_visible_artifacts()
         .map_err(ApiError::from)?;

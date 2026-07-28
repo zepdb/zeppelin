@@ -185,8 +185,20 @@ pub struct Config {
     /// Disabled-by-default namespace-branching limits and admission switch.
     #[serde(default)]
     pub branching: BranchingConfig,
+    /// Disabled-by-default signed retrieval receipt publication.
+    #[serde(default)]
+    pub receipts: ReceiptsConfig,
     /// Authentication, durable audit, bootstrap-key, and security refresh settings.
     pub security: SecurityConfig,
+}
+
+/// Signed retrieval receipt publication configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptsConfig {
+    /// Populate manifest artifact inventories and expose receipt operations.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Base namespace-branching configuration.
@@ -827,6 +839,25 @@ mod tests {
                 "expected {error:?} to contain {needle:?}"
             );
         }
+    }
+
+    #[test]
+    fn receipts_are_disabled_by_default_and_require_explicit_opt_in() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        assert!(!load_toml("").unwrap().receipts.enabled);
+        assert!(
+            load_toml(
+                r#"
+                [receipts]
+                enabled = true
+                "#,
+            )
+            .unwrap()
+            .receipts
+            .enabled
+        );
     }
 
     /// Enforced mode cannot boot without durable audit, and every mode needs a live timer.

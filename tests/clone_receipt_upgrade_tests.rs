@@ -4,9 +4,12 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::server::{cleanup_ns, client_with_bearer, create_ns_api_with, start_test_server};
+use common::server::{
+    cleanup_ns, client_with_bearer, create_ns_api_with, start_test_server_with_config,
+};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+use zeppelin::config::Config;
 use zeppelin::wal::Manifest;
 
 async fn wait_for_compaction(client: &reqwest::Client, base_url: &str, namespace: &str) {
@@ -40,7 +43,10 @@ async fn wait_for_compaction(client: &reqwest::Client, base_url: &str, namespace
 
 #[tokio::test]
 async fn legacy_hierarchical_clone_hydrates_and_copies_routing_nodes() {
-    let (base_url, harness, bearer) = start_test_server().await;
+    let mut config = Config::default();
+    config.receipts.enabled = true;
+    let (base_url, harness, _cache, _cache_dir, bearer) =
+        start_test_server_with_config(Some(config)).await;
     let client = client_with_bearer(&bearer);
     let source = create_ns_api_with(
         &client,

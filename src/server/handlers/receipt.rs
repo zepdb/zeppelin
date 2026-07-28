@@ -161,6 +161,7 @@ pub async fn verify(
     Extension(context): Extension<RequestContext>,
     Json(request): Json<VerifyReceiptRequest>,
 ) -> Result<Json<VerifyReceiptResponse>, ApiError> {
+    state.receipts.require_enabled()?;
     crate::security::verify_receipt(
         &state.store,
         &state.security,
@@ -178,6 +179,7 @@ pub async fn manifest_root(
     State(state): State<AppState>,
     Path(namespace): Path<String>,
 ) -> Result<Json<ManifestRootResponse>, ApiError> {
+    state.receipts.require_enabled()?;
     let manifest = Manifest::read(&state.store, &namespace)
         .await
         .map_err(ApiError::from)?

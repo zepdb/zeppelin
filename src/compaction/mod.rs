@@ -1850,20 +1850,20 @@ impl Compactor {
         let rewrite_for_index_config = manifest_needs_index_rewrite(&manifest, &indexing_config);
         let materialize_foreign = manifest.has_foreign_visible_artifacts()?;
         let authoritative_origin = manifest.local_origin()?;
-        let authenticated_source_inventory =
-            if materialize_foreign && self.store.object_signer_node()?.is_some() {
-                Some(
-                    AuthenticatedManifestArtifactInventory::authenticate(
-                        &self.store,
-                        namespace,
-                        &manifest,
-                    )
-                    .await
-                    .map_err(map_foreign_source_integrity_error)?,
+        let authenticated_source_inventory = if materialize_foreign && self.store.receipts_enabled()
+        {
+            Some(
+                AuthenticatedManifestArtifactInventory::authenticate(
+                    &self.store,
+                    namespace,
+                    &manifest,
                 )
-            } else {
-                None
-            };
+                .await
+                .map_err(map_foreign_source_integrity_error)?,
+            )
+        } else {
+            None
+        };
         let verify_source_body = |key: &str, body: &[u8]| {
             authenticated_source_inventory
                 .as_ref()
@@ -1885,9 +1885,7 @@ impl Compactor {
             && !rewrite_for_index_config
             && !materialize_foreign
         {
-            if self.store.object_signer_node()?.is_some()
-                && manifest.receipt_upgrade_needed(namespace)
-            {
+            if self.store.receipts_enabled() && manifest.receipt_upgrade_needed(namespace) {
                 check_lease_lost(namespace, lease_lost.as_deref())?;
                 if let Some(token) = fencing_token {
                     if manifest.fencing_token > token {
@@ -2637,9 +2635,7 @@ impl Compactor {
             // for those retained objects, so complete the exact post-compaction
             // inventory now. This makes one explicit compaction sufficient for
             // upgrade instead of requiring a second no-WAL pass.
-            if self.store.object_signer_node()?.is_some()
-                && fresh_manifest.receipt_upgrade_needed(namespace)
-            {
+            if self.store.receipts_enabled() && fresh_manifest.receipt_upgrade_needed(namespace) {
                 fresh_manifest
                     .hydrate_receipt_artifacts(&self.store, namespace)
                     .await?;

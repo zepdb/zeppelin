@@ -481,7 +481,8 @@ async fn build_app_with_entitlement_resolver(
         }
     }
     // Initialize storage
-    let store = ZeppelinStore::from_config(&config.storage)?;
+    let store =
+        ZeppelinStore::from_config(&config.storage)?.with_receipts_enabled(config.receipts.enabled);
     if storage_available {
         match probe_storage(&store).await {
             Ok(()) => tracing::info!("storage health probe succeeded"),
@@ -513,7 +514,7 @@ async fn build_app_with_entitlement_resolver(
         Arc::clone(&entitlements),
     )
     .await?;
-    if durable_audit_enabled || entitlements.has(Feature::Receipts) {
+    if durable_audit_enabled || (config.receipts.enabled && entitlements.has(Feature::Receipts)) {
         security.install_object_signer(&store)?;
     }
     let audit_now = clock.now();
@@ -737,7 +738,7 @@ async fn build_app_with_entitlement_resolver(
         shutdown_tx.subscribe(),
     );
     let credential_adapter: Arc<dyn crate::security::CredentialAdapter> = credential_adapter;
-    let receipts = crate::server::ReceiptCapability::compose(&security);
+    let receipts = crate::server::ReceiptCapability::compose(&security, config.receipts.enabled);
     let background_security = Arc::clone(&security);
     let server_tasks = Arc::new(ServerTaskSupervisor::new());
     let state = AppState {

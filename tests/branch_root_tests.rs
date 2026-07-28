@@ -653,7 +653,8 @@ async fn root_is_query_inert_and_survives_normal_manifest_publishers() {
 
 #[tokio::test]
 async fn signed_receipt_upgrade_preserves_exact_branch_roots() {
-    let harness = TestHarness::new().await;
+    let mut harness = TestHarness::new().await;
+    harness.store = harness.store.clone().with_receipts_enabled(true);
     let source = harness.artifact_origin_namespace("branch-root-receipt-upgrade-source");
     let target = harness.artifact_origin_namespace("branch-root-receipt-upgrade-target");
     let mut security_config = Config::default();

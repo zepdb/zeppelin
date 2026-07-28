@@ -364,33 +364,37 @@ pub(crate) fn namespace_graph(state: &AppState) -> NamespaceGraph {
 /// Composition-root result for the licensed receipt service.
 #[derive(Debug, Clone, Copy)]
 pub struct ReceiptCapability {
-    enabled: bool,
+    configured: bool,
+    licensed: bool,
 }
 
 impl ReceiptCapability {
-    /// Compose the request-path capability once from boot-verified entitlements.
+    /// Compose the request-path capability from config and verified entitlements.
     #[must_use]
-    pub fn compose(security: &SecurityKernel) -> Self {
+    pub fn compose(security: &SecurityKernel, configured: bool) -> Self {
         Self {
-            enabled: security.entitlements().has(Feature::Receipts),
+            configured,
+            licensed: security.entitlements().has(Feature::Receipts),
         }
     }
 
     /// Whether receipt routes should be mounted to their production handlers.
     #[must_use]
     fn enabled(self) -> bool {
-        self.enabled
+        self.configured && self.licensed
     }
 
     /// Fail before query I/O when receipt issuance was not composed at boot.
     pub(crate) fn require_enabled(self) -> Result<(), ApiError> {
-        if self.enabled {
-            Ok(())
-        } else {
-            Err(ApiError(
-                SecurityError::FeatureNotLicensed(Feature::Receipts).into(),
-            ))
+        if !self.configured {
+            return Err(ApiError(SecurityError::ReceiptsDisabled.into()));
         }
+        if !self.licensed {
+            return Err(ApiError(
+                SecurityError::FeatureNotLicensed(Feature::Receipts).into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2357,10 +2361,8 @@ async fn delegation_not_licensed() -> Result<(), ApiError> {
     ))
 }
 
-async fn receipts_not_licensed() -> Result<(), ApiError> {
-    Err(ApiError(
-        SecurityError::FeatureNotLicensed(Feature::Receipts).into(),
-    ))
+async fn receipts_unavailable(State(state): State<AppState>) -> Result<(), ApiError> {
+    state.receipts.require_enabled()
 }
 
 async fn enforce_security_management_license(
@@ -2671,7 +2673,7 @@ pub fn build_router(state: AppState) -> Router {
                 if state.receipts.enabled() {
                     post(receipt_handler::verify)
                 } else {
-                    post(receipts_not_licensed)
+                    post(receipts_unavailable)
                 },
                 &state,
             ),
@@ -2694,7 +2696,7 @@ pub fn build_router(state: AppState) -> Router {
                 if state.receipts.enabled() {
                     get(receipt_handler::manifest_root)
                 } else {
-                    get(receipts_not_licensed)
+                    get(receipts_unavailable)
                 },
                 &state,
             ),

@@ -2443,6 +2443,9 @@ impl Manifest {
         store: &ZeppelinStore,
         namespace: &str,
     ) -> Result<()> {
+        if !store.receipts_enabled() {
+            return Err(crate::security::SecurityError::ReceiptsDisabled.into());
+        }
         let incarnation = self.namespace_incarnation().ok_or_else(|| {
             ZeppelinError::Serialization(format!(
                 "manifest for namespace {namespace} has no incarnation for receipt hydration"
@@ -2872,7 +2875,7 @@ impl Manifest {
             .map_or(&[], Vec::as_slice)
     }
 
-    fn receipt_reachable_keys(&self, namespace: &str) -> Result<BTreeSet<String>> {
+    pub(crate) fn receipt_reachable_keys(&self, namespace: &str) -> Result<BTreeSet<String>> {
         let mut reachable = crate::compaction::gc::reachable_keys(namespace, self)?;
         let located_segments = match self.namespace_incarnation() {
             Some(incarnation) => {
@@ -2998,14 +3001,20 @@ impl Manifest {
         self.validate_branch_lineage_state(namespace)?;
         self.validate_foreign_origin_admission()?;
         let reachable = self.receipt_reachable_keys(namespace)?;
-        self.artifact_hashes
-            .retain(|key, _| reachable.contains(key));
-        for key in &reachable {
-            if !self.artifact_hashes.contains_key(key) {
-                if let Some(content_hash) = store.known_content_hash(key) {
-                    self.artifact_hashes.insert(key.clone(), content_hash);
+        let receipts_enabled = store.receipts_enabled();
+        if receipts_enabled {
+            self.artifact_hashes
+                .retain(|key, _| reachable.contains(key));
+            for key in &reachable {
+                if !self.artifact_hashes.contains_key(key) {
+                    if let Some(content_hash) = store.known_content_hash(key) {
+                        self.artifact_hashes.insert(key.clone(), content_hash);
+                    }
                 }
             }
+        } else {
+            self.artifact_hashes.clear();
+            store.forget_known_content_hashes(reachable.iter());
         }
 
         let has_roots_control = self.deletion_fence.is_some() || !self.branch_roots.is_empty();
@@ -3032,9 +3041,10 @@ impl Manifest {
             ReceiptBindingVersion::V1 | ReceiptBindingVersion::V2Origins => None,
         };
 
-        if reachable
-            .iter()
-            .any(|key| !self.artifact_hashes.contains_key(key))
+        if !receipts_enabled
+            || reachable
+                .iter()
+                .any(|key| !self.artifact_hashes.contains_key(key))
         {
             self.merkle_root = None;
             self.root_signature = None;
@@ -3149,6 +3159,7 @@ impl Manifest {
         source_identity: &ArtifactOrigin,
         target_identity: &ArtifactOrigin,
         lineage_seed: BranchLineageSeed,
+        receipts_enabled: bool,
         now: DateTime<Utc>,
     ) -> Result<PreparedZeroCopyFork> {
         source.validate_namespace_binding(source_identity.namespace.as_str())?;
@@ -3280,19 +3291,21 @@ impl Manifest {
         target.namespace = Some(target_identity.namespace.to_string());
         target.bind_namespace_incarnation(target_identity.incarnation.as_uuid())?;
         target.artifact_origins = origins.table;
-        target.artifact_hashes = source.artifact_hashes.clone();
         target.validate_artifact_origins()?;
-        let reachable = target.receipt_reachable_keys(target_identity.namespace.as_str())?;
-        target
-            .artifact_hashes
-            .retain(|key, _| reachable.contains(key));
-        if reachable
-            .iter()
-            .any(|key| !target.artifact_hashes.contains_key(key))
-        {
-            return Err(ZeppelinError::Serialization(
-                "zero-copy fork source is missing a reachable artifact hash".to_string(),
-            ));
+        if receipts_enabled {
+            target.artifact_hashes = source.artifact_hashes.clone();
+            let reachable = target.receipt_reachable_keys(target_identity.namespace.as_str())?;
+            target
+                .artifact_hashes
+                .retain(|key, _| reachable.contains(key));
+            if reachable
+                .iter()
+                .any(|key| !target.artifact_hashes.contains_key(key))
+            {
+                return Err(ZeppelinError::Serialization(
+                    "zero-copy fork source is missing a reachable artifact hash".to_string(),
+                ));
+            }
         }
 
         let fork_view_sha256 = target.compute_initial_fork_view_digest(
@@ -6324,6 +6337,62 @@ mod tests {
 
     use crate::storage::ZeppelinStore;
 
+    #[tokio::test]
+    async fn receipt_config_controls_inventory_size_and_empty_inventory_round_trip() {
+        async fn publish(namespace: &str, receipts_enabled: bool) -> Manifest {
+            let store = ZeppelinStore::new(Arc::new(InMemory::new()))
+                .with_receipts_enabled(receipts_enabled);
+            let mut manifest = Manifest::new();
+            for sequence_number in 0_u64..8 {
+                let id = Ulid::from(u128::from(sequence_number + 1));
+                let key = crate::wal::WalFragment::s3_key(namespace, &id);
+                store
+                    .put(&key, Bytes::from(vec![sequence_number as u8; 64]))
+                    .await
+                    .unwrap();
+                manifest.add_fragment(FragmentRef {
+                    id,
+                    vector_count: 1,
+                    delete_count: 0,
+                    sequence_number,
+                    size_bytes: 64,
+                    artifact_origin: None,
+                });
+            }
+            manifest.write(&store, namespace).await.unwrap();
+            manifest
+        }
+
+        let off = publish("receipt-size", false).await;
+        let on = publish("receipt-size", true).await;
+        let off_bytes = off.to_bytes().unwrap();
+        let on_bytes = on.to_bytes().unwrap();
+        let decoded = Manifest::from_bytes_for_namespace(&off_bytes, "receipt-size").unwrap();
+
+        assert!(off.artifact_hashes.is_empty());
+        assert!(off.merkle_root().is_none());
+        assert!(off.root_signature().is_none());
+        assert!(off.root_signer_node().is_none());
+        assert!(matches!(
+            off.receipt_artifacts("receipt-size"),
+            Err(crate::security::SecurityError::ReceiptsUnavailableUnhashed)
+        ));
+        assert_eq!(decoded.artifact_hashes, off.artifact_hashes);
+        assert_eq!(decoded.receipt_state_digest(), off.receipt_state_digest());
+        assert_eq!(
+            decoded.receipt_binding_version(),
+            off.receipt_binding_version()
+        );
+        assert_eq!(on.artifact_hashes.len(), 8);
+        assert!(on.merkle_root().is_some());
+        assert!(on_bytes.len() > off_bytes.len());
+        println!(
+            "manifest_size_receipts_off={} manifest_size_receipts_on={}",
+            off_bytes.len(),
+            on_bytes.len()
+        );
+    }
+
     /// Builds a minimal legacy-layout segment descriptor for state-model tests.
     ///
     /// The returned segment owns every cluster itself and records no optional
@@ -6809,7 +6878,7 @@ mod tests {
 
     #[test]
     fn receipt_publication_canonicalizes_only_explicit_origin_metadata() {
-        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let store = ZeppelinStore::new(Arc::new(InMemory::new())).with_receipts_enabled(true);
         let local = origin("canonical-publication", 1);
         let unused = origin("unused-origin", 2);
         let mut manifest = Manifest::new();
@@ -7688,6 +7757,7 @@ mod tests {
             &source_identity,
             &target_identity,
             lineage_seed(&source_identity, 7, 0x103, 1),
+            true,
             DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
         )
         .unwrap();
@@ -7752,10 +7822,11 @@ mod tests {
             &root_identity,
             &parent_identity,
             lineage_seed(&root_identity, 3, 0x205, 1),
+            true,
             Utc::now(),
         )
         .unwrap();
-        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let store = ZeppelinStore::new(Arc::new(InMemory::new())).with_receipts_enabled(true);
         let parent = parent
             .manifest
             .preseal_generation_one(&store, &parent_identity)
@@ -7765,6 +7836,7 @@ mod tests {
             &parent_identity,
             &target_identity,
             lineage_seed(&parent_identity, 1, 0x206, 2),
+            true,
             Utc::now(),
         )
         .unwrap();
@@ -7803,10 +7875,11 @@ mod tests {
                 &root_identity,
                 &parent_identity,
                 lineage_seed(&root_identity, 3, ordinal + 4, 1),
+                true,
                 Utc::now(),
             )
             .unwrap();
-            let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+            let store = ZeppelinStore::new(Arc::new(InMemory::new())).with_receipts_enabled(true);
             let mut parent = parent
                 .manifest
                 .preseal_generation_one(&store, &parent_identity)
@@ -7839,6 +7912,7 @@ mod tests {
                 &parent_identity,
                 &target_identity,
                 lineage_seed(&parent_identity, 2, ordinal + 6, 2),
+                true,
                 Utc::now(),
             )
             .unwrap();
@@ -7885,6 +7959,7 @@ mod tests {
             &source_identity,
             &target_identity,
             lineage_seed(&source_identity, 4, 0x303, 1),
+            true,
             Utc::now(),
         )
         .unwrap();
@@ -7940,6 +8015,7 @@ mod tests {
             &source_identity,
             &target_identity,
             lineage_seed(&source_identity, 2, 0x403, 1),
+            true,
             Utc::now(),
         )
         .unwrap();
@@ -7991,6 +8067,7 @@ mod tests {
             &source_identity,
             &target_identity,
             lineage_seed(&source_identity, 11, 0x503, 1),
+            true,
             Utc::now(),
         )
         .unwrap();

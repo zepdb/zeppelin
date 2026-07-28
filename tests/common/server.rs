@@ -658,11 +658,15 @@ async fn start_test_server_with_config_inner(
     // Ensure metrics are registered (idempotent)
     zeppelin::metrics::init();
 
-    let harness = TestHarness::new().await;
+    let mut harness = TestHarness::new().await;
     let mut config = config_override.unwrap_or_default();
     if override_rate_limits {
         configure_test_server_limits(&mut config);
     }
+    harness.store = harness
+        .store
+        .clone()
+        .with_receipts_enabled(config.receipts.enabled);
     let clock = Clock::system();
     let entitlements =
         Arc::new(entitlements_override.unwrap_or_else(|| test_entitlements(Feature::ALL)));
@@ -706,7 +710,7 @@ async fn start_test_server_with_config_inner(
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(&security),
+        receipts: zeppelin::server::ReceiptCapability::compose(&security, config.receipts.enabled),
         security: Arc::clone(&security),
         audit,
         credential_adapter,
@@ -797,6 +801,7 @@ pub async fn start_test_server_on_store_with_readiness(
     zeppelin::metrics::init();
 
     configure_test_server_limits(&mut config);
+    let store = store.with_receipts_enabled(config.receipts.enabled);
     let clock = Clock::system();
     // Custom application-store wrappers still share the harness's underlying
     // backend. Keep policy authority isolated by the harness's random prefix
@@ -843,7 +848,7 @@ pub async fn start_test_server_on_store_with_readiness(
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(&security),
+        receipts: zeppelin::server::ReceiptCapability::compose(&security, config.receipts.enabled),
         security: Arc::clone(&security),
         audit,
         credential_adapter,
@@ -898,9 +903,13 @@ pub async fn start_test_server_with_compactor(
 ) {
     zeppelin::metrics::init();
 
-    let harness = TestHarness::new().await;
+    let mut harness = TestHarness::new().await;
     let mut config = config_override.unwrap_or_default();
     configure_test_server_limits(&mut config);
+    harness.store = harness
+        .store
+        .clone()
+        .with_receipts_enabled(config.receipts.enabled);
     let clock = Clock::system();
     let security_store = scoped_test_security_store(&harness.store, &harness.prefix);
     let (security, credential_adapter, admin_bearer) =
@@ -931,7 +940,7 @@ pub async fn start_test_server_with_compactor(
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(&security),
+        receipts: zeppelin::server::ReceiptCapability::compose(&security, config.receipts.enabled),
         security: Arc::clone(&security),
         audit,
         credential_adapter,
@@ -987,9 +996,13 @@ pub async fn start_test_server_with_compaction(
 ) {
     zeppelin::metrics::init();
 
-    let harness = TestHarness::new().await;
+    let mut harness = TestHarness::new().await;
     let mut config = config_override.unwrap_or_default();
     configure_test_server_limits(&mut config);
+    harness.store = harness
+        .store
+        .clone()
+        .with_receipts_enabled(config.receipts.enabled);
     let clock = Clock::system();
     let security_store = scoped_test_security_store(&harness.store, &harness.prefix);
     let (security, credential_adapter, admin_bearer) =
@@ -1063,7 +1076,7 @@ pub async fn start_test_server_with_compaction(
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(&security),
+        receipts: zeppelin::server::ReceiptCapability::compose(&security, config.receipts.enabled),
         security: Arc::clone(&security),
         audit,
         credential_adapter,
@@ -1600,6 +1613,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     if override_rate_limits {
         configure_test_server_limits(&mut config);
     }
+    let store = store.with_receipts_enabled(config.receipts.enabled);
     let clock = clock.unwrap_or_else(Clock::system);
     let entitlements =
         Arc::new(entitlements_override.unwrap_or_else(|| test_entitlements(Feature::ALL)));
@@ -1708,7 +1722,10 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(&state_security),
+        receipts: zeppelin::server::ReceiptCapability::compose(
+            &state_security,
+            config.receipts.enabled,
+        ),
         security: state_security,
         audit: audit.clone(),
         credential_adapter,

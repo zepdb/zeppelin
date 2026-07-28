@@ -108,7 +108,7 @@ tables below are a complete index of the served routes.
 | `POST`            | `/v1/namespaces/:ns/hydrate`           | Trigger cache hydration                          |
 | `GET`             | `/v1/namespaces/:ns/snapshots`         | List snapshots                                   |
 | `GET/PUT/DELETE`  | `/v1/namespaces/:ns/snapshots/:name`   | Read, create, or delete one named snapshot       |
-| `GET`             | `/v1/namespaces/:ns/manifest/root`     | Signed manifest root — requires the receipts entitlement |
+| `GET`             | `/v1/namespaces/:ns/manifest/root`     | Signed manifest root — requires `receipts.enabled` and the receipts entitlement |
 
 ### Data
 

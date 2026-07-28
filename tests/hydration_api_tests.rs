@@ -130,7 +130,7 @@ async fn start_api_server(mut config: Config) -> ApiServer {
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(&security),
+        receipts: zeppelin::server::ReceiptCapability::compose(&security, config.receipts.enabled),
         security: Arc::clone(&security),
         audit,
         credential_adapter,

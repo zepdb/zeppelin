@@ -100,7 +100,7 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
     let app = build_router(AppState {
         store: store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(&security),
+        receipts: zeppelin::server::ReceiptCapability::compose(&security, config.receipts.enabled),
         security: Arc::clone(&security),
         audit,
         credential_adapter,

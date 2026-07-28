@@ -4583,6 +4583,7 @@ impl NamespaceGraph {
                 depth: reservation.depth,
                 created_at: reservation.created_at,
             },
+            self.store.receipts_enabled(),
             reservation.created_at,
         )?;
         let publication = manifest.preseal_generation_one(&self.store, &target_identity)?;

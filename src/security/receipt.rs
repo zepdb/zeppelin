@@ -458,6 +458,9 @@ impl AuthenticatedManifestArtifactInventory {
         namespace: &str,
         manifest: &Manifest,
     ) -> ZeppelinResult<Self> {
+        if !store.receipts_enabled() {
+            return Err(SecurityError::ReceiptsDisabled.into());
+        }
         let artifacts = manifest.receipt_artifacts(namespace)?;
         let rebuilt_root = MerkleTree::build(artifacts)?.root();
         let manifest_root = manifest.merkle_root().ok_or_else(|| {
@@ -581,6 +584,9 @@ pub(crate) fn issue_receipt(issue: ReceiptIssue<'_>) -> ZeppelinResult<Retrieval
         touched_artifacts,
         issued_at,
     } = issue;
+    if !store.receipts_enabled() {
+        return Err(SecurityError::ReceiptsDisabled.into());
+    }
     if !derived_artifacts_complete {
         return Err(SecurityError::ReceiptsUnavailableUnhashed.into());
     }
@@ -739,6 +745,9 @@ pub(crate) async fn verify_receipt(
     context: &super::RequestContext,
     request: &VerifyReceiptRequest,
 ) -> ZeppelinResult<VerifyReceiptResponse> {
+    if !store.receipts_enabled() {
+        return Err(SecurityError::ReceiptsDisabled.into());
+    }
     let receipt = &request.receipt;
     if !super::delegation::verify_published_signature(
         store,
@@ -999,7 +1008,7 @@ mod tests {
         String,
         Bytes,
     ) {
-        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let store = ZeppelinStore::new(Arc::new(InMemory::new())).with_receipts_enabled(true);
         let key_file = tempfile::NamedTempFile::new().expect("signing-key fixture must create");
         std::fs::write(key_file.path(), "11".repeat(32)).expect("signing-key fixture must write");
         #[cfg(unix)]
@@ -1087,7 +1096,8 @@ mod tests {
             Err(ZeppelinError::Security(SecurityError::InvalidReceipt(_)))
         ));
 
-        let unknown_signer_store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let unknown_signer_store =
+            ZeppelinStore::new(Arc::new(InMemory::new())).with_receipts_enabled(true);
         assert!(matches!(
             AuthenticatedManifestArtifactInventory::authenticate(
                 &unknown_signer_store,

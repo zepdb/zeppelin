@@ -7,9 +7,10 @@ use bytes::Bytes;
 use common::counting::counting_store;
 use common::harness::TestHarness;
 use common::server::{
-    cleanup_ns, client_with_bearer, create_ns_api_with, start_test_server, start_test_server_full,
+    cleanup_ns, client_with_bearer, create_ns_api_with, start_test_server_full,
     start_test_server_full_without_rate_limit_override_and_admin_bearer,
-    start_test_server_with_compactor, start_test_server_with_entitlements, test_entitlements,
+    start_test_server_with_compactor, start_test_server_with_config,
+    start_test_server_with_entitlements, test_entitlements,
 };
 use proptest::prelude::*;
 use reqwest::StatusCode;
@@ -28,6 +29,12 @@ use zeppelin::wal::{Manifest, WalFragment};
 
 fn hash(byte: u8) -> [u8; 32] {
     [byte; 32]
+}
+
+fn receipts_config() -> Config {
+    let mut config = Config::default();
+    config.receipts.enabled = true;
+    config
 }
 
 #[test]
@@ -162,7 +169,7 @@ async fn eventual_receipt_proves_only_delete_bearing_wal_that_query_consumed() {
     let server = start_test_server_full(
         harness.store.clone(),
         Some(harness.prefix.clone()),
-        Config::default(),
+        receipts_config(),
         false,
         None,
     )
@@ -260,7 +267,7 @@ async fn eventual_receipt_proves_only_delete_bearing_wal_that_query_consumed() {
 #[tokio::test]
 async fn v2_origin_receipt_verifies_and_rejects_origin_table_tamper() {
     let harness = TestHarness::new().await;
-    let config = Config::default();
+    let config = receipts_config();
     let server = start_test_server_full(
         harness.store.clone(),
         Some(harness.prefix.clone()),
@@ -389,7 +396,7 @@ async fn receipt_on_cpu_measurement_adds_no_storage_operations() {
     let server = start_test_server_full(
         store,
         Some(harness.prefix.clone()),
-        Config::default(),
+        receipts_config(),
         false,
         None,
     )
@@ -577,7 +584,8 @@ async fn assert_receipt_refetches(
 
 #[tokio::test]
 async fn receipt_round_trip_verifies_and_reports_first_divergence() {
-    let (base_url, harness, bearer) = start_test_server().await;
+    let (base_url, harness, _cache, _cache_dir, bearer) =
+        start_test_server_with_config(Some(receipts_config())).await;
     let client = client_with_bearer(&bearer);
     let namespace = create_ns_api_with(
         &client,
@@ -762,7 +770,8 @@ async fn receipt_round_trip_verifies_and_reports_first_divergence() {
 
 #[tokio::test]
 async fn refetch_reports_the_first_tampered_artifact() {
-    let (base_url, harness, bearer) = start_test_server().await;
+    let (base_url, harness, _cache, _cache_dir, bearer) =
+        start_test_server_with_config(Some(receipts_config())).await;
     let client = client_with_bearer(&bearer);
     let namespace = create_ns_api_with(
         &client,
@@ -849,7 +858,7 @@ async fn refetch_reports_the_first_tampered_artifact() {
 #[tokio::test]
 async fn unhashed_legacy_manifest_is_refused_until_compaction_rewrites_it() {
     let harness = TestHarness::new().await;
-    let config = Config::default();
+    let config = receipts_config();
     let server = start_test_server_full(
         harness.store.clone(),
         Some(harness.prefix.clone()),
@@ -987,7 +996,7 @@ async fn unhashed_legacy_manifest_is_refused_until_compaction_rewrites_it() {
 #[tokio::test]
 async fn empty_legacy_namespace_upgrades_once_and_issues_an_empty_receipt() {
     let harness = TestHarness::new().await;
-    let config = Config::default();
+    let config = receipts_config();
     let server = start_test_server_full(
         harness.store.clone(),
         Some(harness.prefix.clone()),
@@ -1099,7 +1108,8 @@ async fn empty_legacy_namespace_upgrades_once_and_issues_an_empty_receipt() {
 
 #[tokio::test]
 async fn compaction_resigns_the_new_root_and_old_receipt_history_still_verifies() {
-    let (base_url, harness, bearer) = start_test_server().await;
+    let (base_url, harness, _cache, _cache_dir, bearer) =
+        start_test_server_with_config(Some(receipts_config())).await;
     let client = client_with_bearer(&bearer);
     let namespace = create_ns_api_with(
         &client,
@@ -1259,7 +1269,8 @@ async fn compaction_resigns_the_new_root_and_old_receipt_history_still_verifies(
 
 #[tokio::test]
 async fn retained_history_rejects_active_segment_rebinding_with_same_artifact_root() {
-    let (base_url, harness, bearer) = start_test_server().await;
+    let (base_url, harness, _cache, _cache_dir, bearer) =
+        start_test_server_with_config(Some(receipts_config())).await;
     let client = client_with_bearer(&bearer);
     let namespace = create_ns_api_with(
         &client,
@@ -1354,7 +1365,8 @@ async fn retained_history_rejects_active_segment_rebinding_with_same_artifact_ro
 
 #[tokio::test]
 async fn clone_immediately_rewrites_and_resigns_the_complete_receipt_inventory() {
-    let (base_url, harness, bearer) = start_test_server().await;
+    let (base_url, harness, _cache, _cache_dir, bearer) =
+        start_test_server_with_config(Some(receipts_config())).await;
     let client = client_with_bearer(&bearer);
     let source = create_ns_api_with(
         &client,
@@ -1422,7 +1434,8 @@ async fn clone_immediately_rewrites_and_resigns_the_complete_receipt_inventory()
 
 #[tokio::test]
 async fn hierarchical_receipts_bind_routing_nodes_and_survive_clone() {
-    let (base_url, harness, bearer) = start_test_server().await;
+    let (base_url, harness, _cache, _cache_dir, bearer) =
+        start_test_server_with_config(Some(receipts_config())).await;
     let client = client_with_bearer(&bearer);
     let source = create_ns_api_with(
         &client,
@@ -1549,7 +1562,7 @@ async fn retrieval_algebra_receipt_preserves_each_sources_actual_traversal() {
             default_num_centroids: 4,
             ..Default::default()
         },
-        ..Default::default()
+        ..receipts_config()
     };
     let (base_url, harness, _cache, _cache_dir, _compactor, bearer) =
         start_test_server_with_compactor(Some(config)).await;
@@ -1683,7 +1696,7 @@ async fn grouped_flat_receipt_proves_the_physical_object_for_scanned_siblings() 
             default_num_centroids: 4,
             ..Default::default()
         },
-        ..Default::default()
+        ..receipts_config()
     };
     let (base_url, harness, _cache, _cache_dir, _compactor, bearer) =
         start_test_server_with_compactor(Some(config)).await;
@@ -1855,7 +1868,7 @@ async fn legacy_scalar_receipt_proves_the_standalone_calibration_read() {
     let server = start_test_server_full(
         harness.store.clone(),
         Some(harness.prefix.clone()),
-        Config::default(),
+        receipts_config(),
         false,
         None,
     )
@@ -2000,7 +2013,7 @@ async fn global_bm25_receipt_proves_and_refetches_result_cluster_data() {
             default_num_centroids: 4,
             ..Default::default()
         },
-        ..Default::default()
+        ..receipts_config()
     };
     let (base_url, harness, _cache, _cache_dir, _compactor, bearer) =
         start_test_server_with_compactor(Some(config)).await;
@@ -2102,7 +2115,7 @@ async fn by_id_and_vector_rerank_receipt_proves_membership_and_cluster_reads() {
             default_num_centroids: 4,
             ..Default::default()
         },
-        ..Default::default()
+        ..receipts_config()
     };
     let (base_url, harness, _cache, _cache_dir, _compactor, bearer) =
         start_test_server_with_compactor(Some(config)).await;
@@ -2272,7 +2285,7 @@ async fn empty_scoped_ann_receipt_proves_its_descriptor_and_refetches() {
             default_num_centroids: 4,
             ..Default::default()
         },
-        ..Default::default()
+        ..receipts_config()
     };
     let (base_url, harness, _cache, _cache_dir, _compactor, bearer) =
         start_test_server_with_compactor(Some(config)).await;
@@ -2341,7 +2354,7 @@ async fn multi_child_scoped_ann_receipt_proves_only_the_physical_search_path() {
             leaf_size: Some(8),
             ..Default::default()
         },
-        ..Default::default()
+        ..receipts_config()
     };
     let (base_url, harness, _cache, _cache_dir, _compactor, bearer) =
         start_test_server_with_compactor(Some(config)).await;
@@ -2454,7 +2467,7 @@ async fn scoped_bm25_receipt_binds_and_refetches_the_lazy_policy_artifact() {
             default_num_centroids: 4,
             ..Default::default()
         },
-        ..Default::default()
+        ..receipts_config()
     };
     let (base_url, harness, _cache, _cache_dir, _compactor, bearer) =
         start_test_server_with_compactor(Some(config)).await;
@@ -2549,7 +2562,7 @@ async fn transient_scoped_bm25_receipt_proves_segment_and_wal_materialization_re
             default_num_centroids: 4,
             ..Default::default()
         },
-        ..Default::default()
+        ..receipts_config()
     };
     let (base_url, harness, _cache, _cache_dir, _compactor, bearer) =
         start_test_server_with_compactor(Some(config)).await;
@@ -2684,7 +2697,8 @@ async fn transient_scoped_bm25_receipt_proves_segment_and_wal_materialization_re
 
 #[tokio::test]
 async fn receipt_binds_principal_policy_and_only_the_filter_hash() {
-    let (base_url, harness, bearer) = start_test_server().await;
+    let (base_url, harness, _cache, _cache_dir, bearer) =
+        start_test_server_with_config(Some(receipts_config())).await;
     let admin = client_with_bearer(&bearer);
     let namespace = create_ns_api_with(
         &admin,
@@ -2826,7 +2840,7 @@ async fn receipt_binds_principal_policy_and_only_the_filter_hash() {
 async fn receipt_request_requires_the_receipts_entitlement() {
     let entitlements = test_entitlements([Feature::Rbac, Feature::Delegation]);
     let (base_url, harness, _cache, _cache_dir, bearer) =
-        start_test_server_with_entitlements(Config::default(), entitlements).await;
+        start_test_server_with_entitlements(receipts_config(), entitlements).await;
     let client = client_with_bearer(&bearer);
     let namespace = create_ns_api_with(
         &client,
@@ -2845,6 +2859,53 @@ async fn receipt_request_requires_the_receipts_entitlement() {
     let body: Value = response.json().await.expect("license denial must be JSON");
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["code"], "feature_not_licensed");
+
+    cleanup_ns(&harness.store, &namespace).await;
+}
+
+#[tokio::test]
+async fn disabled_receipts_deny_query_root_and_verification() {
+    let entitlements = test_entitlements(Feature::ALL);
+    let (base_url, harness, _cache, _cache_dir, bearer) =
+        start_test_server_with_entitlements(Config::default(), entitlements).await;
+    let client = client_with_bearer(&bearer);
+    let namespace = create_ns_api_with(
+        &client,
+        &base_url,
+        json!({"dimensions": 2, "distance_metric": "euclidean"}),
+    )
+    .await;
+
+    let responses = [
+        client
+            .post(format!("{base_url}/v1/namespaces/{namespace}/query"))
+            .json(&json!({"vector": [0.0, 0.0], "receipt": true}))
+            .send()
+            .await
+            .expect("disabled receipt query denial must complete"),
+        client
+            .get(format!(
+                "{base_url}/v1/namespaces/{namespace}/manifest/root"
+            ))
+            .send()
+            .await
+            .expect("disabled manifest-root denial must complete"),
+        client
+            .post(format!("{base_url}/v1/verify"))
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("disabled receipt verification denial must complete"),
+    ];
+    for response in responses {
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .expect("disabled receipt denial must return JSON");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "receipts_disabled", "{body}");
+    }
 
     cleanup_ns(&harness.store, &namespace).await;
 }

@@ -384,6 +384,9 @@ pub enum SecurityError {
     /// The selected namespace still references artifacts written before hashes existed.
     #[error("retrieval receipts are unavailable until every reachable artifact is hashed")]
     ReceiptsUnavailableUnhashed,
+    /// Receipt publication and verification are disabled by process configuration.
+    #[error("retrieval receipts are disabled")]
+    ReceiptsDisabled,
     /// A preservation request violates the strict public schema or bounds.
     #[error("invalid preservation request: {0}")]
     InvalidPreservationRequest(String),
@@ -507,6 +510,7 @@ impl SecurityError {
             Self::ConstraintViolation => 403,
             Self::DelegationChainingForbidden | Self::DelegationPrincipalKindForbidden => 403,
             Self::ApprovalRequired => 403,
+            Self::ReceiptsDisabled => 403,
             Self::PreservationLocked => 409,
             Self::ReceiptsUnavailableUnhashed => 409,
             Self::PreservationStateUnavailable => 503,
@@ -564,6 +568,7 @@ impl SecurityError {
             Self::DelegationPrincipalKindForbidden => "delegation_parent_kind_forbidden",
             Self::ApprovalRequired => "approval_required",
             Self::PreservationLocked => "preservation_locked",
+            Self::ReceiptsDisabled => "receipts_disabled",
             Self::ReceiptsUnavailableUnhashed => "receipts_unavailable_unhashed",
             Self::PreservationStateUnavailable => "preservation_state_unavailable",
             Self::InvalidPreservationRequest(_) => "invalid_preservation_request",
@@ -634,6 +639,7 @@ impl SecurityError {
             Self::PreservationLocked => {
                 "operation is blocked by an active preservation lock".to_string()
             }
+            Self::ReceiptsDisabled => "retrieval receipts are disabled".to_string(),
             Self::ReceiptsUnavailableUnhashed => {
                 "retrieval receipts require a fully hashed namespace; compact and retry".to_string()
             }
