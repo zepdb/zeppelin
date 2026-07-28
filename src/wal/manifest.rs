@@ -856,13 +856,13 @@ pub struct Manifest {
     /// Deleting the signed-root inventory intentionally changed this field's
     /// MessagePack position. Future persisted fields still append at the end.
     #[serde(default)]
-    receipt_state_digest: Option<[u8; 32]>,
-    /// Version of the stable projection encoded by `receipt_state_digest`.
+    execution_state_digest: Option<[u8; 32]>,
+    /// Version of the stable projection encoded by `execution_state_digest`.
     ///
     /// A new query-relevant manifest field requires a new binding version
     /// rather than changing the v1 projection in place.
     #[serde(default)]
-    receipt_binding_version: Option<ReceiptBindingVersion>,
+    manifest_binding_version: Option<ManifestBindingVersion>,
     /// Canonical physical owners referenced by fragment and segment descriptors.
     #[serde(default)]
     pub artifact_origins: Vec<ArtifactOrigin>,
@@ -894,7 +894,7 @@ pub struct Manifest {
 
 /// Stable manifest execution projection version.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ReceiptBindingVersion {
+pub enum ManifestBindingVersion {
     /// Original field-by-field query-routing projection.
     #[serde(rename = "v1")]
     V1,
@@ -1021,7 +1021,7 @@ struct ManifestExecutionBindingV2<'a> {
     artifact_origins: Vec<ArtifactOriginExecutionBindingV2<'a>>,
 }
 
-/// Exact retention/control projection introduced by receipt binding V3.
+/// Exact retention/control projection introduced by manifest binding V3.
 #[derive(Serialize)]
 struct ControlRootsV1<'a> {
     namespace: &'a str,
@@ -1030,7 +1030,7 @@ struct ControlRootsV1<'a> {
     branch_roots: &'a BTreeMap<BranchId, BranchRoot>,
 }
 
-/// Exact lineage/control projection introduced by receipt binding V4.
+/// Exact lineage/control projection introduced by manifest binding V4.
 #[derive(Serialize)]
 struct ControlBranchV2<'a> {
     namespace: &'a str,
@@ -1270,8 +1270,8 @@ impl Manifest {
             namespace_incarnation: None,
             deletion_fence: None,
             hierarchical_routing_nodes: BTreeMap::new(),
-            receipt_state_digest: None,
-            receipt_binding_version: None,
+            execution_state_digest: None,
+            manifest_binding_version: None,
             artifact_origins: Vec::new(),
             control_state_digest: None,
             branch_roots: BTreeMap::new(),
@@ -2270,7 +2270,7 @@ impl Manifest {
         self.validate_branch_root_state(&namespace)
     }
 
-    /// Return the writer-fencing generation bound into the signed root.
+    /// Return the writer-fencing generation bound into the manifest binding.
     #[must_use]
     pub const fn fencing_token(&self) -> u64 {
         self.fencing_token
@@ -2278,14 +2278,14 @@ impl Manifest {
 
     /// Return the canonical query-routing state digest carried by this generation.
     #[must_use]
-    pub const fn receipt_state_digest(&self) -> Option<[u8; 32]> {
-        self.receipt_state_digest
+    pub const fn execution_state_digest(&self) -> Option<[u8; 32]> {
+        self.execution_state_digest
     }
 
     /// Return the stable projection version carried by this generation.
     #[must_use]
-    pub const fn receipt_binding_version(&self) -> Option<ReceiptBindingVersion> {
-        self.receipt_binding_version
+    pub const fn manifest_binding_version(&self) -> Option<ManifestBindingVersion> {
+        self.manifest_binding_version
     }
 
     /// Return the versioned retention/lineage control digest, when published.
@@ -2296,23 +2296,23 @@ impl Manifest {
 
     /// Recompute the domain-separated query-routing projection digest.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn recompute_receipt_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
-        let binding_version = self.receipt_binding_version.ok_or_else(|| {
-            ZeppelinError::Serialization(
-                "manifest receipt binding version is unavailable".to_string(),
-            )
+    pub(crate) fn recompute_execution_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
+        let binding_version = self.manifest_binding_version.ok_or_else(|| {
+            ZeppelinError::Serialization("manifest binding version is unavailable".to_string())
         })?;
-        self.compute_receipt_state_digest(namespace, binding_version)
+        self.compute_execution_state_digest(namespace, binding_version)
     }
 
     /// Recompute the exact V3 roots/fence control digest.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn recompute_control_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
-        match self.receipt_binding_version {
-            Some(ReceiptBindingVersion::V3Roots) => self.compute_control_roots_digest(namespace),
-            Some(ReceiptBindingVersion::V4Lineage) => self.compute_control_branch_digest(namespace),
+        match self.manifest_binding_version {
+            Some(ManifestBindingVersion::V3Roots) => self.compute_control_roots_digest(namespace),
+            Some(ManifestBindingVersion::V4Lineage) => {
+                self.compute_control_branch_digest(namespace)
+            }
             _ => Err(ZeppelinError::Serialization(
-                "manifest control digest requires receipt binding v3_roots or v4_lineage"
+                "manifest control digest requires manifest binding v3_roots or v4_lineage"
                     .to_string(),
             )),
         }
@@ -2324,27 +2324,28 @@ impl Manifest {
     /// normal persisted decoding reaches the independent foreign-origin
     /// admission gate. It does not publish or authorize the manifest.
     #[cfg(feature = "branching-test-support")]
-    pub(crate) fn bind_synthetic_origin_receipt_for_test_support(
+    pub(crate) fn bind_synthetic_origin_binding_for_test_support(
         &mut self,
         namespace: &str,
     ) -> Result<()> {
-        self.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
-        self.receipt_state_digest =
-            Some(self.compute_receipt_state_digest(namespace, ReceiptBindingVersion::V2Origins)?);
+        self.manifest_binding_version = Some(ManifestBindingVersion::V2Origins);
+        self.execution_state_digest = Some(
+            self.compute_execution_state_digest(namespace, ManifestBindingVersion::V2Origins)?,
+        );
         Ok(())
     }
 
-    fn compute_receipt_state_digest(
+    fn compute_execution_state_digest(
         &self,
         namespace: &str,
-        binding_version: ReceiptBindingVersion,
+        binding_version: ManifestBindingVersion,
     ) -> Result<[u8; 32]> {
         self.validate_namespace_binding(namespace)?;
         let bytes = match binding_version {
-            ReceiptBindingVersion::V1 => serde_json::to_vec(&self.execution_binding_v1(namespace)),
-            ReceiptBindingVersion::V2Origins
-            | ReceiptBindingVersion::V3Roots
-            | ReceiptBindingVersion::V4Lineage => {
+            ManifestBindingVersion::V1 => serde_json::to_vec(&self.execution_binding_v1(namespace)),
+            ManifestBindingVersion::V2Origins
+            | ManifestBindingVersion::V3Roots
+            | ManifestBindingVersion::V4Lineage => {
                 self.validate_artifact_origins()?;
                 serde_json::to_vec(&self.execution_binding_v2(namespace))
             }
@@ -2380,7 +2381,7 @@ impl Manifest {
         self.validate_branch_lineage_state(namespace)?;
         let lineage = self.branch_lineage.as_ref().ok_or_else(|| {
             ZeppelinError::Serialization(
-                "receipt binding v4_lineage requires immutable branch lineage".to_string(),
+                "manifest binding v4_lineage requires immutable branch lineage".to_string(),
             )
         })?;
         let bytes = serde_json::to_vec(&ControlBranchV2 {
@@ -2593,7 +2594,7 @@ impl Manifest {
             .map_or(&[], Vec::as_slice)
     }
 
-    pub(crate) fn receipt_reachable_keys(&self, namespace: &str) -> Result<BTreeSet<String>> {
+    pub(crate) fn clone_reachable_keys(&self, namespace: &str) -> Result<BTreeSet<String>> {
         let mut reachable = crate::compaction::gc::reachable_keys(namespace, self)?;
         let located_segments = match self.namespace_incarnation() {
             Some(incarnation) => {
@@ -2721,26 +2722,26 @@ impl Manifest {
 
         let has_roots_control = self.deletion_fence.is_some() || !self.branch_roots.is_empty();
         let has_lineage_control = self.branch_lineage.is_some();
-        let binding_version = match self.receipt_binding_version {
-            Some(ReceiptBindingVersion::V4Lineage) => ReceiptBindingVersion::V4Lineage,
-            _ if has_lineage_control => ReceiptBindingVersion::V4Lineage,
-            Some(ReceiptBindingVersion::V3Roots) => ReceiptBindingVersion::V3Roots,
-            _ if has_roots_control => ReceiptBindingVersion::V3Roots,
-            Some(ReceiptBindingVersion::V2Origins) => ReceiptBindingVersion::V2Origins,
-            Some(ReceiptBindingVersion::V1) | None if self.has_explicit_artifact_origins() => {
-                ReceiptBindingVersion::V2Origins
+        let binding_version = match self.manifest_binding_version {
+            Some(ManifestBindingVersion::V4Lineage) => ManifestBindingVersion::V4Lineage,
+            _ if has_lineage_control => ManifestBindingVersion::V4Lineage,
+            Some(ManifestBindingVersion::V3Roots) => ManifestBindingVersion::V3Roots,
+            _ if has_roots_control => ManifestBindingVersion::V3Roots,
+            Some(ManifestBindingVersion::V2Origins) => ManifestBindingVersion::V2Origins,
+            Some(ManifestBindingVersion::V1) | None if self.has_explicit_artifact_origins() => {
+                ManifestBindingVersion::V2Origins
             }
-            Some(ReceiptBindingVersion::V1) | None => ReceiptBindingVersion::V1,
+            Some(ManifestBindingVersion::V1) | None => ManifestBindingVersion::V1,
         };
-        let state_digest = self.compute_receipt_state_digest(namespace, binding_version)?;
-        self.receipt_state_digest = Some(state_digest);
-        self.receipt_binding_version = Some(binding_version);
+        let state_digest = self.compute_execution_state_digest(namespace, binding_version)?;
+        self.execution_state_digest = Some(state_digest);
+        self.manifest_binding_version = Some(binding_version);
         self.control_state_digest = match binding_version {
-            ReceiptBindingVersion::V3Roots => Some(self.compute_control_roots_digest(namespace)?),
-            ReceiptBindingVersion::V4Lineage => {
+            ManifestBindingVersion::V3Roots => Some(self.compute_control_roots_digest(namespace)?),
+            ManifestBindingVersion::V4Lineage => {
                 Some(self.compute_control_branch_digest(namespace)?)
             }
-            ReceiptBindingVersion::V1 | ReceiptBindingVersion::V2Origins => None,
+            ManifestBindingVersion::V1 | ManifestBindingVersion::V2Origins => None,
         };
         Ok(())
     }
@@ -2809,18 +2810,18 @@ impl Manifest {
     ///
     /// This is the only intentional root-map clearing path outside exact root
     /// removal. A clone starts a fresh namespace lifetime, so retaining V3's
-    /// control binding would incorrectly pin or sign the source's child graph.
+    /// control binding would incorrectly pin or bind the source's child graph.
     pub(crate) fn clear_branch_control_for_new_namespace(&mut self) {
         self.deletion_fence = None;
         self.branch_roots.clear();
         self.branch_lineage = None;
         self.control_state_digest = None;
         if matches!(
-            self.receipt_binding_version,
-            Some(ReceiptBindingVersion::V3Roots | ReceiptBindingVersion::V4Lineage)
+            self.manifest_binding_version,
+            Some(ManifestBindingVersion::V3Roots | ManifestBindingVersion::V4Lineage)
         ) {
-            self.receipt_binding_version = None;
-            self.receipt_state_digest = None;
+            self.manifest_binding_version = None;
+            self.execution_state_digest = None;
         }
     }
 
@@ -2836,7 +2837,7 @@ impl Manifest {
         source.validate_branch_root_state(source_identity.namespace.as_str())?;
         source.validate_branch_lineage_state(source_identity.namespace.as_str())?;
         source.validate_artifact_origins()?;
-        source.validate_receipt_binding_state(source_identity.namespace.as_str())?;
+        source.validate_manifest_binding_state(source_identity.namespace.as_str())?;
         source.validate_foreign_origin_admission()?;
         if source.namespace.as_deref() != Some(source_identity.namespace.as_str())
             || source.namespace_incarnation() != Some(source_identity.incarnation.as_uuid())
@@ -3068,9 +3069,9 @@ impl Manifest {
         let mut manifest = self.clone();
         manifest.version = 1;
         manifest.finalize_manifest_binding(target_identity.namespace.as_str())?;
-        if manifest.receipt_binding_version != Some(ReceiptBindingVersion::V4Lineage) {
+        if manifest.manifest_binding_version != Some(ManifestBindingVersion::V4Lineage) {
             return Err(ZeppelinError::Serialization(
-                "fork generation one did not select receipt binding v4_lineage".to_string(),
+                "fork generation one did not select manifest binding v4_lineage".to_string(),
             ));
         }
         let bytes = manifest.to_bytes()?;
@@ -3787,7 +3788,7 @@ impl Manifest {
         manifest.validate_branch_root_state(namespace)?;
         manifest.validate_artifact_origins()?;
         manifest.validate_branch_lineage_state(namespace)?;
-        manifest.validate_receipt_binding_state(namespace)?;
+        manifest.validate_manifest_binding_state(namespace)?;
         manifest.validate_foreign_origin_admission()?;
         manifest.validate_pending_deletes_are_local(namespace)?;
         Ok(manifest)
@@ -3805,134 +3806,136 @@ impl Manifest {
                 .any(|segment| segment.artifact_origin.is_some())
     }
 
-    fn validate_receipt_binding_state(&self, namespace: &str) -> Result<()> {
-        match self.receipt_binding_version {
+    fn validate_manifest_binding_state(&self, namespace: &str) -> Result<()> {
+        match self.manifest_binding_version {
             None => {
-                if self.receipt_state_digest.is_some() || self.control_state_digest.is_some() {
+                if self.execution_state_digest.is_some() || self.control_state_digest.is_some() {
                     return Err(ZeppelinError::Serialization(
-                        "manifest digest fields require a receipt binding version".to_string(),
+                        "manifest digest fields require a manifest binding version".to_string(),
                     ));
                 }
                 if self.has_explicit_artifact_origins() {
                     return Err(ZeppelinError::Serialization(
-                        "explicit artifact origins require receipt binding v2_origins".to_string(),
+                        "explicit artifact origins require manifest binding v2_origins".to_string(),
                     ));
                 }
                 if !self.branch_roots.is_empty() {
                     return Err(ZeppelinError::Serialization(
-                        "branch roots require receipt binding v3_roots".to_string(),
+                        "branch roots require manifest binding v3_roots".to_string(),
                     ));
                 }
                 if self.branch_lineage.is_some() {
                     return Err(ZeppelinError::Serialization(
-                        "branch lineage requires receipt binding v4_lineage".to_string(),
+                        "branch lineage requires manifest binding v4_lineage".to_string(),
                     ));
                 }
             }
-            Some(ReceiptBindingVersion::V1) => {
-                if self.receipt_state_digest.is_none() {
+            Some(ManifestBindingVersion::V1) => {
+                if self.execution_state_digest.is_none() {
                     return Err(ZeppelinError::Serialization(
-                        "receipt binding v1 requires an execution digest".to_string(),
+                        "manifest binding v1 requires an execution digest".to_string(),
                     ));
                 }
                 if self.control_state_digest.is_some() {
                     return Err(ZeppelinError::Serialization(
-                        "receipt binding v1 forbids a control digest".to_string(),
+                        "manifest binding v1 forbids a control digest".to_string(),
                     ));
                 }
                 if self.has_explicit_artifact_origins() {
                     return Err(ZeppelinError::Serialization(
-                        "explicit artifact origins require receipt binding v2_origins".to_string(),
+                        "explicit artifact origins require manifest binding v2_origins".to_string(),
                     ));
                 }
                 if !self.branch_roots.is_empty() {
                     return Err(ZeppelinError::Serialization(
-                        "branch roots require receipt binding v3_roots".to_string(),
+                        "branch roots require manifest binding v3_roots".to_string(),
                     ));
                 }
                 if self.branch_lineage.is_some() {
                     return Err(ZeppelinError::Serialization(
-                        "branch lineage requires receipt binding v4_lineage".to_string(),
+                        "branch lineage requires manifest binding v4_lineage".to_string(),
                     ));
                 }
             }
-            Some(ReceiptBindingVersion::V2Origins) => {
-                if self.receipt_state_digest.is_none() {
+            Some(ManifestBindingVersion::V2Origins) => {
+                if self.execution_state_digest.is_none() {
                     return Err(ZeppelinError::Serialization(
-                        "receipt binding v2_origins requires an execution digest".to_string(),
+                        "manifest binding v2_origins requires an execution digest".to_string(),
                     ));
                 }
                 if self.control_state_digest.is_some() {
                     return Err(ZeppelinError::Serialization(
-                        "receipt binding v2_origins forbids a control digest".to_string(),
+                        "manifest binding v2_origins forbids a control digest".to_string(),
                     ));
                 }
                 if !self.branch_roots.is_empty() {
                     return Err(ZeppelinError::Serialization(
-                        "branch roots require receipt binding v3_roots".to_string(),
+                        "branch roots require manifest binding v3_roots".to_string(),
                     ));
                 }
                 if self.branch_lineage.is_some() {
                     return Err(ZeppelinError::Serialization(
-                        "branch lineage requires receipt binding v4_lineage".to_string(),
+                        "branch lineage requires manifest binding v4_lineage".to_string(),
                     ));
                 }
             }
-            Some(ReceiptBindingVersion::V3Roots) => {
+            Some(ManifestBindingVersion::V3Roots) => {
                 if self.branch_lineage.is_some() {
                     return Err(ZeppelinError::Serialization(
-                        "branch lineage requires receipt binding v4_lineage".to_string(),
+                        "branch lineage requires manifest binding v4_lineage".to_string(),
                     ));
                 }
-                let execution = self.receipt_state_digest.ok_or_else(|| {
+                let execution = self.execution_state_digest.ok_or_else(|| {
                     ZeppelinError::Serialization(
-                        "receipt binding v3_roots requires an execution digest".to_string(),
+                        "manifest binding v3_roots requires an execution digest".to_string(),
                     )
                 })?;
                 let control = self.control_state_digest.ok_or_else(|| {
                     ZeppelinError::Serialization(
-                        "receipt binding v3_roots requires a control digest".to_string(),
+                        "manifest binding v3_roots requires a control digest".to_string(),
                     )
                 })?;
-                if self.compute_receipt_state_digest(namespace, ReceiptBindingVersion::V3Roots)?
+                if self
+                    .compute_execution_state_digest(namespace, ManifestBindingVersion::V3Roots)?
                     != execution
                 {
                     return Err(ZeppelinError::Serialization(
-                        "receipt binding v3_roots execution digest mismatch".to_string(),
+                        "manifest binding v3_roots execution digest mismatch".to_string(),
                     ));
                 }
                 if self.compute_control_roots_digest(namespace)? != control {
                     return Err(ZeppelinError::Serialization(
-                        "receipt binding v3_roots control digest mismatch".to_string(),
+                        "manifest binding v3_roots control digest mismatch".to_string(),
                     ));
                 }
             }
-            Some(ReceiptBindingVersion::V4Lineage) => {
-                let execution = self.receipt_state_digest.ok_or_else(|| {
+            Some(ManifestBindingVersion::V4Lineage) => {
+                let execution = self.execution_state_digest.ok_or_else(|| {
                     ZeppelinError::Serialization(
-                        "receipt binding v4_lineage requires an execution digest".to_string(),
+                        "manifest binding v4_lineage requires an execution digest".to_string(),
                     )
                 })?;
                 let control = self.control_state_digest.ok_or_else(|| {
                     ZeppelinError::Serialization(
-                        "receipt binding v4_lineage requires a control digest".to_string(),
+                        "manifest binding v4_lineage requires a control digest".to_string(),
                     )
                 })?;
                 if self.branch_lineage.is_none() {
                     return Err(ZeppelinError::Serialization(
-                        "receipt binding v4_lineage requires immutable branch lineage".to_string(),
+                        "manifest binding v4_lineage requires immutable branch lineage".to_string(),
                     ));
                 }
-                if self.compute_receipt_state_digest(namespace, ReceiptBindingVersion::V4Lineage)?
+                if self
+                    .compute_execution_state_digest(namespace, ManifestBindingVersion::V4Lineage)?
                     != execution
                 {
                     return Err(ZeppelinError::Serialization(
-                        "receipt binding v4_lineage execution digest mismatch".to_string(),
+                        "manifest binding v4_lineage execution digest mismatch".to_string(),
                     ));
                 }
                 if self.compute_control_branch_digest(namespace)? != control {
                     return Err(ZeppelinError::Serialization(
-                        "receipt binding v4_lineage control digest mismatch".to_string(),
+                        "manifest binding v4_lineage control digest mismatch".to_string(),
                     ));
                 }
             }
@@ -4194,15 +4197,15 @@ impl Manifest {
                 || manifest.branch_lineage.is_some()
                 || manifest.control_state_digest.is_some()
                 || matches!(
-                    manifest.receipt_binding_version,
-                    Some(ReceiptBindingVersion::V3Roots | ReceiptBindingVersion::V4Lineage)
+                    manifest.manifest_binding_version,
+                    Some(ManifestBindingVersion::V3Roots | ManifestBindingVersion::V4Lineage)
                 )
         };
         if (is_branch_bound(self) || is_branch_bound(live))
             && (self.branch_roots != live.branch_roots
                 || self.branch_lineage != live.branch_lineage
                 || self.namespace_incarnation != live.namespace_incarnation
-                || self.receipt_binding_version != live.receipt_binding_version
+                || self.manifest_binding_version != live.manifest_binding_version
                 || self.control_state_digest != live.control_state_digest)
         {
             return Err(ZeppelinError::ManifestConflict {
@@ -6081,7 +6084,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_v2_digest_binds_segment_origin_index() {
+    fn execution_v2_digest_binds_segment_origin_index() {
         let mut manifest = Manifest::new();
         manifest.namespace = Some("target".to_string());
         manifest
@@ -6091,19 +6094,19 @@ mod tests {
         let mut segment = make_segment("segment-origin");
         segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
         manifest.segments.push(segment);
-        manifest.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
+        manifest.manifest_binding_version = Some(ManifestBindingVersion::V2Origins);
 
         let baseline = manifest
-            .recompute_receipt_state_digest("target")
-            .expect("origin-aware receipt projection must encode");
+            .recompute_execution_state_digest("target")
+            .expect("origin-aware execution projection must encode");
         manifest.segments[0].artifact_origin = Some(ArtifactOriginIndex::new(1));
 
         assert_ne!(
             baseline,
             manifest
-                .recompute_receipt_state_digest("target")
-                .expect("mutated origin-aware receipt projection must encode"),
-            "changing only an origin index must change the receipt digest"
+                .recompute_execution_state_digest("target")
+                .expect("mutated origin-aware execution projection must encode"),
+            "changing only an origin index must change the execution digest"
         );
     }
 
@@ -6472,7 +6475,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_publication_canonicalizes_only_explicit_origin_metadata() {
+    fn manifest_publication_canonicalizes_only_explicit_origin_metadata() {
         let local = origin("canonical-publication", 1);
         let unused = origin("unused-origin", 2);
         let mut manifest = Manifest::new();
@@ -6519,13 +6522,13 @@ mod tests {
         );
         assert_eq!(manifest.segments[1].artifact_origin, None);
         assert_eq!(
-            manifest.receipt_binding_version(),
-            Some(ReceiptBindingVersion::V2Origins)
+            manifest.manifest_binding_version(),
+            Some(ManifestBindingVersion::V2Origins)
         );
     }
 
     #[test]
-    fn receipt_v2_digest_binds_origin_table_namespace_and_incarnation() {
+    fn execution_v2_digest_binds_origin_table_namespace_and_incarnation() {
         let mut manifest = Manifest::new();
         manifest.namespace = Some("target".to_string());
         manifest
@@ -6535,14 +6538,14 @@ mod tests {
         let mut segment = make_segment("segment-origin-table");
         segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
         manifest.segments.push(segment);
-        manifest.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
-        let baseline = manifest.recompute_receipt_state_digest("target").unwrap();
+        manifest.manifest_binding_version = Some(ManifestBindingVersion::V2Origins);
+        let baseline = manifest.recompute_execution_state_digest("target").unwrap();
 
         let mut namespace_tamper = manifest.clone();
         namespace_tamper.artifact_origins[0] = origin("another-source", 2);
         assert_ne!(
             namespace_tamper
-                .recompute_receipt_state_digest("target")
+                .recompute_execution_state_digest("target")
                 .unwrap(),
             baseline
         );
@@ -6551,7 +6554,7 @@ mod tests {
         incarnation_tamper.artifact_origins[0] = origin("source", 3);
         assert_ne!(
             incarnation_tamper
-                .recompute_receipt_state_digest("target")
+                .recompute_execution_state_digest("target")
                 .unwrap(),
             baseline
         );
@@ -6562,18 +6565,18 @@ mod tests {
             .push(origin("unused-source", 4));
         assert_ne!(
             table_tamper
-                .recompute_receipt_state_digest("target")
+                .recompute_execution_state_digest("target")
                 .unwrap(),
             baseline
         );
     }
 
     #[test]
-    fn receipt_state_digest_binds_query_routing_topology() {
+    fn execution_state_digest_binds_query_routing_topology() {
         let mut manifest = Manifest::new();
         manifest
             .bind_namespace_incarnation(uuid::Uuid::from_u128(7))
-            .expect("receipt topology fixture must bind one incarnation");
+            .expect("execution topology fixture must bind one incarnation");
         manifest.fragments = vec![
             FragmentRef {
                 id: Ulid::from(1_u128),
@@ -6597,16 +6600,16 @@ mod tests {
         manifest
             .hierarchical_routing_nodes
             .insert("segment-b".to_string(), vec!["node-0".to_string()]);
-        manifest.receipt_binding_version = Some(ReceiptBindingVersion::V1);
+        manifest.manifest_binding_version = Some(ManifestBindingVersion::V1);
         let baseline = manifest
-            .recompute_receipt_state_digest("topology")
-            .expect("baseline receipt topology must encode");
+            .recompute_execution_state_digest("topology")
+            .expect("baseline execution topology must encode");
 
         let mut reordered = manifest.clone();
         reordered.fragments.swap(0, 1);
         assert_ne!(
             reordered
-                .recompute_receipt_state_digest("topology")
+                .recompute_execution_state_digest("topology")
                 .unwrap(),
             baseline
         );
@@ -6614,7 +6617,9 @@ mod tests {
         let mut rebound = manifest.clone();
         rebound.active_segment = Some("segment-a".to_string());
         assert_ne!(
-            rebound.recompute_receipt_state_digest("topology").unwrap(),
+            rebound
+                .recompute_execution_state_digest("topology")
+                .unwrap(),
             baseline
         );
 
@@ -6622,7 +6627,7 @@ mod tests {
         descriptor_changed.segments[0].cluster_count += 1;
         assert_ne!(
             descriptor_changed
-                .recompute_receipt_state_digest("topology")
+                .recompute_execution_state_digest("topology")
                 .unwrap(),
             baseline
         );
@@ -6635,7 +6640,7 @@ mod tests {
             .push("node-1".to_string());
         assert_ne!(
             routing_changed
-                .recompute_receipt_state_digest("topology")
+                .recompute_execution_state_digest("topology")
                 .unwrap(),
             baseline
         );
@@ -6651,7 +6656,7 @@ mod tests {
         });
         assert_eq!(
             separately_bound
-                .recompute_receipt_state_digest("topology")
+                .recompute_execution_state_digest("topology")
                 .unwrap(),
             baseline,
             "timestamps, replay allocator, fencing, and write-only membership use separate bindings"
@@ -6659,7 +6664,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_binding_v1_uses_an_explicit_stable_segment_projection() {
+    fn manifest_binding_v1_uses_an_explicit_stable_segment_projection() {
         let mut manifest = Manifest::new();
         manifest
             .bind_namespace_incarnation(uuid::Uuid::from_u128(9))
@@ -6835,7 +6840,7 @@ mod tests {
         let predecessor_bytes = manifest.to_bytes().unwrap();
         let digest = ManifestDigest::new(Sha256::digest(&predecessor_bytes).into());
         let v2_execution = manifest
-            .compute_receipt_state_digest("v3-roots", ReceiptBindingVersion::V2Origins)
+            .compute_execution_state_digest("v3-roots", ManifestBindingVersion::V2Origins)
             .unwrap();
         let root = branch_root(
             BranchId::from_ulid(Ulid::from(31_u128)),
@@ -6850,10 +6855,10 @@ mod tests {
         manifest.finalize_manifest_binding("v3-roots").unwrap();
 
         assert_eq!(
-            manifest.receipt_binding_version(),
-            Some(ReceiptBindingVersion::V3Roots)
+            manifest.manifest_binding_version(),
+            Some(ManifestBindingVersion::V3Roots)
         );
-        assert_eq!(manifest.receipt_state_digest(), Some(v2_execution));
+        assert_eq!(manifest.execution_state_digest(), Some(v2_execution));
         let control = manifest.control_state_digest().unwrap();
         assert_eq!(
             manifest.recompute_control_state_digest("v3-roots").unwrap(),
@@ -6869,14 +6874,14 @@ mod tests {
             .insert(root.branch_id, changed_root);
         changed_view.finalize_manifest_binding("v3-roots").unwrap();
         let changed_control = changed_view.control_state_digest().unwrap();
-        assert_eq!(changed_view.receipt_state_digest(), Some(v2_execution));
+        assert_eq!(changed_view.execution_state_digest(), Some(v2_execution));
         assert_ne!(changed_control, control);
 
         manifest.remove_branch_root_candidate(&root).unwrap();
         manifest.finalize_manifest_binding("v3-roots").unwrap();
         assert_eq!(
-            manifest.receipt_binding_version(),
-            Some(ReceiptBindingVersion::V3Roots),
+            manifest.manifest_binding_version(),
+            Some(ManifestBindingVersion::V3Roots),
             "removing the final root must not downgrade this namespace lifetime"
         );
         assert!(manifest.control_state_digest().is_some());
@@ -6922,8 +6927,8 @@ mod tests {
             Some(&root)
         );
         assert_eq!(
-            after_erase_attempt.receipt_binding_version(),
-            Some(ReceiptBindingVersion::V3Roots)
+            after_erase_attempt.manifest_binding_version(),
+            Some(ManifestBindingVersion::V3Roots)
         );
 
         let (mut rootless_v3, rooted_version) = Manifest::read_versioned(&store, namespace)
@@ -6947,8 +6952,8 @@ mod tests {
         let after_resurrection_attempts = Manifest::read(&store, namespace).await.unwrap().unwrap();
         assert!(after_resurrection_attempts.branch_roots().is_empty());
         assert_eq!(
-            after_resurrection_attempts.receipt_binding_version(),
-            Some(ReceiptBindingVersion::V3Roots)
+            after_resurrection_attempts.manifest_binding_version(),
+            Some(ManifestBindingVersion::V3Roots)
         );
     }
 
@@ -7015,11 +7020,11 @@ mod tests {
         manifest.reset_version_for_clone();
         assert!(manifest.branch_roots().is_empty());
         assert_eq!(manifest.control_state_digest(), None);
-        assert_eq!(manifest.receipt_binding_version(), None);
+        assert_eq!(manifest.manifest_binding_version(), None);
     }
 
     #[test]
-    fn receipt_binding_version_never_downgrades_within_one_namespace_lifetime() {
+    fn manifest_binding_version_never_downgrades_within_one_namespace_lifetime() {
         let mut manifest = Manifest::new();
         manifest.namespace = Some("binding-monotonic".to_string());
         manifest
@@ -7034,8 +7039,8 @@ mod tests {
             .finalize_manifest_binding("binding-monotonic")
             .unwrap();
         assert_eq!(
-            manifest.receipt_binding_version(),
-            Some(ReceiptBindingVersion::V2Origins)
+            manifest.manifest_binding_version(),
+            Some(ManifestBindingVersion::V2Origins)
         );
 
         manifest.segments.clear();
@@ -7044,14 +7049,14 @@ mod tests {
             .finalize_manifest_binding("binding-monotonic")
             .unwrap();
         assert_eq!(
-            manifest.receipt_binding_version(),
-            Some(ReceiptBindingVersion::V2Origins),
+            manifest.manifest_binding_version(),
+            Some(ManifestBindingVersion::V2Origins),
             "removing the last explicit origin must not downgrade this namespace lifetime"
         );
     }
 
     #[test]
-    fn receipt_binding_combinations_fail_closed() {
+    fn manifest_binding_combinations_fail_closed() {
         fn decode_error(mut manifest: Manifest) -> ZeppelinError {
             manifest.namespace = Some("binding-combinations".to_string());
             manifest
@@ -7061,26 +7066,26 @@ mod tests {
                 &manifest.to_bytes().expect("fixture must encode"),
                 "binding-combinations",
             )
-            .expect_err("invalid receipt binding combination must fail")
+            .expect_err("invalid manifest binding combination must fail")
         }
 
         let mut digest_without_version = Manifest::new();
-        digest_without_version.receipt_state_digest = Some([1; 32]);
+        digest_without_version.execution_state_digest = Some([1; 32]);
         assert!(matches!(
             decode_error(digest_without_version),
             ZeppelinError::Serialization(_)
         ));
 
         let mut v1_without_digest = Manifest::new();
-        v1_without_digest.receipt_binding_version = Some(ReceiptBindingVersion::V1);
+        v1_without_digest.manifest_binding_version = Some(ManifestBindingVersion::V1);
         assert!(matches!(
             decode_error(v1_without_digest),
             ZeppelinError::Serialization(_)
         ));
 
         let mut v1_with_control = Manifest::new();
-        v1_with_control.receipt_binding_version = Some(ReceiptBindingVersion::V1);
-        v1_with_control.receipt_state_digest = Some([1; 32]);
+        v1_with_control.manifest_binding_version = Some(ManifestBindingVersion::V1);
+        v1_with_control.execution_state_digest = Some([1; 32]);
         v1_with_control.control_state_digest = Some([2; 32]);
         assert!(matches!(
             decode_error(v1_with_control),
@@ -7088,15 +7093,15 @@ mod tests {
         ));
 
         let mut v2_without_digest = Manifest::new();
-        v2_without_digest.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
+        v2_without_digest.manifest_binding_version = Some(ManifestBindingVersion::V2Origins);
         assert!(matches!(
             decode_error(v2_without_digest),
             ZeppelinError::Serialization(_)
         ));
 
         let mut v2_with_control = Manifest::new();
-        v2_with_control.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
-        v2_with_control.receipt_state_digest = Some([1; 32]);
+        v2_with_control.manifest_binding_version = Some(ManifestBindingVersion::V2Origins);
+        v2_with_control.execution_state_digest = Some([1; 32]);
         v2_with_control.control_state_digest = Some([2; 32]);
         assert!(matches!(
             decode_error(v2_with_control),
@@ -7104,8 +7109,8 @@ mod tests {
         ));
 
         let mut v1_with_origin = Manifest::new();
-        v1_with_origin.receipt_binding_version = Some(ReceiptBindingVersion::V1);
-        v1_with_origin.receipt_state_digest = Some([1; 32]);
+        v1_with_origin.manifest_binding_version = Some(ManifestBindingVersion::V1);
+        v1_with_origin.execution_state_digest = Some([1; 32]);
         v1_with_origin.artifact_origins = vec![origin("binding-combinations", 1)];
         let mut segment = make_segment("segment-v1-origin");
         segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
@@ -7117,7 +7122,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_receipt_bindings_reject_all_origin_metadata() {
+    fn legacy_manifest_bindings_reject_all_origin_metadata() {
         fn decode_error(mut manifest: Manifest) -> ZeppelinError {
             manifest.namespace = Some("legacy-origin-binding".to_string());
             manifest
@@ -7155,8 +7160,8 @@ mod tests {
         ));
 
         let mut v1_table_only = Manifest::new();
-        v1_table_only.receipt_binding_version = Some(ReceiptBindingVersion::V1);
-        v1_table_only.receipt_state_digest = Some([1; 32]);
+        v1_table_only.manifest_binding_version = Some(ManifestBindingVersion::V1);
+        v1_table_only.execution_state_digest = Some([1; 32]);
         v1_table_only.artifact_origins = vec![local_origin];
         assert!(matches!(
             decode_error(v1_table_only),
@@ -7171,8 +7176,8 @@ mod tests {
         manifest
             .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
             .unwrap();
-        manifest.receipt_binding_version = Some(ReceiptBindingVersion::V4Lineage);
-        manifest.receipt_state_digest = Some([1; 32]);
+        manifest.manifest_binding_version = Some(ManifestBindingVersion::V4Lineage);
+        manifest.execution_state_digest = Some([1; 32]);
 
         let error = Manifest::from_bytes_for_namespace(
             &manifest
@@ -7397,15 +7402,15 @@ mod tests {
             .preseal_generation_one(&target_identity)
             .unwrap();
         assert_eq!(
-            sealed.manifest().receipt_binding_version(),
-            Some(ReceiptBindingVersion::V4Lineage)
+            sealed.manifest().manifest_binding_version(),
+            Some(ManifestBindingVersion::V4Lineage)
         );
         assert_eq!(
             sealed
                 .manifest()
-                .recompute_receipt_state_digest("v4-target")
+                .recompute_execution_state_digest("v4-target")
                 .unwrap(),
-            sealed.manifest().receipt_state_digest().unwrap()
+            sealed.manifest().execution_state_digest().unwrap()
         );
         assert_eq!(
             sealed
@@ -8332,10 +8337,13 @@ mod tests {
         let mut local_segment = make_segment("segment-local-origin");
         local_segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
         explicit_local.segments.push(local_segment);
-        explicit_local.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
-        explicit_local.receipt_state_digest = Some(
+        explicit_local.manifest_binding_version = Some(ManifestBindingVersion::V2Origins);
+        explicit_local.execution_state_digest = Some(
             explicit_local
-                .compute_receipt_state_digest("origin-roundtrip", ReceiptBindingVersion::V2Origins)
+                .compute_execution_state_digest(
+                    "origin-roundtrip",
+                    ManifestBindingVersion::V2Origins,
+                )
                 .unwrap(),
         );
         let decoded_explicit = Manifest::from_bytes_for_namespace(
@@ -8355,10 +8363,13 @@ mod tests {
         let mut foreign_segment = make_segment("segment-foreign-origin");
         foreign_segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
         foreign.segments.push(foreign_segment);
-        foreign.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
-        foreign.receipt_state_digest = Some(
+        foreign.manifest_binding_version = Some(ManifestBindingVersion::V2Origins);
+        foreign.execution_state_digest = Some(
             foreign
-                .compute_receipt_state_digest("origin-roundtrip", ReceiptBindingVersion::V2Origins)
+                .compute_execution_state_digest(
+                    "origin-roundtrip",
+                    ManifestBindingVersion::V2Origins,
+                )
                 .unwrap(),
         );
         let foreign_bytes = foreign.to_bytes().unwrap();

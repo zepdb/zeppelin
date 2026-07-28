@@ -2142,7 +2142,7 @@ fn clone_copy_map(
     // before scheduling any copy; Phase 06 rebuilds such views through the
     // production owned-view materialization seam.
     let source_keys = manifest
-        .receipt_reachable_keys(source)?
+        .clone_reachable_keys(source)?
         .into_iter()
         .collect::<Vec<_>>();
     let source_prefix = format!("{source}/");

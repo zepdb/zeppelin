@@ -32,7 +32,7 @@ use crate::time::Clock;
 use crate::types::{
     AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult, VectorId,
 };
-use crate::wal::manifest::{Manifest, ReceiptBindingVersion};
+use crate::wal::manifest::{Manifest, ManifestBindingVersion};
 use crate::wal::{LeaseManager, WalReader};
 use chrono::{DateTime, Utc};
 
@@ -106,7 +106,7 @@ pub struct BranchControlSnapshot {
     /// Whether the same authoritative manifest observation carried a delete fence.
     pub deletion_fenced: bool,
     /// Execution/control projection version bound to the live generation.
-    pub binding_version: Option<ReceiptBindingVersion>,
+    pub binding_version: Option<ManifestBindingVersion>,
     /// Exact live manifest generation from the same observation.
     pub manifest_generation: u64,
     /// Writer fencing token from the same observation.
@@ -771,7 +771,7 @@ pub async fn branch_control_snapshot(
     Ok(BranchControlSnapshot {
         roots: manifest.branch_roots().values().cloned().collect(),
         deletion_fenced: version.is_deletion_fenced(),
-        binding_version: manifest.receipt_binding_version(),
+        binding_version: manifest.manifest_binding_version(),
         manifest_generation: manifest.version(),
         fencing_token: manifest.fencing_token(),
     })
@@ -902,7 +902,7 @@ impl SyntheticForeignOriginView {
             segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
         }
         manifest.fragments.extend(local_tail);
-        manifest.bind_synthetic_origin_receipt_for_test_support(target_namespace)?;
+        manifest.bind_synthetic_origin_binding_for_test_support(target_namespace)?;
 
         // Validate the exact view once at construction. This is structural
         // resolution only; it intentionally does not open persisted admission.

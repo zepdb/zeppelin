@@ -433,7 +433,7 @@ impl ForkIdentity {
     }
 }
 
-/// Immutable ancestry proof signed by every manifest in a branch lifetime.
+/// Immutable ancestry proof bound by every manifest in a branch lifetime.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BranchLineage {

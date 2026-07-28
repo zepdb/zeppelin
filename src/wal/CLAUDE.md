@@ -26,9 +26,10 @@ Because the format is not fully self-describing:
   and not a `HashMap`.
 
 `ManifestExecutionBindingV1`/`V2` are the checksum-input shapes. V2 added
-`artifact_origins` and `branch_roots`. If you add a manifest field that
-participates in identity, it needs a binding version — do not silently extend
-V2 in place, or you invalidate every existing checksum.
+`artifact_origins`; `branch_roots` belongs to the V3/V4 control projection. If
+you add a manifest field that participates in identity, it needs a binding
+version — do not silently extend V2 in place, or you invalidate every existing
+checksum.
 
 ## Artifact origins (branching)
 

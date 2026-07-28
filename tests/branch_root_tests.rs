@@ -244,7 +244,7 @@ async fn branch_root_and_deletion_fence_race_has_exactly_one_cas_winner() {
     assert_eq!(control.roots.is_empty(), control.deletion_fenced);
     assert_eq!(
         control.binding_version,
-        Some(zeppelin::wal::manifest::ReceiptBindingVersion::V3Roots)
+        Some(zeppelin::wal::manifest::ManifestBindingVersion::V3Roots)
     );
     harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup_artifact_origin_namespace(&target).await;
@@ -641,7 +641,7 @@ async fn root_is_query_inert_and_survives_normal_manifest_publishers() {
     assert_eq!(final_control.roots, vec![root]);
     assert_eq!(
         final_control.binding_version,
-        Some(zeppelin::wal::manifest::ReceiptBindingVersion::V3Roots)
+        Some(zeppelin::wal::manifest::ManifestBindingVersion::V3Roots)
     );
 
     harness.cleanup_artifact_origin_namespace(&source).await;
