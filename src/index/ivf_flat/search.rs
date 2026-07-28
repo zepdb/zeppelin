@@ -106,7 +106,8 @@ use crate::wal::manifest::CoarsePayloadEncoding;
 use super::build::{
     attrs_key, cluster_key, cluster_object_header_range_len, cluster_object_layout,
     cluster_object_sections, deserialize_attrs, deserialize_cluster_from_object,
-    deserialize_colocated_sq_cluster_from_object, ClusterObjectLayout, ClusterObjectRange,
+    deserialize_colocated_sq_cluster_from_object, deserialize_id_block, ClusterObjectLayout,
+    ClusterObjectRange, Zbp5ClusterLayout,
 };
 use super::sketch::{AdaptiveClusterBudget, ClusterScore};
 use super::IvfFlatIndex;
@@ -272,6 +273,34 @@ struct ClusterFetchObject {
     live_range: Option<std::ops::Range<usize>>,
     /// Manifest-declared complete object length, or zero for legacy metadata.
     size_bytes: u64,
+    /// Manifest-declared `ZBP5` row layouts; empty for every earlier layout.
+    ///
+    /// A non-empty table is the authority for this object's coarse, ID, and
+    /// fixed-stride vector ranges, so the query never reads its directory
+    /// header. Manifest loading already validated it against the segment
+    /// dimension.
+    row_layouts: Vec<Zbp5ClusterLayout>,
+}
+
+impl ClusterFetchObject {
+    /// Resolves one cluster's declared row layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index error when this object publishes row layouts but not
+    /// one for `cluster_idx`. A published layout is complete by construction, so
+    /// a gap is corruption rather than a reason to read the object header.
+    fn row_layout(&self, cluster_idx: usize) -> Result<&Zbp5ClusterLayout> {
+        self.row_layouts
+            .iter()
+            .find(|layout| layout.cluster_idx == cluster_idx)
+            .ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "cluster {cluster_idx} missing from published row layout for {}",
+                    self.key
+                ))
+            })
+    }
 }
 
 /// Outcome of consulting the local full-object cache for a range request.
@@ -827,6 +856,11 @@ fn cluster_fetch_object(index: &IvfFlatIndex, cluster_idx: usize) -> Result<Clus
             clusters: object_ref.clusters.clone(),
             live_range,
             size_bytes: object_ref.size_bytes,
+            row_layouts: object_ref
+                .row_layouts
+                .iter()
+                .map(Zbp5ClusterLayout::from_manifest)
+                .collect(),
         });
     }
 
@@ -844,6 +878,7 @@ fn cluster_fetch_object(index: &IvfFlatIndex, cluster_idx: usize) -> Result<Clus
         clusters: vec![cluster_idx],
         live_range: None,
         size_bytes: 0,
+        row_layouts: Vec::new(),
     })
 }
 
@@ -2619,7 +2654,7 @@ async fn scan_clusters_rq(
                 rq_cluster.asymmetric_distance(query_adc.as_ref(), row_idx, distance_metric)?
                     + cluster_score_offset;
             coarse_candidates.push((
-                rq_cluster.ids()[row_idx].clone(),
+                rq_cluster.id(row_idx)?.to_owned(),
                 approx_score,
                 cluster_idx,
                 row_idx,
@@ -2791,9 +2826,79 @@ struct CoarseObjectSqFetch {
 /// Two-bit coarse payloads and exact-vector ranges from one grouped object.
 struct CoarseObjectRqFetch {
     /// Decoded compact rows keyed by logical cluster.
-    rq_clusters: Vec<(usize, crate::index::quantization::rq::RqClusterCodes)>,
+    rq_clusters: Vec<(usize, RqCoarseRows)>,
     /// Absolute full-vector byte ranges aligned with each cluster's RQ IDs.
     vector_ranges: Vec<(usize, Vec<Range<usize>>)>,
+}
+
+/// One cluster's two-bit coarse rows, from either persisted layout.
+///
+/// `ZCL3` keeps IDs inline with the codes; `ZBP5` stores them in a separate ID
+/// block joined by row position. Scoring is identical, so the coarse scan sees
+/// one shape.
+enum RqCoarseRows {
+    /// `ZCL3` coarse payload carrying its own row IDs.
+    WithIds(crate::index::quantization::rq::RqClusterCodes),
+    /// `ZBP5` codes-only block plus its hoisted ID block, aligned by row.
+    CodesOnly {
+        /// Packed planes and factors without IDs.
+        codes: crate::index::quantization::rq::RqClusterCodesOnly,
+        /// Row-aligned IDs decoded from the sibling ID block.
+        ids: Vec<String>,
+    },
+}
+
+impl RqCoarseRows {
+    /// Returns the persisted code dimension.
+    fn dim(&self) -> usize {
+        match self {
+            Self::WithIds(codes) => codes.dim(),
+            Self::CodesOnly { codes, .. } => codes.dim(),
+        }
+    }
+
+    /// Returns the number of coarse rows in this cluster.
+    fn row_count(&self) -> usize {
+        match self {
+            Self::WithIds(codes) => codes.row_count(),
+            Self::CodesOnly { codes, .. } => codes.row_count(),
+        }
+    }
+
+    /// Borrows one row's identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index error when `row` is outside the decoded rows.
+    fn id(&self, row: usize) -> Result<&str> {
+        let ids = match self {
+            Self::WithIds(codes) => codes.ids(),
+            Self::CodesOnly { ids, .. } => ids.as_slice(),
+        };
+        ids.get(row).map(String::as_str).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "two-bit coarse row {row} is outside {} decoded IDs",
+                ids.len()
+            ))
+        })
+    }
+
+    /// Scores one row with the shared two-bit estimator.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the estimator's dimension, bounds, and plane errors.
+    fn asymmetric_distance(
+        &self,
+        query: &crate::index::quantization::rabitq::QueryAdc4,
+        row: usize,
+        metric: DistanceMetric,
+    ) -> Result<f32> {
+        match self {
+            Self::WithIds(codes) => Ok(codes.asymmetric_distance(query, row, metric)?),
+            Self::CodesOnly { codes, .. } => Ok(codes.asymmetric_distance(query, row, metric)?),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2900,7 +3005,56 @@ async fn load_sq_object_for_coarse(
     cache: Option<&Arc<DiskCache>>,
     stats: Option<&SqSearchByteStats>,
 ) -> Result<CoarseObjectSqFetch> {
-    use crate::index::quantization::sq::{deserialize_sq_cluster, sq_cluster_key};
+    use crate::index::quantization::sq::{
+        deserialize_sq_cluster, deserialize_sq_codes_only, sq_cluster_key, SqClusterData,
+    };
+
+    // A published row layout is authoritative: read the coarse codes and the
+    // hoisted ID blocks directly and derive exact-vector spans arithmetically.
+    // No grouped-object header is fetched, and no ID lengths are walked.
+    if !object.row_layouts.is_empty() {
+        let fetched = fetch_object_row_layout_range(object, store, cache, stats).await?;
+        let mut sq_clusters = Vec::with_capacity(object.clusters.len());
+        let mut vector_ranges = Vec::with_capacity(object.clusters.len());
+        for &cluster_idx in &object.clusters {
+            let layout = object.row_layout(cluster_idx)?;
+            let codes = deserialize_sq_codes_only(slice_relative_range(
+                &fetched.bytes,
+                &layout.coarse_range()?,
+                fetched.base_offset,
+                "v5 coarse block",
+                &object.key,
+            )?)?;
+            let ids = deserialize_id_block(slice_relative_range(
+                &fetched.bytes,
+                &layout.ids_range()?,
+                fetched.base_offset,
+                "v5 ID block",
+                &object.key,
+            )?)?;
+            let ranges = row_layout_vector_ranges(
+                layout,
+                codes.codes.len(),
+                ids.len(),
+                index.dim,
+                &object.key,
+            )?;
+            sq_clusters.push((
+                cluster_idx,
+                SqClusterData {
+                    ids,
+                    codes: codes.codes,
+                },
+            ));
+            vector_ranges.push((cluster_idx, ranges));
+        }
+        return Ok(CoarseObjectSqFetch {
+            object_key: object.key.clone(),
+            sq_clusters,
+            vector_ranges,
+            full_object: None,
+        });
+    }
 
     if !prefer_colocated {
         let mut sq_clusters = Vec::with_capacity(object.clusters.len());
@@ -3045,7 +3199,45 @@ async fn load_rq_object_for_coarse(
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
 ) -> Result<CoarseObjectRqFetch> {
-    use crate::index::quantization::rq::RqClusterCodes;
+    use crate::index::quantization::rq::{RqClusterCodes, RqClusterCodesOnly};
+
+    // Manifest-declared layout: one range read covers the codes-only coarse
+    // blocks and the hoisted ID blocks, and exact-vector spans are arithmetic.
+    if !object.row_layouts.is_empty() {
+        let fetched = fetch_object_row_layout_range(object, store, cache, None).await?;
+        let mut rq_clusters = Vec::with_capacity(object.clusters.len());
+        let mut vector_ranges = Vec::with_capacity(object.clusters.len());
+        for &cluster_idx in &object.clusters {
+            let layout = object.row_layout(cluster_idx)?;
+            let codes = RqClusterCodesOnly::from_bytes(slice_relative_range(
+                &fetched.bytes,
+                &layout.coarse_range()?,
+                fetched.base_offset,
+                "v5 coarse block",
+                &object.key,
+            )?)?;
+            let ids = deserialize_id_block(slice_relative_range(
+                &fetched.bytes,
+                &layout.ids_range()?,
+                fetched.base_offset,
+                "v5 ID block",
+                &object.key,
+            )?)?;
+            let ranges = row_layout_vector_ranges(
+                layout,
+                codes.row_count(),
+                ids.len(),
+                index.dim,
+                &object.key,
+            )?;
+            rq_clusters.push((cluster_idx, RqCoarseRows::CodesOnly { codes, ids }));
+            vector_ranges.push((cluster_idx, ranges));
+        }
+        return Ok(CoarseObjectRqFetch {
+            rq_clusters,
+            vector_ranges,
+        });
+    }
 
     let layout = load_cluster_object_layout(index, object, store, cache, None)
         .await?
@@ -3096,13 +3288,134 @@ async fn load_rq_object_for_coarse(
         )?;
         let rq_cluster = RqClusterCodes::from_bytes(coarse_slice)?;
         let ranges = full_vector_ranges_from_coarse_ids(section, rq_cluster.ids(), index.dim)?;
-        rq_clusters.push((cluster_idx, rq_cluster));
+        rq_clusters.push((cluster_idx, RqCoarseRows::WithIds(rq_cluster)));
         vector_ranges.push((cluster_idx, ranges));
     }
     Ok(CoarseObjectRqFetch {
         rq_clusters,
         vector_ranges,
     })
+}
+
+/// Fetches the span covering the coarse and ID blocks of selected v5 clusters.
+///
+/// A `ZBP5` object stores every coarse block before every ID block, so the
+/// smallest span covering both regions for the selected clusters is one
+/// contiguous read. Selecting all of an object's clusters — the normal case,
+/// since object selection expands to whole objects — produces a span with no
+/// slack at all.
+///
+/// # Parameters
+///
+/// - `object`: Physical object carrying manifest-declared row layouts.
+/// - `store`: Authoritative range reader.
+/// - `cache`: Optional complete-object cache.
+/// - `stats`: Optional byte counters, charged to the coarse phase.
+///
+/// # Returns
+///
+/// The contiguous bytes from the minimum coarse start through the maximum ID
+/// end, plus that absolute starting offset.
+///
+/// # Errors
+///
+/// Returns an index error for a missing layout or an empty combined span, and
+/// propagates cache or range-GET failures.
+///
+/// # Side Effects
+///
+/// May evict a wrong-length cached object, perform one range GET, and update
+/// range-source metrics.
+async fn fetch_object_row_layout_range(
+    object: &ClusterFetchObject,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+    stats: Option<&SqSearchByteStats>,
+) -> Result<RangeBytes> {
+    let mut start = usize::MAX;
+    let mut end = 0usize;
+    let mut logical_bytes = 0usize;
+    for &cluster_idx in &object.clusters {
+        let layout = object.row_layout(cluster_idx)?;
+        let coarse = layout.coarse_range()?;
+        let ids = layout.ids_range()?;
+        logical_bytes = logical_bytes
+            .checked_add(coarse.end - coarse.start)
+            .and_then(|total| total.checked_add(ids.end - ids.start))
+            .ok_or_else(|| ZeppelinError::Index("v5 coarse logical byte count overflows".into()))?;
+        start = start.min(coarse.start);
+        end = end.max(ids.end);
+    }
+    if start == usize::MAX || start >= end {
+        return Err(ZeppelinError::Index(format!(
+            "empty v5 coarse range for object {}",
+            object.key
+        )));
+    }
+    match cached_full_object_for_range(
+        cache,
+        &object.cache_key,
+        &object.key,
+        object.size_bytes,
+        end,
+        "sq",
+        1,
+    )
+    .await?
+    {
+        RangeCacheLookup::Local(data) => {
+            if let Some(stats) = stats {
+                stats.record_local_bytes(data.len());
+                stats.record_logical_sq_bytes(logical_bytes);
+            }
+            return Ok(RangeBytes {
+                base_offset: start,
+                bytes: data.slice(start..end),
+            });
+        }
+        RangeCacheLookup::Miss => {
+            crate::metrics::RANGE_SOURCE_TOTAL
+                .with_label_values(&["sq", "s3"])
+                .inc();
+        }
+        RangeCacheLookup::CorruptEvicted => {}
+    }
+    let bytes = store.get_range(&object.key, start..end).await?;
+    if let Some(stats) = stats {
+        stats.record_get(SqBytePhase::Sq, bytes.len());
+        stats.record_logical_sq_bytes(logical_bytes);
+    }
+    Ok(RangeBytes {
+        base_offset: start,
+        bytes,
+    })
+}
+
+/// Derives every row's exact-vector span from one cluster's declared layout.
+///
+/// This replaces walking variable-length ID records: a fixed stride makes row
+/// `r`'s offset pure multiplication.
+///
+/// # Errors
+///
+/// Returns an index error when the coarse and ID row counts disagree with the
+/// declared row count, or when any row's checked range arithmetic fails.
+fn row_layout_vector_ranges(
+    layout: &Zbp5ClusterLayout,
+    coarse_rows: usize,
+    id_rows: usize,
+    dim: usize,
+    object_key: &str,
+) -> Result<Vec<Range<usize>>> {
+    if coarse_rows != layout.row_count || id_rows != layout.row_count {
+        return Err(ZeppelinError::Index(format!(
+            "v5 cluster {} in {object_key} row-count disagreement: layout={}, coarse={coarse_rows}, ids={id_rows}",
+            layout.cluster_idx, layout.row_count
+        )));
+    }
+    (0..layout.row_count)
+        .map(|row| layout.vector_row_range_usize(row, dim))
+        .collect()
 }
 
 /// Bytes fetched for one absolute object span plus their origin offset.
@@ -3356,6 +3669,32 @@ async fn load_full_clusters_for_rerank(
             &needed_clusters,
             cluster_candidates,
         );
+    }
+
+    // A published row layout already supplied every winner's exact span during
+    // the coarse phase, so rerank reads only those spans. Missing spans here
+    // would mean the manifest and the coarse decode disagreed, which is an
+    // index error rather than a reason to download the object.
+    if !object.row_layouts.is_empty() {
+        if !all_needed_vectors_have_ranges(&needed_clusters, cluster_candidates) {
+            return Err(ZeppelinError::Index(format!(
+                "cluster object {} publishes row layouts but a rerank candidate has no vector range",
+                object.key
+            )));
+        }
+        return fetch_rerank_vectors_by_range(
+            &object.key,
+            &object.cache_key,
+            object.size_bytes,
+            &needed_clusters,
+            cluster_candidates,
+            index.dim,
+            store,
+            cache,
+            stats,
+            rerank_coalesce_gap_bytes,
+        )
+        .await;
     }
 
     if load_cluster_object_layout(index, object, store, cache, stats)
@@ -5147,6 +5486,8 @@ mod tests {
                 live_offset: 0,
                 live_len: 0,
                 size_bytes: 0,
+                cluster_layout_version: 0,
+                row_layouts: Vec::new(),
             },
             crate::wal::manifest::ClusterDataObjectRef {
                 key: "test_ns/segments/seg_001/cluster_group_1.bin".to_string(),
@@ -5154,6 +5495,8 @@ mod tests {
                 live_offset: 0,
                 live_len: 0,
                 size_bytes: 0,
+                cluster_layout_version: 0,
+                row_layouts: Vec::new(),
             },
         ];
         index.cluster_object_by_cluster = vec![0, 0, 1, 1];

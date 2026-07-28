@@ -445,16 +445,18 @@ async fn cold_strong_vector_query_pins_sq8_get_profile() {
     // - bootstrap=1: active segment bootstrap blob, including centroids,
     //   SQ calibration, and resident sketch.
     // - sq=0: no SQ calibration or per-cluster SQ sidecars for v2 segments.
-    // - cluster=6: two grouped cluster-data objects cover the four clusters;
-    //   each object pays one header-range GET, one SQ-range GET, and one
-    //   coalesced rerank-vector range GET. This intentionally accepts more
-    //   operations than the earlier full-object coarse fetch so cold SQ scans
-    //   avoid downloading full f32 payload bytes during coarse scoring.
+    // - cluster=4: two grouped ZBP5 cluster-data objects cover the four
+    //   clusters; the manifest-published row layout replaces the old
+    //   header-range GET, so each object pays one coarse+ID span GET and one
+    //   coalesced fixed-stride rerank-vector range GET. This intentionally
+    //   accepts more operations than the earlier full-object coarse fetch so
+    //   cold SQ scans avoid downloading full f32 payload bytes during coarse
+    //   scoring.
     // - attrs=4: lazy final-result enrichment still needs all four attrs
     //   blobs in this fixture because top_k=4 returns one vector from each
     //   one-vector cluster. attrs_laziness_tests pins the reduced top_k=1
     //   profile where only the winning cluster's attrs are fetched.
-    // - total=12: honest object GET count, not the thesis-level "2".
+    // - total=10: honest object GET count, not the thesis-level "2".
     assert_get_profile(
         &fixture.counter,
         ExpectedGets {
@@ -462,7 +464,7 @@ async fn cold_strong_vector_query_pins_sq8_get_profile() {
             centroids: 0,
             bootstrap: 1,
             sq: 0,
-            cluster: 6,
+            cluster: 4,
             attrs: 4,
             sketch: 0,
             wal: 0,
@@ -646,7 +648,7 @@ async fn cluster_gets_reflect_grouped_sq_ranges_and_nprobe() {
             centroids: 0,
             bootstrap: 1,
             sq: 0,
-            cluster: 3,
+            cluster: 2,
             attrs: 2,
             sketch: 0,
             wal: 0,
@@ -667,7 +669,7 @@ async fn cluster_gets_reflect_grouped_sq_ranges_and_nprobe() {
             centroids: 0,
             bootstrap: 1,
             sq: 0,
-            cluster: 6,
+            cluster: 4,
             attrs: 4,
             sketch: 0,
             wal: 0,
@@ -675,8 +677,8 @@ async fn cluster_gets_reflect_grouped_sq_ranges_and_nprobe() {
     );
     let cluster_gets_nprobe_4 = fixture.counter.gets_for(ArtifactClass::Cluster);
 
-    assert_eq!(cluster_gets_nprobe_1, 3);
-    assert_eq!(cluster_gets_nprobe_4, 6);
+    assert_eq!(cluster_gets_nprobe_1, 2);
+    assert_eq!(cluster_gets_nprobe_4, 4);
 
     fixture.harness.cleanup().await;
 }
@@ -709,7 +711,7 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
             centroids: 0,
             bootstrap: 1,
             sq: 0,
-            cluster: 6,
+            cluster: 4,
             attrs: 4,
             sketch: 0,
             wal: 0,
@@ -731,8 +733,9 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
         "warm strong vector query with populated disk cache, SQ8, nprobe=4",
         &fixture.counter,
     );
-    // The disk cache still serves bootstrap metadata, attrs, and decoded
-    // grouped-object layouts. SQ and rerank vector ranges intentionally remain
+    // The disk cache still serves bootstrap metadata and attrs; the
+    // manifest-published ZBP5 row layout needs no cached grouped-object
+    // directory at all. Coarse and rerank vector ranges intentionally remain
     // ranged S3 reads so the cache does not need to store full grouped objects
     // just to satisfy coarse SQ scoring.
     assert_get_profile(
@@ -750,7 +753,7 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
     );
     let warm_total = fixture.counter.total_gets();
 
-    assert_eq!(cold_total, 12);
+    assert_eq!(cold_total, 10);
     assert_eq!(warm_total, 5);
     assert!(
         warm_total < cold_total,

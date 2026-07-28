@@ -162,7 +162,10 @@ use crate::error::{Result, ZeppelinError};
 use crate::index::quantization::QuantizationType;
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, VectorEntry};
-use crate::wal::manifest::{BootstrapRef, ClusterDataObjectRef, CoarsePayloadEncoding};
+use crate::wal::manifest::{
+    BootstrapRef, ClusterDataObjectRef, ClusterRowLayoutRef, CoarsePayloadEncoding,
+    CLUSTER_LAYOUT_VERSION_ZBP5,
+};
 
 use super::kmeans::{repair_cluster_balance, train_kmeans};
 use super::membership::build_membership_artifact;
@@ -696,6 +699,7 @@ fn emit_cluster_group_stats(max_clusters_per_object: usize, cutoff: f32, groups:
 /// - `cluster_count`: Number of logical clusters in the loaded centroid set.
 /// - `cluster_objects`: Manifest-defined immutable objects and their logical
 ///   cluster membership.
+/// - `dim`: Segment vector dimension used to check declared row layouts.
 ///
 /// # Returns
 ///
@@ -706,8 +710,10 @@ fn emit_cluster_group_stats(max_clusters_per_object: usize, cutoff: f32, groups:
 /// # Errors
 ///
 /// Returns an index error for an empty object key, an object with no clusters,
-/// an out-of-range or duplicate cluster, a cluster listed in two objects, or a
-/// logical cluster missing from the layout. No object-store I/O occurs.
+/// an out-of-range or duplicate cluster, a cluster listed in two objects, a
+/// logical cluster missing from the layout, or an inconsistent declared row
+/// layout. No object-store I/O occurs. Validating layouts here is what lets the
+/// query path trust manifest ranges without re-reading object headers.
 ///
 /// # Examples
 ///
@@ -723,6 +729,7 @@ fn emit_cluster_group_stats(max_clusters_per_object: usize, cutoff: f32, groups:
 pub(crate) fn build_cluster_object_lookup(
     cluster_count: usize,
     cluster_objects: &[ClusterDataObjectRef],
+    dim: usize,
 ) -> Result<Vec<usize>> {
     if cluster_objects.is_empty() {
         return Ok(Vec::new());
@@ -730,6 +737,7 @@ pub(crate) fn build_cluster_object_lookup(
 
     let mut lookup = vec![usize::MAX; cluster_count];
     for (object_idx, object_ref) in cluster_objects.iter().enumerate() {
+        object_ref.validate_row_layouts(dim)?;
         if object_ref.key.is_empty() {
             return Err(ZeppelinError::Index(format!(
                 "cluster object {object_idx} has empty key"
@@ -2020,8 +2028,18 @@ pub(crate) fn deserialize_cluster_from_object(
     data: &[u8],
     cluster_idx: usize,
 ) -> Result<ClusterData> {
-    let data = cluster_section_from_object(data, cluster_idx)?;
-    deserialize_cluster(data)
+    let Some(sections) = cluster_object_sections(data)? else {
+        return deserialize_cluster(data);
+    };
+    sections
+        .iter()
+        .find(|section| section.cluster_idx == cluster_idx)
+        .ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "cluster {cluster_idx} missing from cluster data object"
+            ))
+        })?
+        .decode()
 }
 
 /// Decodes the count/dimension legacy full-vector cluster representation.
@@ -2223,8 +2241,28 @@ pub(crate) fn deserialize_colocated_coarse_cluster_from_object(
         return decode_coarse_payload(&data[coarse.clone()], encoding).map(Some);
     }
 
-    let data = cluster_section_from_object(data, cluster_idx)?;
-    deserialize_colocated_coarse_cluster(data, encoding)
+    if is_cluster_data_object_v5(data) {
+        // v5 coarse blocks carry no IDs, so they are only meaningful alongside
+        // their sibling ID block. Callers must use the manifest row layout.
+        return Err(ZeppelinError::Index(
+            "v5 cluster data object coarse blocks require manifest row layouts".into(),
+        ));
+    }
+
+    let Some(layout) = cluster_object_layout(data)? else {
+        return deserialize_colocated_coarse_cluster(data, encoding);
+    };
+    let section = layout.section(cluster_idx).ok_or_else(|| {
+        ZeppelinError::Index(format!(
+            "cluster {cluster_idx} missing from cluster data object"
+        ))
+    })?;
+    validate_range_in_object(
+        &section.full,
+        data.len(),
+        "cluster data object full section",
+    )?;
+    deserialize_colocated_coarse_cluster(&data[section.full.clone()], encoding)
 }
 
 /// Deserialize the SQ section for one cluster in either a legacy per-cluster
@@ -2269,12 +2307,78 @@ struct ColocatedClusterSections<'a> {
     full: &'a [u8],
 }
 
-/// Borrowed full-vector payload for one entry in a grouped object.
+/// Borrowed exact-row payload for one entry in a grouped object.
+///
+/// A `ZBP1`/`ZBP4` entry owns one contiguous legacy row section; a `ZBP5` entry
+/// instead owns a hoisted ID block and a fixed-stride f32 block that must be
+/// joined by row position. [`Self::decode`] hides that difference from callers
+/// that only want the cluster's IDs and exact vectors.
 pub(crate) struct ClusterObjectSection<'a> {
     /// Logical IVF cluster represented by this range.
     pub cluster_idx: usize,
-    /// Full-vector child section borrowed from the grouped object.
-    pub data: &'a [u8],
+    /// Borrowed rows in whichever grouped layout the object uses.
+    rows: ClusterObjectRows<'a>,
+}
+
+/// The two persisted shapes an exact-row section can take.
+enum ClusterObjectRows<'a> {
+    /// One `[row_count][dim][(id_len, id, f32[dim])...]` child section.
+    Legacy(&'a [u8]),
+    /// Separated `ZBP5` ID and fixed-stride vector blocks for one cluster.
+    RowLayout {
+        /// Rows shared by both blocks, from the object directory.
+        row_count: usize,
+        /// Deterministic ID block bytes.
+        ids: &'a [u8],
+        /// Exactly `row_count × dim × 4` vector bytes.
+        vectors: &'a [u8],
+    },
+}
+
+impl ClusterObjectSection<'_> {
+    /// Decodes this section's IDs and exact vectors in persisted row order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index error for a malformed legacy section, a malformed
+    /// `ZBP5` ID block, a vector block whose length is not a whole number of
+    /// fixed-stride rows, or an ID/vector row-count disagreement. A `ZBP5`
+    /// section derives its dimension from the declared block length, so a
+    /// mismatch is corruption rather than a differently sized segment.
+    pub(crate) fn decode(&self) -> Result<ClusterData> {
+        match &self.rows {
+            ClusterObjectRows::Legacy(data) => deserialize_cluster(data),
+            ClusterObjectRows::RowLayout {
+                row_count,
+                ids,
+                vectors,
+            } => {
+                let ids = deserialize_id_block(ids)?;
+                if ids.len() != *row_count {
+                    return Err(ZeppelinError::Index(format!(
+                        "v5 cluster {} declares {row_count} rows but its ID block has {}",
+                        self.cluster_idx,
+                        ids.len()
+                    )));
+                }
+                let dim = if *row_count == 0 {
+                    0
+                } else {
+                    let row_bytes = vectors.len() / row_count;
+                    if row_bytes % 4 != 0 || row_bytes * row_count != vectors.len() {
+                        return Err(ZeppelinError::Index(format!(
+                            "v5 cluster {} vector block of {} bytes is not {row_count} whole f32 rows",
+                            self.cluster_idx,
+                            vectors.len()
+                        )));
+                    }
+                    row_bytes / 4
+                };
+                let vectors = deserialize_fixed_stride_f32_block(vectors, *row_count, dim)?;
+                Ok(ClusterData { ids, vectors })
+            }
+        }
+    }
 }
 
 /// Absolute byte ranges for one cluster inside a grouped cluster-data object.
@@ -2414,6 +2518,26 @@ pub(crate) fn cluster_object_layout(data: &[u8]) -> Result<Option<ClusterObjectL
 pub(crate) fn cluster_object_sections(
     data: &[u8],
 ) -> Result<Option<Vec<ClusterObjectSection<'_>>>> {
+    if is_cluster_data_object_v5(data) {
+        let layouts = parse_cluster_data_object_v5(data)?;
+        let mut sections = Vec::with_capacity(layouts.len());
+        for layout in layouts {
+            let ids = usize_range(&layout.ids, "v5 cluster data object ID block")?;
+            let vectors = usize_range(&layout.vectors, "v5 cluster data object vector block")?;
+            validate_range_in_object(&ids, data.len(), "v5 cluster data object ID block")?;
+            validate_range_in_object(&vectors, data.len(), "v5 cluster data object vector block")?;
+            sections.push(ClusterObjectSection {
+                cluster_idx: layout.cluster_idx,
+                rows: ClusterObjectRows::RowLayout {
+                    row_count: layout.row_count,
+                    ids: &data[ids],
+                    vectors: &data[vectors],
+                },
+            });
+        }
+        return Ok(Some(sections));
+    }
+
     let Some(layout) = cluster_object_layout(data)? else {
         return Ok(None);
     };
@@ -2426,7 +2550,7 @@ pub(crate) fn cluster_object_sections(
         )?;
         sections.push(ClusterObjectSection {
             cluster_idx: section.cluster_idx,
-            data: &data[section.full],
+            rows: ClusterObjectRows::Legacy(&data[section.full]),
         });
     }
 
@@ -2641,7 +2765,6 @@ fn is_cluster_data_object_v4(data: &[u8]) -> bool {
 /// # Returns
 ///
 /// `true` only when the first four bytes are `ZBP` followed by version 5.
-#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
 fn is_cluster_data_object_v5(data: &[u8]) -> bool {
     data.len() >= 4
         && &data[0..3] == CLUSTER_DATA_OBJECT_MAGIC_PREFIX
@@ -2658,7 +2781,6 @@ fn is_cluster_data_object_v5(data: &[u8]) -> bool {
 ///
 /// Returns an index error when the row count or an ID length does not fit the
 /// format's `u32` fields.
-#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
 pub(crate) fn serialize_id_block(ids: &[String]) -> Result<Bytes> {
     let row_count = u32::try_from(ids.len()).map_err(|_| {
         ZeppelinError::Index(format!(
@@ -2693,7 +2815,6 @@ pub(crate) fn serialize_id_block(ids: &[String]) -> Result<Bytes> {
 /// Returns an index error for a truncated header, ID length, or ID payload,
 /// for non-UTF-8 IDs, or for trailing bytes after the declared rows. The block
 /// has an exact length; malformed input is never partially returned.
-#[allow(dead_code)] // Wired by the v5 production reader in a later slice.
 pub(crate) fn deserialize_id_block(data: &[u8]) -> Result<Vec<String>> {
     if data.len() < 4 {
         return Err(ZeppelinError::Index(
@@ -2750,7 +2871,6 @@ pub(crate) fn deserialize_id_block(data: &[u8]) -> Result<Vec<String>> {
 /// # Errors
 ///
 /// Returns an index error when the multiplication overflows.
-#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
 pub(crate) fn fixed_stride_f32_block_len(row_count: usize, dim: usize) -> Result<usize> {
     row_count
         .checked_mul(dim)
@@ -2769,7 +2889,6 @@ pub(crate) fn fixed_stride_f32_block_len(row_count: usize, dim: usize) -> Result
 /// Returns an index error when a row's width differs from `dim` or the size
 /// arithmetic overflows. A wrong width would silently shift every following
 /// row, so it is rejected rather than zipped short.
-#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
 pub(crate) fn serialize_fixed_stride_f32_block(vectors: &[Vec<f32>], dim: usize) -> Result<Bytes> {
     let total = fixed_stride_f32_block_len(vectors.len(), dim)?;
     let mut buf = Vec::with_capacity(total);
@@ -2800,7 +2919,6 @@ pub(crate) fn serialize_fixed_stride_f32_block(vectors: &[Vec<f32>], dim: usize)
 ///
 /// Returns an index error when `data.len()` differs from exactly
 /// `row_count × dim × 4` or the size arithmetic overflows.
-#[allow(dead_code)] // Wired by the v5 production reader in a later slice.
 pub(crate) fn deserialize_fixed_stride_f32_block(
     data: &[u8],
     row_count: usize,
@@ -2836,7 +2954,6 @@ pub(crate) fn deserialize_fixed_stride_f32_block(
 /// full-object parser derives the same values as the object's self-describing
 /// corruption boundary. Row `r`'s exact-vector range is pure arithmetic via
 /// [`Self::vector_row_range`]; no ID-length walk is ever required.
-#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Zbp5ClusterLayout {
     /// Logical IVF cluster named by the directory entry.
@@ -2851,8 +2968,52 @@ pub(crate) struct Zbp5ClusterLayout {
     pub vectors: Range<u64>,
 }
 
-#[allow(dead_code)] // Wired by the v5 production reader in a later slice.
 impl Zbp5ClusterLayout {
+    /// Rebuilds the typed layout from its manifest projection.
+    ///
+    /// The manifest is authoritative for query ranges, so this is the seam that
+    /// lets the hot path plan reads without a grouped-object header GET. The
+    /// values are validated once by
+    /// [`ClusterDataObjectRef::validate_row_layouts`] when the index handle is
+    /// constructed.
+    #[must_use]
+    pub(crate) fn from_manifest(layout: &ClusterRowLayoutRef) -> Self {
+        Self {
+            cluster_idx: layout.cluster_idx,
+            row_count: layout.row_count as usize,
+            coarse: layout.coarse_offset..layout.coarse_offset + layout.coarse_len,
+            ids: layout.ids_offset..layout.ids_offset + layout.ids_len,
+            vectors: layout.vectors_offset..layout.vectors_offset + layout.vectors_len,
+        }
+    }
+
+    /// Returns the coarse block as a platform-sized range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index error when an endpoint does not fit in `usize`.
+    pub(crate) fn coarse_range(&self) -> Result<Range<usize>> {
+        usize_range(&self.coarse, "v5 coarse block")
+    }
+
+    /// Returns the ID block as a platform-sized range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index error when an endpoint does not fit in `usize`.
+    pub(crate) fn ids_range(&self) -> Result<Range<usize>> {
+        usize_range(&self.ids, "v5 ID block")
+    }
+
+    /// Returns row `r`'s exact-vector span as a platform-sized range.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::vector_row_range`] and narrowing failures.
+    pub(crate) fn vector_row_range_usize(&self, row: usize, dim: usize) -> Result<Range<usize>> {
+        usize_range(&self.vector_row_range(row, dim)?, "v5 vector row")
+    }
+
     /// Computes row `r`'s exact-vector range with checked arithmetic.
     ///
     /// The range is `vectors_offset + r × dim × 4 .. + dim × 4`, clamped to the
@@ -2896,7 +3057,6 @@ impl Zbp5ClusterLayout {
 }
 
 /// Borrowed per-cluster blocks that become one `ZBP5` directory entry.
-#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
 pub(crate) struct Zbp5ClusterBlocks<'a> {
     /// Logical IVF cluster named in the grouped directory.
     pub cluster_idx: usize,
@@ -2914,12 +3074,133 @@ pub(crate) struct Zbp5ClusterBlocks<'a> {
 ///
 /// The layout is returned, never re-derived, so the publisher can record the
 /// exact ranges in manifest metadata without re-parsing the just-built bytes.
-#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
 pub(crate) struct SerializedClusterDataObjectV5 {
     /// Complete immutable object bytes.
     pub bytes: Bytes,
     /// One layout descriptor per directory entry, in stored order.
     pub layout: Vec<Zbp5ClusterLayout>,
+}
+
+impl From<&Zbp5ClusterLayout> for ClusterRowLayoutRef {
+    fn from(layout: &Zbp5ClusterLayout) -> Self {
+        Self {
+            cluster_idx: layout.cluster_idx,
+            row_count: layout.row_count as u64,
+            coarse_offset: layout.coarse.start,
+            coarse_len: layout.coarse.end - layout.coarse.start,
+            ids_offset: layout.ids.start,
+            ids_len: layout.ids.end - layout.ids.start,
+            vectors_offset: layout.vectors.start,
+            vectors_len: layout.vectors.end - layout.vectors.start,
+        }
+    }
+}
+
+/// One cluster's serialized payload before it is placed in a grouped object.
+///
+/// The variant decides the grouped-object layout: quantized builds emit the
+/// three `ZBP5` blocks, while unquantized and product-quantized builds keep the
+/// legacy row section. A group is never mixed.
+pub(crate) enum ClusterPayload {
+    /// One complete legacy or co-located cluster section.
+    Legacy(Bytes),
+    /// Hoisted-ID `ZBP5` blocks for one cluster, in row order.
+    RowLayout {
+        /// Rows shared by all three blocks.
+        row_count: usize,
+        /// Codes-and-factors coarse block without IDs.
+        coarse: Bytes,
+        /// Deterministic ID block.
+        ids: Bytes,
+        /// Fixed-stride f32 block of exactly `row_count × dim × 4` bytes.
+        vectors: Bytes,
+    },
+}
+
+/// A serialized grouped object plus the manifest metadata describing it.
+pub(crate) struct SerializedClusterGroup {
+    /// Complete immutable object bytes.
+    pub bytes: Bytes,
+    /// [`CLUSTER_LAYOUT_VERSION_ZBP5`] for a row-layout object, else `0`.
+    pub layout_version: u32,
+    /// Exactly the ranges written, in entry order; empty for earlier layouts.
+    pub row_layouts: Vec<ClusterRowLayoutRef>,
+}
+
+/// Serializes one group of clusters into a single immutable object.
+///
+/// # Parameters
+///
+/// - `entries`: `(logical cluster index, payload)` pairs. Entry order becomes
+///   directory and payload order.
+///
+/// # Returns
+///
+/// The object bytes plus the manifest layout metadata the publisher must record
+/// verbatim. Row layouts come from the serializer, never from re-parsing the
+/// bytes that were just built.
+///
+/// # Errors
+///
+/// Returns an index error for an empty group, a group mixing row-layout and
+/// legacy payloads, or any child serializer failure. Mixing is rejected rather
+/// than downgraded: one object has exactly one layout.
+pub(crate) fn serialize_cluster_group(
+    entries: &[(usize, &ClusterPayload)],
+) -> Result<SerializedClusterGroup> {
+    if entries.is_empty() {
+        return Err(ZeppelinError::Index("cluster group cannot be empty".into()));
+    }
+    let row_layout_entries = entries
+        .iter()
+        .filter(|(_, payload)| matches!(payload, ClusterPayload::RowLayout { .. }))
+        .count();
+    if row_layout_entries != 0 && row_layout_entries != entries.len() {
+        return Err(ZeppelinError::Index(format!(
+            "cluster group mixes v5 row-layout and legacy payloads: {row_layout_entries} of {}",
+            entries.len()
+        )));
+    }
+
+    if row_layout_entries == 0 {
+        let legacy: Vec<(usize, Bytes)> = entries
+            .iter()
+            .map(|(cluster_idx, payload)| match payload {
+                ClusterPayload::Legacy(bytes) => (*cluster_idx, bytes.clone()),
+                ClusterPayload::RowLayout { .. } => unreachable!("checked above"),
+            })
+            .collect();
+        return Ok(SerializedClusterGroup {
+            bytes: serialize_cluster_data_object(&legacy)?,
+            layout_version: 0,
+            row_layouts: Vec::new(),
+        });
+    }
+
+    let blocks: Vec<Zbp5ClusterBlocks<'_>> = entries
+        .iter()
+        .map(|(cluster_idx, payload)| match payload {
+            ClusterPayload::RowLayout {
+                row_count,
+                coarse,
+                ids,
+                vectors,
+            } => Zbp5ClusterBlocks {
+                cluster_idx: *cluster_idx,
+                row_count: *row_count,
+                coarse,
+                ids,
+                vectors,
+            },
+            ClusterPayload::Legacy(_) => unreachable!("checked above"),
+        })
+        .collect();
+    let serialized = serialize_cluster_data_object_v5(&blocks)?;
+    Ok(SerializedClusterGroup {
+        row_layouts: serialized.layout.iter().map(Into::into).collect(),
+        bytes: serialized.bytes,
+        layout_version: CLUSTER_LAYOUT_VERSION_ZBP5,
+    })
 }
 
 /// Writes a v5 grouped object: directory, coarse blocks, ID blocks, then
@@ -2947,7 +3228,6 @@ pub(crate) struct SerializedClusterDataObjectV5 {
 /// Two clusters become `directory | coarse0 | coarse1 | ids0 | ids1 |
 /// vectors0 | vectors1`; the first ID block therefore starts exactly where the
 /// last coarse block ends.
-#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
 pub(crate) fn serialize_cluster_data_object_v5(
     entries: &[Zbp5ClusterBlocks<'_>],
 ) -> Result<SerializedClusterDataObjectV5> {
@@ -3077,7 +3357,6 @@ pub(crate) fn serialize_cluster_data_object_v5(
 /// Returns an index error for a non-v5 signature, a truncated header or
 /// directory, zero entries, duplicate cluster indexes, non-tiling ranges, an
 /// inexact object end, or arithmetic overflow.
-#[allow(dead_code)] // Wired by the v5 production reader in a later slice.
 pub(crate) fn parse_cluster_data_object_v5(data: &[u8]) -> Result<Vec<Zbp5ClusterLayout>> {
     if !is_cluster_data_object_v5(data) {
         return Err(ZeppelinError::Index("not a v5 cluster data object".into()));
@@ -3208,6 +3487,24 @@ pub(crate) fn parse_cluster_data_object_v5(data: &[u8]) -> Result<Vec<Zbp5Cluste
 /// # Errors
 ///
 /// Returns an index error for a reversed or out-of-bounds range.
+/// Narrows a persisted `u64` range to this platform's `usize`.
+///
+/// # Errors
+///
+/// Returns an index error when either endpoint does not fit in `usize`.
+fn usize_range(range: &Range<u64>, label: &str) -> Result<Range<usize>> {
+    let start = usize::try_from(range.start).map_err(|_| {
+        ZeppelinError::Index(format!(
+            "{label} start does not fit in usize: {}",
+            range.start
+        ))
+    })?;
+    let end = usize::try_from(range.end).map_err(|_| {
+        ZeppelinError::Index(format!("{label} end does not fit in usize: {}", range.end))
+    })?;
+    Ok(start..end)
+}
+
 fn validate_range_in_object(range: &Range<usize>, object_len: usize, label: &str) -> Result<()> {
     if range.start > range.end || range.end > object_len {
         return Err(ZeppelinError::Index(format!(
@@ -3216,37 +3513,6 @@ fn validate_range_in_object(range: &Range<usize>, object_len: usize, label: &str
         )));
     }
     Ok(())
-}
-
-/// Borrows one full-vector child section from standalone or grouped bytes.
-///
-/// # Parameters
-///
-/// - `data`: Complete standalone cluster section or grouped object.
-/// - `cluster_idx`: Logical cluster to select when grouped.
-///
-/// # Returns
-///
-/// A slice tied to `data`. Legacy standalone bytes are returned whole because
-/// their key already identifies the cluster.
-///
-/// # Errors
-///
-/// Returns an index error for malformed grouped metadata/ranges or a missing
-/// requested cluster.
-fn cluster_section_from_object(data: &[u8], cluster_idx: usize) -> Result<&[u8]> {
-    let Some(sections) = cluster_object_sections(data)? else {
-        return Ok(data);
-    };
-    sections
-        .into_iter()
-        .find(|section| section.cluster_idx == cluster_idx)
-        .map(|section| section.data)
-        .ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "cluster {cluster_idx} missing from cluster data object"
-            ))
-        })
 }
 
 /// Selects the exact-vector child from a co-located or legacy cluster section.
@@ -3763,7 +4029,7 @@ pub async fn build_ivf_flat(
     // CPU phase: pre-serialize all cluster sections and sidecars.
     let mut bitmap_fields_set = std::collections::HashSet::new();
     let mut bitmap_complete_fields: Option<BTreeSet<String>> = None;
-    let mut cluster_sections: Vec<Bytes> = Vec::with_capacity(num_clusters);
+    let mut cluster_sections: Vec<ClusterPayload> = Vec::with_capacity(num_clusters);
     let mut sidecar_payloads: Vec<(String, Bytes)> = Vec::new();
     for i in 0..num_clusters {
         let cvec_data = match quantization {
@@ -3774,7 +4040,12 @@ pub async fn build_ivf_flat(
                 let cluster_refs: Vec<&[f32]> =
                     cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
                 let codes = calibration.encode_batch(&cluster_refs);
-                serialize_colocated_sq_cluster(&cluster_ids[i], &cluster_vecs[i], &codes, dim)?
+                ClusterPayload::RowLayout {
+                    row_count: cluster_ids[i].len(),
+                    coarse: crate::index::quantization::sq::serialize_sq_codes_only(&codes, dim)?,
+                    ids: serialize_id_block(&cluster_ids[i])?,
+                    vectors: serialize_fixed_stride_f32_block(&cluster_vecs[i], dim)?,
+                }
             }
             QuantizationType::TwoBit => {
                 let rotation = rq_rotation.as_ref().ok_or_else(|| {
@@ -3790,10 +4061,15 @@ pub async fn build_ivf_flat(
                     &centroids[i],
                     rotation,
                 )?;
-                serialize_colocated_rq_cluster(&cluster_vecs[i], &codes, dim)?
+                ClusterPayload::RowLayout {
+                    row_count: cluster_ids[i].len(),
+                    coarse: codes.to_codes_only_bytes(),
+                    ids: serialize_id_block(&cluster_ids[i])?,
+                    vectors: serialize_fixed_stride_f32_block(&cluster_vecs[i], dim)?,
+                }
             }
             QuantizationType::None | QuantizationType::Product => {
-                serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?
+                ClusterPayload::Legacy(serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?)
             }
         };
         cluster_sections.push(cvec_data);
@@ -3830,21 +4106,23 @@ pub async fn build_ivf_flat(
         .into_iter()
         .enumerate()
     {
-        let entries: Vec<(usize, Bytes)> = group
+        let entries: Vec<(usize, &ClusterPayload)> = group
             .iter()
-            .map(|&cluster_idx| (cluster_idx, cluster_sections[cluster_idx].clone()))
+            .map(|&cluster_idx| (cluster_idx, &cluster_sections[cluster_idx]))
             .collect();
         let key = cluster_group_key(namespace, segment_id, group_idx);
-        let data = serialize_cluster_data_object(&entries)?;
-        let size_bytes = data.len() as u64;
+        let serialized = serialize_cluster_group(&entries)?;
+        let size_bytes = serialized.bytes.len() as u64;
         cluster_objects.push(ClusterDataObjectRef {
             key: key.clone(),
             clusters: group,
             live_offset: 0,
             live_len: 0,
             size_bytes,
+            cluster_layout_version: serialized.layout_version,
+            row_layouts: serialized.row_layouts,
         });
-        cluster_object_payloads.push((key, data));
+        cluster_object_payloads.push((key, serialized.bytes));
     }
 
     // I/O phase: write all cluster data and sidecars in parallel.
@@ -3957,7 +4235,8 @@ pub async fn build_ivf_flat(
         "IVF-Flat index build complete"
     );
 
-    let cluster_object_by_cluster = build_cluster_object_lookup(num_clusters, &cluster_objects)?;
+    let cluster_object_by_cluster =
+        build_cluster_object_lookup(num_clusters, &cluster_objects, dim)?;
     Ok(IvfFlatIndex {
         centroids: Arc::new(centroids),
         num_vectors: vectors.len(),
@@ -4190,7 +4469,7 @@ async fn load_ivf_flat_from_manifest_routed(
         }
     };
     let cluster_object_by_cluster =
-        build_cluster_object_lookup(metadata.centroids.len(), &cluster_objects)?;
+        build_cluster_object_lookup(metadata.centroids.len(), &cluster_objects, metadata.dim)?;
 
     info!(
         namespace = logical_namespace,
@@ -4680,19 +4959,35 @@ pub async fn load_ivf_flat(
             ))
         })?;
         for section in &sections {
-            let cluster = deserialize_cluster(section.data)?;
+            let cluster = section.decode()?;
             num_vectors += cluster.ids.len();
         }
         let clusters = sections
             .into_iter()
             .map(|section| section.cluster_idx)
             .collect::<Vec<_>>();
+        // The probing loader recovers the same declared layout a manifest would
+        // publish, so a handle built here reads a v5 object exactly like one
+        // loaded from the manifest instead of silently degrading to full GETs.
+        let (cluster_layout_version, row_layouts) = if is_cluster_data_object_v5(&data) {
+            (
+                CLUSTER_LAYOUT_VERSION_ZBP5,
+                parse_cluster_data_object_v5(&data)?
+                    .iter()
+                    .map(Into::into)
+                    .collect(),
+            )
+        } else {
+            (0, Vec::new())
+        };
         cluster_objects.push(ClusterDataObjectRef {
             key,
             clusters,
             live_offset: 0,
             live_len: 0,
             size_bytes: data.len() as u64,
+            cluster_layout_version,
+            row_layouts,
         });
     }
 
@@ -4704,7 +4999,8 @@ pub async fn load_ivf_flat(
             num_vectors += cluster.ids.len();
         }
     }
-    let cluster_object_by_cluster = build_cluster_object_lookup(num_clusters, &cluster_objects)?;
+    let cluster_object_by_cluster =
+        build_cluster_object_lookup(num_clusters, &cluster_objects, dim)?;
 
     // Detect quantization: check for PQ codebook first, then embedded or
     // legacy SQ calibration.
@@ -5047,8 +5343,8 @@ mod tests {
         assert_eq!(sq0.codes, codes0);
 
         let sections = cluster_object_sections(&object).unwrap().unwrap();
-        let cluster0 = deserialize_cluster(sections[0].data).unwrap();
-        let cluster1 = deserialize_cluster(sections[1].data).unwrap();
+        let cluster0 = sections[0].decode().unwrap();
+        let cluster1 = sections[1].decode().unwrap();
         assert_eq!(cluster0.ids, ids0);
         assert_eq!(cluster0.vectors, vecs0);
         assert_eq!(cluster1.ids, ids1);

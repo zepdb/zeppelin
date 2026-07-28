@@ -33,6 +33,7 @@ use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, VectorEntry};
 use zeppelin::wal::manifest::{
     ClusterDataObjectRef, Manifest, MembershipRef, SegmentRef, SketchRef,
+    CLUSTER_LAYOUT_VERSION_ZBP5,
 };
 use zeppelin::wal::{WalReader, WalWriter};
 
@@ -2947,5 +2948,306 @@ async fn test_incremental_multigen_and_update_moves_cluster() {
          got {from_c0}/5: {ids_c0:?}"
     );
 
+    harness.cleanup().await;
+}
+
+/// Seeds one SQ8 grouped segment through the production compaction path.
+///
+/// Returns the published segment and the rows it contains. The segment's
+/// objects carry the current `ZBP5` row layout.
+async fn seed_row_layout_segment(
+    store: &ZeppelinStore,
+    ns: &str,
+) -> (SegmentRef, Vec<VectorEntry>) {
+    use zeppelin::index::quantization::QuantizationType;
+
+    let (vectors, _centroids) = clustered_vectors(N_CLUSTERS, 8, DIM, 0.01);
+    common::seed_active_namespace(store, ns, DIM, DistanceMetric::Euclidean).await;
+    WalWriter::new(store.clone())
+        .append(ns, vectors.clone(), vec![])
+        .await
+        .unwrap();
+    incremental_compactor_quantized(store, QuantizationType::Scalar)
+        .compact(ns)
+        .await
+        .unwrap();
+    let segment = active_segment_ref(store, ns).await;
+    assert!(
+        !segment.cluster_objects.is_empty(),
+        "row-layout fixture must publish grouped objects"
+    );
+    (segment, vectors)
+}
+
+/// Asserts every published object declares `ZBP5` layouts matching its clusters.
+fn assert_row_layout_homogeneous(segment: &SegmentRef, context: &str) {
+    for object in &segment.cluster_objects {
+        assert_eq!(
+            object.cluster_layout_version, CLUSTER_LAYOUT_VERSION_ZBP5,
+            "{context}: object {} is not a row-layout object",
+            object.key
+        );
+        assert_eq!(
+            object.row_layouts.len(),
+            object.clusters.len(),
+            "{context}: object {} publishes {} layouts for {} clusters",
+            object.key,
+            object.row_layouts.len(),
+            object.clusters.len()
+        );
+        for (layout, &cluster_idx) in object.row_layouts.iter().zip(&object.clusters) {
+            assert_eq!(
+                layout.cluster_idx, cluster_idx,
+                "{context}: object {} publishes layouts out of cluster order",
+                object.key
+            );
+            assert_eq!(
+                layout.vectors_len,
+                layout.row_count * (DIM as u64) * 4,
+                "{context}: object {} cluster {cluster_idx} is not fixed stride",
+                object.key
+            );
+        }
+    }
+}
+
+/// Rewrites every grouped object of the active segment into the older `ZBP4`
+/// layout and republishes the manifest without row layouts.
+///
+/// Only the physical arrangement changes: IDs move back inline and exact rows
+/// regain their per-row headers.
+async fn downgrade_active_segment_to_v4(store: &ZeppelinStore, ns: &str) {
+    let mut manifest = Manifest::read(store, ns).await.unwrap().unwrap();
+    let active_id = manifest.active_segment.clone().unwrap();
+    let segment = manifest
+        .segments
+        .iter()
+        .find(|segment| segment.id == active_id)
+        .unwrap()
+        .clone();
+
+    let mut rewritten = Vec::with_capacity(segment.cluster_objects.len());
+    for (object_index, object) in segment.cluster_objects.iter().enumerate() {
+        assert_eq!(object.cluster_layout_version, CLUSTER_LAYOUT_VERSION_ZBP5);
+        let source = store.get(&object.key).await.unwrap();
+        let mut sections: Vec<(usize, Bytes)> = Vec::with_capacity(object.row_layouts.len());
+        for layout in &object.row_layouts {
+            let ids = decode_v5_id_block(
+                &source[layout.ids_offset as usize..(layout.ids_offset + layout.ids_len) as usize],
+            );
+            assert_eq!(ids.len() as u64, layout.row_count);
+            let coarse_block = &source[layout.coarse_offset as usize
+                ..(layout.coarse_offset + layout.coarse_len) as usize];
+            let vectors_block = &source[layout.vectors_offset as usize
+                ..(layout.vectors_offset + layout.vectors_len) as usize];
+            let dim = read_u32(coarse_block, 4) as usize;
+            let codes: Vec<Vec<u8>> = (0..ids.len())
+                .map(|row| coarse_block[8 + row * dim..8 + (row + 1) * dim].to_vec())
+                .collect();
+            let values: Vec<Vec<f32>> = (0..ids.len())
+                .map(|row| {
+                    (0..DIM)
+                        .map(|component| read_f32(vectors_block, (row * DIM + component) * 4))
+                        .collect()
+                })
+                .collect();
+            sections.push((
+                layout.cluster_idx,
+                colocated_sq_section(
+                    &serialize_sq_cluster(&ids, &codes, dim).unwrap(),
+                    &legacy_cluster_bytes(&ids, &values, DIM),
+                ),
+            ));
+        }
+        let bytes = serialize_group_object_v4(&sections);
+        let (prefix, _) = object.key.rsplit_once('/').unwrap();
+        let key = format!("{prefix}/cluster_group_v4_{object_index}.bin");
+        store.put(&key, bytes.clone()).await.unwrap();
+        rewritten.push(ClusterDataObjectRef {
+            key,
+            clusters: object.clusters.clone(),
+            live_offset: 0,
+            live_len: 0,
+            size_bytes: bytes.len() as u64,
+            cluster_layout_version: 0,
+            row_layouts: Vec::new(),
+        });
+    }
+
+    manifest
+        .segments
+        .iter_mut()
+        .find(|segment| segment.id == active_id)
+        .unwrap()
+        .cluster_objects = rewritten;
+    manifest.write(store, ns).await.unwrap();
+}
+
+fn decode_v5_id_block(data: &[u8]) -> Vec<String> {
+    let rows = read_u32(data, 0) as usize;
+    let mut ids = Vec::with_capacity(rows);
+    let mut offset = 4;
+    for _ in 0..rows {
+        let id_len = read_u32(data, offset) as usize;
+        offset += 4;
+        ids.push(
+            std::str::from_utf8(&data[offset..offset + id_len])
+                .unwrap()
+                .to_string(),
+        );
+        offset += id_len;
+    }
+    assert_eq!(offset, data.len());
+    ids
+}
+
+fn colocated_sq_section(coarse: &Bytes, full: &Bytes) -> Bytes {
+    let header = 4 + 8 * 4;
+    let mut section = Vec::with_capacity(header + coarse.len() + full.len());
+    section.extend_from_slice(b"ZCL2");
+    section.extend_from_slice(&(header as u64).to_le_bytes());
+    section.extend_from_slice(&(coarse.len() as u64).to_le_bytes());
+    section.extend_from_slice(&((header + coarse.len()) as u64).to_le_bytes());
+    section.extend_from_slice(&(full.len() as u64).to_le_bytes());
+    section.extend_from_slice(coarse);
+    section.extend_from_slice(full);
+    Bytes::from(section)
+}
+
+fn serialize_group_object_v4(sections: &[(usize, Bytes)]) -> Bytes {
+    let header_len = 8 + sections.len() * (4 + 8 * 4);
+    let mut coarse_offset = header_len;
+    let mut full_offset = header_len
+        + sections
+            .iter()
+            .map(|(_, section)| read_u64(section, 12) as usize)
+            .sum::<usize>();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"ZBP\x04");
+    bytes.extend_from_slice(&(sections.len() as u32).to_le_bytes());
+    for (cluster_idx, section) in sections {
+        let coarse_len = read_u64(section, 12) as usize;
+        let full_len = read_u64(section, 28) as usize;
+        bytes.extend_from_slice(&(*cluster_idx as u32).to_le_bytes());
+        bytes.extend_from_slice(&(coarse_offset as u64).to_le_bytes());
+        bytes.extend_from_slice(&(coarse_len as u64).to_le_bytes());
+        bytes.extend_from_slice(&(full_offset as u64).to_le_bytes());
+        bytes.extend_from_slice(&(full_len as u64).to_le_bytes());
+        coarse_offset += coarse_len;
+        full_offset += full_len;
+    }
+    for (_, section) in sections {
+        let start = read_u64(section, 4) as usize;
+        let len = read_u64(section, 12) as usize;
+        bytes.extend_from_slice(&section[start..start + len]);
+    }
+    for (_, section) in sections {
+        let start = read_u64(section, 20) as usize;
+        let len = read_u64(section, 28) as usize;
+        bytes.extend_from_slice(&section[start..start + len]);
+    }
+    Bytes::from(bytes)
+}
+
+/// A segment describes exactly one cluster layout.
+///
+/// Carrying an object forward is only allowed when its published layout matches
+/// what the rewritten clusters are about to be written as. A `ZBP4` source
+/// therefore cannot be stitched into a `ZBP5` result: the carry-over
+/// optimization reports `cluster_layout_version_mismatch` and the fallback
+/// rebuild republishes every object in one layout.
+#[tokio::test]
+async fn incremental_compaction_keeps_one_cluster_layout_per_segment() {
+    use zeppelin::index::quantization::QuantizationType;
+
+    // v5 carry + v5 rewrite stays v5.
+    let harness = TestHarness::new().await;
+    let ns = harness.artifact_origin_namespace("incr-layout-v5");
+    let store = &harness.store;
+    let (seeded, vectors) = seed_row_layout_segment(store, &ns).await;
+    assert_row_layout_homogeneous(&seeded, "seeded segment");
+
+    let added: Vec<VectorEntry> = (0..3)
+        .map(|i| VectorEntry {
+            id: format!("added_{i}"),
+            values: vectors[0].values.iter().map(|x| x + 0.001).collect(),
+            attributes: None,
+        })
+        .collect();
+    WalWriter::new(store.clone())
+        .append(&ns, added, vec![])
+        .await
+        .unwrap();
+    incremental_compactor_quantized(store, QuantizationType::Scalar)
+        .compact(&ns)
+        .await
+        .unwrap();
+
+    let carried = active_segment_ref(store, &ns).await;
+    assert_row_layout_homogeneous(&carried, "incremental result");
+    assert!(
+        carried
+            .cluster_objects
+            .iter()
+            .any(|object| object.key.contains(&seeded.id)),
+        "incremental cycle must carry at least one object from {}",
+        seeded.id
+    );
+    harness.cleanup().await;
+
+    // A v4 source is refused by carry-over and rebuilt as one v5 layout.
+    let harness = TestHarness::new().await;
+    let ns = harness.artifact_origin_namespace("incr-layout-v4");
+    let store = &harness.store;
+    let (seeded, vectors) = seed_row_layout_segment(store, &ns).await;
+    downgrade_active_segment_to_v4(store, &ns).await;
+    let downgraded = active_segment_ref(store, &ns).await;
+    assert!(
+        downgraded
+            .cluster_objects
+            .iter()
+            .all(|object| object.cluster_layout_version == 0),
+        "downgraded fixture must publish no row layouts"
+    );
+
+    let mismatch_counter = zeppelin::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
+        .with_label_values(&[ns.as_str(), "cluster_layout_version_mismatch"]);
+    let mismatch_before = mismatch_counter.get();
+
+    let added: Vec<VectorEntry> = (0..3)
+        .map(|i| VectorEntry {
+            id: format!("added_{i}"),
+            values: vectors[0].values.iter().map(|x| x + 0.001).collect(),
+            attributes: None,
+        })
+        .collect();
+    WalWriter::new(store.clone())
+        .append(&ns, added, vec![])
+        .await
+        .unwrap();
+    incremental_compactor_quantized(store, QuantizationType::Scalar)
+        .compact(&ns)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        mismatch_counter.get(),
+        mismatch_before + 1,
+        "carrying a v4 object into a v5 rewrite must report the layout mismatch"
+    );
+    let rebuilt = active_segment_ref(store, &ns).await;
+    assert_row_layout_homogeneous(&rebuilt, "layout-mismatch rebuild");
+    assert!(
+        rebuilt
+            .cluster_objects
+            .iter()
+            .all(|object| !object.key.contains(&seeded.id)),
+        "no v4 object may be stitched into the v5 result"
+    );
+    assert_eq!(
+        rebuilt.vector_count,
+        vectors.len() + 3,
+        "the rebuild must retain every row"
+    );
     harness.cleanup().await;
 }

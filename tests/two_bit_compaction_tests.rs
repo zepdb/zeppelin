@@ -15,7 +15,7 @@ const DIM: usize = 256;
 
 async fn compact_with_mode(
     mode: QuantizationType,
-) -> (QuantizationType, CoarsePayloadEncoding, Vec<u8>) {
+) -> (QuantizationType, CoarsePayloadEncoding, u64) {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("two-bit-compaction");
     common::seed_active_namespace(&harness.store, &namespace, DIM, DistanceMetric::Euclidean).await;
@@ -60,29 +60,45 @@ async fn compact_with_mode(
         .get(&segment.cluster_objects[0].key)
         .await
         .unwrap();
-    assert_eq!(&object[..4], b"ZBP\x04");
-    let coarse_offset = u64::from_le_bytes(object[12..20].try_into().unwrap()) as usize;
-    let coarse_len = u64::from_le_bytes(object[20..28].try_into().unwrap()) as usize;
-    let coarse_prefix = object[coarse_offset..coarse_offset + coarse_len.min(4)].to_vec();
+    // Quantized compactions write ZBP5: the grouped object carries no
+    // per-section magic, so the manifest row layout is the authoritative
+    // source of the coarse block's range and the encoding tag is the type
+    // identity of the codes-only payload.
+    assert_eq!(&object[..4], b"ZBP\x05");
+    let object_ref = &segment.cluster_objects[0];
+    assert!(object_ref.declares_row_layout());
+    let layout = &object_ref.row_layouts[0];
+    assert_eq!(
+        layout.vectors_len,
+        layout.row_count * DIM as u64 * 4,
+        "published vector block must be exactly row_count rows of fixed-stride f32"
+    );
+    let coarse_len = layout.coarse_len;
     let segment_mode = segment.quantization;
 
     harness.cleanup().await;
-    (segment_mode, encoding, coarse_prefix)
+    (segment_mode, encoding, coarse_len)
 }
 
 #[tokio::test]
 async fn compaction_round_trips_two_bit_and_scalar_modes() {
-    let (two_bit_mode, two_bit_encoding, two_bit_coarse) =
+    let (two_bit_mode, two_bit_encoding, two_bit_coarse_len) =
         compact_with_mode(QuantizationType::TwoBit).await;
     assert_eq!(two_bit_mode, QuantizationType::TwoBit);
     assert_eq!(two_bit_encoding, CoarsePayloadEncoding::TwoBit);
-    assert_eq!(two_bit_coarse, b"ZRQ1");
 
-    let (scalar_mode, scalar_encoding, scalar_coarse) =
+    let (scalar_mode, scalar_encoding, scalar_coarse_len) =
         compact_with_mode(QuantizationType::Scalar).await;
     assert_eq!(scalar_mode, QuantizationType::Scalar);
     assert_eq!(scalar_encoding, CoarsePayloadEncoding::Sq8);
-    assert_ne!(scalar_coarse, b"ZRQ1");
+
+    // Same corpus and partitioning in both runs: the two-bit codes-only block
+    // must be narrower than the SQ8 one, proving the writer really emitted a
+    // different encoding per mode rather than relabeling one payload.
+    assert!(
+        two_bit_coarse_len < scalar_coarse_len,
+        "two-bit coarse block ({two_bit_coarse_len} B) must be narrower than SQ8 ({scalar_coarse_len} B)"
+    );
 }
 
 #[tokio::test]
@@ -94,8 +110,8 @@ async fn default_quantization_stays_scalar() {
     };
     assert_eq!(config.quantization, QuantizationType::Scalar);
 
-    let (segment_mode, encoding, coarse) = compact_with_mode(config.quantization).await;
+    let (segment_mode, encoding, coarse_len) = compact_with_mode(config.quantization).await;
     assert_eq!(segment_mode, QuantizationType::Scalar);
     assert_eq!(encoding, CoarsePayloadEncoding::Sq8);
-    assert_ne!(coarse, b"ZRQ1");
+    assert!(coarse_len > 0);
 }

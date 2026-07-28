@@ -255,6 +255,38 @@ pub enum CoarsePayloadEncoding {
     TwoBit,
 }
 
+/// Layout version of a grouped object with hoisted ID blocks and fixed-stride
+/// f32 vector blocks (`ZBP5`).
+pub const CLUSTER_LAYOUT_VERSION_ZBP5: u32 = 5;
+
+/// Typed row layout for one cluster inside a `ZBP5` grouped object.
+///
+/// All ranges are absolute byte offsets within the object named by the owning
+/// [`ClusterDataObjectRef`]. The manifest publishes exactly the ranges the
+/// serializer wrote, so the query path can range-read coarse codes, ID blocks,
+/// and individual fixed-stride f32 rows without a grouped-object header GET.
+/// The ranges participate in execution identity and are therefore included in
+/// the manifest execution-binding projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterRowLayoutRef {
+    /// Logical IVF cluster described by this entry.
+    pub cluster_idx: usize,
+    /// Number of rows shared by the coarse, ID, and vector blocks.
+    pub row_count: u64,
+    /// Absolute offset of the codes-and-factors coarse block.
+    pub coarse_offset: u64,
+    /// Byte length of the coarse block.
+    pub coarse_len: u64,
+    /// Absolute offset of the deterministic ID block.
+    pub ids_offset: u64,
+    /// Byte length of the ID block.
+    pub ids_len: u64,
+    /// Absolute offset of the fixed-stride f32 vector block.
+    pub vectors_offset: u64,
+    /// Byte length of the vector block: exactly `row_count × dim × 4`.
+    pub vectors_len: u64,
+}
+
 /// Manifest metadata for one immutable object containing one or more IVF
 /// cluster payloads.
 ///
@@ -291,6 +323,26 @@ pub struct ClusterDataObjectRef {
     /// new fields are trailing and `#[serde(default)]`.
     #[serde(default)]
     pub size_bytes: u64,
+    /// Grouped-object row layout version.
+    ///
+    /// `0` means no declared row layout: the object predates typed row ranges
+    /// (legacy `ZBP1`/`ZBP4` or per-cluster keys) and readers discover ranges
+    /// from the object header. [`CLUSTER_LAYOUT_VERSION_ZBP5`] declares one
+    /// [`ClusterRowLayoutRef`] per advertised cluster.
+    ///
+    /// NOTE: manifest schema additions must remain trailing in the struct.
+    /// MessagePack encodes structs as arrays, so old manifests decode only if
+    /// new fields are trailing and `#[serde(default)]`.
+    #[serde(default)]
+    pub cluster_layout_version: u32,
+    /// Typed row layouts for a `ZBP5` object, one per advertised cluster in the
+    /// same order as [`Self::clusters`]. Empty for every earlier layout.
+    ///
+    /// NOTE: this field must stay LAST. MessagePack encodes structs as arrays,
+    /// so old manifests decode only if new fields are trailing and
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub row_layouts: Vec<ClusterRowLayoutRef>,
 }
 
 impl ClusterDataObjectRef {
@@ -343,6 +395,135 @@ impl ClusterDataObjectRef {
             ))
         })?;
         Ok(Some(start..end))
+    }
+
+    /// Reports whether this object publishes typed `ZBP5` row layouts.
+    #[must_use]
+    pub fn declares_row_layout(&self) -> bool {
+        self.cluster_layout_version == CLUSTER_LAYOUT_VERSION_ZBP5
+    }
+
+    /// Validates published row layouts against the object's own metadata.
+    ///
+    /// The manifest is authoritative for the hot query ranges, so it is checked
+    /// once when an index handle is constructed rather than trusted per query.
+    /// A declared layout must name every advertised cluster in the same order,
+    /// keep its coarse, ID, and vector regions grouped and non-overlapping
+    /// inside the declared object size, and size each vector block at exactly
+    /// `row_count × dim × 4`.
+    ///
+    /// # Parameters
+    ///
+    /// - `dim`: Segment vector dimension used for the fixed-stride check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Index`] for an unknown layout version, layouts
+    /// present without a version (or absent with one), a cluster/layout
+    /// mismatch, overlapping or out-of-bounds ranges, region groups that are not
+    /// ordered coarse → IDs → vectors, or a vector block whose length is not the
+    /// exact fixed stride. There is no permissive mode: an inconsistent layout
+    /// is corruption, not a reason to fall back to header reads.
+    pub fn validate_row_layouts(&self, dim: usize) -> Result<()> {
+        if self.cluster_layout_version == 0 {
+            if self.row_layouts.is_empty() {
+                return Ok(());
+            }
+            return Err(ZeppelinError::Index(format!(
+                "cluster object {} published {} row layouts without a layout version",
+                self.key,
+                self.row_layouts.len()
+            )));
+        }
+        if self.cluster_layout_version != CLUSTER_LAYOUT_VERSION_ZBP5 {
+            return Err(ZeppelinError::Index(format!(
+                "cluster object {} declares unsupported layout version {}",
+                self.key, self.cluster_layout_version
+            )));
+        }
+        if self.row_layouts.len() != self.clusters.len() {
+            return Err(ZeppelinError::Index(format!(
+                "cluster object {} declares {} row layouts for {} clusters",
+                self.key,
+                self.row_layouts.len(),
+                self.clusters.len()
+            )));
+        }
+
+        let stride = u64::try_from(dim)
+            .ok()
+            .and_then(|dim| dim.checked_mul(4))
+            .ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "cluster object {} row stride overflows for dim {dim}",
+                    self.key
+                ))
+            })?;
+        let mut coarse_end = 0_u64;
+        let mut ids_start = u64::MAX;
+        let mut ids_end = 0_u64;
+        let mut vectors_start = u64::MAX;
+        let mut spans: Vec<(u64, u64)> = Vec::with_capacity(self.row_layouts.len() * 3);
+        for (layout, &cluster_idx) in self.row_layouts.iter().zip(&self.clusters) {
+            if layout.cluster_idx != cluster_idx {
+                return Err(ZeppelinError::Index(format!(
+                    "cluster object {} row layout order mismatch: layout names {}, clusters name {cluster_idx}",
+                    self.key, layout.cluster_idx
+                )));
+            }
+            let expected_vectors_len = layout.row_count.checked_mul(stride).ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "cluster object {} cluster {cluster_idx} vector block size overflows",
+                    self.key
+                ))
+            })?;
+            if layout.vectors_len != expected_vectors_len {
+                return Err(ZeppelinError::Index(format!(
+                    "cluster object {} cluster {cluster_idx} vector block is {} bytes, expected {expected_vectors_len} for {} rows at dim {dim}",
+                    self.key, layout.vectors_len, layout.row_count
+                )));
+            }
+            for (offset, len, label) in [
+                (layout.coarse_offset, layout.coarse_len, "coarse"),
+                (layout.ids_offset, layout.ids_len, "ids"),
+                (layout.vectors_offset, layout.vectors_len, "vectors"),
+            ] {
+                let end = offset.checked_add(len).ok_or_else(|| {
+                    ZeppelinError::Index(format!(
+                        "cluster object {} cluster {cluster_idx} {label} range overflows",
+                        self.key
+                    ))
+                })?;
+                if self.size_bytes != 0 && end > self.size_bytes {
+                    return Err(ZeppelinError::Index(format!(
+                        "cluster object {} cluster {cluster_idx} {label} range ends at {end}, past declared size {}",
+                        self.key, self.size_bytes
+                    )));
+                }
+                spans.push((offset, end));
+            }
+            coarse_end = coarse_end.max(layout.coarse_offset + layout.coarse_len);
+            ids_start = ids_start.min(layout.ids_offset);
+            ids_end = ids_end.max(layout.ids_offset + layout.ids_len);
+            vectors_start = vectors_start.min(layout.vectors_offset);
+        }
+
+        if coarse_end > ids_start || ids_end > vectors_start {
+            return Err(ZeppelinError::Index(format!(
+                "cluster object {} row layout regions are not grouped coarse → ids → vectors",
+                self.key
+            )));
+        }
+        spans.sort_unstable();
+        for window in spans.windows(2) {
+            if window[0].1 > window[1].0 {
+                return Err(ZeppelinError::Index(format!(
+                    "cluster object {} row layout ranges overlap: {}..{} and {}..{}",
+                    self.key, window[0].0, window[0].1, window[1].0, window[1].1
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1006,6 +1187,54 @@ struct ArtifactOriginExecutionBindingV2<'a> {
     incarnation: [u8; 16],
 }
 
+/// Row-layout-aware cluster-object projection introduced by execution binding
+/// V3.
+///
+/// `ClusterObjectExecutionBindingV1` is frozen: it is the shape every stored
+/// `fork_view_sha256` was computed over. Manifest-declared `ZBP5` row ranges
+/// select the query path's byte reads and therefore belong to execution
+/// identity, so they enter through this new shape instead.
+#[derive(Serialize)]
+struct ClusterObjectExecutionBindingV2<'a> {
+    key: &'a str,
+    clusters: &'a [usize],
+    live_offset: u64,
+    live_len: u64,
+    size_bytes: u64,
+    cluster_layout_version: u32,
+    row_layouts: &'a [ClusterRowLayoutRef],
+}
+
+#[derive(Serialize)]
+struct SegmentExecutionBindingV3<'a> {
+    id: &'a str,
+    vector_count: usize,
+    cluster_count: usize,
+    quantization: &'static str,
+    hierarchical: bool,
+    bitmap_fields: &'a [String],
+    fts_fields: &'a [String],
+    has_global_fts: bool,
+    cluster_owners: &'a [String],
+    sketch: Option<SketchExecutionBindingV1<'a>>,
+    cluster_objects: Vec<ClusterObjectExecutionBindingV2<'a>>,
+    bootstrap: Option<BootstrapExecutionBindingV1<'a>>,
+    artifact_origin: Option<u32>,
+}
+
+/// Origin-aware execution projection that also binds `ZBP5` row layouts.
+#[derive(Serialize)]
+struct ManifestExecutionBindingV3<'a> {
+    format: &'static str,
+    namespace: &'a str,
+    namespace_incarnation: Option<[u8; 16]>,
+    fragments: Vec<FragmentExecutionBindingV2>,
+    segments: Vec<SegmentExecutionBindingV3<'a>>,
+    active_segment: Option<&'a str>,
+    hierarchical_routing_nodes: Vec<HierarchicalRoutingExecutionBindingV1<'a>>,
+    artifact_origins: Vec<ArtifactOriginExecutionBindingV2<'a>>,
+}
+
 #[derive(Serialize)]
 struct ManifestExecutionBindingV2<'a> {
     format: &'static str,
@@ -1128,6 +1357,29 @@ struct ForkViewProjectionV1<'a> {
     source_config_sha256: SourceDataPlaneConfigDigest,
     depth: u16,
     execution: ManifestExecutionBindingV2<'a>,
+}
+
+/// Initial-view projection for a source whose segments declare row layouts.
+///
+/// Identical to [`ForkViewProjectionV1`] except that the execution binding is
+/// V3, which includes the `ZBP5` layout version and row ranges. Selection is a
+/// pure function of manifest content
+/// ([`Manifest::declares_cluster_row_layout`]), so recomputing a stored digest
+/// always reproduces the projection that computed it: a manifest with no
+/// declared layout keeps the V1 projection byte for byte.
+#[derive(Serialize)]
+struct ForkViewProjectionV2<'a> {
+    domain: &'static str,
+    target_namespace: &'a str,
+    target_incarnation: [u8; 16],
+    source_namespace: &'a str,
+    source_incarnation: [u8; 16],
+    branch_id: BranchId,
+    source_generation: ManifestGeneration,
+    source_manifest_sha256: ManifestDigest,
+    source_config_sha256: SourceDataPlaneConfigDigest,
+    depth: u16,
+    execution: ManifestExecutionBindingV3<'a>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2444,6 +2696,68 @@ impl Manifest {
         }
     }
 
+    /// Reports whether any segment publishes a typed cluster row layout.
+    ///
+    /// This is the fork-view projection selector. It is deliberately derived
+    /// from persisted content rather than a stored flag so that recomputing an
+    /// old digest cannot pick a different projection than the one that produced
+    /// it.
+    fn declares_cluster_row_layout(&self) -> bool {
+        self.segments.iter().any(|segment| {
+            segment
+                .cluster_objects
+                .iter()
+                .any(ClusterDataObjectRef::declares_row_layout)
+        })
+    }
+
+    fn execution_binding_v3<'a>(&'a self, namespace: &'a str) -> ManifestExecutionBindingV3<'a> {
+        let v2 = self.execution_binding_v2(namespace);
+        let segments = self
+            .segments
+            .iter()
+            .zip(v2.segments)
+            .map(|(segment, projected)| SegmentExecutionBindingV3 {
+                id: projected.id,
+                vector_count: projected.vector_count,
+                cluster_count: projected.cluster_count,
+                quantization: projected.quantization,
+                hierarchical: projected.hierarchical,
+                bitmap_fields: projected.bitmap_fields,
+                fts_fields: projected.fts_fields,
+                has_global_fts: projected.has_global_fts,
+                cluster_owners: projected.cluster_owners,
+                sketch: projected.sketch,
+                cluster_objects: segment
+                    .cluster_objects
+                    .iter()
+                    .map(|object| ClusterObjectExecutionBindingV2 {
+                        key: &object.key,
+                        clusters: &object.clusters,
+                        live_offset: object.live_offset,
+                        live_len: object.live_len,
+                        size_bytes: object.size_bytes,
+                        cluster_layout_version: object.cluster_layout_version,
+                        row_layouts: &object.row_layouts,
+                    })
+                    .collect(),
+                bootstrap: projected.bootstrap,
+                artifact_origin: projected.artifact_origin,
+            })
+            .collect();
+
+        ManifestExecutionBindingV3 {
+            format: "zeppelin-manifest-execution-v3-row-layout",
+            namespace,
+            namespace_incarnation: v2.namespace_incarnation,
+            fragments: v2.fragments,
+            segments,
+            active_segment: v2.active_segment,
+            hierarchical_routing_nodes: v2.hierarchical_routing_nodes,
+            artifact_origins: v2.artifact_origins,
+        }
+    }
+
     #[allow(dead_code)]
     fn execution_binding_v1<'a>(&'a self, namespace: &'a str) -> ManifestExecutionBindingV1<'a> {
         let fragments = self
@@ -2949,19 +3263,35 @@ impl Manifest {
             .into());
         }
         self.validate_artifact_origins()?;
-        let bytes = serde_json::to_vec(&ForkViewProjectionV1 {
-            domain: "zeppelin-fork-view-projection-v1",
-            target_namespace: target_identity.namespace.as_str(),
-            target_incarnation: *target_identity.incarnation.as_uuid().as_bytes(),
-            source_namespace: source_identity.namespace.as_str(),
-            source_incarnation: *source_identity.incarnation.as_uuid().as_bytes(),
-            branch_id: lineage_seed.branch_id,
-            source_generation: lineage_seed.fork_generation,
-            source_manifest_sha256: lineage_seed.fork_manifest_sha256,
-            source_config_sha256: lineage_seed.source_config_sha256,
-            depth: lineage_seed.depth,
-            execution: self.execution_binding_v2(target_identity.namespace.as_str()),
-        })
+        let bytes = if self.declares_cluster_row_layout() {
+            serde_json::to_vec(&ForkViewProjectionV2 {
+                domain: "zeppelin-fork-view-projection-v2",
+                target_namespace: target_identity.namespace.as_str(),
+                target_incarnation: *target_identity.incarnation.as_uuid().as_bytes(),
+                source_namespace: source_identity.namespace.as_str(),
+                source_incarnation: *source_identity.incarnation.as_uuid().as_bytes(),
+                branch_id: lineage_seed.branch_id,
+                source_generation: lineage_seed.fork_generation,
+                source_manifest_sha256: lineage_seed.fork_manifest_sha256,
+                source_config_sha256: lineage_seed.source_config_sha256,
+                depth: lineage_seed.depth,
+                execution: self.execution_binding_v3(target_identity.namespace.as_str()),
+            })
+        } else {
+            serde_json::to_vec(&ForkViewProjectionV1 {
+                domain: "zeppelin-fork-view-projection-v1",
+                target_namespace: target_identity.namespace.as_str(),
+                target_incarnation: *target_identity.incarnation.as_uuid().as_bytes(),
+                source_namespace: source_identity.namespace.as_str(),
+                source_incarnation: *source_identity.incarnation.as_uuid().as_bytes(),
+                branch_id: lineage_seed.branch_id,
+                source_generation: lineage_seed.fork_generation,
+                source_manifest_sha256: lineage_seed.fork_manifest_sha256,
+                source_config_sha256: lineage_seed.source_config_sha256,
+                depth: lineage_seed.depth,
+                execution: self.execution_binding_v2(target_identity.namespace.as_str()),
+            })
+        }
         .map_err(|error| {
             ZeppelinError::Serialization(format!(
                 "fork-view projection serialization failed: {error}"
@@ -7171,6 +7501,84 @@ mod tests {
         target.validate_initial_fork_view().unwrap();
     }
 
+    /// Declared row ranges are part of execution identity, and adding them does
+    /// not disturb the projection every stored digest was computed over.
+    ///
+    /// A source with no declared layout keeps the frozen V1 projection over
+    /// `ManifestExecutionBindingV2`; a source that declares `ZBP5` layouts moves
+    /// to the V2 projection over V3, whose digest changes when a published range
+    /// changes. Both digests still validate against their own manifest, which is
+    /// what `ForkIdentity` cross-checks across the three stored copies.
+    #[test]
+    fn fork_view_binds_row_layouts_without_changing_the_frozen_projection() {
+        let source_identity = origin("layout-fork-source", 0x901);
+        let target_identity = origin("layout-fork-target", 0x902);
+        let layout_free_object = ClusterDataObjectRef {
+            key: "layout-fork-source/segments/active/cluster_group_0.bin".to_string(),
+            clusters: vec![0],
+            live_offset: 0,
+            live_len: 0,
+            size_bytes: 4096,
+            cluster_layout_version: 0,
+            row_layouts: Vec::new(),
+        };
+        let mut row_layout_object = layout_free_object.clone();
+        row_layout_object.cluster_layout_version = CLUSTER_LAYOUT_VERSION_ZBP5;
+        row_layout_object.row_layouts = vec![ClusterRowLayoutRef {
+            cluster_idx: 0,
+            row_count: 2,
+            coarse_offset: 64,
+            coarse_len: 16,
+            ids_offset: 80,
+            ids_len: 20,
+            vectors_offset: 100,
+            vectors_len: 2 * 8 * 4,
+        }];
+
+        let fork = |object: ClusterDataObjectRef| {
+            let mut source = bound_manifest(&source_identity, 7);
+            let mut active = make_segment("active");
+            active.cluster_count = 1;
+            active.cluster_objects = vec![object];
+            source.active_segment = Some(active.id.clone());
+            source.segments.push(active);
+            let prepared = Manifest::prepare_zero_copy_fork(
+                &source,
+                &source_identity,
+                &target_identity,
+                lineage_seed(&source_identity, 7, 0x903, 1),
+                DateTime::from_timestamp(1_700_000_002, 0).unwrap(),
+            )
+            .unwrap();
+            prepared.manifest.validate_initial_fork_view().unwrap();
+            prepared.lineage.fork_view_sha256
+        };
+
+        let layout_free_digest = fork(layout_free_object.clone());
+        let row_layout_digest = fork(row_layout_object.clone());
+        assert_ne!(
+            layout_free_digest, row_layout_digest,
+            "publishing row layouts must change execution identity"
+        );
+
+        // The same object with one moved range is a different execution.
+        let mut moved_range = row_layout_object;
+        moved_range.row_layouts[0].vectors_offset += 4;
+        assert_ne!(
+            fork(moved_range),
+            row_layout_digest,
+            "a moved vector range must change execution identity"
+        );
+
+        // A layout-free source still selects the frozen projection, so its
+        // digest is unaffected by the existence of the newer binding.
+        assert_eq!(
+            fork(layout_free_object),
+            layout_free_digest,
+            "the frozen projection must remain deterministic"
+        );
+    }
+
     #[test]
     fn nested_inherited_only_fork_does_not_add_its_direct_parent_origin() {
         let root_identity = origin("nested-root", 0x201);
@@ -8618,6 +9026,8 @@ mod tests {
             live_offset: 0,
             live_len: 123,
             size_bytes: 456,
+            cluster_layout_version: 0,
+            row_layouts: Vec::new(),
         }];
         manifest.add_segment(seg);
         let bytes = manifest.to_bytes().unwrap();

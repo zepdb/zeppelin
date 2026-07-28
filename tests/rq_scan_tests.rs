@@ -12,7 +12,10 @@ use zeppelin::config::{CompactionConfig, IndexingConfig, DEFAULT_RERANK_COALESCE
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, VectorEntry};
-use zeppelin::wal::manifest::{ClusterDataObjectRef, CoarsePayloadEncoding, Manifest, SegmentRef};
+use zeppelin::wal::manifest::{
+    ClusterDataObjectRef, ClusterRowLayoutRef, CoarsePayloadEncoding, Manifest, SegmentRef,
+    CLUSTER_LAYOUT_VERSION_ZBP5,
+};
 use zeppelin::wal::{WalReader, WalWriter};
 
 const ROWS: usize = 20_000;
@@ -21,7 +24,8 @@ const GROUP_SIZE: usize = 10;
 const CLUSTERS: usize = 4;
 const QUERY_GROUP: usize = 1_240;
 const GROUP_OBJECT_HEADER_LEN: usize = 8;
-const GROUP_OBJECT_ENTRY_LEN: usize = 4 + 8 * 4;
+/// One `ZBP5` directory record: cluster index, row count, three ranges.
+const GROUP_OBJECT_V5_ENTRY_LEN: usize = 4 + 4 + 8 * 6;
 const SKETCH_V4_HEADER_LEN: usize = 44;
 
 struct ScanFixture {
@@ -35,9 +39,23 @@ struct ScanFixture {
 #[derive(Clone)]
 struct RangedObjectEvidence {
     key: String,
+    /// The single span a `ZBP5` coarse read covers: codes plus ID blocks.
     coarse_span: Range<usize>,
-    first_full_offset: usize,
+    /// Absolute start of the first fixed-stride vector block.
+    first_vectors_offset: usize,
+    /// Per-cluster fixed-stride row spans, keyed by cluster index.
+    vector_rows: HashMap<usize, Vec<Range<usize>>>,
     object_size: usize,
+}
+
+/// One `ZBP5` directory entry read back from a published object.
+#[derive(Clone)]
+struct GroupV5Entry {
+    cluster_idx: usize,
+    row_count: usize,
+    coarse: Range<usize>,
+    ids: Range<usize>,
+    vectors: Range<usize>,
 }
 
 struct SketchRows {
@@ -148,40 +166,32 @@ fn read_u64(data: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
 }
 
-fn parse_group_full_ranges(data: &[u8]) -> HashMap<usize, Range<usize>> {
-    assert_eq!(&data[..4], b"ZBP\x04");
+fn parse_group_v5(data: &[u8]) -> Vec<GroupV5Entry> {
+    assert_eq!(&data[..4], b"ZBP\x05", "fixture must publish ZBP5 objects");
     let entry_count = read_u32(data, 4) as usize;
-    let mut ranges = HashMap::with_capacity(entry_count);
+    let mut entries = Vec::with_capacity(entry_count);
     for entry in 0..entry_count {
-        let offset = GROUP_OBJECT_HEADER_LEN + entry * GROUP_OBJECT_ENTRY_LEN;
-        let cluster_idx = read_u32(data, offset) as usize;
-        let full_offset = read_u64(data, offset + 20) as usize;
-        let full_len = read_u64(data, offset + 28) as usize;
-        let full_end = full_offset.checked_add(full_len).unwrap();
-        assert!(full_end <= data.len());
-        assert!(ranges.insert(cluster_idx, full_offset..full_end).is_none());
+        let base = GROUP_OBJECT_HEADER_LEN + entry * GROUP_OBJECT_V5_ENTRY_LEN;
+        let cluster_idx = read_u32(data, base) as usize;
+        let row_count = read_u32(data, base + 4) as usize;
+        let coarse_offset = read_u64(data, base + 8) as usize;
+        let coarse_len = read_u64(data, base + 16) as usize;
+        let ids_offset = read_u64(data, base + 24) as usize;
+        let ids_len = read_u64(data, base + 32) as usize;
+        let vectors_offset = read_u64(data, base + 40) as usize;
+        let vectors_len = read_u64(data, base + 48) as usize;
+        assert!(vectors_offset + vectors_len <= data.len());
+        assert_eq!(vectors_len, row_count * DIM * 4);
+        assert!(coarse_offset + coarse_len <= ids_offset);
+        entries.push(GroupV5Entry {
+            cluster_idx,
+            row_count,
+            coarse: coarse_offset..coarse_offset + coarse_len,
+            ids: ids_offset..ids_offset + ids_len,
+            vectors: vectors_offset..vectors_offset + vectors_len,
+        });
     }
-    ranges
-}
-
-fn parse_full_ids(full: &[u8], expected_dim: usize) -> Vec<String> {
-    let rows = read_u32(full, 0) as usize;
-    assert_eq!(read_u32(full, 4) as usize, expected_dim);
-    let mut ids = Vec::with_capacity(rows);
-    let mut offset = 8;
-    for _ in 0..rows {
-        let id_len = read_u32(full, offset) as usize;
-        offset += 4;
-        let id_end = offset + id_len;
-        ids.push(
-            std::str::from_utf8(&full[offset..id_end])
-                .unwrap()
-                .to_string(),
-        );
-        offset = id_end + expected_dim * 4;
-    }
-    assert_eq!(offset, full.len());
-    ids
+    entries
 }
 
 fn parse_sketch_rows(data: Bytes) -> SketchRows {
@@ -213,71 +223,118 @@ fn parse_sketch_rows(data: Bytes) -> SketchRows {
 }
 
 impl SketchRows {
-    fn rq_payload(&self, cluster_idx: usize, ids: &[String]) -> Bytes {
+    /// Builds the codes-only two-bit coarse block a `ZBP5` object stores.
+    ///
+    /// IDs live in the sibling ID block, so this payload is `[row_count][dim]`
+    /// followed by each row's planes and factors, joined to IDs by position.
+    fn rq_codes_only_payload(&self, cluster_idx: usize, row_count: usize) -> Bytes {
         let rows = self
             .cluster_offsets
             .get(cluster_idx)
             .expect("sketch cluster must exist");
-        assert_eq!(rows.len(), ids.len());
+        assert_eq!(rows.len(), row_count);
         let mut payload = Vec::new();
-        payload.extend_from_slice(b"ZRQ1");
-        payload.push(1);
+        payload.extend_from_slice(&(row_count as u64).to_le_bytes());
         payload.extend_from_slice(&(self.code_dims as u64).to_le_bytes());
-        payload.extend_from_slice(&(ids.len() as u64).to_le_bytes());
-        for (local_row, id) in ids.iter().enumerate() {
-            payload.extend_from_slice(&(id.len() as u64).to_le_bytes());
-            payload.extend_from_slice(id.as_bytes());
-            let global_row = rows.start + local_row;
-            let start = global_row * self.row_bytes;
+        for local_row in 0..row_count {
+            let start = (rows.start + local_row) * self.row_bytes;
             payload.extend_from_slice(&self.codes[start..start + self.row_bytes]);
         }
         Bytes::from(payload)
     }
 }
 
-fn serialize_group(
-    clusters: &[usize],
+/// Reserializes one cluster group as a `ZBP5` object with new coarse blocks.
+///
+/// The ID and fixed-stride vector blocks are copied verbatim from the source
+/// object, so only the coarse encoding changes. The returned evidence records
+/// exactly the spans a manifest-driven reader should request.
+fn serialize_group_v5(
+    entries: &[GroupV5Entry],
+    source: &Bytes,
     coarse_payloads: &HashMap<usize, Bytes>,
-    full_payloads: &HashMap<usize, Bytes>,
-) -> (Bytes, RangedObjectEvidence) {
-    let header_len = GROUP_OBJECT_HEADER_LEN + clusters.len() * GROUP_OBJECT_ENTRY_LEN;
-    let mut coarse_offset = header_len;
-    let mut full_offset = header_len
-        + clusters
-            .iter()
-            .map(|cluster| coarse_payloads[cluster].len())
-            .sum::<usize>();
-    let first_full_offset = full_offset;
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"ZBP\x04");
-    bytes.extend_from_slice(&(clusters.len() as u32).to_le_bytes());
-    for &cluster_idx in clusters {
-        let coarse = &coarse_payloads[&cluster_idx];
-        let full = &full_payloads[&cluster_idx];
-        bytes.extend_from_slice(&(cluster_idx as u32).to_le_bytes());
-        bytes.extend_from_slice(&(coarse_offset as u64).to_le_bytes());
-        bytes.extend_from_slice(&(coarse.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&(full_offset as u64).to_le_bytes());
-        bytes.extend_from_slice(&(full.len() as u64).to_le_bytes());
-        coarse_offset += coarse.len();
-        full_offset += full.len();
+) -> (Bytes, RangedObjectEvidence, Vec<ClusterRowLayoutRef>) {
+    let header_len = GROUP_OBJECT_HEADER_LEN + entries.len() * GROUP_OBJECT_V5_ENTRY_LEN;
+    let mut coarse_ranges = Vec::with_capacity(entries.len());
+    let mut cursor = header_len;
+    for entry in entries {
+        let len = coarse_payloads[&entry.cluster_idx].len();
+        coarse_ranges.push(cursor..cursor + len);
+        cursor += len;
     }
-    for cluster_idx in clusters {
-        bytes.extend_from_slice(&coarse_payloads[cluster_idx]);
+    let mut id_ranges = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let len = entry.ids.len();
+        id_ranges.push(cursor..cursor + len);
+        cursor += len;
     }
-    for cluster_idx in clusters {
-        bytes.extend_from_slice(&full_payloads[cluster_idx]);
+    let mut vector_ranges = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let len = entry.vectors.len();
+        vector_ranges.push(cursor..cursor + len);
+        cursor += len;
     }
-    let object_size = bytes.len();
-    (
-        Bytes::from(bytes),
-        RangedObjectEvidence {
-            key: String::new(),
-            coarse_span: header_len..first_full_offset,
-            first_full_offset,
-            object_size,
-        },
-    )
+
+    let mut bytes = Vec::with_capacity(cursor);
+    bytes.extend_from_slice(b"ZBP\x05");
+    bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (idx, entry) in entries.iter().enumerate() {
+        bytes.extend_from_slice(&(entry.cluster_idx as u32).to_le_bytes());
+        bytes.extend_from_slice(&(entry.row_count as u32).to_le_bytes());
+        bytes.extend_from_slice(&(coarse_ranges[idx].start as u64).to_le_bytes());
+        bytes.extend_from_slice(&(coarse_ranges[idx].len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(id_ranges[idx].start as u64).to_le_bytes());
+        bytes.extend_from_slice(&(id_ranges[idx].len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(vector_ranges[idx].start as u64).to_le_bytes());
+        bytes.extend_from_slice(&(vector_ranges[idx].len() as u64).to_le_bytes());
+    }
+    for entry in entries {
+        bytes.extend_from_slice(&coarse_payloads[&entry.cluster_idx]);
+    }
+    for entry in entries {
+        bytes.extend_from_slice(&source[entry.ids.clone()]);
+    }
+    for entry in entries {
+        bytes.extend_from_slice(&source[entry.vectors.clone()]);
+    }
+    assert_eq!(bytes.len(), cursor);
+
+    let row_layouts = entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| ClusterRowLayoutRef {
+            cluster_idx: entry.cluster_idx,
+            row_count: entry.row_count as u64,
+            coarse_offset: coarse_ranges[idx].start as u64,
+            coarse_len: coarse_ranges[idx].len() as u64,
+            ids_offset: id_ranges[idx].start as u64,
+            ids_len: id_ranges[idx].len() as u64,
+            vectors_offset: vector_ranges[idx].start as u64,
+            vectors_len: vector_ranges[idx].len() as u64,
+        })
+        .collect();
+    let vector_rows = entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let base = vector_ranges[idx].start;
+            let stride = DIM * 4;
+            (
+                entry.cluster_idx,
+                (0..entry.row_count)
+                    .map(|row| base + row * stride..base + (row + 1) * stride)
+                    .collect(),
+            )
+        })
+        .collect();
+    let evidence = RangedObjectEvidence {
+        key: String::new(),
+        coarse_span: header_len..id_ranges[entries.len() - 1].end,
+        first_vectors_offset: vector_ranges[0].start,
+        vector_rows,
+        object_size: cursor,
+    };
+    (Bytes::from(bytes), evidence, row_layouts)
 }
 
 async fn rewrite_active_segment_as_rq(fixture: &ScanFixture) -> Vec<RangedObjectEvidence> {
@@ -296,21 +353,21 @@ async fn rewrite_active_segment_as_rq(fixture: &ScanFixture) -> Vec<RangedObject
     let mut rewritten_objects = Vec::with_capacity(segment.cluster_objects.len());
     let mut evidence = Vec::with_capacity(segment.cluster_objects.len());
     for (object_index, object) in segment.cluster_objects.iter().enumerate() {
+        assert_eq!(
+            object.cluster_layout_version, CLUSTER_LAYOUT_VERSION_ZBP5,
+            "fixture SQ8 compaction must publish a row layout"
+        );
         let old_bytes = fixture.store.get(&object.key).await.unwrap();
-        let full_ranges = parse_group_full_ranges(&old_bytes);
+        let entries = parse_group_v5(&old_bytes);
         let mut coarse_payloads = HashMap::new();
-        let mut full_payloads = HashMap::new();
-        for &cluster_idx in &object.clusters {
-            let full_range = full_ranges
-                .get(&cluster_idx)
-                .expect("group directory must contain manifest cluster");
-            let full = old_bytes.slice(full_range.clone());
-            let ids = parse_full_ids(&full, DIM);
-            coarse_payloads.insert(cluster_idx, sketch.rq_payload(cluster_idx, &ids));
-            full_payloads.insert(cluster_idx, full);
+        for entry in &entries {
+            coarse_payloads.insert(
+                entry.cluster_idx,
+                sketch.rq_codes_only_payload(entry.cluster_idx, entry.row_count),
+            );
         }
-        let (bytes, mut object_evidence) =
-            serialize_group(&object.clusters, &coarse_payloads, &full_payloads);
+        let (bytes, mut object_evidence, row_layouts) =
+            serialize_group_v5(&entries, &old_bytes, &coarse_payloads);
         let (prefix, _) = object.key.rsplit_once('/').unwrap();
         let key = format!("{prefix}/cluster_group_rq_{object_index}.bin");
         fixture.store.put(&key, bytes.clone()).await.unwrap();
@@ -318,10 +375,12 @@ async fn rewrite_active_segment_as_rq(fixture: &ScanFixture) -> Vec<RangedObject
         evidence.push(object_evidence);
         rewritten_objects.push(ClusterDataObjectRef {
             key,
-            clusters: object.clusters.clone(),
+            clusters: entries.iter().map(|entry| entry.cluster_idx).collect(),
             live_offset: object.live_offset,
             live_len: object.live_len,
             size_bytes: bytes.len() as u64,
+            cluster_layout_version: CLUSTER_LAYOUT_VERSION_ZBP5,
+            row_layouts,
         });
     }
 
@@ -338,6 +397,224 @@ async fn rewrite_active_segment_as_rq(fixture: &ScanFixture) -> Vec<RangedObject
         .await
         .unwrap();
     evidence
+}
+
+/// Rewrites the active segment's objects into the equivalent `ZBP4` layout.
+///
+/// Every row keeps its identity, order, coarse codes, and exact vector bytes;
+/// only the physical arrangement changes — IDs move back inline and the exact
+/// rows regain their per-row headers. This is the control for proving that the
+/// `ZBP5` substitution does not move results.
+async fn rewrite_active_segment_as_v4(fixture: &ScanFixture, encoding: CoarsePayloadEncoding) {
+    let mut manifest = Manifest::read(&fixture.store, &fixture.namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    let segment = active_segment(&manifest).clone();
+    let mut rewritten_objects = Vec::with_capacity(segment.cluster_objects.len());
+    for (object_index, object) in segment.cluster_objects.iter().enumerate() {
+        assert_eq!(object.cluster_layout_version, CLUSTER_LAYOUT_VERSION_ZBP5);
+        let source = fixture.store.get(&object.key).await.unwrap();
+        let entries = parse_group_v5(&source);
+        let mut coarse_payloads = HashMap::new();
+        let mut full_payloads = HashMap::new();
+        for entry in &entries {
+            let ids = parse_id_block(&source[entry.ids.clone()]);
+            assert_eq!(ids.len(), entry.row_count);
+            let vectors = &source[entry.vectors.clone()];
+            coarse_payloads.insert(
+                entry.cluster_idx,
+                v4_coarse_section(encoding, &ids, &source[entry.coarse.clone()]),
+            );
+            full_payloads.insert(entry.cluster_idx, legacy_full_section(&ids, vectors));
+        }
+        let clusters: Vec<usize> = entries.iter().map(|entry| entry.cluster_idx).collect();
+        let bytes = serialize_group_v4(&clusters, &coarse_payloads, &full_payloads, encoding);
+        let (prefix, _) = object.key.rsplit_once('/').unwrap();
+        let key = format!("{prefix}/cluster_group_v4_{object_index}.bin");
+        fixture.store.put(&key, bytes.clone()).await.unwrap();
+        rewritten_objects.push(ClusterDataObjectRef {
+            key,
+            clusters,
+            live_offset: 0,
+            live_len: 0,
+            size_bytes: bytes.len() as u64,
+            cluster_layout_version: 0,
+            row_layouts: Vec::new(),
+        });
+    }
+
+    let active_id = segment.id;
+    let active = manifest
+        .segments
+        .iter_mut()
+        .find(|candidate| candidate.id == active_id)
+        .unwrap();
+    active.cluster_objects = rewritten_objects;
+    manifest.set_coarse_payload_encoding(active_id, encoding);
+    manifest
+        .write(&fixture.store, &fixture.namespace)
+        .await
+        .unwrap();
+}
+
+fn parse_id_block(data: &[u8]) -> Vec<String> {
+    let rows = read_u32(data, 0) as usize;
+    let mut ids = Vec::with_capacity(rows);
+    let mut offset = 4;
+    for _ in 0..rows {
+        let id_len = read_u32(data, offset) as usize;
+        offset += 4;
+        ids.push(
+            std::str::from_utf8(&data[offset..offset + id_len])
+                .unwrap()
+                .to_string(),
+        );
+        offset += id_len;
+    }
+    assert_eq!(offset, data.len());
+    ids
+}
+
+/// Rebuilds a coarse child payload that carries its own row IDs.
+fn v4_coarse_section(encoding: CoarsePayloadEncoding, ids: &[String], codes_only: &[u8]) -> Bytes {
+    let mut payload = Vec::new();
+    match encoding {
+        CoarsePayloadEncoding::Sq8 => {
+            let row_count = read_u32(codes_only, 0) as usize;
+            let dim = read_u32(codes_only, 4) as usize;
+            assert_eq!(row_count, ids.len());
+            payload.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+            payload.extend_from_slice(&(dim as u32).to_le_bytes());
+            for (row, id) in ids.iter().enumerate() {
+                payload.extend_from_slice(&(id.len() as u32).to_le_bytes());
+                payload.extend_from_slice(id.as_bytes());
+                let start = 8 + row * dim;
+                payload.extend_from_slice(&codes_only[start..start + dim]);
+            }
+        }
+        CoarsePayloadEncoding::TwoBit => {
+            let row_count = read_u64(codes_only, 0) as usize;
+            let dim = read_u64(codes_only, 8) as usize;
+            assert_eq!(row_count, ids.len());
+            let row_bytes = (codes_only.len() - 16) / row_count.max(1);
+            payload.extend_from_slice(b"ZRQ1");
+            payload.push(1);
+            payload.extend_from_slice(&(dim as u64).to_le_bytes());
+            payload.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+            for (row, id) in ids.iter().enumerate() {
+                payload.extend_from_slice(&(id.len() as u64).to_le_bytes());
+                payload.extend_from_slice(id.as_bytes());
+                let start = 16 + row * row_bytes;
+                payload.extend_from_slice(&codes_only[start..start + row_bytes]);
+            }
+        }
+    }
+    Bytes::from(payload)
+}
+
+/// Rebuilds the legacy `[n][dim][(id_len, id, f32[dim])...]` exact section.
+fn legacy_full_section(ids: &[String], vectors: &[u8]) -> Bytes {
+    let stride = DIM * 4;
+    assert_eq!(vectors.len(), ids.len() * stride);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&(DIM as u32).to_le_bytes());
+    for (row, id) in ids.iter().enumerate() {
+        payload.extend_from_slice(&(id.len() as u32).to_le_bytes());
+        payload.extend_from_slice(id.as_bytes());
+        payload.extend_from_slice(&vectors[row * stride..(row + 1) * stride]);
+    }
+    Bytes::from(payload)
+}
+
+fn serialize_group_v4(
+    clusters: &[usize],
+    coarse_payloads: &HashMap<usize, Bytes>,
+    full_payloads: &HashMap<usize, Bytes>,
+    encoding: CoarsePayloadEncoding,
+) -> Bytes {
+    let magic: &[u8; 4] = match encoding {
+        CoarsePayloadEncoding::Sq8 => b"ZCL2",
+        CoarsePayloadEncoding::TwoBit => b"ZCL3",
+    };
+    // Each v4 directory entry points at one complete co-located child section.
+    let sections: Vec<(usize, Bytes)> = clusters
+        .iter()
+        .map(|&cluster_idx| {
+            let coarse = &coarse_payloads[&cluster_idx];
+            let full = &full_payloads[&cluster_idx];
+            let header = 4 + 8 * 4;
+            let mut section = Vec::with_capacity(header + coarse.len() + full.len());
+            section.extend_from_slice(magic);
+            section.extend_from_slice(&(header as u64).to_le_bytes());
+            section.extend_from_slice(&(coarse.len() as u64).to_le_bytes());
+            section.extend_from_slice(&((header + coarse.len()) as u64).to_le_bytes());
+            section.extend_from_slice(&(full.len() as u64).to_le_bytes());
+            section.extend_from_slice(coarse);
+            section.extend_from_slice(full);
+            (cluster_idx, Bytes::from(section))
+        })
+        .collect();
+
+    let header_len = GROUP_OBJECT_HEADER_LEN + clusters.len() * (4 + 8 * 4);
+    let mut coarse_offset = header_len;
+    let mut full_offset = header_len
+        + sections
+            .iter()
+            .map(|(_, section)| read_u64(section, 12) as usize)
+            .sum::<usize>();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"ZBP\x04");
+    bytes.extend_from_slice(&(clusters.len() as u32).to_le_bytes());
+    for (cluster_idx, section) in &sections {
+        let coarse_len = read_u64(section, 12) as usize;
+        let full_len = read_u64(section, 28) as usize;
+        bytes.extend_from_slice(&(*cluster_idx as u32).to_le_bytes());
+        bytes.extend_from_slice(&(coarse_offset as u64).to_le_bytes());
+        bytes.extend_from_slice(&(coarse_len as u64).to_le_bytes());
+        bytes.extend_from_slice(&(full_offset as u64).to_le_bytes());
+        bytes.extend_from_slice(&(full_len as u64).to_le_bytes());
+        coarse_offset += coarse_len;
+        full_offset += full_len;
+    }
+    for (_, section) in &sections {
+        let coarse_start = read_u64(section, 4) as usize;
+        let coarse_len = read_u64(section, 12) as usize;
+        bytes.extend_from_slice(&section[coarse_start..coarse_start + coarse_len]);
+    }
+    for (_, section) in &sections {
+        let full_start = read_u64(section, 20) as usize;
+        let full_len = read_u64(section, 28) as usize;
+        bytes.extend_from_slice(&section[full_start..full_start + full_len]);
+    }
+    Bytes::from(bytes)
+}
+
+async fn query_results(fixture: &ScanFixture, filter: Option<&Filter>) -> Vec<(String, u32)> {
+    let wal_reader = WalReader::new(fixture.store.clone());
+    execute_query(QueryParams {
+        store: &fixture.store,
+        wal_reader: &wal_reader,
+        namespace: &fixture.namespace,
+        query: &fixture.query,
+        top_k: GROUP_SIZE,
+        nprobe: CLUSTERS,
+        filter,
+        consistency: ConsistencyLevel::Eventual,
+        distance_metric: DistanceMetric::Euclidean,
+        oversample_factor: 3,
+        rerank_coalesce_gap_bytes: DEFAULT_RERANK_COALESCE_GAP_BYTES,
+        cache: None,
+        manifest_cache: None,
+        include_attributes: false,
+    })
+    .await
+    .unwrap()
+    .results
+    .into_iter()
+    .map(|result| (result.id, result.score.to_bits()))
+    .collect()
 }
 
 async fn query_ids(
@@ -377,6 +654,51 @@ fn equality_filter(field: &str, value: i64) -> Filter {
     }
 }
 
+/// Layout substitution must not move a single result.
+///
+/// The table covers both coarse encodings and both filter states. For each
+/// cell, the same rows are queried through the published `ZBP5` layout and then
+/// through an equivalent `ZBP4` object rebuilt from those exact bytes; top-k IDs
+/// and raw distance bits must be identical. Distances are compared as bit
+/// patterns because they are recomputed from exact f32 in both layouts, so any
+/// difference would mean the rerank read the wrong row.
+#[tokio::test]
+async fn layout_substitution_preserves_top_k_ids_and_distance_bits() {
+    let sparse = equality_filter("sparse", (QUERY_GROUP % 31) as i64);
+    for encoding in [CoarsePayloadEncoding::Sq8, CoarsePayloadEncoding::TwoBit] {
+        let name = match encoding {
+            CoarsePayloadEncoding::Sq8 => "layout-identity-sq8",
+            CoarsePayloadEncoding::TwoBit => "layout-identity-two-bit",
+        };
+        let fixture = scan_fixture(name).await;
+        if encoding == CoarsePayloadEncoding::TwoBit {
+            rewrite_active_segment_as_rq(&fixture).await;
+        }
+
+        let v5_unfiltered = query_results(&fixture, None).await;
+        let v5_filtered = query_results(&fixture, Some(&sparse)).await;
+        assert!(!v5_unfiltered.is_empty(), "{name}: v5 returned no results");
+        assert!(
+            !v5_filtered.is_empty(),
+            "{name}: filtered v5 returned no results"
+        );
+
+        rewrite_active_segment_as_v4(&fixture, encoding).await;
+
+        assert_eq!(
+            query_results(&fixture, None).await,
+            v5_unfiltered,
+            "{name}: unfiltered results moved when the layout changed"
+        );
+        assert_eq!(
+            query_results(&fixture, Some(&sparse)).await,
+            v5_filtered,
+            "{name}: filtered results moved when the layout changed"
+        );
+        fixture.harness.cleanup().await;
+    }
+}
+
 #[tokio::test]
 async fn rq_scan_matches_sq8_unfiltered_and_at_two_filter_selectivities() {
     let fixture = scan_fixture("rq-scan-parity").await;
@@ -405,12 +727,14 @@ async fn rq_scan_matches_sq8_unfiltered_and_at_two_filter_selectivities() {
 
 #[tokio::test]
 #[ignore = "requires TEST_BACKEND=minio to validate physical range responses"]
-async fn rq_coarse_fetch_reads_only_the_coarse_region() {
+async fn zbp5_ranged_read_uses_published_regions_without_a_header_get() {
     let fixture = scan_fixture("rq-scan-ranges").await;
     let evidence = rewrite_active_segment_as_rq(&fixture).await;
     let sparse = equality_filter("sparse", (QUERY_GROUP % 31) as i64);
 
     fixture.counter.reset();
+    // Gap zero disables coalescing so every rerank range is exactly one
+    // published fixed-stride row.
     let results = query_ids(&fixture, Some(&sparse), 0).await;
     assert_eq!(results.len(), GROUP_SIZE);
 
@@ -418,23 +742,61 @@ async fn rq_coarse_fetch_reads_only_the_coarse_region() {
         let ranges = fixture.counter.ranges_for(&object.key);
         assert!(
             ranges.contains(&object.coarse_span),
-            "missing coarse-only fetch {:?} for {}: {ranges:?}",
+            "missing published coarse+ID fetch {:?} for {}: {ranges:?}",
             object.coarse_span,
+            object.key
+        );
+        // No grouped-object directory read: the manifest already published the
+        // ranges, so nothing may request the header prefix.
+        assert!(
+            ranges
+                .iter()
+                .all(|range| range.start != 0 || range.end >= object.coarse_span.end),
+            "a range read the grouped-object header for {}: {ranges:?}",
             object.key
         );
         assert!(
             ranges
                 .iter()
-                .all(|range| !(range.start < object.first_full_offset
-                    && range.end > object.first_full_offset)),
-            "a range crossed from coarse bytes into full vectors for {}: {ranges:?}",
+                .all(|range| !(range.start < object.first_vectors_offset
+                    && range.end > object.first_vectors_offset)),
+            "a range crossed from coarse bytes into vector blocks for {}: {ranges:?}",
             object.key
         );
         assert!(
             !ranges.contains(&(0..object.object_size)),
-            "RQ query fetched the complete grouped object {}",
+            "query fetched the complete grouped object {}",
             object.key
         );
+        // Every rerank range is exactly one published fixed-stride row: an
+        // offset derived by walking ID lengths could not land on this grid.
+        let published_rows: Vec<Range<usize>> = object
+            .vector_rows
+            .values()
+            .flat_map(|rows| rows.iter().cloned())
+            .collect();
+        let rerank_ranges: Vec<&Range<usize>> = ranges
+            .iter()
+            .filter(|range| range.start >= object.first_vectors_offset)
+            .collect();
+        assert!(
+            !rerank_ranges.is_empty(),
+            "no rerank range was issued for {}",
+            object.key
+        );
+        for range in rerank_ranges {
+            assert_eq!(
+                range.end - range.start,
+                DIM * 4,
+                "rerank range {range:?} for {} is not one fixed-stride row",
+                object.key
+            );
+            assert!(
+                published_rows.contains(range),
+                "rerank range {range:?} for {} is not a published row span",
+                object.key
+            );
+        }
     }
     fixture.harness.cleanup().await;
 }

@@ -28,6 +28,8 @@ const RERANK_FACTOR: usize = 4;
 const RERANK_CANDIDATES: usize = TOP_K * FILTER_OVERSAMPLE * RERANK_FACTOR;
 const GROUP_OBJECT_HEADER_LEN: usize = 8;
 const GROUP_OBJECT_ENTRY_LEN: usize = 4 + 8 * 4;
+/// One `ZBP5` directory record: cluster index, row count, three ranges.
+const GROUP_OBJECT_V5_ENTRY_LEN: usize = 4 + 4 + 8 * 6;
 const GAPS: [(&str, usize); 4] = [
     ("1 MiB", 1024 * 1024),
     ("128 KiB", 128 * 1024),
@@ -120,25 +122,56 @@ fn read_u64(data: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
 }
 
+/// Splits a grouped object into the region the coarse phase reads and the
+/// region rerank reads.
+///
+/// This follows the persisted layout; it does not change what is measured. A
+/// `ZBP4` object stores coarse payloads (IDs inline) then exact rows. A `ZBP5`
+/// object stores coarse codes, then hoisted ID blocks, then fixed-stride vector
+/// blocks — the coarse phase reads the first two as one span, so they are the
+/// coarse region here and the vector blocks are the rerank region.
 fn parse_object_regions(key: String, data: &[u8]) -> ObjectRegions {
-    assert_eq!(&data[..4], b"ZBP\x04");
     let entry_count = read_u32(data, 4) as usize;
-    let coarse_start = GROUP_OBJECT_HEADER_LEN + entry_count * GROUP_OBJECT_ENTRY_LEN;
-    let mut coarse_end = coarse_start;
-    let mut full_start = data.len();
-    let mut full_end = 0;
-
-    for entry in 0..entry_count {
-        let offset = GROUP_OBJECT_HEADER_LEN + entry * GROUP_OBJECT_ENTRY_LEN;
-        let entry_coarse_start = read_u64(data, offset + 4) as usize;
-        let entry_coarse_len = read_u64(data, offset + 12) as usize;
-        let entry_full_start = read_u64(data, offset + 20) as usize;
-        let entry_full_len = read_u64(data, offset + 28) as usize;
-        assert!(entry_coarse_start >= coarse_start);
-        coarse_end = coarse_end.max(entry_coarse_start + entry_coarse_len);
-        full_start = full_start.min(entry_full_start);
-        full_end = full_end.max(entry_full_start + entry_full_len);
-    }
+    let (coarse_start, coarse_end, full_start, full_end) = match &data[..4] {
+        b"ZBP\x04" => {
+            let coarse_start = GROUP_OBJECT_HEADER_LEN + entry_count * GROUP_OBJECT_ENTRY_LEN;
+            let mut coarse_end = coarse_start;
+            let mut full_start = data.len();
+            let mut full_end = 0;
+            for entry in 0..entry_count {
+                let offset = GROUP_OBJECT_HEADER_LEN + entry * GROUP_OBJECT_ENTRY_LEN;
+                let entry_coarse_start = read_u64(data, offset + 4) as usize;
+                let entry_coarse_len = read_u64(data, offset + 12) as usize;
+                let entry_full_start = read_u64(data, offset + 20) as usize;
+                let entry_full_len = read_u64(data, offset + 28) as usize;
+                assert!(entry_coarse_start >= coarse_start);
+                coarse_end = coarse_end.max(entry_coarse_start + entry_coarse_len);
+                full_start = full_start.min(entry_full_start);
+                full_end = full_end.max(entry_full_start + entry_full_len);
+            }
+            (coarse_start, coarse_end, full_start, full_end)
+        }
+        b"ZBP\x05" => {
+            let coarse_start = GROUP_OBJECT_HEADER_LEN + entry_count * GROUP_OBJECT_V5_ENTRY_LEN;
+            let mut coarse_end = coarse_start;
+            let mut full_start = data.len();
+            let mut full_end = 0;
+            for entry in 0..entry_count {
+                let offset = GROUP_OBJECT_HEADER_LEN + entry * GROUP_OBJECT_V5_ENTRY_LEN;
+                let entry_coarse_start = read_u64(data, offset + 8) as usize;
+                let entry_ids_start = read_u64(data, offset + 24) as usize;
+                let entry_ids_len = read_u64(data, offset + 32) as usize;
+                let entry_vectors_start = read_u64(data, offset + 40) as usize;
+                let entry_vectors_len = read_u64(data, offset + 48) as usize;
+                assert!(entry_coarse_start >= coarse_start);
+                coarse_end = coarse_end.max(entry_ids_start + entry_ids_len);
+                full_start = full_start.min(entry_vectors_start);
+                full_end = full_end.max(entry_vectors_start + entry_vectors_len);
+            }
+            (coarse_start, coarse_end, full_start, full_end)
+        }
+        magic => panic!("unrecognized grouped-object magic {magic:?}"),
+    };
 
     assert_eq!(coarse_end, full_start);
     assert_eq!(full_end, data.len());

@@ -269,7 +269,6 @@ impl RqClusterCodes {
     /// row order. Row position joins the codes to the separately persisted ID
     /// block. No magic or version byte is emitted: the enclosing grouped object
     /// and manifest encoding tag identify this payload.
-    #[allow(dead_code)] // Wired by the ZBP5 grouped writer in a later slice.
     #[must_use]
     pub fn to_codes_only_bytes(&self) -> Bytes {
         let words_per_row = 2 * (self.dim / 64);
@@ -469,7 +468,6 @@ const RQ_CODES_ONLY_HEADER_LEN: usize = 2 * std::mem::size_of::<u64>();
 /// ID block: `planes` row `r` and `factors[r]` belong to the `r`-th ID of the
 /// matching ID block. The buffers are private so row alignment cannot be
 /// changed independently after construction.
-#[allow(dead_code)] // Wired by the ZBP5 grouped reader in a later slice.
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct RqClusterCodesOnly {
@@ -479,7 +477,6 @@ pub struct RqClusterCodesOnly {
     factors: Vec<TwoBitFactors>,
 }
 
-#[allow(dead_code)] // Wired by the ZBP5 grouped reader in a later slice.
 impl RqClusterCodesOnly {
     /// Returns the vector dimension represented by every row.
     #[must_use]
@@ -503,6 +500,48 @@ impl RqClusterCodesOnly {
     #[must_use]
     pub fn factors(&self) -> &[TwoBitFactors] {
         &self.factors
+    }
+
+    /// Scores one row exactly as [`RqClusterCodes::asymmetric_distance`] does.
+    ///
+    /// Hoisting IDs out of the coarse block changes only where a row's ID is
+    /// stored, never how its codes are scored, so this shares the estimator and
+    /// the caller-supplied query ADC contract unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RqError`] when the query ADC dimension differs from the
+    /// persisted dimension, when `row` is out of bounds, or when the estimator
+    /// rejects the packed planes.
+    pub fn asymmetric_distance(
+        &self,
+        query: &QueryAdc4,
+        row: usize,
+        metric: DistanceMetric,
+    ) -> Result<f32, RqError> {
+        check_dimension("query", query.dim(), self.dim)?;
+        let factors = self
+            .factors
+            .get(row)
+            .copied()
+            .ok_or(RqError::RowIndexOutOfBounds {
+                row,
+                rows: self.row_count,
+            })?;
+        let words_per_plane = self.dim / 64;
+        let words_per_row = words_per_plane * 2;
+        let plane_start = row * words_per_row;
+        let planes = &self.planes[plane_start..plane_start + words_per_row];
+        let (low_plane, high_plane) = planes.split_at(words_per_plane);
+
+        match metric {
+            DistanceMetric::Cosine | DistanceMetric::Euclidean => Ok(
+                rabitq::estimate_l2_two_bit_parts(low_plane, high_plane, factors, query, 0.0)?,
+            ),
+            DistanceMetric::DotProduct => Ok(-rabitq::estimate_residual_dot_two_bit_parts(
+                low_plane, high_plane, factors, query,
+            )?),
+        }
     }
 
     /// Decodes and validates one complete codes-only two-bit payload.

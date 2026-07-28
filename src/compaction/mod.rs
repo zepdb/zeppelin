@@ -220,7 +220,7 @@ use crate::index::hierarchical::build::build_hierarchical;
 use crate::index::hierarchical::HierarchicalIndex;
 use crate::index::ivf_flat::build::{
     attrs_key, build_ivf_flat, cluster_group_key, cluster_key, cluster_object_sections,
-    deserialize_attrs, deserialize_cluster,
+    deserialize_attrs, deserialize_cluster, ClusterData,
 };
 use crate::index::ivf_flat::membership::{
     build_membership_artifact, deserialize_membership, MembershipData,
@@ -236,8 +236,9 @@ use crate::time::Clock;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{
-    BootstrapRef, ClusterDataObjectRef, CoarsePayloadEncoding, LocatedFragmentIdentity,
-    LocatedFragmentRef, LocatedSegmentRef, Manifest, MembershipRef, SegmentRef,
+    BootstrapRef, ClusterDataObjectRef, ClusterRowLayoutRef, CoarsePayloadEncoding,
+    LocatedFragmentIdentity, LocatedFragmentRef, LocatedSegmentRef, Manifest, MembershipRef,
+    SegmentRef,
 };
 use crate::wal::{FragmentCachePolicy, WalReader};
 
@@ -3318,8 +3319,9 @@ impl Compactor {
     )> {
         use crate::index::ivf_flat::build::{
             build_bootstrap_artifact, centroids_key, serialize_attrs,
-            serialize_centroids_with_sq_calibration, serialize_cluster,
-            serialize_cluster_data_object, serialize_colocated_sq_cluster,
+            serialize_centroids_with_sq_calibration, serialize_cluster, serialize_cluster_group,
+            serialize_colocated_sq_cluster, serialize_fixed_stride_f32_block, serialize_id_block,
+            ClusterPayload,
         };
         use crate::index::ivf_flat::sketch::{
             build_resident_sketch, stitch_resident_sketch, ResidentSketchStitch,
@@ -3377,6 +3379,50 @@ impl Compactor {
         let rewritten_count = touched.iter().filter(|t| **t).count();
         let carries_clusters = rewritten_count < num_clusters;
 
+        // Layout homogeneity. Rewritten quantized clusters are written as v5
+        // row-layout objects, so a carried object that predates that layout
+        // would leave the segment describing two different read protocols.
+        // Reject the optimization instead; the caller falls back to a full
+        // rebuild, which republishes every object as v5.
+        let writes_row_layout = matches!(
+            indexing_config.quantization,
+            crate::index::quantization::QuantizationType::Scalar
+                | crate::index::quantization::QuantizationType::TwoBit
+        ) && !old_cluster_objects.is_empty();
+        if writes_row_layout && carries_clusters {
+            let mut old_object_by_cluster: Vec<Option<&ClusterDataObjectRef>> =
+                vec![None; num_clusters];
+            for object_ref in old_cluster_objects {
+                for &cluster_idx in &object_ref.clusters {
+                    if let Some(slot) = old_object_by_cluster.get_mut(cluster_idx) {
+                        *slot = Some(object_ref);
+                    }
+                }
+            }
+            for (cluster_idx, is_touched) in touched.iter().enumerate() {
+                if *is_touched {
+                    continue;
+                }
+                let carried = old_object_by_cluster[cluster_idx].ok_or_else(|| {
+                    ZeppelinError::Index(format!(
+                        "grouped old segment missing object for carried cluster {cluster_idx}"
+                    ))
+                })?;
+                if !carried.declares_row_layout() {
+                    crate::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
+                        .with_label_values(&[namespace, "cluster_layout_version_mismatch"])
+                        .inc();
+                    return Err(ZeppelinError::Index(format!(
+                        "incremental carry-over unavailable: cluster_layout_version_mismatch — \
+                         carried object {} declares layout version {}, new clusters write {}",
+                        carried.key,
+                        carried.cluster_layout_version,
+                        crate::wal::manifest::CLUSTER_LAYOUT_VERSION_ZBP5
+                    )));
+                }
+            }
+        }
+
         let new_ckey = centroids_key(namespace, new_segment_id);
         let new_centroids_data = serialize_centroids_with_sq_calibration(
             &centroids,
@@ -3405,6 +3451,8 @@ impl Compactor {
         };
         let mut payloads: Vec<(String, Bytes)> = vec![(new_ckey, new_centroids_data.clone())];
         let mut cluster_object_sizes: HashMap<String, u64> = HashMap::new();
+        let mut cluster_object_layouts: HashMap<String, (u32, Vec<ClusterRowLayoutRef>)> =
+            HashMap::new();
 
         let mut sketch_unavailable_reason = None;
         let stitched_sketch = if let Some(old_sketch) = preloaded_old_sketch.as_ref() {
@@ -3555,7 +3603,23 @@ impl Compactor {
                     let cluster_refs: Vec<&[f32]> =
                         cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
                     let codes = calibration.encode_batch(&cluster_refs);
-                    serialize_colocated_sq_cluster(&cluster_ids[i], &cluster_vecs[i], &codes, dim)?
+                    if writes_row_layout {
+                        ClusterPayload::RowLayout {
+                            row_count: cluster_ids[i].len(),
+                            coarse: crate::index::quantization::sq::serialize_sq_codes_only(
+                                &codes, dim,
+                            )?,
+                            ids: serialize_id_block(&cluster_ids[i])?,
+                            vectors: serialize_fixed_stride_f32_block(&cluster_vecs[i], dim)?,
+                        }
+                    } else {
+                        ClusterPayload::Legacy(serialize_colocated_sq_cluster(
+                            &cluster_ids[i],
+                            &cluster_vecs[i],
+                            &codes,
+                            dim,
+                        )?)
+                    }
                 }
                 crate::index::quantization::QuantizationType::TwoBit => {
                     let rotation = rq_rotation.as_ref().ok_or_else(|| {
@@ -3571,23 +3635,43 @@ impl Compactor {
                         &centroids[i],
                         rotation,
                     )?;
-                    crate::index::ivf_flat::build::serialize_colocated_rq_cluster(
-                        &cluster_vecs[i],
-                        &codes,
-                        dim,
-                    )?
+                    if writes_row_layout {
+                        ClusterPayload::RowLayout {
+                            row_count: cluster_ids[i].len(),
+                            coarse: codes.to_codes_only_bytes(),
+                            ids: serialize_id_block(&cluster_ids[i])?,
+                            vectors: serialize_fixed_stride_f32_block(&cluster_vecs[i], dim)?,
+                        }
+                    } else {
+                        ClusterPayload::Legacy(
+                            crate::index::ivf_flat::build::serialize_colocated_rq_cluster(
+                                &cluster_vecs[i],
+                                &codes,
+                                dim,
+                            )?,
+                        )
+                    }
                 }
                 crate::index::quantization::QuantizationType::None
-                | crate::index::quantization::QuantizationType::Product => {
-                    serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?
-                }
+                | crate::index::quantization::QuantizationType::Product => ClusterPayload::Legacy(
+                    serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?,
+                ),
             };
             let (cvec_key, cvec_payload) = if old_cluster_objects.is_empty() {
-                (cluster_key(namespace, new_segment_id, i), cvec_data)
+                let ClusterPayload::Legacy(bytes) = cvec_data else {
+                    return Err(ZeppelinError::Index(
+                        "legacy per-cluster layout cannot store a v5 row-layout payload".into(),
+                    ));
+                };
+                (cluster_key(namespace, new_segment_id, i), bytes)
             } else {
                 let key = cluster_group_key(namespace, new_segment_id, i);
-                let data = serialize_cluster_data_object(&[(i, cvec_data)])?;
-                (key, data)
+                let serialized = serialize_cluster_group(&[(i, &cvec_data)])?;
+                cluster_object_layouts.insert(
+                    key.clone(),
+                    (serialized.layout_version, serialized.row_layouts),
+                );
+                (key, serialized.bytes)
             };
             cluster_object_sizes.insert(cvec_key.clone(), cvec_payload.len() as u64);
 
@@ -3711,6 +3795,7 @@ impl Compactor {
             &touched,
             old_cluster_objects,
             &cluster_object_sizes,
+            &cluster_object_layouts,
         )?;
         Ok((
             num_clusters,
@@ -4043,7 +4128,10 @@ async fn load_touched_segment_vectors(
             .unwrap_or(segment_id)
     };
     let num_clusters = touched.len();
-    let mut cluster_results = Vec::new();
+    // Rows are decoded at the read site because a grouped object's exact rows
+    // are not always one contiguous legacy section: a ZBP5 entry joins a
+    // hoisted ID block to a fixed-stride vector block.
+    let mut cluster_results: Vec<(usize, Result<ClusterData>, Result<bytes::Bytes>)> = Vec::new();
 
     if cluster_objects.is_empty() {
         cluster_results =
@@ -4068,7 +4156,16 @@ async fn load_touched_segment_vectors(
                     (i, cluster_res, attrs_res)
                 }
             }))
-            .await;
+            .await
+            .into_iter()
+            .map(|(i, cluster_res, attrs_res)| {
+                (
+                    i,
+                    cluster_res.and_then(|data| deserialize_cluster(&data)),
+                    attrs_res,
+                )
+            })
+            .collect();
     } else {
         let object_results = futures::future::join_all(
             cluster_objects
@@ -4123,18 +4220,14 @@ async fn load_touched_segment_vectors(
                 let attrs_res =
                     get_compaction_read(store, namespace, &cattr_key, COMPACTION_READ_CLASS_ATTRS)
                         .await;
-                cluster_results.push((
-                    cluster_idx,
-                    Ok(bytes::Bytes::copy_from_slice(section.data)),
-                    attrs_res,
-                ));
+                cluster_results.push((cluster_idx, section.decode(), attrs_res));
             }
         }
     }
 
     let mut clusters = vec![Vec::new(); num_clusters];
     for (cluster_idx, cluster_res, attrs_res) in cluster_results {
-        let cluster = deserialize_cluster(&cluster_res?)?;
+        let cluster = cluster_res?;
         let attrs = deserialize_attrs(&attrs_res?)?;
         if attrs.len() < cluster.ids.len() {
             return Err(ZeppelinError::Index(format!(
@@ -4202,6 +4295,7 @@ fn incremental_cluster_objects(
     touched: &[bool],
     old_cluster_objects: &[ClusterDataObjectRef],
     new_object_sizes: &HashMap<String, u64>,
+    new_object_layouts: &HashMap<String, (u32, Vec<ClusterRowLayoutRef>)>,
 ) -> Result<Vec<ClusterDataObjectRef>> {
     if old_cluster_objects.is_empty() {
         return Ok(Vec::new());
@@ -4233,6 +4327,10 @@ fn incremental_cluster_objects(
 
     let mut grouped: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     let mut size_by_key: HashMap<String, u64> = HashMap::new();
+    // A carried key keeps the layout its own writer published; a rewritten key
+    // takes the layout this pass just serialized. Neither is re-derived from
+    // bytes.
+    let mut layout_by_key: HashMap<String, (u32, Vec<ClusterRowLayoutRef>)> = HashMap::new();
     for cluster_idx in 0..num_clusters {
         let key = if touched[cluster_idx] {
             let key = cluster_group_key(namespace, new_segment_id, cluster_idx);
@@ -4240,6 +4338,10 @@ fn incremental_cluster_objects(
                 ZeppelinError::Index(format!("missing size for rewritten cluster object {key}"))
             })?;
             size_by_key.insert(key.clone(), size);
+            let layout = new_object_layouts.get(&key).cloned().ok_or_else(|| {
+                ZeppelinError::Index(format!("missing layout for rewritten cluster object {key}"))
+            })?;
+            layout_by_key.insert(key.clone(), layout);
             key
         } else {
             let object_ref = old_object_by_cluster[cluster_idx].ok_or_else(|| {
@@ -4248,6 +4350,13 @@ fn incremental_cluster_objects(
                 ))
             })?;
             size_by_key.insert(object_ref.key.clone(), object_ref.size_bytes);
+            layout_by_key.insert(
+                object_ref.key.clone(),
+                (
+                    object_ref.cluster_layout_version,
+                    object_ref.row_layouts.clone(),
+                ),
+            );
             object_ref.key.clone()
         };
         grouped.entry(key).or_default().push(cluster_idx);
@@ -4258,12 +4367,40 @@ fn incremental_cluster_objects(
         let size_bytes = size_by_key.remove(&key).ok_or_else(|| {
             ZeppelinError::Index(format!("missing size for cluster object {key}"))
         })?;
+        let (cluster_layout_version, source_layouts) =
+            layout_by_key.remove(&key).ok_or_else(|| {
+                ZeppelinError::Index(format!("missing layout for cluster object {key}"))
+            })?;
+        // A partially carried object keeps every byte it had but advertises
+        // only the clusters it still owns, so its published layouts are
+        // narrowed to those clusters in the same order. The retained ranges are
+        // still exact absolute offsets into the unchanged object.
+        let row_layouts = if cluster_layout_version == 0 {
+            Vec::new()
+        } else {
+            clusters
+                .iter()
+                .map(|&cluster_idx| {
+                    source_layouts
+                        .iter()
+                        .find(|layout| layout.cluster_idx == cluster_idx)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ZeppelinError::Index(format!(
+                                "cluster object {key} declares a row layout but omits cluster {cluster_idx}"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         object_refs.push(ClusterDataObjectRef {
             key,
             clusters,
             live_offset: 0,
             live_len: 0,
             size_bytes,
+            cluster_layout_version,
+            row_layouts,
         });
     }
     Ok(object_refs)
@@ -4676,7 +4813,9 @@ async fn load_segment_vectors(
         centroids.len()
     };
 
-    let mut cluster_results = Vec::new();
+    // See `load_touched_segment_vectors`: exact rows are decoded where they are
+    // read so both grouped layouts can be handled uniformly here.
+    let mut cluster_results: Vec<(usize, Result<ClusterData>, Result<bytes::Bytes>)> = Vec::new();
     if cluster_objects.is_empty() {
         // Parallel fetch: 2 GETs per cluster via tokio::join!
         cluster_results =
@@ -4701,7 +4840,16 @@ async fn load_segment_vectors(
                     (i, cluster_res, attrs_res)
                 }
             }))
-            .await;
+            .await
+            .into_iter()
+            .map(|(i, cluster_res, attrs_res)| {
+                (
+                    i,
+                    cluster_res.and_then(|data| deserialize_cluster(&data)),
+                    attrs_res,
+                )
+            })
+            .collect();
     } else {
         let object_results =
             futures::future::join_all(cluster_objects.iter().map(|object_ref| async move {
@@ -4738,11 +4886,7 @@ async fn load_segment_vectors(
                 let attrs_res =
                     get_compaction_read(store, namespace, &cattr_key, COMPACTION_READ_CLASS_ATTRS)
                         .await;
-                cluster_results.push((
-                    cluster_idx,
-                    Ok(bytes::Bytes::copy_from_slice(section.data)),
-                    attrs_res,
-                ));
+                cluster_results.push((cluster_idx, section.decode(), attrs_res));
             }
         }
     }
@@ -4757,7 +4901,7 @@ async fn load_segment_vectors(
     let mut vectors = Vec::new();
     let mut id_to_cluster: HashMap<String, usize> = HashMap::new();
     for (i, cluster_res, attrs_res) in cluster_results {
-        let cluster = deserialize_cluster(&cluster_res?)?;
+        let cluster = cluster_res?;
         let attrs = deserialize_attrs(&attrs_res?)?;
 
         for (j, id) in cluster.ids.into_iter().enumerate() {

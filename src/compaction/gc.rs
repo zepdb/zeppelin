@@ -5822,6 +5822,8 @@ mod tests {
             live_offset: 0,
             live_len: 0,
             size_bytes: 2048,
+            cluster_layout_version: 0,
+            row_layouts: Vec::new(),
         }];
         metadata_manifest.segments.push(metadata);
 

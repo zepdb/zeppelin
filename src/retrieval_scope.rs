@@ -1384,6 +1384,8 @@ mod tests {
                 live_offset: 0,
                 live_len: 0,
                 size_bytes: 1,
+                cluster_layout_version: 0,
+                row_layouts: Vec::new(),
             }],
             sketch: Some(crate::wal::manifest::SketchRef {
                 key: format!("{flat_prefix}/coarse_sketch.bin"),
