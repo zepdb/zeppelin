@@ -261,6 +261,32 @@ impl RqClusterCodes {
         Bytes::from(data)
     }
 
+    /// Serializes only codes and factors, omitting every row ID.
+    ///
+    /// This is the coarse-block payload for `ZBP5` grouped objects. The layout
+    /// is `[row_count: u64][dim: u64]` followed by each row's two fixed-width
+    /// little-endian bit planes and two little-endian factor scalars, in cluster
+    /// row order. Row position joins the codes to the separately persisted ID
+    /// block. No magic or version byte is emitted: the enclosing grouped object
+    /// and manifest encoding tag identify this payload.
+    #[allow(dead_code)] // Wired by the ZBP5 grouped writer in a later slice.
+    #[must_use]
+    pub fn to_codes_only_bytes(&self) -> Bytes {
+        let words_per_row = 2 * (self.dim / 64);
+        let mut data = Vec::new();
+        data.extend_from_slice(&(self.ids.len() as u64).to_le_bytes());
+        data.extend_from_slice(&(self.dim as u64).to_le_bytes());
+        for row in 0..self.ids.len() {
+            let plane_start = row * words_per_row;
+            for word in &self.planes[plane_start..plane_start + words_per_row] {
+                data.extend_from_slice(&word.to_le_bytes());
+            }
+            data.extend_from_slice(&self.factors[row].residual_norm.to_le_bytes());
+            data.extend_from_slice(&self.factors[row].bar_dot_residual.to_le_bytes());
+        }
+        Bytes::from(data)
+    }
+
     /// Decodes and validates one complete RQ cluster container.
     ///
     /// Malformed signatures, dimensions, IDs, planes, factors, and trailing
@@ -430,6 +456,135 @@ impl RqClusterCodes {
                 low_plane, high_plane, factors, query,
             )?),
         }
+    }
+}
+
+/// Fixed header of a codes-only two-bit payload: row count plus dimension.
+const RQ_CODES_ONLY_HEADER_LEN: usize = 2 * std::mem::size_of::<u64>();
+
+/// Owns packed two-bit planes and factors for one cluster, without row IDs.
+///
+/// This is the decoded form of the codes-only coarse block stored in `ZBP5`
+/// grouped objects. Row position joins each entry to the separately persisted
+/// ID block: `planes` row `r` and `factors[r]` belong to the `r`-th ID of the
+/// matching ID block. The buffers are private so row alignment cannot be
+/// changed independently after construction.
+#[allow(dead_code)] // Wired by the ZBP5 grouped reader in a later slice.
+#[must_use]
+#[derive(Debug, Clone)]
+pub struct RqClusterCodesOnly {
+    dim: usize,
+    row_count: usize,
+    planes: Vec<u64>,
+    factors: Vec<TwoBitFactors>,
+}
+
+#[allow(dead_code)] // Wired by the ZBP5 grouped reader in a later slice.
+impl RqClusterCodesOnly {
+    /// Returns the vector dimension represented by every row.
+    #[must_use]
+    pub const fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Returns the number of positionally aligned rows.
+    #[must_use]
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    /// Returns the flat low-plane/high-plane words for all rows.
+    #[must_use]
+    pub fn packed_planes(&self) -> &[u64] {
+        &self.planes
+    }
+
+    /// Returns the factors aligned with the cluster rows.
+    #[must_use]
+    pub fn factors(&self) -> &[TwoBitFactors] {
+        &self.factors
+    }
+
+    /// Decodes and validates one complete codes-only two-bit payload.
+    ///
+    /// The payload is `[row_count: u64][dim: u64]` followed by each row's two
+    /// fixed-width bit planes and two factor scalars. Truncated planes,
+    /// truncated factors, invalid dimensions, and trailing bytes are rejected
+    /// rather than skipped; a fixed-stride artifact has an exact length.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, RqError> {
+        if data.len() < RQ_CODES_ONLY_HEADER_LEN {
+            return Err(RqError::TruncatedHeader {
+                expected_bytes: RQ_CODES_ONLY_HEADER_LEN,
+                actual_bytes: data.len(),
+            });
+        }
+
+        let row_count = read_header_usize(data, 0, "row count")?;
+        let dim = read_header_usize(data, 8, "dimension")?;
+        if dim == 0 || dim % BLOCK_DIM != 0 {
+            return Err(RabitqError::InvalidDimension { dim }.into());
+        }
+        let words_per_plane = dim / 64;
+        let words_per_row =
+            words_per_plane
+                .checked_mul(2)
+                .ok_or(RqError::TruncatedPlaneBuffer {
+                    row: 0,
+                    expected_bytes: usize::MAX,
+                    actual_bytes: 0,
+                })?;
+        let plane_bytes = words_per_row
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or(RqError::TruncatedPlaneBuffer {
+                row: 0,
+                expected_bytes: usize::MAX,
+                actual_bytes: 0,
+            })?;
+
+        let mut planes = Vec::new();
+        let mut factors = Vec::new();
+        let mut offset = RQ_CODES_ONLY_HEADER_LEN;
+        for row in 0..row_count {
+            let available = data.len() - offset;
+            if available < plane_bytes {
+                return Err(RqError::TruncatedPlaneBuffer {
+                    row,
+                    expected_bytes: plane_bytes,
+                    actual_bytes: available,
+                });
+            }
+            let plane_end = offset + plane_bytes;
+            for chunk in data[offset..plane_end].chunks_exact(8) {
+                planes.push(read_u64(chunk));
+            }
+            offset = plane_end;
+
+            let available = data.len() - offset;
+            if available < FACTOR_BYTES {
+                return Err(RqError::FactorCountMismatch {
+                    rows: row_count,
+                    factors: row,
+                });
+            }
+            factors.push(TwoBitFactors {
+                residual_norm: read_f32(&data[offset..offset + 4]),
+                bar_dot_residual: read_f32(&data[offset + 4..offset + FACTOR_BYTES]),
+            });
+            offset += FACTOR_BYTES;
+        }
+
+        if offset != data.len() {
+            return Err(RqError::TrailingBytes {
+                bytes: data.len() - offset,
+            });
+        }
+
+        Ok(Self {
+            dim,
+            row_count,
+            planes,
+            factors,
+        })
     }
 }
 

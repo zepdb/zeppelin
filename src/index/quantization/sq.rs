@@ -62,6 +62,14 @@
 //!   [id_len: u32][UTF-8 id bytes][u8 code * dimension]
 //! ```
 //!
+//! Codes-only cluster payload (coarse block of `ZBP5` grouped objects; row IDs
+//! live in a separate ID block joined by position):
+//! ```text
+//! [num_vectors: u32][dimension: u32][u8 code * dimension * num_vectors]
+//! ```
+//! Unlike the other two formats, the codes-only reader requires an exact
+//! length: trailing bytes are rejected.
+//!
 //! ## Invariants
 //!
 //! - Calibration and every encoded row use the segment's declared dimension.
@@ -827,6 +835,165 @@ pub fn deserialize_sq_cluster(data: &[u8]) -> Result<SqClusterData> {
     }
 
     Ok(SqClusterData { ids, codes })
+}
+
+/// Owns SQ8 code rows parsed from a codes-only cluster payload.
+///
+/// The codes-only payload carries no row IDs; callers join each row to the
+/// separately persisted ID block by position. [`Self::codes`] retains the
+/// persisted row order, so `codes[r]` belongs to the `r`-th ID of the matching
+/// ID block.
+///
+/// # Examples
+///
+/// A three-row payload yields exactly three code rows; attaching scores to IDs
+/// requires fetching the sibling ID block for the same cluster.
+#[derive(Debug)]
+pub struct SqCodesOnlyData {
+    /// Persisted code width and vector dimension.
+    pub dim: usize,
+    /// Owned one-byte-per-dimension codes in persisted row order.
+    pub codes: Vec<Vec<u8>>,
+}
+
+/// Serializes SQ8 code rows without IDs into one fixed-stride payload.
+///
+/// This is the coarse-block payload for `ZBP5` grouped objects. Row position
+/// joins each code to the separately persisted ID block, so the format stores
+/// only `[row_count: u32][dimension: u32]` followed by exactly
+/// `row_count * dim` code bytes.
+///
+/// # Parameters
+///
+/// - `codes`: Borrowed SQ8 rows in cluster row order. Every row must contain
+///   exactly `dim` bytes.
+/// - `dim`: Persisted code width and vector dimension.
+///
+/// # Returns
+///
+/// Returns immutable bytes with the row count, dimension, and concatenated code
+/// rows. No IDs are emitted.
+///
+/// # Errors
+///
+/// Returns [`ZeppelinError::Index`] when a row's width differs from `dim`, when
+/// the row count or dimension does not fit the format's `u32` fields, or when
+/// the total size arithmetic overflows. Unlike [`serialize_sq_cluster`], this
+/// serializer validates row widths because a shifted fixed-stride row corrupts
+/// every following row silently.
+///
+/// # Consistency
+///
+/// Constructing bytes neither writes nor publishes an object; visibility still
+/// requires an immutable segment and manifest update.
+///
+/// # Performance
+///
+/// Allocates one exactly sized buffer and copies every code byte once.
+///
+/// # Examples
+///
+/// Three eight-byte codes produce `8 + 3 * 8 = 32` bytes. Deserializing them
+/// with [`deserialize_sq_codes_only`] recovers the same three rows.
+pub fn serialize_sq_codes_only(codes: &[Vec<u8>], dim: usize) -> Result<Bytes> {
+    let row_count = u32::try_from(codes.len()).map_err(|_| {
+        ZeppelinError::Index(format!(
+            "SQ codes-only row count does not fit in u32: {}",
+            codes.len()
+        ))
+    })?;
+    let dimension = u32::try_from(dim).map_err(|_| {
+        ZeppelinError::Index(format!(
+            "SQ codes-only dimension does not fit in u32: {dim}"
+        ))
+    })?;
+    let total = codes
+        .len()
+        .checked_mul(dim)
+        .and_then(|payload| payload.checked_add(8))
+        .ok_or_else(|| ZeppelinError::Index("SQ codes-only payload size overflows".into()))?;
+
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(&row_count.to_le_bytes());
+    buf.extend_from_slice(&dimension.to_le_bytes());
+    for (row, code) in codes.iter().enumerate() {
+        if code.len() != dim {
+            return Err(ZeppelinError::Index(format!(
+                "SQ codes-only row {row} width mismatch: expected {dim}, got {}",
+                code.len()
+            )));
+        }
+        buf.extend_from_slice(code);
+    }
+    debug_assert_eq!(buf.len(), total);
+
+    Ok(Bytes::from(buf))
+}
+
+/// Parses one codes-only SQ8 payload into owned code rows.
+///
+/// # Parameters
+///
+/// - `data`: Borrowed bytes in the codes-only format produced by
+///   [`serialize_sq_codes_only`].
+///
+/// # Returns
+///
+/// Returns [`SqCodesOnlyData`] with exactly the declared number of fixed-width
+/// code rows, in persisted order. No IDs are present to decode.
+///
+/// # Errors
+///
+/// Returns [`ZeppelinError::Index`] when the header is truncated, the size
+/// arithmetic overflows, or the payload length differs from exactly
+/// `8 + row_count * dim`. Trailing and missing bytes are both rejected: a
+/// fixed-stride artifact has an exact length.
+///
+/// # Performance
+///
+/// Allocates one outer vector and one `Vec<u8>` per row; parsing is linear in
+/// the payload size.
+///
+/// # Examples
+///
+/// Bytes from [`serialize_sq_codes_only`] round-trip the code rows. Appending
+/// one byte is an error, not an ignored suffix.
+pub fn deserialize_sq_codes_only(data: &[u8]) -> Result<SqCodesOnlyData> {
+    if data.len() < 8 {
+        return Err(ZeppelinError::Index(
+            "SQ codes-only blob too small for header".into(),
+        ));
+    }
+    let row_count = u32::from_le_bytes(
+        data[0..4]
+            .try_into()
+            .map_err(|_| ZeppelinError::Index("SQ codes-only header parse error".into()))?,
+    ) as usize;
+    let dim = u32::from_le_bytes(
+        data[4..8]
+            .try_into()
+            .map_err(|_| ZeppelinError::Index("SQ codes-only header parse error".into()))?,
+    ) as usize;
+
+    let expected = row_count
+        .checked_mul(dim)
+        .and_then(|payload| payload.checked_add(8))
+        .ok_or_else(|| ZeppelinError::Index("SQ codes-only payload size overflows".into()))?;
+    if data.len() != expected {
+        return Err(ZeppelinError::Index(format!(
+            "SQ codes-only blob size mismatch: expected {expected}, got {}",
+            data.len()
+        )));
+    }
+
+    let mut codes = Vec::with_capacity(row_count);
+    let mut offset = 8;
+    for _ in 0..row_count {
+        codes.push(data[offset..offset + dim].to_vec());
+        offset += dim;
+    }
+
+    Ok(SqCodesOnlyData { dim, codes })
 }
 
 /// Builds the legacy object-store key for one segment's SQ calibration.

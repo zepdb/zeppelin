@@ -121,6 +121,16 @@
 //!   manifest's `cluster_objects` field; an empty field is an explicit legacy
 //!   per-cluster layout. Cycle 7 `cluster_pair_i.bin` objects use the same
 //!   per-object directory and remain readable.
+//! - `ZBP5` grouped objects hoist IDs out of the vector block:
+//!   `[b"ZBP", version=5][entry_count:u32]` followed by directory entries of
+//!   `cluster_idx:u32, row_count:u32` and absolute `coarse`, `ids`, and
+//!   `vectors` ranges, then all coarse blocks, all ID blocks, and all
+//!   fixed-stride f32 blocks in entry order. A coarse block carries codes and
+//!   factors only; an ID block is `row_count:u32` then repeated
+//!   `[id_len:u32][UTF-8 id]`; a vector block is exactly `row_count × dim × 4`
+//!   bytes with no per-row header or ID, so row `r` starts at
+//!   `vectors_offset + r × dim × 4`. Regions tile the object exactly; any gap,
+//!   overlap, or trailing byte is an error.
 //! - `attrs_i.bin` is unchanged and remains lazy-loaded.
 //! - `sq_cluster_i.bin` and `sq_calibration.bin` are legacy read-only keys.
 //!   New SQ segments do not write them. Old-format carried clusters continue
@@ -180,6 +190,12 @@ const CLUSTER_DATA_OBJECT_HEADER_LEN: usize = 8;
 const CLUSTER_DATA_OBJECT_DIR_ENTRY_LEN: usize = 4 + 8 + 8;
 /// Bytes in one v4 tuple containing separate SQ and full-vector ranges.
 const CLUSTER_DATA_OBJECT_V4_DIR_ENTRY_LEN: usize = 4 + 8 + 8 + 8 + 8;
+/// Version byte for grouped objects with hoisted ID blocks and fixed-stride
+/// f32 vector blocks.
+const CLUSTER_DATA_OBJECT_V5_VERSION: u8 = 5;
+/// Bytes in one v5 tuple: cluster index, row count, and coarse/IDs/vectors
+/// absolute ranges.
+const CLUSTER_DATA_OBJECT_V5_DIR_ENTRY_LEN: usize = 4 + 4 + 8 * 6;
 /// Four-byte signature for a combined centroid-and-sketch bootstrap object.
 const BOOTSTRAP_MAGIC: &[u8; 4] = b"ZBS1";
 /// Legacy bootstrap version containing centroids and resident sketch only.
@@ -2612,6 +2628,571 @@ fn is_cluster_data_object_v4(data: &[u8]) -> bool {
         && data[3] == CLUSTER_DATA_OBJECT_V4_VERSION
 }
 
+// ---------------------------------------------------------------------------
+// ZBP5: hoisted IDs and fixed-stride f32 rows
+// ---------------------------------------------------------------------------
+
+/// Recognizes the v5 grouped-object signature without parsing its directory.
+///
+/// # Parameters
+///
+/// - `data`: Any byte slice, including one shorter than a header.
+///
+/// # Returns
+///
+/// `true` only when the first four bytes are `ZBP` followed by version 5.
+#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
+fn is_cluster_data_object_v5(data: &[u8]) -> bool {
+    data.len() >= 4
+        && &data[0..3] == CLUSTER_DATA_OBJECT_MAGIC_PREFIX
+        && data[3] == CLUSTER_DATA_OBJECT_V5_VERSION
+}
+
+/// Serializes one cluster's row IDs into a deterministic `ZBP5` ID block.
+///
+/// The block is `row_count:u32` followed by repeated `[id_len:u32][UTF-8 id]`
+/// in row order. Row position joins each ID to the sibling coarse and
+/// fixed-stride f32 blocks of the same cluster.
+///
+/// # Errors
+///
+/// Returns an index error when the row count or an ID length does not fit the
+/// format's `u32` fields.
+#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
+pub(crate) fn serialize_id_block(ids: &[String]) -> Result<Bytes> {
+    let row_count = u32::try_from(ids.len()).map_err(|_| {
+        ZeppelinError::Index(format!(
+            "v5 ID block row count does not fit in u32: {}",
+            ids.len()
+        ))
+    })?;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&row_count.to_le_bytes());
+    for id in ids {
+        let id_bytes = id.as_bytes();
+        let id_len = u32::try_from(id_bytes.len()).map_err(|_| {
+            ZeppelinError::Index(format!(
+                "v5 ID block ID length does not fit in u32: {}",
+                id_bytes.len()
+            ))
+        })?;
+        buf.extend_from_slice(&id_len.to_le_bytes());
+        buf.extend_from_slice(id_bytes);
+    }
+    Ok(Bytes::from(buf))
+}
+
+/// Parses one `ZBP5` ID block into owned row IDs.
+///
+/// # Returns
+///
+/// Exactly the declared number of IDs in persisted row order.
+///
+/// # Errors
+///
+/// Returns an index error for a truncated header, ID length, or ID payload,
+/// for non-UTF-8 IDs, or for trailing bytes after the declared rows. The block
+/// has an exact length; malformed input is never partially returned.
+#[allow(dead_code)] // Wired by the v5 production reader in a later slice.
+pub(crate) fn deserialize_id_block(data: &[u8]) -> Result<Vec<String>> {
+    if data.len() < 4 {
+        return Err(ZeppelinError::Index(
+            "v5 ID block too small for header".into(),
+        ));
+    }
+    let row_count = u32::from_le_bytes(
+        data[0..4]
+            .try_into()
+            .map_err(|_| ZeppelinError::Index("v5 ID block header parse error".into()))?,
+    ) as usize;
+
+    let mut ids = Vec::with_capacity(row_count);
+    let mut offset = 4;
+    for row in 0..row_count {
+        if offset + 4 > data.len() {
+            return Err(ZeppelinError::Index(
+                "v5 ID block truncated at id_len".into(),
+            ));
+        }
+        let id_len = u32::from_le_bytes(
+            data[offset..offset + 4]
+                .try_into()
+                .map_err(|_| ZeppelinError::Index("v5 ID block id_len parse error".into()))?,
+        ) as usize;
+        offset += 4;
+        let end = offset
+            .checked_add(id_len)
+            .ok_or_else(|| ZeppelinError::Index("v5 ID block ID range overflows".into()))?;
+        if end > data.len() {
+            return Err(ZeppelinError::Index("v5 ID block truncated at id".into()));
+        }
+        let id = std::str::from_utf8(&data[offset..end])
+            .map_err(|_| ZeppelinError::Index(format!("v5 ID block row {row} is not valid UTF-8")))?
+            .to_owned();
+        offset = end;
+        ids.push(id);
+    }
+    if offset != data.len() {
+        return Err(ZeppelinError::Index(format!(
+            "v5 ID block has {} trailing bytes",
+            data.len() - offset
+        )));
+    }
+    Ok(ids)
+}
+
+/// Computes the exact byte length of a fixed-stride f32 block.
+///
+/// # Returns
+///
+/// `row_count × dim × 4`, the only valid length for a `ZBP5` vector block.
+///
+/// # Errors
+///
+/// Returns an index error when the multiplication overflows.
+#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
+pub(crate) fn fixed_stride_f32_block_len(row_count: usize, dim: usize) -> Result<usize> {
+    row_count
+        .checked_mul(dim)
+        .and_then(|floats| floats.checked_mul(4))
+        .ok_or_else(|| ZeppelinError::Index("fixed-stride f32 block size overflows".into()))
+}
+
+/// Serializes exact vectors into a fixed-stride `ZBP5` f32 block.
+///
+/// The block is exactly `row_count × dim × 4` little-endian bytes with no
+/// per-row header and no per-row ID, so row `r` occupies
+/// `r × dim × 4 .. (r + 1) × dim × 4` within the block.
+///
+/// # Errors
+///
+/// Returns an index error when a row's width differs from `dim` or the size
+/// arithmetic overflows. A wrong width would silently shift every following
+/// row, so it is rejected rather than zipped short.
+#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
+pub(crate) fn serialize_fixed_stride_f32_block(vectors: &[Vec<f32>], dim: usize) -> Result<Bytes> {
+    let total = fixed_stride_f32_block_len(vectors.len(), dim)?;
+    let mut buf = Vec::with_capacity(total);
+    for (row, vector) in vectors.iter().enumerate() {
+        if vector.len() != dim {
+            return Err(ZeppelinError::Index(format!(
+                "fixed-stride f32 row {row} width mismatch: expected {dim}, got {}",
+                vector.len()
+            )));
+        }
+        for &val in vector {
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+    }
+    debug_assert_eq!(buf.len(), total);
+    Ok(Bytes::from(buf))
+}
+
+/// Parses a fixed-stride `ZBP5` f32 block into owned vectors.
+///
+/// # Parameters
+///
+/// - `data`: Complete vector-block bytes for one cluster.
+/// - `row_count`: Declared row count from the directory or manifest layout.
+/// - `dim`: Vector dimension shared by every row.
+///
+/// # Errors
+///
+/// Returns an index error when `data.len()` differs from exactly
+/// `row_count × dim × 4` or the size arithmetic overflows.
+#[allow(dead_code)] // Wired by the v5 production reader in a later slice.
+pub(crate) fn deserialize_fixed_stride_f32_block(
+    data: &[u8],
+    row_count: usize,
+    dim: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let expected = fixed_stride_f32_block_len(row_count, dim)?;
+    if data.len() != expected {
+        return Err(ZeppelinError::Index(format!(
+            "fixed-stride f32 block size mismatch: expected {expected}, got {}",
+            data.len()
+        )));
+    }
+    let row_bytes = dim * 4;
+    let mut vectors = Vec::with_capacity(row_count);
+    let mut offset = 0;
+    for _ in 0..row_count {
+        let end = offset + row_bytes;
+        vectors.push(
+            data[offset..end]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        );
+        offset = end;
+    }
+    Ok(vectors)
+}
+
+/// Typed per-cluster layout metadata for one `ZBP5` directory entry.
+///
+/// Ranges are absolute byte offsets within the grouped object. Serialization
+/// returns these values so the publisher records exactly what was written; the
+/// full-object parser derives the same values as the object's self-describing
+/// corruption boundary. Row `r`'s exact-vector range is pure arithmetic via
+/// [`Self::vector_row_range`]; no ID-length walk is ever required.
+#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Zbp5ClusterLayout {
+    /// Logical IVF cluster named by the directory entry.
+    pub cluster_idx: usize,
+    /// Number of rows shared by the coarse, ID, and vector blocks.
+    pub row_count: usize,
+    /// Absolute range of the codes-and-factors coarse block.
+    pub coarse: Range<u64>,
+    /// Absolute range of the deterministic ID block.
+    pub ids: Range<u64>,
+    /// Absolute range of the fixed-stride f32 vector block.
+    pub vectors: Range<u64>,
+}
+
+#[allow(dead_code)] // Wired by the v5 production reader in a later slice.
+impl Zbp5ClusterLayout {
+    /// Computes row `r`'s exact-vector range with checked arithmetic.
+    ///
+    /// The range is `vectors_offset + r × dim × 4 .. + dim × 4`, clamped to the
+    /// declared vector block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index error when `row` is outside the declared row count,
+    /// when the arithmetic overflows, or when the computed range escapes the
+    /// vector block. There is no fallback estimate.
+    pub(crate) fn vector_row_range(&self, row: usize, dim: usize) -> Result<Range<u64>> {
+        if row >= self.row_count {
+            return Err(ZeppelinError::Index(format!(
+                "v5 vector row {row} out of bounds for {} rows",
+                self.row_count
+            )));
+        }
+        let stride = u64::try_from(dim)
+            .ok()
+            .and_then(|dim| dim.checked_mul(4))
+            .ok_or_else(|| ZeppelinError::Index("v5 vector row stride overflows".into()))?;
+        let row_offset = stride
+            .checked_mul(row as u64)
+            .ok_or_else(|| ZeppelinError::Index("v5 vector row offset overflows".into()))?;
+        let start = self
+            .vectors
+            .start
+            .checked_add(row_offset)
+            .ok_or_else(|| ZeppelinError::Index("v5 vector row start overflows".into()))?;
+        let end = start
+            .checked_add(stride)
+            .ok_or_else(|| ZeppelinError::Index("v5 vector row end overflows".into()))?;
+        if end > self.vectors.end {
+            return Err(ZeppelinError::Index(format!(
+                "v5 vector row {row} escapes vectors block: end={end}, vectors_end={}",
+                self.vectors.end
+            )));
+        }
+        Ok(start..end)
+    }
+}
+
+/// Borrowed per-cluster blocks that become one `ZBP5` directory entry.
+#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
+pub(crate) struct Zbp5ClusterBlocks<'a> {
+    /// Logical IVF cluster named in the grouped directory.
+    pub cluster_idx: usize,
+    /// Row count shared by all three blocks.
+    pub row_count: usize,
+    /// Codes-and-factors coarse block (SQ8 or two-bit), without IDs.
+    pub coarse: &'a [u8],
+    /// Deterministic ID block from [`serialize_id_block`].
+    pub ids: &'a [u8],
+    /// Fixed-stride f32 block from [`serialize_fixed_stride_f32_block`].
+    pub vectors: &'a [u8],
+}
+
+/// A serialized `ZBP5` object plus the typed layout that was written.
+///
+/// The layout is returned, never re-derived, so the publisher can record the
+/// exact ranges in manifest metadata without re-parsing the just-built bytes.
+#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
+pub(crate) struct SerializedClusterDataObjectV5 {
+    /// Complete immutable object bytes.
+    pub bytes: Bytes,
+    /// One layout descriptor per directory entry, in stored order.
+    pub layout: Vec<Zbp5ClusterLayout>,
+}
+
+/// Writes a v5 grouped object: directory, coarse blocks, ID blocks, then
+/// fixed-stride f32 blocks, each region set in entry order.
+///
+/// # Parameters
+///
+/// - `entries`: Prevalidated cluster indexes and their three block payloads.
+///   Entry order becomes directory and block order; indexes must be unique and
+///   fit in `u32`.
+///
+/// # Returns
+///
+/// The object bytes together with the typed per-cluster layout exactly as
+/// written.
+///
+/// # Errors
+///
+/// Returns an index error for no entries, a duplicate/oversized cluster index
+/// or row count, or any checked directory, block, range, or total-size
+/// overflow.
+///
+/// # Examples
+///
+/// Two clusters become `directory | coarse0 | coarse1 | ids0 | ids1 |
+/// vectors0 | vectors1`; the first ID block therefore starts exactly where the
+/// last coarse block ends.
+#[allow(dead_code)] // Wired by the v5 production writer in a later slice.
+pub(crate) fn serialize_cluster_data_object_v5(
+    entries: &[Zbp5ClusterBlocks<'_>],
+) -> Result<SerializedClusterDataObjectV5> {
+    if entries.is_empty() {
+        return Err(ZeppelinError::Index(
+            "v5 cluster data object cannot be empty".into(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for entry in entries {
+        if entry.cluster_idx > u32::MAX as usize {
+            return Err(ZeppelinError::Index(format!(
+                "cluster index does not fit in u32: {}",
+                entry.cluster_idx
+            )));
+        }
+        if entry.row_count > u32::MAX as usize {
+            return Err(ZeppelinError::Index(format!(
+                "v5 cluster row count does not fit in u32: {}",
+                entry.row_count
+            )));
+        }
+        if !seen.insert(entry.cluster_idx) {
+            return Err(ZeppelinError::Index(format!(
+                "duplicate cluster {} in v5 cluster data object",
+                entry.cluster_idx
+            )));
+        }
+    }
+
+    let directory_len = entries
+        .len()
+        .checked_mul(CLUSTER_DATA_OBJECT_V5_DIR_ENTRY_LEN)
+        .ok_or_else(|| ZeppelinError::Index("v5 cluster object directory overflows".into()))?;
+    let payload_offset = CLUSTER_DATA_OBJECT_HEADER_LEN
+        .checked_add(directory_len)
+        .ok_or_else(|| ZeppelinError::Index("v5 cluster object header overflows".into()))?;
+
+    let mut coarse_ranges = Vec::with_capacity(entries.len());
+    let mut cursor = payload_offset;
+    for entry in entries {
+        let end = cursor.checked_add(entry.coarse.len()).ok_or_else(|| {
+            ZeppelinError::Index("v5 cluster object coarse block overflows".into())
+        })?;
+        coarse_ranges.push(cursor..end);
+        cursor = end;
+    }
+    let mut id_ranges = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let end = cursor
+            .checked_add(entry.ids.len())
+            .ok_or_else(|| ZeppelinError::Index("v5 cluster object ID block overflows".into()))?;
+        id_ranges.push(cursor..end);
+        cursor = end;
+    }
+    let mut vector_ranges = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let end = cursor.checked_add(entry.vectors.len()).ok_or_else(|| {
+            ZeppelinError::Index("v5 cluster object vectors block overflows".into())
+        })?;
+        vector_ranges.push(cursor..end);
+        cursor = end;
+    }
+    let total = cursor;
+
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(CLUSTER_DATA_OBJECT_MAGIC_PREFIX);
+    buf.push(CLUSTER_DATA_OBJECT_V5_VERSION);
+    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (idx, entry) in entries.iter().enumerate() {
+        buf.extend_from_slice(&(entry.cluster_idx as u32).to_le_bytes());
+        buf.extend_from_slice(&(entry.row_count as u32).to_le_bytes());
+        buf.extend_from_slice(&(coarse_ranges[idx].start as u64).to_le_bytes());
+        buf.extend_from_slice(&(entry.coarse.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(id_ranges[idx].start as u64).to_le_bytes());
+        buf.extend_from_slice(&(entry.ids.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(vector_ranges[idx].start as u64).to_le_bytes());
+        buf.extend_from_slice(&(entry.vectors.len() as u64).to_le_bytes());
+    }
+    for entry in entries {
+        buf.extend_from_slice(entry.coarse);
+    }
+    for entry in entries {
+        buf.extend_from_slice(entry.ids);
+    }
+    for entry in entries {
+        buf.extend_from_slice(entry.vectors);
+    }
+    debug_assert_eq!(buf.len(), total);
+
+    let layout = entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| Zbp5ClusterLayout {
+            cluster_idx: entry.cluster_idx,
+            row_count: entry.row_count,
+            coarse: coarse_ranges[idx].start as u64..coarse_ranges[idx].end as u64,
+            ids: id_ranges[idx].start as u64..id_ranges[idx].end as u64,
+            vectors: vector_ranges[idx].start as u64..vector_ranges[idx].end as u64,
+        })
+        .collect();
+
+    Ok(SerializedClusterDataObjectV5 {
+        bytes: Bytes::from(buf),
+        layout,
+    })
+}
+
+/// Parses and validates a complete `ZBP5` grouped object's directory.
+///
+/// Beyond field decoding, every region must tile the object exactly: coarse
+/// blocks are contiguous from the end of the directory in entry order, ID
+/// blocks follow contiguously, vector blocks follow contiguously, and the last
+/// vector block ends exactly at the object end. Any gap, overlap, truncation,
+/// or trailing byte is an error — the parser never returns a partial layout.
+///
+/// # Parameters
+///
+/// - `data`: Complete `ZBP5` object bytes.
+///
+/// # Returns
+///
+/// One validated layout descriptor per directory entry, in stored order.
+///
+/// # Errors
+///
+/// Returns an index error for a non-v5 signature, a truncated header or
+/// directory, zero entries, duplicate cluster indexes, non-tiling ranges, an
+/// inexact object end, or arithmetic overflow.
+#[allow(dead_code)] // Wired by the v5 production reader in a later slice.
+pub(crate) fn parse_cluster_data_object_v5(data: &[u8]) -> Result<Vec<Zbp5ClusterLayout>> {
+    if !is_cluster_data_object_v5(data) {
+        return Err(ZeppelinError::Index("not a v5 cluster data object".into()));
+    }
+    let entry_count = cluster_object_entry_count(data)?;
+    let directory_len = entry_count
+        .checked_mul(CLUSTER_DATA_OBJECT_V5_DIR_ENTRY_LEN)
+        .ok_or_else(|| ZeppelinError::Index("v5 cluster object directory overflows".into()))?;
+    let payload_start = CLUSTER_DATA_OBJECT_HEADER_LEN
+        .checked_add(directory_len)
+        .ok_or_else(|| ZeppelinError::Index("v5 cluster object header overflows".into()))?;
+    if data.len() < payload_start {
+        return Err(ZeppelinError::Index(format!(
+            "v5 cluster data object truncated directory: expected at least {payload_start}, got {}",
+            data.len()
+        )));
+    }
+
+    let mut layouts = Vec::with_capacity(entry_count);
+    let mut seen = BTreeSet::new();
+    for entry_idx in 0..entry_count {
+        let base =
+            CLUSTER_DATA_OBJECT_HEADER_LEN + entry_idx * CLUSTER_DATA_OBJECT_V5_DIR_ENTRY_LEN;
+        let cluster_idx = u32::from_le_bytes(
+            data[base..base + 4]
+                .try_into()
+                .map_err(|_| ZeppelinError::Index("v5 cluster object index parse error".into()))?,
+        ) as usize;
+        if !seen.insert(cluster_idx) {
+            return Err(ZeppelinError::Index(format!(
+                "duplicate cluster {cluster_idx} in v5 cluster data object"
+            )));
+        }
+        let row_count =
+            u32::from_le_bytes(data[base + 4..base + 8].try_into().map_err(|_| {
+                ZeppelinError::Index("v5 cluster object row count parse error".into())
+            })?) as usize;
+        let coarse_offset = read_u64_usize(data, base + 8, "v5 cluster object coarse offset")?;
+        let coarse_len = read_u64_usize(data, base + 16, "v5 cluster object coarse length")?;
+        let ids_offset = read_u64_usize(data, base + 24, "v5 cluster object IDs offset")?;
+        let ids_len = read_u64_usize(data, base + 32, "v5 cluster object IDs length")?;
+        let vectors_offset = read_u64_usize(data, base + 40, "v5 cluster object vectors offset")?;
+        let vectors_len = read_u64_usize(data, base + 48, "v5 cluster object vectors length")?;
+        layouts.push((
+            cluster_idx,
+            row_count,
+            coarse_offset,
+            coarse_len,
+            ids_offset,
+            ids_len,
+            vectors_offset,
+            vectors_len,
+        ));
+    }
+
+    // Exact tiling: all coarse blocks tile from payload_start in entry order,
+    // then all ID blocks, then all vector blocks; the object must end exactly
+    // at the last vector block's end.
+    let mut cursor = payload_start;
+    for region in 0..3 {
+        for (_, _, coarse_offset, coarse_len, ids_offset, ids_len, vectors_offset, vectors_len) in
+            &layouts
+        {
+            let (offset, len, label) = match region {
+                0 => (*coarse_offset, *coarse_len, "coarse"),
+                1 => (*ids_offset, *ids_len, "ID"),
+                _ => (*vectors_offset, *vectors_len, "vectors"),
+            };
+            let end = offset.checked_add(len).ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "v5 cluster {label} block overflows: offset={offset}, len={len}"
+                ))
+            })?;
+            if offset != cursor {
+                return Err(ZeppelinError::Index(format!(
+                    "v5 cluster {label} block does not tile: offset={offset}, expected={cursor}"
+                )));
+            }
+            cursor = end;
+        }
+    }
+    if cursor != data.len() {
+        return Err(ZeppelinError::Index(format!(
+            "v5 cluster data object size mismatch: expected exact end {cursor}, got {}",
+            data.len()
+        )));
+    }
+
+    let layouts_typed = layouts
+        .into_iter()
+        .map(
+            |(
+                cluster_idx,
+                row_count,
+                coarse_offset,
+                coarse_len,
+                ids_offset,
+                ids_len,
+                vectors_offset,
+                vectors_len,
+            )| {
+                Zbp5ClusterLayout {
+                    cluster_idx,
+                    row_count,
+                    coarse: coarse_offset as u64..(coarse_offset + coarse_len) as u64,
+                    ids: ids_offset as u64..(ids_offset + ids_len) as u64,
+                    vectors: vectors_offset as u64..(vectors_offset + vectors_len) as u64,
+                }
+            },
+        )
+        .collect();
+
+    Ok(layouts_typed)
+}
+
 /// Validates a half-open persisted range against complete object bytes.
 ///
 /// # Parameters
@@ -4784,5 +5365,257 @@ mod tests {
         assert_eq!(index.num_clusters(), 2);
         assert!(index.resident_sketch.is_some());
         assert!(index.bootstrap_ref.is_none());
+    }
+
+    /// Codes-only parity: SQ8 and two-bit codes-only payloads round-trip the
+    /// same code/factor rows as the existing ID-carrying codecs, with IDs
+    /// absent from the new payload bytes.
+    #[test]
+    fn codes_only_parity_matches_existing_codecs() {
+        use crate::index::quantization::rabitq::{StructuredRotation, BLOCK_DIM};
+        use crate::index::quantization::rq::{RqClusterCodes, RqClusterCodesOnly};
+        use crate::index::quantization::sq::{
+            deserialize_sq_cluster, deserialize_sq_codes_only, serialize_sq_cluster,
+            serialize_sq_codes_only, SqCalibration,
+        };
+
+        // SQ8: decoded code rows equal the existing codec's rows.
+        let sq_dim = 8;
+        let sq_vectors = [
+            vec![0.0_f32; 8],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            vec![-3.0, 0.5, 9.25, 2.0, -1.0, 4.5, 0.0, 6.75],
+        ];
+        let sq_refs: Vec<&[f32]> = sq_vectors.iter().map(Vec::as_slice).collect();
+        let calibration = SqCalibration::calibrate(&sq_refs, sq_dim);
+        let sq_codes: Vec<Vec<u8>> = sq_refs.iter().map(|v| calibration.encode(v)).collect();
+        let sq_ids = vec![
+            "sq-row-alpha".to_string(),
+            "sq-row-beta".to_string(),
+            "sq-row-gamma-longer".to_string(),
+        ];
+
+        let existing = serialize_sq_cluster(&sq_ids, &sq_codes, sq_dim).unwrap();
+        let existing_decoded = deserialize_sq_cluster(&existing).unwrap();
+        let codes_only = serialize_sq_codes_only(&sq_codes, sq_dim).unwrap();
+        let decoded = deserialize_sq_codes_only(&codes_only).unwrap();
+        assert_eq!(decoded.dim, sq_dim);
+        assert_eq!(decoded.codes.len(), sq_ids.len());
+        assert_eq!(decoded.codes, existing_decoded.codes);
+        for id in &sq_ids {
+            assert!(
+                !codes_only
+                    .windows(id.len())
+                    .any(|window| window == id.as_bytes()),
+                "SQ8 codes-only payload must not contain ID {id}"
+            );
+        }
+
+        // Two-bit: decoded planes/factors equal the existing codec's rows.
+        let rq_dim = BLOCK_DIM;
+        let rotation = StructuredRotation::new(rq_dim, 0x5A50_4352_5354_5431).unwrap();
+        let centroid = vec![0.25_f32; rq_dim];
+        let rq_rows = [
+            vec![0.5_f32; rq_dim],
+            vec![-0.125_f32; rq_dim],
+            vec![0.0625_f32; rq_dim],
+        ];
+        let rq_refs: Vec<&[f32]> = rq_rows.iter().map(Vec::as_slice).collect();
+        let rq_ids = vec![
+            "rq-row-zero".to_string(),
+            "rq-row-one".to_string(),
+            "rq-row-two-with-a-longer-id".to_string(),
+        ];
+        let encoded = RqClusterCodes::encode(&rq_ids, &rq_refs, &centroid, &rotation).unwrap();
+        let existing_decoded = RqClusterCodes::from_bytes(&encoded.to_bytes()).unwrap();
+
+        let codes_only = encoded.to_codes_only_bytes();
+        let decoded = RqClusterCodesOnly::from_bytes(&codes_only).unwrap();
+        assert_eq!(decoded.dim(), existing_decoded.dim());
+        assert_eq!(decoded.row_count(), existing_decoded.row_count());
+        assert_eq!(decoded.packed_planes(), existing_decoded.packed_planes());
+        assert_eq!(decoded.factors().len(), existing_decoded.factors().len());
+        for (actual, expected) in decoded.factors().iter().zip(existing_decoded.factors()) {
+            assert_eq!(
+                actual.residual_norm.to_bits(),
+                expected.residual_norm.to_bits()
+            );
+            assert_eq!(
+                actual.bar_dot_residual.to_bits(),
+                expected.bar_dot_residual.to_bits()
+            );
+        }
+        for id in &rq_ids {
+            assert!(
+                !codes_only
+                    .windows(id.len())
+                    .any(|window| window == id.as_bytes()),
+                "two-bit codes-only payload must not contain ID {id}"
+            );
+        }
+    }
+
+    /// ZBP5 round trip: two clusters with mixed ID lengths prove directory →
+    /// IDs → fixed-stride f32 row alignment and the exact arithmetic ranges of
+    /// the first, middle, and last rows.
+    #[test]
+    fn zbp5_round_trip_two_clusters_mixed_id_lengths() {
+        let dim = 3;
+        let ids_a = vec![
+            "a".to_string(),
+            "medium-length-id".to_string(),
+            "x".to_string(),
+        ];
+        let vectors_a = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![4.0, 5.0, 6.0],
+            vec![7.0, 8.0, 9.0],
+        ];
+        let ids_b = vec!["cluster-b-row-zero".to_string(), "bb".to_string()];
+        let vectors_b = vec![vec![-1.5, 0.25, 3.5], vec![9.0, -8.0, 7.0]];
+
+        let id_block_a = serialize_id_block(&ids_a).unwrap();
+        let id_block_b = serialize_id_block(&ids_b).unwrap();
+        let f32_block_a = serialize_fixed_stride_f32_block(&vectors_a, dim).unwrap();
+        let f32_block_b = serialize_fixed_stride_f32_block(&vectors_b, dim).unwrap();
+
+        let entries = [
+            Zbp5ClusterBlocks {
+                cluster_idx: 7,
+                row_count: ids_a.len(),
+                coarse: b"sq8-codes-a",
+                ids: &id_block_a,
+                vectors: &f32_block_a,
+            },
+            Zbp5ClusterBlocks {
+                cluster_idx: 12,
+                row_count: ids_b.len(),
+                coarse: b"sq8-codes-b-longer",
+                ids: &id_block_b,
+                vectors: &f32_block_b,
+            },
+        ];
+        let object = serialize_cluster_data_object_v5(&entries).unwrap();
+
+        // The parser derives exactly the layout the serializer returned.
+        let parsed = parse_cluster_data_object_v5(&object.bytes).unwrap();
+        assert_eq!(parsed, object.layout);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].cluster_idx, 7);
+        assert_eq!(parsed[0].row_count, 3);
+        assert_eq!(parsed[1].cluster_idx, 12);
+        assert_eq!(parsed[1].row_count, 2);
+
+        // Directory → coarse and ID blocks slice back to the written payloads.
+        assert_eq!(
+            &object.bytes[parsed[0].coarse.start as usize..parsed[0].coarse.end as usize],
+            b"sq8-codes-a"
+        );
+        assert_eq!(
+            deserialize_id_block(
+                &object.bytes[parsed[0].ids.start as usize..parsed[0].ids.end as usize]
+            )
+            .unwrap(),
+            ids_a
+        );
+        assert_eq!(
+            deserialize_id_block(
+                &object.bytes[parsed[1].ids.start as usize..parsed[1].ids.end as usize]
+            )
+            .unwrap(),
+            ids_b
+        );
+
+        // Regions tile in order: coarse blocks, then ID blocks, then f32 blocks.
+        assert_eq!(parsed[0].coarse.end, parsed[1].coarse.start);
+        assert_eq!(parsed[1].coarse.end, parsed[0].ids.start);
+        assert_eq!(parsed[1].ids.end, parsed[0].vectors.start);
+        assert_eq!(parsed[0].vectors.end, parsed[1].vectors.start);
+        assert_eq!(parsed[1].vectors.end, object.bytes.len() as u64);
+
+        // Exact fixed-stride arithmetic for first, middle, and last rows of
+        // both clusters; decoded row bytes match the input vectors.
+        let stride = (dim * 4) as u64;
+        for (layout, vectors) in [(&parsed[0], &vectors_a), (&parsed[1], &vectors_b)] {
+            let row_count = layout.row_count;
+            assert_eq!(
+                layout.vectors.end - layout.vectors.start,
+                fixed_stride_f32_block_len(row_count, dim).unwrap() as u64
+            );
+            for row in [0, row_count / 2, row_count - 1] {
+                let range = layout.vector_row_range(row, dim).unwrap();
+                let expected_start = layout.vectors.start + row as u64 * stride;
+                assert_eq!(range, expected_start..expected_start + stride);
+                let decoded = deserialize_fixed_stride_f32_block(
+                    &object.bytes[range.start as usize..range.end as usize],
+                    1,
+                    dim,
+                )
+                .unwrap();
+                assert_eq!(decoded, vec![vectors[row].clone()]);
+            }
+        }
+
+        // Whole-block decode also aligns with the input rows.
+        let decoded_b = deserialize_fixed_stride_f32_block(
+            &object.bytes[parsed[1].vectors.start as usize..parsed[1].vectors.end as usize],
+            ids_b.len(),
+            dim,
+        )
+        .unwrap();
+        assert_eq!(decoded_b, vectors_b);
+    }
+
+    /// Fail-loud bounds: a corrupted range length or row count makes the v5
+    /// parser/block decoders reject the object before any partial layout or
+    /// vectors are returned.
+    #[test]
+    fn zbp5_parser_rejects_corrupt_bounds() {
+        let dim = 2;
+        let ids = vec!["id-zero".to_string(), "id-one".to_string()];
+        let vectors = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let id_block = serialize_id_block(&ids).unwrap();
+        let f32_block = serialize_fixed_stride_f32_block(&vectors, dim).unwrap();
+        let entries = [Zbp5ClusterBlocks {
+            cluster_idx: 3,
+            row_count: ids.len(),
+            coarse: b"coarse",
+            ids: &id_block,
+            vectors: &f32_block,
+        }];
+        let object = serialize_cluster_data_object_v5(&entries).unwrap();
+        assert!(parse_cluster_data_object_v5(&object.bytes).is_ok());
+
+        // Corrupt the directory vectors_len: the regions no longer tile to the
+        // exact object end.
+        let entry_base = CLUSTER_DATA_OBJECT_HEADER_LEN;
+        let vectors_len_at = entry_base + 48;
+        let mut corrupted = object.bytes.to_vec();
+        corrupted[vectors_len_at..vectors_len_at + 8]
+            .copy_from_slice(&(f32_block.len() as u64 - 4).to_le_bytes());
+        assert!(parse_cluster_data_object_v5(&corrupted).is_err());
+
+        // Corrupt the directory row count: the declared layout no longer
+        // matches the fixed-stride block, so row access fails loudly.
+        let row_count_at = entry_base + 4;
+        let mut corrupted = object.bytes.to_vec();
+        corrupted[row_count_at..row_count_at + 4].copy_from_slice(&1_u32.to_le_bytes());
+        let layout = parse_cluster_data_object_v5(&corrupted).unwrap();
+        assert!(layout[0].vector_row_range(1, dim).is_err());
+        assert!(deserialize_fixed_stride_f32_block(
+            &object.bytes[layout[0].vectors.start as usize..layout[0].vectors.end as usize],
+            layout[0].row_count,
+            dim,
+        )
+        .is_err());
+
+        // Corrupt the ID block row count: the block decoder rejects it.
+        let mut corrupted_ids = id_block.to_vec();
+        corrupted_ids[0..4].copy_from_slice(&99_u32.to_le_bytes());
+        assert!(deserialize_id_block(&corrupted_ids).is_err());
+
+        // Truncate the object: exact-end validation rejects it.
+        let truncated = &object.bytes[..object.bytes.len() - 1];
+        assert!(parse_cluster_data_object_v5(truncated).is_err());
     }
 }
