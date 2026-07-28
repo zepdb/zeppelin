@@ -402,9 +402,17 @@ fn assert_fork_sample(source: &str, target: &str, sample: &OperationSnapshot) {
         }),
         "fork must upload no target WAL, segment, or cluster artifact"
     );
-    assert!(sample.observed_get_ops <= MAX_FORK_CONTROL_GETS);
+    assert!(
+        sample.observed_get_ops <= MAX_FORK_CONTROL_GETS,
+        "fork used {} control GETs, maximum is {MAX_FORK_CONTROL_GETS}",
+        sample.observed_get_ops
+    );
     assert!(sample.observed_put_ops <= MAX_FORK_CONTROL_PUTS);
-    assert!(sample.count_request(PhysicalRequest::PutUpdate) <= MAX_FORK_CAS_PUTS);
+    let cas_puts = sample.count_request(PhysicalRequest::PutUpdate);
+    assert!(
+        cas_puts <= MAX_FORK_CAS_PUTS,
+        "fork used {cas_puts} CAS PUTs, maximum is {MAX_FORK_CAS_PUTS}"
+    );
 }
 
 fn assert_fork_contract(tiny: &ForkCensus, corpus: &ForkCensus) {

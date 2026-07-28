@@ -17,7 +17,9 @@ use zeppelin::index::bitmap::bitmap_key;
 use zeppelin::index::ivf_flat::build::attrs_key;
 use zeppelin::index::ivf_flat::membership::deserialize_membership;
 use zeppelin::index::quantization::QuantizationType;
+use zeppelin::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
 use zeppelin::namespace::manager::NamespaceMetadata;
+use zeppelin::namespace::NamespaceId;
 use zeppelin::time::{Clock, TimeSource};
 use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::manifest::SegmentRef;
@@ -65,7 +67,7 @@ impl TimeSource for StableWidthPerfTime {
         loop {
             let real_micros = Utc::now().timestamp_micros();
             let mut candidate = real_micros.max(previous.saturating_add(1));
-            if candidate.rem_euclid(1_000) == 0 {
+            if candidate.rem_euclid(10) == 0 {
                 candidate = candidate.saturating_add(1);
             }
             match self.last_micros.compare_exchange_weak(
@@ -84,7 +86,7 @@ impl TimeSource for StableWidthPerfTime {
     }
 }
 
-fn stable_width_perf_clock() -> Clock {
+pub(crate) fn stable_width_perf_clock() -> Clock {
     Clock::from_source(Arc::new(StableWidthPerfTime {
         last_micros: AtomicI64::new(i64::MIN),
     }))
@@ -1463,7 +1465,41 @@ async fn clone_namespace_for_cold(
             object.key = rewrite_cold_key(source, target, &object.key);
         }
     }
+    // Compaction canonicalizes explicit artifact origins (ed4f159), so the
+    // cloned manifest can carry a self-origin table indexing every segment.
+    // The rewrite above moved every artifact key into the target prefix, so
+    // the origin table must be rebased onto the target or the fail-closed
+    // origin validation rejects the clone publish. The clone also keeps the
+    // source's incarnation binding: reset_version_for_clone clears it, and the
+    // origin validation's local-origin resolution refuses a binding-less
+    // manifest, so rebind the same incarnation after the reset.
+    if !manifest.artifact_origins.is_empty() {
+        let incarnation = manifest.artifact_origins[0].incarnation.clone();
+        manifest.artifact_origins = vec![ArtifactOrigin {
+            namespace: NamespaceId::new(target).unwrap_or_else(|error| {
+                panic!("cold clone target {target:?} is not a valid namespace: {error}")
+            }),
+            incarnation,
+        }];
+        for fragment in &mut manifest.fragments {
+            if fragment.artifact_origin.is_some() {
+                fragment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+            }
+        }
+        for segment in &mut manifest.segments {
+            if segment.artifact_origin.is_some() {
+                segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+            }
+        }
+    }
     reset_cold_clone_manifest_version(&mut manifest);
+    if let Some(origin) = manifest.artifact_origins.first() {
+        let incarnation = uuid::Uuid::parse_str(&origin.incarnation.to_string())
+            .unwrap_or_else(|error| panic!("cold clone origin incarnation is not a UUID: {error}"));
+        manifest
+            .bind_namespace_incarnation(incarnation)
+            .unwrap_or_else(|error| panic!("cold clone incarnation rebind failed: {error}"));
+    }
     manifest
         .write(&server.store, target)
         .await
@@ -1897,6 +1933,11 @@ fn scenario_config(spec: &ScenarioSpec) -> Config {
     // Keep asynchronous setup audit traffic outside each deterministic
     // measured window. Destructive barriers still force exactly one batch.
     config.security.audit_flush_secs = 60;
+    // Pin the policy/signer refresh loop out of measured windows the same way
+    // security.rs:163 and branching.rs:204 do: at the 5 s default a refresh
+    // lands mid-sample once the window stretches (latency profiles multiply
+    // repeat wall time), and its signer-slots LIST pollutes the census.
+    config.security.policy_refresh_secs = 3_600;
     // `start_test_server_full` injects this same fixed test-only key into its
     // cloned config. Retain it here so the post-measure CPU probe can load the
     // production policy kernel without inventing a second cursor key.

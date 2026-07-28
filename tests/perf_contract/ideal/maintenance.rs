@@ -742,13 +742,16 @@ async fn execute_trigger_manifest_changed(case: &IdealCase) -> IdealSample {
     );
     let sample = world.snapshot(case).await;
     assert_eq!(sample.total_get_ops, 1);
-    // One conditional GET of a receipt-bearing manifest. Manifest-shaped
-    // objects encode timestamps at variable width, so this is not
-    // byte-deterministic: 3 samples on 23accb3 spanned 449..464 (15 B). The
-    // frozen 146 predates the receipt artifact inventory accepted in a887d3c
-    // and was unreachable behind an earlier assertion until 2026-07-25.
+    // One conditional GET of the live manifest. Manifest-shaped objects
+    // encode timestamps at variable width, so this is not byte-deterministic:
+    // 3 samples on 23accb3 spanned 449..464 (15 B). The frozen 146 predates
+    // the receipt artifact inventory accepted in a887d3c and was unreachable
+    // behind an earlier assertion until 2026-07-25. Receipt removal at
+    // 9ff6fbd..9adc1cb deleted the artifact-hash inventory and the
+    // execution-state digest, dropping the observed value to 188; the band
+    // keeps the same +/-60 B (4x the 15 B spread) padding.
     assert!(
-        (389..=524).contains(&sample.total_get_bytes),
+        (128..=248).contains(&sample.total_get_bytes),
         "changed-trigger manifest GET bytes outside the banded range: {}",
         sample.total_get_bytes
     );
@@ -777,10 +780,14 @@ async fn execute_trigger_cache_invalidated(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal invalidated-trigger namespace setup failed");
     let manifest_cache = ManifestCache::new(Duration::from_secs(3_600));
-    manifest_cache
+    let primed_manifest = manifest_cache
         .get_strong_required(&world.store, &namespace)
         .await
         .expect("ideal invalidated-trigger manifest prime failed");
+    let expected_manifest_bytes = primed_manifest
+        .to_bytes()
+        .expect("encode invalidated-trigger manifest")
+        .len() as u64;
     manifest_cache.invalidate_at(&namespace, world.now);
     let compactor = maintenance_compactor(&world, CompactionConfig::default());
 
@@ -792,7 +799,9 @@ async fn execute_trigger_cache_invalidated(case: &IdealCase) -> IdealSample {
     );
     let sample = world.snapshot(case).await;
     assert_eq!(sample.total_get_ops, 1);
-    assert_eq!(sample.total_get_bytes, 115);
+    // The invalidated cache still performs one exact full-manifest GET. Compare
+    // it with the authoritative encoding because timestamp width is variable.
+    assert_eq!(sample.total_get_bytes, expected_manifest_bytes);
     assert_eq!(sample.serial_get_chain.depth, 1);
     assert_single_manifest_get(&sample, PhysicalRequest::GetFull, SpanOutcome::Success);
     world.cleanup(sample).await
@@ -928,7 +937,10 @@ async fn execute_resume_delete(case: &IdealCase) -> IdealSample {
     assert!(outcome.complete);
     assert_eq!(outcome.deleted, 2);
     let sample = world.snapshot(case).await;
-    assert_eq!(sample.total_get_ops, 1);
+    // e232818's legacy cleanup guard re-reads metadata and re-checks manifest
+    // absence before both the batch delete and the tombstone removal: one
+    // entry read plus two per guarded step.
+    assert_eq!(sample.total_get_ops, 5);
     assert_eq!(physical_mode_ops(&sample, "list_recursive"), 2);
     assert_eq!(physical_mode_ops(&sample, "delete_batch"), 1);
     assert_eq!(physical_mode_ops(&sample, "delete"), 1);
@@ -1334,7 +1346,9 @@ async fn execute_idle_new_orphan(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal idle new-orphan cycle failed");
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 2, 2, 1, 3);
+    // fc5e34b's branch-root observation reads the live manifest once more per
+    // GC phase and extends the serial chain over the stale e3ea98b census.
+    assert_full_gc_census(&sample, 0, 7, 2, 2, 1, 5);
     assert_eq!(report.candidates_marked, 1);
     assert_eq!(report.objects_deleted, 1);
     assert!(
@@ -1391,7 +1405,9 @@ async fn execute_idle_candidate_maturity(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal idle candidate maturity cycle failed");
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 2, 1, 1, 3);
+    // fc5e34b's branch-root observation reads the live manifest once more per
+    // GC phase and extends the serial chain over the stale e3ea98b census.
+    assert_full_gc_census(&sample, 0, 7, 2, 1, 1, 5);
     assert_eq!(report.candidates_marked, 0);
     assert_eq!(report.objects_deleted, 1);
     assert!(
@@ -1447,9 +1463,14 @@ async fn execute_idle_pending_delete_maturity(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal idle pending-delete maturity cycle failed");
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 2, 2, 2, 1, 2);
-    assert_eq!(report.pending_deletes_deleted, 1);
-    assert_eq!(report.pending_deletes_pruned, 1);
+    // 56eb959's candidate-phase precedence defers the pending-delete drain for
+    // one cycle once the deadline wakes the idle gate, so the mature key is
+    // swept as a candidate and the drain reports no progress this cycle. The
+    // history create/read pair is 5f43ffb's conflict confirmation, and
+    // fc5e34b's root observation adds the remaining manifest reads.
+    assert_full_gc_census(&sample, 1, 5, 2, 1, 1, 5);
+    assert_eq!(report.pending_deletes_deleted, 0);
+    assert_eq!(report.pending_deletes_pruned, 0);
     assert_eq!(report.pending_deletes_retained, 0);
     assert!(
         !world
@@ -1482,7 +1503,9 @@ async fn execute_idle_pitr_expiry(case: &IdealCase) -> IdealSample {
         .expect("ideal idle PITR-expiry cycle failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 1, 0, 1, 3);
+    // fc5e34b's branch-root observation reads the live manifest once more per
+    // GC phase and extends the serial chain over the stale e3ea98b census.
+    assert_full_gc_census(&sample, 0, 7, 1, 0, 1, 5);
     let histories = Manifest::list_history(&world.harness.store, &namespace)
         .await
         .expect("ideal idle PITR-expiry history oracle failed");
@@ -1538,7 +1561,9 @@ async fn execute_idle_staging_lease_expiry(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal idle staging lease-expiry cycle failed");
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 2, 2, 1, 3);
+    // fc5e34b's branch-root observation reads the live manifest once more per
+    // GC phase and extends the serial chain over the stale e3ea98b census.
+    assert_full_gc_census(&sample, 0, 7, 2, 2, 1, 5);
     assert_eq!(report.candidates_marked, 1);
     assert_eq!(report.objects_deleted, 1);
     assert!(
@@ -1629,16 +1654,20 @@ async fn execute_idle_changed_control(
     let sample = world.snapshot(case).await;
     match mutation {
         IdleControlMutation::Snapshot | IdleControlMutation::SnapshotPair => {
+            // e3ea98b-era bytes predate the artifact-origins, branch-root, and
+            // incarnation binding fields and tonight's receipt removal; the
+            // serial chain gained one link from fc5e34b's root observation.
+            // Byte counts re-derived at 9adc1cb.
             let (names, expected_gets, expected_bytes): (&[&str], u64, u64) = match mutation {
-                IdleControlMutation::Snapshot => (&["idle-control-change"], 7, 375),
+                IdleControlMutation::Snapshot => (&["idle-control-change"], 7, 414),
                 IdleControlMutation::SnapshotPair => {
-                    (&["idle-control-change-a", "idle-control-change-b"], 8, 406)
+                    (&["idle-control-change-a", "idle-control-change-b"], 8, 445)
                 }
                 IdleControlMutation::Staging | IdleControlMutation::CandidateLedger => {
                     unreachable!("snapshot branch must have snapshot mutation")
                 }
             };
-            assert_full_gc_census(&sample, 0, expected_gets, 1, 0, 0, 4);
+            assert_full_gc_census(&sample, 0, expected_gets, 1, 0, 0, 5);
             assert_eq!(sample.total_get_bytes, expected_bytes);
             for name in names {
                 assert!(NamedSnapshot::read(&world.harness.store, &namespace, name)
@@ -1648,10 +1677,14 @@ async fn execute_idle_changed_control(
             }
         }
         IdleControlMutation::Staging => {
-            assert_full_gc_census(&sample, 0, 6, 1, 0, 0, 3);
+            // fc5e34b's root observation extends the serial chain by one link
+            // over the stale e3ea98b census.
+            assert_full_gc_census(&sample, 0, 6, 1, 0, 0, 4);
         }
         IdleControlMutation::CandidateLedger => {
-            assert_full_gc_census(&sample, 0, 6, 1, 1, 0, 3);
+            // fc5e34b's root observation extends the serial chain by one link
+            // over the stale e3ea98b census.
+            assert_full_gc_census(&sample, 0, 6, 1, 1, 0, 4);
             assert!(
                 load_gc_candidates(&world.harness.store, &namespace)
                     .await
@@ -1679,7 +1712,9 @@ async fn execute_idle_backward_clock(case: &IdealCase) -> IdealSample {
         .expect("ideal idle backward-clock cycle failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.finish(case).await;
-    assert_full_gc_census(&sample, 0, 6, 1, 0, 0, 3);
+    // fc5e34b's root observation extends the serial chain by one link over the
+    // stale e3ea98b census.
+    assert_full_gc_census(&sample, 0, 6, 1, 0, 0, 4);
     sample
 }
 
@@ -1702,7 +1737,9 @@ async fn execute_idle_shorter_retention_config(case: &IdealCase) -> IdealSample 
         .expect("ideal idle shorter-retention cycle failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 1, 0, 1, 3);
+    // fc5e34b's branch-root observation reads the live manifest once more per
+    // GC phase and extends the serial chain over the stale e3ea98b census.
+    assert_full_gc_census(&sample, 0, 7, 1, 0, 1, 5);
     let histories = Manifest::list_history(&world.harness.store, &namespace)
         .await
         .expect("ideal idle shorter-retention history oracle failed");
@@ -1747,7 +1784,9 @@ async fn execute_idle_prior_partial_failure(case: &IdealCase) -> IdealSample {
         .expect("ideal idle post-failure retry failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.finish(case).await;
-    assert_full_gc_census(&sample, 0, 6, 1, 0, 0, 3);
+    // fc5e34b's root observation extends the serial chain by one link over the
+    // stale e3ea98b census.
+    assert_full_gc_census(&sample, 0, 6, 1, 0, 0, 4);
     sample
 }
 
@@ -1821,7 +1860,11 @@ fn assert_prune_reuse_empty_pending_census(sample: &IdealSample) {
             calls,
             sample.serial_get_chain.depth,
         ),
-        (36, 18_278, 42, 18_673, 1, 0, 43, 5),
+        // Byte totals re-derived at 9adc1cb: the e3ea98b-era values predate
+        // the artifact-origins, branch-root, and incarnation binding fields
+        // (+13 B per sized history generation) and tonight's receipt removal;
+        // the serial chain gained one link from fc5e34b's root observation.
+        (36, 18_746, 42, 19_180, 1, 0, 43, 6),
         "warm GC must preserve prune-result reuse traffic while overlapping independent retention, mark, and sweep reads",
     );
 }
@@ -1882,7 +1925,11 @@ async fn execute_prune_reuse_eligible_pending_refresh(case: &IdealCase) -> Ideal
             physical_verb_ops(&sample, "delete"),
             sample.serial_get_chain.depth,
         ),
-        (18, 19, 9_377, 2, 0, 0, 2),
+        // Re-derived at 9adc1cb: fc5e34b's branch-root observation adds one
+        // live-manifest GET and one serial link over the stale e3ea98b census,
+        // and the byte total also spans the binding-field growth and tonight's
+        // receipt removal.
+        (18, 20, 9_875, 2, 0, 0, 3),
         "an eligible pending delete must fail closed when the fresh full inventory lacks history ETags",
     );
     assert_eq!(report.pending_deletes_deleted, 0);
@@ -1919,8 +1966,12 @@ async fn execute_history_memo_new_generation(case: &IdealCase) -> IdealSample {
     assert_eq!(report.pending_deletes_deleted, 0);
 
     let sample = world.finish(case).await;
-    assert_history_memo_census(&sample, 2, 8, 1, 0, 9, 5);
-    assert_eq!(sample.total_get_bytes, 583);
+    // fc5e34b's root observation extends the serial chain by one link over the
+    // stale e3ea98b census; the byte total also predates the origins, branch,
+    // and incarnation binding fields and tonight's receipt removal, and is
+    // re-derived at 9adc1cb.
+    assert_history_memo_census(&sample, 2, 8, 1, 0, 9, 6);
+    assert_eq!(sample.total_get_bytes, 648);
     sample
 }
 
@@ -1957,7 +2008,9 @@ async fn execute_history_memo_changed_etag(case: &IdealCase) -> IdealSample {
     assert_eq!(report.objects_deleted, 0);
     assert_eq!(report.pending_deletes_deleted, 0);
     let sample = world.finish(case).await;
-    assert_history_memo_census(&sample, 2, 8, 1, 0, 9, 5);
+    // fc5e34b's root observation extends the serial chain by one link over the
+    // stale e3ea98b census.
+    assert_history_memo_census(&sample, 2, 8, 1, 0, 9, 6);
     sample
 }
 
@@ -1981,7 +2034,9 @@ async fn execute_history_memo_missing_etag(case: &IdealCase) -> IdealSample {
     assert_eq!(report.objects_deleted, 0);
     assert_eq!(report.pending_deletes_deleted, 0);
     let sample = world.finish(case).await;
-    assert_history_memo_census(&sample, 2, 8, 1, 0, 9, 5);
+    // fc5e34b's root observation extends the serial chain by one link over the
+    // stale e3ea98b census.
+    assert_history_memo_census(&sample, 2, 8, 1, 0, 9, 6);
     sample
 }
 
@@ -2081,7 +2136,9 @@ async fn execute_history_memo_unpublished_orphan_overwrite(case: &IdealCase) -> 
     let sample = world.snapshot(case).await;
     assert_eq!(report.objects_deleted, 0);
     assert_eq!(report.pending_deletes_deleted, 0);
-    assert_history_memo_census(&sample, 2, 8, 1, 1, 10, 5);
+    // fc5e34b's root observation extends the serial chain by one link over the
+    // stale e3ea98b census.
+    assert_history_memo_census(&sample, 2, 8, 1, 1, 10, 6);
     assert!(
         world
             .harness
@@ -2173,7 +2230,9 @@ async fn execute_history_memo_cold_runner_restart(case: &IdealCase) -> IdealSamp
 
 fn assert_history_failure_closed(report: &GcCycleReport, sample: &IdealSample) {
     assert_eq!(report, &GcCycleReport::default());
-    assert_history_memo_census(sample, 1, 1, 1, 0, 2, 1);
+    // fc5e34b's root observation adds one live-manifest GET and one serial
+    // link to the fail-closed path over the stale e3ea98b census.
+    assert_history_memo_census(sample, 1, 2, 1, 0, 3, 2);
     assert_eq!(physical_verb_ops(sample, "delete"), 0);
 }
 
@@ -2336,7 +2395,10 @@ async fn seed_gc_cycle_sized_history(world: &MaintenanceWorld, namespace: &str) 
     let mut manifest = Manifest::new_at(world.now);
     for index in 0..18 {
         let padding_len = if index < 17 { 388 } else { 347 };
-        manifest.pending_deletes = vec!["x".repeat(padding_len)];
+        // 6c850f5 validates that pending-delete entries are local immutable
+        // artifact keys, so the sizing pad takes a wal key shape; the total
+        // length is unchanged from the pre-validation "x".repeat pad.
+        manifest.pending_deletes = vec![sized_wal_pad_key(namespace, padding_len)];
         manifest
             .write(&world.store, namespace)
             .await
@@ -2363,8 +2425,21 @@ async fn seed_gc_cycle_sized_history(world: &MaintenanceWorld, namespace: &str) 
             .expect("ideal GC sized-history verification GET failed")
             .len() as u64;
     }
-    assert_eq!(bytes, 9_139, "ideal GC history fixture drifted");
+    // The 9_139 fixture total predates the artifact-origins, branch-root, and
+    // incarnation binding fields; receipts then came and went without a
+    // re-derivation. Re-derived at 9adc1cb.
+    assert_eq!(bytes, 9_373, "ideal GC history fixture drifted");
     manifest
+}
+
+/// Build a `wal/` pending-delete key of exactly `total_len` bytes for the
+/// sized-history fixture, padding the descendant with filler.
+fn sized_wal_pad_key(namespace: &str, total_len: usize) -> String {
+    let base = format!("{namespace}/wal/pad-");
+    let fill = total_len
+        .checked_sub(base.len() + ".wal".len())
+        .expect("sized-history pad key must fit the filler");
+    format!("{base}{}.wal", "x".repeat(fill))
 }
 
 fn history_memo_gc_config() -> GcConfig {
@@ -2410,7 +2485,11 @@ fn assert_history_memo_census(
         "unexpected history GETs in physical operations: {:?}",
         sample.physical_operations
     );
-    assert_eq!(sample.total_get_ops, total_gets);
+    assert_eq!(
+        sample.total_get_ops, total_gets,
+        "unexpected total GETs in physical operations: {:?}",
+        sample.physical_operations
+    );
     assert_eq!(sample.serial_get_chain.depth, get_depth);
     assert_eq!(physical_mode_ops(sample, "list_recursive"), lists);
     assert_eq!(physical_verb_ops(sample, "put"), puts);

@@ -253,8 +253,10 @@ async fn execute_creating_recovery(case: &IdealCase, manifest_present: bool) -> 
     assert_eq!(found[0].state, NamespaceState::Active);
     await_tracker_idle(&world.tracker).await;
     let sample = world.sample(case);
-    let expected_gets = if manifest_present { 3 } else { 4 };
-    let expected_puts = if manifest_present { 1 } else { 3 };
+    // The body-only fixture deliberately has no incarnation metadata. Recovery
+    // first reads and migrates that legacy identity before repairing state.
+    let expected_gets = 5;
+    let expected_puts = if manifest_present { 2 } else { 4 };
     assert_shape(&sample, expected_gets, expected_puts, 1, 0);
 
     let recovered = NamespaceMetadata::from_bytes(
@@ -293,7 +295,10 @@ async fn execute_delete_publish(case: &IdealCase) -> IdealSample {
     assert_eq!(meta.state, NamespaceState::Deleting);
     await_tracker_idle(&world.tracker).await;
     let sample = world.sample(case);
-    assert_shape(&sample, 1, 1, 0, 1);
+    // Two branch-root guard manifest reads (start_delete re-reads the live
+    // manifest before mark_deleting, which re-reads it again inside the CAS
+    // loop; 3999936 and d4c79cd) plus one metadata GET guard the tombstone.
+    assert_shape(&sample, 3, 1, 0, 1);
 
     assert!(Manifest::read(&world.harness.store, &namespace)
         .await
@@ -365,9 +370,14 @@ async fn execute_delete_cleanup(case: &IdealCase, complete: bool) -> IdealSample
     );
     await_tracker_idle(&world.tracker).await;
     let sample = world.sample(case);
+    // e232818 made legacy cleanup re-read authoritative metadata at each step
+    // and re-check manifest absence before batch deletion and tombstone
+    // removal: one read on entry, two per guarded step. An incomplete batch
+    // returns before the second step, so it observes three GETs while the
+    // complete path observes five.
     assert_shape(
         &sample,
-        1,
+        if complete { 5 } else { 3 },
         0,
         if complete { 2 } else { 1 },
         if complete { 2 } else { 1 },
@@ -415,7 +425,11 @@ async fn create_namespace(manager: &NamespaceManager, namespace: &str) -> Namesp
 async fn seed_objects(store: &ZeppelinStore, namespace: &str, count: usize) {
     let mut writes = futures::stream::iter((0..count).map(|index| {
         let store = store.clone();
-        let key = format!("{namespace}/delete-fixture/{index:04}.bin");
+        // Seed under `segments/` so the fixture is a target-owned immutable
+        // artifact. Governed cleanup only enumerates owned artifacts, so a key
+        // directly under `{namespace}/` was never deleted and the delete counts
+        // this case asserts did not exercise the cleanup path at all.
+        let key = format!("{namespace}/segments/delete-fixture/{index:04}.bin");
         async move { store.put(&key, Bytes::from_static(b"x")).await }
     }))
     .buffer_unordered(64);

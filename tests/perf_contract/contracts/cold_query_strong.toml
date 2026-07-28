@@ -28,10 +28,10 @@ top_k = 10
 query_index = 0
 
 [baseline]
-git_rev = "437e9ffeafba7a5e34ed1e0a7df6914330f6f6e0"
-captured = "2026-07-25T06:10:54Z"
+git_rev = "9adc1cb500dba7407e7fc6875bd353f7e1050202"
+captured = "2026-07-28T05:09:03Z"
 approved_by = "anup"
-reason = "Byte-only rebaseline at 437e9ff. The security and branching tracks add 13 persisted manifest fields; the receipt artifact inventory (`artifact_hashes`, bb51e04) dominates and is populated unconditionally, roughly doubling serialized manifest size. Accepted as the intended cost of receipts. Operation counts, key counts, critical-path depth, and quantized artifact bytes are unchanged and were NOT re-approved."
+reason = "Byte-only rebaseline at 437e9ff. The security and branching tracks add 13 persisted manifest fields; the receipt artifact inventory (`artifact_hashes`, bb51e04) dominates and is populated unconditionally, roughly doubling serialized manifest size. Accepted as the intended cost of receipts. Operation counts, key counts, critical-path depth, and quantized artifact bytes are unchanged and were NOT re-approved. ZBS1 v2 at 46bebaf adds a 16-byte section directory and a 4-byte empty field count, increasing the immutable bootstrap by 20 bytes. Receipt removal at 9ff6fbd, d83ad82, and 9adc1cb deleted the Merkle modules, the signed manifest roots with the artifact-hash inventory, and the execution-state digest; every manifest-shaped object shrank, so the manifest and total byte bands are re-derived at 9adc1cb from the release gate and the 100-sample depth-stability run. Operation counts, key counts, critical-path depth, and non-manifest bytes are unchanged and were NOT re-approved."
 
 [assert.depth.get]
 mode = "max"
@@ -73,7 +73,7 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.bootstrap]
-exact = 297613
+exact = 297633
 why = "capture pins the immutable bootstrap object size"
 
 [assert.get_bytes.centroids]
@@ -87,9 +87,9 @@ why = "capture pins the seven measured cluster GETs"
 exact = 0
 
 [assert.get_bytes.manifest]
-min = 5643
-max = 5715
-why = "manifest-shaped objects encode timestamps at variable width, so this count is not byte-deterministic: 5 samples on 437e9ff spanned 5675..5683 (8 B). Band is 4x the observed spread (min 32 B), which absorbs the jitter while still failing on a doubling or a disappearance."
+min = 2763
+max = 2844
+why = "manifest-shaped objects encode timestamps at variable width, so this count is not byte-deterministic: 5 samples on 437e9ff spanned 5675..5683 (8 B). Band is 4x the observed spread (min 32 B), which absorbs the jitter while still failing on a doubling or a disappearance. Re-derived at 9adc1cb after receipt removal: 100 stability samples spanned 2799..2808 (9 B); same 4x padding."
 
 [assert.get_bytes.other]
 exact = 693
@@ -102,9 +102,9 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-min = 733252
-max = 733324
-why = "manifest-shaped objects encode timestamps at variable width, so this count is not byte-deterministic: 5 samples on 437e9ff spanned 733284..733292 (8 B). Band is 4x the observed spread (min 32 B), which absorbs the jitter while still failing on a doubling or a disappearance."
+min = 730392
+max = 730473
+why = "manifest-shaped objects encode timestamps at variable width, so this count is not byte-deterministic: 5 samples on 437e9ff spanned 733284..733292 (8 B). Band is 4x the observed spread (min 32 B), which absorbs the jitter while still failing on a doubling or a disappearance. Re-derived at 9adc1cb after receipt removal: 100 stability samples spanned 730428..730437 (9 B); same 4x padding."
 
 [assert.get_bytes.wal]
 exact = 0

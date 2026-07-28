@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::common::counting::ClassStats;
+use zeppelin::config::IndexingConfig;
 
 use super::dataset::{DatasetSpec, SHAPE_MEDIUM, SHAPE_SMALL};
 use super::depth::{DepthStage, DepthTracker, SpanKind};
@@ -221,13 +222,15 @@ impl ShapeModel {
 
         let mut classes = self.source_classes.clone();
         let rows_per_cluster = vectors as f64 / nlist as f64;
-        let expanded_clusters = grouped_cluster_coverage(nlist, nprobe);
+        let group_count = (nlist as f64 / self.clusters_per_coarse_get).ceil();
+        let coarse_ops = distinct_group_coverage(group_count, nprobe);
+        let expanded_clusters = (coarse_ops * self.clusters_per_coarse_get)
+            .round()
+            .min(nlist as f64);
         let coarse_bytes = expanded_clusters
             * rows_per_cluster
             * (row_bytes as f64 + self.coarse_overhead_per_row);
         let rerank_bytes = rows_per_cluster * (dims as f64 * 4.0 + self.rerank_overhead_per_row);
-        let group_count = (nlist as f64 / self.clusters_per_coarse_get).ceil();
-        let coarse_ops = distinct_group_coverage(group_count, nprobe);
         let cluster_ops = coarse_ops + self.rerank_get_ops;
         let cluster_bytes = coarse_bytes + rerank_bytes;
         let cluster = classes
@@ -498,11 +501,13 @@ fn validate_model(model: &ShapeModel, medium: &ScenarioOutcome) -> ValidationSum
         "GT-B fixture violates its closed-loop identity"
     );
 
+    let medium_nprobe =
+        IndexingConfig::default().effective_default_nprobe_with_floor(SHAPE_MEDIUM.nlist, 4);
     let medium_prediction = model.predict_synthetic(
         SHAPE_MEDIUM.vectors,
         SHAPE_MEDIUM.dims,
         SHAPE_MEDIUM.nlist,
-        4,
+        medium_nprobe,
         SHAPE_MEDIUM.dims,
         8,
     );
