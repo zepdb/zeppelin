@@ -3124,6 +3124,7 @@ impl Compactor {
             old_cluster_owners,
             old_cluster_objects,
             &touched,
+            centroid_state.dim,
         )
         .await?;
 
@@ -3606,6 +3607,7 @@ impl Compactor {
                     if writes_row_layout {
                         ClusterPayload::RowLayout {
                             row_count: cluster_ids[i].len(),
+                            dim,
                             coarse: crate::index::quantization::sq::serialize_sq_codes_only(
                                 &codes, dim,
                             )?,
@@ -3638,6 +3640,7 @@ impl Compactor {
                     if writes_row_layout {
                         ClusterPayload::RowLayout {
                             row_count: cluster_ids[i].len(),
+                            dim,
                             coarse: codes.to_codes_only_bytes(),
                             ids: serialize_id_block(&cluster_ids[i])?,
                             vectors: serialize_fixed_stride_f32_block(&cluster_vecs[i], dim)?,
@@ -4117,6 +4120,7 @@ async fn load_touched_segment_vectors(
     cluster_owners: &[String],
     cluster_objects: &[ClusterDataObjectRef],
     touched: &[bool],
+    dim: usize,
 ) -> Result<Vec<Vec<VectorEntry>>> {
     let namespace = old_segment.logical_namespace;
     let physical_namespace = old_segment.physical_namespace();
@@ -4191,6 +4195,10 @@ async fn load_touched_segment_vectors(
 
         for (object_ref, object_res) in object_results {
             let object_data = object_res?;
+            // The query path validates published row ranges when it builds an
+            // index handle; compaction reads objects straight from the manifest,
+            // so it owes the same check against the segment dimension.
+            object_ref.validate_row_layouts(dim)?;
             let Some(sections) = cluster_object_sections(&object_data)? else {
                 return Err(ZeppelinError::Index(format!(
                     "manifest cluster object {} did not contain grouped cluster data",
@@ -4796,10 +4804,13 @@ async fn load_segment_vectors(
     // `segment_id` to sum vector counts, which would 404 on a segment whose
     // clusters were carried over to other keys. Centroids are segment-global
     // and always live under `segment_id`.
-    let num_clusters = if located.segment.hierarchical {
+    // `dim` is `None` for hierarchical segments, whose cluster count comes from
+    // the tree metadata rather than a centroids blob. Flat segments carry it, so
+    // they can check published row ranges against the real vector width.
+    let (num_clusters, dim) = if located.segment.hierarchical {
         // Compaction reads the segment once; no query cache involved here.
         let h_index = HierarchicalIndex::load_from_located_manifest(store, located, None).await?;
-        h_index.num_leaf_clusters()
+        (h_index.num_leaf_clusters(), None)
     } else {
         use crate::index::ivf_flat::build::{centroids_key, deserialize_centroids};
         let centroids_data = get_compaction_read(
@@ -4809,8 +4820,8 @@ async fn load_segment_vectors(
             COMPACTION_READ_CLASS_CENTROIDS,
         )
         .await?;
-        let (centroids, _dim) = deserialize_centroids(&centroids_data)?;
-        centroids.len()
+        let (centroids, dim) = deserialize_centroids(&centroids_data)?;
+        (centroids.len(), Some(dim))
     };
 
     // See `load_touched_segment_vectors`: exact rows are decoded where they are
@@ -4866,6 +4877,11 @@ async fn load_segment_vectors(
 
         for (object_ref, object_res) in object_results {
             let object_data = object_res?;
+            // See `load_touched_segment_vectors`: the manifest ranges are only
+            // trustworthy once they have been checked against the vector width.
+            if let Some(dim) = dim {
+                object_ref.validate_row_layouts(dim)?;
+            }
             let Some(sections) = cluster_object_sections(&object_data)? else {
                 return Err(ZeppelinError::Index(format!(
                     "manifest cluster object {} did not contain grouped cluster data",

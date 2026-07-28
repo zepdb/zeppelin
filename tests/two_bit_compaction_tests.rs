@@ -8,14 +8,14 @@ use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::types::DistanceMetric;
-use zeppelin::wal::manifest::{CoarsePayloadEncoding, Manifest};
+use zeppelin::wal::manifest::{ClusterRowLayoutRef, CoarsePayloadEncoding, Manifest};
 use zeppelin::wal::{WalReader, WalWriter};
 
 const DIM: usize = 256;
 
 async fn compact_with_mode(
     mode: QuantizationType,
-) -> (QuantizationType, CoarsePayloadEncoding, u64) {
+) -> (QuantizationType, CoarsePayloadEncoding, ClusterRowLayoutRef) {
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("two-bit-compaction");
     common::seed_active_namespace(&harness.store, &namespace, DIM, DistanceMetric::Euclidean).await;
@@ -73,31 +73,45 @@ async fn compact_with_mode(
         layout.row_count * DIM as u64 * 4,
         "published vector block must be exactly row_count rows of fixed-stride f32"
     );
-    let coarse_len = layout.coarse_len;
+    let layout = layout.clone();
     let segment_mode = segment.quantization;
 
     harness.cleanup().await;
-    (segment_mode, encoding, coarse_len)
+    (segment_mode, encoding, layout)
+}
+
+/// An SQ8 codes-only block is a `[row_count: u32][dim: u32]` header followed by
+/// exactly one byte per component. That width is unreachable for any two-bit
+/// payload, so it identifies the encoding without a per-section magic.
+fn assert_sq8_coarse_width(layout: &ClusterRowLayoutRef) {
+    assert_eq!(
+        layout.coarse_len,
+        8 + layout.row_count * DIM as u64,
+        "SQ8 coarse block must be one byte per component over an 8-byte header"
+    );
 }
 
 #[tokio::test]
 async fn compaction_round_trips_two_bit_and_scalar_modes() {
-    let (two_bit_mode, two_bit_encoding, two_bit_coarse_len) =
+    let (two_bit_mode, two_bit_encoding, two_bit_layout) =
         compact_with_mode(QuantizationType::TwoBit).await;
     assert_eq!(two_bit_mode, QuantizationType::TwoBit);
     assert_eq!(two_bit_encoding, CoarsePayloadEncoding::TwoBit);
 
-    let (scalar_mode, scalar_encoding, scalar_coarse_len) =
+    let (scalar_mode, scalar_encoding, scalar_layout) =
         compact_with_mode(QuantizationType::Scalar).await;
     assert_eq!(scalar_mode, QuantizationType::Scalar);
     assert_eq!(scalar_encoding, CoarsePayloadEncoding::Sq8);
+    assert_sq8_coarse_width(&scalar_layout);
 
-    // Same corpus and partitioning in both runs: the two-bit codes-only block
-    // must be narrower than the SQ8 one, proving the writer really emitted a
-    // different encoding per mode rather than relabeling one payload.
+    // Same corpus and partitioning in both runs, so the two-bit block must be
+    // narrower than the SQ8 one it replaces: the writer emitted a different
+    // encoding per mode rather than relabeling one payload.
     assert!(
-        two_bit_coarse_len < scalar_coarse_len,
-        "two-bit coarse block ({two_bit_coarse_len} B) must be narrower than SQ8 ({scalar_coarse_len} B)"
+        two_bit_layout.coarse_len < scalar_layout.coarse_len,
+        "two-bit coarse block ({} B) must be narrower than SQ8 ({} B)",
+        two_bit_layout.coarse_len,
+        scalar_layout.coarse_len
     );
 }
 
@@ -110,8 +124,9 @@ async fn default_quantization_stays_scalar() {
     };
     assert_eq!(config.quantization, QuantizationType::Scalar);
 
-    let (segment_mode, encoding, coarse_len) = compact_with_mode(config.quantization).await;
+    let (segment_mode, encoding, layout) = compact_with_mode(config.quantization).await;
     assert_eq!(segment_mode, QuantizationType::Scalar);
     assert_eq!(encoding, CoarsePayloadEncoding::Sq8);
-    assert!(coarse_len > 0);
+    assert!(layout.row_count > 0, "the fixture must persist rows");
+    assert_sq8_coarse_width(&layout);
 }

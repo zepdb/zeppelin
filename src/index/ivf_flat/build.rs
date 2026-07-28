@@ -2342,9 +2342,14 @@ impl ClusterObjectSection<'_> {
     ///
     /// Returns an index error for a malformed legacy section, a malformed
     /// `ZBP5` ID block, a vector block whose length is not a whole number of
-    /// fixed-stride rows, or an ID/vector row-count disagreement. A `ZBP5`
-    /// section derives its dimension from the declared block length, so a
-    /// mismatch is corruption rather than a differently sized segment.
+    /// fixed-stride rows, a zero-width row, or an ID/vector row-count
+    /// disagreement.
+    ///
+    /// A `ZBP5` object stores no dimension, so this recovers it by dividing the
+    /// vector block by the row count. That division is exact for anything
+    /// [`serialize_cluster_data_object_v5`] wrote, because it validates the
+    /// stride before the object becomes immutable; a remainder or a zero width
+    /// here is corruption, not a differently sized segment.
     pub(crate) fn decode(&self) -> Result<ClusterData> {
         match &self.rows {
             ClusterObjectRows::Legacy(data) => deserialize_cluster(data),
@@ -2362,10 +2367,20 @@ impl ClusterObjectSection<'_> {
                     )));
                 }
                 let dim = if *row_count == 0 {
+                    if !vectors.is_empty() {
+                        return Err(ZeppelinError::Index(format!(
+                            "v5 cluster {} declares no rows but carries {} vector bytes",
+                            self.cluster_idx,
+                            vectors.len()
+                        )));
+                    }
                     0
                 } else {
                     let row_bytes = vectors.len() / row_count;
-                    if row_bytes % 4 != 0 || row_bytes * row_count != vectors.len() {
+                    if row_bytes == 0
+                        || row_bytes % 4 != 0
+                        || row_bytes * row_count != vectors.len()
+                    {
                         return Err(ZeppelinError::Index(format!(
                             "v5 cluster {} vector block of {} bytes is not {row_count} whole f32 rows",
                             self.cluster_idx,
@@ -2476,6 +2491,12 @@ pub(crate) fn cluster_object_header_range_len(entry_count: usize) -> Result<usiz
 /// Returns an index error for a recognized but truncated/malformed directory,
 /// duplicate cluster indexes, invalid relationships, or size overflow.
 ///
+/// A `ZBP5` object is an error, never `None`. Its coarse/ID/vector regions are
+/// not the coarse/full section pair this directory describes, and returning
+/// `None` would tell the caller it was holding a legacy standalone cluster.
+/// Callers that can read v5 must dispatch on the manifest row layout — or on
+/// [`cluster_object_sections`] — before reaching here.
+///
 /// # Examples
 ///
 /// A `ZBP4` header range can expose SQ and full ranges before the payload is
@@ -2486,6 +2507,13 @@ pub(crate) fn cluster_object_layout(data: &[u8]) -> Result<Option<ClusterObjectL
     }
     if is_cluster_data_object_v4(data) {
         return cluster_object_layout_v4(data).map(Some);
+    }
+    if is_cluster_data_object_v5(data) {
+        return Err(ZeppelinError::Index(
+            "v5 cluster data object has no coarse/full section directory; \
+             read its regions from the manifest row layout"
+                .into(),
+        ));
     }
     Ok(None)
 }
@@ -2815,17 +2843,29 @@ pub(crate) fn serialize_id_block(ids: &[String]) -> Result<Bytes> {
 /// Returns an index error for a truncated header, ID length, or ID payload,
 /// for non-UTF-8 IDs, or for trailing bytes after the declared rows. The block
 /// has an exact length; malformed input is never partially returned.
-pub(crate) fn deserialize_id_block(data: &[u8]) -> Result<Vec<String>> {
+/// Reads only the row count an ID block declares in its header.
+///
+/// Lets the `ZBP5` serializer cross-check a caller's row count against the ID
+/// block it supplied without decoding every ID.
+///
+/// # Errors
+///
+/// Returns an index error when the block is too small to hold its header.
+fn id_block_row_count(data: &[u8]) -> Result<usize> {
     if data.len() < 4 {
         return Err(ZeppelinError::Index(
             "v5 ID block too small for header".into(),
         ));
     }
-    let row_count = u32::from_le_bytes(
+    Ok(u32::from_le_bytes(
         data[0..4]
             .try_into()
             .map_err(|_| ZeppelinError::Index("v5 ID block header parse error".into()))?,
-    ) as usize;
+    ) as usize)
+}
+
+pub(crate) fn deserialize_id_block(data: &[u8]) -> Result<Vec<String>> {
+    let row_count = id_block_row_count(data)?;
 
     let mut ids = Vec::with_capacity(row_count);
     let mut offset = 4;
@@ -3062,6 +3102,11 @@ pub(crate) struct Zbp5ClusterBlocks<'a> {
     pub cluster_idx: usize,
     /// Row count shared by all three blocks.
     pub row_count: usize,
+    /// Segment vector dimension. The object stores no dimension of its own, so
+    /// readers recover it as `vectors.len() / row_count / 4`. Carrying it here
+    /// lets the serializer prove that division is exact before the bytes become
+    /// immutable.
+    pub dim: usize,
     /// Codes-and-factors coarse block (SQ8 or two-bit), without IDs.
     pub coarse: &'a [u8],
     /// Deterministic ID block from [`serialize_id_block`].
@@ -3108,6 +3153,9 @@ pub(crate) enum ClusterPayload {
     RowLayout {
         /// Rows shared by all three blocks.
         row_count: usize,
+        /// Segment vector dimension, carried so the serializer can verify the
+        /// vector block's fixed stride before the object becomes immutable.
+        dim: usize,
         /// Codes-and-factors coarse block without IDs.
         coarse: Bytes,
         /// Deterministic ID block.
@@ -3182,12 +3230,14 @@ pub(crate) fn serialize_cluster_group(
         .map(|(cluster_idx, payload)| match payload {
             ClusterPayload::RowLayout {
                 row_count,
+                dim,
                 coarse,
                 ids,
                 vectors,
             } => Zbp5ClusterBlocks {
                 cluster_idx: *cluster_idx,
                 row_count: *row_count,
+                dim: *dim,
                 coarse,
                 ids,
                 vectors,
@@ -3220,8 +3270,15 @@ pub(crate) fn serialize_cluster_group(
 /// # Errors
 ///
 /// Returns an index error for no entries, a duplicate/oversized cluster index
-/// or row count, or any checked directory, block, range, or total-size
-/// overflow.
+/// or row count, an ID block that does not declare exactly `row_count` rows, a
+/// vector block that is not exactly `row_count × dim × 4` bytes, or any checked
+/// directory, block, range, or total-size overflow.
+///
+/// The row-count and stride checks are what make the object self-consistent:
+/// the format stores no dimension, so a reader recovers it by dividing the
+/// vector block by the row count. Rejecting a mismatch here means that division
+/// is exact for every object this writer has ever produced, and a reader that
+/// finds otherwise is looking at corruption.
 ///
 /// # Examples
 ///
@@ -3254,6 +3311,23 @@ pub(crate) fn serialize_cluster_data_object_v5(
             return Err(ZeppelinError::Index(format!(
                 "duplicate cluster {} in v5 cluster data object",
                 entry.cluster_idx
+            )));
+        }
+        let declared_ids = id_block_row_count(entry.ids)?;
+        if declared_ids != entry.row_count {
+            return Err(ZeppelinError::Index(format!(
+                "v5 cluster {} declares {} rows but its ID block declares {declared_ids}",
+                entry.cluster_idx, entry.row_count
+            )));
+        }
+        let expected_vectors = fixed_stride_f32_block_len(entry.row_count, entry.dim)?;
+        if entry.vectors.len() != expected_vectors {
+            return Err(ZeppelinError::Index(format!(
+                "v5 cluster {} vector block is {} bytes, expected {expected_vectors} for {} rows at dim {}",
+                entry.cluster_idx,
+                entry.vectors.len(),
+                entry.row_count,
+                entry.dim
             )));
         }
     }
@@ -4042,6 +4116,7 @@ pub async fn build_ivf_flat(
                 let codes = calibration.encode_batch(&cluster_refs);
                 ClusterPayload::RowLayout {
                     row_count: cluster_ids[i].len(),
+                    dim,
                     coarse: crate::index::quantization::sq::serialize_sq_codes_only(&codes, dim)?,
                     ids: serialize_id_block(&cluster_ids[i])?,
                     vectors: serialize_fixed_stride_f32_block(&cluster_vecs[i], dim)?,
@@ -4063,6 +4138,7 @@ pub async fn build_ivf_flat(
                 )?;
                 ClusterPayload::RowLayout {
                     row_count: cluster_ids[i].len(),
+                    dim,
                     coarse: codes.to_codes_only_bytes(),
                     ids: serialize_id_block(&cluster_ids[i])?,
                     vectors: serialize_fixed_stride_f32_block(&cluster_vecs[i], dim)?,
@@ -5779,6 +5855,7 @@ mod tests {
             Zbp5ClusterBlocks {
                 cluster_idx: 7,
                 row_count: ids_a.len(),
+                dim,
                 coarse: b"sq8-codes-a",
                 ids: &id_block_a,
                 vectors: &f32_block_a,
@@ -5786,6 +5863,7 @@ mod tests {
             Zbp5ClusterBlocks {
                 cluster_idx: 12,
                 row_count: ids_b.len(),
+                dim,
                 coarse: b"sq8-codes-b-longer",
                 ids: &id_block_b,
                 vectors: &f32_block_b,
@@ -5875,6 +5953,7 @@ mod tests {
         let entries = [Zbp5ClusterBlocks {
             cluster_idx: 3,
             row_count: ids.len(),
+            dim,
             coarse: b"coarse",
             ids: &id_block,
             vectors: &f32_block,
@@ -5913,5 +5992,33 @@ mod tests {
         // Truncate the object: exact-end validation rejects it.
         let truncated = &object.bytes[..object.bytes.len() - 1];
         assert!(parse_cluster_data_object_v5(truncated).is_err());
+
+        // The object stores no dimension, so a reader recovers it by dividing
+        // the vector block by the row count. The serializer refuses to write
+        // anything that would make that division wrong: a row count the ID
+        // block disagrees with, or a vector block off the fixed stride.
+        assert!(serialize_cluster_data_object_v5(&[Zbp5ClusterBlocks {
+            cluster_idx: 3,
+            row_count: ids.len() + 1,
+            dim,
+            coarse: b"coarse",
+            ids: &id_block,
+            vectors: &f32_block,
+        }])
+        .is_err());
+        assert!(serialize_cluster_data_object_v5(&[Zbp5ClusterBlocks {
+            cluster_idx: 3,
+            row_count: ids.len(),
+            dim: dim + 1,
+            coarse: b"coarse",
+            ids: &id_block,
+            vectors: &f32_block,
+        }])
+        .is_err());
+
+        // A v5 object has no coarse/full section directory. Asking for one is
+        // an error, never `Ok(None)` — that value means "legacy standalone
+        // cluster bytes" and would silently mis-type the object.
+        assert!(cluster_object_layout(&object.bytes).is_err());
     }
 }
