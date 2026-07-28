@@ -2277,8 +2277,9 @@ impl Manifest {
     }
 
     /// Return the canonical query-routing state digest carried by this generation.
+    #[cfg(test)]
     #[must_use]
-    pub const fn execution_state_digest(&self) -> Option<[u8; 32]> {
+    const fn execution_state_digest(&self) -> Option<[u8; 32]> {
         self.execution_state_digest
     }
 
@@ -2289,14 +2290,15 @@ impl Manifest {
     }
 
     /// Return the versioned retention/lineage control digest, when published.
+    #[cfg(test)]
     #[must_use]
-    pub const fn control_state_digest(&self) -> Option<[u8; 32]> {
+    const fn control_state_digest(&self) -> Option<[u8; 32]> {
         self.control_state_digest
     }
 
     /// Recompute the domain-separated query-routing projection digest.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn recompute_execution_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
+    #[cfg(test)]
+    fn recompute_execution_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
         let binding_version = self.manifest_binding_version.ok_or_else(|| {
             ZeppelinError::Serialization("manifest binding version is unavailable".to_string())
         })?;
@@ -2304,8 +2306,8 @@ impl Manifest {
     }
 
     /// Recompute the exact V3 roots/fence control digest.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn recompute_control_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
+    #[cfg(test)]
+    fn recompute_control_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
         match self.manifest_binding_version {
             Some(ManifestBindingVersion::V3Roots) => self.compute_control_roots_digest(namespace),
             Some(ManifestBindingVersion::V4Lineage) => {
