@@ -60,9 +60,9 @@ const CORPUS_LOGICAL_ROWS: usize = 1_000_000;
 const MAX_FORK_CONTROL_GETS: u64 = 35;
 const MAX_FORK_CONTROL_PUTS: u64 = 32;
 // Fork CAS-PUT budget, justified by the per-key census taken after the GET
-// census landed (22 PutUpdate spans, tiny fixture; this assertion was latent
-// because the GET assertion panicked first). Every CAS succeeded on the
-// first attempt — no retry spinning — and each backs a distinct state
+// census landed (22-23 PutUpdate spans, tiny fixture; this assertion was
+// latent because the GET assertion panicked first). Every CAS succeeded on
+// the first attempt — no retry spinning — and each backs a distinct state
 // transition or the fencing layer of a fenced write:
 //
 //   <dst>/meta.json                          4  Rooted, ManifestPublished,
@@ -72,15 +72,21 @@ const MAX_FORK_CONTROL_PUTS: u64 = 32;
 //     CAS or the visibility CAS (fencing + CAS: both layers required)
 //   _security/heads/policy.json              4  claim (retain session),
 //     claim (begin session), guard install, guard removal
-//   <src>/lease.json                         3  ownership renew immediately
-//     before each fenced source write
+//   <src>/lease.json                      3-4  ownership renew immediately
+//     before each fenced source write; the first fork of a source creates
+//     the lease (PutOverwrite, not counted), while every later fork takes
+//     over the expired record its predecessor's release deliberately
+//     preserved, one takeover CAS that keeps the namespace fencing token
+//     monotonic across sequential writers
 //   <src>/manifest.json                      1  branch-root insertion, the
 //     fork's single data-plane mutation
 //
-// Lowering this means changing the fencing/activation protocol (fewer
-// guard revalidations, combined head CASes), a security-posture decision,
-// not redundancy removal.
-const MAX_FORK_CAS_PUTS: u64 = 22;
+// The contract forks one source 8 times, so the 23 takeover shape is the
+// steady state for 7 of 8 samples and the budget prices it. Lowering this
+// means changing the fencing/activation protocol (fewer guard
+// revalidations, combined head CASes, delete-on-release), a
+// security-posture decision, not redundancy removal.
+const MAX_FORK_CAS_PUTS: u64 = 23;
 
 /// Frozen scenario inventory. Adding or removing an entry is a contract change.
 pub const BRANCHING_SCENARIOS: [&str; 7] = [
