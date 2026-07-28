@@ -117,6 +117,7 @@ async fn test_stress_large_uncompacted_wal_backlog_exact_topk() {
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 1,
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
+        resident_row_bypass: false,
         cache: None,
         manifest_cache: None,
         include_attributes: false,

@@ -297,6 +297,7 @@ async fn run_query_snapshots(
             distance_metric: DistanceMetric::Euclidean,
             oversample_factor: server.oversample_factor,
             rerank_coalesce_gap_bytes: DEFAULT_RERANK_COALESCE_GAP_BYTES,
+            resident_row_bypass: false,
             cache,
             manifest_cache,
             include_attributes: false,

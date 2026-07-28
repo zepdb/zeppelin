@@ -2522,6 +2522,7 @@ async fn evaluate_modes(
                 distance_metric: context.dataset.distance_metric,
                 oversample_factor: context.oversample_factor,
                 rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
+                resident_row_bypass: false,
                 cache: None,
                 manifest_cache: None,
                 include_attributes: true,

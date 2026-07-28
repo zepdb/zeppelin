@@ -300,6 +300,7 @@ async fn measure_gap_curve() -> (String, Vec<Measurement>) {
             distance_metric: DistanceMetric::Euclidean,
             oversample_factor,
             rerank_coalesce_gap_bytes: gap_bytes,
+            resident_row_bypass: false,
             cache: None,
             manifest_cache: None,
             include_attributes: false,
