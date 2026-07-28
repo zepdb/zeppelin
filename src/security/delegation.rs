@@ -5,17 +5,16 @@
 //! verifying one on the request path. Second, node signing identity: reading the
 //! node's Ed25519 private key from disk, publishing only its public half to
 //! object storage, and resolving any published signer's key so other modules can
-//! check signatures. Every signature Zeppelin produces — delegated tokens,
-//! manifest root envelopes, retrieval receipts, audit day anchors — is made and
-//! checked through the primitives here.
+//! check signatures. Delegated tokens, manifest root envelopes, and audit day
+//! anchors are made and checked through the primitives here.
 //!
 //! It deliberately does **not** own policy or authorization. A token never
 //! carries grants of its own; it carries a ceiling that is intersected with the
 //! parent principal's *current* policy authority at every use. Policy documents
 //! live in `policy.rs`/`policy_store.rs`, the decision itself lives in
-//! `kernel.rs`, and what gets signed lives in `receipt.rs`, `audit_chain.rs`,
-//! and `wal/manifest.rs`. This module signs bytes and answers "did this
-//! published signer sign these bytes?"
+//! `kernel.rs`, and what gets signed lives in `audit_chain.rs` and
+//! `wal/manifest.rs`. This module signs bytes and answers "did this published
+//! signer sign these bytes?"
 //!
 //! ## Where this sits
 //!
@@ -27,8 +26,9 @@
 //!   not licensed) at boot, installs it into [`ZeppelinStore`]
 //!   as a `dyn ObjectSigner`, and calls `mint` only after it has confirmed the
 //!   parent's current grants cover every action/namespace pair in the request.
-//! - `receipt.rs` and `audit_chain.rs` call `verify_published_signature` to
-//!   check receipt, manifest-root, and audit-anchor signatures.
+//! - `wal/manifest.rs` and `audit_chain.rs` call
+//!   `verify_published_signature` to check manifest-root and audit-anchor
+//!   signatures.
 //!
 //! ## Narrowing: a token can only ever subtract
 //!
@@ -94,7 +94,7 @@
 //! 5. `read_signing_key`, `publish_signer`, and `claim_signer_slot` — boot-time
 //!    key hygiene and signer publication.
 //! 6. `verify_published_signature` and `load_signers_allow_empty` — the seam the
-//!    receipt and audit-chain verifiers depend on.
+//!    manifest-root and audit-chain verifiers depend on.
 //!
 //! ## Invariants
 //!

@@ -514,7 +514,7 @@ async fn build_app_with_entitlement_resolver(
         Arc::clone(&entitlements),
     )
     .await?;
-    if durable_audit_enabled || (config.receipts.enabled && entitlements.has(Feature::Receipts)) {
+    if durable_audit_enabled || config.receipts.enabled {
         security.install_object_signer(&store)?;
     }
     let audit_now = clock.now();

@@ -230,14 +230,15 @@ use crate::namespace::manager::{
     NamespaceMetadata, NamespaceState, NAMESPACE_INCARNATION_METADATA_KEY,
 };
 use crate::namespace::NamespaceIncarnationId;
-use crate::security::{AuthenticatedManifestArtifactInventory, NamespaceId, PreservationService};
+use crate::security::{NamespaceId, PreservationService};
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{
-    BootstrapRef, ClusterDataObjectRef, CoarsePayloadEncoding, LocatedFragmentIdentity,
-    LocatedFragmentRef, LocatedSegmentRef, Manifest, MembershipRef, SegmentRef,
+    AuthenticatedManifestArtifactInventory, BootstrapRef, ClusterDataObjectRef,
+    CoarsePayloadEncoding, LocatedFragmentIdentity, LocatedFragmentRef, LocatedSegmentRef,
+    Manifest, MembershipRef, SegmentRef,
 };
 use crate::wal::{FragmentCachePolicy, WalReader};
 

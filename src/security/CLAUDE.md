@@ -14,12 +14,12 @@ typed error; do not add a permissive default.
   ETag CAS). Added by the branching activation work.
 - `entitlements.rs` / `license.rs` — Ed25519-signed licensed features.
 - `preservation.rs` — legal-hold / destruction guards.
-- `audit.rs`, `audit_sink.rs`, `audit_chain.rs`, `merkle.rs` — durable audit.
-- `delegation.rs`, `receipt.rs` — delegated credentials, signed receipts.
+- `audit.rs`, `audit_sink.rs`, `audit_chain.rs` — durable audit.
+- `delegation.rs` — delegated credentials and object signing.
 
 ## Entitlements
 
-`Feature` has 9 variants in a **stable bit-assignment order** (`Feature::ALL`).
+`Feature` has 8 variants in a **stable bit-assignment order** (`Feature::ALL`).
 Append new variants at the end.
 
 Be precise about what breaks what. A signed license carries feature *names*

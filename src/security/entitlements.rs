@@ -62,7 +62,7 @@
 //!   to object storage; it is recomputed from names on every boot. So a
 //!   reorder does not break *signature verification* — it breaks meaning, which
 //!   is worse, because the failure is silent.
-//! - **`Feature::ALL` is the declared order.** Its `[Self; 9]` type forces the
+//! - **`Feature::ALL` is the declared order.** Its `[Self; 8]` type forces the
 //!   literal to be updated when the count changes, but the compiler cannot
 //!   check that every variant is present. Add to both places in one edit.
 //! - **The `u16` mask caps the inventory at 16 features.** A 17th variant would
@@ -133,8 +133,6 @@ pub enum Feature {
     Delegation,
     /// Preservation and governance controls introduced in Phase 8.
     Preservation,
-    /// Signed retrieval receipts introduced in Phase 10.
-    Receipts,
     /// External audit-stream delivery reserved for a later phase.
     AuditStreaming,
     /// Customer-managed encryption keys reserved for a later phase.
@@ -145,13 +143,12 @@ pub enum Feature {
 
 impl Feature {
     /// Every licensable feature in stable bit-assignment order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 8] = [
         Self::Rbac,
         Self::Constraints,
         Self::AuditS3,
         Self::Delegation,
         Self::Preservation,
-        Self::Receipts,
         Self::AuditStreaming,
         Self::Cmek,
         Self::Branching,
@@ -166,7 +163,6 @@ impl Feature {
             Self::AuditS3 => "audit_s3",
             Self::Delegation => "delegation",
             Self::Preservation => "preservation",
-            Self::Receipts => "receipts",
             Self::Branching => "branching",
             Self::AuditStreaming => "audit_streaming",
             Self::Cmek => "cmek",

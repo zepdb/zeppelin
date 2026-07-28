@@ -1349,6 +1349,158 @@ pub(crate) fn manifest_root_signing_bytes(
     }
 }
 
+fn artifact_inventory_root(artifacts: &BTreeMap<String, [u8; 32]>) -> Result<[u8; 32]> {
+    if artifacts.keys().any(|key| key.is_empty()) {
+        return Err(ZeppelinError::Validation(
+            "merkle artifact keys must not be empty".to_string(),
+        ));
+    }
+    let mut level = artifacts
+        .iter()
+        .map(|(key, content_hash)| {
+            let mut hasher = Sha256::new();
+            hasher.update([0_u8]);
+            hasher.update((key.len() as u64).to_be_bytes());
+            hasher.update(key.as_bytes());
+            hasher.update(content_hash);
+            <[u8; 32]>::from(hasher.finalize())
+        })
+        .collect::<Vec<_>>();
+    if level.is_empty() {
+        level.push(Sha256::digest(b"zeppelin-empty-merkle-v1").into());
+    }
+    while level.len() > 1 {
+        level = level
+            .chunks(2)
+            .map(|pair| {
+                let left = pair[0];
+                let right = pair.get(1).copied().unwrap_or(left);
+                let mut hasher = Sha256::new();
+                hasher.update([1_u8]);
+                hasher.update(left);
+                hasher.update(right);
+                <[u8; 32]>::from(hasher.finalize())
+            })
+            .collect();
+    }
+    Ok(level[0])
+}
+
+/// Authenticated immutable-object inventory carried by one exact manifest.
+#[derive(Debug, Clone)]
+pub(crate) struct AuthenticatedManifestArtifactInventory {
+    artifacts: BTreeMap<String, [u8; 32]>,
+}
+
+impl AuthenticatedManifestArtifactInventory {
+    pub(crate) async fn authenticate(
+        store: &ZeppelinStore,
+        namespace: &str,
+        manifest: &Manifest,
+    ) -> Result<Self> {
+        if !store.receipts_enabled() {
+            return Err(ZeppelinError::Config(
+                "retrieval receipts are disabled".to_string(),
+            ));
+        }
+        let artifacts = manifest.receipt_artifacts(namespace)?;
+        let rebuilt_root = artifact_inventory_root(artifacts)?;
+        let manifest_root = manifest.merkle_root().ok_or_else(|| {
+            authenticated_manifest_error("manifest omitted its authenticated artifact root")
+        })?;
+        if manifest_root != rebuilt_root {
+            return Err(authenticated_manifest_error(
+                "manifest artifact inventory did not rebuild its authenticated root",
+            ));
+        }
+
+        let binding_version = manifest.receipt_binding_version().ok_or_else(|| {
+            authenticated_manifest_error("manifest omitted its receipt binding version")
+        })?;
+        let manifest_state_digest = manifest.receipt_state_digest().ok_or_else(|| {
+            authenticated_manifest_error("manifest omitted its execution-state digest")
+        })?;
+        if manifest.recompute_receipt_state_digest(namespace)? != manifest_state_digest {
+            return Err(authenticated_manifest_error(
+                "manifest execution state diverged from its authenticated digest",
+            ));
+        }
+
+        let control_state_digest = manifest.control_state_digest();
+        match binding_version {
+            ReceiptBindingVersion::V1 | ReceiptBindingVersion::V2Origins => {
+                if control_state_digest.is_some() {
+                    return Err(authenticated_manifest_error(
+                        "manifest binding version forbids a control-state digest",
+                    ));
+                }
+            }
+            ReceiptBindingVersion::V3Roots | ReceiptBindingVersion::V4Lineage => {
+                let expected = control_state_digest.ok_or_else(|| {
+                    authenticated_manifest_error(
+                        "manifest binding version omitted its control-state digest",
+                    )
+                })?;
+                if manifest.recompute_control_state_digest(namespace)? != expected {
+                    return Err(authenticated_manifest_error(
+                        "manifest control state diverged from its authenticated digest",
+                    ));
+                }
+            }
+        }
+
+        let signer_node = manifest.root_signer_node().ok_or_else(|| {
+            authenticated_manifest_error("manifest omitted its root signer identity")
+        })?;
+        let signature = manifest
+            .root_signature()
+            .ok_or_else(|| authenticated_manifest_error("manifest omitted its root signature"))?;
+        let signing_bytes = manifest_root_signing_bytes(
+            manifest_root,
+            manifest.version(),
+            manifest.fencing_token(),
+            binding_version,
+            manifest_state_digest,
+            control_state_digest,
+        )?;
+        if !crate::security::verify_published_signature(
+            store,
+            signer_node,
+            &signing_bytes,
+            signature,
+        )
+        .await?
+        {
+            return Err(authenticated_manifest_error(
+                "manifest root signature did not verify",
+            ));
+        }
+
+        Ok(Self {
+            artifacts: artifacts.clone(),
+        })
+    }
+
+    pub(crate) fn verify_body(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let expected = self.artifacts.get(key).ok_or_else(|| {
+            authenticated_manifest_error(
+                "consumed artifact is outside the authenticated manifest inventory",
+            )
+        })?;
+        let observed = <[u8; 32]>::from(Sha256::digest(bytes));
+        if &observed != expected {
+            return Err(authenticated_manifest_error(
+                "consumed artifact body diverged from its authenticated hash",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn authenticated_manifest_error(reason: &'static str) -> ZeppelinError {
+    ZeppelinError::Validation(reason.to_string())
+}
+
 impl Manifest {
     /// Creates an unpublished, empty namespace manifest at generation zero.
     ///
@@ -2394,24 +2546,23 @@ impl Manifest {
     }
 
     /// Return the fully hashed immutable inventory used for receipt proofs.
-    pub fn receipt_artifacts(
-        &self,
-        namespace: &str,
-    ) -> std::result::Result<&BTreeMap<String, [u8; 32]>, crate::security::SecurityError> {
+    pub fn receipt_artifacts(&self, namespace: &str) -> Result<&BTreeMap<String, [u8; 32]>> {
         if self.segments.iter().any(|segment| {
             segment.hierarchical && self.hierarchical_routing_nodes(&segment.id).is_empty()
         }) {
-            return Err(crate::security::SecurityError::ReceiptsUnavailableUnhashed);
+            return Err(ZeppelinError::Validation(
+                "retrieval receipts require a fully hashed namespace".to_string(),
+            ));
         }
-        let reachable = self
-            .receipt_reachable_keys(namespace)
-            .map_err(|error| crate::security::SecurityError::InvalidReceipt(error.to_string()))?;
+        let reachable = self.receipt_reachable_keys(namespace)?;
         if reachable.len() != self.artifact_hashes.len()
             || reachable
                 .iter()
                 .any(|key| !self.artifact_hashes.contains_key(key))
         {
-            return Err(crate::security::SecurityError::ReceiptsUnavailableUnhashed);
+            return Err(ZeppelinError::Validation(
+                "retrieval receipts require a fully hashed namespace".to_string(),
+            ));
         }
         Ok(&self.artifact_hashes)
     }
@@ -2444,7 +2595,9 @@ impl Manifest {
         namespace: &str,
     ) -> Result<()> {
         if !store.receipts_enabled() {
-            return Err(crate::security::SecurityError::ReceiptsDisabled.into());
+            return Err(ZeppelinError::Config(
+                "retrieval receipts are disabled".to_string(),
+            ));
         }
         let incarnation = self.namespace_incarnation().ok_or_else(|| {
             ZeppelinError::Serialization(format!(
@@ -3052,7 +3205,7 @@ impl Manifest {
             return Ok(());
         }
 
-        let root = crate::security::MerkleTree::build(&self.artifact_hashes)?.root();
+        let root = artifact_inventory_root(&self.artifact_hashes)?;
         self.merkle_root = Some(root);
         let payload = manifest_root_signing_bytes(
             root,
@@ -6375,7 +6528,7 @@ mod tests {
         assert!(off.root_signer_node().is_none());
         assert!(matches!(
             off.receipt_artifacts("receipt-size"),
-            Err(crate::security::SecurityError::ReceiptsUnavailableUnhashed)
+            Err(ZeppelinError::Validation(_))
         ));
         assert_eq!(decoded.artifact_hashes, off.artifact_hashes);
         assert_eq!(decoded.receipt_state_digest(), off.receipt_state_digest());

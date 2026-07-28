@@ -156,9 +156,7 @@
 //! Nothing here is on the query path. A head load is two sequential GETs (head,
 //! then the snapshot it names). [`PolicyStore::refresh`] is one conditional GET
 //! when nothing changed. A publication is a bounded sequence of lease, GET, and
-//! conditional PUT roundtrips. [`PolicyStore::load_version`] is the expensive
-//! outlier: it LISTs `_security/policies/` and GETs every object, so it belongs
-//! only on privileged receipt-verification paths.
+//! conditional PUT roundtrips.
 //!
 //! ## Rust concepts used here
 //!
@@ -390,37 +388,6 @@ impl PolicyStore {
     pub async fn load_current(&self, now: DateTime<Utc>) -> Result<LoadedPolicy> {
         let loaded = self.load_current_unmigrated().await?;
         self.ensure_phase_seven_migrated(loaded, now).await
-    }
-
-    /// Resolve one immutable historical snapshot by its monotonic version.
-    ///
-    /// The policy head only names the current snapshot, so privileged receipt
-    /// verification enumerates the immutable policy inventory and validates
-    /// every candidate it inspects. Missing or duplicate versions never fall
-    /// back to the current policy.
-    #[allow(dead_code)]
-    pub(crate) async fn load_version(
-        &self,
-        version: super::PolicyVersion,
-        checksum: &str,
-    ) -> Result<Option<PolicySnapshot>> {
-        if version == super::PolicyVersion::BOOT {
-            return Ok(None);
-        }
-        let mut matched = None;
-        for key in self.store.list_prefix("_security/policies/").await? {
-            let bytes = self.store.get(&key).await?;
-            let snapshot: PolicySnapshot = serde_json::from_slice(&bytes).map_err(|error| {
-                SecurityError::InvalidPolicy(format!(
-                    "historical policy snapshot JSON is invalid: {error}"
-                ))
-            })?;
-            snapshot.validate_for_use()?;
-            if snapshot.version() == version && snapshot.checksum() == checksum {
-                matched = Some(snapshot);
-            }
-        }
-        Ok(matched)
     }
 
     pub(crate) async fn refresh(

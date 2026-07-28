@@ -480,30 +480,6 @@ impl PolicyCache {
         ))
     }
 
-    /// Resolve the policy-owned query filter from one immutable generation.
-    #[allow(dead_code)]
-    pub(crate) async fn historical_query_filter(
-        &self,
-        version: PolicyVersion,
-        checksum: &str,
-        principal_id: &PrincipalId,
-        namespace: &super::NamespaceId,
-    ) -> Result<Option<Option<crate::types::Filter>>> {
-        let Some(snapshot) = self.store.load_version(version, checksum).await? else {
-            return Ok(None);
-        };
-        let compiled = snapshot.compile()?;
-        let authorization = compiled.authorize_delegated_parent(
-            principal_id,
-            Action::Query,
-            &Resource::Namespace(namespace.clone()),
-        );
-        Ok(match authorization {
-            Ok(constraints) => Some(constraints.mandatory_filter),
-            Err(_) => None,
-        })
-    }
-
     /// Acquire and claim the global publication lease, run fresh caller
     /// validation against that exact authoritative head/snapshot, then install
     /// a pending activation guard while retaining the same lease claim.

@@ -148,8 +148,8 @@
 //!   authority by skipping the handler's config flag. Preservation and delegation
 //!   APIs return `FeatureNotLicensed` when their feature is absent.
 //! - **Licensed features have ordering dependencies.** Composition rejects
-//!   delegation or preservation without RBAC, receipts without delegation, and
-//!   delegation or preservation in `OpenUnsafe` mode.
+//!   delegation or preservation without RBAC and delegation or preservation in
+//!   `OpenUnsafe` mode.
 //! - **Delegation cannot widen.** A delegated token may not be re-delegated, may
 //!   only descend from a human or service principal, and is authorized by
 //!   re-checking *both* the narrowing and the live parent grants for every
@@ -172,7 +172,7 @@
 //!   freshly loaded policy head, and `revalidate` refuses to proceed until the
 //!   activation audit record has settled ([`SecurityError::AuditUnavailable`]).
 //! - **Signing capability is fail-closed.** `install_object_signer` errors when
-//!   receipts or S3 audit are licensed but no signer was composed.
+//!   S3 audit is licensed but no signer was composed.
 //!
 //! ## Concurrency
 //!
@@ -291,17 +291,6 @@ pub struct SecurityKernel {
     preservation: Option<Arc<PreservationService>>,
 }
 
-#[allow(dead_code)]
-pub(crate) struct ReceiptPolicyLookup<'a> {
-    pub verifier: &'a Principal,
-    pub context: &'a RequestContext,
-    pub receipt_principal: &'a super::PrincipalId,
-    pub delegation_parent: Option<&'a super::PrincipalId>,
-    pub namespace: &'a super::NamespaceId,
-    pub version: super::PolicyVersion,
-    pub checksum: Option<&'a str>,
-}
-
 /// Request-owned facts consumed when minting graph deletion authority.
 pub(crate) struct NamespaceDeleteAdmission {
     pub namespace: NamespaceId,
@@ -369,20 +358,6 @@ struct PolicyRetainedBranchActivationGuard {
 
 struct NamespaceBranchActivationRecovery {
     kernel: Arc<SecurityKernel>,
-}
-
-/// Outcome of the privileged historical-policy lookup used by receipt verification.
-#[allow(dead_code)]
-pub(crate) enum ReceiptPolicyResolution {
-    /// The verifier lacks `SecurityAdminRead`, so predicate consistency is intentionally skipped.
-    Unchecked,
-    /// The exact immutable policy generation authorized the receipt principal.
-    Resolved {
-        filter: Option<crate::types::Filter>,
-        delegated: bool,
-    },
-    /// A privileged verifier could not resolve or authorize the receipt's claimed policy state.
-    Diverged { delegated: bool },
 }
 
 impl SecurityKernel {
@@ -474,13 +449,6 @@ impl SecurityKernel {
         {
             return Err(crate::error::ZeppelinError::Config(
                 "preservation entitlement requires the rbac entitlement".to_string(),
-            ));
-        }
-        if entitlements.has(super::Feature::Receipts)
-            && !entitlements.has(super::Feature::Delegation)
-        {
-            return Err(crate::error::ZeppelinError::Config(
-                "receipts entitlement requires the delegation signer entitlement".to_string(),
             ));
         }
         if config.mode == SecurityMode::OpenUnsafe && entitlements.has(super::Feature::Delegation) {
@@ -654,9 +622,7 @@ impl SecurityKernel {
             let signer: Arc<dyn ObjectSigner> = audit_signer.clone();
             return store.install_object_signer(signer);
         }
-        if self.entitlements.has(super::Feature::Receipts)
-            || self.entitlements.has(super::Feature::AuditS3)
-        {
+        if self.entitlements.has(super::Feature::AuditS3) {
             return Err(super::SecurityError::FeatureRequired(super::Feature::Delegation).into());
         }
         Ok(())
@@ -1479,52 +1445,6 @@ impl SecurityKernel {
             )
             .into()),
         }
-    }
-
-    /// Resolve the historical policy-filter component for a receipt verifier.
-    ///
-    /// Only a caller lacking `SecurityAdminRead` receives `Unchecked`. Once a
-    /// caller is privileged, missing or inconsistent historical evidence is a
-    /// divergence rather than a silent downgrade. The route never reveals the
-    /// predicate itself.
-    #[allow(dead_code)]
-    pub(crate) async fn receipt_policy_filter(
-        &self,
-        lookup: ReceiptPolicyLookup<'_>,
-    ) -> ZeppelinResult<ReceiptPolicyResolution> {
-        if !matches!(
-            self.authorize(
-                lookup.verifier,
-                Action::SecurityAdminRead,
-                &Resource::SecurityPolicy,
-                lookup.context,
-            ),
-            Decision::Allow(_)
-        ) {
-            return Ok(ReceiptPolicyResolution::Unchecked);
-        }
-        let delegated = lookup.delegation_parent.is_some();
-        let SecurityAuthority::Policy(cache) = &self.authority else {
-            return Ok(ReceiptPolicyResolution::Diverged { delegated });
-        };
-        let Some(checksum) = lookup.checksum else {
-            return Ok(ReceiptPolicyResolution::Diverged { delegated });
-        };
-        let policy_principal = lookup.delegation_parent.unwrap_or(lookup.receipt_principal);
-        Ok(
-            match cache
-                .historical_query_filter(
-                    lookup.version,
-                    checksum,
-                    policy_principal,
-                    lookup.namespace,
-                )
-                .await?
-            {
-                Some(filter) => ReceiptPolicyResolution::Resolved { filter, delegated },
-                None => ReceiptPolicyResolution::Diverged { delegated },
-            },
-        )
     }
 
     /// Force one authoritative policy-head refresh for integration harnesses.

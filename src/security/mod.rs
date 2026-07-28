@@ -23,7 +23,7 @@
 //! - the authoritative policy document in the reserved `_security/` keyspace,
 //!   and its cache;
 //! - licensed feature authority ([`Entitlements`](crate::security::Entitlements), [`Feature`](crate::security::Feature));
-//! - durable, hash-chained audit evidence and signed retrieval receipts;
+//! - durable, hash-chained audit evidence;
 //! - preservation locks that veto destruction.
 //!
 //! It does **not** own HTTP plumbing (that is `src/server/`), domain work such
@@ -102,15 +102,14 @@
 //!    [`FileLicenseResolver`](crate::security::FileLicenseResolver)): offline Ed25519 verification of which surfaces
 //!    exist at all.
 //! 7. **Audit** — `audit.rs` ([`AuditRecord`](crate::security::AuditRecord), [`AuditParams`](crate::security::AuditParams)),
-//!    `audit_sink.rs` ([`AuditClient`](crate::security::AuditClient), [`AuditRuntime`](crate::security::AuditRuntime)), `audit_chain.rs`
-//!    ([`verify_audit_day`](crate::security::verify_audit_day)), `merkle.rs` ([`MerkleTree`](crate::security::MerkleTree)).
+//!    `audit_sink.rs` ([`AuditClient`](crate::security::AuditClient), [`AuditRuntime`](crate::security::AuditRuntime)), and
+//!    `audit_chain.rs` ([`verify_audit_day`](crate::security::verify_audit_day)).
 //! 8. **Constraint enforcement** — `constraints.rs` ([`apply_field_mask`](crate::security::apply_field_mask),
 //!    [`filter_references_denied_field`](crate::security::filter_references_denied_field)): the server-owned obligations an
 //!    allow decision carries into the query and write paths.
 //! 9. **Licensed surfaces** — `delegation.rs` ([`DelegationContext`](crate::security::DelegationContext),
 //!    [`IssuedDelegatedToken`](crate::security::IssuedDelegatedToken)) for short-lived credentials that can only
-//!    narrow parent authority; `receipt.rs` ([`RetrievalReceipt`](crate::security::RetrievalReceipt)) for signed
-//!    structural proof of what a query touched; `preservation.rs`
+//!    narrow parent authority; `preservation.rs`
 //!    ([`PreservationService`](crate::security::PreservationService), [`PreservationGuard`](crate::security::PreservationGuard)) for legal-hold vetoes
 //!    over destruction.
 //!
@@ -154,9 +153,9 @@
 //! with `pub use`. That is deliberate: callers depend on
 //! `crate::security::Action`, not on a file layout, so internals can move
 //! without breaking anything outside. A handful of items are exported
-//! `pub(crate)` instead — the cursor binding key, delegated-fork admission
-//! types, receipt issuance — because they are seams between Zeppelin's own
-//! modules rather than API for external users. Java's package-private is the
+//! `pub(crate)` instead — the cursor binding key and delegated-fork admission
+//! types — because they are seams between Zeppelin's own modules rather than
+//! API for external users. Java's package-private is the
 //! closest analogy, but `pub(crate)` is enforced across the whole crate rather
 //! than one namespace.
 //!
@@ -185,15 +184,12 @@ mod delegation;
 mod entitlements;
 mod kernel;
 mod license;
-mod merkle;
 mod policy;
 mod policy_cache;
 mod policy_publication;
 mod policy_store;
 mod preservation;
 mod principal;
-#[allow(dead_code)]
-mod receipt;
 mod resource;
 mod route_map;
 
@@ -217,6 +213,7 @@ pub use decision::{
     AllowDecision, Decision, DecisionId, DenyDecision, DenyReason, FieldMask, Obligation,
     PolicyVersion, WriteConstraints,
 };
+pub(crate) use delegation::verify_published_signature;
 pub use delegation::{DelegationContext, DelegationNarrowing, IssuedDelegatedToken};
 pub use entitlements::{CustomerId, EntitlementLimits, EntitlementSource, Entitlements, Feature};
 pub use kernel::SecurityKernel;
@@ -228,7 +225,6 @@ pub use license::{
     EntitlementResolver, FileLicenseResolver, LicenseError, LicenseLimits, LicensePayload,
     SignedLicense, LICENSE_PUBKEY,
 };
-pub use merkle::{MerklePath, MerkleSide, MerkleStep, MerkleTree};
 pub use policy::{
     canonical_policy_checksum, ApiKeyId, GrantActions, GrantDefinition, GrantScope, IssuedApiKey,
     KeyState, PolicyGrant, PolicyHead, PolicyKey, PolicyPrincipal, PolicySnapshot,
@@ -246,12 +242,6 @@ pub use preservation::{
     PreservationState,
 };
 pub use principal::{AuthStrength, Principal, PrincipalId, PrincipalKind};
-pub(crate) use receipt::AuthenticatedManifestArtifactInventory;
-pub use receipt::{
-    PolicyFilterCheck, ReceiptDivergence, RetrievalReceipt, TouchedArtifact, TraversalMetric,
-    TraversalParams, TraversalSourceKind, TraversalSourceParams, VerificationMode,
-    VerifyReceiptRequest, VerifyReceiptResponse,
-};
 pub use resource::{Resource, SnapshotName};
 pub use route_map::{classify_route, RouteAction, RouteClass, ROUTE_ACTIONS};
 
@@ -377,15 +367,6 @@ pub enum SecurityError {
     /// Authoritative preservation state is stale or unavailable.
     #[error("authoritative preservation state is unavailable")]
     PreservationStateUnavailable,
-    /// A receipt or Merkle proof violates its canonical schema or invariants.
-    #[error("invalid retrieval receipt: {0}")]
-    InvalidReceipt(String),
-    /// The selected namespace still references artifacts written before hashes existed.
-    #[error("retrieval receipts are unavailable until every reachable artifact is hashed")]
-    ReceiptsUnavailableUnhashed,
-    /// Receipt publication and verification are disabled by process configuration.
-    #[error("retrieval receipts are disabled")]
-    ReceiptsDisabled,
     /// A preservation request violates the strict public schema or bounds.
     #[error("invalid preservation request: {0}")]
     InvalidPreservationRequest(String),
@@ -509,16 +490,13 @@ impl SecurityError {
             Self::ConstraintViolation => 403,
             Self::DelegationChainingForbidden | Self::DelegationPrincipalKindForbidden => 403,
             Self::ApprovalRequired => 403,
-            Self::ReceiptsDisabled => 403,
             Self::PreservationLocked => 409,
-            Self::ReceiptsUnavailableUnhashed => 409,
             Self::PreservationStateUnavailable => 503,
             Self::CursorPolicyStale => 400,
             Self::InvalidNamespaceId | Self::InvalidSnapshotName => 400,
             Self::InvalidPolicyRequest(_)
             | Self::DelegationScopeExceeded
-            | Self::InvalidPreservationRequest(_)
-            | Self::InvalidReceipt(_) => 400,
+            | Self::InvalidPreservationRequest(_) => 400,
             Self::PolicyConflict | Self::PolicyEntityAlreadyExists | Self::PreservationConflict => {
                 409
             }
@@ -567,11 +545,8 @@ impl SecurityError {
             Self::DelegationPrincipalKindForbidden => "delegation_parent_kind_forbidden",
             Self::ApprovalRequired => "approval_required",
             Self::PreservationLocked => "preservation_locked",
-            Self::ReceiptsDisabled => "receipts_disabled",
-            Self::ReceiptsUnavailableUnhashed => "receipts_unavailable_unhashed",
             Self::PreservationStateUnavailable => "preservation_state_unavailable",
             Self::InvalidPreservationRequest(_) => "invalid_preservation_request",
-            Self::InvalidReceipt(_) => "invalid_receipt",
             Self::PreservationLockNotFound => "preservation_lock_not_found",
             Self::PreservationConflict => "preservation_conflict",
             Self::PolicyConflict => "security_conflict",
@@ -638,15 +613,10 @@ impl SecurityError {
             Self::PreservationLocked => {
                 "operation is blocked by an active preservation lock".to_string()
             }
-            Self::ReceiptsDisabled => "retrieval receipts are disabled".to_string(),
-            Self::ReceiptsUnavailableUnhashed => {
-                "retrieval receipts require a fully hashed namespace; compact and retry".to_string()
-            }
             Self::PreservationStateUnavailable => {
                 "preservation state is unavailable; destructive operation denied".to_string()
             }
             Self::InvalidPreservationRequest(_) => "invalid preservation request".to_string(),
-            Self::InvalidReceipt(_) => "invalid retrieval receipt".to_string(),
             Self::PreservationLockNotFound => "active preservation lock not found".to_string(),
             Self::PreservationConflict => {
                 "preservation state changed concurrently; retry".to_string()

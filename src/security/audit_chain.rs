@@ -9,8 +9,7 @@
 //! It deliberately does **not** own audit itself. `audit.rs` owns the
 //! [`AuditRecord`] schema and its redaction rules; `audit_sink.rs` owns
 //! delivery, batching, the writer lease, and every object write; `delegation.rs`
-//! owns the signing keys and signature checking; `receipt.rs` owns the canonical
-//! JSON encoding that record hashing depends on. Nothing here writes an audit
+//! owns the signing keys and signature checking. Nothing here writes an audit
 //! object — it computes hashes and keys, and it checks.
 //!
 //! ## Where this sits
@@ -162,6 +161,31 @@ use super::AuditRecord;
 
 const TERMINAL_SEAL_FORMAT: &str = "zeppelin_audit_terminal_seal_v1";
 
+fn canonical_json_bytes<T: Serialize + ?Sized>(value: &T) -> ZeppelinResult<Vec<u8>> {
+    let value = serde_json::to_value(value).map_err(|error| {
+        ZeppelinError::Serialization(format!("receipt canonicalization failed: {error}"))
+    })?;
+    serde_json::to_vec(&canonicalize_value(value)).map_err(|error| {
+        ZeppelinError::Serialization(format!("receipt canonical encoding failed: {error}"))
+    })
+}
+
+fn canonicalize_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonicalize_value).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let ordered = values
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize_value(value)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            serde_json::Value::Object(ordered.into_iter().collect())
+        }
+        scalar => scalar,
+    }
+}
+
 /// Signed terminal commitment for one `(UTC day, node)` audit stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -184,7 +208,7 @@ impl AuditDayAnchor {
     pub(crate) fn unsigned_bytes(&self) -> ZeppelinResult<Vec<u8>> {
         let mut unsigned = self.clone();
         unsigned.signature.clear();
-        super::receipt::canonical_json_bytes(&unsigned)
+        canonical_json_bytes(&unsigned)
     }
 }
 
@@ -290,7 +314,7 @@ impl AuditTerminalSeal {
 }
 
 pub(crate) fn record_hash(record: &AuditRecord) -> ZeppelinResult<String> {
-    let bytes = super::receipt::canonical_json_bytes(record)?;
+    let bytes = canonical_json_bytes(record)?;
     Ok(hex_sha256(&bytes))
 }
 
@@ -644,9 +668,26 @@ fn hex_sha256(bytes: &[u8]) -> String {
 mod tests {
     use chrono::{TimeZone, Utc};
     use proptest::prelude::*;
+    use serde_json::json;
 
-    use super::{advance_chain, record_hash, AuditChainState};
+    use super::{advance_chain, canonical_json_bytes, record_hash, AuditChainState};
     use crate::security::{AuditChainPosition, AuditRecord};
+
+    #[test]
+    fn canonical_json_orders_object_keys() {
+        let Ok(bytes) = canonical_json_bytes(&json!({"z": 1, "a": 2})) else {
+            panic!("canonical JSON must encode");
+        };
+        assert_eq!(bytes, br#"{"a":2,"z":1}"#);
+    }
+
+    #[test]
+    fn canonical_json_orders_nested_objects_without_reordering_arrays() {
+        let Ok(bytes) = canonical_json_bytes(&json!([{"z": 1, "a": 2}, {"b": 3, "a": 4}])) else {
+            panic!("canonical JSON must encode");
+        };
+        assert_eq!(bytes, br#"[{"a":2,"z":1},{"a":4,"b":3}]"#);
+    }
 
     fn chained_records(request_ids: &[String]) -> (Vec<AuditRecord>, AuditChainState) {
         let Some(day) = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).single() else {

@@ -158,11 +158,10 @@
 //! - **The head proof is a re-serialization, not the observed bytes.**
 //!   [`PreservationService::guard_namespace_strong`] digests
 //!   `serde_json::to_vec` of the decoded head, alongside the ETag actually
-//!   observed. It does not use the receipt module's recursive key-sorting
-//!   canonicalizer; determinism comes from struct field declaration order plus
-//!   the head validation that forces `active_lock_ids` to be strictly
-//!   ascending. It matches the stored bytes because every writer in this file
-//!   produces them through the same `encode_json` seam.
+//!   observed. Determinism comes from struct field declaration order plus the
+//!   head validation that forces `active_lock_ids` to be strictly ascending. It
+//!   matches the stored bytes because every writer in this file produces them
+//!   through the same `encode_json` seam.
 //! - **Lock identifiers are audit evidence, never response bodies.** A guard
 //!   carries the matching ids so a deferral record can name them; handlers must
 //!   not echo them to callers.

@@ -158,15 +158,17 @@ use crate::namespace::manager::{
     COMPACTION_DEGRADED_FAILURE_THRESHOLD,
 };
 use crate::security::{
-    Action, AllowDecision, AuditParams, AuthenticatedManifestArtifactInventory, Feature,
-    IndexConfigValues, NamespaceDeleteAdmission, NamespaceForkAdmission, NamespaceId,
-    PreservationBlockedSurface, Principal, RequestContext, SecurityError,
+    Action, AllowDecision, AuditParams, Feature, IndexConfigValues, NamespaceDeleteAdmission,
+    NamespaceForkAdmission, NamespaceId, PreservationBlockedSurface, Principal, RequestContext,
+    SecurityError,
 };
 use crate::server::{
     authorize_namespace_action, namespace_graph, AppState, AuditRequest, RateLimitIdentity,
 };
 use crate::types::{DistanceMetric, IndexType};
-use crate::wal::manifest::{NamedSnapshot, NamedSnapshotRef, SegmentRef};
+use crate::wal::manifest::{
+    AuthenticatedManifestArtifactInventory, NamedSnapshot, NamedSnapshotRef, SegmentRef,
+};
 use crate::wal::{FragmentCachePolicy, Manifest};
 
 use super::{as_of, ApiError};

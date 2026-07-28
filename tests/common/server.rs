@@ -196,7 +196,7 @@ async fn start_test_audit_with_entitlements(
         None => format!("test-node-{}", uuid::Uuid::new_v4()),
     };
     let durable_audit_enabled = config.security.audit_s3 && entitlements.has(Feature::AuditS3);
-    if durable_audit_enabled || entitlements.has(Feature::Receipts) {
+    if durable_audit_enabled || config.receipts.enabled {
         security
             .install_object_signer(store)
             .expect("test signing capability must be shared with the application store");
@@ -681,7 +681,7 @@ async fn start_test_server_with_config_inner(
     .await;
     security
         .install_object_signer(&harness.store)
-        .expect("receipt signer must be shared with the application store");
+        .expect("object signer must be shared with the application store");
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -810,7 +810,7 @@ pub async fn start_test_server_on_store_with_readiness(
         test_security_runtime(&security_store, &mut config, &clock).await;
     security
         .install_object_signer(&store)
-        .expect("receipt signer must be shared with the application store");
+        .expect("object signer must be shared with the application store");
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -914,7 +914,7 @@ pub async fn start_test_server_with_compactor(
         test_security_runtime(&security_store, &mut config, &clock).await;
     security
         .install_object_signer(&harness.store)
-        .expect("receipt signer must be shared with the application store");
+        .expect("object signer must be shared with the application store");
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -1006,7 +1006,7 @@ pub async fn start_test_server_with_compaction(
         test_security_runtime(&security_store, &mut config, &clock).await;
     security
         .install_object_signer(&harness.store)
-        .expect("receipt signer must be shared with the application store");
+        .expect("object signer must be shared with the application store");
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -1627,7 +1627,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     .await;
     security
         .install_object_signer(&store)
-        .expect("receipt signer must be shared with the application store");
+        .expect("object signer must be shared with the application store");
     let credential_adapter: Arc<dyn CredentialAdapter> =
         credential_adapter_override.unwrap_or(credential_adapter);
 

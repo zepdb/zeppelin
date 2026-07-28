@@ -50,7 +50,7 @@
 //! expiry timestamps, the explicit feature list, and optional limits. Unknown
 //! fields are rejected. Feature names are the stable `snake_case` spellings
 //! (`rbac`, `constraints`, `audit_s3`, `delegation`, `preservation`,
-//! `receipts`, `audit_streaming`, `cmek`, `branching`).
+//! `audit_streaming`, `cmek`, `branching`).
 //!
 //! `ED25519_SEED` is a text file holding the 32-byte signing seed as either 64
 //! hex characters or unpadded base64url. Surrounding whitespace is trimmed.

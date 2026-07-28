@@ -73,8 +73,8 @@
 //! and the attribute-admin marker never leave the process. `mandatory_filter` is
 //! the *effective* predicate (policy filter combined with any delegated-token
 //! narrowing) and may be observed; `policy_filter` is the policy-owned component
-//! alone, kept private so a retrieval receipt can bind and later re-verify the
-//! historical predicate without disclosing it.
+//! alone and remains private so authorization internals do not disclose the
+//! predicate.
 //!
 //! Because those fields are skipped, a deserialized [`AllowDecision`] comes back
 //! with an all-zero cursor binding key, no policy checksum, no policy filter, and
@@ -579,8 +579,8 @@ pub struct AllowDecision {
     pub mandatory_filter: Option<Filter>,
     /// Policy-owned component before any delegated-token narrowing is applied.
     ///
-    /// This remains server-only so retrieval receipts can bind and later
-    /// verify the historical policy predicate without exposing it.
+    /// This remains server-only so authorization internals retain the original
+    /// policy component without exposing it.
     #[serde(skip, default)]
     pub(crate) policy_filter: Option<Filter>,
     /// Server-owned response projection restrictions.
