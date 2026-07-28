@@ -2754,7 +2754,8 @@ impl NamespaceManager {
                 "namespace {name} requires governed deletion"
             )));
         }
-        if let Some(manifest) = crate::wal::Manifest::read(&self.store, name).await? {
+        let manifest = crate::wal::Manifest::read(&self.store, name).await?;
+        if let Some(manifest) = &manifest {
             if !manifest.branch_roots().is_empty() {
                 return Err(BranchError::NamespaceHasLiveBranches {
                     namespace: name.to_string(),
@@ -2769,7 +2770,7 @@ impl NamespaceManager {
             "governed namespace deletion must enter NamespaceGraph"
         );
 
-        let meta = self.mark_deleting(name).await?;
+        let meta = self.mark_deleting(name, manifest.as_ref()).await?;
         self.registry.remove(name);
         self.remove_live_manifest(name).await?;
         info!(
@@ -3647,11 +3648,21 @@ impl NamespaceManager {
     ///
     /// Each retry reloads S3 and its ETag. The process registry is refreshed
     /// only with metadata read from or successfully written to S3.
-    async fn mark_deleting(&self, name: &str) -> Result<NamespaceMetadata> {
+    /// Marks metadata deleting under the single-writer contract.
+    ///
+    /// `manifest` is the live manifest the caller already read for its
+    /// live-branch guard; re-reading it inside the CAS loop would double the
+    /// manifest GETs without strengthening the guard, since neither read
+    /// linearizes against a concurrent fork anyway.
+    async fn mark_deleting(
+        &self,
+        name: &str,
+        manifest: Option<&crate::wal::Manifest>,
+    ) -> Result<NamespaceMetadata> {
         let key = NamespaceMetadata::s3_key(name);
         for _ in 0..8 {
             let (mut meta, etag) = self.read_metadata_versioned(name).await?;
-            if let Some(manifest) = crate::wal::Manifest::read(&self.store, name).await? {
+            if let Some(manifest) = manifest {
                 if !manifest.branch_roots().is_empty() {
                     return Err(BranchError::NamespaceHasLiveBranches {
                         namespace: name.to_string(),

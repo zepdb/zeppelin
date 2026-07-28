@@ -295,10 +295,10 @@ async fn execute_delete_publish(case: &IdealCase) -> IdealSample {
     assert_eq!(meta.state, NamespaceState::Deleting);
     await_tracker_idle(&world.tracker).await;
     let sample = world.sample(case);
-    // Two branch-root guard manifest reads (start_delete re-reads the live
-    // manifest before mark_deleting, which re-reads it again inside the CAS
-    // loop; 3999936 and d4c79cd) plus one metadata GET guard the tombstone.
-    assert_shape(&sample, 3, 1, 0, 1);
+    // One branch-root guard manifest read (start_delete reads the live manifest
+    // once and threads it into mark_deleting, which re-checks it without a
+    // second fetch) plus one metadata GET guard the tombstone.
+    assert_shape(&sample, 2, 1, 0, 1);
 
     assert!(Manifest::read(&world.harness.store, &namespace)
         .await
