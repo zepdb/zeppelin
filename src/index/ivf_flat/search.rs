@@ -109,7 +109,7 @@ use super::build::{
     deserialize_colocated_sq_cluster_from_object, deserialize_id_block, ClusterObjectLayout,
     ClusterObjectRange, Zbp5ClusterLayout,
 };
-use super::sketch::{AdaptiveClusterBudget, ClusterScore, ResidentRowScore};
+use super::sketch::{AdaptiveClusterBudget, ClusterScore};
 use super::IvfFlatIndex;
 
 use crate::index::bitmap::evaluate::{
@@ -193,28 +193,6 @@ fn candidate_distance_cmp(a: &Candidate, b: &Candidate) -> CmpOrdering {
 
 /// One quantized coarse candidate before exact full-vector reranking.
 type QuantizedCoarseCandidate = (String, f32, usize, usize);
-
-/// Exact-vector spans retained either densely by coarse decoding or sparsely by
-/// resident row coordinates.
-enum QuantizedVectorRanges {
-    /// Existing coarse paths know every row range in a decoded cluster.
-    Dense(Vec<Range<usize>>),
-    /// The resident bypass derives ranges only for its bounded frontier.
-    Sparse(HashMap<usize, Range<usize>>),
-}
-
-impl QuantizedVectorRanges {
-    /// Resolves one row without forcing a dense per-cluster allocation.
-    fn get(&self, row_idx: usize) -> Option<&Range<usize>> {
-        match self {
-            Self::Dense(ranges) => ranges.get(row_idx),
-            Self::Sparse(ranges) => ranges.get(&row_idx),
-        }
-    }
-}
-
-/// Logical cluster to exact-vector range lookup used by shared reranking.
-type VectorRangesByCluster = HashMap<usize, QuantizedVectorRanges>;
 
 /// Orders quantized coarse tuples by approximate distance and then identifier.
 ///
@@ -1068,49 +1046,6 @@ fn emit_scan_stats(effective_nprobe: usize, objects: usize, clusters: usize, gro
     }
 }
 
-/// Returns the structured reason the resident-row bypass cannot dispatch.
-fn resident_row_bypass_reason(
-    index: &IvfFlatIndex,
-    coarse_payload_encoding: CoarsePayloadEncoding,
-    filter: Option<&Filter>,
-    probe_clusters: &[usize],
-    row_frontier_top_k: usize,
-) -> Result<Option<&'static str>> {
-    if filter.is_some() {
-        return Ok(Some("filter_present"));
-    }
-    if row_frontier_top_k == 0 || probe_clusters.is_empty() {
-        return Ok(Some("sketch_unavailable"));
-    }
-    let scan_supports_bypass = matches!(
-        (index.quantization, coarse_payload_encoding),
-        (QuantizationType::Scalar, CoarsePayloadEncoding::Sq8)
-            | (
-                QuantizationType::Scalar | QuantizationType::TwoBit,
-                CoarsePayloadEncoding::TwoBit
-            )
-    );
-    if !scan_supports_bypass
-        || !index
-            .resident_sketch
-            .as_deref()
-            .is_some_and(super::sketch::ResidentSketch::supports_row_frontier)
-    {
-        return Ok(Some("sketch_unavailable"));
-    }
-
-    // Slice 9.2 writes homogeneous v5 objects. Checking the complete centroid
-    // probe set before sketch scoring is therefore equivalent to checking the
-    // eventual selected subset, and avoids a second sketch scan on fallback.
-    let objects = cluster_fetch_objects(index, probe_clusters)?;
-    if objects.iter().any(|object| {
-        object.row_layouts.is_empty() || object.row_layouts.len() != object.clusters.len()
-    }) {
-        return Ok(Some("layout_not_v5"));
-    }
-    Ok(None)
-}
-
 /// Searches one loaded immutable IVF-Flat segment and returns exact-distance winners.
 ///
 /// Centroids choose at most `nprobe` nearby logical clusters. An optional
@@ -1348,22 +1283,7 @@ async fn search_ivf_flat_with_trace_inner(
     let sq_byte_stats =
         SqSearchByteStats::new_if_enabled(matches!(index.quantization, QuantizationType::Scalar));
 
-    let row_frontier_top_k = fetch_k * 4;
-    let row_bypass_reason = resident_row_bypass_reason(
-        index,
-        coarse_payload_encoding,
-        filter,
-        &probe_clusters,
-        row_frontier_top_k,
-    )?;
-    if let Some(reason) = row_bypass_reason {
-        debug!(
-            reason,
-            segment_id = index.segment_id,
-            "resident row bypass precondition missed; using existing coarse path"
-        );
-    }
-    let scan_selection = select_scan_clusters_with_frontier(
+    let scan_clusters = select_scan_clusters(
         index,
         query,
         distance_metric,
@@ -1371,19 +1291,7 @@ async fn search_ivf_flat_with_trace_inner(
         &probe_clusters,
         effective_nprobe,
         fetch_k,
-        if row_bypass_reason.is_none() {
-            row_frontier_top_k
-        } else {
-            0
-        },
     )?;
-    let scan_clusters = scan_selection.clusters;
-    let row_frontier = scan_selection.row_frontier;
-    let row_frontier = if row_bypass_reason.is_none() && !row_frontier.is_empty() {
-        Some(row_frontier.as_slice())
-    } else {
-        None
-    };
 
     debug!(
         nprobe = effective_nprobe,
@@ -1416,7 +1324,6 @@ async fn search_ivf_flat_with_trace_inner(
                 filter,
                 filter_metadata_path,
                 fetch_k,
-                row_frontier,
                 store,
                 cache,
                 rerank_coalesce_gap_bytes,
@@ -1433,7 +1340,6 @@ async fn search_ivf_flat_with_trace_inner(
                     filter,
                     filter_metadata_path,
                     fetch_k,
-                    row_frontier,
                     store,
                     cache,
                     rerank_coalesce_gap_bytes,
@@ -1454,7 +1360,6 @@ async fn search_ivf_flat_with_trace_inner(
                     filter,
                     filter_metadata_path,
                     fetch_k,
-                    row_frontier,
                     store,
                     cache,
                     sq_byte_stats.clone(),
@@ -1631,7 +1536,6 @@ async fn search_ivf_flat_with_trace_inner(
 /// most approximate top-row mass in 7 and 8, an ungrouped segment may scan
 /// `[7, 8]`. If 7 shares an object with 6, the grouped result includes both 7
 /// and 6 because fetching only 7 would not save bytes or requests.
-#[cfg(test)]
 fn select_scan_clusters(
     index: &IvfFlatIndex,
     query: &[f32],
@@ -1641,44 +1545,8 @@ fn select_scan_clusters(
     effective_nprobe: usize,
     retrieval_top_k: usize,
 ) -> Result<Vec<usize>> {
-    Ok(select_scan_clusters_with_frontier(
-        index,
-        query,
-        distance_metric,
-        filter,
-        probe_clusters,
-        effective_nprobe,
-        retrieval_top_k,
-        0,
-    )?
-    .clusters)
-}
-
-/// Cluster selection plus an optional row frontier from the same sketch scan.
-struct ClusterScanSelection {
-    /// Logical clusters used by the existing coarse fallback.
-    clusters: Vec<usize>,
-    /// Approximate row winners retained for the fixed-stride bypass.
-    row_frontier: Vec<ResidentRowScore>,
-}
-
-/// Selects scan clusters and optionally retains row winners without rescoring.
-#[allow(clippy::too_many_arguments)]
-fn select_scan_clusters_with_frontier(
-    index: &IvfFlatIndex,
-    query: &[f32],
-    distance_metric: DistanceMetric,
-    filter: Option<&Filter>,
-    probe_clusters: &[usize],
-    effective_nprobe: usize,
-    retrieval_top_k: usize,
-    row_frontier_top_k: usize,
-) -> Result<ClusterScanSelection> {
     let Some(sketch) = &index.resident_sketch else {
-        return Ok(ClusterScanSelection {
-            clusters: expand_clusters_to_objects(index, probe_clusters)?,
-            row_frontier: Vec::new(),
-        });
+        return expand_clusters_to_objects(index, probe_clusters);
     };
 
     // Attribute filters require exact per-row attrs during coarse pruning.
@@ -1686,10 +1554,7 @@ fn select_scan_clusters_with_frontier(
     // filtered queries keep the legacy cluster set and preserve existing
     // semantics. Unfiltered benchmark/query traffic uses the sketch path.
     if filter.is_some() {
-        return Ok(ClusterScanSelection {
-            clusters: expand_clusters_to_objects(index, probe_clusters)?,
-            row_frontier: Vec::new(),
-        });
+        return expand_clusters_to_objects(index, probe_clusters);
     }
 
     let cluster_budget = adaptive_sketch_budget(effective_nprobe);
@@ -1702,62 +1567,29 @@ fn select_scan_clusters_with_frontier(
             clusters.len(),
             !index.cluster_objects.is_empty(),
         );
-        let row_frontier = if row_frontier_top_k == 0 {
-            Vec::new()
-        } else {
-            sketch
-                .rank_clusters_with_frontier(
-                    query,
-                    distance_metric,
-                    probe_clusters,
-                    retrieval_top_k,
-                    row_frontier_top_k,
-                )?
-                .row_frontier
-        };
-        return Ok(ClusterScanSelection {
-            clusters,
-            row_frontier,
-        });
+        return Ok(clusters);
     }
 
     if !index.cluster_objects.is_empty() {
-        let scores = sketch.rank_clusters_with_frontier(
-            query,
-            distance_metric,
-            probe_clusters,
-            retrieval_top_k,
-            row_frontier_top_k,
-        )?;
-        let selected =
-            select_grouped_object_clusters(index, &scores.ranked_clusters, effective_nprobe)?;
+        let ranked_clusters =
+            sketch.rank_clusters(query, distance_metric, probe_clusters, retrieval_top_k)?;
+        let selected = select_grouped_object_clusters(index, &ranked_clusters, effective_nprobe)?;
         emit_scan_stats(
             effective_nprobe,
             selected.object_count,
             selected.clusters.len(),
             true,
         );
-        return Ok(ClusterScanSelection {
-            clusters: selected.clusters,
-            row_frontier: scores.row_frontier,
-        });
+        return Ok(selected.clusters);
     }
 
-    if row_frontier_top_k != 0 {
-        return Err(ZeppelinError::Index(
-            "resident row frontier requires manifest-declared grouped layouts".into(),
-        ));
-    }
-    Ok(ClusterScanSelection {
-        clusters: sketch.select_clusters(
-            query,
-            distance_metric,
-            probe_clusters,
-            cluster_budget,
-            retrieval_top_k,
-        )?,
-        row_frontier: Vec::new(),
-    })
+    sketch.select_clusters(
+        query,
+        distance_metric,
+        probe_clusters,
+        cluster_budget,
+        retrieval_top_k,
+    )
 }
 
 /// Object-aware sketch selection returned to the scan dispatcher.
@@ -2385,157 +2217,6 @@ async fn scan_clusters_flat(
     Ok(candidates)
 }
 
-/// Turns resident row coordinates into ID-bearing exact-rerank candidates.
-///
-/// One whole ID block is fetched for each cluster represented in the bounded
-/// frontier. Exact-vector ranges are derived only for those rows, avoiding both
-/// coarse payload I/O and dense per-cluster range allocation.
-async fn load_resident_frontier_candidates(
-    index: &IvfFlatIndex,
-    row_frontier: &[ResidentRowScore],
-    store: &ZeppelinStore,
-    cache: Option<&Arc<DiskCache>>,
-    stats: Option<&SqSearchByteStats>,
-) -> Result<(Vec<QuantizedCoarseCandidate>, VectorRangesByCluster)> {
-    let mut rows_by_cluster: HashMap<usize, BTreeSet<usize>> = HashMap::new();
-    for row in row_frontier {
-        rows_by_cluster
-            .entry(row.cluster_idx)
-            .or_default()
-            .insert(row.row_idx);
-    }
-    let mut cluster_ids = rows_by_cluster.keys().copied().collect::<Vec<_>>();
-    cluster_ids.sort_unstable();
-    let mut requests = Vec::with_capacity(cluster_ids.len());
-    for cluster_idx in cluster_ids {
-        let object = cluster_fetch_object(index, cluster_idx)?;
-        let layout = object.row_layout(cluster_idx)?.clone();
-        requests.push((cluster_idx, object, layout));
-    }
-
-    let fetched = futures::future::join_all(requests.into_iter().map(
-        |(cluster_idx, object, layout)| async move {
-            let ids = fetch_resident_frontier_id_block(&object, &layout, store, cache, stats).await;
-            (cluster_idx, layout, ids)
-        },
-    ))
-    .await;
-
-    let mut ids_by_cluster = HashMap::new();
-    let mut vector_ranges_by_cluster = HashMap::new();
-    for (cluster_idx, layout, ids) in fetched {
-        let ids = ids?;
-        let row_indices = rows_by_cluster.get(&cluster_idx).ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "resident row bypass lost requested rows for cluster {cluster_idx}"
-            ))
-        })?;
-        let ranges = row_indices
-            .iter()
-            .map(|&row_idx| Ok((row_idx, layout.vector_row_range_usize(row_idx, index.dim)?)))
-            .collect::<Result<HashMap<_, _>>>()?;
-        if ids_by_cluster.insert(cluster_idx, ids).is_some()
-            || vector_ranges_by_cluster
-                .insert(cluster_idx, QuantizedVectorRanges::Sparse(ranges))
-                .is_some()
-        {
-            return Err(ZeppelinError::Index(format!(
-                "resident row bypass fetched duplicate cluster {cluster_idx}"
-            )));
-        }
-    }
-
-    let mut candidates = Vec::with_capacity(row_frontier.len());
-    for row in row_frontier {
-        let ids = ids_by_cluster.get(&row.cluster_idx).ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "resident row bypass is missing IDs for cluster {}",
-                row.cluster_idx
-            ))
-        })?;
-        let id = ids.get(row.row_idx).ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "resident row bypass row {} outside cluster {} ID block with {} rows",
-                row.row_idx,
-                row.cluster_idx,
-                ids.len()
-            ))
-        })?;
-        candidates.push((
-            id.clone(),
-            row.approximate_score,
-            row.cluster_idx,
-            row.row_idx,
-        ));
-    }
-    debug!(
-        frontier_rows = candidates.len(),
-        id_clusters = ids_by_cluster.len(),
-        "resident row frontier loaded IDs without coarse payloads"
-    );
-    Ok((candidates, vector_ranges_by_cluster))
-}
-
-/// Fetches and validates one complete ID block selected by row winners.
-async fn fetch_resident_frontier_id_block(
-    object: &ClusterFetchObject,
-    layout: &Zbp5ClusterLayout,
-    store: &ZeppelinStore,
-    cache: Option<&Arc<DiskCache>>,
-    stats: Option<&SqSearchByteStats>,
-) -> Result<Vec<String>> {
-    let range = layout.ids_range()?;
-    let bytes = match cached_full_object_for_range(
-        cache,
-        &object.cache_key,
-        &object.key,
-        object.size_bytes,
-        range.end,
-        "sq",
-        1,
-    )
-    .await?
-    {
-        RangeCacheLookup::Local(data) => {
-            if let Some(stats) = stats {
-                stats.record_local_bytes(range.end - range.start);
-                stats.record_logical_sq_bytes(range.end - range.start);
-            }
-            data.slice(range)
-        }
-        RangeCacheLookup::Miss => {
-            crate::metrics::RANGE_SOURCE_TOTAL
-                .with_label_values(&["sq", "s3"])
-                .inc();
-            let bytes = store.get_range(&object.key, range).await?;
-            if let Some(stats) = stats {
-                stats.record_get(SqBytePhase::Sq, bytes.len());
-                stats.record_logical_sq_bytes(bytes.len());
-            }
-            bytes
-        }
-        RangeCacheLookup::CorruptEvicted => {
-            let bytes = store.get_range(&object.key, range).await?;
-            if let Some(stats) = stats {
-                stats.record_get(SqBytePhase::Sq, bytes.len());
-                stats.record_logical_sq_bytes(bytes.len());
-            }
-            bytes
-        }
-    };
-    let ids = deserialize_id_block(&bytes)?;
-    if ids.len() != layout.row_count {
-        return Err(ZeppelinError::Index(format!(
-            "resident row bypass ID block row-count mismatch for cluster {} in {}: layout={}, object={}",
-            layout.cluster_idx,
-            object.key,
-            layout.row_count,
-            ids.len()
-        )));
-    }
-    Ok(ids)
-}
-
 /// Uses SQ8 for coarse row ranking and full vectors for exact reranking.
 ///
 /// Scalar quantization stores one calibrated byte per vector component. The
@@ -2636,41 +2317,12 @@ async fn scan_clusters_sq(
     filter: Option<&Filter>,
     filter_metadata_path: FilterMetadataPath,
     fetch_k: usize,
-    row_frontier: Option<&[ResidentRowScore]>,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
     byte_stats: Option<Arc<SqSearchByteStats>>,
     rerank_coalesce_gap_bytes: usize,
 ) -> Result<Vec<Candidate>> {
     use crate::index::quantization::sq::{sq_calibration_key, SqCalibration};
-
-    if let Some(row_frontier) = row_frontier {
-        let (coarse_candidates, vector_ranges_by_cluster) = load_resident_frontier_candidates(
-            index,
-            row_frontier,
-            store,
-            cache,
-            byte_stats.as_deref(),
-        )
-        .await?;
-        return rerank_quantized_candidates(
-            index,
-            query,
-            distance_metric,
-            filter,
-            filter_metadata_path,
-            fetch_k,
-            store,
-            cache,
-            byte_stats,
-            rerank_coalesce_gap_bytes,
-            coarse_candidates,
-            vector_ranges_by_cluster,
-            HashMap::new(),
-            "resident_sketch_v4",
-        )
-        .await;
-    }
 
     // Load SQ calibration. New segments embed it in centroids; legacy segments
     // keep the old sidecar.
@@ -2742,7 +2394,7 @@ async fn scan_clusters_sq(
     .await;
 
     let mut sq_by_cluster = HashMap::new();
-    let mut vector_ranges_by_cluster = VectorRangesByCluster::new();
+    let mut vector_ranges_by_cluster: HashMap<usize, Vec<Range<usize>>> = HashMap::new();
     let mut prefetched_objects: HashMap<String, bytes::Bytes> = HashMap::new();
     for object_res in sq_prefetched {
         let fetched = object_res?;
@@ -2751,7 +2403,7 @@ async fn scan_clusters_sq(
         }
         for (cluster_idx, ranges) in fetched.vector_ranges {
             if vector_ranges_by_cluster
-                .insert(cluster_idx, QuantizedVectorRanges::Dense(ranges))
+                .insert(cluster_idx, ranges)
                 .is_some()
             {
                 return Err(ZeppelinError::Index(format!(
@@ -2838,34 +2490,11 @@ async fn scan_clusters_rq(
     filter: Option<&Filter>,
     filter_metadata_path: FilterMetadataPath,
     fetch_k: usize,
-    row_frontier: Option<&[ResidentRowScore]>,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
     rerank_coalesce_gap_bytes: usize,
 ) -> Result<Vec<Candidate>> {
     use crate::index::quantization::rabitq::{self, StructuredRotation};
-
-    if let Some(row_frontier) = row_frontier {
-        let (coarse_candidates, vector_ranges_by_cluster) =
-            load_resident_frontier_candidates(index, row_frontier, store, cache, None).await?;
-        return rerank_quantized_candidates(
-            index,
-            query,
-            distance_metric,
-            filter,
-            filter_metadata_path,
-            fetch_k,
-            store,
-            cache,
-            None,
-            rerank_coalesce_gap_bytes,
-            coarse_candidates,
-            vector_ranges_by_cluster,
-            HashMap::new(),
-            "resident_sketch_v4",
-        )
-        .await;
-    }
 
     let sketch_ref = index.sketch_ref.as_ref().ok_or_else(|| {
         ZeppelinError::Index(format!(
@@ -2928,12 +2557,12 @@ async fn scan_clusters_rq(
     .await;
 
     let mut rq_by_cluster = HashMap::new();
-    let mut vector_ranges_by_cluster = VectorRangesByCluster::new();
+    let mut vector_ranges_by_cluster: HashMap<usize, Vec<Range<usize>>> = HashMap::new();
     for object_res in rq_prefetched {
         let fetched = object_res?;
         for (cluster_idx, ranges) in fetched.vector_ranges {
             if vector_ranges_by_cluster
-                .insert(cluster_idx, QuantizedVectorRanges::Dense(ranges))
+                .insert(cluster_idx, ranges)
                 .is_some()
             {
                 return Err(ZeppelinError::Index(format!(
@@ -3066,7 +2695,7 @@ async fn rerank_quantized_candidates(
     byte_stats: Option<Arc<SqSearchByteStats>>,
     rerank_coalesce_gap_bytes: usize,
     mut coarse_candidates: Vec<QuantizedCoarseCandidate>,
-    vector_ranges_by_cluster: VectorRangesByCluster,
+    vector_ranges_by_cluster: HashMap<usize, Vec<Range<usize>>>,
     prefetched_objects: HashMap<String, bytes::Bytes>,
     coarse_encoding: &'static str,
 ) -> Result<Vec<Candidate>> {
