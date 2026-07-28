@@ -902,7 +902,7 @@ impl SyntheticForeignOriginView {
             segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
         }
         manifest.fragments.extend(local_tail);
-        manifest.bind_synthetic_origin_binding_for_test_support(target_namespace)?;
+        manifest.bind_synthetic_origin_binding_for_test_support();
 
         // Validate the exact view once at construction. This is structural
         // resolution only; it intentionally does not open persisted admission.
