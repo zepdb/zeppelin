@@ -127,7 +127,7 @@
 //! fragment ownership are materialized into the returned results.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -137,7 +137,7 @@ use crate::cache::decoded_cache::DecodedArtifactCache;
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::{with_cache_diagnostics, CacheDiagnostics, DiskCache};
 use crate::config::IndexingConfig;
-use crate::error::{Result, ZeppelinError};
+use crate::error::Result;
 use crate::fts::bm25::Bm25Params;
 use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
 use crate::fts::rank_by::{evaluate_rank_by, RankBy};
@@ -202,7 +202,6 @@ pub fn compile_effective_filter(
 /// would commonly use nullable fields plus serializer annotations, while C
 /// would need an explicit presence flag beside each payload.
 #[derive(Debug, Serialize)]
-#[allow(dead_code)]
 pub struct QueryResponse {
     /// Ranked hits in the score direction of the executed source.
     pub results: Vec<SearchResult>,
@@ -229,33 +228,6 @@ pub struct QueryResponse {
     /// Query execution explain output, returned only when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explain: Option<QueryExplain>,
-    /// Signed structural proof, returned only for an opted-in single query.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub receipt: Option<crate::security::RetrievalReceipt>,
-    /// Internal source-by-source traversal evidence for optional receipts.
-    #[serde(skip)]
-    pub(crate) receipt_traversal: Vec<crate::security::TraversalSourceParams>,
-    /// Exact ANN routing indexes captured by the production segment search.
-    #[serde(skip)]
-    pub(crate) probed_centroids: Vec<usize>,
-    /// Exact physical clusters whose row or sidecar data was scanned.
-    #[serde(skip)]
-    pub(crate) scanned_clusters: Vec<usize>,
-    /// Exact hierarchical routing-node IDs fetched by ANN traversal.
-    #[serde(skip)]
-    pub(crate) probed_routing_nodes: Vec<String>,
-    /// Exact lazily published policy-scope artifacts consumed by this query.
-    #[serde(skip)]
-    pub(crate) receipt_derived_artifacts: BTreeMap<String, [u8; 32]>,
-    /// Exact lazily published policy-scope artifacts consumed by this query.
-    #[serde(skip)]
-    pub(crate) receipt_derived_touched_artifacts: BTreeSet<String>,
-    /// Exact manifest-owned artifacts read by by-ID seeds or explicit reranking.
-    #[serde(skip)]
-    pub(crate) receipt_touched_artifacts: BTreeSet<String>,
-    /// False when a legacy scoped descriptor lacks content-hash evidence.
-    #[serde(skip)]
-    pub(crate) receipt_derived_artifacts_complete: bool,
 }
 
 /// Groups ranked hits that share one response-level attribute value.
@@ -1424,8 +1396,8 @@ async fn execute_query_with_manifest_scoped(
                 .await?
             }
             ConsistencyLevel::Eventual if !manifest.uncompacted_fragments().is_empty() => {
-                let read = wal_reader
-                    .read_located_delete_ids_with_trace_unchecked(
+                let deleted_ids = wal_reader
+                    .read_located_delete_ids_unchecked(
                         &located_fragments,
                         cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
                         fragment_cache,
@@ -1435,8 +1407,7 @@ async fn execute_query_with_manifest_scoped(
                     results: Vec::new(),
                     overriding_ids: HashSet::new(),
                     fragment_count: 0,
-                    deleted_ids: read.deleted_ids,
-                    touched_artifacts: read.touched_artifacts,
+                    deleted_ids,
                 }
             }
             _ => WalScanResult {
@@ -1444,7 +1415,6 @@ async fn execute_query_with_manifest_scoped(
                 overriding_ids: HashSet::new(),
                 fragment_count: 0,
                 deleted_ids: HashSet::new(),
-                touched_artifacts: BTreeSet::new(),
             },
         };
         let wal_ms = wal_start.elapsed().as_millis() as u64;
@@ -1458,18 +1428,7 @@ async fn execute_query_with_manifest_scoped(
 
     let segment_future = async {
         let segment_start = std::time::Instant::now();
-        let (
-            results,
-            scanned,
-            clusters_probed,
-            probed_centroids,
-            scanned_clusters,
-            probed_routing_nodes,
-            touched_artifacts,
-            receipt_derived_artifacts,
-            receipt_derived_touched_artifacts,
-            receipt_derived_artifacts_complete,
-        ) = if let Some(seg_ref) = segment_ref {
+        let (results, scanned, clusters_probed) = if let Some(seg_ref) = segment_ref {
             let output = segment_search(
                 store,
                 seg_ref,
@@ -1486,31 +1445,9 @@ async fn execute_query_with_manifest_scoped(
                 scoped_ann,
             )
             .await?;
-            (
-                output.results,
-                1,
-                output.clusters_probed,
-                output.probed_centroids,
-                output.scanned_clusters,
-                output.probed_routing_nodes,
-                output.touched_artifacts,
-                output.receipt_derived_artifacts,
-                output.receipt_derived_touched_artifacts,
-                output.receipt_derived_artifacts_complete,
-            )
+            (output.results, 1, output.clusters_probed)
         } else {
-            (
-                Vec::new(),
-                0,
-                0,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                BTreeSet::new(),
-                BTreeMap::new(),
-                BTreeSet::new(),
-                true,
-            )
+            (Vec::new(), 0, 0)
         };
         let segment_ms = segment_start.elapsed().as_millis() as u64;
         debug!(
@@ -1518,19 +1455,7 @@ async fn execute_query_with_manifest_scoped(
             segments_scanned = scanned,
             "query phase: segment search"
         );
-        Ok::<_, crate::error::ZeppelinError>((
-            results,
-            scanned,
-            segment_ms,
-            clusters_probed,
-            probed_centroids,
-            scanned_clusters,
-            probed_routing_nodes,
-            touched_artifacts,
-            receipt_derived_artifacts,
-            receipt_derived_touched_artifacts,
-            receipt_derived_artifacts_complete,
-        ))
+        Ok::<_, crate::error::ZeppelinError>((results, scanned, segment_ms, clusters_probed))
     };
 
     let (wal_result, segment_result) = tokio::join!(wal_future, segment_future);
@@ -1540,24 +1465,10 @@ async fn execute_query_with_manifest_scoped(
             overriding_ids: wal_overriding_ids,
             fragment_count: scanned_fragments,
             deleted_ids: wal_deleted_ids,
-            touched_artifacts: wal_touched_artifacts,
         },
         wal_ms,
     ) = wal_result?;
-    let (
-        mut segment_results,
-        scanned_segments,
-        mut segment_ms,
-        clusters_probed,
-        mut probed_centroids,
-        mut scanned_clusters,
-        mut probed_routing_nodes,
-        mut receipt_touched_artifacts,
-        mut receipt_derived_artifacts,
-        mut receipt_derived_touched_artifacts,
-        mut receipt_derived_artifacts_complete,
-    ) = segment_result?;
-    receipt_touched_artifacts.extend(wal_touched_artifacts);
+    let (mut segment_results, scanned_segments, mut segment_ms, clusters_probed) = segment_result?;
 
     if let Some(seg_ref) = segment_ref {
         if let Some(refill_top_k) = segment_refill_top_k(
@@ -1586,40 +1497,6 @@ async fn execute_query_with_manifest_scoped(
             )
             .await?;
             segment_results = refill.results;
-            receipt_derived_artifacts_complete &= refill.receipt_derived_artifacts_complete;
-            receipt_touched_artifacts.extend(refill.touched_artifacts);
-            receipt_derived_touched_artifacts.extend(refill.receipt_derived_touched_artifacts);
-            for (key, content_hash) in refill.receipt_derived_artifacts {
-                if receipt_derived_artifacts
-                    .insert(key.clone(), content_hash)
-                    .is_some_and(|existing| existing != content_hash)
-                {
-                    return Err(ZeppelinError::Index(format!(
-                        "derived receipt artifact {key} changed during segment refill"
-                    )));
-                }
-            }
-            let mut seen = probed_centroids.iter().copied().collect::<HashSet<_>>();
-            probed_centroids.extend(
-                refill
-                    .probed_centroids
-                    .into_iter()
-                    .filter(|centroid| seen.insert(*centroid)),
-            );
-            let mut seen_scanned = scanned_clusters.iter().copied().collect::<HashSet<_>>();
-            scanned_clusters.extend(
-                refill
-                    .scanned_clusters
-                    .into_iter()
-                    .filter(|cluster| seen_scanned.insert(*cluster)),
-            );
-            let mut seen_nodes = probed_routing_nodes.iter().cloned().collect::<HashSet<_>>();
-            probed_routing_nodes.extend(
-                refill
-                    .probed_routing_nodes
-                    .into_iter()
-                    .filter(|node| seen_nodes.insert(node.clone())),
-            );
             let segment_retry_ms = segment_retry_start.elapsed().as_millis() as u64;
             segment_ms += segment_retry_ms;
             debug!(
@@ -1682,15 +1559,6 @@ async fn execute_query_with_manifest_scoped(
         groups: None,
         facets: None,
         explain: None,
-        receipt: None,
-        receipt_traversal: Vec::new(),
-        probed_centroids,
-        scanned_clusters,
-        probed_routing_nodes,
-        receipt_derived_artifacts,
-        receipt_derived_touched_artifacts,
-        receipt_touched_artifacts,
-        receipt_derived_artifacts_complete,
     })
 }
 
@@ -1718,8 +1586,6 @@ struct WalScanResult {
     /// A later upsert removes an ID from this set. Both consistency modes use
     /// it to prevent a compacted record from being resurrected.
     deleted_ids: HashSet<String>,
-    /// Exact physical WAL keys whose decoded contents the query consumed.
-    touched_artifacts: BTreeSet<String>,
 }
 
 /// Replays and distance-scores every visible uncompacted WAL fragment.
@@ -1827,15 +1693,13 @@ async fn wal_scan(
     // The historical `unchecked` name is compatibility-only: misses still
     // validate payload checksums, while decoded-cache hits reuse values that
     // already passed that validation.
-    let read = wal_reader
-        .read_located_query_fragments_with_trace_unchecked(
+    let fragments = wal_reader
+        .read_located_query_fragments_unchecked(
             refs,
             cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
             fragment_cache,
         )
         .await?;
-    let fragments = read.fragments;
-    let touched_artifacts = read.touched_artifacts;
     let frag_count = fragments.len();
 
     if fragments.is_empty() {
@@ -1844,7 +1708,6 @@ async fn wal_scan(
             overriding_ids: HashSet::new(),
             fragment_count: 0,
             deleted_ids: HashSet::new(),
-            touched_artifacts,
         });
     }
 
@@ -1942,7 +1805,6 @@ async fn wal_scan(
         overriding_ids,
         fragment_count: frag_count,
         deleted_ids,
-        touched_artifacts,
     })
 }
 
@@ -2029,13 +1891,6 @@ async fn wal_scan(
 struct SegmentSearchOutput {
     results: Vec<SearchResult>,
     clusters_probed: usize,
-    probed_centroids: Vec<usize>,
-    scanned_clusters: Vec<usize>,
-    probed_routing_nodes: Vec<String>,
-    touched_artifacts: BTreeSet<String>,
-    receipt_derived_artifacts: BTreeMap<String, [u8; 32]>,
-    receipt_derived_touched_artifacts: BTreeSet<String>,
-    receipt_derived_artifacts_complete: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2073,8 +1928,6 @@ async fn segment_search(
         .await;
     }
 
-    let segment_id = &segment_ref.id;
-
     // Use manifest metadata to determine index type — no S3 probe needed.
     if segment_ref.hierarchical {
         let mut index =
@@ -2094,21 +1947,9 @@ async fn segment_search(
             include_attributes,
         )
         .await?;
-        let mut touched_artifacts = output.touched_artifacts;
-        touched_artifacts.insert(crate::index::hierarchical::tree_meta_key(
-            located.physical_namespace(),
-            segment_id,
-        ));
         return Ok(SegmentSearchOutput {
             clusters_probed: output.probed_centroids.len(),
-            probed_centroids: output.probed_centroids.clone(),
-            scanned_clusters: output.probed_centroids,
-            probed_routing_nodes: output.probed_routing_nodes,
-            touched_artifacts,
             results: output.results,
-            receipt_derived_artifacts: BTreeMap::new(),
-            receipt_derived_touched_artifacts: BTreeSet::new(),
-            receipt_derived_artifacts_complete: true,
         });
     }
 
@@ -2132,29 +1973,9 @@ async fn segment_search(
     )
     .await?;
 
-    let mut touched_artifacts = output.touched_artifacts;
-    if let Some(bootstrap) = &segment_ref.bootstrap {
-        touched_artifacts.insert(bootstrap.key.clone());
-    } else {
-        touched_artifacts.insert(crate::index::ivf_flat::build::centroids_key(
-            located.physical_namespace(),
-            segment_id,
-        ));
-    }
-    if segment_ref.bootstrap.is_none() {
-        touched_artifacts.extend(segment_ref.sketch.iter().map(|sketch| sketch.key.clone()));
-    }
-
     Ok(SegmentSearchOutput {
         clusters_probed: output.probed_centroids.len(),
-        probed_centroids: output.probed_centroids,
-        scanned_clusters: output.scanned_clusters,
-        probed_routing_nodes: Vec::new(),
-        touched_artifacts,
         results: output.results,
-        receipt_derived_artifacts: BTreeMap::new(),
-        receipt_derived_touched_artifacts: BTreeSet::new(),
-        receipt_derived_artifacts_complete: true,
     })
 }
 
@@ -2220,25 +2041,9 @@ async fn scoped_segment_search(
             include_attributes,
         )
         .await?;
-    let receipt_derived_artifacts = index.receipt_artifacts().clone();
-    let (touched_artifacts, receipt_derived_touched_artifacts) =
-        if receipt_derived_artifacts.is_empty() {
-            let mut touched = result.touched_artifacts;
-            touched.extend(scoped_fts_source_artifact_keys(located)?);
-            (touched, BTreeSet::new())
-        } else {
-            (BTreeSet::new(), result.touched_artifacts)
-        };
     Ok(SegmentSearchOutput {
         results: result.results,
         clusters_probed: result.clusters_probed,
-        probed_centroids: result.probed_centroids,
-        scanned_clusters: result.scanned_clusters,
-        probed_routing_nodes: result.probed_routing_nodes,
-        touched_artifacts,
-        receipt_derived_artifacts,
-        receipt_derived_touched_artifacts,
-        receipt_derived_artifacts_complete: true,
     })
 }
 
@@ -2804,21 +2609,19 @@ async fn execute_bm25_query_with_manifest_scoped(
         let mut scanned_fragments = 0;
         let mut wal_deleted_ids = std::collections::HashSet::new();
         let mut wal_overriding_ids = std::collections::HashSet::new();
-        let mut wal_touched_artifacts = BTreeSet::new();
         let wal_results = match consistency {
             ConsistencyLevel::Strong if !manifest.uncompacted_fragments().is_empty() => {
                 // The historical `unchecked` name is compatibility-only;
                 // misses still validate checksums before memo insertion.
-                let read = wal_reader
-                    .read_located_query_fragments_with_trace_unchecked(
+                let fragments = wal_reader
+                    .read_located_query_fragments_unchecked(
                         &located_fragments,
                         cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
                         fragment_cache,
                     )
                     .await?;
-                wal_touched_artifacts = read.touched_artifacts;
                 let scan_result = wal_bm25_scan(
-                    &read.fragments,
+                    &fragments,
                     &local_origin,
                     rank_by,
                     fts_configs,
@@ -2834,15 +2637,13 @@ async fn execute_bm25_query_with_manifest_scoped(
                 scan_result.results
             }
             ConsistencyLevel::Eventual if !manifest.uncompacted_fragments().is_empty() => {
-                let read = wal_reader
-                    .read_located_delete_ids_with_trace_unchecked(
+                wal_deleted_ids = wal_reader
+                    .read_located_delete_ids_unchecked(
                         &located_fragments,
                         cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
                         fragment_cache,
                     )
                     .await?;
-                wal_deleted_ids = read.deleted_ids;
-                wal_touched_artifacts = read.touched_artifacts;
                 Vec::new()
             }
             _ => Vec::new(),
@@ -2858,81 +2659,50 @@ async fn execute_bm25_query_with_manifest_scoped(
             scanned_fragments,
             wal_deleted_ids,
             wal_overriding_ids,
-            wal_touched_artifacts,
             wal_ms,
         ))
     };
 
     let segment_future = async {
         let segment_start = std::time::Instant::now();
-        let (results, scanned, clusters_probed, probed_centroids, touched_artifacts) =
-            match active_segment {
-                Some(seg_ref) => {
-                    let segment_top_k = if manifest.uncompacted_fragments().is_empty() {
-                        top_k
-                    } else {
-                        usize::MAX
-                    };
-                    let output = segment_bm25_search(
-                        store,
-                        seg_ref,
-                        rank_by,
-                        fts_configs,
-                        filter,
-                        last_as_prefix,
-                        decoded_artifact_cache,
-                        cache,
-                        max_full_scan_clusters,
-                        max_full_scan_vectors,
-                        segment_top_k,
-                        include_attributes,
-                    )
-                    .await?;
-                    let clusters_probed = output.probed_centroids.len();
-                    (
-                        output.results,
-                        1,
-                        clusters_probed,
-                        output.probed_centroids,
-                        output.touched_artifacts,
-                    )
-                }
-                _ => (Vec::new(), 0, 0, Vec::new(), BTreeSet::new()),
-            };
+        let (results, scanned, clusters_probed) = match active_segment {
+            Some(seg_ref) => {
+                let segment_top_k = if manifest.uncompacted_fragments().is_empty() {
+                    top_k
+                } else {
+                    usize::MAX
+                };
+                let output = segment_bm25_search(
+                    store,
+                    seg_ref,
+                    rank_by,
+                    fts_configs,
+                    filter,
+                    last_as_prefix,
+                    decoded_artifact_cache,
+                    cache,
+                    max_full_scan_clusters,
+                    max_full_scan_vectors,
+                    segment_top_k,
+                    include_attributes,
+                )
+                .await?;
+                (output.results, 1, output.clusters_probed)
+            }
+            _ => (Vec::new(), 0, 0),
+        };
         let segment_ms = segment_start.elapsed().as_millis() as u64;
         debug!(
             segment_duration_ms = segment_ms,
             segments_scanned = scanned,
             "BM25 query phase: segment search"
         );
-        Ok::<_, crate::error::ZeppelinError>((
-            results,
-            scanned,
-            segment_ms,
-            clusters_probed,
-            probed_centroids,
-            touched_artifacts,
-        ))
+        Ok::<_, crate::error::ZeppelinError>((results, scanned, segment_ms, clusters_probed))
     };
 
     let (wal_result, segment_result) = tokio::join!(wal_future, segment_future);
-    let (
-        wal_results,
-        scanned_fragments,
-        wal_deleted_ids,
-        wal_overriding_ids,
-        wal_touched_artifacts,
-        wal_ms,
-    ) = wal_result?;
-    let (
-        segment_results,
-        scanned_segments,
-        segment_ms,
-        clusters_probed,
-        probed_centroids,
-        mut touched_artifacts,
-    ) = segment_result?;
-    touched_artifacts.extend(wal_touched_artifacts);
+    let (wal_results, scanned_fragments, wal_deleted_ids, wal_overriding_ids, wal_ms) = wal_result?;
+    let (segment_results, scanned_segments, segment_ms, clusters_probed) = segment_result?;
 
     // Merge results — BM25 is higher-is-better
     // Pass deleted IDs so segment results for deleted docs are excluded
@@ -2985,15 +2755,6 @@ async fn execute_bm25_query_with_manifest_scoped(
         groups: None,
         facets: None,
         explain: None,
-        receipt: None,
-        receipt_traversal: Vec::new(),
-        scanned_clusters: probed_centroids.clone(),
-        probed_centroids,
-        probed_routing_nodes: Vec::new(),
-        receipt_derived_artifacts: BTreeMap::new(),
-        receipt_derived_touched_artifacts: BTreeSet::new(),
-        receipt_touched_artifacts: touched_artifacts,
-        receipt_derived_artifacts_complete: true,
     })
 }
 
@@ -3045,22 +2806,8 @@ async fn execute_filtered_bm25_query_with_manifest(
         .is_empty()
         .then(|| segment_ref.map(|segment| segment.segment.id.as_str()))
         .flatten();
-    let (transient_scanned_clusters, transient_source_artifacts) =
-        if durable_source_segment_id.is_none() {
-            match segment_ref {
-                Some(segment) => (
-                    (0..segment.segment.cluster_count).collect(),
-                    scoped_fts_source_artifact_keys(segment)?,
-                ),
-                None => (Vec::new(), BTreeSet::new()),
-            }
-        } else {
-            (Vec::new(), BTreeSet::new())
-        };
-    let wal_read_trace = Arc::new(tokio::sync::Mutex::new(BTreeSet::new()));
     let index = match decoded_artifact_cache {
         Some(decoded_artifact_cache) => {
-            let build_wal_read_trace = Arc::clone(&wal_read_trace);
             decoded_artifact_cache
                 .get_or_build_scoped_fts(&artifact_key, || async {
                     ScopedFtsIndex::load_or_build(
@@ -3081,7 +2828,6 @@ async fn execute_filtered_bm25_query_with_manifest(
                                 cache,
                                 located_fragments,
                                 segment_ref,
-                                &build_wal_read_trace,
                             )
                             .await
                         },
@@ -3090,39 +2836,31 @@ async fn execute_filtered_bm25_query_with_manifest(
                 })
                 .await?
         }
-        None => {
-            let build_wal_read_trace = Arc::clone(&wal_read_trace);
-            Arc::new(
-                ScopedFtsIndex::load_or_build(
-                    store,
-                    logical_origin.namespace.as_str(),
-                    durable_source_segment_id,
-                    &artifact_key,
-                    cache,
-                    || async {
-                        build_scoped_fts_snapshot(
-                            store,
-                            wal_reader,
-                            fts_configs,
-                            mandatory_filter,
-                            consistency,
-                            fragment_cache,
-                            None,
-                            cache,
-                            located_fragments,
-                            segment_ref,
-                            &build_wal_read_trace,
-                        )
-                        .await
-                    },
-                )
-                .await?,
+        None => Arc::new(
+            ScopedFtsIndex::load_or_build(
+                store,
+                logical_origin.namespace.as_str(),
+                durable_source_segment_id,
+                &artifact_key,
+                cache,
+                || async {
+                    build_scoped_fts_snapshot(
+                        store,
+                        wal_reader,
+                        fts_configs,
+                        mandatory_filter,
+                        consistency,
+                        fragment_cache,
+                        None,
+                        cache,
+                        located_fragments,
+                        segment_ref,
+                    )
+                    .await
+                },
             )
-        }
-    };
-    let wal_touched_artifacts = {
-        let mut trace = wal_read_trace.lock().await;
-        std::mem::take(&mut *trace)
+            .await?,
+        ),
     };
     let segment_ms = artifact_start.elapsed().as_millis() as u64;
     let wal_ms = 0;
@@ -3136,15 +2874,6 @@ async fn execute_filtered_bm25_query_with_manifest(
         include_attributes,
     )?;
     let merge_ms = merge_start.elapsed().as_millis() as u64;
-    let receipt_derived_artifacts = index.receipt_artifacts().clone();
-    let receipt_derived_touched_artifacts = receipt_derived_artifacts.keys().cloned().collect();
-    let transient_source_consumed = receipt_derived_artifacts.is_empty();
-    let mut receipt_touched_artifacts = if transient_source_consumed {
-        transient_source_artifacts
-    } else {
-        BTreeSet::new()
-    };
-    receipt_touched_artifacts.extend(wal_touched_artifacts);
     let debug = cache_diagnostics.map(|diagnostics| {
         let cache_snapshot = diagnostics.snapshot();
         QueryDebug {
@@ -3179,19 +2908,6 @@ async fn execute_filtered_bm25_query_with_manifest(
         groups: None,
         facets: None,
         explain: None,
-        receipt: None,
-        receipt_traversal: Vec::new(),
-        probed_centroids: Vec::new(),
-        scanned_clusters: if transient_source_consumed {
-            transient_scanned_clusters
-        } else {
-            Vec::new()
-        },
-        probed_routing_nodes: Vec::new(),
-        receipt_derived_artifacts,
-        receipt_derived_touched_artifacts,
-        receipt_touched_artifacts,
-        receipt_derived_artifacts_complete: true,
     })
 }
 
@@ -3207,7 +2923,6 @@ async fn build_scoped_fts_snapshot(
     cache: Option<&Arc<DiskCache>>,
     located_fragments: &[LocatedFragmentRef<'_>],
     segment_ref: Option<LocatedSegmentRef<'_>>,
-    wal_read_trace: &tokio::sync::Mutex<BTreeSet<String>>,
 ) -> Result<ScopedFtsIndex> {
     let mut dimensions = 0;
     let base_corpus = if let Some(segment_ref) = segment_ref {
@@ -3234,26 +2949,22 @@ async fn build_scoped_fts_snapshot(
     let mut eventual_deleted_ids = HashSet::new();
     match consistency {
         ConsistencyLevel::Strong if !located_fragments.is_empty() => {
-            let read = wal_reader
-                .read_located_query_fragments_with_trace_unchecked(
+            strong_fragments = wal_reader
+                .read_located_query_fragments_unchecked(
                     located_fragments,
                     cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
                     fragment_cache,
                 )
                 .await?;
-            strong_fragments = read.fragments;
-            *wal_read_trace.lock().await = read.touched_artifacts;
         }
         ConsistencyLevel::Eventual if !located_fragments.is_empty() => {
-            let read = wal_reader
-                .read_located_delete_ids_with_trace_unchecked(
+            eventual_deleted_ids = wal_reader
+                .read_located_delete_ids_unchecked(
                     located_fragments,
                     cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
                     fragment_cache,
                 )
                 .await?;
-            eventual_deleted_ids = read.deleted_ids;
-            *wal_read_trace.lock().await = read.touched_artifacts;
         }
         _ => {}
     }
@@ -3575,8 +3286,7 @@ fn validate_bm25_full_scan_budget(
 #[derive(Debug)]
 struct Bm25SearchOutput {
     results: Vec<SearchResult>,
-    probed_centroids: Vec<usize>,
-    touched_artifacts: BTreeSet<String>,
+    clusters_probed: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3739,7 +3449,6 @@ async fn segment_bm25_search_global(
     // Load and decode the global FTS index once per retained immutable key.
     let gkey = global_fts_key(physical_namespace, segment_id);
     let global_cache_key = located.cache_key(&gkey);
-    let mut touched_artifacts = BTreeSet::from([gkey.clone()]);
     let global_index = match decoded_artifact_cache {
         Some(decoded_cache) => {
             decoded_cache
@@ -3787,8 +3496,7 @@ async fn segment_bm25_search_global(
     if position_field_scores.is_empty() {
         return Ok(Bm25SearchOutput {
             results: Vec::new(),
-            probed_centroids: Vec::new(),
-            touched_artifacts,
+            clusters_probed: 0,
         });
     }
 
@@ -3796,11 +3504,7 @@ async fn segment_bm25_search_global(
     let needed_clusters: HashSet<u16> = position_field_scores.keys().map(|(c, _)| *c).collect();
 
     let load_attrs = filter.is_some() || include_attributes;
-    touched_artifacts.extend(bm25_cluster_source_artifact_keys(
-        located,
-        &needed_clusters,
-        load_attrs,
-    ));
+    let clusters_probed = needed_clusters.len();
     let cluster_data =
         fetch_bm25_cluster_attrs_and_ids(store, located, &needed_clusters, load_attrs, cache)
             .await?;
@@ -3867,15 +3571,9 @@ async fn segment_bm25_search_global(
 
     partial_topk_by(&mut results, top_k, bm25_result_cmp);
 
-    let mut probed_centroids = needed_clusters
-        .into_iter()
-        .map(usize::from)
-        .collect::<Vec<_>>();
-    probed_centroids.sort_unstable();
     Ok(Bm25SearchOutput {
         results,
-        probed_centroids,
-        touched_artifacts,
+        clusters_probed,
     })
 }
 
@@ -3899,71 +3597,6 @@ fn all_bm25_cluster_addresses(segment_ref: &SegmentRef) -> Result<HashSet<u16>> 
             })
         })
         .collect()
-}
-
-fn bm25_cluster_source_artifact_keys(
-    located: LocatedSegmentRef<'_>,
-    clusters: &HashSet<u16>,
-    load_attrs: bool,
-) -> BTreeSet<String> {
-    use crate::index::ivf_flat::build::{attrs_key, cluster_key};
-
-    let namespace = located.physical_namespace();
-    let segment_ref = located.segment;
-    let mut keys = BTreeSet::new();
-    for &cluster_idx in clusters {
-        let cluster_idx = usize::from(cluster_idx);
-        let owner = segment_ref.cluster_owner(cluster_idx);
-        if load_attrs {
-            keys.insert(attrs_key(namespace, owner, cluster_idx));
-        }
-        if segment_ref.cluster_objects.is_empty() {
-            keys.insert(cluster_key(namespace, owner, cluster_idx));
-        }
-    }
-    if !segment_ref.cluster_objects.is_empty() {
-        for object in &segment_ref.cluster_objects {
-            if object.clusters.iter().any(|cluster_idx| {
-                u16::try_from(*cluster_idx)
-                    .ok()
-                    .is_some_and(|cluster_idx| clusters.contains(&cluster_idx))
-            }) {
-                keys.insert(object.key.clone());
-            }
-        }
-    }
-    keys
-}
-
-/// Returns the exact immutable base objects consumed while materializing a
-/// transient policy-scoped FTS corpus from the active segment.
-fn scoped_fts_source_artifact_keys(located: LocatedSegmentRef<'_>) -> Result<BTreeSet<String>> {
-    use crate::index::ivf_flat::build::{attrs_key, cluster_key};
-
-    let namespace = located.physical_namespace();
-    let segment_ref = located.segment;
-    let clusters = all_bm25_cluster_addresses(segment_ref)?;
-    let mut keys = BTreeSet::new();
-    for &cluster_idx in &clusters {
-        let cluster_idx = usize::from(cluster_idx);
-        let owner = segment_ref.cluster_owner(cluster_idx);
-        keys.insert(attrs_key(namespace, owner, cluster_idx));
-        if segment_ref.cluster_objects.is_empty() {
-            keys.insert(cluster_key(namespace, owner, cluster_idx));
-        }
-    }
-    if !segment_ref.cluster_objects.is_empty() {
-        for object in &segment_ref.cluster_objects {
-            if object.clusters.iter().any(|cluster_idx| {
-                u16::try_from(*cluster_idx)
-                    .ok()
-                    .is_some_and(|cluster_idx| clusters.contains(&cluster_idx))
-            }) {
-                keys.insert(object.key.clone());
-            }
-        }
-    }
-    Ok(keys)
 }
 
 #[allow(clippy::type_complexity)]
@@ -4346,34 +3979,16 @@ async fn segment_bm25_search_full_scan(
 
     let namespace = located.physical_namespace();
     let segment_ref = located.segment;
-    let segment_id = &segment_ref.id;
     let fts_fields = &segment_ref.fts_fields;
 
     // Load the IVF-Flat index using manifest metadata to skip cluster probing.
     // The decoded FTS memo is separate from this index-metadata load.
     let index = IvfFlatIndex::load_from_located_manifest(store, located, cache).await?;
     let num_clusters = index.num_clusters();
-    let mut touched_artifacts = BTreeSet::from([crate::index::ivf_flat::build::centroids_key(
-        namespace, segment_id,
-    )]);
-
     let field_queries = rank_by.extract_field_queries();
     let load_attrs = filter.is_some() || include_attributes;
     let mut all_results: HashMap<String, (f32, Option<HashMap<String, AttributeValue>>)> =
         HashMap::new();
-    for cluster_idx in 0..num_clusters {
-        let owner = segment_ref.cluster_owner(cluster_idx);
-        touched_artifacts.insert(fts_index_key(namespace, owner, cluster_idx));
-        touched_artifacts.insert(crate::index::ivf_flat::build::cluster_key(
-            namespace,
-            owner,
-            cluster_idx,
-        ));
-        if load_attrs {
-            touched_artifacts.insert(attrs_key(namespace, owner, cluster_idx));
-        }
-    }
-
     // Parallel prefetch all cluster data (fts index, attrs, cluster vectors).
     let prefetched = futures::future::join_all((0..num_clusters).map(|cluster_idx| {
         // Per-cluster keys route through cluster_owner(): a carried-over
@@ -4522,8 +4137,7 @@ async fn segment_bm25_search_full_scan(
 
     Ok(Bm25SearchOutput {
         results,
-        probed_centroids: (0..num_clusters).collect(),
-        touched_artifacts,
+        clusters_probed: num_clusters,
     })
 }
 

@@ -66,8 +66,6 @@ pub struct SyntheticForeignQueryResult {
     pub ids: Vec<String>,
     /// Complete ranked hits, including projected attributes when requested.
     pub results: Vec<SearchResult>,
-    /// Exact immutable object keys traversed for receipt construction.
-    pub touched_artifact_keys: Vec<String>,
     /// Number of visible WAL fragments scored by the query.
     pub scanned_fragments: usize,
     /// Number of active immutable segments searched by the query.
@@ -1331,7 +1329,6 @@ impl SyntheticForeignOriginView {
         SyntheticForeignQueryResult {
             ids,
             results: response.results,
-            touched_artifact_keys: response.receipt_touched_artifacts.into_iter().collect(),
             scanned_fragments: response.scanned_fragments,
             scanned_segments: response.scanned_segments,
             debug_present,

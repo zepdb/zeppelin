@@ -234,16 +234,6 @@ async fn synthetic_target_queries_foreign_flat_segment_without_opening_admission
     assert_eq!(response.ids.first().map(String::as_str), Some("source-00"));
     assert_eq!(response.scanned_segments, 1);
     assert_eq!(response.scanned_fragments, 0);
-    assert!(!response.touched_artifact_keys.is_empty());
-    assert!(response
-        .touched_artifact_keys
-        .iter()
-        .all(|key| key.starts_with(&format!("{source}/"))));
-    assert!(response
-        .touched_artifact_keys
-        .iter()
-        .all(|key| !key.starts_with(&format!("{target}/"))));
-
     let admission_error = view.production_admission_result().unwrap_err();
     assert!(
         admission_error
@@ -252,15 +242,15 @@ async fn synthetic_target_queries_foreign_flat_segment_without_opening_admission
         "production decode must stay fail-closed: {admission_error}"
     );
 
-    let missing_key = response
-        .touched_artifact_keys
+    let reachable = view.reachable_artifact_keys().unwrap();
+    let missing_key = reachable
         .iter()
         .find(|key| {
             key.ends_with("/bootstrap.bin")
                 || key.ends_with("/centroids.bin")
                 || key.contains("/cluster_")
         })
-        .expect("the query must report one required ANN object")
+        .expect("the manifest must reference one required ANN object")
         .clone();
     harness.store.delete(&missing_key).await.unwrap();
 
@@ -410,19 +400,6 @@ async fn synthetic_target_routes_flat_sq_bitmap_attrs_bm25_cache_and_reachabilit
             .and_then(|attrs| attrs.get("status"))
             == Some(&AttributeValue::String("active".to_string()))
     }));
-    assert!(ann
-        .touched_artifact_keys
-        .iter()
-        .all(|key| key.starts_with(&format!("{source}/"))));
-    assert!(ann
-        .touched_artifact_keys
-        .iter()
-        .any(|key| key.contains("bitmap_") || key.contains("attrs_")));
-    assert!(ann
-        .touched_artifact_keys
-        .iter()
-        .any(|key| key.contains("sq_") || key.contains("cluster_")));
-
     let lexical = view
         .query_bm25(
             &RankBy::Bm25 {
@@ -440,15 +417,6 @@ async fn synthetic_target_routes_flat_sq_bitmap_attrs_bm25_cache_and_reachabilit
         .unwrap();
     assert!(!lexical.results.is_empty());
     assert!(lexical.debug_present);
-    assert!(lexical
-        .touched_artifact_keys
-        .iter()
-        .all(|key| key.starts_with(&format!("{source}/"))));
-    assert!(lexical
-        .touched_artifact_keys
-        .iter()
-        .any(|key| key.ends_with("/global_fts.bin")));
-
     let reachable = view.reachable_artifact_keys().unwrap();
     assert!(!reachable.is_empty());
     assert!(reachable
@@ -546,19 +514,6 @@ async fn synthetic_target_hybrid_batch_shares_foreign_snapshot_and_isolates_entr
     assert!(!hybrid.results.is_empty());
     assert!(hybrid.debug_present);
     assert_eq!(hybrid.scanned_segments, 2);
-    assert!(hybrid
-        .touched_artifact_keys
-        .iter()
-        .all(|key| key.starts_with(&format!("{source}/"))));
-    assert!(hybrid
-        .touched_artifact_keys
-        .iter()
-        .any(|key| key.ends_with("/global_fts.bin")));
-    assert!(hybrid
-        .touched_artifact_keys
-        .iter()
-        .any(|key| { key.ends_with("/centroids.bin") || key.contains("/cluster_") }));
-
     let middle_error = entries[1]
         .as_ref()
         .expect_err("one malformed batch entry must remain an error in place");
@@ -569,11 +524,6 @@ async fn synthetic_target_hybrid_batch_shares_foreign_snapshot_and_isolates_entr
         .expect("a later entry must execute after an earlier entry error");
     assert!(!lexical.results.is_empty());
     assert!(lexical.debug_present);
-    assert!(lexical
-        .touched_artifact_keys
-        .iter()
-        .all(|key| key.starts_with(&format!("{source}/"))));
-
     harness.cleanup().await;
 }
 
@@ -619,19 +569,6 @@ async fn synthetic_target_routes_hierarchical_pq_tree_nodes_and_codebooks() {
 
     assert!(!result.ids.is_empty());
     assert_eq!(result.scanned_segments, 1);
-    assert!(result
-        .touched_artifact_keys
-        .iter()
-        .all(|key| key.starts_with(&format!("{source}/"))));
-    assert!(result
-        .touched_artifact_keys
-        .iter()
-        .any(|key| key.ends_with("/tree_meta.json") || key.contains("/node_")));
-    assert!(result
-        .touched_artifact_keys
-        .iter()
-        .any(|key| key.contains("pq_") || key.ends_with("/pq_codebook.bin")));
-
     harness.cleanup().await;
 }
 
@@ -987,14 +924,5 @@ async fn synthetic_target_merges_foreign_and_local_wal_and_applies_local_tombsto
     assert!(result.ids.iter().any(|id| id == "target-local-wal"));
     assert!(!result.ids.iter().any(|id| id == "source-00"));
     assert_eq!(result.scanned_fragments, 2);
-    assert!(result
-        .touched_artifact_keys
-        .iter()
-        .any(|key| key.starts_with(&format!("{source}/wal/"))));
-    assert!(result
-        .touched_artifact_keys
-        .iter()
-        .any(|key| key.starts_with(&format!("{target}/wal/"))));
-
     harness.cleanup().await;
 }

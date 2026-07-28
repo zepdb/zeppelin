@@ -127,7 +127,7 @@ async fn test_compaction_fragment_cache_is_read_only_and_output_deterministic() 
         // used to be measuring.
         //
         // The warm read must be Strong: an Eventual query only scans fragments
-        // carrying deletes (`read_located_delete_ids_with_trace_unchecked` filters
+        // carrying deletes (`read_located_delete_ids_unchecked` filters
         // on `delete_count > 0` and early-returns), so it reads nothing for a
         // delete-free fixture. Strong reads whole fragments and populates.
         // Staging the appends warms exactly the intended prefix without reaching

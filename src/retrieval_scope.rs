@@ -164,10 +164,6 @@ impl ScopedSegmentCorpus {
 pub(crate) struct ScopedAnnIndex {
     artifact: ScopedAnnArtifact,
     dimensions: usize,
-    receipt_artifacts: BTreeMap<String, [u8; 32]>,
-    receipt_descriptor_key: String,
-    receipt_routing_key: Option<String>,
-    receipt_sketch_key: Option<String>,
 }
 
 #[derive(Debug)]
@@ -192,10 +188,6 @@ pub(crate) struct ScopedAnnBuildRequest<'a> {
 pub(crate) struct ScopedAnnSearch {
     pub(crate) results: Vec<SearchResult>,
     pub(crate) clusters_probed: usize,
-    pub(crate) probed_centroids: Vec<usize>,
-    pub(crate) scanned_clusters: Vec<usize>,
-    pub(crate) probed_routing_nodes: Vec<String>,
-    pub(crate) touched_artifacts: BTreeSet<String>,
 }
 
 impl ScopedAnnIndex {
@@ -224,10 +216,7 @@ impl ScopedAnnIndex {
         if let Some(bytes) = read_optional_immutable(store, cache, &descriptor_key).await? {
             let descriptor =
                 ScopedAnnDescriptor::from_bytes(&bytes, scope_cache_key, &artifact_namespace)?;
-            let receipt_artifacts = descriptor.receipt_artifacts(&descriptor_key, &bytes);
-            return descriptor
-                .load(store, cache, receipt_artifacts, descriptor_key.clone())
-                .await;
+            return descriptor.load(store, cache).await;
         }
 
         let corpus = build_corpus().await?;
@@ -270,25 +259,10 @@ impl ScopedAnnIndex {
                     cache.put(&descriptor_key, &descriptor_bytes).await?;
                     descriptor.warm_bootstrap(store, cache).await?;
                 }
-                let receipt_artifacts =
-                    descriptor.receipt_artifacts(&descriptor_key, &descriptor_bytes);
                 store.forget_known_content_hashes(descriptor.artifact_hashes.keys());
                 Ok(Self {
                     artifact: built_artifact,
                     dimensions: descriptor.dimensions,
-                    receipt_artifacts,
-                    receipt_descriptor_key: descriptor_key,
-                    receipt_routing_key: descriptor.routing_key(),
-                    receipt_sketch_key: descriptor
-                        .bootstrap
-                        .is_none()
-                        .then(|| {
-                            descriptor
-                                .sketch
-                                .as_ref()
-                                .map(|artifact| artifact.key.clone())
-                        })
-                        .flatten(),
                 })
             }
             CreateOnlyOutcome::AlreadyExists => {
@@ -299,18 +273,9 @@ impl ScopedAnnIndex {
                 }
                 let descriptor =
                     ScopedAnnDescriptor::from_bytes(&bytes, scope_cache_key, &artifact_namespace)?;
-                let receipt_artifacts = descriptor.receipt_artifacts(&descriptor_key, &bytes);
-                descriptor
-                    .load(store, cache, receipt_artifacts, descriptor_key)
-                    .await
+                descriptor.load(store, cache).await
             }
         }
-    }
-
-    /// Borrow exact descriptor and child-object hashes for receipt evidence.
-    #[must_use]
-    pub(crate) fn receipt_artifacts(&self) -> &BTreeMap<String, [u8; 32]> {
-        &self.receipt_artifacts
     }
 
     /// Searches the published scope artifact without a whole-segment scan.
@@ -334,73 +299,48 @@ impl ScopedAnnIndex {
                 actual: query.len(),
             });
         }
-        let (results, probed_centroids, scanned_clusters, probed_routing_nodes, touched_artifacts) =
-            match &self.artifact {
-                ScopedAnnArtifact::Empty => (
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    BTreeSet::new(),
-                ),
-                ScopedAnnArtifact::Flat(index) => {
-                    let output = search_ivf_flat_with_trace(
-                        index,
-                        CoarsePayloadEncoding::Sq8,
-                        query,
-                        top_k,
-                        nprobe,
-                        filter,
-                        distance_metric,
-                        store,
-                        oversample_factor,
-                        cache,
-                        include_attributes,
-                        rerank_coalesce_gap_bytes,
-                    )
-                    .await?;
-                    (
-                        output.results,
-                        output.probed_centroids,
-                        output.scanned_clusters,
-                        Vec::new(),
-                        output.touched_artifacts,
-                    )
-                }
-                ScopedAnnArtifact::Hierarchical(index) => {
-                    let output = search_hierarchical_with_trace(
-                        index,
-                        query,
-                        top_k,
-                        nprobe,
-                        filter,
-                        distance_metric,
-                        store,
-                        oversample_factor,
-                        cache,
-                        include_attributes,
-                    )
-                    .await?;
-                    (
-                        output.results,
-                        output.probed_centroids.clone(),
-                        output.probed_centroids,
-                        output.probed_routing_nodes,
-                        output.touched_artifacts,
-                    )
-                }
-            };
-        let mut touched_artifacts = touched_artifacts;
-        touched_artifacts.insert(self.receipt_descriptor_key.clone());
-        touched_artifacts.extend(self.receipt_routing_key.iter().cloned());
-        touched_artifacts.extend(self.receipt_sketch_key.iter().cloned());
+        let (results, clusters_probed) = match &self.artifact {
+            ScopedAnnArtifact::Empty => (Vec::new(), 0),
+            ScopedAnnArtifact::Flat(index) => {
+                let output = search_ivf_flat_with_trace(
+                    index,
+                    CoarsePayloadEncoding::Sq8,
+                    query,
+                    top_k,
+                    nprobe,
+                    filter,
+                    distance_metric,
+                    store,
+                    oversample_factor,
+                    cache,
+                    include_attributes,
+                    rerank_coalesce_gap_bytes,
+                )
+                .await?;
+                let clusters_probed = output.probed_centroids.len();
+                (output.results, clusters_probed)
+            }
+            ScopedAnnArtifact::Hierarchical(index) => {
+                let output = search_hierarchical_with_trace(
+                    index,
+                    query,
+                    top_k,
+                    nprobe,
+                    filter,
+                    distance_metric,
+                    store,
+                    oversample_factor,
+                    cache,
+                    include_attributes,
+                )
+                .await?;
+                let clusters_probed = output.probed_centroids.len();
+                (output.results, clusters_probed)
+            }
+        };
         Ok(ScopedAnnSearch {
             results,
-            clusters_probed: probed_centroids.len(),
-            probed_centroids,
-            scanned_clusters,
-            probed_routing_nodes,
-            touched_artifacts,
+            clusters_probed,
         })
     }
 
@@ -549,26 +489,6 @@ struct ScopedAnnDescriptor {
 }
 
 impl ScopedAnnDescriptor {
-    fn routing_key(&self) -> Option<String> {
-        let artifact_id = self.artifact_id.as_ref()?;
-        match self.kind {
-            ScopedAnnKind::Empty => None,
-            ScopedAnnKind::Flat => Some(self.bootstrap.as_ref().map_or_else(
-                || {
-                    crate::index::ivf_flat::build::centroids_key(
-                        &self.artifact_namespace,
-                        artifact_id,
-                    )
-                },
-                |artifact| artifact.key.clone(),
-            )),
-            ScopedAnnKind::Hierarchical => Some(crate::index::hierarchical::tree_meta_key(
-                &self.artifact_namespace,
-                artifact_id,
-            )),
-        }
-    }
-
     fn empty(scope_cache_key: &str, artifact_namespace: String, dimensions: usize) -> Self {
         Self {
             version: SCOPED_ANN_DESCRIPTOR_VERSION,
@@ -663,19 +583,6 @@ impl ScopedAnnDescriptor {
         }
         self.validate_artifact_hashes()?;
         Ok(())
-    }
-
-    fn receipt_artifacts(
-        &self,
-        descriptor_key: &str,
-        descriptor_bytes: &[u8],
-    ) -> BTreeMap<String, [u8; 32]> {
-        let mut artifacts = self.artifact_hashes.clone();
-        artifacts.insert(
-            descriptor_key.to_string(),
-            <[u8; 32]>::from(Sha256::digest(descriptor_bytes)),
-        );
-        artifacts
     }
 
     fn to_bytes(&self) -> Result<Bytes> {
@@ -890,15 +797,7 @@ impl ScopedAnnDescriptor {
         self,
         store: &ZeppelinStore,
         cache: Option<&Arc<DiskCache>>,
-        receipt_artifacts: BTreeMap<String, [u8; 32]>,
-        receipt_descriptor_key: String,
     ) -> Result<ScopedAnnIndex> {
-        let receipt_routing_key = self.routing_key();
-        let receipt_sketch_key = self
-            .bootstrap
-            .is_none()
-            .then(|| self.sketch.as_ref().map(|artifact| artifact.key.clone()))
-            .flatten();
         let artifact = match (self.kind, self.artifact_id.as_ref()) {
             (ScopedAnnKind::Empty, None) => ScopedAnnArtifact::Empty,
             (ScopedAnnKind::Flat, Some(artifact_id)) => {
@@ -950,10 +849,6 @@ impl ScopedAnnDescriptor {
         Ok(ScopedAnnIndex {
             artifact,
             dimensions: self.dimensions,
-            receipt_artifacts,
-            receipt_descriptor_key,
-            receipt_routing_key,
-            receipt_sketch_key,
         })
     }
 
@@ -972,8 +867,6 @@ impl ScopedAnnDescriptor {
 pub(crate) struct ScopedFtsIndex {
     rows: Vec<ScopedFtsRow>,
     index: InvertedIndex,
-    #[serde(skip)]
-    receipt_artifacts: BTreeMap<String, [u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1013,11 +906,7 @@ impl ScopedFtsIndex {
         let attribute_refs: Vec<Option<&HashMap<String, AttributeValue>>> =
             rows.iter().map(|row| Some(&row.attributes)).collect();
         let index = InvertedIndex::build(&attribute_refs, fts_configs);
-        Self {
-            rows,
-            index,
-            receipt_artifacts: BTreeMap::new(),
-        }
+        Self { rows, index }
     }
 
     /// Loads or create-publishes a stable segment snapshot.
@@ -1042,10 +931,7 @@ impl ScopedFtsIndex {
         let object_key = ScopedArtifactLocation::new(namespace, source_segment_id)
             .fts_object_key(scope_cache_key)?;
         if let Some(bytes) = read_optional_immutable(store, cache, &object_key).await? {
-            let content_hash = <[u8; 32]>::from(Sha256::digest(&bytes));
-            let mut index = decode_scoped_fts(bytes, scope_cache_key.to_string()).await?;
-            index.receipt_artifacts.insert(object_key, content_hash);
-            return Ok(index);
+            return decode_scoped_fts(bytes, scope_cache_key.to_string()).await;
         }
 
         let built = build().await?;
@@ -1055,10 +941,6 @@ impl ScopedFtsIndex {
                 if let Some(cache) = cache {
                     cache.put(&object_key, &bytes).await?;
                 }
-                let mut built = built;
-                built
-                    .receipt_artifacts
-                    .insert(object_key, <[u8; 32]>::from(Sha256::digest(&bytes)));
                 Ok(built)
             }
             CreateOnlyOutcome::AlreadyExists => {
@@ -1066,18 +948,9 @@ impl ScopedFtsIndex {
                 if let Some(cache) = cache {
                     cache.put(&object_key, &winner).await?;
                 }
-                let content_hash = <[u8; 32]>::from(Sha256::digest(&winner));
-                let mut index = decode_scoped_fts(winner, scope_cache_key.to_string()).await?;
-                index.receipt_artifacts.insert(object_key, content_hash);
-                Ok(index)
+                decode_scoped_fts(winner, scope_cache_key.to_string()).await
             }
         }
-    }
-
-    /// Borrow the exact persisted policy-scope artifact used by this query.
-    #[must_use]
-    pub(crate) fn receipt_artifacts(&self) -> &BTreeMap<String, [u8; 32]> {
-        &self.receipt_artifacts
     }
 
     fn to_bytes(&self, scope_cache_key: &str) -> Result<Bytes> {
@@ -1598,10 +1471,6 @@ mod tests {
                 routing_node_ids: Vec::new(),
             })),
             dimensions: 2,
-            receipt_artifacts: BTreeMap::new(),
-            receipt_descriptor_key: String::new(),
-            receipt_routing_key: None,
-            receipt_sketch_key: None,
         };
 
         assert!(

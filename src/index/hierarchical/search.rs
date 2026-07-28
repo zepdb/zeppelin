@@ -87,8 +87,8 @@
 //! [`QuantizationType`] forces each encoding to choose a scan path.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use tracing::debug;
 
@@ -116,33 +116,6 @@ use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 /// The outer vector position matches vector, ID, code, and bitmap row indexes;
 /// an inner `None` means that row has no attributes.
 type ClusterAttrs = Vec<Option<HashMap<String, AttributeValue>>>;
-
-#[derive(Clone, Default)]
-struct ArtifactReadTrace(Arc<Mutex<BTreeSet<String>>>);
-
-impl ArtifactReadTrace {
-    fn record(&self, key: &str) {
-        self.0
-            .lock()
-            .unwrap_or_else(|_| panic!("hierarchical artifact-read trace lock poisoned"))
-            .insert(key.to_string());
-    }
-
-    fn snapshot(&self) -> BTreeSet<String> {
-        self.0
-            .lock()
-            .unwrap_or_else(|_| panic!("hierarchical artifact-read trace lock poisoned"))
-            .clone()
-    }
-}
-
-tokio::task_local! {
-    static ARTIFACT_READ_TRACE: ArtifactReadTrace;
-}
-
-fn record_artifact_read(key: &str) {
-    let _outside_receipt_traced_search = ARTIFACT_READ_TRACE.try_with(|trace| trace.record(key));
-}
 
 /// Owned internal result retained between leaf scanning and final projection.
 ///
@@ -239,7 +212,6 @@ impl<'a> ArtifactReadContext<'a> {
         } else {
             self.store.get(store_key).await
         }?;
-        record_artifact_read(store_key);
         Ok(bytes)
     }
 }
@@ -351,8 +323,6 @@ pub async fn search_hierarchical(
 pub(crate) struct HierarchicalSearchOutput {
     pub(crate) results: Vec<SearchResult>,
     pub(crate) probed_centroids: Vec<usize>,
-    pub(crate) probed_routing_nodes: Vec<String>,
-    pub(crate) touched_artifacts: BTreeSet<String>,
 }
 
 fn require_inventoried_routing_node(
@@ -381,26 +351,19 @@ pub(crate) async fn search_hierarchical_with_trace(
     cache: Option<&Arc<DiskCache>>,
     include_attributes: bool,
 ) -> Result<HierarchicalSearchOutput> {
-    let trace = ArtifactReadTrace::default();
-    let mut output = ARTIFACT_READ_TRACE
-        .scope(
-            trace.clone(),
-            search_hierarchical_with_trace_inner(
-                index,
-                query,
-                top_k,
-                beam_width,
-                filter,
-                distance_metric,
-                store,
-                oversample_factor,
-                cache,
-                include_attributes,
-            ),
-        )
-        .await?;
-    output.touched_artifacts = trace.snapshot();
-    Ok(output)
+    search_hierarchical_with_trace_inner(
+        index,
+        query,
+        top_k,
+        beam_width,
+        filter,
+        distance_metric,
+        store,
+        oversample_factor,
+        cache,
+        include_attributes,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -427,8 +390,6 @@ async fn search_hierarchical_with_trace_inner(
         return Ok(HierarchicalSearchOutput {
             results: Vec::new(),
             probed_centroids: Vec::new(),
-            probed_routing_nodes: Vec::new(),
-            touched_artifacts: BTreeSet::new(),
         });
     }
 
@@ -493,8 +454,6 @@ async fn search_hierarchical_with_trace_inner(
         return Ok(HierarchicalSearchOutput {
             results,
             probed_centroids: cluster_indices,
-            probed_routing_nodes: vec![index.meta.root_node_id.clone()],
-            touched_artifacts: BTreeSet::new(),
         });
     }
 
@@ -516,7 +475,6 @@ async fn search_hierarchical_with_trace_inner(
 
     let mut accumulated: Vec<Candidate> = Vec::new();
     let mut probed_centroids = root_leaf_clusters.clone();
-    let mut probed_routing_nodes = vec![index.meta.root_node_id.clone()];
 
     // Scan any leaf clusters found at root level.
     if !root_leaf_clusters.is_empty() {
@@ -545,8 +503,6 @@ async fn search_hierarchical_with_trace_inner(
         return Ok(HierarchicalSearchOutput {
             results,
             probed_centroids,
-            probed_routing_nodes,
-            touched_artifacts: BTreeSet::new(),
         });
     }
 
@@ -557,7 +513,6 @@ async fn search_hierarchical_with_trace_inner(
         for node_id in &current_ids {
             require_inventoried_routing_node(routing_inventory.as_ref(), node_id)?;
         }
-        probed_routing_nodes.extend(current_ids.iter().cloned());
         let node_results = futures::future::join_all(current_ids.iter().map(|node_id| {
             let nkey = tree_node_key(ns, seg, node_id);
             async move { (node_id.clone(), artifacts.fetch(&nkey).await) }
@@ -625,13 +580,9 @@ async fn search_hierarchical_with_trace_inner(
                     .await?;
             let mut seen = HashSet::new();
             probed_centroids.retain(|cluster| seen.insert(*cluster));
-            let mut seen_nodes = HashSet::new();
-            probed_routing_nodes.retain(|node| seen_nodes.insert(node.clone()));
             return Ok(HierarchicalSearchOutput {
                 results,
                 probed_centroids,
-                probed_routing_nodes,
-                touched_artifacts: BTreeSet::new(),
             });
         }
 

@@ -90,7 +90,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, error};
 
 use crate::cache::DiskCache;
@@ -121,43 +121,6 @@ use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 /// Position `i` belongs to the same row as vector and ID position `i`; `None`
 /// means that row stored no attributes. The outer vector is owned after decode.
 type ClusterAttrs = Vec<Option<HashMap<String, AttributeValue>>>;
-
-#[derive(Clone, Default)]
-struct ArtifactReadTrace(Arc<Mutex<BTreeSet<String>>>);
-
-impl ArtifactReadTrace {
-    fn record(&self, key: &str) {
-        self.0
-            .lock()
-            .unwrap_or_else(|_| panic!("IVF artifact-read trace lock poisoned"))
-            .insert(key.to_string());
-    }
-
-    fn snapshot(&self) -> BTreeSet<String> {
-        self.0
-            .lock()
-            .unwrap_or_else(|_| panic!("IVF artifact-read trace lock poisoned"))
-            .clone()
-    }
-}
-
-tokio::task_local! {
-    static ARTIFACT_READ_TRACE: ArtifactReadTrace;
-}
-
-fn record_artifact_read(key: &str) {
-    let _outside_receipt_traced_search = ARTIFACT_READ_TRACE.try_with(|trace| trace.record(key));
-}
-
-async fn fetch_range_traced(
-    store: &ZeppelinStore,
-    key: &str,
-    range: Range<usize>,
-) -> Result<bytes::Bytes> {
-    let bytes = store.get_range(key, range).await?;
-    record_artifact_read(key);
-    Ok(bytes)
-}
 
 /// Minimum size of the historical smooth cluster budget before adaptation.
 ///
@@ -661,7 +624,6 @@ async fn fetch_with_cache(
     } else {
         store.get(key).await
     }?;
-    record_artifact_read(key);
     Ok(bytes)
 }
 
@@ -711,7 +673,6 @@ async fn fetch_with_cache_counted(
             if let Some(stats) = stats {
                 stats.record_local_bytes(data.len());
             }
-            record_artifact_read(key);
             return Ok(data);
         }
         let data = c
@@ -723,14 +684,12 @@ async fn fetch_with_cache_counted(
                 Ok(data)
             })
             .await?;
-        record_artifact_read(key);
         Ok(data)
     } else {
         let data = store.get(key).await?;
         if let Some(stats) = stats {
             stats.record_get(phase, data.len());
         }
-        record_artifact_read(key);
         Ok(data)
     }
 }
@@ -794,7 +753,6 @@ async fn cached_full_object_for_range(
             crate::metrics::RANGE_SOURCE_TOTAL
                 .with_label_values(&[phase, "local"])
                 .inc_by(range_count);
-            record_artifact_read(store_key);
             return Ok(RangeCacheLookup::Local(data));
         }
         return Ok(RangeCacheLookup::Miss);
@@ -819,7 +777,6 @@ async fn cached_full_object_for_range(
         crate::metrics::RANGE_SOURCE_TOTAL
             .with_label_values(&[phase, "local"])
             .inc_by(range_count);
-        record_artifact_read(store_key);
         return Ok(RangeCacheLookup::Local(data));
     }
 
@@ -954,7 +911,7 @@ async fn fetch_cluster_object_for_flat_scan(
                 }
                 RangeCacheLookup::CorruptEvicted => {}
             }
-            return fetch_range_traced(store, &object.key, range).await;
+            return store.get_range(&object.key, range).await;
         }
     }
     fetch_with_cache(cache, store, &object.key, &object.cache_key).await
@@ -1198,8 +1155,6 @@ pub async fn search_ivf_flat(
 pub(crate) struct IvfFlatSearchOutput {
     pub(crate) results: Vec<SearchResult>,
     pub(crate) probed_centroids: Vec<usize>,
-    pub(crate) scanned_clusters: Vec<usize>,
-    pub(crate) touched_artifacts: BTreeSet<String>,
 }
 
 /// Execute IVF search while preserving the production centroid-ranking trace.
@@ -1218,28 +1173,21 @@ pub(crate) async fn search_ivf_flat_with_trace(
     include_attributes: bool,
     rerank_coalesce_gap_bytes: usize,
 ) -> Result<IvfFlatSearchOutput> {
-    let trace = ArtifactReadTrace::default();
-    let mut output = ARTIFACT_READ_TRACE
-        .scope(
-            trace.clone(),
-            search_ivf_flat_with_trace_inner(
-                index,
-                coarse_payload_encoding,
-                query,
-                top_k,
-                nprobe,
-                filter,
-                distance_metric,
-                store,
-                oversample_factor,
-                cache,
-                include_attributes,
-                rerank_coalesce_gap_bytes,
-            ),
-        )
-        .await?;
-    output.touched_artifacts = trace.snapshot();
-    Ok(output)
+    search_ivf_flat_with_trace_inner(
+        index,
+        coarse_payload_encoding,
+        query,
+        top_k,
+        nprobe,
+        filter,
+        distance_metric,
+        store,
+        oversample_factor,
+        cache,
+        include_attributes,
+        rerank_coalesce_gap_bytes,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1269,8 +1217,6 @@ async fn search_ivf_flat_with_trace_inner(
         return Ok(IvfFlatSearchOutput {
             results: Vec::new(),
             probed_centroids: Vec::new(),
-            scanned_clusters: Vec::new(),
-            touched_artifacts: BTreeSet::new(),
         });
     }
 
@@ -1508,8 +1454,6 @@ async fn search_ivf_flat_with_trace_inner(
     Ok(IvfFlatSearchOutput {
         results,
         probed_centroids: probe_clusters,
-        scanned_clusters: scan_clusters,
-        touched_artifacts: BTreeSet::new(),
     })
 }
 
@@ -3271,7 +3215,7 @@ async fn fetch_object_coarse_range(
         }
         RangeCacheLookup::CorruptEvicted => {}
     }
-    let bytes = fetch_range_traced(store, object_key, start..end).await?;
+    let bytes = store.get_range(object_key, start..end).await?;
     if let Some(stats) = stats {
         stats.record_get(SqBytePhase::Sq, bytes.len());
         stats.record_logical_sq_bytes(logical_bytes);
@@ -3618,7 +3562,7 @@ async fn fetch_rerank_vectors_by_range(
                     ranges
                         .iter()
                         .cloned()
-                        .map(|range| fetch_range_traced(store, object_key, range)),
+                        .map(|range| store.get_range(object_key, range)),
                 )
                 .await
                 .into_iter()
@@ -3642,7 +3586,7 @@ async fn fetch_rerank_vectors_by_range(
                     ranges
                         .iter()
                         .cloned()
-                        .map(|range| fetch_range_traced(store, object_key, range)),
+                        .map(|range| store.get_range(object_key, range)),
                 )
                 .await
                 .into_iter()
@@ -3973,7 +3917,6 @@ async fn load_cluster_object_layout(
 
     if let Some(c) = cache {
         if let Some(layout) = c.get_decoded::<ClusterObjectLayout>(&object.cache_key)? {
-            record_artifact_read(&object.key);
             return Ok(Some(layout));
         }
     }
@@ -3981,7 +3924,6 @@ async fn load_cluster_object_layout(
         .get(&object.cache_key)
         .map(|entry| Arc::clone(entry.value()))
     {
-        record_artifact_read(&object.key);
         if let Some(c) = cache {
             c.insert_decoded(&object.cache_key, Arc::clone(&layout));
         }
@@ -4005,14 +3947,14 @@ async fn load_cluster_object_layout(
             crate::metrics::RANGE_SOURCE_TOTAL
                 .with_label_values(&["header", "s3"])
                 .inc();
-            let header = fetch_range_traced(store, &object.key, 0..header_len).await?;
+            let header = store.get_range(&object.key, 0..header_len).await?;
             if let Some(stats) = stats {
                 stats.record_get(SqBytePhase::Other, header.len());
             }
             header
         }
         RangeCacheLookup::CorruptEvicted => {
-            let header = fetch_range_traced(store, &object.key, 0..header_len).await?;
+            let header = store.get_range(&object.key, 0..header_len).await?;
             if let Some(stats) = stats {
                 stats.record_get(SqBytePhase::Other, header.len());
             }

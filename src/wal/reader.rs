@@ -69,7 +69,7 @@
 //! `Arc`, so the reader performs no reference-count clone per fragment.
 
 use std::borrow::Borrow;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -91,22 +91,6 @@ pub(crate) struct LocatedWalFragment {
     pub(crate) identity: LocatedFragmentIdentity,
     /// Shared checksum-validated body.
     pub(crate) fragment: Arc<WalFragment>,
-}
-
-/// Successful origin-resolved WAL reads plus their exact physical keys.
-pub(crate) struct LocatedWalRead {
-    /// Checksum-validated bodies in manifest replay order.
-    pub(crate) fragments: Vec<LocatedWalFragment>,
-    /// Physical immutable keys whose contents were returned to the caller.
-    pub(crate) touched_artifacts: BTreeSet<String>,
-}
-
-/// Effective tombstones plus the exact WAL objects consumed to derive them.
-pub(crate) struct LocatedWalDeleteRead {
-    /// IDs whose last operation among the selected delete-bearing refs is delete.
-    pub(crate) deleted_ids: HashSet<String>,
-    /// Physical immutable keys whose contents were returned to the caller.
-    pub(crate) touched_artifacts: BTreeSet<String>,
 }
 
 impl Borrow<WalFragment> for LocatedWalFragment {
@@ -594,31 +578,6 @@ impl WalReader {
         self.finish_located_fragment_results(refs, results).await
     }
 
-    /// Read origin-resolved query fragments and retain exact successful keys.
-    pub(crate) async fn read_located_query_fragments_with_trace_unchecked(
-        &self,
-        refs: &[LocatedFragmentRef<'_>],
-        cache_policy: FragmentCachePolicy<'_>,
-        fragment_cache: Option<&Arc<WalFragmentCache>>,
-    ) -> Result<LocatedWalRead> {
-        let fragments = self
-            .read_located_query_fragments_unchecked(refs, cache_policy, fragment_cache)
-            .await?;
-        let touched_artifacts = fragments
-            .iter()
-            .map(|fragment| {
-                WalFragment::s3_key(
-                    fragment.identity.physical_origin.namespace.as_str(),
-                    &fragment.identity.id,
-                )
-            })
-            .collect();
-        Ok(LocatedWalRead {
-            fragments,
-            touched_artifacts,
-        })
-    }
-
     /// Compute effective tombstones from origin-resolved delete-bearing refs.
     pub(crate) async fn read_located_delete_ids_unchecked(
         &self,
@@ -626,38 +585,19 @@ impl WalReader {
         cache_policy: FragmentCachePolicy<'_>,
         fragment_cache: Option<&Arc<WalFragmentCache>>,
     ) -> Result<HashSet<String>> {
-        self.read_located_delete_ids_with_trace_unchecked(refs, cache_policy, fragment_cache)
-            .await
-            .map(|read| read.deleted_ids)
-    }
-
-    /// Compute effective tombstones and retain exact successful physical keys.
-    pub(crate) async fn read_located_delete_ids_with_trace_unchecked(
-        &self,
-        refs: &[LocatedFragmentRef<'_>],
-        cache_policy: FragmentCachePolicy<'_>,
-        fragment_cache: Option<&Arc<WalFragmentCache>>,
-    ) -> Result<LocatedWalDeleteRead> {
         let delete_refs: Vec<LocatedFragmentRef<'_>> = refs
             .iter()
             .copied()
             .filter(|located| located.fragment.delete_count > 0)
             .collect();
         if delete_refs.is_empty() {
-            return Ok(LocatedWalDeleteRead {
-                deleted_ids: HashSet::new(),
-                touched_artifacts: BTreeSet::new(),
-            });
+            return Ok(HashSet::new());
         }
-        let read = self
-            .read_located_query_fragments_with_trace_unchecked(
-                &delete_refs,
-                cache_policy,
-                fragment_cache,
-            )
+        let fragments = self
+            .read_located_query_fragments_unchecked(&delete_refs, cache_policy, fragment_cache)
             .await?;
         let mut deleted_ids = HashSet::new();
-        for fragment in &read.fragments {
+        for fragment in &fragments {
             for deleted in &fragment.deletes {
                 deleted_ids.insert(deleted.clone());
             }
@@ -665,10 +605,7 @@ impl WalReader {
                 deleted_ids.remove(&vector.id);
             }
         }
-        Ok(LocatedWalDeleteRead {
-            deleted_ids,
-            touched_artifacts: read.touched_artifacts,
-        })
+        Ok(deleted_ids)
     }
 
     /// Reads query-visible refs while memoizing successful decoded fragments.

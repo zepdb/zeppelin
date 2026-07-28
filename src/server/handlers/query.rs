@@ -143,7 +143,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use axum::extract::{Extension, Path, Query, State};
@@ -4552,15 +4552,6 @@ fn fuse_source_responses(
         groups: None,
         facets: None,
         explain: None,
-        receipt: None,
-        receipt_traversal: Vec::new(),
-        probed_centroids: Vec::new(),
-        scanned_clusters: Vec::new(),
-        probed_routing_nodes: Vec::new(),
-        receipt_derived_artifacts: BTreeMap::new(),
-        receipt_derived_touched_artifacts: BTreeSet::new(),
-        receipt_touched_artifacts: BTreeSet::new(),
-        receipt_derived_artifacts_complete: false,
     })
 }
 
