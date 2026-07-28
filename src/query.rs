@@ -613,11 +613,6 @@ pub struct QueryParams<'a> {
     pub oversample_factor: usize,
     /// Largest byte gap allowed when coalescing exact-rerank range GETs.
     pub rerank_coalesce_gap_bytes: usize,
-    /// Whether an unfiltered quantized segment scan may pick its exact-rerank
-    /// frontier from resident sketch row scores instead of reading coarse
-    /// payloads. Off is the shipped default; see
-    /// [`Config::effective_resident_row_bypass`](crate::config::Config::effective_resident_row_bypass).
-    pub resident_row_bypass: bool,
     /// Disposable immutable-artifact cache; absence reads through the store.
     pub cache: Option<&'a Arc<DiskCache>>,
     /// Optional current-manifest cache with consistency-aware freshness rules.
@@ -1352,7 +1347,6 @@ async fn execute_query_with_manifest_scoped(
         distance_metric,
         oversample_factor,
         rerank_coalesce_gap_bytes,
-        resident_row_bypass,
         cache,
         manifest_cache: _,
         include_attributes,
@@ -1446,7 +1440,6 @@ async fn execute_query_with_manifest_scoped(
                 distance_metric,
                 oversample_factor,
                 rerank_coalesce_gap_bytes,
-                resident_row_bypass,
                 cache,
                 include_attributes,
                 scoped_ann,
@@ -1498,7 +1491,6 @@ async fn execute_query_with_manifest_scoped(
                 distance_metric,
                 oversample_factor,
                 rerank_coalesce_gap_bytes,
-                resident_row_bypass,
                 cache,
                 include_attributes,
                 scoped_ann,
@@ -1913,7 +1905,6 @@ async fn segment_search(
     distance_metric: DistanceMetric,
     oversample_factor: usize,
     rerank_coalesce_gap_bytes: usize,
-    resident_row_bypass: bool,
     cache: Option<&Arc<DiskCache>>,
     include_attributes: bool,
     scoped_ann: Option<ScopedAnnQuery<'_>>,
@@ -1930,7 +1921,6 @@ async fn segment_search(
             distance_metric,
             oversample_factor,
             rerank_coalesce_gap_bytes,
-            resident_row_bypass,
             cache,
             include_attributes,
             scoped_ann,
@@ -1980,7 +1970,6 @@ async fn segment_search(
         cache,
         include_attributes,
         rerank_coalesce_gap_bytes,
-        resident_row_bypass,
     )
     .await?;
 
@@ -2001,7 +1990,6 @@ async fn scoped_segment_search(
     distance_metric: DistanceMetric,
     oversample_factor: usize,
     rerank_coalesce_gap_bytes: usize,
-    resident_row_bypass: bool,
     cache: Option<&Arc<DiskCache>>,
     include_attributes: bool,
     scoped_ann: ScopedAnnQuery<'_>,
@@ -2050,7 +2038,6 @@ async fn scoped_segment_search(
             cache,
             oversample_factor,
             rerank_coalesce_gap_bytes,
-            resident_row_bypass,
             include_attributes,
         )
         .await?;

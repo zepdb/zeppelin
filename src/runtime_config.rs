@@ -64,13 +64,6 @@ use crate::error::{Result, ZeppelinError};
 pub struct QueryKnobs {
     /// Maximum gap, in bytes, between rerank f32 ranges merged into one GET.
     pub rerank_coalesce_gap_bytes: usize,
-    /// Whether unfiltered quantized scans may select their exact-rerank
-    /// frontier from resident sketch row scores instead of coarse payloads.
-    ///
-    /// Startup configuration only: it changes the approximate selection signal,
-    /// so it is deliberately absent from [`QueryKnobsPatch`] and cannot be
-    /// flipped by an admin request mid-flight.
-    pub resident_row_bypass: bool,
     /// Minimum probes for an omitted query; flat segments may scale above it.
     pub default_nprobe: usize,
     /// Default result count when a query omits `top_k`.
@@ -203,7 +196,6 @@ impl RuntimeQueryConfig {
         Self {
             inner: RwLock::new(Arc::new(QueryKnobs {
                 rerank_coalesce_gap_bytes: config.effective_rerank_coalesce_gap_bytes(),
-                resident_row_bypass: config.effective_resident_row_bypass(),
                 default_nprobe: config.indexing.default_nprobe,
                 default_top_k: config.server.default_top_k,
                 bm25_max_full_scan_clusters: config.indexing.bm25_max_full_scan_clusters,

@@ -4424,7 +4424,6 @@ async fn execute_query_source_with_manifest(
                 distance_metric: meta.distance_metric,
                 oversample_factor: state.config.indexing.oversample_factor,
                 rerank_coalesce_gap_bytes: knobs.rerank_coalesce_gap_bytes,
-                resident_row_bypass: knobs.resident_row_bypass,
                 cache: Some(&state.cache),
                 manifest_cache: Some(&state.manifest_cache),
                 include_attributes,

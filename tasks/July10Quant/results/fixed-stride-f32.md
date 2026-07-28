@@ -6,11 +6,17 @@ implementation and a fixture that could not test what it claimed to. See
 
 ## Verdict
 
-**Do not ship the bypass.** F4's prewritten rule is met: physical bytes fell
-1.45x, below its 2x threshold, and result quality moved materially at the same
-time. The bypass is committed but **off by default**
-(`[query] resident_row_bypass`, default `false`) so the evidence stays
-reproducible from `tests/fixed_stride_f32_tests.rs`.
+**Do not ship the bypass, and it is not in the tree.** F4's prewritten rule is
+met: physical bytes fell 1.45x, below its 2x threshold, and result quality
+moved materially at the same time.
+
+The implementation was measured, verdicted, and then removed rather than
+carried on main behind a default-off knob: a dead selector is maintenance cost
+against a result that says not to use it. Slices 9.1 and 9.2 stay — they are a
+GET reduction in their own right (see "What 9.1/9.2 are worth without 9.3").
+
+To reproduce this table, restore the implementation from `212b689` and its test
+from `tests/fixed_stride_f32_tests.rs` at that commit.
 
 ## Fixture and method
 
@@ -126,6 +132,38 @@ With all three fixed the verdict changed in both directions: F3 went from
 failed to marginally survived, and F4's byte ratio improved from 1.27x to 1.45x
 but still misses the threshold. The conclusion is unchanged, and is now
 supported by a measurement that means what it says.
+
+## What 9.1/9.2 are worth without 9.3
+
+9.3 was the projected headline (149 MB of coarse reads per query going to
+~0.2-0.5 MB), so it is fair to ask whether the format work pays for itself
+alone. It does, in the currency Slice 6.3 established matters on S3.
+
+**The win: one fewer GET per grouped object touched, per query.** Before 9.2 a
+query could not compute a cluster's byte offsets without first range-reading
+the grouped object's `ZBP4` directory, so each touched object cost a header GET
+plus a coarse GET plus rerank ranges. Manifest-declared row layouts delete the
+header read outright. `tests/get_count_bench.rs` pins it directly at 2 objects:
+cluster GETs 6 -> 4, total 12 -> 10. The coarse cell of the census above is
+10 objects at 20 GETs; the same query before 9.2 would have paid 30.
+
+That is a **33% query GET reduction at production probe ratios**, and unlike
+9.3's byte reduction it lands in the currency that costs money.
+
+Secondary: ID bytes are stored once per row in the ID block instead of inline
+in every exact row, so `ZBP5` objects are smaller than `ZBP4` by about
+`4 + id_len` per row — around 2% at dim 256, under 1% at dim 768. Real but
+minor.
+
+**The cost, which should be tracked:** `row_layouts` adds one 8-field record
+per cluster per object to every quantized segment's manifest — roughly 15-20 KB
+at the production `nlist = 334`, and 200-250 KB at the 4096 upper bound. The
+manifest is CAS-PUT on every WAL append and read on the query path. The
+perf-contract manifest byte bands were deliberately not rebaselined; they need
+a deliberate capture.
+
+Net: keep 9.1 and 9.2. The header-GET elimination stands on its own, and it
+does not depend on any part of 9.3.
 
 ## If this is picked up again
 

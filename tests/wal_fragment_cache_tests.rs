@@ -79,7 +79,6 @@ async fn strong_query_with_filter(
             distance_metric: DistanceMetric::Euclidean,
             oversample_factor: 1,
             rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
-            resident_row_bypass: false,
             cache: Some(cache),
             manifest_cache: None,
             include_attributes: true,

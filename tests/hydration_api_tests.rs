@@ -308,7 +308,6 @@ async fn test_admin_hydrate_endpoint_hydrates_namespace() {
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: server.oversample_factor,
         rerank_coalesce_gap_bytes: DEFAULT_RERANK_COALESCE_GAP_BYTES,
-        resident_row_bypass: false,
         cache: Some(&server.cache),
         manifest_cache: None,
         include_attributes: false,

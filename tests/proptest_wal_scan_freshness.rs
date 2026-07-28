@@ -296,7 +296,6 @@ async fn assert_case(seed: u64, random_top_k: usize) -> Result<(), String> {
                     distance_metric: DistanceMetric::Euclidean,
                     oversample_factor: 3,
                     rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
-                    resident_row_bypass: false,
                     cache: None,
                     manifest_cache: None,
                     include_attributes: true,

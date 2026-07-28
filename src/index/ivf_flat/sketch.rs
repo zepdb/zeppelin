@@ -392,19 +392,6 @@ impl Rabitq2QueryScorer<'_> {
 }
 
 impl ResidentSketch {
-    /// Reports whether row scores come from attached production v4 state.
-    #[must_use]
-    pub(crate) fn supports_row_frontier(&self) -> bool {
-        self.version == SKETCH_VERSION
-            && matches!(
-                &self.encoding,
-                ResidentEncoding::Rabitq2 {
-                    rotated_centroids: Some(_),
-                    ..
-                }
-            )
-    }
-
     /// Decodes and validates one complete supported sketch for unit tests.
     ///
     /// Validation derives every section size with checked arithmetic, requires
@@ -947,6 +934,30 @@ impl ResidentSketch {
     /// scans two bit planes per row. Legacy formats build a PQ ADC table. Both
     /// retain at most `mass_top_k` rows in a heap plus one score per cluster.
     ///
+    /// # Measured: do not re-propose a row-frontier bypass without new evidence
+    ///
+    /// This loop scores every row and then reduces to per-cluster mass,
+    /// discarding the `(cluster_idx, row_idx)` coordinates. Exposing them so an
+    /// unfiltered query could fetch only the winning rows' IDs and exact
+    /// vectors — skipping cluster coarse payloads entirely — was built and
+    /// measured as Phase 4 slice 9.3, and **rejected**. See
+    /// `tasks/July10Quant/results/fixed-stride-f32.md`; the implementation is
+    /// recoverable from `212b689`.
+    ///
+    /// Two findings, both against the idea rather than that implementation:
+    ///
+    /// - **Winner dispersion is near-total.** At production probe/frontier
+    ///   ratios a 40-row frontier over 3,750 probed rows still touched 9 of the
+    ///   10 grouped objects the coarse path touched, so requests fell only
+    ///   20 -> 18. The bypass saves reads only if winners concentrate into few
+    ///   objects, and they do not.
+    /// - **This sketch is a materially weaker selector than SQ8 coarse codes.**
+    ///   Same frontier, same probe set, same exact-f32 rerank: recall@10 fell
+    ///   1.00 -> 0.80 and recall@100 fell 1.00 -> 0.94.
+    ///
+    /// The binding constraint is selection quality, not row addressing. A wider
+    /// sketch would attack it; better addressing will not.
+    ///
     /// # Rust Notes for Java/C Engineers
     ///
     /// The iterator chain that builds `centroid_rank` consumes copied integer
@@ -960,25 +971,6 @@ impl ResidentSketch {
         probe_clusters: &[usize],
         mass_top_k: usize,
     ) -> Result<Vec<ClusterScore>> {
-        Ok(self
-            .rank_clusters_with_frontier(query, distance_metric, probe_clusters, mass_top_k, 0)?
-            .ranked_clusters)
-    }
-
-    /// Scores one probe set once for cluster mass and an optional row frontier.
-    ///
-    /// Existing cluster selection consumes `ranked_clusters`; the fixed-stride
-    /// rerank path consumes `row_frontier`. Both outputs share the same prepared
-    /// query scorer and per-row ADC pass, so requesting row coordinates never
-    /// scans the resident sketch a second time.
-    pub(crate) fn rank_clusters_with_frontier(
-        &self,
-        query: &[f32],
-        distance_metric: DistanceMetric,
-        probe_clusters: &[usize],
-        mass_top_k: usize,
-        row_frontier_top_k: usize,
-    ) -> Result<ResidentSketchScores> {
         if query.len() != self.dim {
             return Err(ZeppelinError::DimensionMismatch {
                 expected: self.dim,
@@ -1012,7 +1004,7 @@ impl ResidentSketch {
             .map(|(rank, cluster_idx)| (cluster_idx, rank))
             .collect();
         let mut ranked_clusters = Vec::new();
-        let mut row_scores = SketchRowAccumulator::new(mass_top_k, row_frontier_top_k);
+        let mut top_rows = BinaryHeap::with_capacity(mass_top_k);
         for &cluster_idx in probe_clusters {
             let (start, end) = self.cluster_offsets[cluster_idx];
             if start == end {
@@ -1026,11 +1018,11 @@ impl ResidentSketch {
                 let codes = &self.codes[code_offset..code_offset + self.packed_code_bytes];
                 let score = scorer.score(codes)?;
                 top_scores.insert(score);
-                row_scores.insert(ResidentRowScore {
-                    approximate_score: score,
-                    cluster_idx,
-                    row_idx: row - start,
-                });
+                insert_top_mass_row(
+                    &mut top_rows,
+                    mass_top_k,
+                    SketchRowScore { score, cluster_idx },
+                );
             }
             ranked_clusters.push(ClusterScore {
                 cluster_idx,
@@ -1040,7 +1032,7 @@ impl ResidentSketch {
         }
 
         let mut mass_counts = vec![0usize; self.cluster_count];
-        for row in row_scores.mass_rows {
+        for row in top_rows {
             mass_counts[row.cluster_idx] += 1;
         }
         for score in &mut ranked_clusters {
@@ -1069,91 +1061,7 @@ impl ResidentSketch {
                 })
         });
 
-        let mut row_frontier = row_scores.frontier_rows.into_vec();
-        row_frontier.sort();
-        Ok(ResidentSketchScores {
-            ranked_clusters,
-            row_frontier,
-        })
-    }
-
-    /// Scores additional clusters for the row frontier only.
-    ///
-    /// The coarse path expands its probe set to whole grouped objects, so it
-    /// examines every row of every object it touches. Scoring the bypass over
-    /// the bare centroid probe set would hand it a strictly smaller candidate
-    /// pool and make any recall comparison between the two meaningless. This
-    /// covers the difference: pass the clusters the coarse path would have
-    /// scanned but the probe set does not name.
-    ///
-    /// Cluster mass and ranking are deliberately not affected. Those feed
-    /// object selection, which has already happened by the time this is called,
-    /// and changing them would move the existing coarse path.
-    ///
-    /// # Parameters
-    ///
-    /// - `clusters`: Extra clusters, disjoint from the original probe set. No
-    ///   row is scored twice.
-    /// - `row_frontier_top_k`: Bound on retained rows, same as the first pass.
-    ///
-    /// # Returns
-    ///
-    /// The best rows among `clusters`, unsorted. Callers merge this with the
-    /// probe set's frontier and re-bound the union.
-    ///
-    /// # Errors
-    ///
-    /// Returns a dimension mismatch for a wrong-width query and an index error
-    /// for a cluster outside this sketch.
-    pub(crate) fn frontier_rows(
-        &self,
-        query: &[f32],
-        distance_metric: DistanceMetric,
-        clusters: &[usize],
-        row_frontier_top_k: usize,
-    ) -> Result<Vec<ResidentRowScore>> {
-        if query.len() != self.dim {
-            return Err(ZeppelinError::DimensionMismatch {
-                expected: self.dim,
-                actual: query.len(),
-            });
-        }
-        if clusters.is_empty() || row_frontier_top_k == 0 {
-            return Ok(Vec::new());
-        }
-        for &cluster_idx in clusters {
-            if cluster_idx >= self.cluster_count {
-                return Err(ZeppelinError::Index(format!(
-                    "frontier cluster {cluster_idx} outside sketch cluster_count {}",
-                    self.cluster_count
-                )));
-            }
-        }
-
-        let mut scorer = self.prepare_query_scorer(query, distance_metric)?;
-        let mut frontier = BinaryHeap::with_capacity(row_frontier_top_k);
-        for &cluster_idx in clusters {
-            let (start, end) = self.cluster_offsets[cluster_idx];
-            if start == end {
-                continue;
-            }
-            scorer.prepare_cluster(cluster_idx)?;
-            for row in start..end {
-                let code_offset = row * self.packed_code_bytes;
-                let codes = &self.codes[code_offset..code_offset + self.packed_code_bytes];
-                let score = scorer.score(codes)?;
-                insert_top_frontier_row(
-                    &mut frontier,
-                    row_frontier_top_k,
-                    ResidentRowScore {
-                        approximate_score: score,
-                        cluster_idx,
-                        row_idx: row - start,
-                    },
-                );
-            }
-        }
-        Ok(frontier.into_vec())
+        Ok(ranked_clusters)
     }
 
     /// Precomputes query distance to every codeword for constant-time code lookup.
@@ -1914,90 +1822,47 @@ pub(crate) struct ClusterScore {
     pub(crate) mass_count: usize,
 }
 
-/// Outputs derived from one shared resident-sketch row scan.
-pub(crate) struct ResidentSketchScores {
-    /// Existing cluster-mass ranking, sorted by coarse preference.
-    pub(crate) ranked_clusters: Vec<ClusterScore>,
-    /// Globally best requested rows, sorted by deterministic coarse preference.
-    pub(crate) row_frontier: Vec<ResidentRowScore>,
-}
-
-/// Owned approximate row coordinate retained from the resident sketch.
+/// Heap entry for one approximate row participating in global mass counting.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ResidentRowScore {
+struct SketchRowScore {
     /// Lower-is-better ADC score.
-    pub(crate) approximate_score: f32,
+    score: f32,
     /// Cluster that owns the encoded row.
-    pub(crate) cluster_idx: usize,
-    /// Zero-based row position within that cluster.
-    pub(crate) row_idx: usize,
+    cluster_idx: usize,
 }
 
-impl PartialEq for ResidentRowScore {
+impl PartialEq for SketchRowScore {
     /// Compares exact float bit patterns and cluster indexes for heap consistency.
     ///
     /// Bit equality distinguishes representations such as positive and negative
     /// zero. Together with [`Ord::cmp`]'s total float order, this avoids the
     /// undefined NaN behavior of ordinary partial float comparison.
     fn eq(&self, other: &Self) -> bool {
-        self.approximate_score.to_bits() == other.approximate_score.to_bits()
-            && self.cluster_idx == other.cluster_idx
-            && self.row_idx == other.row_idx
+        self.score.to_bits() == other.score.to_bits() && self.cluster_idx == other.cluster_idx
     }
 }
 
-impl Eq for ResidentRowScore {}
+impl Eq for SketchRowScore {}
 
-impl PartialOrd for ResidentRowScore {
+impl PartialOrd for SketchRowScore {
     /// Adapts the type's total ordering to APIs expecting partial ordering.
     ///
-    /// This always returns `Some` because [`ResidentRowScore::cmp`] orders every
+    /// This always returns `Some` because [`SketchRowScore::cmp`] orders every
     /// IEEE-754 bit pattern, including NaN.
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for ResidentRowScore {
-    /// Orders worse scores first, then uses stable row coordinates as tie-breaks.
+impl Ord for SketchRowScore {
+    /// Orders worse (larger) scores first, then uses cluster index as a tie-break.
     ///
     /// Rust's `f32::total_cmp` resembles Java's `Float.compare`; C callers would
     /// need to define an explicit total order before using floats in a heap.
     fn cmp(&self, other: &Self) -> Ordering {
-        self.approximate_score
-            .total_cmp(&other.approximate_score)
+        self.score
+            .total_cmp(&other.score)
             .then_with(|| self.cluster_idx.cmp(&other.cluster_idx))
-            .then_with(|| self.row_idx.cmp(&other.row_idx))
-    }
-}
-
-/// Shared accumulator fed by the single resident-sketch ADC row loop.
-struct SketchRowAccumulator {
-    /// Historical mass window used by cluster ranking.
-    mass_rows: BinaryHeap<ResidentRowScore>,
-    /// Optional larger row window used by fixed-stride exact rerank.
-    frontier_rows: BinaryHeap<ResidentRowScore>,
-    /// Maximum number of rows retained for cluster mass.
-    mass_top_k: usize,
-    /// Maximum number of explicit row coordinates returned to search.
-    frontier_top_k: usize,
-}
-
-impl SketchRowAccumulator {
-    /// Allocates the two bounded views populated from each score exactly once.
-    fn new(mass_top_k: usize, frontier_top_k: usize) -> Self {
-        Self {
-            mass_rows: BinaryHeap::with_capacity(mass_top_k),
-            frontier_rows: BinaryHeap::with_capacity(frontier_top_k),
-            mass_top_k,
-            frontier_top_k,
-        }
-    }
-
-    /// Feeds one row into cluster-mass and frontier views without rescoring it.
-    fn insert(&mut self, row: ResidentRowScore) {
-        insert_top_mass_row(&mut self.mass_rows, self.mass_top_k, row);
-        insert_top_frontier_row(&mut self.frontier_rows, self.frontier_top_k, row);
     }
 }
 
@@ -2023,9 +1888,9 @@ impl SketchRowAccumulator {
 /// With capacity two and retained scores `1.0` and `3.0`, inserting `2.0`
 /// evicts `3.0`; inserting `4.0` changes nothing.
 fn insert_top_mass_row(
-    top_rows: &mut BinaryHeap<ResidentRowScore>,
+    top_rows: &mut BinaryHeap<SketchRowScore>,
     mass_top_k: usize,
-    row: ResidentRowScore,
+    row: SketchRowScore,
 ) {
     if top_rows.len() < mass_top_k {
         top_rows.push(row);
@@ -2036,34 +1901,7 @@ fn insert_top_mass_row(
         top_rows.push(row);
         return;
     };
-    if row
-        .approximate_score
-        .total_cmp(&worst.approximate_score)
-        .is_lt()
-    {
-        top_rows.pop();
-        top_rows.push(row);
-    }
-}
-
-/// Retains a deterministic globally best row frontier.
-fn insert_top_frontier_row(
-    top_rows: &mut BinaryHeap<ResidentRowScore>,
-    frontier_top_k: usize,
-    row: ResidentRowScore,
-) {
-    if frontier_top_k == 0 {
-        return;
-    }
-    if top_rows.len() < frontier_top_k {
-        top_rows.push(row);
-        return;
-    }
-    let Some(&worst) = top_rows.peek() else {
-        top_rows.push(row);
-        return;
-    };
-    if row.cmp(&worst).is_lt() {
+    if row.score.total_cmp(&worst.score).is_lt() {
         top_rows.pop();
         top_rows.push(row);
     }
@@ -2816,64 +2654,6 @@ mod tests {
                 codebook_size: SKETCH_V3_K,
                 code_width: SketchCodeWidth::EightBit,
             },
-        }
-    }
-
-    /// Row-frontier scoring is deterministic and never escapes the probe set.
-    #[test]
-    fn resident_row_frontier_is_deterministic_and_probe_bounded() {
-        let cluster_scores = [vec![4.0_f32, 1.0], vec![1.0, 9.0], vec![0.25, 1.0]];
-        let mut codebook = vec![0.0; SKETCH_V3_K];
-        let mut codes = Vec::new();
-        let mut cluster_offsets = Vec::new();
-        for scores in &cluster_scores {
-            let start = codes.len();
-            for &score in scores {
-                let code = codes.len();
-                codebook[code] = score.sqrt();
-                codes.push(code as u8);
-            }
-            cluster_offsets.push((start, codes.len()));
-        }
-        let sketch = ResidentSketch {
-            version: SKETCH_V3_VERSION,
-            dim: 1,
-            cluster_count: cluster_scores.len(),
-            cluster_offsets,
-            codes: Bytes::from(codes),
-            cluster_has_attrs: vec![false; cluster_scores.len()],
-            packed_code_bytes: 1,
-            serialized_size: 0,
-            encoding: ResidentEncoding::LegacyPq {
-                subquantizers: 1,
-                codebook,
-                codebook_size: SKETCH_V3_K,
-                code_width: SketchCodeWidth::EightBit,
-            },
-        };
-
-        let first = sketch
-            .rank_clusters_with_frontier(&[0.0], DistanceMetric::Euclidean, &[2, 0], 2, 4)
-            .unwrap()
-            .row_frontier;
-        let second = sketch
-            .rank_clusters_with_frontier(&[0.0], DistanceMetric::Euclidean, &[2, 0], 2, 4)
-            .unwrap()
-            .row_frontier;
-
-        let coordinates = |rows: &[ResidentRowScore]| {
-            rows.iter()
-                .map(|row| (row.cluster_idx, row.row_idx))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(coordinates(&first), vec![(2, 0), (0, 1), (2, 1), (0, 0)]);
-        assert_eq!(coordinates(&second), coordinates(&first));
-        assert!(first.iter().all(|row| row.cluster_idx != 1));
-        for (left, right) in first.iter().zip(second) {
-            assert_eq!(
-                left.approximate_score.to_bits(),
-                right.approximate_score.to_bits()
-            );
         }
     }
 

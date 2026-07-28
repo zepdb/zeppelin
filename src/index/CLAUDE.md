@@ -43,6 +43,32 @@ Known measured ceiling: nprobe 16 has a coarse recall ceiling of 0.85–0.93 on
 not a bug — it was investigated and no geometry error was found (≤0.005).
 Mini-batch occupancy degenerates at high k.
 
+## The resident sketch does not replace coarse payloads — measured
+
+`ZBP5` (Phase 4 slices 9.1/9.2) makes a row's exact-vector offset pure
+arithmetic from the manifest, which makes it *possible* to select the rerank
+frontier from resident sketch row scores and skip cluster coarse reads
+entirely. That was built and measured as slice 9.3 and **rejected**; the code
+was removed. Numbers in `tasks/July10Quant/results/fixed-stride-f32.md`,
+implementation recoverable from `212b689`.
+
+- **Winner dispersion is near-total.** At production probe/frontier ratios a
+  40-row frontier over 3,750 probed rows still touched 9 of the 10 grouped
+  objects the coarse path touched: requests fell only 20 → 18. The bypass pays
+  off only if winners concentrate into few objects, and they do not.
+- **The two-bit sketch is a materially weaker selector than SQ8 coarse codes.**
+  Same frontier, same probe set, same exact-f32 rerank: recall@10 1.00 → 0.80,
+  recall@100 1.00 → 0.94.
+
+Do not re-propose this on better row addressing. The constraint is selection
+quality; a wider sketch is the only thing that would move it, and that is its
+own slice with its own recall gate.
+
+**What 9.1/9.2 still buy:** one fewer GET per grouped object touched per
+query — the `ZBP4` directory read the manifest row layout replaced. Pinned by
+`tests/get_count_bench.rs` (cluster GETs 6 → 4 at two objects); about 33% of
+query GETs at production probe ratios. That stands without 9.3.
+
 ## Hierarchical search
 
 Root beam search **must partition leaf vs internal children**. Hybrid root

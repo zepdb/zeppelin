@@ -351,7 +351,6 @@ async fn synthetic_target_routes_flat_sq_bitmap_attrs_bm25_cache_and_reachabilit
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 3,
         rerank_coalesce_gap_bytes: DEFAULT_RERANK_COALESCE_GAP_BYTES,
-        resident_row_bypass: false,
         cache: Some(&cache),
         manifest_cache: None,
         include_attributes: true,

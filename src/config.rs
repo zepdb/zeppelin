@@ -499,17 +499,6 @@ pub struct QueryConfig {
     /// Preset profile that resolves to `rerank_coalesce_gap_bytes` at load time.
     #[serde(default)]
     pub cost_latency_profile: Option<CostLatencyProfile>,
-    /// Whether an unfiltered quantized query may select its exact-rerank
-    /// frontier from resident sketch row scores instead of reading cluster
-    /// coarse payloads.
-    ///
-    /// `None` means unset, which resolves to **off**. This changes the
-    /// approximate *selection* signal, not the returned distances, which stay
-    /// exact `f32` on both paths. It is off by default because the pinned
-    /// `wikidpr1m`/`wikidpr2m` recall gate has not run against it; see
-    /// `tasks/July10Quant/results/fixed-stride-f32.md`.
-    #[serde(default)]
-    pub resident_row_bypass: Option<bool>,
 }
 
 /// Named tradeoff profiles for rerank range coalescing.
@@ -3235,23 +3224,6 @@ impl Config {
         self.query
             .rerank_coalesce_gap_bytes
             .unwrap_or(DEFAULT_RERANK_COALESCE_GAP_BYTES)
-    }
-
-    /// Reports whether the resident-sketch row-frontier bypass may dispatch.
-    ///
-    /// # Returns
-    ///
-    /// The configured value, or `false` when unset. Off is the default: the
-    /// bypass changes which candidates are selected, and its recall has not
-    /// been through the pinned two-dataset gate.
-    ///
-    /// # Example
-    ///
-    /// `Config::default()` returns `false`; `[query] resident_row_bypass = true`
-    /// returns `true`.
-    #[must_use]
-    pub fn effective_resident_row_bypass(&self) -> bool {
-        self.query.resident_row_bypass.unwrap_or(false)
     }
 
     /// Applies every recognized environment override over file/default values.

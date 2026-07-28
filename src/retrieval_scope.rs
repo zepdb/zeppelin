@@ -291,7 +291,6 @@ impl ScopedAnnIndex {
         cache: Option<&Arc<DiskCache>>,
         oversample_factor: usize,
         rerank_coalesce_gap_bytes: usize,
-        resident_row_bypass: bool,
         include_attributes: bool,
     ) -> Result<ScopedAnnSearch> {
         if query.len() != self.dimensions {
@@ -316,7 +315,6 @@ impl ScopedAnnIndex {
                     cache,
                     include_attributes,
                     rerank_coalesce_gap_bytes,
-                    resident_row_bypass,
                 )
                 .await?;
                 let clusters_probed = output.probed_centroids.len();
