@@ -165,8 +165,9 @@ use super::policy_store::{PolicyPublication, PolicyRefresh};
 use super::{
     Action, ApiKeyId, GrantActions, GrantDefinition, GrantScope, IssuedApiKey, LoadedPolicy,
     PendingBranchActivation, PolicyActivationGuardPermit, PolicyGrant, PolicyHead, PolicyKey,
-    PolicyPrincipal, PolicySnapshot, PolicyStore, PolicyVersion, Principal, PrincipalId,
-    PrincipalKind, Resource, SecurityError, SecurityOperationError, SecurityOperationResult,
+    PolicyPrincipal, PolicySnapshot, PolicySnapshotMemo, PolicyStore, PolicyVersion, Principal,
+    PrincipalId, PrincipalKind, Resource, SecurityError, SecurityOperationError,
+    SecurityOperationResult,
 };
 use crate::error::Result;
 use crate::namespace::branching::activation::BranchActivationTarget;
@@ -483,6 +484,10 @@ impl PolicyCache {
     /// Acquire and claim the global publication lease, run fresh caller
     /// validation against that exact authoritative head/snapshot, then install
     /// a pending activation guard while retaining the same lease claim.
+    ///
+    /// `snapshot_memo` is the operation-scoped verified-snapshot record shared
+    /// with the caller's other activation steps; the head is still re-read
+    /// here, and the immutable body only when the head selects a new snapshot.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn begin_branch_activation<T, F, Fut>(
         &self,
@@ -492,12 +497,16 @@ impl PolicyCache {
         activation_nonce: ActivationNonce,
         expires_at: DateTime<Utc>,
         validate: F,
+        snapshot_memo: &mut Option<PolicySnapshotMemo>,
     ) -> SecurityOperationResult<(super::AllowDecision, T, PolicyActivationGuardPermit)>
     where
         F: FnOnce(LoadedPolicy) -> Fut,
         Fut: Future<Output = SecurityOperationResult<(super::AllowDecision, T)>>,
     {
-        let session = self.store.acquire_claimed_publication().await?;
+        let session = self
+            .store
+            .acquire_claimed_publication(snapshot_memo)
+            .await?;
         let observation = session.loaded().clone();
         let (authorization, validated) = match validate(observation.clone()).await {
             Ok(validated) => validated,
@@ -566,12 +575,20 @@ impl PolicyCache {
 
     /// Take over and retain one exact persisted guard for target nonce
     /// inspection during crash recovery or prepared cancellation.
+    ///
+    /// `snapshot_memo` scopes verified-snapshot reuse to the caller's single
+    /// activation operation, exactly as in
+    /// [`Self::begin_branch_activation`].
     pub(crate) async fn retain_pending_branch_activation(
         &self,
         target: &BranchActivationTarget,
         expected_nonce: Option<ActivationNonce>,
+        snapshot_memo: &mut Option<PolicySnapshotMemo>,
     ) -> Result<Option<PolicyActivationGuardPermit>> {
-        let session = self.store.acquire_claimed_publication().await?;
+        let session = self
+            .store
+            .acquire_claimed_publication(snapshot_memo)
+            .await?;
         let retained = self
             .store
             .retain_pending_branch_activation(session, target, expected_nonce)
@@ -591,7 +608,11 @@ impl PolicyCache {
     pub(crate) async fn retain_next_expired_branch_activation(
         &self,
     ) -> Result<Option<PolicyActivationGuardPermit>> {
-        let session = self.store.acquire_claimed_publication().await?;
+        let mut snapshot_memo = None;
+        let session = self
+            .store
+            .acquire_claimed_publication(&mut snapshot_memo)
+            .await?;
         let retained = self
             .store
             .retain_next_expired_branch_activation(session, self.clock.now())

@@ -22,7 +22,7 @@ use crate::namespace::{BranchId, NamespaceId, NamespaceIncarnationId};
 use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, StorageVersion, ZeppelinStore};
 use crate::time::Clock;
 
-use super::{PolicyVersion, SecurityError};
+use super::{PolicyHead, PolicySnapshot, PolicyVersion, SecurityError};
 
 /// Authoritative object holding the one global policy-publication lease.
 pub const POLICY_PUBLICATION_LEASE_KEY: &str = "_security/leases/policy-publication.json";
@@ -574,6 +574,46 @@ impl PolicyPublicationLease {
     }
 }
 
+/// Verified policy-snapshot reuse scoped to one branch-activation operation.
+///
+/// Every step of branch activation re-reads the mutable policy head from S3;
+/// that read is the authority check and is never skipped. The immutable
+/// snapshot body the head names is re-fetched only when the fresh head selects
+/// a different object key or checksum than the one this operation already
+/// verified. The memo never crosses operations: the governance adapter or
+/// permit chain that owns one activation carries it, and it is dropped with
+/// that activation.
+#[derive(Debug, Clone)]
+pub struct PolicySnapshotMemo {
+    object_key: String,
+    checksum: String,
+    snapshot: PolicySnapshot,
+}
+
+impl PolicySnapshotMemo {
+    /// Record one fully verified head/snapshot pair for later reuse.
+    #[must_use]
+    pub(crate) fn new(head: &PolicyHead, snapshot: PolicySnapshot) -> Self {
+        Self {
+            object_key: head.object_key().to_string(),
+            checksum: head.checksum().to_string(),
+            snapshot,
+        }
+    }
+
+    /// Whether `head` names the exact immutable snapshot this memo verified.
+    #[must_use]
+    pub(crate) fn matches(&self, head: &PolicyHead) -> bool {
+        self.object_key == head.object_key() && self.checksum == head.checksum()
+    }
+
+    /// Borrow the verified snapshot; offered only after [`Self::matches`].
+    #[must_use]
+    pub(crate) const fn snapshot(&self) -> &PolicySnapshot {
+        &self.snapshot
+    }
+}
+
 /// Permit retained across target activation and exact guard finalization.
 #[derive(Debug)]
 pub struct PolicyActivationGuardPermit {
@@ -581,6 +621,8 @@ pub struct PolicyActivationGuardPermit {
     pub(crate) lease_claim: PolicyPublicationLeaseClaim,
     pub(crate) head_version: StorageVersion,
     pub(crate) control_revision: PolicyControlRevision,
+    /// Operation-scoped verified snapshot reused by guard renewal/finalization.
+    pub(crate) snapshot_memo: Option<PolicySnapshotMemo>,
 }
 
 impl PolicyActivationGuardPermit {

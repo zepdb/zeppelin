@@ -4402,6 +4402,36 @@ impl Manifest {
         }
         self.write_conditional_candidate(store, namespace, version)
             .await
+            .map(|(new_version, _)| new_version)
+    }
+
+    /// Publish the next generation and report predecessor-history proof.
+    ///
+    /// Behaves exactly like [`Manifest::write_conditional`]; the additional
+    /// return value is `true` only when this process stored the predecessor
+    /// generation's immutable history object or verified its bytes against
+    /// the exact ETag-bound live snapshot — either during this call or during
+    /// the write that produced `version`. A caller holding those same exact
+    /// bytes may then skip a confirming re-read of that immutable object.
+    /// Every other situation (crash resume, foreign writer, generation zero)
+    /// reports `false` and must still read the history object.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`Manifest::write_conditional`].
+    pub(crate) async fn write_conditional_with_history_proof(
+        &mut self,
+        store: &ZeppelinStore,
+        namespace: &str,
+        version: &ManifestVersion,
+    ) -> Result<(ManifestVersion, bool)> {
+        if self.deletion_fence.is_some() || version.deletion_fenced {
+            return Err(ZeppelinError::NamespaceDeleting {
+                namespace: namespace.to_string(),
+            });
+        }
+        self.write_conditional_candidate(store, namespace, version)
+            .await
     }
 
     /// Publishes the generation-one namespace bootstrap without discovery or rebasing.
@@ -4437,7 +4467,7 @@ impl Manifest {
         store: &ZeppelinStore,
         namespace: &str,
         version: &ManifestVersion,
-    ) -> Result<ManifestVersion> {
+    ) -> Result<(ManifestVersion, bool)> {
         let key = Self::s3_key(namespace);
         if version.has_version() {
             let predecessor_bytes = version.exact_manifest_bytes()?;
@@ -4449,9 +4479,19 @@ impl Manifest {
             }
             self.require_valid_branch_successor(&predecessor, namespace)?;
         }
-        if self.version() > 0 && !version.history_confirmed {
-            let data = version.history_snapshot_bytes(namespace, self.version())?;
-            Self::write_immutable_history_snapshot(store, namespace, self.version(), data).await?;
+        // `history_confirmed` means this same process already stored or
+        // byte-verified the predecessor history object when it produced
+        // `version`; otherwise the create-or-verify below proves it now.
+        let mut predecessor_history_verified = false;
+        if self.version() > 0 {
+            if version.history_confirmed {
+                predecessor_history_verified = true;
+            } else {
+                let data = version.history_snapshot_bytes(namespace, self.version())?;
+                Self::write_immutable_history_snapshot(store, namespace, self.version(), data)
+                    .await?;
+                predecessor_history_verified = true;
+            }
         }
         let next_version = self.next_committed_version()?;
         let mut committed = self.clone();
@@ -4478,7 +4518,7 @@ impl Manifest {
             .await?;
         let new_version = ManifestVersion::for_manifest(published, &committed, data, true);
         *self = committed;
-        Ok(new_version)
+        Ok((new_version, predecessor_history_verified))
     }
 
     /// CAS-publish the governed-destruction fence and return its exact manifest.

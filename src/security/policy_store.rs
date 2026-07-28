@@ -154,9 +154,11 @@
 //! ## Cost
 //!
 //! Nothing here is on the query path. A head load is two sequential GETs (head,
-//! then the snapshot it names). [`PolicyStore::refresh`] is one conditional GET
-//! when nothing changed. A publication is a bounded sequence of lease, GET, and
-//! conditional PUT roundtrips.
+//! then the snapshot it names); one branch-activation operation may reuse the
+//! verified snapshot body across its own head re-reads via
+//! [`PolicySnapshotMemo`], but never the head GET itself. [`PolicyStore::refresh`]
+//! is one conditional GET when nothing changed. A publication is a bounded
+//! sequence of lease, GET, and conditional PUT roundtrips.
 //!
 //! ## Rust concepts used here
 //!
@@ -205,7 +207,7 @@ use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, StorageVersion, Z
 use super::{Entitlements, Feature, PolicyHead, PolicySnapshot, SecurityError};
 use super::{
     PendingBranchActivation, PolicyActivationGuardPermit, PolicyPublicationLease,
-    PolicyPublicationLeaseClaim,
+    PolicyPublicationLeaseClaim, PolicySnapshotMemo,
 };
 
 const POLICY_ROOT: &str = "_security";
@@ -378,9 +380,22 @@ impl PolicyStore {
 
     // Transitional raw load used only inside the bounded Phase 7 migration path.
     async fn load_current_unmigrated(&self) -> Result<LoadedPolicy> {
+        let mut memo = None;
+        self.load_current_unmigrated_with_memo(&mut memo).await
+    }
+
+    /// Raw load with operation-scoped snapshot reuse.
+    ///
+    /// The head GET always happens — it is the authority check. The immutable
+    /// snapshot body is re-read only when the fresh head names an object key or
+    /// checksum `memo` has not already verified for this operation.
+    async fn load_current_unmigrated_with_memo(
+        &self,
+        memo: &mut Option<PolicySnapshotMemo>,
+    ) -> Result<LoadedPolicy> {
         let (head_bytes, head_version) = self.store.get_with_meta(POLICY_HEAD_KEY).await?;
         let observed_at = Instant::now();
-        self.load_head_bytes(head_bytes, head_version, observed_at)
+        self.load_head_bytes_with_memo(head_bytes, head_version, observed_at, memo)
             .await
     }
 
@@ -485,8 +500,11 @@ impl PolicyStore {
 
     /// Acquire the global lease, claim its token into the exact policy head,
     /// and strongly load the snapshot selected by that claimed head.
-    pub(crate) async fn acquire_claimed_publication(&self) -> Result<ClaimedPolicyPublication> {
-        self.acquire_claimed_publication_from(None)
+    pub(crate) async fn acquire_claimed_publication(
+        &self,
+        memo: &mut Option<PolicySnapshotMemo>,
+    ) -> Result<ClaimedPolicyPublication> {
+        self.acquire_claimed_publication_from(None, memo)
             .await?
             .ok_or_else(|| SecurityError::PolicyConflict.into())
     }
@@ -494,10 +512,11 @@ impl PolicyStore {
     async fn acquire_claimed_publication_from(
         &self,
         expected_head_version: Option<&StorageVersion>,
+        memo: &mut Option<PolicySnapshotMemo>,
     ) -> Result<Option<ClaimedPolicyPublication>> {
         let lease_claim = self.publication_lease.acquire().await?;
         match self
-            .claim_current_head(lease_claim, expected_head_version)
+            .claim_current_head(lease_claim, expected_head_version, memo)
             .await
         {
             Ok(session) => Ok(session),
@@ -512,12 +531,13 @@ impl PolicyStore {
         &self,
         mut lease_claim: PolicyPublicationLeaseClaim,
         expected_head_version: Option<&StorageVersion>,
+        memo: &mut Option<PolicySnapshotMemo>,
     ) -> std::result::Result<
         Option<ClaimedPolicyPublication>,
         (ZeppelinError, PolicyPublicationLeaseClaim),
     > {
         for _attempt in 0..PHASE_SEVEN_MIGRATION_ATTEMPTS {
-            let current = match self.load_current_unmigrated().await {
+            let current = match self.load_current_unmigrated_with_memo(memo).await {
                 Ok(current) => current,
                 Err(error) => return Err((error, lease_claim)),
             };
@@ -574,7 +594,7 @@ impl PolicyStore {
                     }));
                 }
                 ConditionalPutOutcome::Updated { version: None } => {
-                    let loaded = match self.load_current_unmigrated().await {
+                    let loaded = match self.load_current_unmigrated_with_memo(memo).await {
                         Ok(loaded) => loaded,
                         Err(error) => return Err((error, lease_claim)),
                     };
@@ -637,6 +657,10 @@ impl PolicyStore {
             lease_claim: session.lease_claim,
             head_version: loaded.head_version().clone(),
             control_revision: loaded.head().control_revision(),
+            snapshot_memo: Some(PolicySnapshotMemo::new(
+                loaded.head(),
+                loaded.snapshot().clone(),
+            )),
         };
         Ok(Some((loaded, permit)))
     }
@@ -663,6 +687,10 @@ impl PolicyStore {
             lease_claim: session.lease_claim,
             head_version: loaded.head_version().clone(),
             control_revision: loaded.head().control_revision(),
+            snapshot_memo: Some(PolicySnapshotMemo::new(
+                loaded.head(),
+                loaded.snapshot().clone(),
+            )),
         };
         Ok(Some((loaded, permit)))
     }
@@ -685,6 +713,10 @@ impl PolicyStore {
                     lease_claim: session.lease_claim,
                     head_version: loaded.head_version().clone(),
                     control_revision: loaded.head().control_revision(),
+                    snapshot_memo: Some(PolicySnapshotMemo::new(
+                        loaded.head(),
+                        loaded.snapshot().clone(),
+                    )),
                 };
                 Ok((loaded, permit))
             }
@@ -737,12 +769,18 @@ impl PolicyStore {
 
     /// Renew and strongly verify that the exact guard/lease/head permit remains
     /// authoritative immediately before the target visibility CAS.
+    ///
+    /// The head is always re-read from S3; the immutable snapshot body is
+    /// re-fetched only when the fresh head no longer names the snapshot this
+    /// permit's operation already verified.
     pub(crate) async fn renew_branch_activation_guard(
         &self,
         permit: &mut PolicyActivationGuardPermit,
     ) -> Result<LoadedPolicy> {
         permit.lease_claim = self.publication_lease.renew(&permit.lease_claim).await?;
-        let loaded = self.load_current_unmigrated().await?;
+        let loaded = self
+            .load_current_unmigrated_with_memo(&mut permit.snapshot_memo)
+            .await?;
         if *loaded.head_version() != permit.head_version
             || loaded.head().publication_fencing_token() != Some(permit.lease_claim.fencing_token())
             || loaded
@@ -843,8 +881,9 @@ impl PolicyStore {
     ) -> Result<PolicyPublication> {
         candidate.validate_for_use()?;
         self.validate_entitlements(&candidate)?;
+        let mut memo = None;
         let mut session = match self
-            .acquire_claimed_publication_from(Some(expected_head_version))
+            .acquire_claimed_publication_from(Some(expected_head_version), &mut memo)
             .await
         {
             Ok(Some(session)) => session,
@@ -934,23 +973,35 @@ impl PolicyStore {
         head_version: Option<StorageVersion>,
         observed_at: Instant,
     ) -> Result<LoadedPolicy> {
+        let mut memo = None;
+        self.load_head_bytes_with_memo(head_bytes, head_version, observed_at, &mut memo)
+            .await
+    }
+
+    /// Verification pipeline for one head observation, with operation-scoped
+    /// snapshot-body reuse. Every check `load_head_bytes` performs still runs;
+    /// only the immutable body fetch is skipped when `memo` matches.
+    async fn load_head_bytes_with_memo(
+        &self,
+        head_bytes: Bytes,
+        head_version: Option<StorageVersion>,
+        observed_at: Instant,
+        memo: &mut Option<PolicySnapshotMemo>,
+    ) -> Result<LoadedPolicy> {
         let head: PolicyHead = serde_json::from_slice(&head_bytes).map_err(|error| {
             SecurityError::InvalidPolicy(format!("policy head JSON is invalid: {error}"))
         })?;
         head.validate(POLICY_ROOT)?;
         let head_version = head_version.ok_or(SecurityError::PolicyHeadMissingEtag)?;
 
-        let snapshot_bytes = self.store.get(head.object_key()).await?;
-        let snapshot: PolicySnapshot =
-            serde_json::from_slice(&snapshot_bytes).map_err(|error| {
-                SecurityError::InvalidPolicy(format!("policy snapshot JSON is invalid: {error}"))
-            })?;
-        if snapshot.requires_phase_seven_all_migration() {
-            snapshot.verify_checksum()?;
-        } else {
-            snapshot.validate_for_use()?;
-        }
-        self.validate_entitlements(&snapshot)?;
+        let snapshot = match memo.as_ref() {
+            Some(verified) if verified.matches(&head) => verified.snapshot().clone(),
+            _ => {
+                let snapshot = self.load_verified_snapshot(&head).await?;
+                *memo = Some(PolicySnapshotMemo::new(&head, snapshot.clone()));
+                snapshot
+            }
+        };
         if snapshot.version() != head.version() || snapshot.checksum() != head.checksum() {
             return Err(SecurityError::InvalidPolicy(
                 "policy head and snapshot identity disagree".to_string(),
@@ -964,6 +1015,22 @@ impl PolicyStore {
             head_version,
             observed_at,
         ))
+    }
+
+    /// Read and fully verify the immutable snapshot body named by `head`.
+    async fn load_verified_snapshot(&self, head: &PolicyHead) -> Result<PolicySnapshot> {
+        let snapshot_bytes = self.store.get(head.object_key()).await?;
+        let snapshot: PolicySnapshot =
+            serde_json::from_slice(&snapshot_bytes).map_err(|error| {
+                SecurityError::InvalidPolicy(format!("policy snapshot JSON is invalid: {error}"))
+            })?;
+        if snapshot.requires_phase_seven_all_migration() {
+            snapshot.verify_checksum()?;
+        } else {
+            snapshot.validate_for_use()?;
+        }
+        self.validate_entitlements(&snapshot)?;
+        Ok(snapshot)
     }
 
     async fn bootstrap(&self, config: &SecurityConfig, now: DateTime<Utc>) -> Result<LoadedPolicy> {

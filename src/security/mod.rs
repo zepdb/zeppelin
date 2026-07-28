@@ -231,8 +231,8 @@ pub use policy::{
 pub use policy_publication::{
     PendingBranchActivation, PolicyActivationGuardPermit, PolicyControlRevision, PolicyHeadDigest,
     PolicyLeaseFencingToken, PolicyPublicationLease, PolicyPublicationLeaseClaim,
-    MAX_PENDING_BRANCH_ACTIVATIONS, MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS,
-    POLICY_PUBLICATION_LEASE_KEY,
+    PolicySnapshotMemo, MAX_PENDING_BRANCH_ACTIVATIONS,
+    MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS, POLICY_PUBLICATION_LEASE_KEY,
 };
 pub use policy_store::{LoadedPolicy, PolicyStore};
 pub use preservation::{

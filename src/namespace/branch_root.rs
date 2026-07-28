@@ -159,7 +159,7 @@ pub(crate) async fn insert_branch_root_with_lease(
 
     if let Some(existing) = manifest.branch_roots().get(&request.root.branch_id) {
         return if existing == &request.root {
-            verify_rooted_history(store, namespace, &manifest, existing, None).await?;
+            verify_rooted_history(store, namespace, &manifest, existing, None, false).await?;
             Ok(existing.clone())
         } else {
             Err(BranchError::BranchRootConflict {
@@ -230,8 +230,8 @@ pub(crate) async fn insert_branch_root_with_lease(
     }
     manifest.fencing_token = renewed.fencing_token;
     *lease = renewed;
-    manifest
-        .write_conditional(store, namespace, &version)
+    let (_, predecessor_history_verified) = manifest
+        .write_conditional_with_history_proof(store, namespace, &version)
         .await?;
 
     verify_rooted_history(
@@ -240,6 +240,7 @@ pub(crate) async fn insert_branch_root_with_lease(
         &manifest,
         &request.root,
         Some(exact_bytes),
+        predecessor_history_verified,
     )
     .await?;
     Ok(request.root)
@@ -327,13 +328,28 @@ fn required_incarnation(
     })
 }
 
+/// Validate one rooted source generation against its immutable history object.
+///
+/// The history GET is skipped only when `predecessor_history_verified` is
+/// `true` and `expected_bytes` carries the exact predecessor live bytes: that
+/// pair means this same process stored the immutable history object or
+/// byte-verified it against those exact bytes moments earlier (see
+/// [`Manifest::write_conditional_with_history_proof`]). Crash resumes, foreign
+/// writers, and every unverified path still re-read the object.
 async fn verify_rooted_history(
     store: &ZeppelinStore,
     namespace: &str,
     root_manifest: &Manifest,
     root: &BranchRoot,
     expected_bytes: Option<Bytes>,
+    predecessor_history_verified: bool,
 ) -> Result<()> {
+    if predecessor_history_verified {
+        if let Some(exact_bytes) = expected_bytes.as_ref() {
+            return root_manifest
+                .validate_rooted_history_bytes(root.source_generation, exact_bytes);
+        }
+    }
     let key = Manifest::history_key(namespace, root.source_generation.get());
     let history_bytes = store.get(&key).await?;
     if expected_bytes

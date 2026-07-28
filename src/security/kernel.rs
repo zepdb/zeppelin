@@ -254,9 +254,10 @@ use super::{
     Decision, DelegationNarrowing, DenyDecision, DenyReason, Entitlements, GrantActions,
     GrantDefinition, GrantScope, IssuedApiKey, IssuedDelegatedToken, LoadedPolicy, NamespaceId,
     Obligation, PolicyActivationGuardPermit, PolicyGrant, PolicyPrincipal, PolicySnapshot,
-    PolicyStore, PreservationLockId, PreservationLockRecord, PreservationService, Principal,
-    PrincipalId, PrincipalKind, RequestContext, Resource, ResourceRef, SecurityError,
-    SecurityOperationError, SecurityOperationResult, MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS,
+    PolicySnapshotMemo, PolicyStore, PreservationLockId, PreservationLockRecord,
+    PreservationService, Principal, PrincipalId, PrincipalKind, RequestContext, Resource,
+    ResourceRef, SecurityError, SecurityOperationError, SecurityOperationResult,
+    MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS,
 };
 
 const BRANCH_ACTIVATION_GUARD_TTL_SECS: i64 = MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS / 2;
@@ -324,6 +325,11 @@ pub(crate) struct NamespaceForkAdmission {
 struct NamespaceForkGovernance {
     kernel: Arc<SecurityKernel>,
     admission: NamespaceForkAdmission,
+    /// Verified policy-snapshot reuse scoped to this one fork operation. The
+    /// policy head is still re-read from S3 at every activation step; only the
+    /// immutable snapshot body is reused, and only while the head names the
+    /// exact object key and checksum already verified for this fork.
+    snapshot_memo: tokio::sync::Mutex<Option<PolicySnapshotMemo>>,
 }
 
 struct FreshForkAuthorization {
@@ -755,6 +761,7 @@ impl SecurityKernel {
             Box::new(NamespaceForkGovernance {
                 kernel: Arc::clone(self),
                 admission,
+                snapshot_memo: tokio::sync::Mutex::new(None),
             }),
         ))
     }
@@ -1866,6 +1873,7 @@ impl BranchActivationGovernance for NamespaceForkGovernance {
                     })?;
                 let kernel = Arc::clone(&self.kernel);
                 let validation_admission = self.admission.clone();
+                let mut snapshot_memo = self.snapshot_memo.lock().await;
                 let (_, fresh, guard) = cache
                     .begin_branch_activation(
                         prepared.identity.branch_id,
@@ -1880,6 +1888,7 @@ impl BranchActivationGovernance for NamespaceForkGovernance {
                             )?;
                             Ok((fresh.fork.clone(), fresh))
                         },
+                        &mut snapshot_memo,
                     )
                     .await
                     .map_err(SecurityOperationError::into_error)?;
@@ -1917,19 +1926,22 @@ impl BranchActivationGovernance for NamespaceForkGovernance {
         let target = BranchActivationTarget::from_identity(&prepared.identity);
         match &self.kernel.authority {
             SecurityAuthority::Bootstrap(_) => Ok(None),
-            SecurityAuthority::Policy(cache) => cache
-                .retain_pending_branch_activation(&target, expected_nonce)
-                .await
-                .map(|guard| {
-                    guard.map(|guard| {
-                        let attempt = guard.attempt();
-                        Box::new(PolicyRetainedBranchActivationGuard {
-                            cache: Arc::clone(cache),
-                            guard,
-                            attempt,
-                        }) as Box<dyn BranchActivationGuard>
+            SecurityAuthority::Policy(cache) => {
+                let mut snapshot_memo = self.snapshot_memo.lock().await;
+                cache
+                    .retain_pending_branch_activation(&target, expected_nonce, &mut snapshot_memo)
+                    .await
+                    .map(|guard| {
+                        guard.map(|guard| {
+                            let attempt = guard.attempt();
+                            Box::new(PolicyRetainedBranchActivationGuard {
+                                cache: Arc::clone(cache),
+                                guard,
+                                attempt,
+                            }) as Box<dyn BranchActivationGuard>
+                        })
                     })
-                }),
+            }
         }
     }
 }
@@ -2046,19 +2058,22 @@ impl BranchActivationRecovery for NamespaceBranchActivationRecovery {
     ) -> ZeppelinResult<Option<Box<dyn BranchActivationGuard>>> {
         match &self.kernel.authority {
             SecurityAuthority::Bootstrap(_) => Ok(None),
-            SecurityAuthority::Policy(cache) => cache
-                .retain_pending_branch_activation(target, None)
-                .await
-                .map(|guard| {
-                    guard.map(|guard| {
-                        let attempt = guard.attempt();
-                        Box::new(PolicyRetainedBranchActivationGuard {
-                            cache: Arc::clone(cache),
-                            guard,
-                            attempt,
-                        }) as Box<dyn BranchActivationGuard>
+            SecurityAuthority::Policy(cache) => {
+                let mut snapshot_memo = None;
+                cache
+                    .retain_pending_branch_activation(target, None, &mut snapshot_memo)
+                    .await
+                    .map(|guard| {
+                        guard.map(|guard| {
+                            let attempt = guard.attempt();
+                            Box::new(PolicyRetainedBranchActivationGuard {
+                                cache: Arc::clone(cache),
+                                guard,
+                                attempt,
+                            }) as Box<dyn BranchActivationGuard>
+                        })
                     })
-                }),
+            }
         }
     }
 

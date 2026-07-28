@@ -4778,7 +4778,7 @@ impl NamespaceGraph {
             }
             .into());
         }
-        let (before_publication, _) = self
+        let (before_publication, before_etag) = self
             .namespace_manager
             .read_creating_intent_strong(target)
             .await?;
@@ -4800,12 +4800,22 @@ impl NamespaceGraph {
         )
         .await?;
 
+        // The before-publication observation already passed the cancellation
+        // and identity checks above, and manifest generation-one publication
+        // does not touch target metadata, so its ETag seeds the first CAS
+        // attempt. A concurrent metadata change still fails the CAS and is
+        // re-read on the next iteration, exactly as before.
+        let mut seeded_observation = Some((before_publication, before_etag));
         let mut marked_published = false;
         for _ in 0..MAX_PREPARE_ATTEMPTS {
-            let (mut metadata, etag) = self
-                .namespace_manager
-                .read_creating_intent_strong(target)
-                .await?;
+            let (mut metadata, etag) = match seeded_observation.take() {
+                Some(observation) => observation,
+                None => {
+                    self.namespace_manager
+                        .read_creating_intent_strong(target)
+                        .await?
+                }
+            };
             Self::require_preparation_not_cancelled(&metadata)?;
             if metadata.branch_identity.as_ref() != Some(&candidate.branch.identity) {
                 return Err(BranchError::IntentMismatch {
