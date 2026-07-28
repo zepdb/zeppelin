@@ -67,14 +67,3 @@ removal, and reordering when the verifier retains a trusted checkpoint. Bucket
 immutability, retention, access policy, and external anchor custody remain
 deployment controls; a hash chain alone cannot prevent replacement of both the
 stream and its anchor by an actor with unrestricted bucket authority.
-
-Structural retrieval receipts additionally bind the exact canonical query and
-result digests, production traversal evidence for every ANN or BM25 source, the
-historical policy-owned filter hash, a manifest-rooted Merkle inventory, and a
-separately rooted receipt-signed inventory for lazy policy-scope ANN/BM25
-artifacts. A signed, persisted binding version selects the stable field-by-field
-query-routing projection, preventing schema evolution from reinterpreting old
-receipt digests. Privileged verification may resolve the named immutable policy
-generation; unprivileged verification explicitly reports that check as
-unchecked. These receipts provide tamper evidence, not a claim of deterministic
-replay, semantic completeness, or exact recall.

@@ -86,7 +86,7 @@
 //! independent object PUT futures concurrently without spawning detached tasks.
 
 use bytes::Bytes;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::HashMap;
 use tracing::{debug, info};
 use ulid::Ulid;
 
@@ -972,38 +972,4 @@ async fn load_hierarchical_routed(
         bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
         routing_node_ids: Vec::new(),
     })
-}
-
-/// Discover every routing node reachable from a legacy tree root.
-///
-/// Current builders return this inventory directly. Explicit receipt upgrade
-/// uses this bounded traversal only for older manifests that predate the
-/// persisted inventory; query execution never substitutes prefix listing for
-/// manifest authority.
-pub(crate) async fn discover_hierarchical_routing_nodes(
-    store: &ZeppelinStore,
-    namespace: &str,
-    segment_id: &str,
-) -> Result<Vec<String>> {
-    let index = load_hierarchical(store, namespace, segment_id, None).await?;
-    let mut pending = VecDeque::from([index.meta.root_node_id.clone()]);
-    let mut seen = BTreeSet::new();
-
-    while let Some(node_id) = pending.pop_front() {
-        if !seen.insert(node_id.clone()) {
-            return Err(ZeppelinError::Index(format!(
-                "hierarchical routing graph repeats node {node_id}"
-            )));
-        }
-        let key = tree_node_key(namespace, segment_id, &node_id);
-        let bytes = store.get(&key).await?;
-        let node = super::deserialize_tree_node(&bytes)?;
-        for child in node.children {
-            if child.parse::<usize>().is_err() {
-                pending.push_back(child);
-            }
-        }
-    }
-
-    Ok(seen.into_iter().collect())
 }

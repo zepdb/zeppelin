@@ -519,32 +519,6 @@ impl WalReader {
         .collect()
     }
 
-    /// Reads an exact captured WAL selection and authenticates each raw body.
-    ///
-    /// The verifier receives the exact physical object key and bytes returned
-    /// by the cache/storage path before MessagePack decoding. This lets callers
-    /// bind a cross-namespace materialization read to an already authenticated
-    /// manifest inventory without coupling the WAL layer to receipt types.
-    /// Missing objects remain storage errors; verifier failures reject the
-    /// complete batch and no decoded fragment is returned.
-    pub(crate) async fn read_located_fragments_strict_verified<F>(
-        &self,
-        refs: &[LocatedFragmentRef<'_>],
-        cache_policy: FragmentCachePolicy<'_>,
-        verify_body: &F,
-    ) -> Result<Vec<WalFragment>>
-    where
-        F: Fn(&str, &[u8]) -> Result<()> + Sync,
-    {
-        Self::validate_located_batch(refs)?;
-        futures::future::join_all(refs.iter().map(|located| {
-            self.read_located_fragment_with_cache_verified(*located, cache_policy, verify_body)
-        }))
-        .await
-        .into_iter()
-        .collect()
-    }
-
     /// Read origin-resolved refs while retaining identities for derived caches.
     pub(crate) async fn read_located_query_fragments_unchecked(
         &self,
@@ -793,47 +767,6 @@ impl WalReader {
                         fragment_id = %located.fragment.id,
                         error = %error,
                         "failed to evict corrupt located WAL fragment cache entry"
-                    );
-                }
-            }
-        }
-        result
-    }
-
-    async fn read_located_fragment_with_cache_verified<F>(
-        &self,
-        located: LocatedFragmentRef<'_>,
-        cache_policy: FragmentCachePolicy<'_>,
-        verify_body: &F,
-    ) -> Result<WalFragment>
-    where
-        F: Fn(&str, &[u8]) -> Result<()> + Sync,
-    {
-        let s3_key = WalFragment::s3_key(located.physical_origin.namespace(), &located.fragment.id);
-        let cache_key = located.cache_key(&s3_key);
-        let data = self
-            .read_fragment_bytes_at(
-                &s3_key,
-                &cache_key,
-                located.logical_namespace,
-                &located.fragment.id,
-                cache_policy,
-            )
-            .await?;
-        let result = verify_body(&s3_key, &data).and_then(|()| {
-            WalFragment::from_bytes(&data).and_then(|fragment| {
-                Self::validate_fragment_identity(fragment, &located.fragment.id)
-            })
-        });
-        if result.is_err() {
-            if let Some(cache) = cache_policy.cache() {
-                if let Err(error) = cache.invalidate(&cache_key).await {
-                    warn!(
-                        logical_namespace = located.logical_namespace,
-                        physical_namespace = located.physical_origin.namespace(),
-                        fragment_id = %located.fragment.id,
-                        error = %error,
-                        "failed to evict unauthenticated located WAL fragment cache entry"
                     );
                 }
             }

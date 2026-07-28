@@ -225,7 +225,7 @@ use crate::index::ivf_flat::build::{
 use crate::index::ivf_flat::membership::{
     build_membership_artifact, deserialize_membership, MembershipData,
 };
-use crate::namespace::branching::{ArtifactOrigin, BranchError};
+use crate::namespace::branching::ArtifactOrigin;
 use crate::namespace::manager::{
     NamespaceMetadata, NamespaceState, NAMESPACE_INCARNATION_METADATA_KEY,
 };
@@ -236,9 +236,8 @@ use crate::time::Clock;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{
-    AuthenticatedManifestArtifactInventory, BootstrapRef, ClusterDataObjectRef,
-    CoarsePayloadEncoding, LocatedFragmentIdentity, LocatedFragmentRef, LocatedSegmentRef,
-    Manifest, MembershipRef, SegmentRef,
+    BootstrapRef, ClusterDataObjectRef, CoarsePayloadEncoding, LocatedFragmentIdentity,
+    LocatedFragmentRef, LocatedSegmentRef, Manifest, MembershipRef, SegmentRef,
 };
 use crate::wal::{FragmentCachePolicy, WalReader};
 
@@ -301,19 +300,6 @@ async fn get_compaction_read(
     key: &str,
     class: &str,
 ) -> Result<bytes::Bytes> {
-    get_compaction_read_with_verifier(store, namespace, key, class, None).await
-}
-
-type CompactionBodyVerifier<'a> = dyn Fn(&str, &[u8]) -> Result<()> + Sync + 'a;
-
-/// Fetches one compaction artifact and authenticates the exact returned body.
-async fn get_compaction_read_with_verifier(
-    store: &ZeppelinStore,
-    namespace: &str,
-    key: &str,
-    class: &str,
-    verify_body: Option<&CompactionBodyVerifier<'_>>,
-) -> Result<bytes::Bytes> {
     crate::metrics::COMPACTION_READ_OPS_TOTAL
         .with_label_values(&[namespace, class])
         .inc();
@@ -321,21 +307,7 @@ async fn get_compaction_read_with_verifier(
     crate::metrics::COMPACTION_READ_BYTES_TOTAL
         .with_label_values(&[namespace, class])
         .inc_by(data.len() as u64);
-    if let Some(verify_body) = verify_body {
-        verify_body(key, &data)?;
-    }
     Ok(data)
-}
-
-/// Converts authenticated foreign-view divergence into the public branch integrity class.
-fn map_foreign_source_integrity_error(error: ZeppelinError) -> ZeppelinError {
-    match error {
-        // Preserve genuine backend availability/I/O failures. Missing immutable
-        // objects and every decoding/hash/signature divergence are branch-state
-        // integrity failures, not caller-visible storage locations.
-        error @ (ZeppelinError::Storage(_) | ZeppelinError::Io(_)) => error,
-        _ => BranchError::BranchIntegrity.into(),
-    }
 }
 
 /// Resolves the manifest's active segment ID to its borrowed descriptor.
@@ -604,7 +576,7 @@ impl UnpublishedOwnedSegment {
     /// The operation consumes the candidate so a caller cannot accidentally
     /// install it twice or forget its hierarchical routing-node inventory. It
     /// performs no object-store write; the caller still owns the final policy
-    /// recheck, receipt hydration, and conditional manifest publication.
+    /// recheck and conditional manifest publication.
     pub(crate) fn install_into_at(
         self,
         manifest: &mut Manifest,
@@ -851,25 +823,11 @@ impl Compactor {
         source_namespace: &str,
         source_manifest: &Manifest,
         target_identity: &ArtifactOrigin,
-        source_inventory: Option<&AuthenticatedManifestArtifactInventory>,
     ) -> Result<Option<UnpublishedOwnedSegment>> {
         let (indexing_config, fts_configs) =
             self.owned_build_target_config(target_identity).await?;
-        let verify_source_body = |key: &str, body: &[u8]| {
-            source_inventory
-                .ok_or_else(|| {
-                    ZeppelinError::Config(
-                        "owned source verifier invoked without an authenticated inventory"
-                            .to_string(),
-                    )
-                })?
-                .verify_body(key, body)
-                .map_err(map_foreign_source_integrity_error)
-        };
-        let source_body_verifier =
-            source_inventory.map(|_| &verify_source_body as &CompactionBodyVerifier<'_>);
         let vectors = self
-            .materialize_manifest_view(source_namespace, source_manifest, source_body_verifier)
+            .materialize_manifest_view(source_namespace, source_manifest)
             .await?;
         if vectors.is_empty() {
             return Ok(None);
@@ -978,7 +936,6 @@ impl Compactor {
         &self,
         logical_namespace: &str,
         manifest: &Manifest,
-        source_body_verifier: Option<&CompactionBodyVerifier<'_>>,
     ) -> Result<Vec<VectorEntry>> {
         let authoritative_origin = manifest.local_origin()?;
         if authoritative_origin.namespace.as_str() != logical_namespace {
@@ -990,22 +947,10 @@ impl Compactor {
         let origins = manifest.artifact_origin_resolver(&authoritative_origin)?;
         let located_fragments = origins.uncompacted_located_fragments()?;
         let active_segment = origins.active_located_segment()?;
-        let fragments = match source_body_verifier {
-            Some(verify_body) => {
-                self.wal_reader
-                    .read_located_fragments_strict_verified(
-                        &located_fragments,
-                        FragmentCachePolicy::Bypass,
-                        &|key, body| verify_body(key, body),
-                    )
-                    .await?
-            }
-            None => {
-                self.wal_reader
-                    .read_located_fragments_strict(&located_fragments, FragmentCachePolicy::Bypass)
-                    .await?
-            }
-        };
+        let fragments = self
+            .wal_reader
+            .read_located_fragments_strict(&located_fragments, FragmentCachePolicy::Bypass)
+            .await?;
 
         let mut latest_vectors = HashMap::new();
         let mut deleted_ids = HashSet::new();
@@ -1026,7 +971,6 @@ impl Compactor {
             active_segment,
             latest_vectors,
             &deleted_ids,
-            source_body_verifier,
         )
         .await
     }
@@ -1837,89 +1781,25 @@ impl Compactor {
         let processed_deletes: HashSet<String> = HashSet::new();
 
         // 1. Read manifest to get fragment list (snapshot for segment building)
-        let (mut manifest, manifest_version) =
-            Manifest::read_versioned_required(&self.store, namespace)
-                .await
-                .map_err(|error| match error {
-                    ZeppelinError::NotFound { .. } => ZeppelinError::ManifestNotFound {
-                        namespace: namespace.to_string(),
-                    },
-                    error => error,
-                })?;
+        let (manifest, _) = Manifest::read_versioned_required(&self.store, namespace)
+            .await
+            .map_err(|error| match error {
+                ZeppelinError::NotFound { .. } => ZeppelinError::ManifestNotFound {
+                    namespace: namespace.to_string(),
+                },
+                error => error,
+            })?;
         let indexing_config = self.effective_indexing_config(namespace).await?;
         validate_two_bit_rotation_seed(namespace, &manifest, &indexing_config)?;
         let rewrite_for_index_config = manifest_needs_index_rewrite(&manifest, &indexing_config);
         let materialize_foreign = manifest.has_foreign_visible_artifacts()?;
         let authoritative_origin = manifest.local_origin()?;
-        let authenticated_source_inventory = if materialize_foreign && self.store.receipts_enabled()
-        {
-            Some(
-                AuthenticatedManifestArtifactInventory::authenticate(
-                    &self.store,
-                    namespace,
-                    &manifest,
-                )
-                .await
-                .map_err(map_foreign_source_integrity_error)?,
-            )
-        } else {
-            None
-        };
-        let verify_source_body = |key: &str, body: &[u8]| {
-            authenticated_source_inventory
-                .as_ref()
-                .ok_or_else(|| {
-                    ZeppelinError::Config(
-                        "foreign materialization verifier invoked without an authenticated inventory"
-                            .to_string(),
-                    )
-                })?
-                .verify_body(key, body)
-                .map_err(map_foreign_source_integrity_error)
-        };
-        let source_body_verifier = authenticated_source_inventory
-            .as_ref()
-            .map(|_| &verify_source_body as &CompactionBodyVerifier<'_>);
 
         // 2. If no uncompacted fragments → no-op
         if manifest.uncompacted_fragments().is_empty()
             && !rewrite_for_index_config
             && !materialize_foreign
         {
-            if self.store.receipts_enabled() && manifest.receipt_upgrade_needed(namespace) {
-                check_lease_lost(namespace, lease_lost.as_deref())?;
-                if let Some(token) = fencing_token {
-                    if manifest.fencing_token > token {
-                        return Err(ZeppelinError::FencingTokenStale {
-                            namespace: namespace.to_string(),
-                            our_token: token,
-                            manifest_token: manifest.fencing_token,
-                        });
-                    }
-                    manifest.fencing_token = token;
-                }
-                manifest
-                    .hydrate_receipt_artifacts(&self.store, namespace)
-                    .await?;
-                // The legacy inventory may require arbitrarily many S3 GETs.
-                // Reuse the publication-delay hook here so takeover tests can
-                // hold this exact hydration-to-CAS window open.
-                if let Some(delay) = self.test_pre_cas_delay {
-                    warn!(
-                        delay_ms = delay.as_millis() as u64,
-                        "test hook: delaying legacy receipt upgrade before final CAS"
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-                // Hydration is not lease-protected work by itself. A heartbeat
-                // can observe takeover while those reads are in flight, so the
-                // stale writer must recheck immediately before its CAS.
-                check_lease_lost(namespace, lease_lost.as_deref())?;
-                manifest
-                    .write_conditional(&self.store, namespace, &manifest_version)
-                    .await?;
-                info!("upgraded legacy manifest receipt inventory");
-            }
             debug!("no uncompacted fragments, skipping");
             return Ok(CompactionResult {
                 segment_id: None,
@@ -1954,22 +1834,9 @@ impl Compactor {
         // 3. Read fragments using snapshot refs (not re-reading manifest).
         // Uses unchecked read — fragments were validated on write.
         let fragments = if materialize_foreign {
-            match source_body_verifier {
-                Some(verify_body) => {
-                    self.wal_reader
-                        .read_located_fragments_strict_verified(
-                            &located_fragment_refs,
-                            fragment_cache,
-                            &|key, body| verify_body(key, body),
-                        )
-                        .await?
-                }
-                None => {
-                    self.wal_reader
-                        .read_located_fragments_strict(&located_fragment_refs, fragment_cache)
-                        .await?
-                }
-            }
+            self.wal_reader
+                .read_located_fragments_strict(&located_fragment_refs, fragment_cache)
+                .await?
         } else {
             self.wal_reader
                 .read_located_fragments_unchecked(&located_fragment_refs, fragment_cache)
@@ -2106,7 +1973,7 @@ impl Compactor {
             // before until that cluster is rewritten or a retrain fires.
             if let Some(located) = old_segment {
                 let (existing_vecs, id_to_cluster) =
-                    load_segment_vectors(&self.store, located, source_body_verifier).await?;
+                    load_segment_vectors(&self.store, located).await?;
                 old_id_to_cluster = id_to_cluster;
                 for vec in existing_vecs {
                     // WAL overrides: only insert if not already in latest_vectors and not deleted
@@ -2334,7 +2201,6 @@ impl Compactor {
                         old_segment,
                         latest_vectors.clone(),
                         &deleted_ids,
-                        source_body_verifier,
                     )
                     .await?;
                     vectors_compacted = full_vectors.len();
@@ -2631,19 +2497,8 @@ impl Compactor {
             validate_deferred_deletes_are_local(namespace, &deferred_deletes)?;
             merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
 
-            // A legacy generation may retain old immutable segments alongside
-            // the new segment. A restarted process has no local hash knowledge
-            // for those retained objects, so complete the exact post-compaction
-            // inventory now. This makes one explicit compaction sufficient for
-            // upgrade instead of requiring a second no-WAL pass.
-            if self.store.receipts_enabled() && fresh_manifest.receipt_upgrade_needed(namespace) {
-                fresh_manifest
-                    .hydrate_receipt_artifacts(&self.store, namespace)
-                    .await?;
-            }
-
-            // Manifest reads, inventory hydration, and candidate mutation can
-            // all outlive the lease observation at the top of this attempt.
+            // Manifest reads and candidate mutation can outlive the lease
+            // observation at the top of this attempt.
             // Recheck at the final publication boundary; ETag CAS remains the
             // independent second layer against a concurrent manifest writer.
             check_lease_lost(namespace, lease_lost.as_deref())?;
@@ -4095,11 +3950,9 @@ async fn load_full_surviving_vectors_for_fallback(
     old_segment: Option<LocatedSegmentRef<'_>>,
     mut latest_vectors: HashMap<String, VectorEntry>,
     deleted_ids: &HashSet<String>,
-    source_body_verifier: Option<&CompactionBodyVerifier<'_>>,
 ) -> Result<Vec<VectorEntry>> {
     if let Some(located) = old_segment {
-        let (existing_vecs, _id_to_cluster) =
-            load_segment_vectors(store, located, source_body_verifier).await?;
+        let (existing_vecs, _id_to_cluster) = load_segment_vectors(store, located).await?;
         for vector in existing_vecs {
             if !latest_vectors.contains_key(&vector.id) && !deleted_ids.contains(&vector.id) {
                 latest_vectors.insert(vector.id.clone(), vector);
@@ -4784,7 +4637,6 @@ fn check_upload_window(
 async fn load_segment_vectors(
     store: &ZeppelinStore,
     located: LocatedSegmentRef<'_>,
-    source_body_verifier: Option<&CompactionBodyVerifier<'_>>,
 ) -> Result<(Vec<VectorEntry>, HashMap<String, usize>)> {
     let namespace = located.logical_namespace;
     let physical_namespace = located.physical_namespace();
@@ -4807,23 +4659,17 @@ async fn load_segment_vectors(
     // `segment_id` to sum vector counts, which would 404 on a segment whose
     // clusters were carried over to other keys. Centroids are segment-global
     // and always live under `segment_id`.
-    let num_clusters = if source_body_verifier.is_some() {
-        // The authenticated manifest execution digest binds this descriptor.
-        // Full materialization needs only row payloads, so avoid consuming an
-        // unverified centroid/tree sidecar merely to rediscover this count.
-        located.segment.cluster_count
-    } else if located.segment.hierarchical {
+    let num_clusters = if located.segment.hierarchical {
         // Compaction reads the segment once; no query cache involved here.
         let h_index = HierarchicalIndex::load_from_located_manifest(store, located, None).await?;
         h_index.num_leaf_clusters()
     } else {
         use crate::index::ivf_flat::build::{centroids_key, deserialize_centroids};
-        let centroids_data = get_compaction_read_with_verifier(
+        let centroids_data = get_compaction_read(
             store,
             namespace,
             &centroids_key(physical_namespace, segment_id),
             COMPACTION_READ_CLASS_CENTROIDS,
-            source_body_verifier,
         )
         .await?;
         let (centroids, _dim) = deserialize_centroids(&centroids_data)?;
@@ -4833,39 +4679,37 @@ async fn load_segment_vectors(
     let mut cluster_results = Vec::new();
     if cluster_objects.is_empty() {
         // Parallel fetch: 2 GETs per cluster via tokio::join!
-        cluster_results = futures::future::join_all((0..num_clusters).map(|i| {
-            let cvec_key = cluster_key(physical_namespace, owner(i), i);
-            let cattr_key = attrs_key(physical_namespace, owner(i), i);
-            async move {
-                let (cluster_res, attrs_res) = tokio::join!(
-                    get_compaction_read_with_verifier(
-                        store,
-                        namespace,
-                        &cvec_key,
-                        COMPACTION_READ_CLASS_CLUSTER,
-                        source_body_verifier,
-                    ),
-                    get_compaction_read_with_verifier(
-                        store,
-                        namespace,
-                        &cattr_key,
-                        COMPACTION_READ_CLASS_ATTRS,
-                        source_body_verifier,
-                    ),
-                );
-                (i, cluster_res, attrs_res)
-            }
-        }))
-        .await;
+        cluster_results =
+            futures::future::join_all((0..num_clusters).map(|i| {
+                let cvec_key = cluster_key(physical_namespace, owner(i), i);
+                let cattr_key = attrs_key(physical_namespace, owner(i), i);
+                async move {
+                    let (cluster_res, attrs_res) = tokio::join!(
+                        get_compaction_read(
+                            store,
+                            namespace,
+                            &cvec_key,
+                            COMPACTION_READ_CLASS_CLUSTER,
+                        ),
+                        get_compaction_read(
+                            store,
+                            namespace,
+                            &cattr_key,
+                            COMPACTION_READ_CLASS_ATTRS,
+                        ),
+                    );
+                    (i, cluster_res, attrs_res)
+                }
+            }))
+            .await;
     } else {
         let object_results =
             futures::future::join_all(cluster_objects.iter().map(|object_ref| async move {
-                let object_res = get_compaction_read_with_verifier(
+                let object_res = get_compaction_read(
                     store,
                     namespace,
                     &object_ref.key,
                     COMPACTION_READ_CLASS_CLUSTER,
-                    source_body_verifier,
                 )
                 .await;
                 (object_ref, object_res)
@@ -4891,14 +4735,9 @@ async fn load_segment_vectors(
                         ))
                     })?;
                 let cattr_key = attrs_key(physical_namespace, owner(cluster_idx), cluster_idx);
-                let attrs_res = get_compaction_read_with_verifier(
-                    store,
-                    namespace,
-                    &cattr_key,
-                    COMPACTION_READ_CLASS_ATTRS,
-                    source_body_verifier,
-                )
-                .await;
+                let attrs_res =
+                    get_compaction_read(store, namespace, &cattr_key, COMPACTION_READ_CLASS_ATTRS)
+                        .await;
                 cluster_results.push((
                     cluster_idx,
                     Ok(bytes::Bytes::copy_from_slice(section.data)),
@@ -5272,7 +5111,7 @@ mod tests {
             .unwrap()
             .expect("fixture has one active segment");
 
-        let (vectors, membership) = load_segment_vectors(&store, located, None).await.unwrap();
+        let (vectors, membership) = load_segment_vectors(&store, located).await.unwrap();
         assert_eq!(vectors.len(), 1);
         assert_eq!(vectors[0].id, "source-row");
         assert_eq!(membership.get("source-row"), Some(&0));

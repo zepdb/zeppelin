@@ -329,22 +329,6 @@ async fn synthetic_target_routes_flat_sq_bitmap_attrs_bm25_cache_and_reachabilit
     );
     assert_eq!(fetched.records[0].attributes.as_ref().unwrap().len(), 1);
     assert_eq!(fetched.missing, vec!["missing-id"]);
-    assert!(fetched
-        .touched_artifact_keys
-        .iter()
-        .all(|key| key.starts_with(&format!("{source}/"))));
-    assert!(fetched
-        .touched_artifact_keys
-        .iter()
-        .any(|key| key.ends_with("/membership.bin")));
-    assert!(fetched
-        .touched_artifact_keys
-        .iter()
-        .any(|key| key.contains("cluster_")));
-    assert!(fetched
-        .touched_artifact_keys
-        .iter()
-        .any(|key| key.contains("attrs_")));
     let active = Filter::Eq {
         field: "status".to_string(),
         value: AttributeValue::String("active".to_string()),

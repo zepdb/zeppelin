@@ -196,7 +196,7 @@ async fn start_test_audit_with_entitlements(
         None => format!("test-node-{}", uuid::Uuid::new_v4()),
     };
     let durable_audit_enabled = config.security.audit_s3 && entitlements.has(Feature::AuditS3);
-    if durable_audit_enabled || config.receipts.enabled {
+    if durable_audit_enabled {
         security
             .install_object_signer(store)
             .expect("test signing capability must be shared with the application store");
@@ -658,15 +658,11 @@ async fn start_test_server_with_config_inner(
     // Ensure metrics are registered (idempotent)
     zeppelin::metrics::init();
 
-    let mut harness = TestHarness::new().await;
+    let harness = TestHarness::new().await;
     let mut config = config_override.unwrap_or_default();
     if override_rate_limits {
         configure_test_server_limits(&mut config);
     }
-    harness.store = harness
-        .store
-        .clone()
-        .with_receipts_enabled(config.receipts.enabled);
     let clock = Clock::system();
     let entitlements =
         Arc::new(entitlements_override.unwrap_or_else(|| test_entitlements(Feature::ALL)));
@@ -679,10 +675,6 @@ async fn start_test_server_with_config_inner(
         Arc::clone(&entitlements),
     )
     .await;
-    security
-        .install_object_signer(&harness.store)
-        .expect("object signer must be shared with the application store");
-
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
@@ -800,7 +792,6 @@ pub async fn start_test_server_on_store_with_readiness(
     zeppelin::metrics::init();
 
     configure_test_server_limits(&mut config);
-    let store = store.with_receipts_enabled(config.receipts.enabled);
     let clock = Clock::system();
     // Custom application-store wrappers still share the harness's underlying
     // backend. Keep policy authority isolated by the harness's random prefix
@@ -808,10 +799,6 @@ pub async fn start_test_server_on_store_with_readiness(
     let security_store = scoped_test_security_store(&store, &harness.prefix);
     let (security, credential_adapter, admin_bearer) =
         test_security_runtime(&security_store, &mut config, &clock).await;
-    security
-        .install_object_signer(&store)
-        .expect("object signer must be shared with the application store");
-
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
@@ -901,21 +888,13 @@ pub async fn start_test_server_with_compactor(
 ) {
     zeppelin::metrics::init();
 
-    let mut harness = TestHarness::new().await;
+    let harness = TestHarness::new().await;
     let mut config = config_override.unwrap_or_default();
     configure_test_server_limits(&mut config);
-    harness.store = harness
-        .store
-        .clone()
-        .with_receipts_enabled(config.receipts.enabled);
     let clock = Clock::system();
     let security_store = scoped_test_security_store(&harness.store, &harness.prefix);
     let (security, credential_adapter, admin_bearer) =
         test_security_runtime(&security_store, &mut config, &clock).await;
-    security
-        .install_object_signer(&harness.store)
-        .expect("object signer must be shared with the application store");
-
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
@@ -993,21 +972,13 @@ pub async fn start_test_server_with_compaction(
 ) {
     zeppelin::metrics::init();
 
-    let mut harness = TestHarness::new().await;
+    let harness = TestHarness::new().await;
     let mut config = config_override.unwrap_or_default();
     configure_test_server_limits(&mut config);
-    harness.store = harness
-        .store
-        .clone()
-        .with_receipts_enabled(config.receipts.enabled);
     let clock = Clock::system();
     let security_store = scoped_test_security_store(&harness.store, &harness.prefix);
     let (security, credential_adapter, admin_bearer) =
         test_security_runtime(&security_store, &mut config, &clock).await;
-    security
-        .install_object_signer(&harness.store)
-        .expect("object signer must be shared with the application store");
-
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
@@ -1609,7 +1580,6 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     if override_rate_limits {
         configure_test_server_limits(&mut config);
     }
-    let store = store.with_receipts_enabled(config.receipts.enabled);
     let clock = clock.unwrap_or_else(Clock::system);
     let entitlements =
         Arc::new(entitlements_override.unwrap_or_else(|| test_entitlements(Feature::ALL)));
@@ -1625,9 +1595,6 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         Arc::clone(&entitlements),
     )
     .await;
-    security
-        .install_object_signer(&store)
-        .expect("object signer must be shared with the application store");
     let credential_adapter: Arc<dyn CredentialAdapter> =
         credential_adapter_override.unwrap_or(credential_adapter);
 

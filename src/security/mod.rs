@@ -213,7 +213,6 @@ pub use decision::{
     AllowDecision, Decision, DecisionId, DenyDecision, DenyReason, FieldMask, Obligation,
     PolicyVersion, WriteConstraints,
 };
-pub(crate) use delegation::verify_published_signature;
 pub use delegation::{DelegationContext, DelegationNarrowing, IssuedDelegatedToken};
 pub use entitlements::{CustomerId, EntitlementLimits, EntitlementSource, Entitlements, Feature};
 pub use kernel::SecurityKernel;

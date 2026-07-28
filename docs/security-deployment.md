@@ -74,17 +74,16 @@ and rotation slots. Request-path verification uses only the disposable cache
 derived from those reservations. Retire an old signer before a deployment would
 exceed that budget; startup fails loudly when no reservation is available.
 Rotate by installing a new seed and restarting the node, which creates a new
-signer ID. Retain the prior reservation and public-key object through the
-longest of the maximum token lifetime, promised receipt-verification window,
-and audit-evidence retention window. Deleting the reservation ends production
-trust immediately: outstanding tokens, receipts, manifest roots, and audit
+signer ID. Retain the prior reservation and public-key object through the longer
+of the maximum token lifetime and audit-evidence retention window. Deleting the
+reservation ends production trust immediately: outstanding tokens and audit
 anchors signed by that key become unverifiable. Delete the reservation first
 when immediately revoking a compromised seed; outstanding credentials and
 evidence become unverifiable after the signer-refresh bound. The 32-slot limit
 therefore bounds active nodes, rotations, and promised verification windows;
-do not promise indefinite verification with this v1 registry. KMS-backed signing
-custody is a managed-service follow-up; this file contract does not silently
-fall back to an in-process generated key.
+do not promise indefinite verification with this v1 registry. KMS-backed
+signing custody is a managed-service follow-up; this file contract does not
+silently fall back to an in-process generated key.
 
 Each durable audit `node-id` is a signer ID plus an immutable stream epoch. The
 S3-authoritative mutable head at
@@ -194,59 +193,6 @@ Audit startup captures one application-clock instant for initial chain-day
 selection and boot-record timestamps. The signer-scoped S3 lease still expires
 against real wall time because it coordinates independent processes; changing
 an application evidence clock cannot extend writer authority.
-
-The licensed Receipts feature uses the same published node key to sign manifest
-roots and opt-in query receipts. A receipt is a structural proof of the exact
-authorized retrieval context: principal and delegation parent, policy version,
-mandatory-filter hashes, canonical query and result digests, per-source
-traversal controls and centroid/leaf indexes captured by the production search
-path, and the immutable artifact inventory committed by the named manifest.
-The manifest signature also binds a domain-separated execution-state digest:
-namespace/incarnation, ordered WAL fragments, complete segment descriptors,
-active-segment selection, and hierarchical routing-node inventory. Reusing the
-same artifact bytes under different query-routing topology therefore invalidates
-the signature and retained-history check. The manifest and receipt carry an
-explicit binding version. Version 1 is a field-by-field projection rather than
-a serialization of the evolvable manifest structs, so a future serde-default
-metadata field cannot silently change retained v1 receipt verification.
-Policy-scoped ANN and BM25 preserve their normal hidden-corpus-isolated execution
-path. When that path consumes lazily published `security_scopes` artifacts, the
-receipt carries a second exact Merkle inventory (`derived_root` and
-`derived_touched`) over those immutable bytes. The outer receipt signature binds
-both inventories, and `refetch=true` re-downloads both; derived artifacts never
-bypass scoped retrieval or masquerade as manifest-rooted objects. It does
-not prove semantic completeness, exact recall, or deterministic replay.
-`verification_mode` remains `structural` until a separate cross-architecture
-byte-identity gate permits stronger claims.
-
-`POST /v1/verify` requires the exact original JSON query as well as the result
-array. A verifier with current `SecurityAdminRead` authority resolves the exact
-immutable historical policy generation and checks the policy-owned filter hash.
-For delegated receipts it reports that only the historical policy component was
-checked because the token-narrowing predicate remains intentionally redacted.
-When the named manifest history generation is retained, verification rebuilds
-its canonical artifact inventory and Merkle root and requires its exact fencing
-token, signer, and signature to match the receipt. A decodable but internally
-inconsistent or re-fenced history body is `manifest_history` divergence, never
-a successfully checked generation. History objects are create-only and never
-overwritten. Writers retain the exact ETag-bound predecessor before live CAS
-and publish history for the winner only after CAS succeeds. A failed live PUT
-therefore creates no speculative future-generation history and a divergent
-retry can safely compete for that generation.
-
-Pre-Phase-10 manifests remain readable but cannot issue receipts while any
-reachable artifact lacks a recorded content hash. Explicitly compact the
-namespace, then retry. A fully compacted legacy namespace performs a one-time
-upgrade pass that reads and hashes its current immutable artifacts and CAS-publishes
-a new signed manifest generation; query execution never performs this work.
-Zeppelin returns
-`receipts_unavailable_unhashed` instead of backfilling through extra reads on a
-query. Old receipts remain structurally verifiable after history pruning from
-their signatures and Merkle paths only while the signing key's authoritative
-slot and public-key object are retained. Manifest-history checking is then
-reported as unavailable, and `refetch=true` can fail once garbage collection
-has removed the named artifacts. Retain signer trust, history, and immutable
-artifacts for at least the receipt-verification window your deployment promises.
 
 ## S3 public-access and transport controls
 

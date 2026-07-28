@@ -53,11 +53,6 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # max_children_per_namespace = 256   # direct children; valid range 1..=4096
 # max_depth = 16                     # ancestry depth; valid range 1..=64
 
-[receipts]
-# Receipt metadata and HTTP operations require this switch AND the receipts
-# license entitlement. Disabled manifests retain no artifact-hash inventory.
-# enabled = false
-
 [storage]
 # backend = "s3"                     # STORAGE_BACKEND — "s3" or "local" (gcs/azure planned)
 # bucket = "zeppelin"                # S3_BUCKET

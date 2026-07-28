@@ -11,14 +11,13 @@ use common::assertions::{assert_s3_object_exists, assert_s3_object_not_exists};
 use common::counting::counting_store;
 use common::fault_injection::{pause_first_after_get_matching, synchronize_cas_pair_matching};
 use common::harness::TestHarness;
-use common::server::test_security_runtime;
 use common::vectors::random_vectors;
 use zeppelin::compaction::gc::{
     gc_candidate_store_key, load_gc_candidates, run_gc_cycle, run_gc_cycle_at,
 };
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{
-    CompactionConfig, Config, GcConfig, IndexingConfig, DEFAULT_RERANK_COALESCE_GAP_BYTES,
+    CompactionConfig, GcConfig, IndexingConfig, DEFAULT_RERANK_COALESCE_GAP_BYTES,
 };
 use zeppelin::error::ZeppelinError;
 use zeppelin::namespace::branching::test_support::{
@@ -30,7 +29,6 @@ use zeppelin::namespace::branching::{
 };
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::query::{execute_query, QueryParams};
-use zeppelin::time::Clock;
 use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
 use zeppelin::wal::manifest::ManifestHistoryRetention;
 use zeppelin::wal::{Manifest, WalFragment, WalReader, WalWriter};
@@ -645,96 +643,6 @@ async fn root_is_query_inert_and_survives_normal_manifest_publishers() {
         final_control.binding_version,
         Some(zeppelin::wal::manifest::ReceiptBindingVersion::V3Roots)
     );
-
-    harness.cleanup_artifact_origin_namespace(&source).await;
-    harness.cleanup_artifact_origin_namespace(&target).await;
-    harness.cleanup().await;
-}
-
-#[tokio::test]
-async fn signed_receipt_upgrade_preserves_exact_branch_roots() {
-    let mut harness = TestHarness::new().await;
-    harness.store = harness.store.clone().with_receipts_enabled(true);
-    let source = harness.artifact_origin_namespace("branch-root-receipt-upgrade-source");
-    let target = harness.artifact_origin_namespace("branch-root-receipt-upgrade-target");
-    let mut security_config = Config::default();
-    let (security, _adapter, _bearer) =
-        test_security_runtime(&harness.store, &mut security_config, &Clock::system()).await;
-    security
-        .install_object_signer(&harness.store)
-        .expect("receipt signer must install on the test store");
-
-    NamespaceManager::new(harness.store.clone())
-        .create(&source, 4, DistanceMetric::Cosine)
-        .await
-        .unwrap();
-    let root = prepare_head_branch_root(
-        harness.store.clone(),
-        &source,
-        BranchId::new(),
-        &target,
-        uuid::Uuid::new_v4(),
-        ForkViewDigest::new([0x94; 32]),
-        Utc::now(),
-    )
-    .await
-    .unwrap();
-    insert_prepared_branch_root(harness.store.clone(), &source, root.clone(), 8)
-        .await
-        .unwrap();
-
-    let rooted = Manifest::read(&harness.store, &source)
-        .await
-        .unwrap()
-        .unwrap();
-    let rooted_generation = rooted.version();
-    let mut upgrade_fixture = serde_json::to_value(rooted).unwrap();
-    let object = upgrade_fixture.as_object_mut().unwrap();
-    for field in [
-        "artifact_hashes",
-        "merkle_root",
-        "root_signature",
-        "root_signer_node",
-    ] {
-        assert!(
-            object.remove(field).is_some(),
-            "signed root fixture must contain {field}"
-        );
-    }
-    harness
-        .store
-        .put(
-            &Manifest::s3_key(&source),
-            Bytes::from(serde_json::to_vec(&upgrade_fixture).unwrap()),
-        )
-        .await
-        .unwrap();
-    harness
-        .store
-        .delete(&Manifest::history_key(&source, rooted_generation))
-        .await
-        .unwrap();
-
-    let upgraded = test_compactor(&harness.store)
-        .compact(&source)
-        .await
-        .unwrap();
-    assert_eq!(upgraded.vectors_compacted, 0);
-    let manifest = Manifest::read(&harness.store, &source)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(manifest.version() > rooted_generation);
-    let control = branch_control_snapshot(&harness.store, &source)
-        .await
-        .unwrap();
-    assert_eq!(control.roots, vec![root]);
-    assert_eq!(
-        control.binding_version,
-        Some(zeppelin::wal::manifest::ReceiptBindingVersion::V3Roots)
-    );
-    assert!(manifest.control_state_digest().is_some());
-    assert!(manifest.root_signer_node().is_some());
 
     harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup_artifact_origin_namespace(&target).await;

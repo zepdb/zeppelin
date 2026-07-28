@@ -640,7 +640,7 @@ pub(crate) fn immutable_artifact_cache_key(origin: &ArtifactOrigin, store_key: &
 /// Resolves every descriptor in one manifest against one authoritative target lifetime.
 ///
 /// The resolver is a read-only context. It never fills legacy manifest fields in
-/// memory, which preserves the signed bytes and receipt projection of retained
+/// memory, which preserves the exact bytes and execution projection of retained
 /// pre-incarnation history.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ArtifactOriginResolver<'a> {
@@ -844,34 +844,17 @@ pub struct Manifest {
     /// encodes structs as positional arrays.
     #[serde(default)]
     deletion_fence: Option<ManifestDeletionFence>,
-    /// SHA-256 inventory for every immutable artifact visible through this generation.
-    ///
-    /// Old manifests decode as empty and remain queryable, but receipt issuance
-    /// fails loudly until compaction replaces their reachable artifact set.
-    #[serde(default)]
-    artifact_hashes: BTreeMap<String, [u8; 32]>,
-    /// Canonical Merkle root over `artifact_hashes` in sorted-key order.
-    #[serde(default)]
-    merkle_root: Option<[u8; 32]>,
-    /// Ed25519 signature over root, execution-state digest, generation, and fencing token.
-    #[serde(default)]
-    root_signature: Option<Vec<u8>>,
-    /// Published signer identity used by `root_signature`.
-    #[serde(default)]
-    root_signer_node: Option<String>,
     /// Exact hierarchical routing-node IDs keyed by owning segment ID.
     ///
     /// Routing nodes are fetched lazily by production search and therefore
-    /// must be explicit manifest-rooted artifacts. Legacy manifests decode
-    /// empty and are populated only by an explicit compaction upgrade.
+    /// must remain explicit manifest artifacts. Deleting the preceding signed
+    /// root fields intentionally changed this field's MessagePack position.
     #[serde(default)]
     hierarchical_routing_nodes: BTreeMap<String, Vec<String>>,
     /// Canonical digest of the query-routing manifest projection.
     ///
-    /// This field retains its persisted position because MessagePack encodes
-    /// structs as positional arrays. It excludes the artifact hashes and
-    /// signature envelope, which are bound separately by the Merkle root
-    /// signature.
+    /// Deleting the signed-root inventory intentionally changed this field's
+    /// MessagePack position. Future persisted fields still append at the end.
     #[serde(default)]
     receipt_state_digest: Option<[u8; 32]>,
     /// Version of the stable projection encoded by `receipt_state_digest`.
@@ -909,7 +892,7 @@ pub struct Manifest {
     coarse_payload_encodings: BTreeMap<String, CoarsePayloadEncoding>,
 }
 
-/// Stable manifest execution projection version used by signed receipts.
+/// Stable manifest execution projection version.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReceiptBindingVersion {
     /// Original field-by-field query-routing projection.
@@ -1134,7 +1117,7 @@ impl PreparedManifestPublication {
 }
 
 /// Frozen canonical initial-view projection. The lineage digest itself,
-/// generation/timestamps, signatures, roots, and pending deletes are excluded.
+/// generation/timestamps, roots, and pending deletes are excluded.
 #[derive(Serialize)]
 struct ForkViewProjectionV1<'a> {
     domain: &'static str,
@@ -1148,23 +1131,6 @@ struct ForkViewProjectionV1<'a> {
     source_config_sha256: SourceDataPlaneConfigDigest,
     depth: u16,
     execution: ManifestExecutionBindingV2<'a>,
-    artifact_hashes: &'a BTreeMap<String, [u8; 32]>,
-}
-
-/// Fixed root-signing envelope shared by V2 origins and later control bindings.
-///
-/// Field order and the domain string are frozen by the V2 byte fixture. Moving
-/// this type out of the match arm lets V3 add a control digest without changing
-/// one byte of existing V2 signatures.
-#[derive(Serialize)]
-struct ManifestRootEnvelopeV2 {
-    domain: &'static str,
-    merkle_root: [u8; 32],
-    manifest_generation: u64,
-    fencing_token: u64,
-    binding_version: ReceiptBindingVersion,
-    execution_digest: [u8; 32],
-    control_digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1270,237 +1236,6 @@ enum HistorySnapshotWrite {
     },
 }
 
-/// Canonical bytes signed by each Merkle-rooted manifest generation.
-pub(crate) fn manifest_root_signing_bytes(
-    merkle_root: [u8; 32],
-    manifest_version: u64,
-    fencing_token: u64,
-    binding_version: ReceiptBindingVersion,
-    state_digest: [u8; 32],
-    control_state_digest: Option<[u8; 32]>,
-) -> Result<Vec<u8>> {
-    match binding_version {
-        ReceiptBindingVersion::V1 => {
-            if control_state_digest.is_some() {
-                return Err(ZeppelinError::Serialization(
-                    "receipt binding v1 forbids a control digest".to_string(),
-                ));
-            }
-
-            #[derive(Serialize)]
-            struct RootBinding {
-                merkle_root: [u8; 32],
-                manifest_version: u64,
-                fencing_token: u64,
-                binding_version: ReceiptBindingVersion,
-                state_digest: [u8; 32],
-            }
-
-            serde_json::to_vec(&RootBinding {
-                merkle_root,
-                manifest_version,
-                fencing_token,
-                binding_version,
-                state_digest,
-            })
-            .map_err(|error| {
-                ZeppelinError::Serialization(format!("manifest root signing failed: {error}"))
-            })
-        }
-        ReceiptBindingVersion::V2Origins => {
-            if control_state_digest.is_some() {
-                return Err(ZeppelinError::Serialization(
-                    "receipt binding v2_origins forbids a control digest".to_string(),
-                ));
-            }
-
-            serde_json::to_vec(&ManifestRootEnvelopeV2 {
-                domain: "zeppelin-manifest-root-envelope-v2",
-                merkle_root,
-                manifest_generation: manifest_version,
-                fencing_token,
-                binding_version,
-                execution_digest: state_digest,
-                control_digest: control_state_digest,
-            })
-            .map_err(|error| {
-                ZeppelinError::Serialization(format!("manifest root signing failed: {error}"))
-            })
-        }
-        ReceiptBindingVersion::V3Roots | ReceiptBindingVersion::V4Lineage => {
-            let control_digest = control_state_digest.ok_or_else(|| {
-                ZeppelinError::Serialization(format!(
-                    "receipt binding {binding_version:?} requires a control digest"
-                ))
-            })?;
-            serde_json::to_vec(&ManifestRootEnvelopeV2 {
-                domain: "zeppelin-manifest-root-envelope-v2",
-                merkle_root,
-                manifest_generation: manifest_version,
-                fencing_token,
-                binding_version,
-                execution_digest: state_digest,
-                control_digest: Some(control_digest),
-            })
-            .map_err(|error| {
-                ZeppelinError::Serialization(format!("manifest root signing failed: {error}"))
-            })
-        }
-    }
-}
-
-fn artifact_inventory_root(artifacts: &BTreeMap<String, [u8; 32]>) -> Result<[u8; 32]> {
-    if artifacts.keys().any(|key| key.is_empty()) {
-        return Err(ZeppelinError::Validation(
-            "merkle artifact keys must not be empty".to_string(),
-        ));
-    }
-    let mut level = artifacts
-        .iter()
-        .map(|(key, content_hash)| {
-            let mut hasher = Sha256::new();
-            hasher.update([0_u8]);
-            hasher.update((key.len() as u64).to_be_bytes());
-            hasher.update(key.as_bytes());
-            hasher.update(content_hash);
-            <[u8; 32]>::from(hasher.finalize())
-        })
-        .collect::<Vec<_>>();
-    if level.is_empty() {
-        level.push(Sha256::digest(b"zeppelin-empty-merkle-v1").into());
-    }
-    while level.len() > 1 {
-        level = level
-            .chunks(2)
-            .map(|pair| {
-                let left = pair[0];
-                let right = pair.get(1).copied().unwrap_or(left);
-                let mut hasher = Sha256::new();
-                hasher.update([1_u8]);
-                hasher.update(left);
-                hasher.update(right);
-                <[u8; 32]>::from(hasher.finalize())
-            })
-            .collect();
-    }
-    Ok(level[0])
-}
-
-/// Authenticated immutable-object inventory carried by one exact manifest.
-#[derive(Debug, Clone)]
-pub(crate) struct AuthenticatedManifestArtifactInventory {
-    artifacts: BTreeMap<String, [u8; 32]>,
-}
-
-impl AuthenticatedManifestArtifactInventory {
-    pub(crate) async fn authenticate(
-        store: &ZeppelinStore,
-        namespace: &str,
-        manifest: &Manifest,
-    ) -> Result<Self> {
-        if !store.receipts_enabled() {
-            return Err(ZeppelinError::Config(
-                "retrieval receipts are disabled".to_string(),
-            ));
-        }
-        let artifacts = manifest.receipt_artifacts(namespace)?;
-        let rebuilt_root = artifact_inventory_root(artifacts)?;
-        let manifest_root = manifest.merkle_root().ok_or_else(|| {
-            authenticated_manifest_error("manifest omitted its authenticated artifact root")
-        })?;
-        if manifest_root != rebuilt_root {
-            return Err(authenticated_manifest_error(
-                "manifest artifact inventory did not rebuild its authenticated root",
-            ));
-        }
-
-        let binding_version = manifest.receipt_binding_version().ok_or_else(|| {
-            authenticated_manifest_error("manifest omitted its receipt binding version")
-        })?;
-        let manifest_state_digest = manifest.receipt_state_digest().ok_or_else(|| {
-            authenticated_manifest_error("manifest omitted its execution-state digest")
-        })?;
-        if manifest.recompute_receipt_state_digest(namespace)? != manifest_state_digest {
-            return Err(authenticated_manifest_error(
-                "manifest execution state diverged from its authenticated digest",
-            ));
-        }
-
-        let control_state_digest = manifest.control_state_digest();
-        match binding_version {
-            ReceiptBindingVersion::V1 | ReceiptBindingVersion::V2Origins => {
-                if control_state_digest.is_some() {
-                    return Err(authenticated_manifest_error(
-                        "manifest binding version forbids a control-state digest",
-                    ));
-                }
-            }
-            ReceiptBindingVersion::V3Roots | ReceiptBindingVersion::V4Lineage => {
-                let expected = control_state_digest.ok_or_else(|| {
-                    authenticated_manifest_error(
-                        "manifest binding version omitted its control-state digest",
-                    )
-                })?;
-                if manifest.recompute_control_state_digest(namespace)? != expected {
-                    return Err(authenticated_manifest_error(
-                        "manifest control state diverged from its authenticated digest",
-                    ));
-                }
-            }
-        }
-
-        let signer_node = manifest.root_signer_node().ok_or_else(|| {
-            authenticated_manifest_error("manifest omitted its root signer identity")
-        })?;
-        let signature = manifest
-            .root_signature()
-            .ok_or_else(|| authenticated_manifest_error("manifest omitted its root signature"))?;
-        let signing_bytes = manifest_root_signing_bytes(
-            manifest_root,
-            manifest.version(),
-            manifest.fencing_token(),
-            binding_version,
-            manifest_state_digest,
-            control_state_digest,
-        )?;
-        if !crate::security::verify_published_signature(
-            store,
-            signer_node,
-            &signing_bytes,
-            signature,
-        )
-        .await?
-        {
-            return Err(authenticated_manifest_error(
-                "manifest root signature did not verify",
-            ));
-        }
-
-        Ok(Self {
-            artifacts: artifacts.clone(),
-        })
-    }
-
-    pub(crate) fn verify_body(&self, key: &str, bytes: &[u8]) -> Result<()> {
-        let expected = self.artifacts.get(key).ok_or_else(|| {
-            authenticated_manifest_error(
-                "consumed artifact is outside the authenticated manifest inventory",
-            )
-        })?;
-        let observed = <[u8; 32]>::from(Sha256::digest(bytes));
-        if &observed != expected {
-            return Err(authenticated_manifest_error(
-                "consumed artifact body diverged from its authenticated hash",
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn authenticated_manifest_error(reason: &'static str) -> ZeppelinError {
-    ZeppelinError::Validation(reason.to_string())
-}
-
 impl Manifest {
     /// Creates an unpublished, empty namespace manifest at generation zero.
     ///
@@ -1534,10 +1269,6 @@ impl Manifest {
             namespace: None,
             namespace_incarnation: None,
             deletion_fence: None,
-            artifact_hashes: BTreeMap::new(),
-            merkle_root: None,
-            root_signature: None,
-            root_signer_node: None,
             hierarchical_routing_nodes: BTreeMap::new(),
             receipt_state_digest: None,
             receipt_binding_version: None,
@@ -2545,162 +2276,6 @@ impl Manifest {
         self.fencing_token
     }
 
-    /// Return the fully hashed immutable inventory used for receipt proofs.
-    pub fn receipt_artifacts(&self, namespace: &str) -> Result<&BTreeMap<String, [u8; 32]>> {
-        if self.segments.iter().any(|segment| {
-            segment.hierarchical && self.hierarchical_routing_nodes(&segment.id).is_empty()
-        }) {
-            return Err(ZeppelinError::Validation(
-                "retrieval receipts require a fully hashed namespace".to_string(),
-            ));
-        }
-        let reachable = self.receipt_reachable_keys(namespace)?;
-        if reachable.len() != self.artifact_hashes.len()
-            || reachable
-                .iter()
-                .any(|key| !self.artifact_hashes.contains_key(key))
-        {
-            return Err(ZeppelinError::Validation(
-                "retrieval receipts require a fully hashed namespace".to_string(),
-            ));
-        }
-        Ok(&self.artifact_hashes)
-    }
-
-    /// Return whether an explicit compaction must upgrade receipt metadata.
-    #[must_use]
-    pub(crate) fn receipt_upgrade_needed(&self, namespace: &str) -> bool {
-        self.receipt_artifacts(namespace).is_err()
-            || self.merkle_root.is_none()
-            || self.root_signature.is_none()
-            || self.root_signer_node.is_none()
-            || self.receipt_binding_version.is_none()
-            || self.recompute_receipt_state_digest(namespace).ok() != self.receipt_state_digest
-            || (matches!(
-                self.receipt_binding_version,
-                Some(ReceiptBindingVersion::V3Roots | ReceiptBindingVersion::V4Lineage)
-            ) && self.recompute_control_state_digest(namespace).ok()
-                != self.control_state_digest)
-    }
-
-    /// Read and hash every currently reachable immutable artifact missing from
-    /// a legacy manifest's receipt inventory.
-    ///
-    /// This is called only by an explicit compaction upgrade. Query execution
-    /// never performs backfill I/O and therefore continues to fail closed until
-    /// the upgraded generation is CAS-published.
-    pub(crate) async fn hydrate_receipt_artifacts(
-        &mut self,
-        store: &ZeppelinStore,
-        namespace: &str,
-    ) -> Result<()> {
-        if !store.receipts_enabled() {
-            return Err(ZeppelinError::Config(
-                "retrieval receipts are disabled".to_string(),
-            ));
-        }
-        let incarnation = self.namespace_incarnation().ok_or_else(|| {
-            ZeppelinError::Serialization(format!(
-                "manifest for namespace {namespace} has no incarnation for receipt hydration"
-            ))
-        })?;
-        let local_origin = ArtifactOrigin {
-            namespace: NamespaceId::parse(namespace.to_string()).map_err(|_| {
-                ZeppelinError::Validation(format!(
-                    "namespace violates artifact-origin grammar: {namespace}"
-                ))
-            })?,
-            incarnation: NamespaceIncarnationId::from_uuid(incarnation),
-        };
-        let hierarchical_segments = self
-            .artifact_origin_resolver(&local_origin)?
-            .located_segments()?
-            .into_iter()
-            .filter(|located| {
-                located.segment.hierarchical
-                    && self
-                        .hierarchical_routing_nodes(&located.segment.id)
-                        .is_empty()
-            })
-            .map(|located| {
-                (
-                    located.segment.id.clone(),
-                    located.physical_namespace().to_string(),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (segment_id, physical_namespace) in hierarchical_segments {
-            let node_ids = crate::index::hierarchical::build::discover_hierarchical_routing_nodes(
-                store,
-                &physical_namespace,
-                &segment_id,
-            )
-            .await?;
-            if node_ids.is_empty() {
-                return Err(ZeppelinError::Index(format!(
-                    "hierarchical segment {} has no routing-node inventory",
-                    segment_id
-                )));
-            }
-            self.set_hierarchical_routing_nodes(&segment_id, node_ids);
-        }
-        let reachable = self.receipt_reachable_keys(namespace)?;
-        self.artifact_hashes
-            .retain(|key, _| reachable.contains(key));
-        for key in reachable {
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-                self.artifact_hashes.entry(key)
-            {
-                // Fresh artifacts already have an exact hash computed beside
-                // their successful PUT. Reuse it so ordinary compaction keeps
-                // the Phase 10 zero-extra-I/O contract. Only retained legacy
-                // artifacts unknown to this process require a storage read.
-                if let Some(content_hash) = store.known_content_hash(entry.key()) {
-                    entry.insert(content_hash);
-                } else {
-                    let body = store.get(entry.key()).await?;
-                    entry.insert(<[u8; 32]>::from(Sha256::digest(&body)));
-                }
-            }
-        }
-        self.merkle_root = None;
-        self.root_signature = None;
-        self.root_signer_node = None;
-        self.receipt_state_digest = None;
-        Ok(())
-    }
-
-    /// Rewrite exact receipt inventory keys after byte-identical clone copies.
-    pub(crate) fn rewrite_receipt_artifacts_for_clone(
-        &mut self,
-        source: &str,
-        target: &str,
-    ) -> Result<()> {
-        let source_prefix = format!("{source}/");
-        let mut rewritten = BTreeMap::new();
-        for (key, content_hash) in std::mem::take(&mut self.artifact_hashes) {
-            let suffix = key.strip_prefix(&source_prefix).ok_or_else(|| {
-                ZeppelinError::Index(format!(
-                    "clone receipt artifact key {key:?} is outside source prefix {source_prefix:?}"
-                ))
-            })?;
-            rewritten.insert(format!("{target}/{suffix}"), content_hash);
-        }
-        self.artifact_hashes = rewritten;
-        self.merkle_root = None;
-        self.root_signature = None;
-        self.root_signer_node = None;
-        self.receipt_state_digest = None;
-        self.receipt_binding_version = None;
-        Ok(())
-    }
-
-    /// Return the canonical root carried by this manifest generation.
-    #[must_use]
-    pub const fn merkle_root(&self) -> Option<[u8; 32]> {
-        self.merkle_root
-    }
-
     /// Return the canonical query-routing state digest carried by this generation.
     #[must_use]
     pub const fn receipt_state_digest(&self) -> Option<[u8; 32]> {
@@ -2720,6 +2295,7 @@ impl Manifest {
     }
 
     /// Recompute the domain-separated query-routing projection digest.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn recompute_receipt_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
         let binding_version = self.receipt_binding_version.ok_or_else(|| {
             ZeppelinError::Serialization(
@@ -2730,6 +2306,7 @@ impl Manifest {
     }
 
     /// Recompute the exact V3 roots/fence control digest.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn recompute_control_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
         match self.receipt_binding_version {
             Some(ReceiptBindingVersion::V3Roots) => self.compute_control_roots_digest(namespace),
@@ -2996,18 +2573,6 @@ impl Manifest {
         }
     }
 
-    /// Borrow the node signature carried by this manifest generation.
-    #[must_use]
-    pub fn root_signature(&self) -> Option<&[u8]> {
-        self.root_signature.as_deref()
-    }
-
-    /// Borrow the published signer identity carried by this manifest generation.
-    #[must_use]
-    pub fn root_signer_node(&self) -> Option<&str> {
-        self.root_signer_node.as_deref()
-    }
-
     /// Record the exact routing-node inventory produced for one segment.
     pub(crate) fn set_hierarchical_routing_nodes(
         &mut self,
@@ -3064,7 +2629,7 @@ impl Manifest {
             // Pre-incarnation manifests cannot contain an origin table or
             // descriptor indices. Their immutable layout is therefore
             // unambiguously namespace-local. Preserve that wire-compatible
-            // receipt inventory without fabricating a namespace-lifetime ID.
+            // object inventory without fabricating a namespace-lifetime ID.
             None => self
                 .segments
                 .iter()
@@ -3097,8 +2662,8 @@ impl Manifest {
 
             // Hierarchical SQ embeds calibration in tree_meta.json and codes
             // in each ordinary cluster object. The conservative GC inventory
-            // protects legacy sidecar names too, but receipts bind only real
-            // published objects.
+            // protects legacy sidecar names too, while copy-clone needs only
+            // real published objects.
             if segment.hierarchical {
                 reachable.remove(&crate::index::quantization::sq::sq_calibration_key(
                     physical_namespace,
@@ -3117,11 +2682,11 @@ impl Manifest {
             // GC deliberately protects every legacy SQ sidecar that might
             // exist, even when a newer manifest proves that the equivalent SQ
             // bytes are embedded in a bootstrap or co-located cluster object.
-            // Receipts need the exact published artifact inventory instead of
-            // that conservative sweep superset, otherwise they would commit
+            // Copy-clone needs the exact published artifact inventory instead
+            // of that conservative sweep superset, otherwise it would request
             // nonexistent keys. A carried cluster from a pre-co-location
             // segment keeps its old standalone sidecar; rewritten and grouped
-            // clusters bind only the object that actually contains the codes.
+            // clusters include only the object that actually contains codes.
             if segment.bootstrap.is_some() {
                 reachable.remove(&crate::index::quantization::sq::sq_calibration_key(
                     physical_namespace,
@@ -3147,28 +2712,12 @@ impl Manifest {
         Ok(reachable)
     }
 
-    fn finalize_receipt_root(&mut self, store: &ZeppelinStore, namespace: &str) -> Result<()> {
+    fn finalize_manifest_binding(&mut self, namespace: &str) -> Result<()> {
         self.validate_branch_root_state(namespace)?;
         self.canonicalize_explicit_artifact_origins()?;
         self.validate_artifact_origins()?;
         self.validate_branch_lineage_state(namespace)?;
         self.validate_foreign_origin_admission()?;
-        let reachable = self.receipt_reachable_keys(namespace)?;
-        let receipts_enabled = store.receipts_enabled();
-        if receipts_enabled {
-            self.artifact_hashes
-                .retain(|key, _| reachable.contains(key));
-            for key in &reachable {
-                if !self.artifact_hashes.contains_key(key) {
-                    if let Some(content_hash) = store.known_content_hash(key) {
-                        self.artifact_hashes.insert(key.clone(), content_hash);
-                    }
-                }
-            }
-        } else {
-            self.artifact_hashes.clear();
-            store.forget_known_content_hashes(reachable.iter());
-        }
 
         let has_roots_control = self.deletion_fence.is_some() || !self.branch_roots.is_empty();
         let has_lineage_control = self.branch_lineage.is_some();
@@ -3193,35 +2742,6 @@ impl Manifest {
             }
             ReceiptBindingVersion::V1 | ReceiptBindingVersion::V2Origins => None,
         };
-
-        if !receipts_enabled
-            || reachable
-                .iter()
-                .any(|key| !self.artifact_hashes.contains_key(key))
-        {
-            self.merkle_root = None;
-            self.root_signature = None;
-            self.root_signer_node = None;
-            return Ok(());
-        }
-
-        let root = artifact_inventory_root(&self.artifact_hashes)?;
-        self.merkle_root = Some(root);
-        let payload = manifest_root_signing_bytes(
-            root,
-            self.version,
-            self.fencing_token,
-            binding_version,
-            state_digest,
-            self.control_state_digest,
-        )?;
-        if let Some((signer_node, signature)) = store.sign_object(&payload)? {
-            self.root_signer_node = Some(signer_node);
-            self.root_signature = Some(signature);
-        } else {
-            self.root_signer_node = None;
-            self.root_signature = None;
-        }
         Ok(())
     }
 
@@ -3301,8 +2821,6 @@ impl Manifest {
         ) {
             self.receipt_binding_version = None;
             self.receipt_state_digest = None;
-            self.root_signature = None;
-            self.root_signer_node = None;
         }
     }
 
@@ -3312,7 +2830,6 @@ impl Manifest {
         source_identity: &ArtifactOrigin,
         target_identity: &ArtifactOrigin,
         lineage_seed: BranchLineageSeed,
-        receipts_enabled: bool,
         now: DateTime<Utc>,
     ) -> Result<PreparedZeroCopyFork> {
         source.validate_namespace_binding(source_identity.namespace.as_str())?;
@@ -3445,21 +2962,6 @@ impl Manifest {
         target.bind_namespace_incarnation(target_identity.incarnation.as_uuid())?;
         target.artifact_origins = origins.table;
         target.validate_artifact_origins()?;
-        if receipts_enabled {
-            target.artifact_hashes = source.artifact_hashes.clone();
-            let reachable = target.receipt_reachable_keys(target_identity.namespace.as_str())?;
-            target
-                .artifact_hashes
-                .retain(|key, _| reachable.contains(key));
-            if reachable
-                .iter()
-                .any(|key| !target.artifact_hashes.contains_key(key))
-            {
-                return Err(ZeppelinError::Serialization(
-                    "zero-copy fork source is missing a reachable artifact hash".to_string(),
-                ));
-            }
-        }
 
         let fork_view_sha256 = target.compute_initial_fork_view_digest(
             source_identity,
@@ -3508,7 +3010,6 @@ impl Manifest {
             source_config_sha256: lineage_seed.source_config_sha256,
             depth: lineage_seed.depth,
             execution: self.execution_binding_v2(target_identity.namespace.as_str()),
-            artifact_hashes: &self.artifact_hashes,
         })
         .map_err(|error| {
             ZeppelinError::Serialization(format!(
@@ -3549,7 +3050,6 @@ impl Manifest {
     /// Finalize an unpublished normalized fork exactly once as generation one.
     pub(crate) fn preseal_generation_one(
         &self,
-        store: &ZeppelinStore,
         target_identity: &ArtifactOrigin,
     ) -> Result<PreparedManifestPublication> {
         if self.version != 0
@@ -3567,7 +3067,7 @@ impl Manifest {
         self.validate_initial_fork_view()?;
         let mut manifest = self.clone();
         manifest.version = 1;
-        manifest.finalize_receipt_root(store, target_identity.namespace.as_str())?;
+        manifest.finalize_manifest_binding(target_identity.namespace.as_str())?;
         if manifest.receipt_binding_version != Some(ReceiptBindingVersion::V4Lineage) {
             return Err(ZeppelinError::Serialization(
                 "fork generation one did not select receipt binding v4_lineage".to_string(),
@@ -4653,7 +4153,7 @@ impl Manifest {
         let mut committed = self.clone();
         committed.version = Self::checked_next_version(base_version)?;
         committed.namespace = Some(namespace.to_string());
-        committed.finalize_receipt_root(store, namespace)?;
+        committed.finalize_manifest_binding(namespace)?;
         let data = committed.to_bytes()?;
         match current {
             Some((_, version)) => {
@@ -4672,7 +4172,6 @@ impl Manifest {
             },
         }
         Self::write_immutable_history_snapshot(store, namespace, committed.version(), data).await?;
-        store.forget_known_content_hashes(committed.artifact_hashes.keys());
         *self = committed;
         Ok(())
     }
@@ -4993,7 +4492,7 @@ impl Manifest {
     /// Namespace creation must never rewrite a newer live manifest with its
     /// original empty candidate. This seam uses the ordinary conditional writer
     /// with an absent-version capability, so the live PUT is create-only while
-    /// receipt finalization and immutable generation-one history remain shared
+    /// manifest binding finalization and immutable generation-one history remain shared
     /// with every other manifest publication path.
     ///
     /// # Errors
@@ -5041,7 +4540,7 @@ impl Manifest {
         let mut committed = self.clone();
         committed.version = next_version;
         committed.namespace = Some(namespace.to_string());
-        committed.finalize_receipt_root(store, namespace)?;
+        committed.finalize_manifest_binding(namespace)?;
         let data = committed.to_bytes()?;
         let published = match &version.version {
             Some(observed) => {
@@ -5061,7 +4560,6 @@ impl Manifest {
         Self::write_immutable_history_snapshot(store, namespace, committed.version(), data.clone())
             .await?;
         let new_version = ManifestVersion::for_manifest(published, &committed, data, true);
-        store.forget_known_content_hashes(committed.artifact_hashes.keys());
         *self = committed;
         Ok(new_version)
     }
@@ -6490,62 +5988,6 @@ mod tests {
 
     use crate::storage::ZeppelinStore;
 
-    #[tokio::test]
-    async fn receipt_config_controls_inventory_size_and_empty_inventory_round_trip() {
-        async fn publish(namespace: &str, receipts_enabled: bool) -> Manifest {
-            let store = ZeppelinStore::new(Arc::new(InMemory::new()))
-                .with_receipts_enabled(receipts_enabled);
-            let mut manifest = Manifest::new();
-            for sequence_number in 0_u64..8 {
-                let id = Ulid::from(u128::from(sequence_number + 1));
-                let key = crate::wal::WalFragment::s3_key(namespace, &id);
-                store
-                    .put(&key, Bytes::from(vec![sequence_number as u8; 64]))
-                    .await
-                    .unwrap();
-                manifest.add_fragment(FragmentRef {
-                    id,
-                    vector_count: 1,
-                    delete_count: 0,
-                    sequence_number,
-                    size_bytes: 64,
-                    artifact_origin: None,
-                });
-            }
-            manifest.write(&store, namespace).await.unwrap();
-            manifest
-        }
-
-        let off = publish("receipt-size", false).await;
-        let on = publish("receipt-size", true).await;
-        let off_bytes = off.to_bytes().unwrap();
-        let on_bytes = on.to_bytes().unwrap();
-        let decoded = Manifest::from_bytes_for_namespace(&off_bytes, "receipt-size").unwrap();
-
-        assert!(off.artifact_hashes.is_empty());
-        assert!(off.merkle_root().is_none());
-        assert!(off.root_signature().is_none());
-        assert!(off.root_signer_node().is_none());
-        assert!(matches!(
-            off.receipt_artifacts("receipt-size"),
-            Err(ZeppelinError::Validation(_))
-        ));
-        assert_eq!(decoded.artifact_hashes, off.artifact_hashes);
-        assert_eq!(decoded.receipt_state_digest(), off.receipt_state_digest());
-        assert_eq!(
-            decoded.receipt_binding_version(),
-            off.receipt_binding_version()
-        );
-        assert_eq!(on.artifact_hashes.len(), 8);
-        assert!(on.merkle_root().is_some());
-        assert!(on_bytes.len() > off_bytes.len());
-        println!(
-            "manifest_size_receipts_off={} manifest_size_receipts_on={}",
-            off_bytes.len(),
-            on_bytes.len()
-        );
-    }
-
     /// Builds a minimal legacy-layout segment descriptor for state-model tests.
     ///
     /// The returned segment owns every cluster itself and records no optional
@@ -7031,7 +6473,6 @@ mod tests {
 
     #[test]
     fn receipt_publication_canonicalizes_only_explicit_origin_metadata() {
-        let store = ZeppelinStore::new(Arc::new(InMemory::new())).with_receipts_enabled(true);
         let local = origin("canonical-publication", 1);
         let unused = origin("unused-origin", 2);
         let mut manifest = Manifest::new();
@@ -7063,7 +6504,7 @@ mod tests {
         manifest.segments = vec![explicit_segment, make_segment("segment-implicit-local")];
 
         manifest
-            .finalize_receipt_root(&store, "canonical-publication")
+            .finalize_manifest_binding("canonical-publication")
             .expect("publication must canonicalize valid explicit origins");
 
         assert_eq!(manifest.artifact_origins, vec![local]);
@@ -7277,70 +6718,6 @@ mod tests {
     }
 
     #[test]
-    fn receipt_v1_root_signing_bytes_and_signature_are_frozen() {
-        use ed25519_dalek::Signer as _;
-
-        let bytes =
-            manifest_root_signing_bytes([1; 32], 7, 9, ReceiptBindingVersion::V1, [2; 32], None)
-                .expect("legacy V1 root binding must encode");
-        let expected = concat!(
-            r#"{"merkle_root":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,"#,
-            r#"1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"#,
-            r#""manifest_version":7,"fencing_token":9,"binding_version":"v1","#,
-            r#""state_digest":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,"#,
-            r#"2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2]}"#,
-        );
-        assert_eq!(bytes, expected.as_bytes());
-
-        let signature = ed25519_dalek::SigningKey::from_bytes(&[7; 32])
-            .sign(&bytes)
-            .to_bytes();
-        assert_eq!(
-            signature,
-            [
-                137, 0, 201, 209, 102, 145, 229, 89, 174, 203, 186, 189, 183, 75, 39, 193, 8, 129,
-                188, 226, 42, 176, 145, 80, 157, 45, 133, 85, 227, 81, 96, 14, 98, 177, 118, 112,
-                155, 84, 173, 5, 19, 177, 14, 126, 67, 126, 97, 92, 119, 124, 126, 74, 44, 23, 98,
-                137, 95, 72, 200, 54, 57, 72, 187, 8,
-            ]
-        );
-    }
-
-    #[test]
-    fn receipt_v2_uses_fixed_envelope_and_rejects_control_digest() {
-        let bytes = manifest_root_signing_bytes(
-            [1; 32],
-            7,
-            9,
-            ReceiptBindingVersion::V2Origins,
-            [2; 32],
-            None,
-        )
-        .expect("V2 origin-aware root envelope must encode");
-        let expected = concat!(
-            r#"{"domain":"zeppelin-manifest-root-envelope-v2","#,
-            r#""merkle_root":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,"#,
-            r#"1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"#,
-            r#""manifest_generation":7,"fencing_token":9,"#,
-            r#""binding_version":"v2_origins","#,
-            r#""execution_digest":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,"#,
-            r#"2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],"control_digest":null}"#,
-        );
-        assert_eq!(bytes, expected.as_bytes());
-
-        let error = manifest_root_signing_bytes(
-            [1; 32],
-            7,
-            9,
-            ReceiptBindingVersion::V2Origins,
-            [2; 32],
-            Some([3; 32]),
-        )
-        .expect_err("V2 origins must not reinterpret a future control digest");
-        assert!(matches!(error, ZeppelinError::Serialization(_)));
-    }
-
-    #[test]
     fn branch_root_candidates_are_exact_idempotent_bounded_and_removable() {
         let mut manifest = Manifest::new();
         manifest.namespace = Some("root-source".to_string());
@@ -7449,7 +6826,6 @@ mod tests {
 
     #[test]
     fn v3_roots_reuses_v2_execution_and_never_downgrades() {
-        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         let mut manifest = Manifest::new();
         manifest.namespace = Some("v3-roots".to_string());
         manifest
@@ -7471,7 +6847,7 @@ mod tests {
         manifest
             .insert_branch_root_candidate(root.clone(), 4)
             .unwrap();
-        manifest.finalize_receipt_root(&store, "v3-roots").unwrap();
+        manifest.finalize_manifest_binding("v3-roots").unwrap();
 
         assert_eq!(
             manifest.receipt_binding_version(),
@@ -7491,52 +6867,13 @@ mod tests {
         changed_view
             .branch_roots
             .insert(root.branch_id, changed_root);
-        changed_view
-            .finalize_receipt_root(&store, "v3-roots")
-            .unwrap();
+        changed_view.finalize_manifest_binding("v3-roots").unwrap();
         let changed_control = changed_view.control_state_digest().unwrap();
         assert_eq!(changed_view.receipt_state_digest(), Some(v2_execution));
         assert_ne!(changed_control, control);
-        assert_ne!(
-            manifest_root_signing_bytes(
-                [1; 32],
-                6,
-                7,
-                ReceiptBindingVersion::V3Roots,
-                [2; 32],
-                Some(control),
-            )
-            .unwrap(),
-            manifest_root_signing_bytes(
-                [1; 32],
-                6,
-                7,
-                ReceiptBindingVersion::V3Roots,
-                [2; 32],
-                Some(changed_control),
-            )
-            .unwrap(),
-            "fork-view identity must change V3 signing bytes without changing V2 execution"
-        );
-        let signing = manifest_root_signing_bytes(
-            [1; 32],
-            6,
-            7,
-            ReceiptBindingVersion::V3Roots,
-            [2; 32],
-            Some([3; 32]),
-        )
-        .unwrap();
-        let signing = String::from_utf8(signing).unwrap();
-        assert!(signing
-            .starts_with(r#"{"domain":"zeppelin-manifest-root-envelope-v2","merkle_root":[1,1"#));
-        assert!(signing.contains(r#""binding_version":"v3_roots""#));
-        assert!(signing.ends_with(
-            r#""control_digest":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3]}"#
-        ));
 
         manifest.remove_branch_root_candidate(&root).unwrap();
-        manifest.finalize_receipt_root(&store, "v3-roots").unwrap();
+        manifest.finalize_manifest_binding("v3-roots").unwrap();
         assert_eq!(
             manifest.receipt_binding_version(),
             Some(ReceiptBindingVersion::V3Roots),
@@ -7617,7 +6954,6 @@ mod tests {
 
     #[test]
     fn v3_root_tampering_fails_decode_and_clone_reset_clears_control() {
-        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         let mut manifest = Manifest::new();
         manifest.namespace = Some("v3-tamper".to_string());
         manifest
@@ -7635,7 +6971,7 @@ mod tests {
         manifest
             .insert_branch_root_candidate(root.clone(), 4)
             .unwrap();
-        manifest.finalize_receipt_root(&store, "v3-tamper").unwrap();
+        manifest.finalize_manifest_binding("v3-tamper").unwrap();
 
         let mut tampered = manifest.clone();
         tampered
@@ -7661,7 +6997,7 @@ mod tests {
             destruction_record_key: "_audit/destruction/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"
                 .to_string(),
         });
-        fenced.finalize_receipt_root(&store, "v3-tamper").unwrap();
+        fenced.finalize_manifest_binding("v3-tamper").unwrap();
         Manifest::from_bytes_for_namespace(&fenced.to_bytes().unwrap(), "v3-tamper").unwrap();
 
         let mut tampered_fence = fenced;
@@ -7684,7 +7020,6 @@ mod tests {
 
     #[test]
     fn receipt_binding_version_never_downgrades_within_one_namespace_lifetime() {
-        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         let mut manifest = Manifest::new();
         manifest.namespace = Some("binding-monotonic".to_string());
         manifest
@@ -7696,7 +7031,7 @@ mod tests {
         manifest.segments.push(segment);
 
         manifest
-            .finalize_receipt_root(&store, "binding-monotonic")
+            .finalize_manifest_binding("binding-monotonic")
             .unwrap();
         assert_eq!(
             manifest.receipt_binding_version(),
@@ -7706,7 +7041,7 @@ mod tests {
         manifest.segments.clear();
         manifest.artifact_origins.clear();
         manifest
-            .finalize_receipt_root(&store, "binding-monotonic")
+            .finalize_manifest_binding("binding-monotonic")
             .unwrap();
         assert_eq!(
             manifest.receipt_binding_version(),
@@ -7847,30 +7182,6 @@ mod tests {
         )
         .expect_err("reserved version must not become authority");
         assert!(matches!(error, ZeppelinError::Serialization(_)));
-
-        let error = manifest_root_signing_bytes(
-            [1; 32],
-            1,
-            1,
-            ReceiptBindingVersion::V4Lineage,
-            [2; 32],
-            None,
-        )
-        .expect_err("V4 root projection requires its control digest");
-        assert!(matches!(error, ZeppelinError::Serialization(_)));
-
-        let bytes = manifest_root_signing_bytes(
-            [1; 32],
-            1,
-            1,
-            ReceiptBindingVersion::V4Lineage,
-            [2; 32],
-            Some([3; 32]),
-        )
-        .expect("V4 must use the frozen V2 root envelope");
-        let bytes = String::from_utf8(bytes).unwrap();
-        assert!(bytes.contains(r#""binding_version":"v4_lineage""#));
-        assert!(bytes.starts_with(r#"{"domain":"zeppelin-manifest-root-envelope-v2""#));
     }
 
     #[test]
@@ -7897,20 +7208,12 @@ mod tests {
         source.active_segment = Some(active.id.clone());
         source.segments.push(make_segment("inactive"));
         source.segments.push(active);
-        let fragment_key = crate::wal::WalFragment::s3_key("fork-source-z", &fragment_id);
-        let active_key = crate::index::ivf_flat::build::centroids_key("fork-source-z", "active");
-        let inactive_key =
-            crate::index::ivf_flat::build::centroids_key("fork-source-z", "inactive");
-        source.artifact_hashes.insert(fragment_key.clone(), [1; 32]);
-        source.artifact_hashes.insert(active_key.clone(), [2; 32]);
-        source.artifact_hashes.insert(inactive_key, [3; 32]);
 
         let prepared = Manifest::prepare_zero_copy_fork(
             &source,
             &source_identity,
             &target_identity,
             lineage_seed(&source_identity, 7, 0x103, 1),
-            true,
             DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
         )
         .unwrap();
@@ -7938,14 +7241,6 @@ mod tests {
             target.segment_origin(&target.segments[0]).unwrap(),
             origin("fork-source-z", 0x101)
         );
-        assert_eq!(
-            target
-                .artifact_hashes
-                .keys()
-                .cloned()
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([fragment_key, active_key])
-        );
         assert_eq!(target.branch_lineage(), Some(&prepared.lineage));
         target.validate_initial_fork_view().unwrap();
     }
@@ -7966,30 +7261,23 @@ mod tests {
             artifact_origin: None,
         });
         root.next_sequence = 1;
-        root.artifact_hashes.insert(
-            crate::wal::WalFragment::s3_key(root_identity.namespace.as_str(), &fragment_id),
-            [4; 32],
-        );
         let parent = Manifest::prepare_zero_copy_fork(
             &root,
             &root_identity,
             &parent_identity,
             lineage_seed(&root_identity, 3, 0x205, 1),
-            true,
             Utc::now(),
         )
         .unwrap();
-        let store = ZeppelinStore::new(Arc::new(InMemory::new())).with_receipts_enabled(true);
         let parent = parent
             .manifest
-            .preseal_generation_one(&store, &parent_identity)
+            .preseal_generation_one(&parent_identity)
             .unwrap();
         let nested = Manifest::prepare_zero_copy_fork(
             parent.manifest(),
             &parent_identity,
             &target_identity,
             lineage_seed(&parent_identity, 1, 0x206, 2),
-            true,
             Utc::now(),
         )
         .unwrap();
@@ -8019,23 +7307,17 @@ mod tests {
                 artifact_origin: None,
             });
             root.next_sequence = 1;
-            root.artifact_hashes.insert(
-                crate::wal::WalFragment::s3_key(root_name, &inherited_id),
-                [5; 32],
-            );
             let parent = Manifest::prepare_zero_copy_fork(
                 &root,
                 &root_identity,
                 &parent_identity,
                 lineage_seed(&root_identity, 3, ordinal + 4, 1),
-                true,
                 Utc::now(),
             )
             .unwrap();
-            let store = ZeppelinStore::new(Arc::new(InMemory::new())).with_receipts_enabled(true);
             let mut parent = parent
                 .manifest
-                .preseal_generation_one(&store, &parent_identity)
+                .preseal_generation_one(&parent_identity)
                 .unwrap()
                 .manifest()
                 .clone();
@@ -8051,13 +7333,9 @@ mod tests {
                 },
                 Utc::now(),
             );
-            parent.artifact_hashes.insert(
-                crate::wal::WalFragment::s3_key(parent_name, &local_id),
-                [6; 32],
-            );
             parent.version = 2;
             parent
-                .finalize_receipt_root(&store, parent_identity.namespace.as_str())
+                .finalize_manifest_binding(parent_identity.namespace.as_str())
                 .unwrap();
 
             let nested = Manifest::prepare_zero_copy_fork(
@@ -8065,7 +7343,6 @@ mod tests {
                 &parent_identity,
                 &target_identity,
                 lineage_seed(&parent_identity, 2, ordinal + 6, 2),
-                true,
                 Utc::now(),
             )
             .unwrap();
@@ -8112,14 +7389,12 @@ mod tests {
             &source_identity,
             &target_identity,
             lineage_seed(&source_identity, 4, 0x303, 1),
-            true,
             Utc::now(),
         )
         .unwrap();
-        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         let sealed = prepared
             .manifest
-            .preseal_generation_one(&store, &target_identity)
+            .preseal_generation_one(&target_identity)
             .unwrap();
         assert_eq!(
             sealed.manifest().receipt_binding_version(),
@@ -8168,14 +7443,12 @@ mod tests {
             &source_identity,
             &target_identity,
             lineage_seed(&source_identity, 2, 0x403, 1),
-            true,
             Utc::now(),
         )
         .unwrap();
-        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         let predecessor = prepared
             .manifest
-            .preseal_generation_one(&store, &target_identity)
+            .preseal_generation_one(&target_identity)
             .unwrap()
             .manifest()
             .clone();
@@ -8220,13 +7493,12 @@ mod tests {
             &source_identity,
             &target_identity,
             lineage_seed(&source_identity, 11, 0x503, 1),
-            true,
             Utc::now(),
         )
         .unwrap();
         let sealed = prepared
             .manifest
-            .preseal_generation_one(&store, &target_identity)
+            .preseal_generation_one(&target_identity)
             .unwrap();
 
         let first = Manifest::create_or_verify_generation_one(&store, &target_identity, &sealed)
@@ -9104,128 +8376,6 @@ mod tests {
             ZeppelinError::Branch(error)
                 if matches!(error.as_ref(), BranchError::BranchingNotReady { .. })
         ));
-    }
-
-    #[test]
-    fn immediately_pre_origin_manifest_resolves_implicit_refs_locally() {
-        #[derive(Serialize)]
-        struct OldFragmentBeforeOrigins {
-            id: Ulid,
-            vector_count: usize,
-            delete_count: usize,
-            sequence_number: u64,
-            size_bytes: u64,
-        }
-
-        #[derive(Serialize)]
-        struct OldSegmentBeforeOrigins {
-            id: String,
-            vector_count: usize,
-            cluster_count: usize,
-            quantization: crate::index::quantization::QuantizationType,
-            hierarchical: bool,
-            bitmap_fields: Vec<String>,
-            fts_fields: Vec<String>,
-            has_global_fts: bool,
-            cluster_owners: Vec<String>,
-            sketch: Option<SketchRef>,
-            cluster_objects: Vec<ClusterDataObjectRef>,
-            bootstrap: Option<BootstrapRef>,
-            membership: Option<MembershipRef>,
-        }
-
-        #[derive(Serialize)]
-        struct OldManifestBeforeOrigins {
-            fragments: Vec<OldFragmentBeforeOrigins>,
-            segments: Vec<OldSegmentBeforeOrigins>,
-            compaction_watermark: Option<Ulid>,
-            active_segment: Option<String>,
-            next_sequence: u64,
-            pending_deletes: Vec<String>,
-            fencing_token: u64,
-            updated_at: DateTime<Utc>,
-            version: u64,
-            namespace: Option<String>,
-            namespace_incarnation: Option<ManifestNamespaceIncarnation>,
-            deletion_fence: Option<ManifestDeletionFence>,
-            artifact_hashes: BTreeMap<String, [u8; 32]>,
-            merkle_root: Option<[u8; 32]>,
-            root_signature: Option<Vec<u8>>,
-            root_signer_node: Option<String>,
-            hierarchical_routing_nodes: BTreeMap<String, Vec<String>>,
-            receipt_state_digest: Option<[u8; 32]>,
-            receipt_binding_version: Option<ReceiptBindingVersion>,
-        }
-
-        let fragment_id = Ulid::from(0x123_u128);
-        let namespace_incarnation = uuid::Uuid::from_u128(0x456);
-        let old = OldManifestBeforeOrigins {
-            fragments: vec![OldFragmentBeforeOrigins {
-                id: fragment_id,
-                vector_count: 1,
-                delete_count: 0,
-                sequence_number: 0,
-                size_bytes: 7,
-            }],
-            segments: vec![OldSegmentBeforeOrigins {
-                id: "legacy-segment".to_string(),
-                vector_count: 1,
-                cluster_count: 1,
-                quantization: crate::index::quantization::QuantizationType::None,
-                hierarchical: false,
-                bitmap_fields: Vec::new(),
-                fts_fields: Vec::new(),
-                has_global_fts: false,
-                cluster_owners: Vec::new(),
-                sketch: None,
-                cluster_objects: Vec::new(),
-                bootstrap: None,
-                membership: None,
-            }],
-            compaction_watermark: None,
-            active_segment: Some("legacy-segment".to_string()),
-            next_sequence: 1,
-            pending_deletes: Vec::new(),
-            fencing_token: 2,
-            updated_at: Utc::now(),
-            version: 3,
-            namespace: Some("legacy-bound".to_string()),
-            namespace_incarnation: Some(ManifestNamespaceIncarnation::from_uuid(
-                namespace_incarnation,
-            )),
-            deletion_fence: None,
-            artifact_hashes: BTreeMap::new(),
-            merkle_root: None,
-            root_signature: None,
-            root_signer_node: None,
-            hierarchical_routing_nodes: BTreeMap::new(),
-            receipt_state_digest: None,
-            receipt_binding_version: None,
-        };
-
-        let mut data = vec![MANIFEST_FORMAT_MSGPACK];
-        data.extend_from_slice(&rmp_serde::to_vec(&old).unwrap());
-        let decoded = Manifest::from_bytes_for_namespace(&data, "legacy-bound")
-            .expect("the immediately pre-origin positional shape must decode locally");
-
-        assert!(decoded.artifact_origins.is_empty());
-        assert!(decoded.branch_roots().is_empty());
-        assert!(decoded.branch_lineage().is_none());
-        assert_eq!(decoded.fragments[0].artifact_origin, None);
-        assert_eq!(decoded.segments[0].artifact_origin, None);
-        let expected = ArtifactOrigin {
-            namespace: NamespaceId::parse("legacy-bound").unwrap(),
-            incarnation: NamespaceIncarnationId::from_uuid(namespace_incarnation),
-        };
-        assert_eq!(decoded.local_origin().unwrap(), expected);
-        assert_eq!(
-            decoded.fragment_origin(&decoded.fragments[0]).unwrap(),
-            expected
-        );
-        assert_eq!(
-            decoded.segment_origin(&decoded.segments[0]).unwrap(),
-            expected
-        );
     }
 
     /// Backward compat: manifests serialized BEFORE `FragmentRef.size_bytes`

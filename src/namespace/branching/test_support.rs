@@ -96,8 +96,6 @@ pub struct SyntheticForeignFetchResult {
     pub records: Vec<SyntheticForeignFetchRecord>,
     /// Absent or tombstoned IDs in request-relative order.
     pub missing: Vec<VectorId>,
-    /// Exact immutable segment keys consumed by lookup.
-    pub touched_artifact_keys: Vec<String>,
 }
 
 /// Test-only observation of one live manifest's branch-control state.
@@ -107,7 +105,7 @@ pub struct BranchControlSnapshot {
     pub roots: Vec<BranchRoot>,
     /// Whether the same authoritative manifest observation carried a delete fence.
     pub deletion_fenced: bool,
-    /// Receipt/control projection version bound to the live generation.
+    /// Execution/control projection version bound to the live generation.
     pub binding_version: Option<ReceiptBindingVersion>,
     /// Exact live manifest generation from the same observation.
     pub manifest_generation: u64,
@@ -1250,19 +1248,18 @@ impl SyntheticForeignOriginView {
         include_attributes: bool,
         attribute_fields: Option<&[String]>,
     ) -> Result<SyntheticForeignFetchResult> {
-        let (response, touched) =
-            crate::server::handlers::vectors::fetch_vectors_by_id_for_test_support(
-                &self.store,
-                &self.target_namespace,
-                ids,
-                consistency,
-                include_vector,
-                include_attributes,
-                attribute_fields,
-                self.manifest.clone(),
-                self.target_origin.clone(),
-            )
-            .await?;
+        let (response, _) = crate::server::handlers::vectors::fetch_vectors_by_id_for_test_support(
+            &self.store,
+            &self.target_namespace,
+            ids,
+            consistency,
+            include_vector,
+            include_attributes,
+            attribute_fields,
+            self.manifest.clone(),
+            self.target_origin.clone(),
+        )
+        .await?;
         Ok(SyntheticForeignFetchResult {
             records: response
                 .results
@@ -1274,7 +1271,6 @@ impl SyntheticForeignOriginView {
                 })
                 .collect(),
             missing: response.missing,
-            touched_artifact_keys: touched.into_iter().collect(),
         })
     }
 

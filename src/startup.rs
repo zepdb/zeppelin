@@ -481,8 +481,7 @@ async fn build_app_with_entitlement_resolver(
         }
     }
     // Initialize storage
-    let store =
-        ZeppelinStore::from_config(&config.storage)?.with_receipts_enabled(config.receipts.enabled);
+    let store = ZeppelinStore::from_config(&config.storage)?;
     if storage_available {
         match probe_storage(&store).await {
             Ok(()) => tracing::info!("storage health probe succeeded"),
@@ -514,7 +513,7 @@ async fn build_app_with_entitlement_resolver(
         Arc::clone(&entitlements),
     )
     .await?;
-    if durable_audit_enabled || config.receipts.enabled {
+    if durable_audit_enabled {
         security.install_object_signer(&store)?;
     }
     let audit_now = clock.now();

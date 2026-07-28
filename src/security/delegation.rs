@@ -26,8 +26,7 @@
 //!   not licensed) at boot, installs it into [`ZeppelinStore`]
 //!   as a `dyn ObjectSigner`, and calls `mint` only after it has confirmed the
 //!   parent's current grants cover every action/namespace pair in the request.
-//! - `wal/manifest.rs` and `audit_chain.rs` call
-//!   `verify_published_signature` to check manifest-root and audit-anchor
+//! - `audit_chain.rs` calls `verify_published_signature` to check audit-anchor
 //!   signatures.
 //!
 //! ## Narrowing: a token can only ever subtract

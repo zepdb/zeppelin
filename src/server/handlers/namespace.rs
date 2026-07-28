@@ -166,9 +166,7 @@ use crate::server::{
     authorize_namespace_action, namespace_graph, AppState, AuditRequest, RateLimitIdentity,
 };
 use crate::types::{DistanceMetric, IndexType};
-use crate::wal::manifest::{
-    AuthenticatedManifestArtifactInventory, NamedSnapshot, NamedSnapshotRef, SegmentRef,
-};
+use crate::wal::manifest::{NamedSnapshot, NamedSnapshotRef, SegmentRef};
 use crate::wal::{FragmentCachePolicy, Manifest};
 
 use super::{as_of, ApiError};
@@ -1627,29 +1625,6 @@ pub async fn clone_namespace(
         }
     };
     let target_manifest = if source_has_foreign_artifacts {
-        let signing_enabled = state.store.receipts_enabled();
-        let authenticated_source_inventory = if signing_enabled {
-            match AuthenticatedManifestArtifactInventory::authenticate(
-                &state.store,
-                &source,
-                &source_manifest,
-            )
-            .await
-            {
-                Ok(inventory) => Some(inventory),
-                Err(error) => {
-                    retain_failed_clone_target(
-                        &state,
-                        &target,
-                        "source receipt authentication failed",
-                    );
-                    release_internal_clone_pin(&state, &source, &clone_pin_name).await;
-                    return Err(ApiError::from(map_clone_source_integrity_error(error)));
-                }
-            }
-        } else {
-            None
-        };
         let target_origin = match target_base_manifest.local_origin() {
             Ok(origin) => origin,
             Err(error) => {
@@ -1660,12 +1635,7 @@ pub async fn clone_namespace(
         };
         let unpublished = match state
             .compactor
-            .build_unpublished_owned_segment(
-                &source,
-                &source_manifest,
-                &target_origin,
-                authenticated_source_inventory.as_ref(),
-            )
+            .build_unpublished_owned_segment(&source, &source_manifest, &target_origin)
             .await
         {
             Ok(candidate) => candidate,
@@ -1679,16 +1649,6 @@ pub async fn clone_namespace(
         let mut manifest = target_base_manifest.clone();
         let publication_guard = unpublished
             .map(|candidate| candidate.install_into_at(&mut manifest, state.clock.now()));
-        if signing_enabled && manifest.receipt_upgrade_needed(&target) {
-            if let Err(error) = manifest
-                .hydrate_receipt_artifacts(&state.store, &target)
-                .await
-            {
-                retain_failed_clone_target(&state, &target, "receipt inventory failed");
-                release_internal_clone_pin(&state, &source, &clone_pin_name).await;
-                return Err(ApiError::from(error));
-            }
-        }
         if let Err(error) = state.security.validate_namespace_copy_no_widening(
             clone_decision.policy_version,
             &source_id,
@@ -1915,14 +1875,6 @@ fn retain_failed_clone_target(state: &AppState, target: &str, stage: &'static st
     );
 }
 
-/// Redacts authenticated source divergence behind the branch integrity contract.
-fn map_clone_source_integrity_error(error: ZeppelinError) -> ZeppelinError {
-    match error {
-        error @ (ZeppelinError::Storage(_) | ZeppelinError::Io(_)) => error,
-        _ => BranchError::BranchIntegrity.into(),
-    }
-}
-
 /// Resolves creation overrides against complete server indexing defaults.
 ///
 /// # Parameters
@@ -2134,15 +2086,9 @@ async fn materialize_clone_manifest(
     mut manifest: Manifest,
 ) -> Result<Manifest, ZeppelinError> {
     manifest.pending_deletes.clear();
-    if state.store.receipts_enabled() && manifest.receipt_artifacts(source).is_err() {
-        manifest
-            .hydrate_receipt_artifacts(&state.store, source)
-            .await?;
-    }
     let copies = clone_copy_map(source, target, &manifest)?;
     manifest.normalize_copy_clone_artifact_ownership()?;
     rewrite_manifest_stored_keys(source, target, &mut manifest)?;
-    manifest.rewrite_receipt_artifacts_for_clone(source, target)?;
     manifest.fencing_token = 0;
     manifest.updated_at = state.clock.now();
     manifest.reset_version_for_clone();
@@ -2181,9 +2127,9 @@ async fn materialize_clone_manifest(
 ///
 /// # Examples
 ///
-/// `source/wal/01.wal` maps to `restore/wal/01.wal`; the manifest's exact,
-/// hydrated receipt inventory supplies every segment sidecar and hierarchical
-/// routing node.
+/// `source/wal/01.wal` maps to `restore/wal/01.wal`; the manifest's reachable
+/// object inventory supplies every segment sidecar and hierarchical routing
+/// node.
 fn clone_copy_map(
     source: &str,
     target: &str,
@@ -2561,10 +2507,9 @@ fn require_unconstrained_namespace_operation(decision: &AllowDecision) -> Result
 ///
 /// # Returns
 ///
-/// HTTP 200 with `status = "noop"` when no fragment, receipt upgrade, or
-/// foreign-backed view needs compaction, or HTTP 202 with `status = "accepted"`
-/// after lease acquisition and task spawn. Both bodies describe the manifest
-/// observed before work began.
+/// HTTP 200 with `status = "noop"` when no fragment or foreign-backed view needs
+/// compaction, or HTTP 202 with `status = "accepted"` after lease acquisition
+/// and task spawn. Both bodies describe the manifest observed before work began.
 ///
 /// # Errors
 ///
@@ -2630,15 +2575,10 @@ pub async fn compact_namespace(
         .await
         .map_err(ApiError::from)?;
 
-    let receipt_upgrade_available =
-        state.store.receipts_enabled() && before.receipt_upgrade_needed(&ns);
     let materialize_foreign = before
         .has_foreign_visible_artifacts()
         .map_err(ApiError::from)?;
-    if before.uncompacted_fragments().is_empty()
-        && !receipt_upgrade_available
-        && !materialize_foreign
-    {
+    if before.uncompacted_fragments().is_empty() && !materialize_foreign {
         return Ok((
             StatusCode::OK,
             Json(CompactNamespaceResponse::from_status(
