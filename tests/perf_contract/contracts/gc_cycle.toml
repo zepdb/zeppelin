@@ -25,10 +25,10 @@ repeats = 1
 op = "gc"
 
 [baseline]
-git_rev = "9adc1cb500dba7407e7fc6875bd353f7e1050202"
-captured = "2026-07-28T05:09:03Z"
+git_rev = "20f7d4069e94fb3bb33aca9a96a71f36d085d26e"
+captured = "2026-07-28T21:39:43Z"
 approved_by = "anup"
-reason = "D9 acceptance, 2026-07-26 at 23accb3, after Anup reviewed the before/after table. BYTES ONLY: operation counts and critical-path depth are unchanged and were restored by 34dd8ca, which stopped GC's mark phase re-reading a live manifest the branch-root observation had already proven current. The growth is the receipt artifact inventory accepted in a887d3c, amplified here because a cycle reads 18 retained history generations: manifest 2.18x, history bodies 3.90x, total 3.53x. Captured in release. Receipt removal at 9ff6fbd, d83ad82, and 9adc1cb deleted the Merkle modules, the signed manifest roots with the artifact-hash inventory, and the execution-state digest; the amplification runs in reverse here because every one of the 18 retained history generations shrank, so the manifest, history, and total byte bands are re-derived at 9adc1cb from the release gate and the 100-sample depth-stability run. Operation counts, key counts, critical-path depth, and non-manifest bytes are unchanged and were NOT re-approved."
+reason = "D9 acceptance, 2026-07-26 at 23accb3, after Anup reviewed the before/after table. BYTES ONLY: operation counts and critical-path depth are unchanged and were restored by 34dd8ca, which stopped GC's mark phase re-reading a live manifest the branch-root observation had already proven current. The growth is the receipt artifact inventory accepted in a887d3c, amplified here because a cycle reads 18 retained history generations: manifest 2.18x, history bodies 3.90x, total 3.53x. Captured in release. Receipt removal at 9ff6fbd, d83ad82, and 9adc1cb deleted the Merkle modules, the signed manifest roots with the artifact-hash inventory, and the execution-state digest; the amplification runs in reverse here because every one of the 18 retained history generations shrank, so the manifest, history, and total byte bands are re-derived at 9adc1cb from the release gate and the 100-sample depth-stability run. Operation counts, key counts, critical-path depth, and non-manifest bytes are unchanged and were NOT re-approved. Cost acceptance at 20f7d40 by anup 2026-07-28 for the row_layouts manifest growth from 35d9f4d. Measured ~25 bytes per cluster per manifest, consistently: +198 B per manifest read at nlist=8 (as_of_query, compaction_incremental), +591 B over three manifest reads in gc_cycle, +364 B at nlist=16 in cold_query_sketch_adc. This is a WRITE-path byte cost paid on the manifest CAS-PUT of every WAL append and on every manifest read, bought for the query-path GET reduction accepted in 86986b5. Accepted on the same reasoning as slice 6.3 (results/coalescing-gap.md): in-region S3 bytes are free and GETs cost $0.40/M. SCALE CAVEAT, recorded deliberately: contract fixtures use nlist 4-16, so this measures ~200 B of a cost that production pays at nlist 256-4096, where it is ~8 KB at a typical nlist=334 and ~100 KB at the upper bound. The gate cannot see that; see results/g4-recapture-20f7d40.md. Bands keep their documented method: 4x the 100-sample depth-stability spread with a 32 B floor for manifest-shaped reads, 256 B each side of the eight gate repeats for the write scenarios."
 
 [assert.depth.get]
 mode = "exact"
@@ -82,9 +82,9 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.manifest]
-min = 7638
-max = 7827
-why = "three live-manifest GETs of a receipt-bearing manifest. Manifest-shaped objects encode timestamps at variable width, so this is not byte-deterministic: 4 release samples on 23accb3 spanned 15924..15942 (18 B). Band pads 4x the observed spread (min 32 B) each side, absorbing jitter while still failing on a doubling or a disappearance. Re-derived at 9adc1cb after receipt removal: 100 stability samples spanned 7722..7743 (21 B); same 4x padding."
+min = 8307
+max = 8550
+why = "three live-manifest GETs of a receipt-bearing manifest. Manifest-shaped objects encode timestamps at variable width, so this is not byte-deterministic: 4 release samples on 23accb3 spanned 15924..15942 (18 B). Band pads 4x the observed spread (min 32 B) each side, absorbing jitter while still failing on a doubling or a disappearance. Re-derived at 9adc1cb after receipt removal: 100 stability samples spanned 7722..7743 (21 B); same 4x padding. Re-derived at 20f7d40: 35d9f4d publishes one ClusterRowLayoutRef (8 integer fields, ~25 B) per cluster per object in every manifest carrying a quantized segment, on the default SQ8 path and not only for two-bit. Band method unchanged."
 
 [assert.get_bytes.other]
 min = 28503
@@ -98,9 +98,9 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-min = 36141
-max = 39732
-why = "sum of the two manifest-shaped bands above; inherits their jitter and padding. Re-derived at 9adc1cb as the sum of the two re-derived bands above."
+min = 37071
+max = 41688
+why = "sum of the two manifest-shaped bands above; inherits their jitter and padding. Re-derived at 9adc1cb as the sum of the two re-derived bands above. Re-derived at 20f7d40: 35d9f4d publishes one ClusterRowLayoutRef (8 integer fields, ~25 B) per cluster per object in every manifest carrying a quantized segment, on the default SQ8 path and not only for two-bit. Band method unchanged."
 
 [assert.get_bytes.wal]
 exact = 0
