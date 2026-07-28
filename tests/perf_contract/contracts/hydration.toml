@@ -26,10 +26,10 @@ op = "hydrate"
 attempts = 2
 
 [baseline]
-git_rev = "9adc1cb500dba7407e7fc6875bd353f7e1050202"
-captured = "2026-07-28T05:09:03Z"
+git_rev = "20f7d4069e94fb3bb33aca9a96a71f36d085d26e"
+captured = "2026-07-28T21:38:56Z"
 approved_by = "anup"
-reason = "Rebaseline at 34dd8ca accepting 6c850f5's per-job hydration authority revalidation. validate_hydration_job_authority (hydration.rs:862) re-reads the live manifest inside the worker's retry loop before any origin-qualified key is headed or fetched, checking namespace lifetime, deletion fence, manifest generation, and resolved physical owner. The queue separates the handler's read from the worker's execution, so unlike GC's mark-phase read this one is a genuine TOCTOU guard and cannot reuse the handler's observation. That adds one manifest GET and one critical-path level per hydration request: gets.manifest 2->4, gets.total 15->17, depth 31->33 for two requests. This rebaseline therefore accepts an OPERATION and DEPTH increase, a stronger claim than a887d3c's byte-only bands. Manifest bytes additionally carry the receipt artifact inventory growth already accepted in a887d3c, and are banded here because manifest-shaped objects are not byte-deterministic. Measured in release; the ns budgets in this catalog are release-calibrated. Receipt removal at 9ff6fbd, d83ad82, and 9adc1cb deleted the Merkle modules, the signed manifest roots with the artifact-hash inventory, and the execution-state digest; the four manifest GETs shrank, so the manifest and total byte bands are re-derived at 9adc1cb from the release gate and the 100-sample depth-stability run. Operation counts, key counts, critical-path depth, and non-manifest bytes are unchanged and were NOT re-approved."
+reason = "Rebaseline at 34dd8ca accepting 6c850f5's per-job hydration authority revalidation. validate_hydration_job_authority (hydration.rs:862) re-reads the live manifest inside the worker's retry loop before any origin-qualified key is headed or fetched, checking namespace lifetime, deletion fence, manifest generation, and resolved physical owner. The queue separates the handler's read from the worker's execution, so unlike GC's mark-phase read this one is a genuine TOCTOU guard and cannot reuse the handler's observation. That adds one manifest GET and one critical-path level per hydration request: gets.manifest 2->4, gets.total 15->17, depth 31->33 for two requests. This rebaseline therefore accepts an OPERATION and DEPTH increase, a stronger claim than a887d3c's byte-only bands. Manifest bytes additionally carry the receipt artifact inventory growth already accepted in a887d3c, and are banded here because manifest-shaped objects are not byte-deterministic. Measured in release; the ns budgets in this catalog are release-calibrated. Receipt removal at 9ff6fbd, d83ad82, and 9adc1cb deleted the Merkle modules, the signed manifest roots with the artifact-hash inventory, and the execution-state digest; the four manifest GETs shrank, so the manifest and total byte bands are re-derived at 9adc1cb from the release gate and the 100-sample depth-stability run. Operation counts, key counts, critical-path depth, and non-manifest bytes are unchanged and were NOT re-approved. Rebaselined at 20f7d40 by anup 2026-07-28 for the ZBP5 cluster-payload improvement ONLY. Cluster-class bytes fell 2.0% on unfiltered query paths and 4.7% on filtered and compaction paths; cold_query_strong cluster GETs went 7 -> 4 and cold_query_sketch_adc 11 -> 6, independently confirming tests/get_count_bench.rs from a second measurement path. Cause: e2983a6 (ZBP5 codecs, hoisted IDs, fixed-stride f32 rows) and 35d9f4d (manifest row layouts, ranged cluster reads). Only cluster-class fields and GET counts moved in this commit; manifest-shaped bands are a separate cause and a separate acceptance. Depth was NOT retightened: 100 depth-stability samples show cold_query_strong at {5: 100} against a governed max of 7, so the bound is satisfied and narrowing it is its own decision."
 
 [assert.depth.get]
 mode = "exact"
@@ -77,7 +77,8 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.cluster]
-exact = 1450432
+exact = 1380928
+why = "Re-derived at 20f7d40: ZBP5 row layouts (e2983a6 codecs, 35d9f4d manifest layouts and ranged reads) removed the grouped-object directory GET and shrank the cluster payload encoding."
 
 [assert.get_bytes.fts]
 exact = 0

@@ -35,10 +35,10 @@ field = "content"
 query = "alpha"
 
 [baseline]
-git_rev = "ff182073ebe01ece19e771f5e4fc6b7b433153b3"
-captured = "2026-07-10T04:58:57.121904+00:00"
+git_rev = "20f7d4069e94fb3bb33aca9a96a71f36d085d26e"
+captured = "2026-07-28T21:38:56Z"
 approved_by = "anup"
-reason = "Initial Phase 2 freeze after audited MinIO capture: the ANN and global-FTS union, including rerank, forms exact depth five without duplicate FTS reads."
+reason = "Initial Phase 2 freeze after audited MinIO capture: the ANN and global-FTS union, including rerank, forms exact depth five without duplicate FTS reads. Rebaselined at 20f7d40 by anup 2026-07-28 for the ZBP5 cluster-payload improvement ONLY. Cluster-class bytes fell 2.0% on unfiltered query paths and 4.7% on filtered and compaction paths; cold_query_strong cluster GETs went 7 -> 4 and cold_query_sketch_adc 11 -> 6, independently confirming tests/get_count_bench.rs from a second measurement path. Cause: e2983a6 (ZBP5 codecs, hoisted IDs, fixed-stride f32 rows) and 35d9f4d (manifest row layouts, ranged cluster reads). Only cluster-class fields and GET counts moved in this commit; manifest-shaped bands are a separate cause and a separate acceptance. Depth was NOT retightened: 100 depth-stability samples show cold_query_strong at {5: 100} against a governed max of 7, so the bound is satisfied and narrowing it is its own decision."
 
 [assert.depth.get]
 mode = "exact"
@@ -86,7 +86,8 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.cluster]
-exact = 1879459
+exact = 1801364
+why = "Re-derived at 20f7d40: ZBP5 row layouts (e2983a6 codecs, 35d9f4d manifest layouts and ranged reads) removed the grouped-object directory GET and shrank the cluster payload encoding."
 
 [assert.get_bytes.fts]
 exact = 172497
@@ -104,7 +105,8 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-exact = 2051956
+exact = 1973861
+why = "Re-derived at 20f7d40: ZBP5 row layouts (e2983a6 codecs, 35d9f4d manifest layouts and ranged reads) removed the grouped-object directory GET and shrank the cluster payload encoding."
 
 [assert.get_bytes.wal]
 exact = 0

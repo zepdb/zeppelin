@@ -28,15 +28,15 @@ top_k = 10
 query_index = 0
 
 [baseline]
-git_rev = "9adc1cb500dba7407e7fc6875bd353f7e1050202"
-captured = "2026-07-28T05:09:03Z"
+git_rev = "20f7d4069e94fb3bb33aca9a96a71f36d085d26e"
+captured = "2026-07-28T21:38:56Z"
 approved_by = "anup"
-reason = "Byte-only rebaseline at 437e9ff. The security and branching tracks add 13 persisted manifest fields; the receipt artifact inventory (`artifact_hashes`, bb51e04) dominates and is populated unconditionally, roughly doubling serialized manifest size. Accepted as the intended cost of receipts. Operation counts, key counts, critical-path depth, and quantized artifact bytes are unchanged and were NOT re-approved. ZBS1 v2 at 46bebaf adds a 16-byte section directory and a 4-byte empty field count, increasing the immutable bootstrap by 20 bytes. Receipt removal at 9ff6fbd, d83ad82, and 9adc1cb deleted the Merkle modules, the signed manifest roots with the artifact-hash inventory, and the execution-state digest; every manifest-shaped object shrank, so the manifest and total byte bands are re-derived at 9adc1cb from the release gate and the 100-sample depth-stability run. Operation counts, key counts, and non-manifest bytes are unchanged and were NOT re-approved. assert.depth.get moves exact 6 -> max 7: that stability run gave {6: 99, 7: 1}, and the depth-7 chain carries the same 14 GETs with the final rerank GET chained one stage later - the completion-order jitter mechanism already approved for cold_query_strong."
+reason = "Byte-only rebaseline at 437e9ff. The security and branching tracks add 13 persisted manifest fields; the receipt artifact inventory (`artifact_hashes`, bb51e04) dominates and is populated unconditionally, roughly doubling serialized manifest size. Accepted as the intended cost of receipts. Operation counts, key counts, critical-path depth, and quantized artifact bytes are unchanged and were NOT re-approved. ZBS1 v2 at 46bebaf adds a 16-byte section directory and a 4-byte empty field count, increasing the immutable bootstrap by 20 bytes. Receipt removal at 9ff6fbd, d83ad82, and 9adc1cb deleted the Merkle modules, the signed manifest roots with the artifact-hash inventory, and the execution-state digest; every manifest-shaped object shrank, so the manifest and total byte bands are re-derived at 9adc1cb from the release gate and the 100-sample depth-stability run. Operation counts, key counts, and non-manifest bytes are unchanged and were NOT re-approved. assert.depth.get moves exact 6 -> max 7: that stability run gave {6: 99, 7: 1}, and the depth-7 chain carries the same 14 GETs with the final rerank GET chained one stage later - the completion-order jitter mechanism already approved for cold_query_strong. Rebaselined at 20f7d40 by anup 2026-07-28 for the ZBP5 cluster-payload improvement ONLY. Cluster-class bytes fell 2.0% on unfiltered query paths and 4.7% on filtered and compaction paths; cold_query_strong cluster GETs went 7 -> 4 and cold_query_sketch_adc 11 -> 6, independently confirming tests/get_count_bench.rs from a second measurement path. Cause: e2983a6 (ZBP5 codecs, hoisted IDs, fixed-stride f32 rows) and 35d9f4d (manifest row layouts, ranged cluster reads). Only cluster-class fields and GET counts moved in this commit; manifest-shaped bands are a separate cause and a separate acceptance. Depth was NOT retightened: 100 depth-stability samples show cold_query_strong at {5: 100} against a governed max of 7, so the bound is satisfied and narrowing it is its own decision."
 
 [assert.depth.get]
 mode = "max"
 value = 7
-why = "cold metadata, manifest, bootstrap, and grouped clusters form depth six; 100 stability samples on 9adc1cb gave {6: 99, 7: 1} because the parallel grouped header/sketch pipelines have completion-order jitter before ADC rerank, the same mechanism approved for cold_query_strong. The depth-7 chain carries the same 14 GETs with the final rerank GET chained one stage later; operation counts and bytes are identical at both depths."
+why = "cold metadata, manifest, bootstrap, and grouped clusters form depth six; 100 stability samples on 9adc1cb gave {6: 99, 7: 1} because the parallel grouped header/sketch pipelines have completion-order jitter before ADC rerank, the same mechanism approved for cold_query_strong. The depth-7 chain carries the same GETs (14 before ZBP5, 9 after) with the final rerank GET chained one stage later; operation counts and bytes are identical at both depths."
 
 [assert.gets]
 attrs = 0
@@ -45,13 +45,13 @@ bootstrap = 1
 centroids = 0
 # 11 < nprobe 16 is reachable only when v4 sketch ranking prunes the probe
 # set before grouped-object cluster reads; no recall assertion is needed.
-cluster = 11
+cluster = 6
 fts = 0
 manifest = 1
 other = 1
 sketch = 0
 sq = 0
-total = 14
+total = 9
 wal = 0
 
 [assert.puts]
@@ -82,8 +82,8 @@ why = "cold bootstrap embeds the resident v4 sketch; capture pins its size"
 exact = 0
 
 [assert.get_bytes.cluster]
-exact = 233694
-why = "capture pins the grouped cluster payloads selected after v4 ranking"
+exact = 229216
+why = "capture pins the grouped cluster payloads selected after v4 ranking Re-derived at 20f7d40: ZBP5 row layouts (e2983a6 codecs, 35d9f4d manifest layouts and ranged reads) removed the grouped-object directory GET and shrank the cluster payload encoding."
 
 [assert.get_bytes.fts]
 exact = 0

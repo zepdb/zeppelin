@@ -28,10 +28,10 @@ top_k = 10
 query_index = 0
 
 [baseline]
-git_rev = "ea8c7ece9d33bed6d31899eb0af7b54ea4f6b092"
-captured = "2026-07-14T05:25:36Z"
+git_rev = "20f7d4069e94fb3bb33aca9a96a71f36d085d26e"
+captured = "2026-07-28T21:38:56Z"
 approved_by = "anup"
-reason = "Phase 1 measured security freeze against warm_query_strong"
+reason = "Phase 1 measured security freeze against warm_query_strong Rebaselined at 20f7d40 by anup 2026-07-28 for the ZBP5 cluster-payload improvement ONLY. Cluster-class bytes fell 2.0% on unfiltered query paths and 4.7% on filtered and compaction paths; cold_query_strong cluster GETs went 7 -> 4 and cold_query_sketch_adc 11 -> 6, independently confirming tests/get_count_bench.rs from a second measurement path. Cause: e2983a6 (ZBP5 codecs, hoisted IDs, fixed-stride f32 rows) and 35d9f4d (manifest row layouts, ranged cluster reads). Only cluster-class fields and GET counts moved in this commit; manifest-shaped bands are a separate cause and a separate acceptance. Depth was NOT retightened: 100 depth-stability samples show cold_query_strong at {5: 100} against a governed max of 7, so the bound is satisfied and narrowing it is its own decision."
 
 [assert.security]
 baseline_scenario = "warm_query_strong"
@@ -86,8 +86,8 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.cluster]
-exact = 429027
-why = "capture pins four grouped-cluster GETs at their measured live-span bytes"
+exact = 420436
+why = "capture pins four grouped-cluster GETs at their measured live-span bytes Re-derived at 20f7d40: ZBP5 row layouts (e2983a6 codecs, 35d9f4d manifest layouts and ranged reads) removed the grouped-object directory GET and shrank the cluster payload encoding."
 
 [assert.get_bytes.fts]
 exact = 0
@@ -106,7 +106,8 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-exact = 429027
+exact = 420436
+why = "Re-derived at 20f7d40: ZBP5 row layouts (e2983a6 codecs, 35d9f4d manifest layouts and ranged reads) removed the grouped-object directory GET and shrank the cluster payload encoding."
 
 [assert.get_bytes.wal]
 exact = 0
