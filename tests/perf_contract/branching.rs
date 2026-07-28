@@ -30,7 +30,34 @@ const CONTRACT_VERSION: u32 = 1;
 const FORK_SAMPLES: usize = 8;
 const TINY_LOGICAL_ROWS: usize = 16;
 const CORPUS_LOGICAL_ROWS: usize = 1_000_000;
-const MAX_FORK_CONTROL_GETS: u64 = 32;
+// Fork control-GET budget, justified by the per-key census taken at e6bfb57
+// (35 GETs, tiny fixture; `assert_fork_contract` proves the count is
+// independent of logical row count). Each group backs a distinct state
+// transition or a deliberate phase-boundary re-verification:
+//
+//   <dst>/meta.json                         9  creating-intent probes, three
+//     metadata-transition CAS reads, publication reads, activation loops
+//   _security/heads/policy.json             5  authority check at every
+//     activation step (head is mutable; never memoized)
+//   <src>/manifest.json                     5  candidate build, fenced CAS
+//     base, root-visibility proof, two independent verification phases
+//   <src>/manifests/<generation>.msgpack    3  root-digest proofs inside
+//     those verification phases
+//   <dst>/manifest.json                     3  live==publication checks (x2
+//     phases) plus the handler's response read
+//   <src>/meta.json                         3  reservation, under-lease
+//     rooting, guarded-write recheck
+//   <src>/lease.json                        2  acquire create-vs-takeover
+//     probe, release ownership check
+//   <dst>/manifests/<generation>.msgpack    2  history==live checks
+//   _security/leases/policy-publication.json 2  two separate lease epochs
+//   _security/policies/<id>.json            1  immutable snapshot body,
+//     fetched once per fork via PolicySnapshotMemo
+//
+// Getting below 35 requires retiring a deliberate duplicate verification
+// (the second verify_prepared_target pass, -4) or the handler's terminal
+// read (-1); those are design decisions, not redundancy.
+const MAX_FORK_CONTROL_GETS: u64 = 35;
 const MAX_FORK_CONTROL_PUTS: u64 = 32;
 const MAX_FORK_CAS_PUTS: u64 = 8;
 
