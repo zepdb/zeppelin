@@ -2033,10 +2033,10 @@ fn build_report(
     }) {
         out.push_str("## Authorization Summary\n\n");
         out.push_str(
-            "| seed | allow | forbidden | unauthorized | staleness resolutions | I22 | I23 | I24 | I25 | I26 | I27 | I28 | I29 |\n",
+            "| seed | allow | forbidden | unauthorized | staleness resolutions | I22 | I23 | I24 | I25 | I26 | I27 | I28 |\n",
         );
         out.push_str(
-            "| --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- |\n",
+            "| --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | --- | --- |\n",
         );
         for seed in seeds {
             let records = read_ops(&seed.dir);
@@ -2071,7 +2071,7 @@ fn build_report(
                 }
             };
             out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 seed.seed,
                 allow,
                 forbidden,
@@ -2084,7 +2084,6 @@ fn build_report(
                 oracle_status(ViolationId::I26SecurityStateSanity),
                 oracle_status(ViolationId::I27ConstraintDrop),
                 oracle_status(ViolationId::I28PreservationBypass),
-                oracle_status(ViolationId::I29ReceiptIntegrity),
             ));
         }
         out.push('\n');
@@ -2407,7 +2406,7 @@ fn build_report(
     out.push('\n');
 
     out.push_str("## Security Oracle Coverage\n\n");
-    for oracle in ["I22", "I23", "I24", "I25", "I26", "I27", "I28", "I29"] {
+    for oracle in ["I22", "I23", "I24", "I25", "I26", "I27", "I28"] {
         let count = coverage
             .security_oracle_counts
             .get(oracle)

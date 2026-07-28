@@ -108,7 +108,6 @@ tables below are a complete index of the served routes.
 | `POST`            | `/v1/namespaces/:ns/hydrate`           | Trigger cache hydration                          |
 | `GET`             | `/v1/namespaces/:ns/snapshots`         | List snapshots                                   |
 | `GET/PUT/DELETE`  | `/v1/namespaces/:ns/snapshots/:name`   | Read, create, or delete one named snapshot       |
-| `GET`             | `/v1/namespaces/:ns/manifest/root`     | Signed manifest root — requires `receipts.enabled` and the receipts entitlement |
 
 ### Data
 
@@ -144,7 +143,6 @@ returns a not-licensed error without it. See the
 | `POST`             | `/v1/security/tokens`                           | Delegation   |
 | `GET/POST`         | `/v1/security/preservation`                     | Preservation |
 | `POST`             | `/v1/security/preservation/:lock_id/release`    | Preservation |
-| `POST`             | `/v1/verify`                                    | Receipts     |
 
 ## API Clients
 

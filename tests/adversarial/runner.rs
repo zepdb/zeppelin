@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, Instant};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
-use ed25519_dalek::{Signer as _, SigningKey};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -21,7 +19,7 @@ use zeppelin::error::ZeppelinError;
 use zeppelin::security::{
     verify_audit_day, AuditRecord, AuditRuntime, PolicyHead, PolicySnapshot, SecurityKernel,
 };
-use zeppelin::storage::{CreateOnlyOutcome, ZeppelinStore};
+use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::Clock;
 use zeppelin::types::ConsistencyLevel;
 use zeppelin::wal::{Lease, LeaseManager, Manifest, WalReader};
@@ -75,7 +73,7 @@ use super::{effective_seed_assignment, PreserveMode, RunMode, RunnerEnv};
 const AMBIGUITY_MARKER: &str = "_adversarial_ambiguity";
 const STORE_FAULT_MARKER: &str = "_adversarial_store_fault";
 const DUAL_WRITER_LEASE_HOLD_EVENT_ID: &str = "ops-dual-writer-lease-hold";
-const SECURITY_OP_KINDS: [&str; 23] = [
+const SECURITY_OP_KINDS: [&str; 20] = [
     "create_key",
     "rotate_key",
     "revoke_key",
@@ -86,9 +84,6 @@ const SECURITY_OP_KINDS: [&str; 23] = [
     "export_probe",
     "security_admin_probe",
     "audit_barrier",
-    "query_with_receipt",
-    "verify_receipt",
-    "tamper_artifact_then_verify",
     "audit_chain_check",
     "mint_token",
     "use_token",
@@ -110,204 +105,6 @@ static DELEGATED_TOKEN_BEARERS: LazyLock<RwLock<BTreeMap<(String, TokenSel), Str
 
 static PRESERVATION_LOCK_IDS: LazyLock<RwLock<BTreeMap<(String, LockSel), String>>> =
     LazyLock::new(|| RwLock::new(BTreeMap::new()));
-
-#[derive(Debug, Clone)]
-struct ReceiptEvidence {
-    namespace: String,
-    receipt: serde_json::Value,
-    results: serde_json::Value,
-    query: serde_json::Value,
-    logical_index: u64,
-}
-
-const MAX_RECEIPT_EVIDENCE_SERVERS: usize = 64;
-const MAX_RECEIPT_EVIDENCE_PER_SERVER: usize = 256;
-
-#[derive(Debug, Default)]
-struct ReceiptEvidenceRegistry {
-    by_server: BTreeMap<String, VecDeque<ReceiptEvidence>>,
-}
-
-impl ReceiptEvidenceRegistry {
-    fn install(&mut self, base_url: &str, evidence: ReceiptEvidence) -> Result<(), &'static str> {
-        if let Some(server_evidence) = self.by_server.get_mut(base_url) {
-            if server_evidence.len() >= MAX_RECEIPT_EVIDENCE_PER_SERVER {
-                return Err("receipt evidence per-server capacity exceeded");
-            }
-            server_evidence.push_back(evidence);
-            return Ok(());
-        }
-        if self.by_server.len() >= MAX_RECEIPT_EVIDENCE_SERVERS {
-            return Err("receipt evidence server capacity exceeded");
-        }
-        self.by_server
-            .insert(base_url.to_string(), VecDeque::from([evidence]));
-        Ok(())
-    }
-
-    fn latest(&self, base_url: &str, namespace: &str) -> Option<ReceiptEvidence> {
-        self.by_server
-            .get(base_url)?
-            .iter()
-            .filter(|item| item.namespace == namespace)
-            .max_by_key(|item| item.logical_index)
-            .cloned()
-    }
-
-    fn for_server(&self, base_url: &str, namespace_prefix: &str) -> Vec<ReceiptEvidence> {
-        self.by_server
-            .get(base_url)
-            .into_iter()
-            .flatten()
-            .filter(|item| item.namespace.starts_with(namespace_prefix))
-            .cloned()
-            .collect()
-    }
-
-    fn clear_server(&mut self, base_url: &str) {
-        self.by_server.remove(base_url);
-    }
-
-    fn clear_namespace_prefix(&mut self, namespace_prefix: &str) {
-        self.by_server.retain(|_, evidence| {
-            evidence.retain(|item| !item.namespace.starts_with(namespace_prefix));
-            !evidence.is_empty()
-        });
-    }
-}
-
-static RECEIPT_EVIDENCE: LazyLock<RwLock<ReceiptEvidenceRegistry>> =
-    LazyLock::new(|| RwLock::new(ReceiptEvidenceRegistry::default()));
-
-fn install_receipt_evidence(base_url: &str, evidence: ReceiptEvidence) {
-    let result = {
-        let mut registry = RECEIPT_EVIDENCE
-            .write()
-            .unwrap_or_else(|_| panic!("receipt evidence registry poisoned"));
-        registry.install(base_url, evidence)
-    };
-    result.unwrap_or_else(|error| panic!("could not retain receipt evidence: {error}"));
-}
-
-fn latest_receipt_evidence(base_url: &str, namespace: &str) -> ReceiptEvidence {
-    RECEIPT_EVIDENCE
-        .read()
-        .unwrap_or_else(|_| panic!("receipt evidence registry poisoned"))
-        .latest(base_url, namespace)
-        .unwrap_or_else(|| {
-            panic!("no receipt evidence recorded for namespace {namespace} on server {base_url}")
-        })
-}
-
-fn receipt_evidence_for_server(base_url: &str, namespace_prefix: &str) -> Vec<ReceiptEvidence> {
-    RECEIPT_EVIDENCE
-        .read()
-        .unwrap_or_else(|_| panic!("receipt evidence registry poisoned"))
-        .for_server(base_url, namespace_prefix)
-}
-
-fn clear_receipt_evidence_for_server(base_url: &str) {
-    RECEIPT_EVIDENCE
-        .write()
-        .unwrap_or_else(|_| panic!("receipt evidence registry poisoned"))
-        .clear_server(base_url);
-}
-
-fn clear_receipt_evidence_for_prefix(namespace_prefix: &str) {
-    RECEIPT_EVIDENCE
-        .write()
-        .unwrap_or_else(|_| panic!("receipt evidence registry poisoned"))
-        .clear_namespace_prefix(namespace_prefix);
-}
-
-#[cfg(test)]
-mod receipt_evidence_registry_tests {
-    use super::*;
-
-    fn evidence(namespace: &str, logical_index: u64) -> ReceiptEvidence {
-        ReceiptEvidence {
-            namespace: namespace.to_string(),
-            receipt: json!({"generation": logical_index}),
-            results: json!([]),
-            query: json!({"top_k": 1}),
-            logical_index,
-        }
-    }
-
-    #[test]
-    fn receipt_evidence_is_exact_server_scoped() {
-        let mut registry = ReceiptEvidenceRegistry::default();
-        registry
-            .install("http://server-a", evidence("seed-ns", 7))
-            .expect("first server evidence must fit");
-
-        assert!(registry.latest("http://server-b", "seed-ns").is_none());
-        assert!(registry.for_server("http://server-b", "seed-").is_empty());
-        assert_eq!(
-            registry
-                .latest("http://server-a", "seed-ns")
-                .expect("matching server evidence must remain")
-                .logical_index,
-            7
-        );
-    }
-
-    #[test]
-    fn receipt_evidence_clear_rejects_stale_server_and_seed_state() {
-        let mut registry = ReceiptEvidenceRegistry::default();
-        registry
-            .install("http://server-a", evidence("seed-a-ns", 1))
-            .expect("server evidence must fit");
-        registry.clear_server("http://server-a");
-        assert!(registry.latest("http://server-a", "seed-a-ns").is_none());
-
-        registry
-            .install("http://server-a", evidence("seed-a-ns", 2))
-            .expect("replacement evidence must fit");
-        registry
-            .install("http://server-b", evidence("seed-b-ns", 3))
-            .expect("independent seed evidence must fit");
-        registry.clear_namespace_prefix("seed-a-");
-        assert!(registry.latest("http://server-a", "seed-a-ns").is_none());
-        assert_eq!(
-            registry
-                .latest("http://server-b", "seed-b-ns")
-                .expect("other seed evidence must remain")
-                .logical_index,
-            3
-        );
-    }
-
-    #[test]
-    fn receipt_evidence_overflow_fails_without_discarding_prior_evidence() {
-        let mut registry = ReceiptEvidenceRegistry::default();
-        for logical_index in 0..MAX_RECEIPT_EVIDENCE_PER_SERVER {
-            registry
-                .install(
-                    "http://server-a",
-                    evidence(
-                        "seed-ns",
-                        u64::try_from(logical_index)
-                            .expect("receipt evidence index must fit in u64"),
-                    ),
-                )
-                .expect("evidence below the bound must fit");
-        }
-
-        assert_eq!(
-            registry.install("http://server-a", evidence("seed-ns", u64::MAX)),
-            Err("receipt evidence per-server capacity exceeded")
-        );
-        let retained = registry.for_server("http://server-a", "seed-");
-        assert_eq!(retained.len(), MAX_RECEIPT_EVIDENCE_PER_SERVER);
-        assert_eq!(retained[0].logical_index, 0);
-        assert_eq!(
-            retained.last().unwrap().logical_index,
-            u64::try_from(MAX_RECEIPT_EVIDENCE_PER_SERVER - 1)
-                .expect("receipt evidence bound must fit in u64")
-        );
-    }
-}
 
 fn install_preservation_lock(base_url: &str, lock: LockSel, lock_id: String) {
     PRESERVATION_LOCK_IDS
@@ -1422,7 +1219,7 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
                 "security overnight coverage floor requires {kind} >= 5, observed {count}"
             );
         }
-        for oracle in ["I22", "I23", "I24", "I25", "I26", "I27", "I28", "I29"] {
+        for oracle in ["I22", "I23", "I24", "I25", "I26", "I27", "I28"] {
             let count = summary
                 .coverage
                 .security_oracle_counts
@@ -1573,7 +1370,6 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let old_prefix = recorded_namespace_prefix(seed_config.seed, &seed_config.namespace_specs);
     let harness = TestHarness::new().await;
     let prefix = harness.prefix.clone();
-    clear_receipt_evidence_for_prefix(&prefix);
     let (legacy_instrumented_store, chaos_handle) =
         wrap_chaos_store(&harness.store, chaos_plan.clone());
     let instrumented_store = scheduler
@@ -1623,7 +1419,6 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         )
         .await,
     );
-    clear_receipt_evidence_for_server(&server.base_url);
     let bootstrapped_policy_version = if let Some(program) = &security_program {
         Some(bootstrap_security_program(&server, program).await)
     } else {
@@ -2158,11 +1953,11 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
                 .unwrap_or_else(|error| {
                     panic!("signed audit-chain verification failed during replay: {error}")
                 });
-        coverage.record_security_oracle("I29");
+        coverage.record_security_oracle("I25");
         if !verification.valid {
             failed = true;
             failure_violations.push(Violation {
-                id: ViolationId::I29ReceiptIntegrity,
+                id: ViolationId::I25AuditEvidence,
                 op_index: op_count,
                 namespace: "_audit".to_string(),
                 detail: "signed audit day failed after graceful replay shutdown".to_string(),
@@ -2220,7 +2015,6 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         && scheduler
             .as_ref()
             .is_none_or(|scheduler| scheduler.schedule().blocks_v1());
-    clear_receipt_evidence_for_prefix(&prefix);
     SeedOutcome {
         mode,
         profile: active_profile,
@@ -3508,11 +3302,7 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
             OracleMutation::PreservationBypass => {
                 fired.contains(&ViolationId::I28PreservationBypass)
             }
-            OracleMutation::ReceiptForgedSignature
-            | OracleMutation::ReceiptWrongMerklePath
-            | OracleMutation::AuditChainRecordDrop => {
-                fired.contains(&ViolationId::I29ReceiptIntegrity)
-            }
+            OracleMutation::AuditChainRecordDrop => fired.contains(&ViolationId::I25AuditEvidence),
         };
         assert!(
             accepted,
@@ -3581,7 +3371,6 @@ async fn run_seed(
         || selftest_probe.is_some_and(OracleMutation::is_security);
     let harness = TestHarness::new().await;
     let prefix = harness.prefix.clone();
-    clear_receipt_evidence_for_prefix(&prefix);
     let mut generator = if branching_profile {
         AdversarialGenerator::new_branching(seed, &prefix)
     } else if profile == Some(FaultProfile::Security) {
@@ -3690,7 +3479,6 @@ async fn run_seed(
         )
         .await,
     );
-    clear_receipt_evidence_for_server(&server.base_url);
     let bootstrapped_policy_version = if let Some(program) = &security_program {
         Some(bootstrap_security_program(&server, program).await)
     } else {
@@ -4319,11 +4107,11 @@ async fn run_seed(
             zeppelin::security::verify_audit_day(&audit_store, audit_day, &audit_node_id)
                 .await
                 .unwrap_or_else(|error| panic!("signed audit-chain verification failed: {error}"));
-        coverage.record_security_oracle("I29");
+        coverage.record_security_oracle("I25");
         if !verification.valid {
             failed = true;
             failure_violations.push(Violation {
-                id: ViolationId::I29ReceiptIntegrity,
+                id: ViolationId::I25AuditEvidence,
                 op_index,
                 namespace: "_audit".to_string(),
                 detail: "signed audit day failed after graceful runner shutdown".to_string(),
@@ -4418,7 +4206,6 @@ async fn run_seed(
         && scheduler
             .as_ref()
             .is_none_or(|scheduler| scheduler.schedule().blocks_v1());
-    clear_receipt_evidence_for_prefix(&prefix);
     SeedOutcome {
         mode,
         profile: active_profile,
@@ -5569,57 +5356,6 @@ async fn finish_recorded_op(
     } = raw;
     let op = &rec.op;
     let http_fault_context = http_fault_context.as_ref();
-    if model.security.enabled() {
-        let observation_store = http_fault_context
-            .map(|context| &context.bookkeeping_store)
-            .unwrap_or(&target.store);
-        match Manifest::read(observation_store, op.namespace()).await {
-            Ok(Some(manifest)) => {
-                let last_observed = model
-                    .published_roots
-                    .get(op.namespace())
-                    .into_iter()
-                    .flatten()
-                    .map(|observation| observation.manifest_version)
-                    .max()
-                    .unwrap_or(0);
-                for version in last_observed.saturating_add(1)..manifest.version() {
-                    match Manifest::read_history(observation_store, op.namespace(), version).await {
-                        Ok(Some(historical)) => {
-                            if let Some(root) = historical.merkle_root() {
-                                model.observe_published_root(
-                                    op.namespace(),
-                                    rec.index,
-                                    historical.version(),
-                                    root,
-                                );
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => panic!(
-                            "logical-op {} historical root observation failed for {} generation {version}: {error}",
-                            rec.index,
-                            op.namespace()
-                        ),
-                    }
-                }
-                if let Some(root) = manifest.merkle_root() {
-                    model.observe_published_root(
-                        op.namespace(),
-                        rec.index,
-                        manifest.version(),
-                        root,
-                    );
-                }
-            }
-            Ok(None) => {}
-            Err(error) => panic!(
-                "logical-op {} root observation failed for {}: {error}",
-                rec.index,
-                op.namespace()
-            ),
-        }
-    }
     coverage.record(op);
     artifacts.write_op(&rec);
     if joined_hold {
@@ -6323,9 +6059,6 @@ async fn execute_op(
         | Op::ExportProbe { .. }
         | Op::SecurityAdminProbe { .. }
         | Op::AuditBarrierOp { .. }
-        | Op::QueryWithReceipt { .. }
-        | Op::VerifyReceipt { .. }
-        | Op::TamperArtifactThenVerify { .. }
         | Op::AuditChainCheck { .. }
         | Op::CreateLock { .. }
         | Op::ReleaseLock { .. }
@@ -6622,137 +6355,6 @@ async fn execute_security_op(
                 record_success_request_id(&mut response, &request_id);
             }
             ("GET".to_string(), path, status, response)
-        }
-        Op::QueryWithReceipt { ns, q, .. } => {
-            let path = format!("/v1/namespaces/{ns}/query");
-            let mut body = q.body.clone();
-            body.as_object_mut()
-                .expect("receipt query body must be an object")
-                .insert("receipt".to_string(), json!(true));
-            let query = body.clone();
-            let (status, response) = request_json(
-                client,
-                Method::POST,
-                &format!("{}{}", target.base_url, path),
-                Some(body),
-            )
-            .await;
-            if (200..300).contains(&status) {
-                install_receipt_evidence(
-                    &target.base_url,
-                    ReceiptEvidence {
-                        namespace: ns.clone(),
-                        receipt: response["receipt"].clone(),
-                        results: response["results"].clone(),
-                        query,
-                        logical_index: op_index,
-                    },
-                );
-            }
-            ("POST".to_string(), path, status, response)
-        }
-        Op::VerifyReceipt { ns, .. } => {
-            let evidence = latest_receipt_evidence(&target.base_url, ns);
-            let path = "/v1/verify".to_string();
-            let (status, response) = request_json(
-                client,
-                Method::POST,
-                &format!("{}{}", target.base_url, path),
-                Some(json!({
-                    "receipt": evidence.receipt,
-                    "results": evidence.results,
-                    "query": evidence.query,
-                    "refetch": false
-                })),
-            )
-            .await;
-            ("POST".to_string(), path, status, response)
-        }
-        Op::TamperArtifactThenVerify { ns, .. } => {
-            let evidence = latest_receipt_evidence(&target.base_url, ns);
-            let admin = target.workload_credentials.client(ActorSel::ADMIN.0, 0);
-            let clone_namespace = format!("{ns}-receipt-tamper-{op_index}");
-            let clone_path = format!("/v1/namespaces/{ns}/clone");
-            let (clone_status, clone_response) = request_json(
-                &admin,
-                Method::POST,
-                &format!("{}{}", target.base_url, clone_path),
-                Some(json!({
-                    "target": clone_namespace,
-                    "as_of": evidence.receipt["manifest_version"].to_string()
-                })),
-            )
-            .await;
-            assert_eq!(
-                clone_status,
-                StatusCode::CREATED.as_u16(),
-                "receipt tamper clone failed: {clone_response}"
-            );
-
-            let clone_query_path = format!("/v1/namespaces/{clone_namespace}/query");
-            let (query_status, clone_query) = request_json(
-                &admin,
-                Method::POST,
-                &format!("{}{}", target.base_url, clone_query_path),
-                Some(evidence.query.clone()),
-            )
-            .await;
-            assert_eq!(
-                query_status,
-                StatusCode::OK.as_u16(),
-                "receipt tamper clone query failed: {clone_query}"
-            );
-            let artifact_key = clone_query["receipt"]["derived_touched"]
-                .as_array()
-                .filter(|artifacts| !artifacts.is_empty())
-                .map_or(&clone_query["receipt"]["touched"][0], |artifacts| {
-                    &artifacts[0]
-                })["key"]
-                .as_str()
-                .expect("receipt artifact must carry a key")
-                .to_string();
-            let original = target
-                .store
-                .get(&artifact_key)
-                .await
-                .unwrap_or_else(|error| panic!("artifact mutation read failed: {error}"));
-            let mut corrupted = original.to_vec();
-            let first = corrupted
-                .first_mut()
-                .expect("receipt artifact mutation requires nonempty bytes");
-            *first ^= 1;
-            target
-                .store
-                .put(&artifact_key, Bytes::from(corrupted))
-                .await
-                .unwrap_or_else(|error| panic!("artifact mutation write failed: {error}"));
-            let path = "/v1/verify".to_string();
-            let (status, response) = request_json(
-                client,
-                Method::POST,
-                &format!("{}{}", target.base_url, path),
-                Some(json!({
-                    "receipt": clone_query["receipt"].clone(),
-                    "results": clone_query["results"].clone(),
-                    "query": evidence.query,
-                    "refetch": true
-                })),
-            )
-            .await;
-            let cleanup_path = format!("/v1/namespaces/{clone_namespace}");
-            let (cleanup_status, cleanup_response) = request_json(
-                &admin,
-                Method::DELETE,
-                &format!("{}{}", target.base_url, cleanup_path),
-                None,
-            )
-            .await;
-            assert!(
-                (200..300).contains(&cleanup_status),
-                "receipt tamper clone cleanup failed: {cleanup_response}"
-            );
-            wait_namespace_gone(&admin, &target.base_url, &clone_namespace).await;
-            ("POST".to_string(), path, status, response)
         }
         Op::AuditChainCheck { .. } => {
             target
@@ -8610,7 +8212,6 @@ impl QuietPeriod<'_> {
                 .await;
             replacement.workload_credentials = workload_credentials;
             self.server.install(replacement);
-            clear_receipt_evidence_for_server(&self.server.base_url);
             true
         } else {
             false
@@ -8875,68 +8476,6 @@ async fn verify_live_audit_links(target: &OpExecutionTarget) -> serde_json::Valu
     })
 }
 
-async fn resign_mutated_receipt(
-    store: &ZeppelinStore,
-    receipt: &mut serde_json::Value,
-    prefix: &str,
-) -> (String, String) {
-    let signing_seed: [u8; 32] = Sha256::digest(prefix.as_bytes()).into();
-    let signing_key = SigningKey::from_bytes(&signing_seed);
-    let public_key = signing_key.verifying_key();
-    let digest = Sha256::digest(public_key.as_bytes());
-    let node_id = format!("zsn1_{}", URL_SAFE_NO_PAD.encode(&digest[..18]));
-    let signer_document = serde_json::to_vec(&json!({
-        "node_id": node_id,
-        "public_key": URL_SAFE_NO_PAD.encode(public_key.as_bytes()),
-    }))
-    .expect("mutation signer document must encode");
-    let signer_key = format!("{prefix}/_security/signers/{node_id}.json");
-    match store
-        .put_create_outcome(&signer_key, Bytes::from(signer_document.clone()))
-        .await
-        .unwrap_or_else(|error| panic!("mutation signer publication failed: {error}"))
-    {
-        CreateOnlyOutcome::Created { .. } => {}
-        CreateOnlyOutcome::AlreadyExists => {
-            let existing = store
-                .get(&signer_key)
-                .await
-                .unwrap_or_else(|error| panic!("mutation signer reread failed: {error}"));
-            assert_eq!(existing.as_ref(), signer_document.as_slice());
-        }
-    }
-
-    let mut claimed_slot_key = None;
-    for slot in 0_u8..32 {
-        let slot_key = format!("{prefix}/_security/signer-slots/{slot:02}.json");
-        let slot_document = serde_json::to_vec(&json!({
-            "slot": slot,
-            "node_id": node_id,
-        }))
-        .expect("mutation signer slot must encode");
-        match store
-            .put_create_outcome(&slot_key, Bytes::from(slot_document))
-            .await
-            .unwrap_or_else(|error| panic!("mutation signer slot claim failed: {error}"))
-        {
-            CreateOnlyOutcome::Created { .. } => {
-                claimed_slot_key = Some(slot_key);
-                break;
-            }
-            CreateOnlyOutcome::AlreadyExists => {}
-        }
-    }
-    let slot_key = claimed_slot_key
-        .unwrap_or_else(|| panic!("mutation signer requires one free authoritative signer slot"));
-
-    receipt["signer_node"] = json!(node_id);
-    receipt["signature"] = json!([]);
-    let unsigned = serde_json::to_vec(&canonicalize_json(receipt.clone()))
-        .expect("mutated receipt must canonicalize");
-    receipt["signature"] = json!(signing_key.sign(&unsigned).to_bytes().to_vec());
-    (signer_key, slot_key)
-}
-
 async fn exercise_audit_record_drop(
     store: &ZeppelinStore,
     day: chrono::NaiveDate,
@@ -9157,97 +8696,6 @@ async fn run_security_refresh_checks(
         findings.push(finding);
     }
 
-    let admin = client_with_bearer(&server.admin_bearer);
-    let receipts = receipt_evidence_for_server(&server.base_url, prefix);
-    let mut mutation_signer_keys = None;
-    for (position, evidence) in receipts.into_iter().enumerate() {
-        let mut receipt = evidence.receipt.clone();
-        if position == 0 && mutation == Some(OracleMutation::ReceiptForgedSignature) {
-            let byte = receipt["signature"][0]
-                .as_u64()
-                .expect("recorded receipt signature must contain bytes");
-            receipt["signature"][0] = json!(byte ^ 1);
-        }
-        if position == 0 && mutation == Some(OracleMutation::ReceiptWrongMerklePath) {
-            let leaf_index = receipt["touched"][0]["merkle_path"]["leaf_index"]
-                .as_u64()
-                .expect("recorded receipt path must carry a leaf index");
-            receipt["touched"][0]["merkle_path"]["leaf_index"] =
-                json!(leaf_index.saturating_add(1));
-            mutation_signer_keys =
-                Some(resign_mutated_receipt(&server.store, &mut receipt, prefix).await);
-        }
-        let (status, verification) = request_json(
-            &admin,
-            Method::POST,
-            &format!("{}/v1/verify", server.base_url),
-            Some(json!({
-                "receipt": receipt,
-                "results": evidence.results,
-                "query": evidence.query,
-                "refetch": false
-            })),
-        )
-        .await;
-        if position == 0 && mutation == Some(OracleMutation::ReceiptWrongMerklePath) {
-            assert_eq!(
-                verification["first_divergence"], "merkle_path",
-                "canonical Merkle-path mutation must reach the production Merkle verifier"
-            );
-        }
-        if status != 200 || verification["valid"] != true {
-            findings.push(SecurityFinding {
-                id: ViolationId::I29ReceiptIntegrity,
-                detail: "quiet-period receipt verification diverged".to_string(),
-                evidence: json!({
-                    "logical_index": evidence.logical_index,
-                    "namespace": evidence.namespace,
-                    "status": status,
-                    "verification": verification,
-                }),
-            });
-            continue;
-        }
-
-        let version = evidence.receipt["manifest_version"]
-            .as_u64()
-            .expect("recorded receipt must name a manifest version");
-        let receipt_root: [u8; 32] =
-            serde_json::from_value(evidence.receipt["manifest_root"].clone())
-                .expect("recorded receipt root must be a 32-byte digest");
-        if !model.root_was_published_at_or_before(
-            &evidence.namespace,
-            evidence.logical_index,
-            version,
-            receipt_root,
-        ) {
-            findings.push(SecurityFinding {
-                id: ViolationId::I29ReceiptIntegrity,
-                detail:
-                    "receipt root was not present in the model publication timeline at issuance"
-                        .to_string(),
-                evidence: json!({
-                    "logical_index": evidence.logical_index,
-                    "namespace": evidence.namespace,
-                    "manifest_version": version,
-                    "receipt_root": evidence.receipt["manifest_root"],
-                    "published_roots": model.published_roots.get(&evidence.namespace),
-                }),
-            });
-        }
-    }
-    if let Some((signer_key, slot_key)) = mutation_signer_keys {
-        server
-            .store
-            .delete(&slot_key)
-            .await
-            .unwrap_or_else(|error| panic!("mutation signer slot cleanup failed: {error}"));
-        server
-            .store
-            .delete(&signer_key)
-            .await
-            .unwrap_or_else(|error| panic!("mutation signer cleanup failed: {error}"));
-    }
     if mutation == Some(OracleMutation::AuditChainRecordDrop) {
         let broken = exercise_audit_record_drop(
             &server.store,
@@ -9261,7 +8709,7 @@ async fn run_security_refresh_checks(
             "production audit verifier accepted a dropped persisted record"
         );
         findings.push(SecurityFinding {
-            id: ViolationId::I29ReceiptIntegrity,
+            id: ViolationId::I25AuditEvidence,
             detail: "production audit-chain verifier detected one dropped persisted record"
                 .to_string(),
             evidence: json!({
@@ -9432,7 +8880,6 @@ async fn run_security_refresh_checks(
     }
     coverage.record_security_oracle("I25");
     coverage.record_security_oracle("I26");
-    coverage.record_security_oracle("I29");
 
     findings
         .into_iter()

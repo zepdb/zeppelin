@@ -75,8 +75,6 @@ pub mod config;
 pub mod namespace;
 /// Vector similarity, BM25, hybrid, and batch query endpoints.
 pub mod query;
-/// Signed receipt verification and manifest-root inspection endpoints.
-pub mod receipt;
 /// Security principal, credential, grant, and policy administration endpoints.
 pub mod security;
 /// Vector upsert, lookup, and delete endpoints.

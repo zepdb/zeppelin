@@ -98,7 +98,6 @@ fn entitlements_gating_is_composition_only() {
         "src/server/handlers/config.rs",
         "src/server/handlers/namespace.rs",
         "src/server/handlers/query.rs",
-        "src/server/handlers/receipt.rs",
         "src/server/handlers/security.rs",
         "src/server/handlers/vectors.rs",
     ] {

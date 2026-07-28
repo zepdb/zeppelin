@@ -75,7 +75,6 @@ async fn start_batch_server(mut config: Config, counted: bool) -> BatchApiServer
     let app = build_router(AppState {
         store: store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(&security, config.receipts.enabled),
         security: Arc::clone(&security),
         audit,
         credential_adapter,

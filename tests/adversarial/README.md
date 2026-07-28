@@ -104,10 +104,8 @@ An explicit `ZEPPELIN_ADVERSARIAL_PROFILE` overrides the table for every seed.
 The `security` profile adds a deterministic actor/credential registry, key,
 grant, and delegated-token lifecycle operations, all tenant observation
 surfaces, constrained-write, export, security-admin, and audit probes. It also
-collects live structural retrieval receipts, re-verifies every receipt against
-its retained manifest generation, rejects a tampered receipt copy, checks audit
-links during the quiet period, and verifies the signed day anchor after graceful
-shutdown. Token actors exercise narrowing, expiry under clock jumps, and
+checks audit links during the quiet period and verifies the signed day anchor
+after graceful shutdown. Token actors exercise narrowing, expiry under clock jumps, and
 parent-revocation absorption. The profile uses supported faults at all four boundaries, never
 provider lies or a second writer. Security artifacts persist redaction-safe
 `principals`, token selectors, and `security_ops`; operation-linked timeline
@@ -203,9 +201,9 @@ assumptions. A new provider-abuse or future-architecture event must be reachable
 only through an explicit campaign; a new supported event may join Mixed only
 after its assumption audit.
 
-The consolidated matrix contains twenty-eight mutations, including pinned
-receipt-signature, Merkle-path, and audit-record-drop mutations for I29 in
-addition to the security-oracle mutations for I22-I28. Each clean
+The consolidated matrix contains twenty-six mutations, including a pinned
+audit-record-drop mutation for I25 in addition to the security-oracle
+mutations for I22-I28. Each clean
 control and mutation is capped at 80 workload operations. Run it with:
 
 ```bash

@@ -125,8 +125,7 @@ use crate::time::Clock;
 use crate::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
 use self::handlers::{
-    config as config_handler, namespace, query, receipt as receipt_handler,
-    security as security_handler, vectors, ApiError,
+    config as config_handler, namespace, query, security as security_handler, vectors, ApiError,
 };
 
 tokio::task_local! {
@@ -291,8 +290,6 @@ pub struct AppState {
     pub clock: Clock,
     /// Central pure-CPU authorization kernel compiled at startup.
     pub security: Arc<SecurityKernel>,
-    /// Boot-composed receipt capability; handlers never inspect entitlements.
-    pub receipts: ReceiptCapability,
     /// Cloneable request-path handle for structured tracing and durable audit.
     pub audit: AuditClient,
     /// Transport credential boundary; phase 1 installs the named API-key adapter.
@@ -359,43 +356,6 @@ pub(crate) fn namespace_graph(state: &AppState) -> NamespaceGraph {
         state.config.indexing.clone(),
         state.config.gc_horizon_floor_secs(),
     )
-}
-
-/// Composition-root result for the licensed receipt service.
-#[derive(Debug, Clone, Copy)]
-pub struct ReceiptCapability {
-    configured: bool,
-    licensed: bool,
-}
-
-impl ReceiptCapability {
-    /// Compose the request-path capability from config and verified entitlements.
-    #[must_use]
-    pub fn compose(security: &SecurityKernel, configured: bool) -> Self {
-        Self {
-            configured,
-            licensed: security.entitlements().has(Feature::Receipts),
-        }
-    }
-
-    /// Whether receipt routes should be mounted to their production handlers.
-    #[must_use]
-    fn enabled(self) -> bool {
-        self.configured && self.licensed
-    }
-
-    /// Fail before query I/O when receipt issuance was not composed at boot.
-    pub(crate) fn require_enabled(self) -> Result<(), ApiError> {
-        if !self.configured {
-            return Err(ApiError(SecurityError::ReceiptsDisabled.into()));
-        }
-        if !self.licensed {
-            return Err(ApiError(
-                SecurityError::FeatureNotLicensed(Feature::Receipts).into(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Mutable, request-local audit annotation shared with one endpoint handler.
@@ -2361,10 +2321,6 @@ async fn delegation_not_licensed() -> Result<(), ApiError> {
     ))
 }
 
-async fn receipts_unavailable(State(state): State<AppState>) -> Result<(), ApiError> {
-    state.receipts.require_enabled()
-}
-
 async fn enforce_security_management_license(
     State(state): State<AppState>,
     request: Request<axum::body::Body>,
@@ -2667,17 +2623,6 @@ pub fn build_router(state: AppState) -> Router {
                 &state,
             ),
         )
-        .route(
-            "/v1/verify",
-            secure_route(
-                if state.receipts.enabled() {
-                    post(receipt_handler::verify)
-                } else {
-                    post(receipts_unavailable)
-                },
-                &state,
-            ),
-        )
         .merge(security_routes(&state))
         .route(
             "/v1/namespaces",
@@ -2687,17 +2632,6 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/namespaces/:ns",
             secure_route(
                 get(namespace::get_namespace).delete(namespace::delete_namespace),
-                &state,
-            ),
-        )
-        .route(
-            "/v1/namespaces/:ns/manifest/root",
-            secure_route(
-                if state.receipts.enabled() {
-                    get(receipt_handler::manifest_root)
-                } else {
-                    get(receipts_unavailable)
-                },
                 &state,
             ),
         )

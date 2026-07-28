@@ -151,7 +151,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tracing::{error, info, instrument};
+use tracing::{info, instrument};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::cache::hydration::HydrationTarget;
@@ -172,10 +172,8 @@ use crate::query::{
 };
 use crate::runtime_config::QueryKnobs;
 use crate::security::{
-    apply_field_mask, filter_references_denied_field, AllowDecision, AuditOutcome, AuditParams,
-    AuditRecord, CursorBindingKey, FieldMask, NamespaceId, PolicyVersion, Principal, ReceiptIssue,
-    ResourceRef, SecurityError, TraversalMetric, TraversalParams, TraversalSourceKind,
-    TraversalSourceParams,
+    apply_field_mask, filter_references_denied_field, AllowDecision, CursorBindingKey, FieldMask,
+    PolicyVersion, SecurityError,
 };
 use crate::server::{AppState, AuditRequest, RateLimitClass, RateLimitIdentity};
 use crate::types::{AttributeValue, ConsistencyLevel, Filter, SearchResult};
@@ -266,9 +264,6 @@ pub struct QueryRequest {
     /// Whether source execution should collect and return timing/cache diagnostics.
     #[serde(default)]
     pub debug: Option<bool>,
-    /// Opt in to one signed structural retrieval receipt.
-    #[serde(default)]
-    pub receipt: Option<bool>,
 }
 
 /// Validates server-owned query constraints before any retrieval planning.
@@ -656,8 +651,6 @@ enum QuerySourceRef<'a> {
         vector: Cow<'a, [f32]>,
         /// Stored seed ID excluded after requesting one extra candidate.
         exclude_id: Option<String>,
-        /// Exact immutable segment artifacts consumed to resolve a stored seed.
-        seed_touched_artifacts: BTreeSet<String>,
     },
     /// BM25 expression and effective final-token prefix setting.
     Bm25 {
@@ -674,8 +667,6 @@ struct SourceQueryResponse {
     kind: QuerySourceKind,
     /// Domain response, including source work counters and optional diagnostics.
     response: QueryResponse,
-    /// Exact production traversal for receipt construction.
-    traversal: TraversalSourceParams,
 }
 
 /// Default reciprocal-rank-fusion offset when the request omits `k`.
@@ -878,30 +869,19 @@ impl BatchQueryError {
 /// handle into the async future. `?`-style conversions preserve typed failures;
 /// RAII guards decrement the active gauge and observe duration even when an
 /// awaited operation returns early.
-#[instrument(skip(state, decision, principal, rate_limit_identity, body), fields(namespace = %ns))]
+#[instrument(skip(state, decision, body), fields(namespace = %ns))]
 pub async fn query_namespace(
     State(state): State<AppState>,
     Extension(decision): Extension<AllowDecision>,
-    Extension(principal): Extension<Principal>,
-    Extension(rate_limit_identity): Extension<RateLimitIdentity>,
     Path(ns): Path<String>,
     Query(params): Query<QueryRouteParams>,
     body: bytes::Bytes,
 ) -> Result<Json<QueryResponse>, ApiError> {
-    let query_document: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
-        ApiError(ZeppelinError::Validation(format!(
-            "invalid request body: {e}"
-        )))
-    })?;
     let req: QueryRequest = serde_json::from_slice(&body).map_err(|e| {
         ApiError(ZeppelinError::Validation(format!(
             "invalid request body: {e}"
         )))
     })?;
-    let receipt_requested = req.receipt == Some(true);
-    if receipt_requested {
-        state.receipts.require_enabled()?;
-    }
     let mut cursor_fingerprint = if params.as_of.is_none() {
         cursor_fingerprint_if_requested(&ns, None, &req).map_err(ApiError::from)?
     } else {
@@ -954,27 +934,7 @@ pub async fn query_namespace(
         validated.cursor_fingerprint = cursor_fingerprint;
     }
     let notify_hydration = as_of_manifest.is_none();
-    let receipt_manifest = if receipt_requested {
-        Some(
-            read_manifest_for_execution(
-                &state,
-                &ns,
-                req.consistency,
-                QueryExecutionOptions {
-                    manifest: as_of_manifest.clone(),
-                    notify_hydration,
-                },
-                meta.artifact_origin().map_err(ApiError::from)?,
-            )
-            .await
-            .map_err(ApiError::from)?,
-        )
-    } else {
-        None
-    };
-    let receipt_top_k = validated.top_k;
-
-    let mut result = execute_validated_query(ValidatedQueryExecution {
+    let result = execute_validated_query(ValidatedQueryExecution {
         state: &state,
         ns: &ns,
         meta: &meta,
@@ -983,68 +943,12 @@ pub async fn query_namespace(
         knobs: knobs.as_ref(),
         security: &decision,
         options: QueryExecutionOptions {
-            manifest: receipt_manifest.clone().or(as_of_manifest),
+            manifest: as_of_manifest,
             notify_hydration,
         },
     })
     .await
     .map_err(ApiError::from)?;
-
-    if let Some(manifest) = receipt_manifest.as_ref() {
-        let receipt = crate::security::issue_receipt(ReceiptIssue {
-            store: &state.store,
-            namespace: &ns,
-            principal: &principal,
-            decision_id: decision.decision_id,
-            policy_version: decision.policy_version,
-            policy_checksum: decision.policy_checksum.as_deref(),
-            mandatory_filter: decision.mandatory_filter.as_ref(),
-            policy_filter: decision.policy_filter.as_ref(),
-            query: &query_document,
-            traversal: TraversalParams {
-                top_k: receipt_top_k,
-                sources: result.receipt_traversal.clone(),
-            },
-            results: &result.results,
-            manifest,
-            derived_artifacts: &result.receipt_derived_artifacts,
-            derived_touched_artifacts: &result.receipt_derived_touched_artifacts,
-            derived_artifacts_complete: result.receipt_derived_artifacts_complete,
-            touched_artifacts: &result.receipt_touched_artifacts,
-            issued_at: state.clock.now(),
-        })
-        .map_err(ApiError::from)?;
-        let receipt_id = receipt.receipt_id.to_string();
-        result.receipt = Some(receipt);
-        let record = AuditRecord::decision_outcome(
-            state.clock.now(),
-            crate::server::current_request_id()
-                .ok_or(SecurityError::MissingRequestContext)
-                .map_err(|error| ApiError(error.into()))?,
-            decision.decision_id,
-            &principal,
-            crate::security::Action::Query,
-            ResourceRef::Namespace {
-                namespace: NamespaceId::new(ns.clone()).map_err(|error| ApiError(error.into()))?,
-            },
-            decision.policy_version,
-            rate_limit_identity.ip,
-            AuditOutcome::Success,
-            AuditParams::ReceiptIssued {
-                receipt_id: receipt_id.clone(),
-            },
-            state.audit.node_id(),
-        );
-        if let Err(submit_error) = state.audit.submit_buffered(record) {
-            crate::metrics::AUDIT_FLUSH_FAILURES_TOTAL.inc();
-            error!(
-                target: "zeppelin::audit",
-                error = %submit_error,
-                receipt_id,
-                "receipt issuance audit record could not be queued"
-            );
-        }
-    }
 
     let request_id = crate::server::current_request_id();
     info!(
@@ -1157,11 +1061,6 @@ pub async fn batch_query_namespace(
         .queries
         .iter()
         .map(|query| {
-            if query.receipt == Some(true) {
-                return Err(ZeppelinError::Validation(
-                    "retrieval receipts are supported only for single queries".to_string(),
-                ));
-            }
             let cursor_fingerprint = cursor_fingerprint_if_requested(&ns, None, query)?;
             validate_query_security_constraints(query, &decision)?;
             let validated =
@@ -1916,7 +1815,7 @@ async fn execute_validated_query(
         vec![explain_source],
         security.mandatory_filter.is_some(),
     );
-    let mut source = execute_query_source_with_manifest(
+    let source = execute_query_source_with_manifest(
         state,
         ns,
         meta,
@@ -1930,10 +1829,8 @@ async fn execute_validated_query(
         knobs,
         manifest.clone(),
         emit_debug,
-        0,
     )
     .await?;
-    source.response.receipt_traversal = vec![source.traversal.clone()];
     if let Some(explain) = explain.as_mut() {
         explain.capture_single_source(0, source.kind, &source.response.results);
     }
@@ -2080,7 +1977,6 @@ async fn execute_hybrid_query(
             knobs,
             manifest.clone(),
             emit_debug,
-            index,
         )
         .await?;
         exclude_seed_ids_from_response(
@@ -3301,7 +3197,7 @@ async fn apply_vector_rerank(
         .iter()
         .map(|result| result.id.clone())
         .collect();
-    let (values, touched_artifacts) = super::vectors::fetch_vector_values_by_ids_with_trace(
+    let values = super::vectors::fetch_vector_values_by_ids(
         ctx.state,
         ctx.ns,
         &ids,
@@ -3310,8 +3206,6 @@ async fn apply_vector_rerank(
         ctx.meta.artifact_origin()?,
     )
     .await?;
-    response.receipt_touched_artifacts.extend(touched_artifacts);
-
     for result in &mut response.results {
         let vector = values.get(&result.id).ok_or_else(|| {
             ZeppelinError::Index(format!(
@@ -4424,7 +4318,6 @@ async fn execute_query_source_with_manifest(
     knobs: &QueryKnobs,
     manifest: Manifest,
     emit_debug: bool,
-    source_index: usize,
 ) -> Result<SourceQueryResponse, ZeppelinError> {
     let authoritative_origin = meta.artifact_origin()?;
     match source_ref {
@@ -4494,23 +4387,11 @@ async fn execute_query_source_with_manifest(
             };
             response.map(|response| SourceQueryResponse {
                 kind: QuerySourceKind::Bm25,
-                traversal: TraversalSourceParams {
-                    source_index,
-                    kind: TraversalSourceKind::Bm25,
-                    nprobe: None,
-                    metric: TraversalMetric::Bm25,
-                    probed_centroids: response.probed_centroids.clone(),
-                    scanned_clusters: response.scanned_clusters.clone(),
-                    probed_routing_nodes: Vec::new(),
-                    attributes_loaded: effective_filter.is_some() || include_attributes,
-                },
                 response,
             })
         }
         QuerySourceRef::Ann {
-            vector,
-            exclude_id,
-            seed_touched_artifacts,
+            vector, exclude_id, ..
         } => {
             if vector.as_ref().len() != meta.dimensions {
                 return Err(ZeppelinError::DimensionMismatch {
@@ -4577,25 +4458,12 @@ async fn execute_query_source_with_manifest(
                 .await
             };
             let mut response = response?;
-            response
-                .receipt_touched_artifacts
-                .extend(seed_touched_artifacts);
             if let Some(exclude_id) = exclude_id {
                 response.results.retain(|result| result.id != exclude_id);
                 response.results.truncate(top_k);
             }
             Ok(SourceQueryResponse {
                 kind: QuerySourceKind::Ann,
-                traversal: TraversalSourceParams {
-                    source_index,
-                    kind: TraversalSourceKind::Ann,
-                    nprobe: Some(nprobe),
-                    metric: meta.distance_metric.into(),
-                    probed_centroids: response.probed_centroids.clone(),
-                    scanned_clusters: response.scanned_clusters.clone(),
-                    probed_routing_nodes: response.probed_routing_nodes.clone(),
-                    attributes_loaded: effective_filter.is_some() || include_attributes,
-                },
                 response,
             })
         }
@@ -4654,37 +4522,6 @@ fn fuse_source_responses(
     } else {
         Vec::new()
     };
-    let receipt_traversal = sources
-        .iter()
-        .map(|source| source.traversal.clone())
-        .collect();
-    let receipt_derived_artifacts_complete = sources
-        .iter()
-        .all(|source| source.response.receipt_derived_artifacts_complete);
-    let mut receipt_derived_artifacts = BTreeMap::new();
-    let mut receipt_derived_touched_artifacts = BTreeSet::new();
-    let mut receipt_touched_artifacts = BTreeSet::new();
-    for source in &sources {
-        for (key, content_hash) in &source.response.receipt_derived_artifacts {
-            if receipt_derived_artifacts
-                .insert(key.clone(), *content_hash)
-                .is_some_and(|existing| existing != *content_hash)
-            {
-                return Err(ZeppelinError::Index(format!(
-                    "derived receipt artifact {key} had conflicting content hashes"
-                )));
-            }
-        }
-        receipt_derived_touched_artifacts.extend(
-            source
-                .response
-                .receipt_derived_touched_artifacts
-                .iter()
-                .cloned(),
-        );
-        receipt_touched_artifacts.extend(source.response.receipt_touched_artifacts.iter().cloned());
-    }
-
     let results = match fusion {
         Some(FusionSpec::None) => {
             return Err(ZeppelinError::Validation(
@@ -4716,14 +4553,14 @@ fn fuse_source_responses(
         facets: None,
         explain: None,
         receipt: None,
-        receipt_traversal,
+        receipt_traversal: Vec::new(),
         probed_centroids: Vec::new(),
         scanned_clusters: Vec::new(),
         probed_routing_nodes: Vec::new(),
-        receipt_derived_artifacts,
-        receipt_derived_touched_artifacts,
-        receipt_touched_artifacts,
-        receipt_derived_artifacts_complete,
+        receipt_derived_artifacts: BTreeMap::new(),
+        receipt_derived_touched_artifacts: BTreeSet::new(),
+        receipt_touched_artifacts: BTreeSet::new(),
+        receipt_derived_artifacts_complete: false,
     })
 }
 
@@ -4731,7 +4568,7 @@ fn fuse_source_responses(
 ///
 /// This feature-only seam accepts responses that were already executed against
 /// the same supplied manifest. It exists so external artifact-origin tests can
-/// exercise the real score-direction, receipt-artifact, scan-counter, and debug
+/// exercise the real score-direction, scan-counter, and debug
 /// aggregation without opening foreign-origin HTTP admission.
 #[cfg(feature = "branching-test-support")]
 // Dependency wiring: every argument is a distinct collaborator passed
@@ -4747,38 +4584,17 @@ pub(crate) fn fuse_ann_bm25_for_test_support(
     attributes_loaded: bool,
     emit_debug: bool,
 ) -> Result<QueryResponse, ZeppelinError> {
-    let ann_traversal = TraversalSourceParams {
-        source_index: 0,
-        kind: TraversalSourceKind::Ann,
-        nprobe: Some(nprobe),
-        metric: distance_metric.into(),
-        probed_centroids: ann.probed_centroids.clone(),
-        scanned_clusters: ann.scanned_clusters.clone(),
-        probed_routing_nodes: ann.probed_routing_nodes.clone(),
-        attributes_loaded,
-    };
-    let bm25_traversal = TraversalSourceParams {
-        source_index: 1,
-        kind: TraversalSourceKind::Bm25,
-        nprobe: None,
-        metric: TraversalMetric::Bm25,
-        probed_centroids: bm25.probed_centroids.clone(),
-        scanned_clusters: bm25.scanned_clusters.clone(),
-        probed_routing_nodes: Vec::new(),
-        attributes_loaded,
-    };
+    let _ = (nprobe, distance_metric, attributes_loaded);
     fuse_source_responses(
         None,
         vec![
             SourceQueryResponse {
                 kind: QuerySourceKind::Ann,
                 response: ann,
-                traversal: ann_traversal,
             },
             SourceQueryResponse {
                 kind: QuerySourceKind::Bm25,
                 response: bm25,
-                traversal: bm25_traversal,
             },
         ],
         top_k,
@@ -5076,7 +4892,6 @@ async fn resolve_query_source_ref<'a>(
             .map(|vector| QuerySourceRef::Ann {
                 vector: Cow::Borrowed(vector),
                 exclude_id: None,
-                seed_touched_artifacts: BTreeSet::new(),
             })
             .ok_or_else(|| ZeppelinError::Validation("vector must be provided".into())),
         ValidatedSource::LegacyBm25 => req
@@ -5155,20 +4970,18 @@ async fn resolve_algebra_source_ref<'a>(
             (Some(vector), None) => Ok(QuerySourceRef::Ann {
                 vector: Cow::Borrowed(vector),
                 exclude_id: None,
-                seed_touched_artifacts: BTreeSet::new(),
             }),
             (None, Some(id)) => {
-                let (vector, seed_touched_artifacts) =
-                    super::vectors::fetch_vector_values_by_id_scoped_with_trace(
-                        state,
-                        ns,
-                        id,
-                        req.consistency,
-                        manifest,
-                        mandatory_filter,
-                        authoritative_origin,
-                    )
-                    .await?;
+                let vector = super::vectors::fetch_vector_values_by_id_scoped(
+                    state,
+                    ns,
+                    id,
+                    req.consistency,
+                    manifest,
+                    mandatory_filter,
+                    authoritative_origin,
+                )
+                .await?;
                 let vector = vector.ok_or_else(|| ZeppelinError::VectorNotFound {
                     namespace: ns.to_string(),
                     id: id.to_string(),
@@ -5176,7 +4989,6 @@ async fn resolve_algebra_source_ref<'a>(
                 Ok(QuerySourceRef::Ann {
                     vector: Cow::Owned(vector),
                     exclude_id: Some(id.to_string()),
-                    seed_touched_artifacts,
                 })
             }
             _ => Err(ZeppelinError::Validation(

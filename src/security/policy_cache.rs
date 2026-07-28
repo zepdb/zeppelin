@@ -481,6 +481,7 @@ impl PolicyCache {
     }
 
     /// Resolve the policy-owned query filter from one immutable generation.
+    #[allow(dead_code)]
     pub(crate) async fn historical_query_filter(
         &self,
         version: PolicyVersion,

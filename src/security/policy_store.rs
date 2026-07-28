@@ -398,6 +398,7 @@ impl PolicyStore {
     /// verification enumerates the immutable policy inventory and validates
     /// every candidate it inspects. Missing or duplicate versions never fall
     /// back to the current policy.
+    #[allow(dead_code)]
     pub(crate) async fn load_version(
         &self,
         version: super::PolicyVersion,

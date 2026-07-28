@@ -738,14 +738,12 @@ async fn build_app_with_entitlement_resolver(
         shutdown_tx.subscribe(),
     );
     let credential_adapter: Arc<dyn crate::security::CredentialAdapter> = credential_adapter;
-    let receipts = crate::server::ReceiptCapability::compose(&security, config.receipts.enabled);
     let background_security = Arc::clone(&security);
     let server_tasks = Arc::new(ServerTaskSupervisor::new());
     let state = AppState {
         store,
         clock,
         security,
-        receipts,
         audit,
         credential_adapter,
         namespace_manager,

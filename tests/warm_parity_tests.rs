@@ -121,7 +121,6 @@ async fn start_parity_server(mut config: Config) -> ParityServer {
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(&security, config.receipts.enabled),
         security: Arc::clone(&security),
         audit,
         credential_adapter,

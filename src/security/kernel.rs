@@ -291,6 +291,7 @@ pub struct SecurityKernel {
     preservation: Option<Arc<PreservationService>>,
 }
 
+#[allow(dead_code)]
 pub(crate) struct ReceiptPolicyLookup<'a> {
     pub verifier: &'a Principal,
     pub context: &'a RequestContext,
@@ -371,6 +372,7 @@ struct NamespaceBranchActivationRecovery {
 }
 
 /// Outcome of the privileged historical-policy lookup used by receipt verification.
+#[allow(dead_code)]
 pub(crate) enum ReceiptPolicyResolution {
     /// The verifier lacks `SecurityAdminRead`, so predicate consistency is intentionally skipped.
     Unchecked,
@@ -1485,6 +1487,7 @@ impl SecurityKernel {
     /// caller is privileged, missing or inconsistent historical evidence is a
     /// divergence rather than a silent downgrade. The route never reveals the
     /// predicate itself.
+    #[allow(dead_code)]
     pub(crate) async fn receipt_policy_filter(
         &self,
         lookup: ReceiptPolicyLookup<'_>,

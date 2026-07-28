@@ -315,38 +315,6 @@
       "response": "batch_query.resp.json"
     },
     {
-      "name": "query_with_receipt",
-      "method": "POST",
-      "path": "/v1/namespaces/contract-main/query",
-      "status": 200,
-      "request": "query_with_receipt.req.json",
-      "response": "query_with_receipt.resp.json"
-    },
-    {
-      "name": "verify_receipt",
-      "method": "POST",
-      "path": "/v1/verify",
-      "status": 200,
-      "request": "verify_receipt.req.json",
-      "response": "verify_receipt.resp.json"
-    },
-    {
-      "name": "verify_receipt_invalid",
-      "method": "POST",
-      "path": "/v1/verify",
-      "status": 200,
-      "request": "verify_receipt_invalid.req.json",
-      "response": "verify_receipt_invalid.resp.json"
-    },
-    {
-      "name": "get_manifest_root",
-      "method": "GET",
-      "path": "/v1/namespaces/contract-main/manifest/root",
-      "status": 200,
-      "request": "get_manifest_root.req.json",
-      "response": "get_manifest_root.resp.json"
-    },
-    {
       "name": "error_constraint_violation_403",
       "method": "POST",
       "path": "/v1/namespaces/contract-main/query",

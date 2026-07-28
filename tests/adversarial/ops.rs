@@ -518,19 +518,6 @@ pub enum Op {
     AuditBarrierOp {
         actor: ActorSel,
     },
-    QueryWithReceipt {
-        actor: ActorSel,
-        ns: String,
-        q: GeneratedQuery,
-    },
-    VerifyReceipt {
-        actor: ActorSel,
-        ns: String,
-    },
-    TamperArtifactThenVerify {
-        actor: ActorSel,
-        ns: String,
-    },
     AuditChainCheck {
         actor: ActorSel,
     },
@@ -752,9 +739,6 @@ impl Op {
             | Self::ExportProbe { actor, .. }
             | Self::SecurityAdminProbe { actor }
             | Self::AuditBarrierOp { actor }
-            | Self::QueryWithReceipt { actor, .. }
-            | Self::VerifyReceipt { actor, .. }
-            | Self::TamperArtifactThenVerify { actor, .. }
             | Self::AuditChainCheck { actor }
             | Self::CreateLock { actor, .. }
             | Self::ReleaseLock { actor, .. }
@@ -791,9 +775,6 @@ impl Op {
                 | Op::ExportProbe { .. }
                 | Op::SecurityAdminProbe { .. }
                 | Op::AuditBarrierOp { .. }
-                | Op::QueryWithReceipt { .. }
-                | Op::VerifyReceipt { .. }
-                | Op::TamperArtifactThenVerify { .. }
                 | Op::AuditChainCheck { .. }
                 | Op::CreateLock { .. }
                 | Op::ReleaseLock { .. }
@@ -843,9 +824,6 @@ impl Op {
             Op::ExportProbe { .. } => "export_probe",
             Op::SecurityAdminProbe { .. } => "security_admin_probe",
             Op::AuditBarrierOp { .. } => "audit_barrier",
-            Op::QueryWithReceipt { .. } => "query_with_receipt",
-            Op::VerifyReceipt { .. } => "verify_receipt",
-            Op::TamperArtifactThenVerify { .. } => "tamper_artifact_then_verify",
             Op::AuditChainCheck { .. } => "audit_chain_check",
             Op::CreateLock { .. } => "create_lock",
             Op::ReleaseLock { .. } => "release_lock",
@@ -873,9 +851,6 @@ impl Op {
                 | Op::ExportProbe { .. }
                 | Op::SecurityAdminProbe { .. }
                 | Op::AuditBarrierOp { .. }
-                | Op::QueryWithReceipt { .. }
-                | Op::VerifyReceipt { .. }
-                | Op::TamperArtifactThenVerify { .. }
                 | Op::AuditChainCheck { .. }
                 | Op::CreateLock { .. }
                 | Op::ReleaseLock { .. }
@@ -906,10 +881,7 @@ impl Op {
             | Op::Hydrate { ns, .. }
             | Op::DeleteNamespace { ns, .. }
             | Op::ProbeSandwich { ns, .. }
-            | Op::CompactInline { ns, .. }
-            | Op::QueryWithReceipt { ns, .. }
-            | Op::VerifyReceipt { ns, .. }
-            | Op::TamperArtifactThenVerify { ns, .. } => ns,
+            | Op::CompactInline { ns, .. } => ns,
             Op::Branching(operation) => operation.namespace(),
             Op::DeleteUnderLock { ns, .. } | Op::GcUnderLock { ns, .. } => ns,
             Op::CreateLock { scope, .. } => scope.namespace().unwrap_or("_security"),
@@ -1008,10 +980,7 @@ impl Op {
             | Op::ExportProbe { .. }
             | Op::SecurityAdminProbe { .. }
             | Op::AuditBarrierOp { .. } => vec!["security"],
-            Op::QueryWithReceipt { .. }
-            | Op::VerifyReceipt { .. }
-            | Op::TamperArtifactThenVerify { .. }
-            | Op::AuditChainCheck { .. } => vec!["security", "receipt"],
+            Op::AuditChainCheck { .. } => vec!["security", "audit"],
             Op::CreateLock { .. }
             | Op::ReleaseLock { .. }
             | Op::DeleteUnderLock { .. }
@@ -1255,19 +1224,6 @@ impl Op {
             },
             Op::SecurityAdminProbe { actor } => Op::SecurityAdminProbe { actor: *actor },
             Op::AuditBarrierOp { actor } => Op::AuditBarrierOp { actor: *actor },
-            Op::QueryWithReceipt { actor, ns, q } => Op::QueryWithReceipt {
-                actor: *actor,
-                ns: rewrite(ns),
-                q: q.clone(),
-            },
-            Op::VerifyReceipt { actor, ns } => Op::VerifyReceipt {
-                actor: *actor,
-                ns: rewrite(ns),
-            },
-            Op::TamperArtifactThenVerify { actor, ns } => Op::TamperArtifactThenVerify {
-                actor: *actor,
-                ns: rewrite(ns),
-            },
             Op::AuditChainCheck { actor } => Op::AuditChainCheck { actor: *actor },
             Op::CreateLock { actor, lock, scope } => Op::CreateLock {
                 actor: *actor,

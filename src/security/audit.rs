@@ -453,11 +453,6 @@ pub enum AuditParams {
         /// Stable active lock identities; never returned in the HTTP error.
         lock_ids: Vec<String>,
     },
-    /// One opted-in query issued a signed structural retrieval receipt.
-    ReceiptIssued {
-        /// Stable receipt identity; query text and policy predicate are excluded.
-        receipt_id: String,
-    },
     /// The process booted with explicit unsafe-open security mode.
     OpenUnsafeBoot,
     /// The process booted with a verified but expired license.

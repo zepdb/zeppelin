@@ -192,6 +192,7 @@ mod policy_publication;
 mod policy_store;
 mod preservation;
 mod principal;
+#[allow(dead_code)]
 mod receipt;
 mod resource;
 mod route_map;
@@ -245,9 +246,7 @@ pub use preservation::{
     PreservationState,
 };
 pub use principal::{AuthStrength, Principal, PrincipalId, PrincipalKind};
-pub(crate) use receipt::{
-    issue_receipt, verify_receipt, AuthenticatedManifestArtifactInventory, ReceiptIssue,
-};
+pub(crate) use receipt::AuthenticatedManifestArtifactInventory;
 pub use receipt::{
     PolicyFilterCheck, ReceiptDivergence, RetrievalReceipt, TouchedArtifact, TraversalMetric,
     TraversalParams, TraversalSourceKind, TraversalSourceParams, VerificationMode,

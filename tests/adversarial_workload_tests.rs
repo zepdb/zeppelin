@@ -59,8 +59,6 @@ const REQUIRED_SECURITY_OP_KINDS: &[&str] = &[
     "export_probe",
     "security_admin_probe",
     "audit_barrier",
-    "query_with_receipt",
-    "verify_receipt",
     "tamper_artifact_then_verify",
     "audit_chain_check",
     "mint_token",
@@ -172,7 +170,7 @@ async fn smoke() {
                 "security operation kind {kind} was not covered"
             );
         }
-        for oracle in ["I22", "I23", "I24", "I25", "I26", "I27", "I28", "I29"] {
+        for oracle in ["I22", "I23", "I24", "I25", "I26", "I27", "I28"] {
             assert!(
                 summary
                     .coverage

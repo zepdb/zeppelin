@@ -202,6 +202,7 @@ pub fn compile_effective_filter(
 /// would commonly use nullable fields plus serializer annotations, while C
 /// would need an explicit presence flag beside each payload.
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct QueryResponse {
     /// Ranked hits in the score direction of the executed source.
     pub results: Vec<SearchResult>,

@@ -710,7 +710,6 @@ async fn start_test_server_with_config_inner(
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(&security, config.receipts.enabled),
         security: Arc::clone(&security),
         audit,
         credential_adapter,
@@ -848,7 +847,6 @@ pub async fn start_test_server_on_store_with_readiness(
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(&security, config.receipts.enabled),
         security: Arc::clone(&security),
         audit,
         credential_adapter,
@@ -940,7 +938,6 @@ pub async fn start_test_server_with_compactor(
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(&security, config.receipts.enabled),
         security: Arc::clone(&security),
         audit,
         credential_adapter,
@@ -1076,7 +1073,6 @@ pub async fn start_test_server_with_compaction(
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(&security, config.receipts.enabled),
         security: Arc::clone(&security),
         audit,
         credential_adapter,
@@ -1722,10 +1718,6 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
-        receipts: zeppelin::server::ReceiptCapability::compose(
-            &state_security,
-            config.receipts.enabled,
-        ),
         security: state_security,
         audit: audit.clone(),
         credential_adapter,
