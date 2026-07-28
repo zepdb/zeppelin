@@ -370,14 +370,13 @@ async fn execute_delete_cleanup(case: &IdealCase, complete: bool) -> IdealSample
     );
     await_tracker_idle(&world.tracker).await;
     let sample = world.sample(case);
-    // e232818 made legacy cleanup re-read authoritative metadata at each step
-    // and re-check manifest absence before batch deletion and tombstone
-    // removal: one read on entry, two per guarded step. An incomplete batch
-    // returns before the second step, so it observes three GETs while the
-    // complete path observes five.
+    // finish_delete checks the tombstone and manifest absence once on entry
+    // and carries that result through the batch delete and tombstone removal;
+    // only a crash-resumed run re-enters and re-checks. Both paths observe one
+    // metadata GET plus one manifest GET.
     assert_shape(
         &sample,
-        if complete { 5 } else { 3 },
+        2,
         0,
         if complete { 2 } else { 1 },
         if complete { 2 } else { 1 },

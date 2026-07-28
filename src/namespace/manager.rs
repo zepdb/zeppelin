@@ -3093,17 +3093,19 @@ impl NamespaceManager {
                 "namespace {name} governed deletion must resume through NamespaceGraph"
             )));
         }
+        Self::require_legacy_cleanup_identity(name, &meta, meta.incarnation_id.as_ref())?;
+        // One manifest-absence check covers this whole uninterrupted pass; the
+        // per-step re-checks below never linearized against a concurrent
+        // writer anyway. A crash-resumed run re-enters here and re-checks.
+        self.require_manifest_absent(name).await?;
 
-        let outcome = self
-            .cleanup_legacy_delete_batch(name, meta.incarnation_id.as_ref(), budget)
-            .await?;
+        let outcome = self.delete_cleanup_batch(name, budget).await?;
 
         if !outcome.complete {
             return Ok(outcome);
         }
 
-        self.remove_legacy_deletion_metadata(name, meta.incarnation_id.as_ref())
-            .await?;
+        self.remove_metadata_after_cleanup(name).await?;
 
         info!(
             namespace = name,
@@ -3358,6 +3360,15 @@ impl NamespaceManager {
         meta: &NamespaceMetadata,
         expected_incarnation: Option<&NamespaceIncarnationId>,
     ) -> Result<()> {
+        Self::require_legacy_cleanup_identity(name, meta, expected_incarnation)?;
+        self.require_manifest_absent(name).await
+    }
+
+    fn require_legacy_cleanup_identity(
+        name: &str,
+        meta: &NamespaceMetadata,
+        expected_incarnation: Option<&NamespaceIncarnationId>,
+    ) -> Result<()> {
         if meta.state != NamespaceState::Deleting {
             return Err(ZeppelinError::Validation(format!(
                 "namespace {name} is not marked deleting"
@@ -3373,6 +3384,10 @@ impl NamespaceManager {
                 "namespace {name} legacy deletion incarnation changed"
             )));
         }
+        Ok(())
+    }
+
+    async fn require_manifest_absent(&self, name: &str) -> Result<()> {
         if crate::wal::Manifest::read(&self.store, name)
             .await?
             .is_some()

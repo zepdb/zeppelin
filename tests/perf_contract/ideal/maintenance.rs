@@ -937,10 +937,10 @@ async fn execute_resume_delete(case: &IdealCase) -> IdealSample {
     assert!(outcome.complete);
     assert_eq!(outcome.deleted, 2);
     let sample = world.snapshot(case).await;
-    // e232818's legacy cleanup guard re-reads metadata and re-checks manifest
-    // absence before both the batch delete and the tombstone removal: one
-    // entry read plus two per guarded step.
-    assert_eq!(sample.total_get_ops, 5);
+    // finish_delete checks the tombstone and manifest absence once on entry
+    // and carries that result through both guarded steps; only a crash-resumed
+    // run re-enters and re-checks.
+    assert_eq!(sample.total_get_ops, 2);
     assert_eq!(physical_mode_ops(&sample, "list_recursive"), 2);
     assert_eq!(physical_mode_ops(&sample, "delete_batch"), 1);
     assert_eq!(physical_mode_ops(&sample, "delete"), 1);
