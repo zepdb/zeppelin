@@ -1,10 +1,13 @@
-//! Deterministic end-to-end recall evaluation against Zeppelin's production SQ8 path.
+//! Deterministic end-to-end recall evaluation against Zeppelin's production
+//! quantized paths.
 //!
 //! This binary is a quality gate for approximate vector search. It reads a
 //! seed specification outside the repository, deterministically generates a
 //! clustered dataset and three query families, writes the dataset through the
-//! normal WAL path to MinIO, compacts it into one immutable scalar-quantized
-//! IVF-Flat segment, and compares production query results with exact
+//! normal WAL path to MinIO, compacts it into one immutable quantized
+//! IVF-Flat segment (two-bit by default, SQ8 with
+//! `ZEPPELIN_QUANTIZATION=scalar`), and compares production query results
+//! with exact
 //! brute-force nearest neighbors. It reports mean recall at `k`; it is not a
 //! latency benchmark, HTTP client, server process, or substitute for API tests.
 //!
@@ -20,8 +23,8 @@
 //! 2. Read `SeedFile`, `resolve_dataset`, and `generate_dataset` for deterministic
 //!    fixture construction.
 //! 3. Read `ExactDataset` and `push_top_k` for independent ground truth.
-//! 4. Read `prepare_namespace` and `verify_compacted_sq8_segment` for WAL,
-//!    compaction, manifest, and SQ8 artifact invariants.
+//! 4. Read `prepare_namespace` and `verify_compacted_segment` for WAL,
+//!    compaction, manifest, and coarse-payload artifact invariants.
 //! 5. Read `evaluate_modes` and the three query generators for recall scoring.
 //! 6. Finish with `cleanup_namespace`, `Report`, and `print_human_report` for the
 //!    observable result and cleanup boundary.
@@ -41,10 +44,10 @@
 //! append immutable WAL batches -> publish manifest generations
 //!              |
 //!              v
-//! compact and publish one immutable IVF-Flat SQ8 segment
+//! compact and publish one immutable quantized IVF-Flat segment
 //!              |
 //!              v
-//! verify: active segment + no WAL + SQ8 artifacts
+//! verify: active segment + no WAL + coarse payload artifacts
 //!              |
 //!      +-------+--------+
 //!      |                |
@@ -71,18 +74,25 @@
 //! ```text
 //! authoritative manifest
 //!        |
-//!        +--> exactly one active non-hierarchical Scalar segment
+//!        +--> exactly one active non-hierarchical Scalar or TwoBit segment
 //!        +--> expected vector count, positive cluster count
 //!        +--> zero uncompacted WAL fragments
 //!        |
-//!        +--> centroids object
-//!        |       +--> ZCT2: embedded SQ calibration
-//!        |       `--> legacy: separate calibration object
+//!        +--> Scalar arm
+//!        |       +--> centroids object
+//!        |       |       +--> ZCT2: embedded SQ calibration
+//!        |       |       `--> legacy: separate calibration object
+//!        |       `--> cluster 0 SQ payload in one supported layout
+//!        |               +--> manifest row-layout coarse block (ZBP5)
+//!        |               +--> manifest grouped cluster object (ZBP4)
+//!        |               +--> co-located singleton cluster object (ZCL2)
+//!        |               `--> legacy separate SQ cluster object
 //!        |
-//!        `--> cluster 0 SQ payload in one supported layout
-//!                +--> manifest grouped cluster object (ZBP4)
-//!                +--> co-located singleton cluster object (ZCL2)
-//!                `--> legacy separate SQ cluster object
+//!        `--> TwoBit arm
+//!                +--> centroids object exists
+//!                +--> manifest CoarsePayloadEncoding::TwoBit tag
+//!                `--> cluster 0 coarse block in-bounds via its
+//!                    manifest-published row layout (ZBP5)
 //! ```
 //!
 //! Layout alternatives provide persisted-format compatibility; they do not
@@ -97,8 +107,8 @@
 //!   to the seed file.
 //! - Exact ground truth uses the dataset metric, lower-is-better score ordering,
 //!   and ascending vector ID as the deterministic tie-break.
-//! - Recall is measured only through the production scalar-quantized IVF path,
-//!   against one active segment and zero WAL-scored fragments.
+//! - Recall is measured only through the production quantized IVF path (SQ8 or
+//!   two-bit), against one active segment and zero WAL-scored fragments.
 //! - Immutable artifacts and the manifest, never local memory, define the
 //!   measured dataset.
 //! - `--nprobe all` resolves to the actual compacted cluster count. Positive
@@ -141,7 +151,8 @@ use zeppelin::error::ZeppelinError;
 use zeppelin::index::distance::compute_distance;
 use zeppelin::index::ivf_flat::build::centroids_key;
 use zeppelin::index::quantization::sq::{
-    deserialize_sq_cluster, sq_calibration_key, sq_cluster_key, SqCalibration,
+    deserialize_sq_cluster, deserialize_sq_codes_only, sq_calibration_key, sq_cluster_key,
+    SqCalibration,
 };
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::namespace::branching::ArtifactOrigin;
@@ -149,6 +160,7 @@ use zeppelin::namespace::manager::NamespaceManager;
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
+use zeppelin::wal::manifest::CoarsePayloadEncoding;
 use zeppelin::wal::{Manifest, WalReader, WalWriter};
 
 /// Default external holdout specification used when `--seed-file` is omitted.
@@ -526,7 +538,7 @@ struct Report {
     query_mode: String,
     /// Effective index/query knobs reported alongside quality.
     config: ReportConfig,
-    /// Evidence that the measured source was the required compacted SQ8 segment.
+    /// Evidence that the measured source was the required compacted segment.
     segment_verification: SegmentVerification,
     /// One result per evaluated mode in execution order.
     modes: Vec<ModeReport>,
@@ -535,7 +547,7 @@ struct Report {
 /// Effective settings needed to reproduce and interpret recall.
 #[derive(Debug, Serialize)]
 struct ReportConfig {
-    /// Production quantization mode required by the evaluator.
+    /// Production quantization mode measured by the evaluator.
     quantization: String,
     /// User-facing probe request, retaining `all` when specified.
     nprobe_requested: String,
@@ -562,10 +574,16 @@ struct SegmentVerification {
     wal_fragments_after_compaction: usize,
     /// Quantization recorded by the active segment descriptor.
     segment_quantization: String,
-    /// Whether a valid embedded or legacy SQ calibration was decoded.
+    /// Manifest coarse payload tag recorded for the measured segment.
+    coarse_payload_encoding: String,
+    /// Whether a valid embedded or legacy SQ calibration was decoded (SQ8 arm).
     sq_calibration_present: bool,
-    /// Whether cluster zero exposed a valid SQ payload in a supported layout.
+    /// Whether cluster zero exposed a valid SQ payload in a supported layout
+    /// (SQ8 arm).
     sq_cluster_zero_present: bool,
+    /// Whether cluster zero's two-bit coarse block was addressable and in
+    /// bounds (two-bit arm).
+    rq_cluster_zero_present: bool,
 }
 
 /// Recall and wall-clock duration for one deterministic query family.
@@ -613,7 +631,7 @@ struct EvalContext<'a> {
 }
 
 /// Verified facts copied out of the manifest before cleanup.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct SegmentSummary {
     /// Active segment's quantization mode.
     quantization: QuantizationType,
@@ -621,10 +639,16 @@ struct SegmentSummary {
     cluster_count: usize,
     /// Visible uncompacted refs after compaction; valid summaries contain zero.
     wal_fragments_after_compaction: usize,
-    /// Whether SQ calibration passed structural decoding.
+    /// Manifest coarse payload tag recorded for the active segment.
+    coarse_payload_encoding: CoarsePayloadEncoding,
+    /// Whether SQ calibration passed structural decoding (SQ8 arm only).
     sq_calibration_present: bool,
-    /// Whether cluster zero's SQ payload passed structural decoding.
+    /// Whether cluster zero's SQ payload passed structural decoding (SQ8 arm
+    /// only).
     sq_cluster_zero_present: bool,
+    /// Whether cluster zero's two-bit coarse block was addressable and in
+    /// bounds (two-bit arm only).
+    rq_cluster_zero_present: bool,
 }
 
 /// Runs the async evaluator and translates its result into process exit status.
@@ -660,10 +684,10 @@ async fn main() {
 /// Orchestrates one complete generation, publication, evaluation, cleanup, and report.
 ///
 /// The function intentionally checks all cheap local configuration before
-/// creating remote state. It then requires production scalar quantization,
-/// builds a MinIO-backed store, prepares and verifies one temporary namespace,
-/// evaluates selected modes, deletes that namespace, and prints only after
-/// cleanup succeeds.
+/// creating remote state. It then requires a production quantization mode the
+/// evaluator supports (SQ8 or two-bit), builds a MinIO-backed store, prepares
+/// and verifies one temporary namespace, evaluates selected modes, deletes
+/// that namespace, and prints only after cleanup succeeds.
 ///
 /// # Returns
 ///
@@ -687,7 +711,7 @@ async fn main() {
 /// # Consistency
 ///
 /// WAL appends and compaction use their normal manifest publication boundaries.
-/// Evaluation begins only after a fresh manifest proves one active scalar
+/// Evaluation begins only after a fresh manifest proves one active quantized
 /// segment contains all vectors and no visible WAL refs remain. Production
 /// queries use eventual mode only because segment-only state has no newer WAL
 /// writes to reconcile.
@@ -730,11 +754,13 @@ async fn run() -> Result<()> {
     validate_top_k(top_k, &seed_file)?;
 
     let config = recall_eval_config()?;
-    if config.indexing.quantization != QuantizationType::Scalar {
-        return Err(RecallEvalError::Config(format!(
-            "recall_eval must measure the production SQ8 path; resolved quantization was {:?}",
-            config.indexing.quantization
-        )));
+    match config.indexing.quantization {
+        QuantizationType::Scalar | QuantizationType::TwoBit => {}
+        other => {
+            return Err(RecallEvalError::Config(format!(
+                "recall_eval must measure a production quantized path (SQ8 or two-bit); resolved quantization was {other:?}"
+            )));
+        }
     }
 
     let store = ZeppelinStore::from_config(&minio_storage_config()?)?;
@@ -800,8 +826,11 @@ async fn run() -> Result<()> {
             compacted_segment: true,
             wal_fragments_after_compaction: segment.wal_fragments_after_compaction,
             segment_quantization: quantization_name(segment.quantization).to_string(),
+            coarse_payload_encoding: coarse_payload_encoding_name(segment.coarse_payload_encoding)
+                .to_string(),
             sq_calibration_present: segment.sq_calibration_present,
             sq_cluster_zero_present: segment.sq_cluster_zero_present,
+            rq_cluster_zero_present: segment.rq_cluster_zero_present,
         },
         modes: mode_reports,
     };
@@ -822,9 +851,12 @@ async fn run() -> Result<()> {
 /// listener or authenticates requests, so it selects `open_unsafe` explicitly
 /// in code and validates the remaining production compaction/indexing defaults.
 /// Keeping that distinction local prevents an offline quality gate from
-/// weakening the fail-closed server configuration contract.
+/// weakening the fail-closed server configuration contract. Environment
+/// overrides (notably `ZEPPELIN_QUANTIZATION=scalar` to measure the SQ8 arm
+/// instead of the two-bit default) apply before the security mode is pinned.
 fn recall_eval_config() -> Result<Config> {
     let mut config = Config::default();
+    config.apply_env_overrides()?;
     config.security.mode = zeppelin::config::SecurityMode::OpenUnsafe;
     config.validate()?;
     Ok(config)
@@ -2136,7 +2168,7 @@ fn compare_scored_ids(
 ///
 /// Each append is acknowledged only after manifest CAS. Compaction chooses
 /// visible fragments, creates immutable artifacts, and publishes the active
-/// segment through the manifest. `verify_compacted_sq8_segment` then requires
+/// segment through the manifest. `verify_compacted_segment` then requires
 /// that no uncompacted refs remain.
 ///
 /// # Performance
@@ -2149,8 +2181,8 @@ fn compare_scored_ids(
 /// # Examples
 ///
 /// A 2,500-entry corpus creates three WAL append batches, compacts them into one
-/// active SQ8 segment, and returns a reader/summary only after the manifest shows
-/// zero remaining fragments.
+/// active quantized segment, and returns a reader/summary only after the
+/// manifest shows zero remaining fragments.
 ///
 /// # Rust Notes for Java/C Engineers
 ///
@@ -2203,7 +2235,7 @@ async fn prepare_namespace(
         ));
     }
 
-    let segment = verify_compacted_sq8_segment(
+    let segment = verify_compacted_segment(
         store,
         &namespace,
         &authoritative_origin,
@@ -2217,12 +2249,17 @@ async fn prepare_namespace(
     })
 }
 
-/// Proves that the namespace is a segment-only production SQ8 measurement source.
+/// Proves that the namespace is a segment-only production quantized measurement
+/// source.
 ///
 /// The verifier reads the authoritative manifest, resolves its active segment,
-/// checks shape/quantization/WAL invariants, decodes either embedded or legacy
-/// SQ calibration, and validates a representative cluster-zero SQ payload in
-/// every supported persisted layout.
+/// checks shape/quantization/WAL invariants, then applies the encoding arm
+/// matching the segment's quantization. The SQ8 arm decodes either embedded or
+/// legacy SQ calibration and validates a representative cluster-zero SQ payload
+/// in every supported persisted layout. The two-bit arm requires the manifest's
+/// `CoarsePayloadEncoding::TwoBit` tag and validates cluster zero's coarse block
+/// through its manifest-published row layout; two-bit segments have no legacy
+/// key fallback because the production two-bit reader has none.
 ///
 /// # Parameters
 ///
@@ -2235,15 +2272,17 @@ async fn prepare_namespace(
 /// # Returns
 ///
 /// A copied [`SegmentSummary`] containing quantization, cluster count, zero WAL
-/// refs, and successful calibration/cluster-zero evidence.
+/// refs, and successful calibration/cluster-zero evidence for the measured arm.
 ///
 /// # Errors
 ///
 /// Returns `Integrity` when the manifest/active descriptor is absent or
 /// contradictory, WAL refs remain, counts differ, the segment is hierarchical,
-/// quantization is not scalar, cluster count is zero, embedded layout arithmetic
-/// overflows/truncates, calibration is empty/invalid, or no valid cluster-zero SQ
-/// representation exists. Storage and SQ decode failures propagate.
+/// quantization is neither scalar nor two-bit, cluster count is zero, embedded
+/// layout arithmetic overflows/truncates, calibration is empty/invalid, no valid
+/// cluster-zero SQ representation exists (SQ8 arm), the two-bit coarse payload
+/// tag is missing, or cluster zero's two-bit coarse block is unaddressable or
+/// out of bounds (two-bit arm). Storage and SQ decode failures propagate.
 ///
 /// A failed GET of the optional legacy co-located singleton is treated as
 /// “layout not present” so manifest-grouped or separate-SQ layouts can still
@@ -2266,15 +2305,18 @@ async fn prepare_namespace(
 ///
 /// Performs one manifest read, one centroids GET, either embedded calibration
 /// decoding or one legacy calibration GET, one optional manifest-grouped object
-/// GET, one optional singleton GET, and possibly one legacy existence request.
-/// Only cluster zero is structurally sampled; this is a path-verification guard,
+/// GET, one optional singleton GET, and possibly one legacy existence request;
+/// the two-bit arm skips calibration and legacy layout probes. Only cluster
+/// zero is structurally sampled; this is a path-verification guard,
 /// not a full segment scrub.
 ///
 /// # Examples
 ///
 /// A scalar segment with all expected vectors, no WAL refs, embedded `ZCT2`
-/// calibration, and cluster zero in a `ZBP4` group passes. The same segment with
-/// one visible WAL fragment fails because recall would mix segment and WAL paths.
+/// calibration, and cluster zero in a `ZBP4` group passes. A two-bit segment
+/// with the manifest two-bit tag and an in-bounds cluster-zero coarse block
+/// passes; the same segment without the tag fails. Any segment with one visible
+/// WAL fragment fails because recall would mix segment and WAL paths.
 ///
 /// # Rust Notes for Java/C Engineers
 ///
@@ -2283,7 +2325,7 @@ async fn prepare_namespace(
 /// parsers often rely on manual pointer arithmetic, while Java `ByteBuffer`
 /// still requires disciplined bounds/order checks. Rust slices prevent out-of-
 /// bounds access once each calculated range has been validated.
-async fn verify_compacted_sq8_segment(
+async fn verify_compacted_segment(
     store: &ZeppelinStore,
     namespace: &str,
     authoritative_origin: &ArtifactOrigin,
@@ -2324,14 +2366,8 @@ async fn verify_compacted_sq8_segment(
     }
     if segment.hierarchical {
         return Err(RecallEvalError::Integrity(
-            "active segment is hierarchical, expected IVF-Flat SQ8".into(),
+            "active segment is hierarchical, expected IVF-Flat".into(),
         ));
-    }
-    if segment.quantization != QuantizationType::Scalar {
-        return Err(RecallEvalError::Integrity(format!(
-            "active segment quantization is {:?}, expected Scalar/SQ8",
-            segment.quantization
-        )));
     }
     if segment.cluster_count == 0 {
         return Err(RecallEvalError::Integrity(
@@ -2339,99 +2375,140 @@ async fn verify_compacted_sq8_segment(
         ));
     }
 
-    let centroids = store
-        .get(&centroids_key(physical_namespace, active_segment_id))
-        .await?;
-    let parsed =
-        if centroids.starts_with(b"ZCT2") {
-            if centroids.len() < 20 {
-                return Err(RecallEvalError::Integrity(
-                    "v2 centroids blob too small for SQ calibration".into(),
-                ));
-            }
-            let num_centroids =
-                u32::from_le_bytes(centroids[4..8].try_into().map_err(|_| {
-                    RecallEvalError::Integrity("v2 centroids count parse error".into())
+    match segment.quantization {
+        QuantizationType::Scalar => {
+            let centroids = store
+                .get(&centroids_key(physical_namespace, active_segment_id))
+                .await?;
+            let parsed = if centroids.starts_with(b"ZCT2") {
+                if centroids.len() < 20 {
+                    return Err(RecallEvalError::Integrity(
+                        "v2 centroids blob too small for SQ calibration".into(),
+                    ));
+                }
+                let num_centroids =
+                    u32::from_le_bytes(centroids[4..8].try_into().map_err(|_| {
+                        RecallEvalError::Integrity("v2 centroids count parse error".into())
+                    })?) as usize;
+                let dim = u32::from_le_bytes(centroids[8..12].try_into().map_err(|_| {
+                    RecallEvalError::Integrity("v2 centroids dimension parse error".into())
                 })?) as usize;
-            let dim = u32::from_le_bytes(centroids[8..12].try_into().map_err(|_| {
-                RecallEvalError::Integrity("v2 centroids dimension parse error".into())
-            })?) as usize;
-            let cal_len_offset = 12usize
-                .checked_add(
-                    num_centroids
-                        .checked_mul(dim)
-                        .and_then(|v| v.checked_mul(4))
+                let cal_len_offset = 12usize
+                        .checked_add(
+                            num_centroids
+                                .checked_mul(dim)
+                                .and_then(|v| v.checked_mul(4))
+                                .ok_or_else(|| {
+                                    RecallEvalError::Integrity(format!(
+                                    "v2 centroids float section overflows: n={num_centroids}, dim={dim}"
+                                ))
+                                })?,
+                        )
                         .ok_or_else(|| {
-                            RecallEvalError::Integrity(format!(
-                            "v2 centroids float section overflows: n={num_centroids}, dim={dim}"
-                        ))
+                            RecallEvalError::Integrity("v2 centroids offset overflow".into())
+                        })?;
+                if centroids.len() < cal_len_offset + 8 {
+                    return Err(RecallEvalError::Integrity(
+                        "v2 centroids blob truncated before SQ calibration length".into(),
+                    ));
+                }
+                let cal_len = u64::from_le_bytes(
+                    centroids[cal_len_offset..cal_len_offset + 8]
+                        .try_into()
+                        .map_err(|_| {
+                            RecallEvalError::Integrity(
+                                "v2 SQ calibration length parse error".into(),
+                            )
                         })?,
-                )
-                .ok_or_else(|| RecallEvalError::Integrity("v2 centroids offset overflow".into()))?;
-            if centroids.len() < cal_len_offset + 8 {
+                ) as usize;
+                if cal_len == 0 {
+                    return Err(RecallEvalError::Integrity(
+                        "v2 SQ8 segment has no embedded SQ calibration".into(),
+                    ));
+                }
+                let cal_start = cal_len_offset + 8;
+                let cal_end = cal_start.checked_add(cal_len).ok_or_else(|| {
+                    RecallEvalError::Integrity("v2 SQ calibration overflow".into())
+                })?;
+                if centroids.len() != cal_end {
+                    return Err(RecallEvalError::Integrity(
+                        "v2 centroids SQ calibration length does not match object size".into(),
+                    ));
+                }
+                SqCalibration::from_bytes(&centroids[cal_start..cal_end])?
+            } else {
+                let calibration_key = sq_calibration_key(physical_namespace, active_segment_id);
+                let calibration = store.get(&calibration_key).await?;
+                SqCalibration::from_bytes(&calibration)?
+            };
+            if parsed.dim == 0 {
                 return Err(RecallEvalError::Integrity(
-                    "v2 centroids blob truncated before SQ calibration length".into(),
+                    "SQ calibration has zero dimensions".into(),
                 ));
             }
-            let cal_len = u64::from_le_bytes(
-                centroids[cal_len_offset..cal_len_offset + 8]
-                    .try_into()
-                    .map_err(|_| {
-                        RecallEvalError::Integrity("v2 SQ calibration length parse error".into())
-                    })?,
-            ) as usize;
-            if cal_len == 0 {
-                return Err(RecallEvalError::Integrity(
-                    "v2 SQ8 segment has no embedded SQ calibration".into(),
-                ));
+            let manifest_cluster_zero_present =
+                manifest_sq_cluster_artifact_present(store, segment, 0).await?;
+            let cluster_zero_key = sq_cluster_key(physical_namespace, segment.cluster_owner(0), 0);
+            let colocated_cluster_zero_key = format!(
+                "{physical_namespace}/segments/{}/cluster_0.bin",
+                segment.cluster_owner(0)
+            );
+            let colocated_cluster_zero_present = match store.get(&colocated_cluster_zero_key).await
+            {
+                Ok(data) => colocated_sq_cluster_present(&data)?,
+                Err(_) => false,
+            };
+            let sq_cluster_zero_present = manifest_cluster_zero_present
+                || colocated_cluster_zero_present
+                || store.exists(&cluster_zero_key).await?;
+            if !sq_cluster_zero_present {
+                return Err(RecallEvalError::Integrity(format!(
+                    "missing SQ8 cluster artifact {cluster_zero_key}, co-located {colocated_cluster_zero_key}, or manifest cluster_objects entry for cluster 0"
+                )));
             }
-            let cal_start = cal_len_offset + 8;
-            let cal_end = cal_start
-                .checked_add(cal_len)
-                .ok_or_else(|| RecallEvalError::Integrity("v2 SQ calibration overflow".into()))?;
-            if centroids.len() != cal_end {
-                return Err(RecallEvalError::Integrity(
-                    "v2 centroids SQ calibration length does not match object size".into(),
-                ));
-            }
-            SqCalibration::from_bytes(&centroids[cal_start..cal_end])?
-        } else {
-            let calibration_key = sq_calibration_key(physical_namespace, active_segment_id);
-            let calibration = store.get(&calibration_key).await?;
-            SqCalibration::from_bytes(&calibration)?
-        };
-    if parsed.dim == 0 {
-        return Err(RecallEvalError::Integrity(
-            "SQ calibration has zero dimensions".into(),
-        ));
-    }
-    let manifest_cluster_zero_present =
-        manifest_sq_cluster_artifact_present(store, segment, 0).await?;
-    let cluster_zero_key = sq_cluster_key(physical_namespace, segment.cluster_owner(0), 0);
-    let colocated_cluster_zero_key = format!(
-        "{physical_namespace}/segments/{}/cluster_0.bin",
-        segment.cluster_owner(0)
-    );
-    let colocated_cluster_zero_present = match store.get(&colocated_cluster_zero_key).await {
-        Ok(data) => colocated_sq_cluster_present(&data)?,
-        Err(_) => false,
-    };
-    let sq_cluster_zero_present = manifest_cluster_zero_present
-        || colocated_cluster_zero_present
-        || store.exists(&cluster_zero_key).await?;
-    if !sq_cluster_zero_present {
-        return Err(RecallEvalError::Integrity(format!(
-            "missing SQ8 cluster artifact {cluster_zero_key}, co-located {colocated_cluster_zero_key}, or manifest cluster_objects entry for cluster 0"
-        )));
-    }
 
-    Ok(SegmentSummary {
-        quantization: segment.quantization,
-        cluster_count: segment.cluster_count,
-        wal_fragments_after_compaction: manifest.uncompacted_fragments().len(),
-        sq_calibration_present: true,
-        sq_cluster_zero_present,
-    })
+            Ok(SegmentSummary {
+                quantization: segment.quantization,
+                cluster_count: segment.cluster_count,
+                wal_fragments_after_compaction: manifest.uncompacted_fragments().len(),
+                coarse_payload_encoding: manifest.coarse_payload_encoding(active_segment_id),
+                sq_calibration_present: true,
+                sq_cluster_zero_present,
+                rq_cluster_zero_present: false,
+            })
+        }
+        QuantizationType::TwoBit => {
+            store
+                .get(&centroids_key(physical_namespace, active_segment_id))
+                .await?;
+            let encoding = manifest.coarse_payload_encoding(active_segment_id);
+            if encoding != CoarsePayloadEncoding::TwoBit {
+                return Err(RecallEvalError::Integrity(format!(
+                    "two-bit segment {active_segment_id} is missing its two-bit coarse payload tag"
+                )));
+            }
+            let rq_cluster_zero_present =
+                manifest_rq_cluster_artifact_present(store, segment, 0).await?;
+            if !rq_cluster_zero_present {
+                return Err(RecallEvalError::Integrity(format!(
+                    "missing two-bit coarse artifact for cluster 0 in manifest cluster_objects of segment {active_segment_id}"
+                )));
+            }
+
+            Ok(SegmentSummary {
+                quantization: segment.quantization,
+                cluster_count: segment.cluster_count,
+                wal_fragments_after_compaction: manifest.uncompacted_fragments().len(),
+                coarse_payload_encoding: encoding,
+                sq_calibration_present: false,
+                sq_cluster_zero_present: false,
+                rq_cluster_zero_present,
+            })
+        }
+        other => Err(RecallEvalError::Integrity(format!(
+            "active segment quantization is {other:?}, expected Scalar/SQ8 or TwoBit"
+        ))),
+    }
 }
 
 /// Evaluates exact-versus-production recall for each selected query family.
@@ -2746,8 +2823,10 @@ async fn cleanup_namespace(store: &ZeppelinStore, namespace: &str) -> Result<usi
 ///
 /// The helper first enforces that the requested logical cluster appears in at
 /// most one grouped-object descriptor. It then loads that exact immutable object
-/// and recognizes either grouped `ZBP` data or a co-located `ZCL2` singleton.
-/// Legacy separate SQ keys are deliberately checked by the caller instead.
+/// and recognizes a manifest-published `ZBP5` row layout (decoding the cluster's
+/// codes-only coarse block through the production SQ decoder), grouped `ZBP`
+/// data, or a co-located `ZCL2` singleton. Legacy separate SQ keys are
+/// deliberately checked by the caller instead.
 ///
 /// # Parameters
 ///
@@ -2804,6 +2883,15 @@ async fn manifest_sq_cluster_artifact_present(
         return Ok(false);
     };
     let data = store.get(&object_ref.key).await?;
+    if let Some(layout) = object_ref
+        .row_layouts
+        .iter()
+        .find(|layout| layout.cluster_idx == cluster_idx)
+    {
+        let coarse_range = row_layout_coarse_range(layout, data.len())?;
+        deserialize_sq_codes_only(&data[coarse_range])?;
+        return Ok(true);
+    }
     if data.starts_with(b"ZBP") {
         return grouped_sq_cluster_present(&data, cluster_idx);
     }
@@ -2811,6 +2899,121 @@ async fn manifest_sq_cluster_artifact_present(
         return colocated_sq_cluster_present(&data);
     }
     Ok(false)
+}
+
+/// Narrows one manifest row layout's coarse block to a validated byte range.
+///
+/// # Parameters
+///
+/// - `layout`: Manifest-published row layout carrying absolute offsets.
+/// - `object_len`: Total length of the fetched object the range must fit.
+///
+/// # Returns
+///
+/// The coarse block's `start..end` byte range inside the object.
+///
+/// # Errors
+///
+/// Returns `Integrity` for a zero-row layout, an offset or length that cannot
+/// narrow to `usize`, a zero-length block, or a range outside the object.
+fn row_layout_coarse_range(
+    layout: &zeppelin::wal::manifest::ClusterRowLayoutRef,
+    object_len: usize,
+) -> Result<std::ops::Range<usize>> {
+    if layout.row_count == 0 {
+        return Err(RecallEvalError::Integrity(format!(
+            "row layout for cluster {} has zero rows",
+            layout.cluster_idx
+        )));
+    }
+    let coarse_start = usize::try_from(layout.coarse_offset).map_err(|_| {
+        RecallEvalError::Integrity(format!(
+            "coarse offset {} does not fit usize",
+            layout.coarse_offset
+        ))
+    })?;
+    let coarse_len = usize::try_from(layout.coarse_len).map_err(|_| {
+        RecallEvalError::Integrity(format!(
+            "coarse length {} does not fit usize",
+            layout.coarse_len
+        ))
+    })?;
+    if coarse_len == 0 {
+        return Err(RecallEvalError::Integrity(format!(
+            "coarse block for cluster {} is empty",
+            layout.cluster_idx
+        )));
+    }
+    let coarse_end = coarse_start.checked_add(coarse_len).ok_or_else(|| {
+        RecallEvalError::Integrity(format!(
+            "coarse range overflows: offset={coarse_start}, len={coarse_len}"
+        ))
+    })?;
+    validate_object_range(coarse_start, coarse_end, object_len, "cluster coarse block")?;
+    Ok(coarse_start..coarse_end)
+}
+
+/// Proves one cluster's two-bit coarse block is addressable and in bounds.
+///
+/// Two-bit segments persist coarse codes only inside manifest-selected grouped
+/// objects addressed by typed row layouts (`ZBP5`); the production two-bit
+/// reader has no legacy key or sidecar fallback, so neither does this verifier.
+/// The manifest-published coarse range is validated against the fetched object
+/// without re-decoding the codes: decode correctness is exercised by the
+/// subsequent production queries, which fail loud on any malformed payload.
+///
+/// # Parameters
+///
+/// - `store`: MinIO-backed gateway used for direct authoritative reads.
+/// - `segment`: Manifest-resolved active descriptor owning cluster objects.
+/// - `cluster_idx`: Logical cluster whose row layout must be present.
+///
+/// # Returns
+///
+/// `true` when the unique matching object declares a row layout for the cluster
+/// whose non-empty coarse range fits inside the fetched object; `false` when no
+/// descriptor matches or the matching descriptor declares no row layout for the
+/// cluster.
+///
+/// # Errors
+///
+/// Returns `Integrity` for duplicate manifest ownership, a zero-row layout, a
+/// zero-length or overflowing/out-of-bounds coarse range, or an offset that
+/// cannot narrow to `usize`. Object-store GET failures propagate.
+///
+/// # Side Effects
+///
+/// Performs no I/O when metadata contains no matching object, otherwise one full
+/// object GET. It does not mutate cache or manifest state.
+async fn manifest_rq_cluster_artifact_present(
+    store: &ZeppelinStore,
+    segment: &zeppelin::wal::manifest::SegmentRef,
+    cluster_idx: usize,
+) -> Result<bool> {
+    let mut matching_object = None;
+    for object_ref in &segment.cluster_objects {
+        if object_ref.clusters.contains(&cluster_idx)
+            && matching_object.replace(object_ref).is_some()
+        {
+            return Err(RecallEvalError::Integrity(format!(
+                "cluster {cluster_idx} appears in multiple manifest cluster_objects"
+            )));
+        }
+    }
+
+    let Some(object_ref) = matching_object else {
+        return Ok(false);
+    };
+    let Some(layout) = object_ref
+        .row_layouts
+        .iter()
+        .find(|layout| layout.cluster_idx == cluster_idx)
+    else {
+        return Ok(false);
+    };
+    let data = store.get(&object_ref.key).await?;
+    row_layout_coarse_range(layout, data.len())?;
+    Ok(true)
 }
 
 /// Parses a v4 grouped cluster object and validates one cluster's SQ/full ranges.
@@ -3137,18 +3340,32 @@ fn validate_object_range(start: usize, end: usize, object_len: usize, label: &st
 ///
 /// # Returns
 ///
-/// One process-lifetime label: `None`, `Scalar`, or `Product`.
+/// One process-lifetime label: `None`, `Scalar`, `TwoBit`, or `Product`.
 ///
 /// # Examples
 ///
-/// `QuantizationType::Scalar` renders as `Scalar`, the SQ8 mode required by this
-/// evaluator.
+/// `QuantizationType::TwoBit` renders as `TwoBit`, the production default this
+/// evaluator measures; `QuantizationType::Scalar` renders as `Scalar`, the SQ8
+/// arm selected with `ZEPPELIN_QUANTIZATION=scalar`.
 fn quantization_name(value: QuantizationType) -> &'static str {
     match value {
         QuantizationType::None => "None",
         QuantizationType::Scalar => "Scalar",
         QuantizationType::TwoBit => "TwoBit",
         QuantizationType::Product => "Product",
+    }
+}
+
+/// Maps a manifest coarse payload encoding tag to a stable report label.
+///
+/// # Examples
+///
+/// `CoarsePayloadEncoding::TwoBit` renders as `two_bit`, matching its serde
+/// spelling in the manifest.
+fn coarse_payload_encoding_name(value: CoarsePayloadEncoding) -> &'static str {
+    match value {
+        CoarsePayloadEncoding::Sq8 => "sq8",
+        CoarsePayloadEncoding::TwoBit => "two_bit",
     }
 }
 
@@ -3195,12 +3412,14 @@ fn print_human_report(report: &Report) {
         report.config.consistency
     );
     println!(
-        "segment: compacted={} quantization={} wal_fragments={} sq_calibration={} sq_cluster_0={}",
+        "segment: compacted={} quantization={} wal_fragments={} coarse_encoding={} sq_calibration={} sq_cluster_0={} rq_cluster_0={}",
         report.segment_verification.compacted_segment,
         report.segment_verification.segment_quantization,
         report.segment_verification.wal_fragments_after_compaction,
+        report.segment_verification.coarse_payload_encoding,
         report.segment_verification.sq_calibration_present,
-        report.segment_verification.sq_cluster_zero_present
+        report.segment_verification.sq_cluster_zero_present,
+        report.segment_verification.rq_cluster_zero_present
     );
     println!("recall@{}:", report.config.top_k);
     for mode in &report.modes {
@@ -3240,7 +3459,9 @@ mod tests {
     };
     use zeppelin::index::quantization::QuantizationType;
     use zeppelin::storage::ZeppelinStore;
-    use zeppelin::wal::manifest::{ClusterDataObjectRef, Manifest, SegmentRef};
+    use zeppelin::wal::manifest::{
+        ClusterDataObjectRef, ClusterRowLayoutRef, Manifest, SegmentRef,
+    };
 
     use super::*;
 
@@ -3335,10 +3556,250 @@ mod tests {
             .await
             .unwrap();
 
-        let summary = verify_compacted_sq8_segment(&store, namespace, &authoritative_origin, 1)
+        let summary = verify_compacted_segment(&store, namespace, &authoritative_origin, 1)
             .await
             .expect("grouped SQ8 cluster object should satisfy recall verifier");
         assert!(summary.sq_cluster_zero_present);
+        assert_eq!(summary.coarse_payload_encoding, CoarsePayloadEncoding::Sq8);
+        assert!(!summary.rq_cluster_zero_present);
+    }
+
+    /// Proves a tagged two-bit segment with a row-layout coarse block verifies.
+    ///
+    /// The fixture publishes one active two-bit segment carrying the manifest
+    /// `CoarsePayloadEncoding::TwoBit` tag, a centroids object, and one
+    /// manifest-referenced `ZBP5` group whose row layout addresses cluster
+    /// zero's coarse block. Acceptance protects the default production path:
+    /// without the two-bit arm the verifier would reject the segment the
+    /// evaluator just compacted.
+    ///
+    /// # Side Effects
+    ///
+    /// Writes isolated objects to an in-memory store only; the store drops at
+    /// test completion and no external service is required.
+    ///
+    /// # Failure protected against
+    ///
+    /// The test fails if the verifier stops recognizing the manifest two-bit
+    /// tag, ignores manifest-published row layouts, or rejects an in-bounds
+    /// cluster-zero coarse block.
+    #[tokio::test]
+    async fn verifier_accepts_two_bit_row_layout_segment() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let namespace = "recall-eval-two-bit";
+        let segment_id = "seg_two_bit";
+        let group_key = format!("{namespace}/segments/{segment_id}/cluster_group_0.bin");
+
+        let manager = NamespaceManager::new(store.clone());
+        let metadata = manager
+            .create(namespace, 2, DistanceMetric::Euclidean)
+            .await
+            .unwrap();
+        let authoritative_origin = metadata.artifact_origin().unwrap().unwrap();
+        let mut manifest = Manifest::read(&store, namespace).await.unwrap().unwrap();
+        manifest.add_segment(row_layout_segment_ref(
+            segment_id,
+            &group_key,
+            QuantizationType::TwoBit,
+            24,
+        ));
+        manifest.set_coarse_payload_encoding(segment_id, CoarsePayloadEncoding::TwoBit);
+        manifest.write(&store, namespace).await.unwrap();
+
+        store
+            .put(
+                &centroids_key(namespace, segment_id),
+                legacy_centroids_blob(1, 2),
+            )
+            .await
+            .unwrap();
+        store
+            .put(&group_key, Bytes::from(vec![0_u8; 48]))
+            .await
+            .unwrap();
+
+        let summary = verify_compacted_segment(&store, namespace, &authoritative_origin, 1)
+            .await
+            .expect("tagged two-bit segment with row layout should satisfy recall verifier");
+        assert_eq!(summary.quantization, QuantizationType::TwoBit);
+        assert_eq!(
+            summary.coarse_payload_encoding,
+            CoarsePayloadEncoding::TwoBit
+        );
+        assert!(summary.rq_cluster_zero_present);
+        assert!(!summary.sq_calibration_present);
+        assert!(!summary.sq_cluster_zero_present);
+    }
+
+    /// Proves an untagged two-bit segment fails loudly instead of verifying.
+    ///
+    /// An untagged segment decodes as SQ8 by default, so accepting it would
+    /// let the evaluator measure a two-bit segment while reporting SQ8
+    /// evidence. The verifier must refuse before any query runs.
+    #[tokio::test]
+    async fn verifier_rejects_two_bit_segment_without_encoding_tag() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let namespace = "recall-eval-two-bit-untagged";
+        let segment_id = "seg_two_bit_untagged";
+        let group_key = format!("{namespace}/segments/{segment_id}/cluster_group_0.bin");
+
+        let manager = NamespaceManager::new(store.clone());
+        let metadata = manager
+            .create(namespace, 2, DistanceMetric::Euclidean)
+            .await
+            .unwrap();
+        let authoritative_origin = metadata.artifact_origin().unwrap().unwrap();
+        let mut manifest = Manifest::read(&store, namespace).await.unwrap().unwrap();
+        manifest.add_segment(row_layout_segment_ref(
+            segment_id,
+            &group_key,
+            QuantizationType::TwoBit,
+            24,
+        ));
+        manifest.write(&store, namespace).await.unwrap();
+
+        store
+            .put(
+                &centroids_key(namespace, segment_id),
+                legacy_centroids_blob(1, 2),
+            )
+            .await
+            .unwrap();
+        store
+            .put(&group_key, Bytes::from(vec![0_u8; 48]))
+            .await
+            .unwrap();
+
+        let error = verify_compacted_segment(&store, namespace, &authoritative_origin, 1)
+            .await
+            .expect_err("untagged two-bit segment must not verify");
+        assert!(
+            matches!(error, RecallEvalError::Integrity(_)),
+            "expected integrity error, got {error}"
+        );
+    }
+
+    /// Proves a scalar segment with a `ZBP5` row-layout coarse block verifies.
+    ///
+    /// Current compaction publishes `ZBP5` grouped objects whose per-cluster
+    /// coarse block is a codes-only SQ payload addressed by the manifest row
+    /// layout, not a v4 directory entry. Acceptance protects the SQ8 arm
+    /// against rejecting the artifacts production compaction actually writes.
+    ///
+    /// # Side Effects
+    ///
+    /// Writes isolated objects to an in-memory store only; the store drops at
+    /// test completion and no external service is required.
+    ///
+    /// # Failure protected against
+    ///
+    /// The test fails if the SQ8 arm stops recognizing manifest-published row
+    /// layouts or no longer decodes the codes-only coarse block through the
+    /// production SQ decoder.
+    #[tokio::test]
+    async fn verifier_accepts_sq8_v5_row_layout_segment() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let namespace = "recall-eval-sq8-v5";
+        let segment_id = "seg_sq8_v5";
+        let group_key = format!("{namespace}/segments/{segment_id}/cluster_group_0.bin");
+
+        let manager = NamespaceManager::new(store.clone());
+        let metadata = manager
+            .create(namespace, 2, DistanceMetric::Euclidean)
+            .await
+            .unwrap();
+        let authoritative_origin = metadata.artifact_origin().unwrap().unwrap();
+        let mut manifest = Manifest::read(&store, namespace).await.unwrap().unwrap();
+        manifest.add_segment(row_layout_segment_ref(
+            segment_id,
+            &group_key,
+            QuantizationType::Scalar,
+            10,
+        ));
+        manifest.write(&store, namespace).await.unwrap();
+
+        let calibration = SqCalibration::calibrate(&[&[0.0_f32, 1.0][..]], 2);
+        store
+            .put(
+                &centroids_key(namespace, segment_id),
+                legacy_centroids_blob(1, 2),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &sq_calibration_key(namespace, segment_id),
+                calibration.to_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let mut object = Vec::new();
+        object.extend_from_slice(&1_u32.to_le_bytes());
+        object.extend_from_slice(&2_u32.to_le_bytes());
+        object.extend_from_slice(&[0_u8, 255]);
+        object.resize(48, 0);
+        store.put(&group_key, Bytes::from(object)).await.unwrap();
+
+        let summary = verify_compacted_segment(&store, namespace, &authoritative_origin, 1)
+            .await
+            .expect("SQ8 segment with v5 row layout should satisfy recall verifier");
+        assert!(summary.sq_calibration_present);
+        assert!(summary.sq_cluster_zero_present);
+    }
+
+    /// Builds one active-segment descriptor with a `ZBP5` row layout.
+    ///
+    /// # Parameters
+    ///
+    /// - `segment_id`: Logical segment identifier recorded in the descriptor.
+    /// - `group_key`: Object key owning cluster zero's coarse block.
+    /// - `quantization`: Coarse encoding the descriptor advertises.
+    /// - `coarse_len`: Byte length of cluster zero's coarse block at offset 0.
+    ///
+    /// # Returns
+    ///
+    /// A descriptor advertising one cluster whose coarse block starts at
+    /// offset zero of a 48-byte grouped object.
+    fn row_layout_segment_ref(
+        segment_id: &str,
+        group_key: &str,
+        quantization: QuantizationType,
+        coarse_len: u64,
+    ) -> SegmentRef {
+        SegmentRef {
+            id: segment_id.to_string(),
+            vector_count: 1,
+            cluster_count: 1,
+            quantization,
+            hierarchical: false,
+            bitmap_fields: Vec::new(),
+            fts_fields: Vec::new(),
+            has_global_fts: false,
+            cluster_owners: Vec::new(),
+            sketch: None,
+            cluster_objects: vec![ClusterDataObjectRef {
+                key: group_key.to_string(),
+                clusters: vec![0],
+                live_offset: 0,
+                live_len: 0,
+                size_bytes: 48,
+                cluster_layout_version: 5,
+                row_layouts: vec![ClusterRowLayoutRef {
+                    cluster_idx: 0,
+                    row_count: 1,
+                    coarse_offset: 0,
+                    coarse_len,
+                    ids_offset: coarse_len,
+                    ids_len: 8,
+                    vectors_offset: coarse_len + 8,
+                    vectors_len: 8,
+                }],
+            }],
+            bootstrap: None,
+            membership: None,
+            artifact_origin: None,
+        }
     }
 
     /// Builds the minimal legacy centroids bytes required by the verifier fixture.

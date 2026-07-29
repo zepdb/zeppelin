@@ -3265,7 +3265,7 @@ impl Config {
     /// absence leaves the previous layer untouched. The compiler infers each
     /// generic numeric or boolean type from the destination field, while string
     /// cases specify `::<String>` explicitly.
-    fn apply_env_overrides(&mut self) -> Result<()> {
+    pub fn apply_env_overrides(&mut self) -> Result<()> {
         // Server
         if let Some(v) = env_override::<String>("ZEPPELIN_HOST")? {
             self.server.host = v;
