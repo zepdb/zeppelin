@@ -5039,22 +5039,8 @@ mod tests {
     #[test]
     fn segment_layout_match_uses_scale_aware_centroid_count() {
         let config = IndexingConfig::default();
-        let mut segment = SegmentRef {
-            id: "seg_scale_aware".to_string(),
-            vector_count: 1_000_000,
-            cluster_count: 334,
-            quantization: config.quantization,
-            hierarchical: false,
-            bitmap_fields: Vec::new(),
-            fts_fields: Vec::new(),
-            has_global_fts: false,
-            cluster_owners: Vec::new(),
-            sketch: None,
-            cluster_objects: Vec::new(),
-            bootstrap: None,
-            membership: None,
-            artifact_origin: None,
-        };
+        let mut segment = segment_for_config("seg_scale_aware", 1_000_000, &config);
+        assert_eq!(segment.cluster_count, 334);
 
         assert!(segment_matches_index_config(&segment, &config));
         segment.cluster_count = 256;
@@ -5190,6 +5176,18 @@ mod tests {
     }
 
     fn segment_for_config(id: &str, vector_count: usize, config: &IndexingConfig) -> SegmentRef {
+        // Two-bit segments must resolve their rotation seed from the resident
+        // sketch; fixtures without one fail validation now that TwoBit is the
+        // default quantization.
+        let sketch = (config.quantization == crate::index::quantization::QuantizationType::TwoBit)
+            .then(|| crate::wal::manifest::SketchRef {
+                key: format!("{id}/coarse_sketch.bin"),
+                version: 4,
+                code_dims: 0,
+                bytes_per_vector: 0,
+                size_bytes: 0,
+                rotation_seed: Some(crate::index::ivf_flat::sketch::sketch_rotation_seed()),
+            });
         SegmentRef {
             id: id.to_string(),
             vector_count,
@@ -5200,7 +5198,7 @@ mod tests {
             fts_fields: Vec::new(),
             has_global_fts: false,
             cluster_owners: Vec::new(),
-            sketch: None,
+            sketch,
             cluster_objects: Vec::new(),
             bootstrap: None,
             membership: None,
@@ -5225,6 +5223,10 @@ mod tests {
         manifest.artifact_origins = vec![source_origin];
         let mut segment = segment_for_config("seg_foreign", 1, &IndexingConfig::default());
         segment.cluster_count = 1;
+        // Foreign artifacts are physically keyed under the source namespace.
+        if let Some(sketch) = segment.sketch.as_mut() {
+            sketch.key = "branch-source/seg_foreign/coarse_sketch.bin".to_string();
+        }
         segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
         manifest.add_segment(segment);
         (manifest, target_origin)

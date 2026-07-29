@@ -255,6 +255,24 @@ pub enum CoarsePayloadEncoding {
     TwoBit,
 }
 
+impl CoarsePayloadEncoding {
+    /// Returns the coarse payload encoding written for one quantization mode.
+    ///
+    /// Two-bit clusters store RaBitQ codes; every other mode's coarse region
+    /// is SQ8-shaped. This mirrors the writer-side mapping in compaction so a
+    /// reader holding the segment's quantization but no manifest tag (scoped
+    /// ANN artifacts, the public `search_ivf_flat` wrapper) can derive the
+    /// encoding instead of assuming SQ8.
+    #[must_use]
+    pub fn for_quantization(quantization: crate::index::quantization::QuantizationType) -> Self {
+        if quantization == crate::index::quantization::QuantizationType::TwoBit {
+            Self::TwoBit
+        } else {
+            Self::Sq8
+        }
+    }
+}
+
 /// Layout version of a grouped object with hoisted ID blocks and fixed-stride
 /// f32 vector blocks (`ZBP5`).
 pub const CLUSTER_LAYOUT_VERSION_ZBP5: u32 = 5;
@@ -3220,6 +3238,12 @@ impl Manifest {
                     .hierarchical_routing_nodes
                     .insert(segment.id.clone(), nodes.clone());
             }
+            // The coarse-payload encoding map is manifest-local, keyed by
+            // segment ID, and untagged means Sq8 — an uncopied TwoBit tag
+            // would misroute the branch's reads of this foreign segment to
+            // the SQ8 decoder and fail loudly. Carry it across the fork.
+            let encoding = source.coarse_payload_encoding(&segment.id);
+            target.set_coarse_payload_encoding(segment.id.clone(), encoding);
             target.segments.push(segment);
         }
         target.next_sequence = source.next_sequence;

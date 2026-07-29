@@ -51,6 +51,29 @@ fn test_compactor(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
     )
 }
 
+/// Create a Compactor pinned to SQ8 for fixtures whose hand-built segments
+/// carry no two-bit rotation seed.
+fn test_compactor_scalar(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
+    let wal_reader = WalReader::new(store.clone());
+    let compaction_config = CompactionConfig {
+        max_wal_fragments_before_compact: 3,
+        ..Default::default()
+    };
+    let indexing_config = IndexingConfig {
+        default_num_centroids: 4,
+        kmeans_max_iterations: 10,
+        quantization: zeppelin::index::quantization::QuantizationType::Scalar,
+        ..Default::default()
+    };
+    Compactor::new(
+        store.clone(),
+        wal_reader,
+        compaction_config,
+        indexing_config,
+        common::default_gc_upload_window(),
+    )
+}
+
 fn normalize_segment_descriptor(mut segment: SegmentRef) -> SegmentRef {
     fn normalize_key(key: &mut String) {
         *key = key
@@ -639,11 +662,13 @@ async fn test_compact_with_existing_segment() {
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
-    // Build IVF-Flat with 50 vecs manually
+    // Build IVF-Flat with 50 vecs manually. Pinned to SQ8: the hand-built
+    // SegmentRef below carries no two-bit rotation seed.
     let initial_vecs = random_vectors(50, 16);
     let indexing_config = IndexingConfig {
         default_num_centroids: 4,
         kmeans_max_iterations: 10,
+        quantization: zeppelin::index::quantization::QuantizationType::Scalar,
         ..Default::default()
     };
     let old_seg_id = "seg_old";
@@ -689,7 +714,7 @@ async fn test_compact_with_existing_segment() {
         .collect();
     writer.append(&ns, new_vecs, vec![]).await.unwrap();
 
-    let compactor = test_compactor(store);
+    let compactor = test_compactor_scalar(store);
     let result = compactor.compact(&ns).await.unwrap();
 
     // New segment should have 70 vectors (50 old + 20 new)

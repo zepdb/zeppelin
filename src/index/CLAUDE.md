@@ -32,7 +32,9 @@ re-pinned, not left unconsidered.
 
 ## Quantization
 
-- SQ8 is the default (`default_quantization()` → `Scalar`).
+- Two-bit is the default (`default_quantization()` → `TwoBit`, flipped
+  2026-07-29 after the G5 gate ran green on both pinned datasets); SQ8
+  remains fully supported as a live configuration.
 - Product quantization and f16 storage are available.
 - RaBitQ / ZSK1: 1-bit retains only ~95% on e5-768 which is **insufficient**;
   2-bit reaches ≥99.3% and passes at nprobe 32. Do not re-propose 1-bit for

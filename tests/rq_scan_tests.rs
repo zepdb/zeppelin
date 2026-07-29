@@ -71,6 +71,10 @@ fn indexing_config() -> IndexingConfig {
         target_rows_per_cluster: ROWS / CLUSTERS,
         max_num_centroids: CLUSTERS,
         kmeans_max_iterations: 4,
+        // These fixtures pin SQ8-vs-RQ layout parity; two-bit coverage comes
+        // from explicitly rewriting the segment as RQ, so the baseline
+        // compaction stays SQ8 now that the default is two-bit.
+        quantization: zeppelin::index::quantization::QuantizationType::Scalar,
         ..Default::default()
     }
 }

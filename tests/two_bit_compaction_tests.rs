@@ -116,17 +116,16 @@ async fn compaction_round_trips_two_bit_and_scalar_modes() {
 }
 
 #[tokio::test]
-async fn default_quantization_stays_scalar() {
+async fn default_quantization_is_two_bit() {
     let config = IndexingConfig {
         default_num_centroids: 2,
         bitmap_index: false,
         ..Default::default()
     };
-    assert_eq!(config.quantization, QuantizationType::Scalar);
+    assert_eq!(config.quantization, QuantizationType::TwoBit);
 
     let (segment_mode, encoding, layout) = compact_with_mode(config.quantization).await;
-    assert_eq!(segment_mode, QuantizationType::Scalar);
-    assert_eq!(encoding, CoarsePayloadEncoding::Sq8);
+    assert_eq!(segment_mode, QuantizationType::TwoBit);
+    assert_eq!(encoding, CoarsePayloadEncoding::TwoBit);
     assert!(layout.row_count > 0, "the fixture must persist rows");
-    assert_sq8_coarse_width(&layout);
 }

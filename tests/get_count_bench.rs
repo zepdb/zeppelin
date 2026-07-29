@@ -79,6 +79,9 @@ fn indexing_config() -> IndexingConfig {
         default_num_centroids: NUM_CENTROIDS,
         default_nprobe: ALL_CLUSTERS,
         kmeans_max_iterations: 10,
+        // These benchmarks pin the SQ8 GET profile by name; keep them on the
+        // SQ8 path explicitly now that the default quantization is two-bit.
+        quantization: QuantizationType::Scalar,
         // H1 measures the default SQ8 vector path, not bitmap prefiltering.
         bitmap_index: false,
         ..Default::default()

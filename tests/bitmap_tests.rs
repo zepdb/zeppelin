@@ -34,6 +34,8 @@ fn bitmap_test_config_hierarchical(bitmap_enabled: bool) -> Config {
     let mut config = bitmap_test_config(bitmap_enabled);
     config.indexing.hierarchical = true;
     config.indexing.leaf_size = Some(20);
+    // Two-bit requires a flat IVF index; hierarchical fixtures stay on SQ8.
+    config.indexing.quantization = zeppelin::index::quantization::QuantizationType::Scalar;
     config
 }
 

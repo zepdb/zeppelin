@@ -131,6 +131,11 @@ impl RqClusterCodes {
     ///
     /// `ids` and `rows` must have the same order and count. The supplied
     /// rotation is the global, manifest-versioned rotation for this dimension.
+    /// Rows and the centroid arrive in the raw namespace dimension, which may
+    /// be shorter than the rotation's padded code dimension (a `BLOCK_DIM`
+    /// multiple); like the sketch build and the query path, shorter inputs
+    /// are embedded in the low coordinates of a zero-padded code-dims buffer.
+    /// Inputs longer than the code dimension are an error.
     /// Plane storage and all scratch buffers are allocated once and reused for
     /// every row.
     pub fn encode(
@@ -147,10 +152,34 @@ impl RqClusterCodes {
         }
 
         let dim = rotation.dim();
-        check_dimension("centroid", centroid.len(), dim)?;
-        for row in rows {
-            check_dimension("row", row.len(), dim)?;
+        if centroid.len() > dim {
+            return Err(RqError::DimensionMismatch {
+                name: "centroid",
+                expected: dim,
+                actual: centroid.len(),
+            });
         }
+        for row in rows {
+            if row.len() > dim {
+                return Err(RqError::DimensionMismatch {
+                    name: "row",
+                    expected: dim,
+                    actual: row.len(),
+                });
+            }
+        }
+
+        // Zero-pad the centroid once; each short row is padded into a reused
+        // scratch buffer below. Residuals are then exact in the raw
+        // coordinates and zero in the padding, matching sketch semantics.
+        let mut padded_centroid = vec![0.0_f32; dim];
+        let centroid: &[f32] = if centroid.len() == dim {
+            centroid
+        } else {
+            padded_centroid[..centroid.len()].copy_from_slice(centroid);
+            &padded_centroid
+        };
+        let mut padded_row = vec![0.0_f32; dim];
 
         let words_per_plane = dim / 64;
         let words_per_row =
@@ -176,6 +205,13 @@ impl RqClusterCodes {
         let mut order_scratch = vec![0_usize; dim];
 
         for (row_index, row) in rows.iter().enumerate() {
+            let row: &[f32] = if row.len() == dim {
+                row
+            } else {
+                padded_row[row.len()..].fill(0.0);
+                padded_row[..row.len()].copy_from_slice(row);
+                &padded_row
+            };
             rotation.rotate_residual(row, centroid, &mut rotated, &mut rotation_scratch)?;
             let row_start = row_index * words_per_row;
             let row_end = row_start + words_per_row;
@@ -711,6 +747,35 @@ mod tests {
         let decoded = RqClusterCodes::from_bytes(&encoded.to_bytes()).expect("decode");
         assert_eq!(decoded.id(0), Some("first"));
         assert_eq!(decoded.id(1), Some("second"));
+    }
+
+    #[test]
+    fn cluster_codes_zero_pad_sub_block_dimensions() {
+        // Raw namespace dimensions below one rotation block are embedded in a
+        // zero-padded code-dims buffer, matching sketch/query semantics.
+        let raw_dim = 4;
+        let rotation = StructuredRotation::new(BLOCK_DIM, TEST_SEED).expect("valid rotation");
+        let centroid = vec![0.25_f32; raw_dim];
+        let rows = [vec![0.5_f32; raw_dim], vec![-0.125_f32; raw_dim]];
+        let row_refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+        let ids = vec!["row-0".to_owned(), "row-1".to_owned()];
+
+        let encoded =
+            RqClusterCodes::encode(&ids, &row_refs, &centroid, &rotation).expect("encode");
+        assert_eq!(encoded.dim(), BLOCK_DIM);
+        let decoded = RqClusterCodes::from_bytes(&encoded.to_bytes()).expect("decode");
+        assert_eq!(decoded.ids(), encoded.ids());
+
+        let too_long = vec![0.0_f32; BLOCK_DIM + 64];
+        let mismatch = RqClusterCodes::encode(&ids[..1], &[&too_long[..]], &centroid, &rotation);
+        assert!(matches!(
+            mismatch,
+            Err(RqError::DimensionMismatch {
+                name: "row",
+                expected: BLOCK_DIM,
+                actual: _
+            })
+        ));
     }
 
     #[test]

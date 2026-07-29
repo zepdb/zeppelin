@@ -2257,9 +2257,9 @@ fn default_oversample_factor() -> usize {
 fn default_pq_m() -> usize {
     8
 }
-/// Returns scalar quantization as the default stored-vector representation.
+/// Returns two-bit quantization as the default stored-vector representation.
 fn default_quantization() -> crate::index::quantization::QuantizationType {
-    crate::index::quantization::QuantizationType::Scalar
+    crate::index::quantization::QuantizationType::TwoBit
 }
 /// Returns whether immutable segments build bitmap indexes by default.
 fn default_bitmap_index() -> bool {

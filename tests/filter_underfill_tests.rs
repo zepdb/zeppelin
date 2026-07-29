@@ -251,6 +251,8 @@ async fn test_hierarchical_sq8_filtered_query_fills_top_k() {
     let mut config = adversarial_config();
     config.indexing.hierarchical = true;
     config.indexing.leaf_size = Some(NEAR_DECOYS + MATCHING + 100);
+    // Two-bit requires a flat IVF index; this scenario is hierarchical + SQ8.
+    config.indexing.quantization = zeppelin::index::quantization::QuantizationType::Scalar;
     let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
     let client = crate::common::server::client_with_bearer(&admin_bearer);

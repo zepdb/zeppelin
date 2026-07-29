@@ -26,6 +26,8 @@ fn hierarchical_test_config() -> IndexingConfig {
         kmeans_max_iterations: 10,
         hierarchical: true,
         leaf_size: Some(10),
+        // Two-bit requires a flat IVF index; hierarchical fixtures stay on SQ8.
+        quantization: zeppelin::index::quantization::QuantizationType::Scalar,
         ..Default::default()
     }
 }
@@ -92,6 +94,7 @@ async fn test_build_hierarchical_single_leaf() {
         kmeans_max_iterations: 10,
         hierarchical: true,
         leaf_size: Some(100), // large enough that all 8 vectors fit
+        quantization: zeppelin::index::quantization::QuantizationType::Scalar,
         ..Default::default()
     };
 
@@ -455,6 +458,7 @@ async fn test_compact_hierarchical() {
         kmeans_max_iterations: 10,
         hierarchical: true,
         leaf_size: Some(10),
+        quantization: zeppelin::index::quantization::QuantizationType::Scalar,
         ..Default::default()
     };
     let compactor = Compactor::new(
@@ -508,6 +512,7 @@ async fn test_query_hierarchical_detection() {
         kmeans_max_iterations: 10,
         hierarchical: true,
         leaf_size: Some(10),
+        quantization: zeppelin::index::quantization::QuantizationType::Scalar,
         ..Default::default()
     };
     let compactor = Compactor::new(

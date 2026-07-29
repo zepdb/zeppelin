@@ -22,7 +22,7 @@
     "hierarchical": false,
     "nlist": 4,
     "pq_m": 8,
-    "quantization": "scalar"
+    "quantization": "two_bit"
   },
   "index_degraded": false,
   "index_kind": "ivf_flat",

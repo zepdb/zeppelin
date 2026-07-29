@@ -260,6 +260,12 @@ impl NamespaceIndexConfig {
                 self.pq_m, dimensions
             )));
         }
+        if self.hierarchical && self.quantization == QuantizationType::TwoBit {
+            return Err(ZeppelinError::Validation(
+                "index_config.quantization=two_bit requires a flat IVF index; hierarchical is unsupported"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }

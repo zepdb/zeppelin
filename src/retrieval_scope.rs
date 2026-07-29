@@ -304,7 +304,7 @@ impl ScopedAnnIndex {
             ScopedAnnArtifact::Flat(index) => {
                 let output = search_ivf_flat_with_trace(
                     index,
-                    CoarsePayloadEncoding::Sq8,
+                    CoarsePayloadEncoding::for_quantization(index.quantization),
                     query,
                     top_k,
                     nprobe,
