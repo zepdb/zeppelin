@@ -15,6 +15,17 @@ const RQ_VERSION: u8 = 1;
 const RQ_HEADER_LEN: usize = RQ_MAGIC.len() + 1 + 2 * std::mem::size_of::<u64>();
 const FACTOR_BYTES: usize = 2 * std::mem::size_of::<f32>();
 
+/// Returns `true` when the payload carries the RQ container signature.
+///
+/// The ID-carrying container written by [`RqClusterCodes::to_bytes`] is the
+/// only two-bit artifact with a magic prefix; the codes-only coarse block
+/// deliberately has none. Readers that probe an unknown coarse payload use
+/// this to recognize the container form without decoding it.
+#[must_use]
+pub(crate) fn is_rq_container(data: &[u8]) -> bool {
+    data.starts_with(RQ_MAGIC)
+}
+
 /// Reports an invalid input or corrupt two-bit cluster payload.
 #[derive(Debug, Error)]
 pub enum RqError {

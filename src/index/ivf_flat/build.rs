@@ -3621,6 +3621,135 @@ fn cluster_section_encoding(data: &[u8]) -> Option<CoarsePayloadEncoding> {
     }
 }
 
+/// Merges one artifact's detected coarse encoding into a segment-wide result.
+///
+/// Artifacts without coarse evidence (legacy v1 objects, full-only standalone
+/// clusters) contribute nothing. Two artifacts naming different encodings are
+/// a loud error: one segment has exactly one coarse encoding, and a mixed
+/// layout is corruption that a guessed label would only hide.
+///
+/// # Errors
+///
+/// Returns an index error when `new` conflicts with an encoding already
+/// detected from another artifact of the same segment.
+fn merge_detected_encoding(
+    detected: &mut Option<CoarsePayloadEncoding>,
+    new: Option<CoarsePayloadEncoding>,
+) -> Result<()> {
+    let Some(new) = new else {
+        return Ok(());
+    };
+    match detected {
+        Some(existing) if *existing != new => Err(ZeppelinError::Index(format!(
+            "segment mixes coarse payload encodings: {existing:?} and {new:?}"
+        ))),
+        _ => {
+            *detected = Some(new);
+            Ok(())
+        }
+    }
+}
+
+/// Detects the encoding of one `ZBP5` codes-only coarse block.
+///
+/// Neither codes-only format carries a magic, but their headers overlap
+/// deterministically: the SQ8 header's `dimension: u32` field (bytes 4..8,
+/// always nonzero) occupies the high half of the two-bit header's
+/// `row_count: u64` field (always zero, because row counts fit the `ZBP5`
+/// directory's u32). One read therefore selects the arm without guessing,
+/// and the strict production decoder for that arm validates the full block —
+/// including its exact-length check — so a corrupt block is an error rather
+/// than a mislabeled encoding.
+///
+/// # Errors
+///
+/// Propagates the selected decoder's validation error (index or RQ), and
+/// returns an index error when the block is too small for either header or
+/// decodes a row count that disagrees with the `ZBP5` directory entry.
+fn detect_codes_only_encoding(block: &[u8], declared_rows: usize) -> Result<CoarsePayloadEncoding> {
+    if block.len() < 8 {
+        return Err(ZeppelinError::Index(format!(
+            "v5 coarse block too small for a codes-only header: {} bytes",
+            block.len()
+        )));
+    }
+    // Header overlap invariant: SQ8 writes a nonzero dimension here; two-bit
+    // writes the always-zero high half of its u64 row count. See the doc above.
+    let header_overlap = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+    if header_overlap == 0 {
+        let codes = crate::index::quantization::rq::RqClusterCodesOnly::from_bytes(block)?;
+        if codes.row_count() != declared_rows {
+            return Err(ZeppelinError::Index(format!(
+                "v5 two-bit coarse block row count mismatch: directory declares {declared_rows}, block holds {}",
+                codes.row_count()
+            )));
+        }
+        Ok(CoarsePayloadEncoding::TwoBit)
+    } else {
+        let codes = crate::index::quantization::sq::deserialize_sq_codes_only(block)?;
+        if codes.codes.len() != declared_rows {
+            return Err(ZeppelinError::Index(format!(
+                "v5 SQ8 coarse block row count mismatch: directory declares {declared_rows}, block holds {}",
+                codes.codes.len()
+            )));
+        }
+        Ok(CoarsePayloadEncoding::Sq8)
+    }
+}
+
+/// Detects the coarse payload encoding persisted in one grouped cluster
+/// object.
+///
+/// `ZBP5` objects are probed per coarse block (see
+/// [`detect_codes_only_encoding`]). `ZBP4` objects store each cluster's
+/// coarse child contiguously, and the two-bit child keeps its `ZRQ1`
+/// container signature, which the magic-less SQ8 payload never carries; both
+/// v4 arms are validated with their strict production decoders. Returns
+/// `None` for v1 legacy objects, which hold exact vectors only.
+///
+/// # Errors
+///
+/// Returns an index error for a malformed directory, an unrecognized or
+/// corrupt coarse block, or mixed encodings inside one object.
+fn detect_cluster_object_encoding(data: &[u8]) -> Result<Option<CoarsePayloadEncoding>> {
+    if is_cluster_data_object_v5(data) {
+        let mut detected = None;
+        for layout in parse_cluster_data_object_v5(data)? {
+            let coarse = usize_range(&layout.coarse, "v5 coarse block")?;
+            validate_range_in_object(&coarse, data.len(), "v5 coarse block")?;
+            merge_detected_encoding(
+                &mut detected,
+                Some(detect_codes_only_encoding(&data[coarse], layout.row_count)?),
+            )?;
+        }
+        return Ok(detected);
+    }
+    if is_cluster_data_object_v4(data) {
+        let mut detected = None;
+        for section in cluster_object_layout_v4(data)?.sections {
+            let sq = section.sq.as_ref().ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "v4 cluster {} is missing its coarse section",
+                    section.cluster_idx
+                ))
+            })?;
+            validate_range_in_object(sq, data.len(), "v4 cluster coarse section")?;
+            let child = &data[sq.start..sq.end];
+            let encoding = if crate::index::quantization::rq::is_rq_container(child) {
+                // Decode only to validate; the probing loader retains no rows.
+                let _codes = crate::index::quantization::rq::RqClusterCodes::from_bytes(child)?;
+                CoarsePayloadEncoding::TwoBit
+            } else {
+                crate::index::quantization::sq::deserialize_sq_cluster(child)?;
+                CoarsePayloadEncoding::Sq8
+            };
+            merge_detected_encoding(&mut detected, Some(encoding))?;
+        }
+        return Ok(detected);
+    }
+    Ok(None)
+}
+
 /// Validates quantized offsets and borrows coarse and exact-vector children.
 ///
 /// # Parameters
@@ -4936,7 +5065,8 @@ async fn load_resident_sketch(
 /// This compatibility loader is used by compaction and tests when a
 /// [`SegmentRef`][crate::wal::manifest::SegmentRef] is not supplied. It loads
 /// centroids, lists grouped keys, reads every cluster to count rows, and probes
-/// quantization sidecars. Normal query planning should use
+/// quantization sidecars plus the coarse encoding persisted in the cluster
+/// artifacts. Normal query planning should use
 /// [`load_ivf_flat_from_manifest`] so the manifest determines layout without
 /// expensive discovery.
 ///
@@ -4956,8 +5086,12 @@ async fn load_resident_sketch(
 ///
 /// Propagates centroid, list, grouped/per-cluster GET, layout, and cluster decode
 /// errors. A key with a grouped filename but non-grouped bytes is an error.
-/// Quantization probes are intentionally heuristic: any PQ probe error is
-/// treated as "not PQ," and any legacy SQ probe error as "not SQ."
+/// The PQ and legacy SQ sidecar probes are intentionally heuristic: any PQ
+/// probe error is treated as "not PQ," and any legacy SQ probe error as
+/// "not SQ." Coarse-encoding detection is strict instead — a corrupt or
+/// unrecognized coarse block, or mixed encodings across a segment's objects,
+/// is an index error, because a wrong silent quantization label is worse
+/// than a failure.
 ///
 /// # Side Effects
 ///
@@ -5014,6 +5148,9 @@ pub async fn load_ivf_flat(
     let segment_prefix = format!("{namespace}/segments/{segment_id}/");
     let segment_keys = store.list_prefix(&segment_prefix).await?;
     let mut cluster_objects: Vec<ClusterDataObjectRef> = Vec::new();
+    // Coarse-encoding evidence gathered from the cluster artifacts themselves;
+    // the quantization probe below consumes it after the calibration checks.
+    let mut detected_encoding: Option<CoarsePayloadEncoding> = None;
     let mut cluster_object_keys: Vec<String> = segment_keys
         .iter()
         .filter(|key| {
@@ -5029,6 +5166,10 @@ pub async fn load_ivf_flat(
     cluster_object_keys.sort();
     for key in cluster_object_keys {
         let data = store.get(&key).await?;
+        merge_detected_encoding(
+            &mut detected_encoding,
+            detect_cluster_object_encoding(&data)?,
+        )?;
         let sections = cluster_object_sections(&data)?.ok_or_else(|| {
             ZeppelinError::Index(format!(
                 "cluster object key {key} did not contain grouped data"
@@ -5071,6 +5212,10 @@ pub async fn load_ivf_flat(
         for i in 0..num_clusters {
             let cvec_key = cluster_key(namespace, segment_id, i);
             let cluster_data = store.get(&cvec_key).await?;
+            merge_detected_encoding(
+                &mut detected_encoding,
+                cluster_section_encoding(&cluster_data),
+            )?;
             let cluster = deserialize_cluster(&cluster_data)?;
             num_vectors += cluster.ids.len();
         }
@@ -5079,7 +5224,10 @@ pub async fn load_ivf_flat(
         build_cluster_object_lookup(num_clusters, &cluster_objects, dim)?;
 
     // Detect quantization: check for PQ codebook first, then embedded or
-    // legacy SQ calibration.
+    // legacy SQ calibration, then the coarse encoding persisted in the
+    // cluster artifacts. Two-bit segments carry no calibration sidecar, so
+    // only the artifact evidence distinguishes them from an unquantized
+    // segment; labeling one `None` would silently route it to the flat scan.
     let quantization = {
         use crate::index::quantization::pq::pq_codebook_key;
         use crate::index::quantization::sq::sq_calibration_key;
@@ -5093,6 +5241,8 @@ pub async fn load_ivf_flat(
             let sq_key = sq_calibration_key(namespace, segment_id);
             if store.get(&sq_key).await.is_ok() {
                 QuantizationType::Scalar
+            } else if matches!(detected_encoding, Some(CoarsePayloadEncoding::TwoBit)) {
+                QuantizationType::TwoBit
             } else {
                 QuantizationType::None
             }
@@ -6020,5 +6170,227 @@ mod tests {
         // an error, never `Ok(None)` — that value means "legacy standalone
         // cluster bytes" and would silently mis-type the object.
         assert!(cluster_object_layout(&object.bytes).is_err());
+    }
+
+    /// Two well-separated clusters of small vectors for loader probing tests.
+    fn probing_test_vectors() -> Vec<VectorEntry> {
+        (0..8)
+            .map(|i| {
+                let base = if i < 4 { 0.0_f32 } else { 100.0 };
+                VectorEntry {
+                    id: format!("probe-row-{i}"),
+                    values: vec![base + i as f32; 4],
+                    attributes: None,
+                }
+            })
+            .collect()
+    }
+
+    fn probing_test_config(quantization: QuantizationType) -> IndexingConfig {
+        IndexingConfig {
+            default_num_centroids: 2,
+            kmeans_max_iterations: 10,
+            quantization,
+            ..IndexingConfig::default()
+        }
+    }
+
+    /// Proves the probing loader labels a two-bit segment `TwoBit`.
+    ///
+    /// `load_ivf_flat` has no manifest tag to read, so the label must come
+    /// from the persisted coarse blocks. Before this probe existed, a
+    /// two-bit segment fell through to `None`: the handle took the flat
+    /// scan and lied about its quantization.
+    #[tokio::test]
+    async fn test_load_ivf_flat_detects_two_bit_encoding() {
+        let store = ZeppelinStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        let namespace = "ns_probe_two_bit";
+        let segment_id = "seg_probe_two_bit";
+        let vectors = probing_test_vectors();
+        let config = probing_test_config(QuantizationType::TwoBit);
+        build_ivf_flat(&vectors, &config, &store, namespace, segment_id)
+            .await
+            .unwrap();
+
+        let loaded = load_ivf_flat(&store, namespace, segment_id).await.unwrap();
+
+        assert_eq!(loaded.quantization, QuantizationType::TwoBit);
+        assert!(loaded.sq_calibration.is_none());
+    }
+
+    /// Proves the coarse-encoding probe leaves the existing Scalar and
+    /// unquantized labels unchanged: embedded calibration still decides
+    /// Scalar, and legacy payloads carry no coarse evidence.
+    #[tokio::test]
+    async fn test_load_ivf_flat_keeps_scalar_and_unquantized_labels() {
+        let store = ZeppelinStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        let vectors = probing_test_vectors();
+
+        let scalar_config = probing_test_config(QuantizationType::Scalar);
+        build_ivf_flat(
+            &vectors,
+            &scalar_config,
+            &store,
+            "ns_probe_scalar",
+            "seg_probe_scalar",
+        )
+        .await
+        .unwrap();
+        let loaded = load_ivf_flat(&store, "ns_probe_scalar", "seg_probe_scalar")
+            .await
+            .unwrap();
+        assert_eq!(loaded.quantization, QuantizationType::Scalar);
+        assert!(loaded.sq_calibration.is_some());
+
+        let none_config = probing_test_config(QuantizationType::None);
+        build_ivf_flat(
+            &vectors,
+            &none_config,
+            &store,
+            "ns_probe_none",
+            "seg_probe_none",
+        )
+        .await
+        .unwrap();
+        let loaded = load_ivf_flat(&store, "ns_probe_none", "seg_probe_none")
+            .await
+            .unwrap();
+        assert_eq!(loaded.quantization, QuantizationType::None);
+    }
+
+    /// Proves a corrupt two-bit coarse block fails the load loudly instead
+    /// of being mislabeled or silently scanned flat.
+    #[tokio::test]
+    async fn test_load_ivf_flat_rejects_corrupt_two_bit_coarse_block() {
+        let store = ZeppelinStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        let namespace = "ns_probe_corrupt";
+        let segment_id = "seg_probe_corrupt";
+        let vectors = probing_test_vectors();
+        let config = probing_test_config(QuantizationType::TwoBit);
+        let built = build_ivf_flat(&vectors, &config, &store, namespace, segment_id)
+            .await
+            .unwrap();
+
+        let object_key = built.cluster_objects()[0].key.clone();
+        let mut data = store.get(&object_key).await.unwrap().to_vec();
+        let layouts = parse_cluster_data_object_v5(&data).unwrap();
+        // The two-bit codes-only dimension must be a BLOCK_DIM multiple; a
+        // low byte of 3 can never be one.
+        let dim_byte = layouts[0].coarse.start as usize + 8;
+        data[dim_byte] = 3;
+        store.put(&object_key, Bytes::from(data)).await.unwrap();
+
+        match load_ivf_flat(&store, namespace, segment_id).await {
+            Ok(_) => panic!("corrupt two-bit coarse block must fail the load loudly"),
+            Err(err) => assert!(
+                matches!(err, ZeppelinError::Rq(_) | ZeppelinError::Index(_)),
+                "expected a typed RQ or index error, got: {err}"
+            ),
+        }
+    }
+
+    /// Probes the object-level detector directly: v5 and v4 objects report
+    /// their persisted arm, legacy v1 objects report nothing, and one object
+    /// mixing coarse encodings is a loud error.
+    #[test]
+    fn detect_cluster_object_encoding_reads_persisted_arms() {
+        use crate::index::quantization::rabitq::{StructuredRotation, BLOCK_DIM};
+        use crate::index::quantization::rq::RqClusterCodes;
+        use crate::index::quantization::sq::{serialize_sq_codes_only, SqCalibration};
+
+        let ids = vec!["row-zero".to_string(), "row-one".to_string()];
+        let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let dim = 2;
+
+        // v5 SQ8 object.
+        let vec_refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let calibration = SqCalibration::calibrate(&vec_refs, dim);
+        let sq_codes: Vec<Vec<u8>> = vec_refs.iter().map(|v| calibration.encode(v)).collect();
+        let sq_coarse = serialize_sq_codes_only(&sq_codes, dim).unwrap();
+        let id_block = serialize_id_block(&ids).unwrap();
+        let f32_block = serialize_fixed_stride_f32_block(&vectors, dim).unwrap();
+        let v5_sq8 = serialize_cluster_data_object_v5(&[Zbp5ClusterBlocks {
+            cluster_idx: 0,
+            row_count: ids.len(),
+            dim,
+            coarse: &sq_coarse,
+            ids: &id_block,
+            vectors: &f32_block,
+        }])
+        .unwrap();
+        assert_eq!(
+            detect_cluster_object_encoding(&v5_sq8.bytes).unwrap(),
+            Some(CoarsePayloadEncoding::Sq8)
+        );
+
+        // v5 two-bit object.
+        let rq_dim = BLOCK_DIM;
+        let rotation = StructuredRotation::new(rq_dim, 0x5A50_4352_5354_5431).unwrap();
+        let rq_rows = [vec![0.5_f32; rq_dim], vec![-0.125_f32; rq_dim]];
+        let rq_refs: Vec<&[f32]> = rq_rows.iter().map(Vec::as_slice).collect();
+        let rq_codes =
+            RqClusterCodes::encode(&ids, &rq_refs, &vec![0.25_f32; rq_dim], &rotation).unwrap();
+        let rq_coarse = rq_codes.to_codes_only_bytes();
+        let rq_id_block = serialize_id_block(&ids).unwrap();
+        let rq_f32_block = serialize_fixed_stride_f32_block(&rq_rows, rq_dim).unwrap();
+        let v5_two_bit = serialize_cluster_data_object_v5(&[Zbp5ClusterBlocks {
+            cluster_idx: 0,
+            row_count: ids.len(),
+            dim: rq_dim,
+            coarse: &rq_coarse,
+            ids: &rq_id_block,
+            vectors: &rq_f32_block,
+        }])
+        .unwrap();
+        assert_eq!(
+            detect_cluster_object_encoding(&v5_two_bit.bytes).unwrap(),
+            Some(CoarsePayloadEncoding::TwoBit)
+        );
+
+        // One v5 object mixing the two arms is corruption, not a coin flip.
+        let mixed = serialize_cluster_data_object_v5(&[
+            Zbp5ClusterBlocks {
+                cluster_idx: 0,
+                row_count: ids.len(),
+                dim,
+                coarse: &sq_coarse,
+                ids: &id_block,
+                vectors: &f32_block,
+            },
+            Zbp5ClusterBlocks {
+                cluster_idx: 1,
+                row_count: ids.len(),
+                dim: rq_dim,
+                coarse: &rq_coarse,
+                ids: &rq_id_block,
+                vectors: &rq_f32_block,
+            },
+        ])
+        .unwrap();
+        match detect_cluster_object_encoding(&mixed.bytes) {
+            Err(ZeppelinError::Index(msg)) => {
+                assert!(msg.contains("mixes coarse payload encodings"), "got: {msg}")
+            }
+            other => panic!("mixed coarse encodings must be a loud error, got: {other:?}"),
+        }
+
+        // v4 objects: the two-bit coarse child keeps its ZRQ1 signature.
+        let zcl3 = serialize_colocated_rq_cluster(&rq_rows, &rq_codes, rq_dim).unwrap();
+        let v4_two_bit = serialize_cluster_data_object(&[(0, zcl3)]).unwrap();
+        assert_eq!(
+            detect_cluster_object_encoding(&v4_two_bit).unwrap(),
+            Some(CoarsePayloadEncoding::TwoBit)
+        );
+        let zcl2 = serialize_colocated_sq_cluster(&ids, &vectors, &sq_codes, dim).unwrap();
+        let v4_sq8 = serialize_cluster_data_object(&[(0, zcl2)]).unwrap();
+        assert_eq!(
+            detect_cluster_object_encoding(&v4_sq8).unwrap(),
+            Some(CoarsePayloadEncoding::Sq8)
+        );
+
+        // v1 legacy objects hold exact vectors only: no encoding evidence.
+        let legacy = serialize_cluster(&ids, &vectors, dim).unwrap();
+        let v1 = serialize_cluster_data_object(&[(0, legacy)]).unwrap();
+        assert_eq!(detect_cluster_object_encoding(&v1).unwrap(), None);
     }
 }
