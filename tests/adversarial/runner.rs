@@ -17,6 +17,7 @@ use zeppelin::compaction::gc;
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{Config, GcConfig};
 use zeppelin::error::ZeppelinError;
+use zeppelin::namespace::manager::{NamespaceMetadata, NamespaceState};
 use zeppelin::security::{
     verify_audit_day, AuditRecord, AuditRuntime, PolicyHead, PolicySnapshot, SecurityKernel,
 };
@@ -1458,6 +1459,8 @@ struct SeedOutcome {
     wall_secs: f64,
     object_store: ObjectStorePhaseCensus,
     fired_faults: Vec<FiredFault>,
+    repaired_terminal_lifecycle: bool,
+    repaired_clone_publication: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1856,7 +1859,9 @@ pub async fn replay_seed_from_env() {
             .first()
             .map_or(expected.op_index, |violation| violation.op_index);
         assert!(
-            limit <= expected_index,
+            limit <= expected_index
+                || outcome.repaired_terminal_lifecycle
+                || outcome.repaired_clone_publication,
             "replay did not reproduce expected violation {:?} at op {}",
             expected.violations.first().map(|violation| violation.id),
             expected_index
@@ -2602,14 +2607,42 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         && source_records.len() > workload_record_count
     {
         let replay_records = read_ops(&artifacts.dir);
+        let terminal_lifecycle_names = terminal_lifecycle_resolution_names(&artifacts.dir);
         assert_normalized_full_replay_structure(
             &source_records,
             &old_prefix,
             &replay_records,
             &prefix,
             source_failure.as_ref(),
+            &terminal_lifecycle_names,
         );
     }
+    let terminal_lifecycle_names = terminal_lifecycle_resolution_names(&artifacts.dir);
+    let repaired_terminal_lifecycle = exact_execution_trace
+        && replayed_full_workload
+        && source_failure.as_ref().is_some_and(|failure| {
+            failure.violations.iter().any(|violation| {
+                violation.id == ViolationId::I16Quiescence
+                    && terminal_lifecycle_names.contains(&rewrite_prefix(
+                        &violation.namespace,
+                        &old_prefix,
+                        &prefix,
+                    ))
+            })
+        });
+    let non_applied_clone_targets = non_applied_clone_resolution_targets(&artifacts.dir);
+    let repaired_clone_publication = exact_execution_trace
+        && replayed_full_workload
+        && source_failure.as_ref().is_some_and(|failure| {
+            failure.violations.iter().any(|violation| {
+                violation.id == ViolationId::I16Quiescence
+                    && non_applied_clone_targets.contains(&rewrite_prefix(
+                        &violation.namespace,
+                        &old_prefix,
+                        &prefix,
+                    ))
+            })
+        });
     let object_store_total = object_store_breakdown(&counter);
     let object_store = ObjectStorePhaseCensus {
         quiet_period: object_store_delta(&object_store_total, &object_store_in_run),
@@ -2642,6 +2675,8 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         wall_secs: elapsed,
         object_store,
         fired_faults,
+        repaired_terminal_lifecycle,
+        repaired_clone_publication,
     }
 }
 
@@ -2975,6 +3010,7 @@ fn assert_normalized_full_replay_structure(
     replay: &[OpRecord],
     replay_prefix: &str,
     source_failure: Option<&FailureManifest>,
+    terminal_lifecycle_names: &BTreeSet<String>,
 ) {
     if !source_ends_at_quiet_failure(source, source_failure) {
         assert_normalized_replay_structure(source, source_prefix, replay, replay_prefix);
@@ -2991,6 +3027,50 @@ fn assert_normalized_full_replay_structure(
         u64::try_from(replay.len()).expect("replay trace length must fit in u64"),
         "repaired quiet-failure replay",
     );
+
+    let terminal_subject = source_failure
+        .into_iter()
+        .flat_map(|failure| &failure.violations)
+        .find(|violation| violation.id == ViolationId::I16Quiescence)
+        .and_then(|violation| {
+            let replay_namespace =
+                rewrite_prefix(&violation.namespace, source_prefix, replay_prefix);
+            terminal_lifecycle_names
+                .contains(&replay_namespace)
+                .then_some((violation.namespace.as_str(), replay_namespace))
+        });
+    if let Some((source_namespace, replay_namespace)) = terminal_subject {
+        let divergence = source
+            .iter()
+            .position(|record| {
+                record.execution.phase == ExecutionPhase::Quiescence
+                    && record.op.namespace() == source_namespace
+            })
+            .expect("terminal lifecycle failure omitted its quiet namespace operation");
+        assert!(
+            matches!(source[divergence].op, Op::CompactInline { .. }),
+            "terminal lifecycle divergence must begin at forced compaction"
+        );
+        assert!(
+            replay.len() >= divergence,
+            "terminal lifecycle replay stopped before its source divergence"
+        );
+        assert_eq!(
+            normalized_op_execution_structure(&replay[..divergence], replay_prefix),
+            normalized_op_execution_structure(&source[..divergence], source_prefix),
+            "terminal lifecycle replay changed the trace before its typed disposition"
+        );
+        assert!(
+            replay[divergence..].iter().all(|record| {
+                record.execution.phase == ExecutionPhase::Quiescence
+                    && record.execution.hold.is_none()
+                    && record.op.namespace() != replay_namespace
+            }),
+            "terminal lifecycle replay retained the disposed namespace or appended non-quiescence work"
+        );
+        return;
+    }
+
     assert!(
         replay.len() >= source.len(),
         "repaired quiet-failure replay stopped before its source failure boundary"
@@ -3006,6 +3086,78 @@ fn assert_normalized_full_replay_structure(
         }),
         "repaired quiet-failure replay appended non-quiescence work"
     );
+}
+
+fn terminal_lifecycle_resolution_names(seed_dir: &Path) -> BTreeSet<String> {
+    let path = seed_dir.join("resolutions.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeSet::new(),
+        Err(error) => panic!(
+            "failed to read lifecycle resolutions {}: {error}",
+            path.display()
+        ),
+    };
+    let resolutions: Vec<serde_json::Value> =
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "failed to decode lifecycle resolutions {}: {error}",
+                path.display()
+            )
+        });
+    resolutions
+        .into_iter()
+        .filter_map(|resolution| {
+            let terminal = resolution["effect"] == "maybe_deleted_namespace"
+                && resolution["resolved"] == "applied"
+                && matches!(
+                    resolution["lifecycle_disposition"].as_str(),
+                    Some("absent" | "deleting" | "deletion_fenced")
+                );
+            terminal.then(|| {
+                resolution["namespace"]
+                    .as_str()
+                    .expect("terminal lifecycle resolution omitted namespace")
+                    .to_string()
+            })
+        })
+        .collect()
+}
+
+fn non_applied_clone_resolution_targets(seed_dir: &Path) -> BTreeSet<String> {
+    let path = seed_dir.join("resolutions.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeSet::new(),
+        Err(error) => panic!(
+            "failed to read clone resolutions {}: {error}",
+            path.display()
+        ),
+    };
+    let resolutions: Vec<serde_json::Value> =
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "failed to decode clone resolutions {}: {error}",
+                path.display()
+            )
+        });
+    resolutions
+        .into_iter()
+        .filter_map(|resolution| {
+            let disproved = resolution["effect"] == "maybe_cloned"
+                && resolution["resolved"] == "not_applied"
+                && matches!(
+                    resolution["publication_disposition"].as_str(),
+                    Some("candidate_mismatch" | "manifest_absent")
+                );
+            disproved.then(|| {
+                resolution["target"]
+                    .as_str()
+                    .expect("non-applied clone resolution omitted target")
+                    .to_string()
+            })
+        })
+        .collect()
 }
 
 fn rewrite_prefix(value: &str, old_prefix: &str, new_prefix: &str) -> String {
@@ -5109,6 +5261,8 @@ async fn run_seed_inner(
         wall_secs: elapsed,
         object_store,
         fired_faults,
+        repaired_terminal_lifecycle: false,
+        repaired_clone_publication: false,
     }
 }
 
@@ -10684,28 +10838,63 @@ async fn resolve_indeterminates(
                     }
                 }
                 NsIndeterminate::MaybeDeletedNs => {
-                    let exists = server
-                        .store
-                        .exists(&format!("{ns}/manifest.json"))
-                        .await
-                        .unwrap_or_else(|error| {
-                            panic!("manifest existence probe failed for {ns}: {error}")
-                        });
-                    if exists {
-                        resolutions.push(json!({
-                            "namespace": ns,
-                            "effect": "maybe_deleted_namespace",
-                            "resolved": "not_applied"
-                        }));
+                    // A metadata tombstone or a manifest destruction fence is
+                    // authoritative terminal state. A failed or lost delete
+                    // response can leave `meta.json` active while the fence is
+                    // already durable, or leave it deleting while the manifest
+                    // survives until governed cleanup resumes. Manifest
+                    // presence alone kept both states in the live model and
+                    // sent quiet compaction back into the product's deletion
+                    // fence (seed 113, F1).
+                    let metadata = match server.store.get(&format!("{ns}/meta.json")).await {
+                        Ok(bytes) => Some(NamespaceMetadata::from_bytes(&bytes).unwrap_or_else(
+                            |error| {
+                                panic!("deletion resolution metadata was invalid for {ns}: {error}")
+                            },
+                        )),
+                        Err(ZeppelinError::NotFound { .. }) => None,
+                        Err(error) => {
+                            panic!("deletion resolution metadata GET failed for {ns}: {error}")
+                        }
+                    };
+                    let manifest_fenced = if metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.deletion_intent.is_some())
+                    {
+                        Manifest::read(&server.store, &ns)
+                            .await
+                            .unwrap_or_else(|error| {
+                                panic!("deletion resolution manifest GET failed for {ns}: {error}")
+                            })
+                            .is_some_and(|manifest| manifest.is_deletion_fenced())
                     } else {
+                        false
+                    };
+                    let lifecycle_disposition = match metadata.as_ref() {
+                        None => "absent",
+                        Some(metadata) if metadata.state == NamespaceState::Deleting => "deleting",
+                        Some(_) if manifest_fenced => "deletion_fenced",
+                        Some(metadata) if metadata.deletion_intent.is_some() => "active_unfenced",
+                        Some(metadata) => metadata.state.as_str(),
+                    };
+                    if metadata.as_ref().is_none_or(|metadata| {
+                        metadata.state == NamespaceState::Deleting || manifest_fenced
+                    }) {
                         model.namespaces.remove(&ns);
                         resolutions.push(json!({
                             "namespace": ns,
                             "effect": "maybe_deleted_namespace",
-                            "resolved": "applied"
+                            "resolved": "applied",
+                            "lifecycle_disposition": lifecycle_disposition
                         }));
                         break;
                     }
+                    resolutions.push(json!({
+                        "namespace": ns,
+                        "effect": "maybe_deleted_namespace",
+                        "resolved": "not_applied",
+                        "lifecycle_disposition": lifecycle_disposition
+                    }));
                 }
                 NsIndeterminate::MaybeSnapshot { name } => {
                     let path = format!("/v1/namespaces/{ns}/snapshots/{name}");
@@ -10784,15 +10973,65 @@ async fn resolve_indeterminates(
                     }
                 }
                 NsIndeterminate::MaybeCloned { target, as_of } => {
-                    let exists = server
-                        .store
-                        .exists(&format!("{target}/manifest.json"))
-                        .await
-                        .unwrap_or_else(|error| {
-                            panic!("clone manifest existence probe failed for {target}: {error}")
-                        });
-                    if exists {
+                    // The copy-clone endpoint creates an empty target manifest
+                    // before it publishes the copied source view. Therefore
+                    // manifest existence proves only that target reservation
+                    // succeeded, not that the ambiguous clone applied. Resolve
+                    // against the candidate's complete authoritative contents.
+                    let expected = clone_source_records(model, &ns, &as_of);
+                    let manifest =
+                        Manifest::read(&server.store, &target)
+                            .await
+                            .unwrap_or_else(|error| {
+                                panic!("clone manifest resolution failed for {target}: {error}")
+                            });
+                    let manifest_vector_count = manifest.as_ref().map_or(0, Manifest::vector_count);
+                    let count_matches = manifest.is_some()
+                        && manifest_vector_count
+                            == u64::try_from(expected.len())
+                                .expect("clone candidate size must fit in u64");
+                    let content_matches = if count_matches && !expected.is_empty() {
+                        let path = format!("/v1/namespaces/{target}/vectors/get");
+                        let ids = expected.keys().cloned().collect::<Vec<_>>();
+                        let (status, response) = request_json(
+                            client,
+                            Method::POST,
+                            &format!("{}{}", server.base_url, path),
+                            Some(json!({
+                                "ids": ids,
+                                "include_vector": true,
+                                "include_attributes": true,
+                                "consistency": ConsistencyLevel::Strong,
+                            })),
+                        )
+                        .await;
+                        if !(200..300).contains(&status) {
+                            violations.push(indeterminate_violation(
+                                op_index,
+                                &ns,
+                                "strong fetch failed while proving ambiguous clone publication",
+                                json!({
+                                    "target": target,
+                                    "status": status,
+                                    "response": response,
+                                }),
+                            ));
+                            false
+                        } else {
+                            expected.iter().all(|(id, candidate)| {
+                                observed_fetch_record(&response, id)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|observed| observed.semantically_eq(candidate))
+                            })
+                        }
+                    } else {
+                        count_matches
+                    };
+                    let publication_matches = count_matches && content_matches;
+                    if publication_matches {
                         let generation = clone_source_generation(model, &ns, &as_of);
+                        let later_target = model.namespaces.remove(&target);
                         model.apply(
                             &Op::CloneNamespace {
                                 actor: ActorSel::ADMIN,
@@ -10805,18 +11044,38 @@ async fn resolve_indeterminates(
                             &json!({ "generation": generation }),
                             None,
                         );
+                        if let Some(later_target) = later_target {
+                            let resolved_target = model
+                                .namespaces
+                                .get_mut(&target)
+                                .expect("resolved clone target must exist");
+                            resolved_target.indeterminate = later_target.indeterminate;
+                            resolved_target
+                                .indeterminate_ns
+                                .extend(later_target.indeterminate_ns);
+                        }
                         resolutions.push(json!({
                             "namespace": ns,
                             "target": target,
                             "effect": "maybe_cloned",
-                            "resolved": "applied"
+                            "resolved": "applied",
+                            "publication_disposition": "candidate_match",
+                            "manifest_vector_count": manifest_vector_count,
+                            "expected_vector_count": expected.len(),
                         }));
                     } else {
                         resolutions.push(json!({
                             "namespace": ns,
                             "target": target,
                             "effect": "maybe_cloned",
-                            "resolved": "not_applied"
+                            "resolved": "not_applied",
+                            "publication_disposition": if manifest.is_some() {
+                                "candidate_mismatch"
+                            } else {
+                                "manifest_absent"
+                            },
+                            "manifest_vector_count": manifest_vector_count,
+                            "expected_vector_count": expected.len(),
                         }));
                     }
                 }
@@ -10967,6 +11226,23 @@ fn clone_source_generation(model: &Model, source: &str, as_of: &super::ops::AsOf
             .unwrap_or(source.live_generation),
         super::ops::AsOfTarget::Timestamp(_) => source.live_generation,
     }
+}
+
+fn clone_source_records(
+    model: &Model,
+    source: &str,
+    as_of: &super::ops::AsOfTarget,
+) -> BTreeMap<String, ModelRecord> {
+    let source_model = model
+        .namespaces
+        .get(source)
+        .unwrap_or_else(|| panic!("missing clone source model during resolution: {source}"));
+    let generation = clone_source_generation(model, source, as_of);
+    source_model
+        .checkpoints
+        .get(&generation)
+        .cloned()
+        .unwrap_or_else(|| source_model.live.clone())
 }
 
 fn observed_fetch_record(
@@ -11175,7 +11451,9 @@ mod outcome_tests {
     use zeppelin::types::DistanceMetric;
 
     use super::*;
-    use crate::adversarial::faults::{Direction, FaultEvent, TargetSelector};
+    use crate::adversarial::faults::{Direction, FaultEvent, InjectedErrorKind, TargetSelector};
+    use crate::adversarial::model::NsModel;
+    use crate::adversarial::ops::AsOfTarget;
 
     #[tokio::test]
     async fn seed_watchdog_fails_loudly_and_retires_a_hung_server_owner() {
@@ -11930,6 +12208,7 @@ mod outcome_tests {
             &replay,
             "replay-prefix",
             None,
+            &BTreeSet::new(),
         );
 
         let mut extended = replay;
@@ -11956,6 +12235,7 @@ mod outcome_tests {
                 &extended,
                 "replay-prefix",
                 None,
+                &BTreeSet::new(),
             );
         })
         .is_err());
@@ -11973,6 +12253,136 @@ mod outcome_tests {
             &replay,
             "replay-prefix",
             Some(&failure),
+            &BTreeSet::new(),
+        );
+    }
+
+    #[test]
+    fn terminal_lifecycle_replay_divergence_requires_typed_disposition_and_omission() {
+        let source = vec![
+            replay_trace_record(
+                0,
+                ExecutionPhase::Workload,
+                Op::GetNamespace {
+                    actor: ActorSel::ADMIN,
+                    ns: "source-prefix-ns".to_string(),
+                },
+            ),
+            replay_trace_record(
+                1,
+                ExecutionPhase::Quiescence,
+                Op::CompactInline {
+                    actor: ActorSel::ADMIN,
+                    ns: "source-prefix-ns".to_string(),
+                },
+            ),
+        ];
+        let replay = vec![
+            replay_trace_record(
+                0,
+                ExecutionPhase::Workload,
+                Op::GetNamespace {
+                    actor: ActorSel::ADMIN,
+                    ns: "replay-prefix-ns".to_string(),
+                },
+            ),
+            replay_trace_record(
+                1,
+                ExecutionPhase::Quiescence,
+                Op::GcCycle {
+                    actor: ActorSel::ADMIN,
+                    ns: "replay-prefix-other".to_string(),
+                    keep_count: 1,
+                },
+            ),
+        ];
+        let failure = quiet_failure_manifest(1);
+        let terminal = BTreeSet::from(["replay-prefix-ns".to_string()]);
+
+        assert_normalized_full_replay_structure(
+            &source,
+            "source-prefix",
+            &replay,
+            "replay-prefix",
+            Some(&failure),
+            &terminal,
+        );
+        assert!(std::panic::catch_unwind(|| {
+            assert_normalized_full_replay_structure(
+                &source,
+                "source-prefix",
+                &replay,
+                "replay-prefix",
+                Some(&failure),
+                &BTreeSet::new(),
+            );
+        })
+        .is_err());
+
+        let mut retained = replay;
+        retained.push(replay_trace_record(
+            2,
+            ExecutionPhase::Quiescence,
+            Op::GcCycle {
+                actor: ActorSel::ADMIN,
+                ns: "replay-prefix-ns".to_string(),
+                keep_count: 1,
+            },
+        ));
+        assert!(std::panic::catch_unwind(|| {
+            assert_normalized_full_replay_structure(
+                &source,
+                "source-prefix",
+                &retained,
+                "replay-prefix",
+                Some(&failure),
+                &terminal,
+            );
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn repaired_clone_publication_requires_typed_non_applied_resolution() {
+        let root = tempfile::TempDir::new().unwrap();
+        fs::write(
+            root.path().join("resolutions.json"),
+            serde_json::to_vec(&json!([
+                {
+                    "effect": "maybe_cloned",
+                    "resolved": "not_applied",
+                    "publication_disposition": "candidate_mismatch",
+                    "target": "candidate-mismatch",
+                },
+                {
+                    "effect": "maybe_cloned",
+                    "resolved": "not_applied",
+                    "publication_disposition": "manifest_absent",
+                    "target": "manifest-absent",
+                },
+                {
+                    "effect": "maybe_cloned",
+                    "resolved": "applied",
+                    "publication_disposition": "candidate_match",
+                    "target": "applied",
+                },
+                {
+                    "effect": "maybe_deleted_namespace",
+                    "resolved": "applied",
+                    "lifecycle_disposition": "deletion_fenced",
+                    "target": "different-effect",
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            non_applied_clone_resolution_targets(root.path()),
+            BTreeSet::from([
+                "candidate-mismatch".to_string(),
+                "manifest-absent".to_string(),
+            ])
         );
     }
 
@@ -12201,6 +12611,681 @@ mod outcome_tests {
             }),
             "{resolutions:#?}"
         );
+    }
+
+    // F1 (seed 113): an ambiguous `DeleteNamespace` can leave metadata active
+    // after the manifest destruction fence commits, or metadata deleting
+    // before the live manifest is removed. Both are terminal quiet-period
+    // states even though `manifest.json` exists. An active but unfenced intent
+    // remains live. The barriers below pin every state without sleeps.
+    #[tokio::test]
+    async fn ambiguous_delete_resolution_uses_authoritative_lifecycle_state() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let spec = NamespaceSpec {
+            dims: 2,
+            metric: DistanceMetric::Cosine,
+            quantization: QuantizationType::None,
+            num_centroids: 4,
+            fts_fields: Vec::new(),
+            bitmap: false,
+        };
+        let ns_fenced = format!("{prefix}-f1-fenced");
+        let ns_deleting = format!("{prefix}-f1-deleting");
+        let ns_unfenced = format!("{prefix}-f1-unfenced");
+        let ns_live = format!("{prefix}-f1-live");
+        let ns_gone = format!("{prefix}-f1-gone");
+
+        let setup_server = start_test_server_full(
+            harness.store.clone(),
+            Some(prefix.clone()),
+            deterministic_config(),
+            false,
+            None,
+        )
+        .await;
+        let admin_bearer = setup_server.admin_bearer.clone();
+        let client = adversarial_client(&setup_server);
+        for ns in [&ns_fenced, &ns_deleting, &ns_unfenced, &ns_live] {
+            let create = client
+                .post(format!("{}/v1/namespaces", setup_server.base_url))
+                .json(&spec.create_body(ns))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(create.status(), StatusCode::CREATED);
+            let upsert = client
+                .post(format!(
+                    "{}/v1/namespaces/{ns}/vectors",
+                    setup_server.base_url
+                ))
+                .json(&json!({
+                    "vectors": [{ "id": "one", "values": [1.0, 0.0] }]
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(upsert.status(), StatusCode::OK);
+        }
+        setup_server.shutdown().await;
+
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Network,
+            events: vec![
+                // Exact seed-113 crash shape: the manifest fence commits, but
+                // the request fails before metadata records the generation.
+                FaultEvent {
+                    id: "f1-manifest-fence-post-commit".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Put),
+                        key_substring: Some(format!("{ns_fenced}/manifest.json")),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::PostCommitFail {
+                        error: InjectedErrorKind::Generic,
+                    },
+                },
+                // Later governed-deletion state: the tombstone commits, but
+                // manifest removal fails.
+                FaultEvent {
+                    id: "f1-manifest-delete-pre-fail".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Delete),
+                        key_substring: Some(format!("{ns_deleting}/manifest.json")),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::PreFail {
+                        error: InjectedErrorKind::Generic,
+                    },
+                },
+                // A deletion intent without a committed manifest fence remains
+                // active and must not be classified terminal.
+                FaultEvent {
+                    id: "f1-lease-pre-fail".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Put),
+                        key_substring: Some(format!("{ns_unfenced}/lease.json")),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::PreFail {
+                        error: InjectedErrorKind::Generic,
+                    },
+                },
+            ],
+        });
+        let faulted_store = store_fault_proxy(&harness.store, scheduler.clone());
+        let server = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
+            faulted_store,
+            Some(prefix),
+            deterministic_config(),
+            false,
+            None,
+            100 * 1024 * 1024,
+            &admin_bearer,
+        )
+        .await;
+        let client = adversarial_client(&server);
+        for ns in [&ns_fenced, &ns_deleting, &ns_unfenced] {
+            let delete = client
+                .delete(format!("{}/v1/namespaces/{ns}", server.base_url))
+                .send()
+                .await
+                .unwrap();
+            let status = delete.status().as_u16();
+            let body = delete.text().await.unwrap_or_default();
+            assert!(
+                (500..600).contains(&status),
+                "the interrupted delete for {ns} must fail ambiguously, got {status}: {body}"
+            );
+        }
+        let fired = scheduler
+            .timeline()
+            .into_iter()
+            .map(|event| event.event_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            fired,
+            BTreeSet::from([
+                "f1-lease-pre-fail".to_string(),
+                "f1-manifest-delete-pre-fail".to_string(),
+                "f1-manifest-fence-post-commit".to_string(),
+            ])
+        );
+
+        let fenced_meta = NamespaceMetadata::from_bytes(
+            &harness
+                .store
+                .get(&format!("{ns_fenced}/meta.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fenced_meta.state, NamespaceState::Active);
+        assert!(fenced_meta.deletion_intent.is_some());
+        let fenced_manifest = Manifest::read(&harness.store, &ns_fenced)
+            .await
+            .unwrap()
+            .expect("post-commit fault must retain the fenced manifest");
+        assert!(fenced_manifest.is_deletion_fenced());
+
+        let deleting_meta = NamespaceMetadata::from_bytes(
+            &harness
+                .store
+                .get(&format!("{ns_deleting}/meta.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deleting_meta.state, NamespaceState::Deleting);
+        assert!(harness
+            .store
+            .exists(&format!("{ns_deleting}/manifest.json"))
+            .await
+            .unwrap());
+
+        let unfenced_meta = NamespaceMetadata::from_bytes(
+            &harness
+                .store
+                .get(&format!("{ns_unfenced}/meta.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unfenced_meta.state, NamespaceState::Active);
+        assert!(unfenced_meta.deletion_intent.is_some());
+        let unfenced_manifest = Manifest::read(&harness.store, &ns_unfenced)
+            .await
+            .unwrap()
+            .expect("lease failure must retain the live manifest");
+        assert!(!unfenced_manifest.is_deletion_fenced());
+
+        let mut model = Model::default();
+        for ns in [&ns_fenced, &ns_deleting, &ns_unfenced, &ns_live, &ns_gone] {
+            let mut ns_model = NsModel::new(spec.clone(), 1);
+            ns_model
+                .indeterminate_ns
+                .push(NsIndeterminate::MaybeDeletedNs);
+            model.namespaces.insert(ns.clone(), ns_model);
+        }
+        let root = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 30,
+            seeds: vec![0],
+            max_ops: None,
+            artifacts: root.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Chaos,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let run_artifacts = RunArtifacts::create(&env);
+        let seed_dir = run_artifacts.root().join("seed-0");
+        let artifacts = run_artifacts.seed(
+            0,
+            &deterministic_config(),
+            &BTreeMap::new(),
+            RunMode::Chaos,
+            None,
+            None,
+            None,
+            None,
+        );
+        let violations = resolve_indeterminates(
+            &client,
+            &server,
+            &mut model,
+            &artifacts,
+            &CorruptionTracker::default(),
+            None,
+            0,
+        )
+        .await;
+        assert!(violations.is_empty(), "{violations:#?}");
+
+        assert!(
+            !model.namespaces.contains_key(&ns_fenced),
+            "a durably fenced namespace must leave the live model set"
+        );
+        assert!(
+            !model.namespaces.contains_key(&ns_deleting),
+            "a durably deleting namespace must leave the live model set"
+        );
+        assert!(
+            !model.namespaces.contains_key(&ns_gone),
+            "a fully tombstoned namespace must leave the live model set"
+        );
+        assert!(
+            model.namespaces.contains_key(&ns_unfenced),
+            "an active namespace with no durable fence must stay live"
+        );
+        assert!(
+            model.namespaces.contains_key(&ns_live),
+            "a namespace whose delete intent never landed must stay live"
+        );
+
+        let resolutions: Vec<serde_json::Value> =
+            serde_json::from_str(&fs::read_to_string(seed_dir.join("resolutions.json")).unwrap())
+                .unwrap();
+        let disposition = |ns: &str| {
+            resolutions
+                .iter()
+                .find(|resolution| resolution["namespace"] == ns)
+                .cloned()
+        };
+        let fenced = disposition(&ns_fenced).expect("missing fenced resolution");
+        assert_eq!(fenced["effect"], "maybe_deleted_namespace");
+        assert_eq!(fenced["resolved"], "applied");
+        assert_eq!(fenced["lifecycle_disposition"], "deletion_fenced");
+        let deleting = disposition(&ns_deleting).expect("missing deleting resolution");
+        assert_eq!(deleting["effect"], "maybe_deleted_namespace");
+        assert_eq!(deleting["resolved"], "applied");
+        assert_eq!(deleting["lifecycle_disposition"], "deleting");
+        let gone = disposition(&ns_gone).expect("missing tombstoned resolution");
+        assert_eq!(gone["resolved"], "applied");
+        assert_eq!(gone["lifecycle_disposition"], "absent");
+        let unfenced = disposition(&ns_unfenced).expect("missing unfenced resolution");
+        assert_eq!(unfenced["resolved"], "not_applied");
+        assert_eq!(unfenced["lifecycle_disposition"], "active_unfenced");
+        let live = disposition(&ns_live).expect("missing live resolution");
+        assert_eq!(live["resolved"], "not_applied");
+        assert_eq!(live["lifecycle_disposition"], "active");
+
+        // The product fence is unchanged: compaction against either terminal
+        // lifecycle shape still fails loudly instead of being swallowed.
+        for ns in [&ns_fenced, &ns_deleting] {
+            let fence = server.compactor.compact(ns).await;
+            assert!(
+                matches!(fence, Err(ZeppelinError::NamespaceDeleting { .. })),
+                "compaction must still reject terminal namespace {ns}: {fence:?}"
+            );
+        }
+
+        server.shutdown().await;
+        harness.cleanup().await;
+    }
+
+    // F5 (seed 1475): an ambiguous copy-clone can reserve an empty target
+    // manifest and then fail before publishing the source view. A later
+    // ambiguous delete and idempotent create leave that empty target active.
+    // Quiet resolution must prove the candidate contents rather than treating
+    // the bootstrap manifest's existence as proof that all source rows landed.
+    #[tokio::test]
+    async fn ambiguous_clone_resolution_requires_published_candidate_contents() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let source = format!("{prefix}-f5-source");
+        let target = format!("{prefix}-f5-target");
+        let spec = NamespaceSpec {
+            dims: 2,
+            metric: DistanceMetric::Cosine,
+            quantization: QuantizationType::None,
+            num_centroids: 4,
+            fts_fields: Vec::new(),
+            bitmap: false,
+        };
+        let vectors = (0..8)
+            .map(|index| GenVector {
+                id: format!("{source}-v{index}"),
+                values: vec![index as f32, 1.0],
+                attributes: None,
+            })
+            .collect::<Vec<_>>();
+
+        let setup_server = start_test_server_full(
+            harness.store.clone(),
+            Some(prefix.clone()),
+            deterministic_config(),
+            false,
+            None,
+        )
+        .await;
+        let admin_bearer = setup_server.admin_bearer.clone();
+        let setup_client = adversarial_client(&setup_server);
+        let create = setup_client
+            .post(format!("{}/v1/namespaces", setup_server.base_url))
+            .json(&spec.create_body(&source))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let upsert = setup_client
+            .post(format!(
+                "{}/v1/namespaces/{source}/vectors",
+                setup_server.base_url
+            ))
+            .json(&json!({ "vectors": vectors }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upsert.status(), StatusCode::OK);
+        let compacted = setup_server.compactor.compact(&source).await.unwrap();
+        assert_eq!(compacted.vectors_compacted, 8);
+        let source_manifest = Manifest::read(&harness.store, &source)
+            .await
+            .unwrap()
+            .expect("compacted source manifest must exist");
+        let source_generation = source_manifest.version();
+        assert_eq!(source_manifest.vector_count(), 8);
+        setup_server.shutdown().await;
+
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Network,
+            events: vec![
+                FaultEvent {
+                    id: "f5-clone-copy-pre-fail".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Copy),
+                        key_substring: Some(format!("->{target}/")),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::PreFail {
+                        error: InjectedErrorKind::Generic,
+                    },
+                },
+                FaultEvent {
+                    id: "f5-delete-lease-pre-fail".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Put),
+                        key_substring: Some(format!("{target}/lease.json")),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::PreFail {
+                        error: InjectedErrorKind::Generic,
+                    },
+                },
+                FaultEvent {
+                    id: "f5-target-wal-pre-fail".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Put),
+                        key_substring: Some(format!("{target}/wal/")),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::PreFail {
+                        error: InjectedErrorKind::Generic,
+                    },
+                },
+            ],
+        });
+        let server = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
+            store_fault_proxy(&harness.store, scheduler.clone()),
+            Some(prefix),
+            deterministic_config(),
+            false,
+            None,
+            100 * 1024 * 1024,
+            &admin_bearer,
+        )
+        .await;
+        let client = adversarial_client(&server);
+
+        let clone = client
+            .post(format!("{}/v1/namespaces/{source}/clone", server.base_url))
+            .json(&json!({
+                "target": target,
+                "as_of": source_generation.to_string(),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(clone.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let empty_target = Manifest::read(&harness.store, &target)
+            .await
+            .unwrap()
+            .expect("failed clone must retain its reserved target manifest");
+        assert_eq!(empty_target.vector_count(), 0);
+
+        let delete = client
+            .delete(format!("{}/v1/namespaces/{target}", server.base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let target_meta = NamespaceMetadata::from_bytes(
+            &harness
+                .store
+                .get(&format!("{target}/meta.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(target_meta.state, NamespaceState::Active);
+        assert!(target_meta.deletion_intent.is_some());
+
+        let recreate = client
+            .post(format!("{}/v1/namespaces", server.base_url))
+            .json(&spec.create_body(&target))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(recreate.status(), StatusCode::OK);
+        let rejected = client
+            .post(format!(
+                "{}/v1/namespaces/{target}/vectors",
+                server.base_url
+            ))
+            .json(&json!({ "vectors": vectors }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let compacted = server.compactor.compact(&target).await.unwrap();
+        assert_eq!(compacted.vectors_compacted, 0);
+        assert!(compacted.segment_id.is_none());
+
+        let fetch = client
+            .post(format!(
+                "{}/v1/namespaces/{target}/vectors/get",
+                server.base_url
+            ))
+            .json(&json!({
+                "ids": vectors.iter().map(|vector| &vector.id).collect::<Vec<_>>(),
+                "include_vector": true,
+                "include_attributes": true,
+                "consistency": ConsistencyLevel::Strong,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(fetch.status(), StatusCode::OK);
+        let fetch: serde_json::Value = fetch.json().await.unwrap();
+        assert_eq!(
+            fetch["missing"].as_array().map(Vec::len),
+            Some(vectors.len())
+        );
+        assert_eq!(
+            Manifest::read(&harness.store, &target)
+                .await
+                .unwrap()
+                .expect("target manifest must remain present")
+                .vector_count(),
+            0
+        );
+
+        let fired = scheduler
+            .timeline()
+            .into_iter()
+            .map(|event| event.event_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            fired,
+            BTreeSet::from([
+                "f5-clone-copy-pre-fail".to_string(),
+                "f5-delete-lease-pre-fail".to_string(),
+                "f5-target-wal-pre-fail".to_string(),
+            ])
+        );
+
+        let mut model = Model::default();
+        model.apply(
+            &Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
+                ns: source.clone(),
+                spec: spec.clone(),
+            },
+            StatusCode::CREATED.as_u16(),
+            Some(1),
+            &json!({}),
+            None,
+        );
+        model.apply(
+            &Op::Upsert {
+                actor: ActorSel::ADMIN,
+                ns: source.clone(),
+                vectors: vectors.clone(),
+            },
+            StatusCode::OK.as_u16(),
+            Some(source_generation),
+            &json!({}),
+            None,
+        );
+        model.apply(
+            &Op::CompactInline {
+                actor: ActorSel::ADMIN,
+                ns: source.clone(),
+            },
+            StatusCode::OK.as_u16(),
+            Some(source_generation),
+            &json!({}),
+            None,
+        );
+        model.apply_outcome(
+            &Op::CloneNamespace {
+                actor: ActorSel::ADMIN,
+                source: source.clone(),
+                target: target.clone(),
+                as_of: AsOfTarget::Generation(source_generation),
+            },
+            &OpOutcome::Ambiguous {
+                reason: AmbiguityReason::ServerError { status: 500 },
+                status: Some(500),
+            },
+            None,
+            None,
+            51,
+        );
+        model.apply_outcome(
+            &Op::DeleteNamespace {
+                actor: ActorSel::ADMIN,
+                ns: target.clone(),
+            },
+            &OpOutcome::Ambiguous {
+                reason: AmbiguityReason::ServerCrashed,
+                status: None,
+            },
+            None,
+            None,
+            57,
+        );
+        model.apply(
+            &Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
+                ns: target.clone(),
+                spec: spec.clone(),
+            },
+            StatusCode::OK.as_u16(),
+            Some(empty_target.version()),
+            &json!({}),
+            None,
+        );
+        model.apply_outcome(
+            &Op::Upsert {
+                actor: ActorSel::ADMIN,
+                ns: target.clone(),
+                vectors: vectors.clone(),
+            },
+            &OpOutcome::Ambiguous {
+                reason: AmbiguityReason::ServerError { status: 500 },
+                status: Some(500),
+            },
+            None,
+            None,
+            67,
+        );
+        model.apply(
+            &Op::CompactInline {
+                actor: ActorSel::ADMIN,
+                ns: target.clone(),
+            },
+            StatusCode::OK.as_u16(),
+            Some(empty_target.version()),
+            &json!({}),
+            None,
+        );
+
+        let root = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 30,
+            seeds: vec![1475],
+            max_ops: None,
+            artifacts: root.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Chaos,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let run_artifacts = RunArtifacts::create(&env);
+        let seed_dir = run_artifacts.root().join("seed-1475");
+        let artifacts = run_artifacts.seed(
+            1475,
+            &deterministic_config(),
+            &BTreeMap::new(),
+            RunMode::Chaos,
+            None,
+            None,
+            None,
+            None,
+        );
+        let violations = resolve_indeterminates(
+            &client,
+            &server,
+            &mut model,
+            &artifacts,
+            &CorruptionTracker::default(),
+            None,
+            515,
+        )
+        .await;
+        assert!(violations.is_empty(), "{violations:#?}");
+        assert!(model.namespaces[&target].live.is_empty());
+        assert!(model.namespaces[&target].indeterminate.is_empty());
+
+        let resolutions: Vec<serde_json::Value> =
+            serde_json::from_str(&fs::read_to_string(seed_dir.join("resolutions.json")).unwrap())
+                .unwrap();
+        let clone_resolution = resolutions
+            .iter()
+            .find(|resolution| resolution["effect"] == "maybe_cloned")
+            .expect("missing ambiguous clone resolution");
+        assert_eq!(clone_resolution["resolved"], "not_applied");
+        assert_eq!(
+            clone_resolution["publication_disposition"],
+            "candidate_mismatch"
+        );
+        assert_eq!(clone_resolution["manifest_vector_count"], 0);
+        assert_eq!(clone_resolution["expected_vector_count"], 8);
+
+        server.shutdown().await;
+        harness.cleanup().await;
     }
 
     #[tokio::test]
