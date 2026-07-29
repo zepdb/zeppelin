@@ -3364,10 +3364,12 @@ async fn restart_after_crash(
     let workload_credentials = server.workload_credentials.clone();
     let old_server = server.take();
     controller.park_token.cancel();
+    let held_call_retirement = scheduler.begin_held_call_retirement();
     old_server
         .abort_and_drop()
         .await
         .unwrap_or_else(|error| panic!("crashed primary HTTP retirement failed: {error}"));
+    drop(held_call_retirement);
     shutdown_http_fault_injector(injector).await;
 
     let mut replacement = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
@@ -15033,6 +15035,157 @@ mod outcome_tests {
             crash_events[0].recovery.as_deref(),
             Some("restart+health-wait")
         );
+
+        drop(http_fault_context.take());
+        shutdown_http_fault_injector(&mut injector).await;
+        drop(client);
+        server.into_inner().shutdown().await;
+        harness.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn crash_retirement_releases_an_accepted_list_hold_without_disarming_later_holds() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::SupportedFull,
+            events: vec![
+                FaultEvent {
+                    id: "accepted-ready-list-before-crash".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::List),
+                        key_substring: Some("__healthcheck__".to_string()),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::HoldCall { for_ops: 100 },
+                },
+                FaultEvent {
+                    id: "ready-list-after-restart".to_string(),
+                    start_op: 10,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::List),
+                        key_substring: Some("__healthcheck__".to_string()),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::HoldCall { for_ops: 5 },
+                },
+                FaultEvent {
+                    id: "list-hold-crash".to_string(),
+                    start_op: u64::MAX,
+                    end_op: None,
+                    boundary: Boundary::Process,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Put),
+                        key_substring: Some("never-trigger-list-hold-crash".to_string()),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::CrashAt {
+                        point: crate::adversarial::faults::process::CrashPoint::StagingDrop,
+                        position: TriggerPosition::Pre,
+                    },
+                },
+            ],
+        });
+        let store = store_fault_proxy(&harness.store, scheduler.clone());
+        let config = deterministic_config();
+        let mut server = RestartableFullTestServer::new(
+            start_test_server_full(
+                store.clone(),
+                Some(prefix.clone()),
+                config.clone(),
+                false,
+                None,
+            )
+            .await,
+        );
+        let client = adversarial_client(&server);
+        let controller = scheduler
+            .process_controller()
+            .expect("crash schedule must own a process controller");
+        let mut injector = None;
+        let mut http_fault_context = None;
+        let model = Model::default();
+
+        scheduler.advance_to(0);
+        let first_client = client.clone();
+        let first_ready_url = format!("{}/readyz", server.base_url);
+        let first_scheduler = scheduler.clone();
+        let first_ready = tokio::spawn(async move {
+            first_scheduler
+                .with_armed_hold(
+                    "accepted-ready-list-before-crash".to_string(),
+                    first_client.get(first_ready_url).send(),
+                )
+                .await
+        });
+        scheduler
+            .wait_for_hold_window_active("accepted-ready-list-before-crash", 0)
+            .await;
+        assert!(!first_ready.is_finished());
+
+        let recovery = tokio::time::timeout(
+            Duration::from_secs(1),
+            restart_after_crash(
+                &mut server,
+                &controller,
+                &scheduler,
+                &mut injector,
+                &mut http_fault_context,
+                &store,
+                &harness.store,
+                &prefix,
+                &config,
+                false,
+                &client,
+                &model,
+                0,
+                CrashRequest {
+                    event_id: "list-hold-crash".to_string(),
+                    op_index: 0,
+                    point: crate::adversarial::faults::process::CrashPoint::StagingDrop,
+                    position: TriggerPosition::Pre,
+                    key: format!("{prefix}/segments/staged"),
+                },
+            ),
+        )
+        .await
+        .expect("crash retirement waited on an accepted LIST hold");
+        assert!(recovery.is_empty(), "{recovery:?}");
+        first_ready
+            .await
+            .expect("accepted readiness task failed while joining")
+            .expect("accepted readiness request failed during retirement");
+
+        scheduler.advance_to(10);
+        let second_client = client.clone();
+        let second_ready_url = format!("{}/readyz", server.base_url);
+        let second_scheduler = scheduler.clone();
+        let second_ready = tokio::spawn(async move {
+            second_scheduler
+                .with_armed_hold(
+                    "ready-list-after-restart".to_string(),
+                    second_client.get(second_ready_url).send(),
+                )
+                .await
+        });
+        scheduler
+            .wait_for_hold_window_active("ready-list-after-restart", 10)
+            .await;
+        assert!(
+            !second_ready.is_finished(),
+            "retirement release permanently disarmed a later scheduled hold"
+        );
+        scheduler.advance_to(15);
+        let response = second_ready
+            .await
+            .expect("post-restart readiness task failed while joining")
+            .expect("post-restart readiness request failed");
+        assert_eq!(response.status(), StatusCode::OK);
 
         drop(http_fault_context.take());
         shutdown_http_fault_injector(&mut injector).await;

@@ -521,6 +521,7 @@ struct SchedulerRuntime {
     logical_op_tx: tokio::sync::watch::Sender<u64>,
     quiesced: AtomicBool,
     release_held_calls: AtomicBool,
+    retirement_release_held_calls: AtomicBool,
     armed_hold_event_id: Mutex<Option<String>>,
     timeline: Mutex<Vec<TimelineEvent>>,
     timeline_revision_tx: tokio::sync::watch::Sender<u64>,
@@ -535,6 +536,27 @@ pub struct FaultScheduler {
     runtime: Arc<SchedulerRuntime>,
     rng_salt: u64,
     process: Option<Arc<Mutex<ProcessController>>>,
+}
+
+/// Scoped release of calls held by a server generation being retired.
+///
+/// Dropping the guard restores hold behavior for the replacement generation;
+/// the permanent quiet-period release remains a separate scheduler state.
+pub struct HeldCallRetirementGuard {
+    runtime: Arc<SchedulerRuntime>,
+}
+
+impl Drop for HeldCallRetirementGuard {
+    fn drop(&mut self) {
+        assert!(
+            self.runtime
+                .retirement_release_held_calls
+                .swap(false, Ordering::SeqCst),
+            "held-call retirement guard dropped after its epoch was already inactive"
+        );
+        let current = self.runtime.logical_op.load(Ordering::SeqCst);
+        self.runtime.logical_op_tx.send_replace(current);
+    }
 }
 
 struct StoreReservationWaiter {
@@ -673,6 +695,7 @@ impl FaultScheduler {
                 logical_op_tx,
                 quiesced: AtomicBool::new(false),
                 release_held_calls: AtomicBool::new(false),
+                retirement_release_held_calls: AtomicBool::new(false),
                 armed_hold_event_id: Mutex::new(None),
                 timeline: Mutex::new(Vec::new()),
                 timeline_revision_tx,
@@ -1285,6 +1308,25 @@ impl FaultScheduler {
         self.runtime.logical_op_tx.send_replace(current);
     }
 
+    /// Temporarily release held calls owned by the server generation being retired.
+    ///
+    /// # Panics
+    ///
+    /// Panics when two server retirements overlap. The runner owns exactly one
+    /// primary generation and must serialize crash recovery.
+    #[must_use]
+    pub fn begin_held_call_retirement(&self) -> HeldCallRetirementGuard {
+        self.runtime
+            .retirement_release_held_calls
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap_or_else(|_| panic!("overlapping held-call server retirement epochs"));
+        let current = self.runtime.logical_op.load(Ordering::SeqCst);
+        self.runtime.logical_op_tx.send_replace(current);
+        HeldCallRetirementGuard {
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+
     pub async fn wait_for_hold_release(&self, action: &StoreFaultAction) {
         let FaultKind::HoldCall { for_ops } = action.kind else {
             panic!("wait_for_hold_release requires HoldCall");
@@ -1293,6 +1335,10 @@ impl FaultScheduler {
         let mut logical_op = self.runtime.logical_op_tx.subscribe();
         loop {
             if self.runtime.release_held_calls.load(Ordering::SeqCst)
+                || self
+                    .runtime
+                    .retirement_release_held_calls
+                    .load(Ordering::SeqCst)
                 || *logical_op.borrow() >= release_op
             {
                 return;
