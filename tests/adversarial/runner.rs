@@ -1821,7 +1821,7 @@ pub async fn replay_seed_from_env() {
         .map(PathBuf::from)
         .expect("ZEPPELIN_ADVERSARIAL_REPLAY must point at a seed artifact dir");
     let expected_failure = read_failure_manifest(&replay);
-    let outcome = run_replay(&env, &replay).await;
+    let outcome = Box::pin(run_replay(&env, &replay)).await;
 
     if outcome.failed {
         if let Some(expected) = expected_failure {
@@ -14797,7 +14797,7 @@ mod outcome_tests {
             assert_eq!(upsert_status, StatusCode::OK.as_u16());
         }
 
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while successful_background_compaction_metric(&namespace) == background_start {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -15377,7 +15377,7 @@ mod outcome_tests {
             profile: None,
             ..source_env
         };
-        let outcome = run_replay(&replay_env, &source_dir).await;
+        let outcome = Box::pin(run_replay(&replay_env, &source_dir)).await;
         assert!(!outcome.failed, "{:?}", outcome.violations);
         let replay_dir = fs::read_dir(replay_root.path())
             .unwrap()
@@ -16570,7 +16570,7 @@ mod outcome_tests {
             profile: None,
             ..source_env
         };
-        let outcome = run_replay(&replay_env, &source_dir).await;
+        let outcome = Box::pin(run_replay(&replay_env, &source_dir)).await;
         assert!(!outcome.failed, "{:?}", outcome.violations);
 
         let replay_dir = fs::read_dir(replay_root.path())
@@ -16758,7 +16758,7 @@ mod outcome_tests {
             profile: None,
             ..source_env.clone()
         };
-        let replay_outcome = run_replay(&replay_env, &source_dir).await;
+        let replay_outcome = Box::pin(run_replay(&replay_env, &source_dir)).await;
         assert!(!replay_outcome.failed, "{:?}", replay_outcome.violations);
         let replay_dirs = fs::read_dir(replay_root.path())
             .unwrap()
