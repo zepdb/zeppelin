@@ -1978,11 +1978,22 @@ total = { exact = 0 }
         });
 
         let violations = check_contract(&contract, &measured);
-        assert!(violations.iter().any(|violation| matches!(
-            violation,
-            CostViolation::SecurityBudget { metric, .. }
-                if metric == "authn_authz_p50_delta_ns"
-        )));
+        // Latency budgets are release-calibrated: in a debug build
+        // check_security_budget refuses to evaluate them and reports the
+        // build regime instead, so the overrun only surfaces in release.
+        if cfg!(debug_assertions) {
+            assert!(violations.iter().any(|violation| matches!(
+                violation,
+                CostViolation::SecurityBudget { metric, .. }
+                    if metric == "build_profile"
+            )));
+        } else {
+            assert!(violations.iter().any(|violation| matches!(
+                violation,
+                CostViolation::SecurityBudget { metric, .. }
+                    if metric == "authn_authz_p50_delta_ns"
+            )));
+        }
     }
 
     #[test]
