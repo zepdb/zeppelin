@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use reqwest::{Client, Method, StatusCode};
+use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
@@ -2318,6 +2319,100 @@ fn assert_contiguous_record_indices(records: &[OpRecord], expected_count: u64, c
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct WorkloadAccountingSnapshot {
+    selected_operation_ids: Vec<u64>,
+    completed_operation_ids: Vec<u64>,
+    held_operation_ids: Vec<u64>,
+    quiet_drain_operation_ids: Vec<u64>,
+}
+
+#[derive(Serialize)]
+struct WorkloadAccountingArtifact {
+    pre_quiet: WorkloadAccountingSnapshot,
+    post_quiet: WorkloadAccountingSnapshot,
+}
+
+fn assert_workload_accounting_bijection(accounting: &WorkloadAccountingSnapshot, context: &str) {
+    let selected = accounting
+        .selected_operation_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        selected.len(),
+        accounting.selected_operation_ids.len(),
+        "{context} selected operation ids contain duplicates"
+    );
+
+    let mut accounted = BTreeSet::new();
+    for (state, operation_ids) in [
+        ("completed", &accounting.completed_operation_ids),
+        ("held", &accounting.held_operation_ids),
+        ("quiet-drain", &accounting.quiet_drain_operation_ids),
+    ] {
+        for operation_id in operation_ids {
+            assert!(
+                accounted.insert(*operation_id),
+                "{context} operation {operation_id} appears in more than one accounting state \
+                 (last state: {state})"
+            );
+        }
+    }
+    assert_eq!(
+        accounted, selected,
+        "{context} generated, held, quiet-drained, and completed operation ids are not bijective"
+    );
+}
+
+fn assert_pre_quiet_workload_accounting(accounting: &WorkloadAccountingSnapshot, context: &str) {
+    assert_workload_accounting_bijection(accounting, context);
+    if accounting.held_operation_ids.is_empty() && accounting.quiet_drain_operation_ids.is_empty() {
+        assert_eq!(
+            accounting.completed_operation_ids.len(),
+            accounting.selected_operation_ids.len(),
+            "every selected workload operation must complete exactly once"
+        );
+    }
+}
+
+fn workload_accounting_snapshot(
+    selected_count: u64,
+    completed_operation_ids: Vec<u64>,
+    held_operation_id: Option<u64>,
+    quiet_drain_start: u64,
+    quiet_drain_count: u64,
+) -> WorkloadAccountingSnapshot {
+    let quiet_drain_end = quiet_drain_start
+        .checked_add(quiet_drain_count)
+        .expect("quiet-drain operation id range overflowed");
+    assert!(
+        quiet_drain_end <= selected_count,
+        "quiet-drain operation ids exceed the selected workload range"
+    );
+    WorkloadAccountingSnapshot {
+        selected_operation_ids: (0..selected_count).collect(),
+        completed_operation_ids,
+        held_operation_ids: held_operation_id.into_iter().collect(),
+        quiet_drain_operation_ids: (quiet_drain_start..quiet_drain_end).collect(),
+    }
+}
+
+fn write_workload_accounting_artifact(
+    seed_dir: &Path,
+    pre_quiet: WorkloadAccountingSnapshot,
+    post_quiet: WorkloadAccountingSnapshot,
+) {
+    let artifact = WorkloadAccountingArtifact {
+        pre_quiet,
+        post_quiet,
+    };
+    let encoded =
+        serde_json::to_vec_pretty(&artifact).expect("workload accounting artifact must serialize");
+    fs::write(seed_dir.join("workload-accounting.json"), encoded)
+        .expect("failed to write workload-accounting.json");
+}
+
 fn replay_workload_records(records: &[OpRecord]) -> (bool, Vec<OpRecord>) {
     let legacy_count = records
         .iter()
@@ -4253,6 +4348,15 @@ async fn run_seed(
     let expected_workload_count = op_index
         .checked_add(deferred_drain_count)
         .expect("expected workload count overflowed");
+    let pre_quiet_accounting = workload_accounting_snapshot(
+        expected_workload_count,
+        artifacts.completed_operation_ids(),
+        pending_held_op
+            .as_ref()
+            .map(|pending: &PendingHeldOp| pending.op_index),
+        op_index,
+        deferred_drain_count,
+    );
     if !failed {
         assert!(
             deferred_ops.is_empty(),
@@ -4265,12 +4369,11 @@ async fn run_seed(
                 "max_ops must remain the executed workload record count"
             );
         }
-        if quiet_drain_ops.is_empty() {
-            assert_eq!(
-                artifacts.op_count(),
-                op_index,
-                "every selected workload operation must complete exactly once"
-            );
+        assert_pre_quiet_workload_accounting(
+            &pre_quiet_accounting,
+            "pre-quiet workload accounting",
+        );
+        if pending_held_op.is_none() && quiet_drain_ops.is_empty() {
             let workload_records = read_ops(&artifacts.dir);
             assert_contiguous_record_indices(
                 &workload_records,
@@ -4318,13 +4421,40 @@ async fn run_seed(
     .run()
     .await;
     post_commit_ack_loss_fired |= quiet.post_commit_ack_lost;
-    if deferred_drain_count > 0 && quiet_drain_ops.is_empty() {
-        let records = read_ops(&artifacts.dir);
-        let (_, workload_records) = replay_workload_records(&records);
+    let records = read_ops(&artifacts.dir);
+    let (_, workload_records) = replay_workload_records(&records);
+    let remaining_quiet_drain_count =
+        u64::try_from(quiet_drain_ops.len()).expect("remaining quiet-drain count must fit in u64");
+    let remaining_quiet_drain_start = expected_workload_count
+        .checked_sub(remaining_quiet_drain_count)
+        .expect("remaining quiet-drain count exceeds selected workload count");
+    let post_quiet_accounting = workload_accounting_snapshot(
+        expected_workload_count,
+        workload_records.iter().map(|record| record.index).collect(),
+        pending_held_op
+            .as_ref()
+            .map(|pending: &PendingHeldOp| pending.op_index),
+        remaining_quiet_drain_start,
+        remaining_quiet_drain_count,
+    );
+    write_workload_accounting_artifact(
+        &artifacts.dir,
+        pre_quiet_accounting,
+        post_quiet_accounting.clone(),
+    );
+    if !failed
+        && quiet.violations.is_empty()
+        && pending_held_op.is_none()
+        && quiet_drain_ops.is_empty()
+    {
+        assert_workload_accounting_bijection(
+            &post_quiet_accounting,
+            "post-quiet workload accounting",
+        );
         assert_contiguous_record_indices(
             &workload_records,
             expected_workload_count,
-            "generated deferred-drain workload trace",
+            "generated post-quiet workload trace",
         );
     }
     if !quiet.violations.is_empty() {
@@ -12238,6 +12368,51 @@ mod outcome_tests {
         baseline_ids.sort();
         recorded_ids.sort();
         assert_eq!(recorded_ids, baseline_ids);
+    }
+
+    #[test]
+    fn terminal_held_operation_remains_selected_until_quiesce_join() {
+        let scheduler = FaultScheduler::for_seed(691, FaultProfile::Sched);
+        let holds = scheduler
+            .schedule()
+            .events
+            .iter()
+            .filter_map(|event| {
+                let FaultKind::HoldCall { for_ops } = event.kind else {
+                    return None;
+                };
+                Some((
+                    event.start_op,
+                    for_ops,
+                    event.target.store_op,
+                    event.target.key_substring.as_deref(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            holds,
+            [
+                (210, 5, Some(StoreOp::Get), Some("manifest.json")),
+                (370, 7, Some(StoreOp::Get), Some("cluster_")),
+            ],
+            "seed 691's two max-boundary holds drifted"
+        );
+
+        let normal_join = WorkloadAccountingSnapshot {
+            selected_operation_ids: (0..500).collect(),
+            completed_operation_ids: (0..500).collect(),
+            held_operation_ids: Vec::new(),
+            quiet_drain_operation_ids: Vec::new(),
+        };
+        assert_pre_quiet_workload_accounting(&normal_join, "normal join");
+
+        let quiesce_join = WorkloadAccountingSnapshot {
+            selected_operation_ids: (0..500).collect(),
+            completed_operation_ids: (0..499).collect(),
+            held_operation_ids: vec![499],
+            quiet_drain_operation_ids: Vec::new(),
+        };
+        assert_pre_quiet_workload_accounting(&quiesce_join, "quiesce join");
     }
 
     #[test]

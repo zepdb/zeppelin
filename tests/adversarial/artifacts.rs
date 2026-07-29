@@ -374,6 +374,13 @@ impl SeedArtifacts {
         self.op_count
     }
 
+    #[must_use]
+    pub fn completed_operation_ids(&self) -> Vec<u64> {
+        (0..self.next_op_index)
+            .chain(self.pending_ops.keys().copied())
+            .collect()
+    }
+
     pub fn write_model_final(&self, model: &Model) {
         write_json(self.dir.join("model-final.json"), model);
     }
