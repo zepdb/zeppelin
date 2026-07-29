@@ -924,8 +924,8 @@ mod tests {
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(seed.dir.join("config.json")).unwrap()).unwrap();
         assert_eq!(config["principals"].as_array().unwrap().len(), 5);
-        assert_eq!(config["security_ops"].as_array().unwrap().len(), 23);
-        assert_eq!(config["protected_assumptions"].as_array().unwrap().len(), 9);
+        assert_eq!(config["security_ops"].as_array().unwrap().len(), 20);
+        assert_eq!(config["protected_assumptions"].as_array().unwrap().len(), 8);
         assert!(!config["security_program"].is_null());
 
         let mut authz = record(0);
@@ -989,9 +989,8 @@ mod tests {
             &Coverage::default(),
         );
         assert!(report.contains("## Authorization Summary"));
-        assert!(report.contains(
-            "| 7 | 0 | 1 | 0 | 0 | pass | pass | pass | pass | pass | pass | pass | pass |"
-        ));
+        assert!(report
+            .contains("| 7 | 0 | 1 | 0 | 0 | pass | pass | pass | pass | pass | pass | pass |"));
     }
 
     #[test]

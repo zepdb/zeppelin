@@ -485,6 +485,11 @@ async fn scoped_delete_append_rejects_recreated_namespace_incarnation() {
             .expect("MinIO manifest reads must provide an ETag");
 
     harness.store.delete(&Manifest::s3_key(&ns)).await.unwrap();
+    harness
+        .store
+        .delete(&Manifest::history_key(&ns, observed_manifest.version()))
+        .await
+        .expect("recreated fixture must not retain immutable history");
     let mut recreated = Manifest::new_at(fixed_time);
     recreated
         .bind_namespace_incarnation(uuid::Uuid::from_u128(2))
@@ -545,7 +550,16 @@ async fn legacy_manifest_incarnation_migration_is_cas_bound_and_idempotent() {
             .await
             .expect("re-reading the same incarnation must not publish another generation");
     assert_eq!(reloaded.version(), migrated.version());
-    assert_eq!(reloaded_storage_version, migrated_storage_version);
+    assert_eq!(
+        reloaded_storage_version.version(),
+        migrated_storage_version.version(),
+        "re-reading must observe the same backend identity token"
+    );
+    assert_eq!(
+        reloaded.to_bytes().unwrap(),
+        migrated.to_bytes().unwrap(),
+        "re-reading must observe identical live bytes"
+    );
 
     let error = Manifest::read_versioned_required_for_incarnation(
         &harness.store,
@@ -585,7 +599,9 @@ async fn bound_manifest_read_rejects_missing_or_empty_get_etags_before_any_put()
                     "an existing bound manifest without a usable GET ETag must fail closed",
                 );
         assert!(matches!(error, ZeppelinError::Index(_)));
-        assert!(error.to_string().contains("requires an object-store ETag"));
+        assert!(error
+            .to_string()
+            .contains("requires an object-store version token"));
         assert_eq!(counter.gets_matching(&manifest_key), 1);
         assert_eq!(counter.puts_matching(&manifest_key), 0);
         assert_eq!(counter.puts_matching(&history_prefix), 0);
@@ -628,7 +644,9 @@ async fn legacy_manifest_migration_rejects_missing_or_empty_get_etags_before_any
                 .await
                 .expect_err("legacy migration without a usable GET ETag must fail closed");
         assert!(matches!(error, ZeppelinError::Index(_)));
-        assert!(error.to_string().contains("requires an object-store ETag"));
+        assert!(error
+            .to_string()
+            .contains("requires an object-store version token"));
         assert_eq!(counter.gets_matching(&manifest_key), 1);
         assert_eq!(counter.puts_matching(&manifest_key), 0);
         assert_eq!(counter.puts_matching(&history_prefix), 0);

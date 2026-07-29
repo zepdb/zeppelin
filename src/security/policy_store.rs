@@ -132,8 +132,9 @@
 //!   less than the authoritative document requires.
 //! - **Legacy wildcard grants must migrate before use.** A snapshot with
 //!   `GrantActions::All` cannot compile; every load path drives a bounded
-//!   migration that publishes a new version, and refuses to claim publication
-//!   authority over an unmigrated head.
+//!   migration that publishes a new version. Normal publication refuses to
+//!   claim authority over an unmigrated head; the migration publish is the
+//!   single exception, since it is the only write that retires one.
 //! - **Bounded retries, then a typed error.** Migration, bootstrap-lease
 //!   acquisition, and head claiming all give up with
 //!   [`SecurityError::PolicyConflict`] rather than looping.
@@ -443,7 +444,10 @@ impl PolicyStore {
             let candidate = loaded.snapshot().migrate_phase_seven_all(now)?;
             self.record_phase_seven_migration_candidate(loaded.snapshot(), &candidate)
                 .await?;
-            loaded = match self.publish(candidate, loaded.head_version()).await? {
+            loaded = match self
+                .publish_phase_seven_migration(candidate, loaded.head_version())
+                .await?
+            {
                 PolicyPublication::Published(published) => *published,
                 PolicyPublication::Conflict => {
                     tokio::time::sleep(BOOTSTRAP_LEASE_RETRY_DELAY).await;
@@ -504,7 +508,7 @@ impl PolicyStore {
         &self,
         memo: &mut Option<PolicySnapshotMemo>,
     ) -> Result<ClaimedPolicyPublication> {
-        self.acquire_claimed_publication_from(None, memo)
+        self.acquire_claimed_publication_from(None, false, memo)
             .await?
             .ok_or_else(|| SecurityError::PolicyConflict.into())
     }
@@ -512,11 +516,12 @@ impl PolicyStore {
     async fn acquire_claimed_publication_from(
         &self,
         expected_head_version: Option<&StorageVersion>,
+        allow_legacy_head: bool,
         memo: &mut Option<PolicySnapshotMemo>,
     ) -> Result<Option<ClaimedPolicyPublication>> {
         let lease_claim = self.publication_lease.acquire().await?;
         match self
-            .claim_current_head(lease_claim, expected_head_version, memo)
+            .claim_current_head(lease_claim, expected_head_version, allow_legacy_head, memo)
             .await
         {
             Ok(session) => Ok(session),
@@ -531,6 +536,7 @@ impl PolicyStore {
         &self,
         mut lease_claim: PolicyPublicationLeaseClaim,
         expected_head_version: Option<&StorageVersion>,
+        allow_legacy_head: bool,
         memo: &mut Option<PolicySnapshotMemo>,
     ) -> std::result::Result<
         Option<ClaimedPolicyPublication>,
@@ -545,7 +551,7 @@ impl PolicyStore {
                 self.release_publication_best_effort(&lease_claim).await;
                 return Ok(None);
             }
-            if current.snapshot().requires_phase_seven_all_migration() {
+            if current.snapshot().requires_phase_seven_all_migration() && !allow_legacy_head {
                 return Err((
                     SecurityError::InvalidPolicy(
                         "legacy wildcard policy must migrate before publication claim".to_string(),
@@ -879,11 +885,41 @@ impl PolicyStore {
         candidate: PolicySnapshot,
         expected_head_version: &StorageVersion,
     ) -> Result<PolicyPublication> {
+        self.publish_with_claim(candidate, expected_head_version, false)
+            .await
+    }
+
+    /// Phase 7 migration publish: identical fencing + CAS discipline to
+    /// [`PolicyStore::publish`], but the head claim accepts the still-legacy
+    /// head it exists to replace. Normal publication refuses to claim a legacy
+    /// head so no writer builds on one; the bounded migration in
+    /// [`PolicyStore::ensure_phase_seven_migrated`] is the single sanctioned
+    /// exception — without it the guard would reject the very publish that
+    /// retires the legacy head.
+    async fn publish_phase_seven_migration(
+        &self,
+        candidate: PolicySnapshot,
+        expected_head_version: &StorageVersion,
+    ) -> Result<PolicyPublication> {
+        self.publish_with_claim(candidate, expected_head_version, true)
+            .await
+    }
+
+    async fn publish_with_claim(
+        &self,
+        candidate: PolicySnapshot,
+        expected_head_version: &StorageVersion,
+        allow_legacy_head: bool,
+    ) -> Result<PolicyPublication> {
         candidate.validate_for_use()?;
         self.validate_entitlements(&candidate)?;
         let mut memo = None;
         let mut session = match self
-            .acquire_claimed_publication_from(Some(expected_head_version), &mut memo)
+            .acquire_claimed_publication_from(
+                Some(expected_head_version),
+                allow_legacy_head,
+                &mut memo,
+            )
             .await
         {
             Ok(Some(session)) => session,

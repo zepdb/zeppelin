@@ -21,6 +21,7 @@ struct WarmRangeFixture {
     namespace: String,
     query: Vec<f32>,
     cluster_keys: Vec<String>,
+    cluster_cache_keys: Vec<String>,
 }
 
 fn test_compactor(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
@@ -77,6 +78,14 @@ async fn warm_range_fixture(name: &str) -> WarmRangeFixture {
         !cluster_keys.is_empty(),
         "fixture must create grouped cluster objects"
     );
+    let cluster_cache_keys: Vec<String> = cluster_keys
+        .iter()
+        .map(|key| {
+            manifest
+                .segment_artifact_cache_key(segment, key)
+                .expect("cluster object cache identity must resolve")
+        })
+        .collect();
 
     WarmRangeFixture {
         harness,
@@ -85,6 +94,7 @@ async fn warm_range_fixture(name: &str) -> WarmRangeFixture {
         namespace,
         query,
         cluster_keys,
+        cluster_cache_keys,
     }
 }
 
@@ -136,9 +146,9 @@ async fn run_query(
 }
 
 async fn cache_full_cluster_objects(fixture: &WarmRangeFixture, cache: &DiskCache) {
-    for key in &fixture.cluster_keys {
+    for (key, cache_key) in fixture.cluster_keys.iter().zip(&fixture.cluster_cache_keys) {
         let bytes = fixture.store.get(key).await.unwrap();
-        cache.put(key, &bytes).await.unwrap();
+        cache.put(cache_key, &bytes).await.unwrap();
     }
 }
 
@@ -238,11 +248,11 @@ async fn test_empty_cache_range_plan_matches_no_cache_and_does_not_insert_ranges
         empty_cache_bytes, no_cache_bytes,
         "empty-cache range path must preserve cold cluster bytes"
     );
-    for key in &fixture.cluster_keys {
+    for cache_key in &fixture.cluster_cache_keys {
         assert_eq!(
-            cache.get(key).await,
+            cache.get(cache_key).await,
             None,
-            "range reads must not insert partial/full cluster object cache entries for {key}"
+            "range reads must not insert partial/full cluster object cache entries for {cache_key}"
         );
     }
 
@@ -285,9 +295,9 @@ async fn test_corrupt_cached_object_evicted_and_served_from_s3() {
     let baseline = run_query(&fixture, None).await;
     let (_cache_dir, cache) = test_cache();
 
-    for key in &fixture.cluster_keys {
+    for cache_key in &fixture.cluster_cache_keys {
         cache
-            .put(key, &bytes::Bytes::from_static(b"truncated"))
+            .put(cache_key, &bytes::Bytes::from_static(b"truncated"))
             .await
             .unwrap();
     }
@@ -305,11 +315,11 @@ async fn test_corrupt_cached_object_evicted_and_served_from_s3() {
         corrupt_after > corrupt_before,
         "known-size corrupt cached objects must meter s3_after_corrupt_evict"
     );
-    for key in &fixture.cluster_keys {
+    for cache_key in &fixture.cluster_cache_keys {
         assert_eq!(
-            cache.get(key).await,
+            cache.get(cache_key).await,
             None,
-            "corrupt cached object must be evicted for {key}"
+            "corrupt cached object must be evicted for {cache_key}"
         );
     }
 

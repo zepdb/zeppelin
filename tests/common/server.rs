@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -528,6 +528,32 @@ fn inject_test_admin(config: &mut Config, existing_admin_bearer: Option<&str>) -
     admin_bearer
 }
 
+/// Return the administrator credential already persisted for a security-store
+/// scope, minting and remembering one on first use.
+///
+/// Policy authority is S3: once a scope's first server has bootstrapped a
+/// policy head, config-injected keys are ignored, so a restart that minted a
+/// fresh bearer would authenticate nothing. Servers restarted against the same
+/// scope must therefore reuse the credential their first boot persisted. Keyed
+/// by the isolation scope so concurrent suites never share a credential.
+fn persisted_scope_admin_bearer(scope: &str) -> String {
+    static SCOPE_ADMIN_BEARERS: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+    SCOPE_ADMIN_BEARERS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|_| panic!("scoped admin bearer registry lock poisoned"))
+        .entry(scope.to_string())
+        .or_insert_with(|| {
+            let mut secret_bytes = [0_u8; 32];
+            OsRng.fill_bytes(&mut secret_bytes);
+            format!(
+                "{TEST_ADMIN_KEY_ID}.{}",
+                URL_SAFE_NO_PAD.encode(secret_bytes)
+            )
+        })
+        .clone()
+}
+
 fn runtime_query_state(config: &Config) -> (Arc<RuntimeQueryConfig>, QueryKnobBounds) {
     (
         Arc::new(RuntimeQueryConfig::from_config(config)),
@@ -797,8 +823,18 @@ pub async fn start_test_server_on_store_with_readiness(
     // backend. Keep policy authority isolated by the harness's random prefix
     // independently of whether the application enforces a namespace prefix.
     let security_store = scoped_test_security_store(&store, &harness.prefix);
-    let (security, credential_adapter, admin_bearer) =
-        test_security_runtime(&security_store, &mut config, &clock).await;
+    // Servers restarted against the same harness share one S3-authoritative
+    // policy store, so they must reuse the administrator their first boot
+    // persisted instead of minting a bearer the policy head does not know.
+    let admin_bearer = persisted_scope_admin_bearer(&harness.prefix);
+    let (security, credential_adapter, admin_bearer) = test_security_runtime_with_admin_bearer(
+        &security_store,
+        &mut config,
+        &clock,
+        Some(&admin_bearer),
+        Arc::new(test_entitlements(Feature::ALL)),
+    )
+    .await;
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
@@ -1354,6 +1390,16 @@ impl FullTestServer {
             .server_task
             .await
             .map_err(|error| format!("test HTTP server failed: {error}"));
+        // Concurrent servers and scoped restarts share one application store,
+        // whose weak object-signer slot each boot rebinds to its own security
+        // kernel. When a peer server retired first, that slot is dead; rebind
+        // it to this server's kernel — alive for the remainder of this
+        // shutdown — so graceful audit shutdown can still sign its sealed tail.
+        if self.audit_runtime.is_some() {
+            self.security
+                .install_object_signer(&self.store)
+                .expect("test server shutdown must rebind its own object signer");
+        }
         let audit_result = match self.audit_runtime.take() {
             Some(runtime) => runtime
                 .shutdown()
@@ -1587,6 +1633,19 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         || store.clone(),
         |scope| scoped_test_security_store(&store, scope),
     );
+    // Scoped restarts share one S3-authoritative policy store, so they must
+    // reuse the administrator their first boot persisted. An unscoped store
+    // keeps minting a fresh administrator per boot so bootstrap-drift coverage
+    // still observes a rejected second-boot credential.
+    let persisted_admin_bearer;
+    let existing_admin_bearer = match (existing_admin_bearer, namespace_name_prefix.as_deref()) {
+        (Some(bearer), _) => Some(bearer),
+        (None, Some(scope)) => {
+            persisted_admin_bearer = persisted_scope_admin_bearer(scope);
+            Some(persisted_admin_bearer.as_str())
+        }
+        (None, None) => None,
+    };
     let (security, credential_adapter, admin_bearer) = test_security_runtime_with_admin_bearer(
         &security_store,
         &mut config,

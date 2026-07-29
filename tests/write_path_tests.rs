@@ -438,8 +438,8 @@ async fn test_group_commit_manifest_memo_conflict_rebuilds_from_authority() {
 
     assert_eq!(
         counter.gets_matching("/manifest.json"),
-        2,
-        "history-conflict classification and CAS retry each require one live GET"
+        1,
+        "the confirmed memo history is trusted; only the CAS retry needs one live GET"
     );
     assert_eq!(committed.fencing_token, 17);
     assert_eq!(committed.fragments.len(), 2);
@@ -546,8 +546,8 @@ async fn test_group_commit_manifest_memo_preserves_fencing_after_takeover() {
     ));
     assert_eq!(
         counter.gets_matching("/manifest.json"),
-        2,
-        "history authority and the retry ETag require two live manifest reads"
+        1,
+        "the confirmed memo history is trusted; only the CAS retry needs one live GET"
     );
 
     let authoritative = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();

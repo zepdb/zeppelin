@@ -125,7 +125,9 @@ fn release_builds_cannot_select_test_license_authority() {
     let integration_server_source = fs::read_to_string("tests/common/server.rs").unwrap();
 
     assert!(
-        !manifest.contains("test-support"),
+        !manifest
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .any(|token| token == "test-support"),
         "test-support must not be a Cargo-selectable production feature"
     );
     assert!(

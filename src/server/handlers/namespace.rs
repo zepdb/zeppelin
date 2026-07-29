@@ -158,7 +158,7 @@ use crate::namespace::manager::{
     COMPACTION_DEGRADED_FAILURE_THRESHOLD,
 };
 use crate::security::{
-    Action, AllowDecision, AuditParams, Feature, IndexConfigValues, NamespaceDeleteAdmission,
+    Action, AllowDecision, AuditParams, IndexConfigValues, NamespaceDeleteAdmission,
     NamespaceForkAdmission, NamespaceId, PreservationBlockedSurface, Principal, RequestContext,
     SecurityError,
 };
@@ -256,11 +256,6 @@ pub async fn create_branch(
                 feature: "namespace branching",
             },
         ))));
-    }
-    if !state.security.entitlements().has(Feature::Branching) {
-        return Err(ApiError(
-            SecurityError::FeatureNotLicensed(Feature::Branching).into(),
-        ));
     }
     let source_id = NamespaceId::new(source).map_err(|e| ApiError(e.into()))?;
     let target_id = NamespaceId::new(request.target).map_err(|e| ApiError(e.into()))?;

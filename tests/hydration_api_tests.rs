@@ -42,6 +42,7 @@ struct ApiServer {
 struct CompactedNamespace {
     namespace: String,
     query: Vec<f32>,
+    manifest: Manifest,
     segment: SegmentRef,
 }
 
@@ -222,6 +223,7 @@ async fn create_compacted_namespace(
     CompactedNamespace {
         namespace,
         query,
+        manifest,
         segment,
     }
 }
@@ -238,9 +240,19 @@ fn active_segment_ref(manifest: &Manifest) -> &SegmentRef {
         .expect("active segment must exist")
 }
 
-async fn all_cluster_objects_cached(cache: &DiskCache, segment: &SegmentRef) -> bool {
+/// Immutable artifacts are cached by physical incarnation, so a cache lookup
+/// built from the raw store key can never hit. Route through the manifest's
+/// origin resolver rather than reproducing the key format.
+async fn all_cluster_objects_cached(
+    cache: &DiskCache,
+    manifest: &Manifest,
+    segment: &SegmentRef,
+) -> bool {
     for object in &segment.cluster_objects {
-        match cache.get(&object.key).await {
+        let cache_key = manifest
+            .segment_artifact_cache_key(segment, &object.key)
+            .expect("cluster object cache key must resolve through its origin");
+        match cache.get(&cache_key).await {
             Some(bytes) if bytes.len() as u64 == object.size_bytes => {}
             _ => return false,
         }
@@ -248,10 +260,10 @@ async fn all_cluster_objects_cached(cache: &DiskCache, segment: &SegmentRef) -> 
     true
 }
 
-async fn wait_for_cached_segment(cache: &DiskCache, segment: &SegmentRef) {
+async fn wait_for_cached_segment(cache: &DiskCache, manifest: &Manifest, segment: &SegmentRef) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if all_cluster_objects_cached(cache, segment).await {
+            if all_cluster_objects_cached(cache, manifest, segment).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -292,7 +304,7 @@ async fn test_admin_hydrate_endpoint_hydrates_namespace() {
     assert_eq!(body["namespace"], fixture.namespace);
     assert_eq!(body["segment_id"], fixture.segment.id);
 
-    wait_for_cached_segment(&server.cache, &fixture.segment).await;
+    wait_for_cached_segment(&server.cache, &fixture.manifest, &fixture.segment).await;
 
     server.counter.reset();
     let wal_reader = WalReader::new(server.store.clone());
@@ -414,11 +426,11 @@ async fn test_admin_hydrate_does_not_block() {
         "admin hydrate must accept asynchronously; elapsed={elapsed:?}"
     );
     assert!(
-        !all_cluster_objects_cached(&server.cache, &fixture.segment).await,
+        !all_cluster_objects_cached(&server.cache, &fixture.manifest, &fixture.segment).await,
         "admin hydrate response must not wait for all cluster objects to cache"
     );
 
-    wait_for_cached_segment(&server.cache, &fixture.segment).await;
+    wait_for_cached_segment(&server.cache, &fixture.manifest, &fixture.segment).await;
     server.harness.cleanup().await;
 }
 

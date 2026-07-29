@@ -4,10 +4,11 @@ use std::str::FromStr;
 
 use serde_json::json;
 use zeppelin::config::Config;
-use zeppelin::security::{Action, AuditParams, NamespaceId, RouteClass, ROUTE_ACTIONS};
+use zeppelin::security::{Action, AuditParams, Feature, NamespaceId, RouteClass, ROUTE_ACTIONS};
 
 use common::server::{
     start_test_server_with_config, start_test_server_with_config_no_limit_override,
+    start_test_server_with_entitlements, test_entitlements,
 };
 
 fn enforced_config() -> Config {
@@ -165,8 +166,12 @@ async fn authentication_failures_remain_ip_rate_limited() {
 
 #[tokio::test]
 async fn unauthenticated_all_protected_routes_401() {
+    let config = enforced_config();
+    // Branching is default-disabled, so its routes are never registered and
+    // fall through to the canonical 404 fallback instead of reaching authn.
+    let branching_enabled = config.branching.enabled;
     let (base_url, _harness, _cache, _cache_dir, _admin_bearer) =
-        start_test_server_with_config(Some(enforced_config())).await;
+        start_test_server_with_config(Some(config)).await;
     let client = reqwest::Client::new();
 
     for entry in ROUTE_ACTIONS {
@@ -183,6 +188,16 @@ async fn unauthenticated_all_protected_routes_401() {
             .send()
             .await
             .unwrap();
+        if !branching_enabled && entry.path == "/v1/namespaces/:ns/branches" {
+            assert_eq!(
+                response.status(),
+                404,
+                "{} {} is unregistered while branching is disabled",
+                entry.method,
+                entry.path
+            );
+            continue;
+        }
         assert_eq!(
             response.status(),
             401,
@@ -508,8 +523,16 @@ mode = "open_unsafe"
 "#,
     )
     .unwrap();
+    // Delegation and Preservation deliberately refuse open-unsafe composition
+    // (fail-closed), so this fixture narrows entitlements to keep the
+    // anonymous-access intent under test.
+    let entitlements = test_entitlements(
+        Feature::ALL
+            .into_iter()
+            .filter(|feature| !matches!(feature, Feature::Delegation | Feature::Preservation)),
+    );
     let (base_url, _harness, _cache, _cache_dir, _admin_bearer) =
-        start_test_server_with_config(Some(config)).await;
+        start_test_server_with_entitlements(config, entitlements).await;
 
     let response = reqwest::Client::new()
         .get(format!("{base_url}/metrics"))
@@ -715,9 +738,10 @@ fn fork_audit_params_have_a_distinct_stable_variant() {
         target: NamespaceId::new("target").unwrap(),
     };
     let value = serde_json::to_value(params).unwrap();
-    assert_eq!(value["type"], "namespace_fork");
-    assert_eq!(value["source"], "source");
-    assert_eq!(value["target"], "target");
+    // AuditParams is externally tagged: the snake_case variant name is the key.
+    let variant = &value["namespace_fork"];
+    assert_eq!(variant["source"], "source");
+    assert_eq!(variant["target"], "target");
 }
 
 #[tokio::test]

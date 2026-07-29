@@ -443,7 +443,17 @@ async fn test_legacy_creating_namespace_without_manifest_mints_incarnation() {
         .put(&metadata_key, legacy_creating.to_bytes().unwrap())
         .await
         .unwrap();
+    let bootstrap_generation = Manifest::read(&harness.store, &name)
+        .await
+        .unwrap()
+        .expect("bootstrap manifest must exist before fixture teardown")
+        .version();
     harness.store.delete(&manifest_key).await.unwrap();
+    harness
+        .store
+        .delete(&Manifest::history_key(&name, bootstrap_generation))
+        .await
+        .expect("fixture teardown must not retain immutable history");
 
     let recovering_manager = NamespaceManager::new(harness.store.clone());
     let recovered = recovering_manager.get(&name).await.unwrap();

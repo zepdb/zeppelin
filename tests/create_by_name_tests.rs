@@ -214,7 +214,7 @@ async fn test_create_namespace_rejects_invalid_client_name() {
             "expected invalid name {name:?} to be rejected"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["code"], "VALIDATION_ERROR");
+        assert_eq!(body["code"], "invalid_namespace");
         assert_eq!(body["status"], 400);
         assert!(
             body["error"]
@@ -242,9 +242,15 @@ async fn test_create_namespace_without_name_still_generates_uuid_name() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 201);
     let body: serde_json::Value = resp.json().await.unwrap();
+    // The test server sets `namespace_name_prefix` so concurrent suites cannot
+    // collide in one bucket, so the response carries that prefix ahead of the
+    // generated identifier.
     let name = body["name"].as_str().unwrap();
+    let generated = name
+        .strip_prefix(&format!("{}-", harness.prefix))
+        .unwrap_or_else(|| panic!("generated name must carry the isolation prefix, got: {name}"));
     assert!(
-        Uuid::parse_str(name).is_ok(),
+        Uuid::parse_str(generated).is_ok(),
         "omitted-name path must keep returning a UUID namespace, got {name:?}"
     );
 

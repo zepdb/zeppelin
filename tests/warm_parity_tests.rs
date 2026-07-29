@@ -251,10 +251,16 @@ async fn post_hydrate(server: &ParityServer, namespace: &str) {
     assert_eq!(body["namespace"], namespace);
 }
 
-async fn wait_for_cached_segment(cache: &DiskCache, segment: &SegmentRef) {
+async fn wait_for_cached_segment(
+    cache: &DiskCache,
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment: &SegmentRef,
+) {
+    let cache_keys = cluster_object_cache_keys(store, namespace, segment).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if all_cluster_objects_cached(cache, segment).await {
+            if all_cluster_objects_cached(cache, segment, &cache_keys).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -264,14 +270,40 @@ async fn wait_for_cached_segment(cache: &DiskCache, segment: &SegmentRef) {
     .expect("segment should hydrate");
 }
 
-async fn all_cluster_objects_cached(cache: &DiskCache, segment: &SegmentRef) -> bool {
-    for object in &segment.cluster_objects {
-        match cache.get(&object.key).await {
+async fn all_cluster_objects_cached(
+    cache: &DiskCache,
+    segment: &SegmentRef,
+    cache_keys: &[String],
+) -> bool {
+    for (object, cache_key) in segment.cluster_objects.iter().zip(cache_keys) {
+        match cache.get(cache_key).await {
             Some(bytes) if bytes.len() as u64 == object.size_bytes => {}
             _ => return false,
         }
     }
     true
+}
+
+/// Cache keys hydration stores this segment's cluster objects under.
+///
+/// Immutable artifacts are cached by physical incarnation
+/// (`Manifest::segment_artifact_cache_key`), so polling or mutating the raw
+/// store keys silently never touches the entries hydration writes.
+async fn cluster_object_cache_keys(
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment: &SegmentRef,
+) -> Vec<String> {
+    let manifest = Manifest::read(store, namespace).await.unwrap().unwrap();
+    segment
+        .cluster_objects
+        .iter()
+        .map(|object| {
+            manifest
+                .segment_artifact_cache_key(segment, &object.key)
+                .expect("cluster object cache key must resolve through its artifact origin")
+        })
+        .collect()
 }
 
 async fn run_query_snapshots(
@@ -352,7 +384,13 @@ async fn test_warm_parity_bit_identical() {
     .unwrap();
 
     post_hydrate(&server, &fixture.namespace).await;
-    wait_for_cached_segment(&server.cache, &fixture.segment).await;
+    wait_for_cached_segment(
+        &server.cache,
+        &server.store,
+        &fixture.namespace,
+        &fixture.segment,
+    )
+    .await;
 
     let local_before = range_source_metric_value("local");
     server.counter.reset();
@@ -404,15 +442,23 @@ async fn test_warm_parity_detects_same_length_cached_corruption() {
     .unwrap();
 
     post_hydrate(&server, &fixture.namespace).await;
-    wait_for_cached_segment(&server.cache, &fixture.segment).await;
-    for object in &fixture.segment.cluster_objects {
-        let mut bytes = server.cache.get(&object.key).await.unwrap().to_vec();
+    wait_for_cached_segment(
+        &server.cache,
+        &server.store,
+        &fixture.namespace,
+        &fixture.segment,
+    )
+    .await;
+    let cache_keys =
+        cluster_object_cache_keys(&server.store, &fixture.namespace, &fixture.segment).await;
+    for cache_key in &cache_keys {
+        let mut bytes = server.cache.get(cache_key).await.unwrap().to_vec();
         for byte in bytes.iter_mut().step_by(97) {
             *byte ^= 0x5a;
         }
         server
             .cache
-            .put(&object.key, &Bytes::from(bytes))
+            .put(cache_key, &Bytes::from(bytes))
             .await
             .unwrap();
     }
@@ -442,7 +488,13 @@ async fn test_rotation_gen1_to_gen2() {
     let server = start_parity_server(parity_config(16)).await;
     let fixture = create_compacted_namespace(&server, random_vectors(512, 32), 4).await;
     post_hydrate(&server, &fixture.namespace).await;
-    wait_for_cached_segment(&server.cache, &fixture.segment).await;
+    wait_for_cached_segment(
+        &server.cache,
+        &server.store,
+        &fixture.namespace,
+        &fixture.segment,
+    )
+    .await;
 
     let mut gen2_vectors = random_vectors(96, 32);
     prefix_ids(&mut gen2_vectors, "gen2");
@@ -453,8 +505,10 @@ async fn test_rotation_gen1_to_gen2() {
     server.compactor.compact(&fixture.namespace).await.unwrap();
     let gen2_segment = active_segment(&server.store, &fixture.namespace).await;
     assert_ne!(fixture.segment.id, gen2_segment.id);
+    let gen2_cache_keys =
+        cluster_object_cache_keys(&server.store, &fixture.namespace, &gen2_segment).await;
     assert!(
-        !all_cluster_objects_cached(&server.cache, &gen2_segment).await,
+        !all_cluster_objects_cached(&server.cache, &gen2_segment, &gen2_cache_keys).await,
         "new generation must not appear cached before gen2 hydration"
     );
 
@@ -490,7 +544,13 @@ async fn test_rotation_gen1_to_gen2() {
     );
 
     post_hydrate(&server, &fixture.namespace).await;
-    wait_for_cached_segment(&server.cache, &gen2_segment).await;
+    wait_for_cached_segment(
+        &server.cache,
+        &server.store,
+        &fixture.namespace,
+        &gen2_segment,
+    )
+    .await;
     server.counter.reset();
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_secs(60)));
     let warm_gen2 = run_query_snapshots(
@@ -528,7 +588,13 @@ async fn test_restart_rebuild_identical() {
     .await
     .unwrap();
     post_hydrate(&server, &fixture.namespace).await;
-    wait_for_cached_segment(&server.cache, &fixture.segment).await;
+    wait_for_cached_segment(
+        &server.cache,
+        &server.store,
+        &fixture.namespace,
+        &fixture.segment,
+    )
+    .await;
 
     let rebuilt_cache = Arc::new(
         DiskCache::new_with_max_bytes(server.cache_dir.path().to_path_buf(), 512 * 1024 * 1024)
@@ -590,7 +656,13 @@ async fn test_np128_exact_sentinel_warm_and_cold() {
     .unwrap();
 
     post_hydrate(&server, &fixture.namespace).await;
-    wait_for_cached_segment(&server.cache, &fixture.segment).await;
+    wait_for_cached_segment(
+        &server.cache,
+        &server.store,
+        &fixture.namespace,
+        &fixture.segment,
+    )
+    .await;
     server.counter.reset();
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_secs(60)));
     let warm = run_query_snapshots(

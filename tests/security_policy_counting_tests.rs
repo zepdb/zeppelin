@@ -28,6 +28,19 @@ fn full_entitlements() -> Arc<Entitlements> {
     Arc::new(test_entitlements(Feature::ALL))
 }
 
+fn delegation_signing_key(config: &mut Config) -> tempfile::NamedTempFile {
+    let file = tempfile::NamedTempFile::new().expect("delegation test key file");
+    std::fs::write(file.path(), "09".repeat(32)).expect("write delegation test seed");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600))
+            .expect("restrict delegation test seed permissions");
+    }
+    config.security.token_signing_key_path = file.path().to_string_lossy().into_owned();
+    file
+}
+
 #[tokio::test]
 async fn warmed_authentication_and_authorization_use_zero_s3_operations() {
     let harness = TestHarness::new().await;
@@ -35,6 +48,7 @@ async fn warmed_authentication_and_authorization_use_zero_s3_operations() {
     let mut config = Config::default();
     config.security.policy_refresh_secs = 60;
     let admin_bearer = test_admin_bearer(&mut config);
+    let _delegation_key = delegation_signing_key(&mut config);
     let clock = Clock::system();
     let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
         store,
@@ -106,6 +120,7 @@ async fn policy_refresh_uses_at_most_one_conditional_get_per_window() {
     let mut config = Config::default();
     config.security.policy_refresh_secs = 1;
     let _admin_bearer = test_admin_bearer(&mut config);
+    let _delegation_key = delegation_signing_key(&mut config);
     let (_kernel, _adapter) = SecurityKernel::from_resolved_entitlements(
         store,
         &config.security,
@@ -139,13 +154,21 @@ async fn policy_refresh_uses_at_most_one_conditional_get_per_window() {
     );
 }
 
+/// One policy mutation is exactly: 1 immutable snapshot create-PUT, plus 2
+/// CAS update-PUTs on the head key (the fencing-token claim in
+/// `claim_current_head`, then the finalize CAS in `publish_claimed`), plus 2
+/// GETs of head + snapshot (the mutation's base load in
+/// `policy_cache.rs::publish_mutation`, then the claim's fresh authoritative
+/// load). The publication-lease traffic lives under `_security/leases/` and is
+/// not part of these per-prefix counts.
 #[tokio::test]
-async fn policy_mutation_is_one_immutable_put_plus_one_cas_put() {
+async fn policy_mutation_is_one_immutable_put_plus_head_claim_and_cas_put() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&scoped_store(&harness));
     let mut config = Config::default();
     config.security.policy_refresh_secs = 60;
     let admin_bearer = test_admin_bearer(&mut config);
+    let _delegation_key = delegation_signing_key(&mut config);
     let clock = Clock::system();
     let now = clock.now();
     let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
@@ -177,12 +200,12 @@ async fn policy_mutation_is_one_immutable_put_plus_one_cas_put() {
     assert_eq!(counter.puts_matching(policy_objects), 1);
     assert_eq!(counter.create_puts_matching(policy_objects), 1);
     assert_eq!(counter.update_puts_matching(policy_objects), 0);
-    assert_eq!(counter.puts_matching(policy_head), 1);
+    assert_eq!(counter.puts_matching(policy_head), 2);
     assert_eq!(counter.create_puts_matching(policy_head), 0);
-    assert_eq!(counter.update_puts_matching(policy_head), 1);
-    assert_eq!(counter.gets_matching(policy_head), 1);
+    assert_eq!(counter.update_puts_matching(policy_head), 2);
+    assert_eq!(counter.gets_matching(policy_head), 2);
     assert_eq!(counter.heads_matching(policy_head), 0);
-    assert_eq!(counter.gets_matching(policy_objects), 1);
+    assert_eq!(counter.gets_matching(policy_objects), 2);
     assert_eq!(counter.heads_matching(policy_objects), 0);
 
     assert_eq!(

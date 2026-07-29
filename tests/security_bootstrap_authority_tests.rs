@@ -11,7 +11,7 @@ use zeppelin::error::ZeppelinError;
 use zeppelin::security::{Feature, PolicyStore, SecurityError};
 use zeppelin::storage::ZeppelinStore;
 
-use common::fault_injection::synchronize_create_pair_matching;
+use common::fault_injection::observe_create_matching;
 use common::harness::TestHarness;
 use common::server::test_entitlements;
 
@@ -60,21 +60,27 @@ fn scoped_store(harness: &TestHarness) -> ZeppelinStore {
 async fn concurrent_first_boot_loser_reads_winners_authoritative_head() {
     let harness = TestHarness::new().await;
     let (store, race) =
-        synchronize_create_pair_matching(&scoped_store(&harness), "_security/heads/policy.json");
+        observe_create_matching(&scoped_store(&harness), "_security/heads/policy.json");
     let first = policy_store(store.clone());
     let second = policy_store(store.clone());
     let config = Config::from_str(BOOTSTRAP_CONFIG).expect("valid bootstrap config");
     let boot_time = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
 
-    let (first, second) = tokio::join!(
-        first.load_or_bootstrap(&config.security, boot_time),
-        second.load_or_bootstrap(&config.security, boot_time),
-    );
+    let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(
+            first.load_or_bootstrap(&config.security, boot_time),
+            second.load_or_bootstrap(&config.security, boot_time),
+        )
+    })
+    .await
+    .expect("concurrent boots must resolve authority within 30 seconds");
     let first = first.expect("first concurrent boot must resolve authority");
     let second = second.expect("second concurrent boot must resolve authority");
 
-    assert_eq!(race.arrivals(), 2);
-    assert_eq!(race.conflicts(), 1);
+    // Publication leasing lets only the winner create the head; the loser
+    // reads the winner's published head instead of issuing a second create.
+    assert_eq!(race.arrivals(), 1);
+    assert_eq!(race.conflicts(), 0);
     assert_eq!(first.head(), second.head());
     assert_eq!(first.snapshot(), second.snapshot());
     assert_eq!(first.head().version().get(), 1);
@@ -82,8 +88,8 @@ async fn concurrent_first_boot_loser_reads_winners_authoritative_head() {
     let policy_objects = store
         .list_prefix("_security/policies/")
         .await
-        .expect("both immutable bootstrap candidates must remain listable");
-    assert_eq!(policy_objects.len(), 2);
+        .expect("the winner's immutable bootstrap candidate must remain listable");
+    assert_eq!(policy_objects.len(), 1);
     assert!(policy_objects
         .iter()
         .any(|key| key == first.head().object_key()));

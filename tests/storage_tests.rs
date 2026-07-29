@@ -6,8 +6,8 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult, Result as OsResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 use std::fmt;
 use std::time::Duration;
@@ -678,8 +678,15 @@ impl ObjectStore for GenerationOnlyStore {
         &self,
         location: &Path,
         payload: PutPayload,
-        options: PutOptions,
+        mut options: PutOptions,
     ) -> OsResult<PutResult> {
+        // The inner store keys conditions on the ETag, so lower a generation-only
+        // condition back into the ETag field the generation was moved out of.
+        if let PutMode::Update(ref mut version) = options.mode {
+            if version.e_tag.is_none() {
+                version.e_tag = version.version.take();
+            }
+        }
         let mut result = self.inner.put_opts(location, payload, options).await?;
         result.version = result.e_tag.take();
         Ok(result)

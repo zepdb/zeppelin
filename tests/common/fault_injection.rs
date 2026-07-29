@@ -489,14 +489,14 @@ pub struct PauseCreateStore {
     release: Arc<tokio::sync::Semaphore>,
 }
 
-/// Controller for inspecting a deterministic two-writer create-only race.
+/// Controller for inspecting create-only calls that reached a matched key.
 #[derive(Clone, Debug)]
-pub struct CreatePairBarrierHandle {
+pub struct CreateObservationHandle {
     arrivals: Arc<AtomicUsize>,
     conflicts: Arc<AtomicUsize>,
 }
 
-impl CreatePairBarrierHandle {
+impl CreateObservationHandle {
     /// Return how many matching create-only calls reached the wrapper.
     #[must_use]
     pub fn arrivals(&self) -> usize {
@@ -510,14 +510,13 @@ impl CreatePairBarrierHandle {
     }
 }
 
-/// Object-store decorator that makes two create-only writers race on one key.
+/// Object-store decorator that counts create-only calls reaching one key.
 #[derive(Debug)]
-pub struct CreatePairBarrierStore {
+pub struct CreateObservationStore {
     inner: Arc<dyn ObjectStore>,
     needle: String,
     arrivals: Arc<AtomicUsize>,
     conflicts: Arc<AtomicUsize>,
-    barrier: Arc<tokio::sync::Barrier>,
 }
 
 /// Wrap a store with a disabled deterministic two-CAS synchronization point.
@@ -838,23 +837,27 @@ pub fn pause_first_create_matching(
     )
 }
 
-/// Wrap a store with a deterministic two-writer create-only synchronization point.
-pub fn synchronize_create_pair_matching(
+/// Wrap a store with a create-only observation point counting arrivals and conflicts.
+///
+/// Bootstrap publication leasing lets only the lease winner issue the matched
+/// create-PUT; concurrent losers read the winner's published object instead of
+/// arriving with a second create. Tests assert that leasing semantics through
+/// the returned handle instead of synchronizing two arrivals.
+pub fn observe_create_matching(
     store: &ZeppelinStore,
     needle: impl Into<String>,
-) -> (ZeppelinStore, CreatePairBarrierHandle) {
+) -> (ZeppelinStore, CreateObservationHandle) {
     let arrivals = Arc::new(AtomicUsize::new(0));
     let conflicts = Arc::new(AtomicUsize::new(0));
-    let wrapper = CreatePairBarrierStore {
+    let wrapper = CreateObservationStore {
         inner: store.inner(),
         needle: needle.into(),
         arrivals: Arc::clone(&arrivals),
         conflicts: Arc::clone(&conflicts),
-        barrier: Arc::new(tokio::sync::Barrier::new(2)),
     };
     (
         ZeppelinStore::new(Arc::new(wrapper)),
-        CreatePairBarrierHandle {
+        CreateObservationHandle {
             arrivals,
             conflicts,
         },
@@ -2185,9 +2188,9 @@ impl ObjectStore for PauseCreateStore {
     }
 }
 
-impl fmt::Display for CreatePairBarrierStore {
+impl fmt::Display for CreateObservationStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CreatePairBarrierStore({})", self.inner)
+        write!(f, "CreateObservationStore({})", self.inner)
     }
 }
 
@@ -2290,23 +2293,20 @@ fn put_payload_contains(payload: &PutPayload, needle: &[u8]) -> bool {
 }
 
 #[async_trait]
-impl ObjectStore for CreatePairBarrierStore {
+impl ObjectStore for CreateObservationStore {
     async fn put_opts(
         &self,
         location: &Path,
         payload: PutPayload,
         opts: PutOptions,
     ) -> OsResult<PutResult> {
-        let synchronize =
+        let observe =
             location.as_ref().contains(&self.needle) && matches!(&opts.mode, PutMode::Create);
-        if synchronize {
-            let arrival = self.arrivals.fetch_add(1, Ordering::SeqCst);
-            if arrival < 2 {
-                self.barrier.wait().await;
-            }
+        if observe {
+            self.arrivals.fetch_add(1, Ordering::SeqCst);
         }
         let result = self.inner.put_opts(location, payload, opts).await;
-        if synchronize && matches!(&result, Err(object_store::Error::AlreadyExists { .. })) {
+        if observe && matches!(&result, Err(object_store::Error::AlreadyExists { .. })) {
             self.conflicts.fetch_add(1, Ordering::SeqCst);
         }
         result
