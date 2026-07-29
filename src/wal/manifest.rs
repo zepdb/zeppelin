@@ -2367,6 +2367,17 @@ impl Manifest {
         self.version
     }
 
+    /// Reports whether governed deletion has durably fenced this manifest.
+    ///
+    /// A fenced live manifest is no longer writable even when a crash occurred
+    /// before the namespace metadata advanced from `active` to `deleting`.
+    /// Lifecycle-aware observers use this typed signal instead of inferring
+    /// liveness from the continued presence of `manifest.json`.
+    #[must_use]
+    pub const fn is_deletion_fenced(&self) -> bool {
+        self.deletion_fence.is_some()
+    }
+
     /// Borrow the authoritative direct-child root map.
     #[must_use]
     pub(crate) fn branch_roots(&self) -> &BTreeMap<BranchId, BranchRoot> {

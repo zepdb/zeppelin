@@ -16,6 +16,7 @@ use zeppelin::compaction::gc;
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{Config, GcConfig};
 use zeppelin::error::ZeppelinError;
+use zeppelin::namespace::manager::{NamespaceMetadata, NamespaceState};
 use zeppelin::security::{
     verify_audit_day, AuditRecord, AuditRuntime, PolicyHead, PolicySnapshot, SecurityKernel,
 };
@@ -1074,6 +1075,7 @@ struct SeedOutcome {
     wall_secs: f64,
     object_store: ObjectStorePhaseCensus,
     fired_faults: Vec<FiredFault>,
+    repaired_terminal_lifecycle: bool,
 }
 
 pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
@@ -1282,7 +1284,7 @@ pub async fn replay_seed_from_env() {
             .first()
             .map_or(expected.op_index, |violation| violation.op_index);
         assert!(
-            limit <= expected_index,
+            limit <= expected_index || outcome.repaired_terminal_lifecycle,
             "replay did not reproduce expected violation {:?} at op {}",
             expected.violations.first().map(|violation| violation.id),
             expected_index
@@ -1994,14 +1996,29 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         && source_records.len() > workload_record_count
     {
         let replay_records = read_ops(&artifacts.dir);
+        let terminal_lifecycle_names = terminal_lifecycle_resolution_names(&artifacts.dir);
         assert_normalized_full_replay_structure(
             &source_records,
             &old_prefix,
             &replay_records,
             &prefix,
             source_failure.as_ref(),
+            &terminal_lifecycle_names,
         );
     }
+    let terminal_lifecycle_names = terminal_lifecycle_resolution_names(&artifacts.dir);
+    let repaired_terminal_lifecycle = exact_execution_trace
+        && replayed_full_workload
+        && source_failure.as_ref().is_some_and(|failure| {
+            failure.violations.iter().any(|violation| {
+                violation.id == ViolationId::I16Quiescence
+                    && terminal_lifecycle_names.contains(&rewrite_prefix(
+                        &violation.namespace,
+                        &old_prefix,
+                        &prefix,
+                    ))
+            })
+        });
     let object_store_total = object_store_breakdown(&counter);
     let object_store = ObjectStorePhaseCensus {
         quiet_period: object_store_delta(&object_store_total, &object_store_in_run),
@@ -2034,6 +2051,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         wall_secs: elapsed,
         object_store,
         fired_faults,
+        repaired_terminal_lifecycle,
     }
 }
 
@@ -2273,6 +2291,7 @@ fn assert_normalized_full_replay_structure(
     replay: &[OpRecord],
     replay_prefix: &str,
     source_failure: Option<&FailureManifest>,
+    terminal_lifecycle_names: &BTreeSet<String>,
 ) {
     if !source_ends_at_quiet_failure(source, source_failure) {
         assert_normalized_replay_structure(source, source_prefix, replay, replay_prefix);
@@ -2289,6 +2308,50 @@ fn assert_normalized_full_replay_structure(
         u64::try_from(replay.len()).expect("replay trace length must fit in u64"),
         "repaired quiet-failure replay",
     );
+
+    let terminal_subject = source_failure
+        .into_iter()
+        .flat_map(|failure| &failure.violations)
+        .find(|violation| violation.id == ViolationId::I16Quiescence)
+        .and_then(|violation| {
+            let replay_namespace =
+                rewrite_prefix(&violation.namespace, source_prefix, replay_prefix);
+            terminal_lifecycle_names
+                .contains(&replay_namespace)
+                .then_some((violation.namespace.as_str(), replay_namespace))
+        });
+    if let Some((source_namespace, replay_namespace)) = terminal_subject {
+        let divergence = source
+            .iter()
+            .position(|record| {
+                record.execution.phase == ExecutionPhase::Quiescence
+                    && record.op.namespace() == source_namespace
+            })
+            .expect("terminal lifecycle failure omitted its quiet namespace operation");
+        assert!(
+            matches!(source[divergence].op, Op::CompactInline { .. }),
+            "terminal lifecycle divergence must begin at forced compaction"
+        );
+        assert!(
+            replay.len() >= divergence,
+            "terminal lifecycle replay stopped before its source divergence"
+        );
+        assert_eq!(
+            normalized_op_execution_structure(&replay[..divergence], replay_prefix),
+            normalized_op_execution_structure(&source[..divergence], source_prefix),
+            "terminal lifecycle replay changed the trace before its typed disposition"
+        );
+        assert!(
+            replay[divergence..].iter().all(|record| {
+                record.execution.phase == ExecutionPhase::Quiescence
+                    && record.execution.hold.is_none()
+                    && record.op.namespace() != replay_namespace
+            }),
+            "terminal lifecycle replay retained the disposed namespace or appended non-quiescence work"
+        );
+        return;
+    }
+
     assert!(
         replay.len() >= source.len(),
         "repaired quiet-failure replay stopped before its source failure boundary"
@@ -2304,6 +2367,42 @@ fn assert_normalized_full_replay_structure(
         }),
         "repaired quiet-failure replay appended non-quiescence work"
     );
+}
+
+fn terminal_lifecycle_resolution_names(seed_dir: &Path) -> BTreeSet<String> {
+    let path = seed_dir.join("resolutions.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeSet::new(),
+        Err(error) => panic!(
+            "failed to read lifecycle resolutions {}: {error}",
+            path.display()
+        ),
+    };
+    let resolutions: Vec<serde_json::Value> =
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "failed to decode lifecycle resolutions {}: {error}",
+                path.display()
+            )
+        });
+    resolutions
+        .into_iter()
+        .filter_map(|resolution| {
+            let terminal = resolution["effect"] == "maybe_deleted_namespace"
+                && resolution["resolved"] == "applied"
+                && matches!(
+                    resolution["lifecycle_disposition"].as_str(),
+                    Some("absent" | "deleting" | "deletion_fenced")
+                );
+            terminal.then(|| {
+                resolution["namespace"]
+                    .as_str()
+                    .expect("terminal lifecycle resolution omitted namespace")
+                    .to_string()
+            })
+        })
+        .collect()
 }
 
 fn rewrite_prefix(value: &str, old_prefix: &str, new_prefix: &str) -> String {
@@ -4231,6 +4330,7 @@ async fn run_seed(
         wall_secs: elapsed,
         object_store,
         fired_faults,
+        repaired_terminal_lifecycle: false,
     }
 }
 
@@ -9806,28 +9906,63 @@ async fn resolve_indeterminates(
                     }
                 }
                 NsIndeterminate::MaybeDeletedNs => {
-                    let exists = server
-                        .store
-                        .exists(&format!("{ns}/manifest.json"))
-                        .await
-                        .unwrap_or_else(|error| {
-                            panic!("manifest existence probe failed for {ns}: {error}")
-                        });
-                    if exists {
-                        resolutions.push(json!({
-                            "namespace": ns,
-                            "effect": "maybe_deleted_namespace",
-                            "resolved": "not_applied"
-                        }));
+                    // A metadata tombstone or a manifest destruction fence is
+                    // authoritative terminal state. A failed or lost delete
+                    // response can leave `meta.json` active while the fence is
+                    // already durable, or leave it deleting while the manifest
+                    // survives until governed cleanup resumes. Manifest
+                    // presence alone kept both states in the live model and
+                    // sent quiet compaction back into the product's deletion
+                    // fence (seed 113, F1).
+                    let metadata = match server.store.get(&format!("{ns}/meta.json")).await {
+                        Ok(bytes) => Some(NamespaceMetadata::from_bytes(&bytes).unwrap_or_else(
+                            |error| {
+                                panic!("deletion resolution metadata was invalid for {ns}: {error}")
+                            },
+                        )),
+                        Err(ZeppelinError::NotFound { .. }) => None,
+                        Err(error) => {
+                            panic!("deletion resolution metadata GET failed for {ns}: {error}")
+                        }
+                    };
+                    let manifest_fenced = if metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.deletion_intent.is_some())
+                    {
+                        Manifest::read(&server.store, &ns)
+                            .await
+                            .unwrap_or_else(|error| {
+                                panic!("deletion resolution manifest GET failed for {ns}: {error}")
+                            })
+                            .is_some_and(|manifest| manifest.is_deletion_fenced())
                     } else {
+                        false
+                    };
+                    let lifecycle_disposition = match metadata.as_ref() {
+                        None => "absent",
+                        Some(metadata) if metadata.state == NamespaceState::Deleting => "deleting",
+                        Some(_) if manifest_fenced => "deletion_fenced",
+                        Some(metadata) if metadata.deletion_intent.is_some() => "active_unfenced",
+                        Some(metadata) => metadata.state.as_str(),
+                    };
+                    if metadata.as_ref().is_none_or(|metadata| {
+                        metadata.state == NamespaceState::Deleting || manifest_fenced
+                    }) {
                         model.namespaces.remove(&ns);
                         resolutions.push(json!({
                             "namespace": ns,
                             "effect": "maybe_deleted_namespace",
-                            "resolved": "applied"
+                            "resolved": "applied",
+                            "lifecycle_disposition": lifecycle_disposition
                         }));
                         break;
                     }
+                    resolutions.push(json!({
+                        "namespace": ns,
+                        "effect": "maybe_deleted_namespace",
+                        "resolved": "not_applied",
+                        "lifecycle_disposition": lifecycle_disposition
+                    }));
                 }
                 NsIndeterminate::MaybeSnapshot { name } => {
                     let path = format!("/v1/namespaces/{ns}/snapshots/{name}");
@@ -10297,7 +10432,8 @@ mod outcome_tests {
     use zeppelin::types::DistanceMetric;
 
     use super::*;
-    use crate::adversarial::faults::{Direction, FaultEvent, TargetSelector};
+    use crate::adversarial::faults::{Direction, FaultEvent, InjectedErrorKind, TargetSelector};
+    use crate::adversarial::model::NsModel;
 
     #[test]
     fn i28_matches_destruction_evidence_only_through_the_current_tombstone() {
@@ -10936,6 +11072,7 @@ mod outcome_tests {
             &replay,
             "replay-prefix",
             None,
+            &BTreeSet::new(),
         );
 
         let mut extended = replay;
@@ -10962,6 +11099,7 @@ mod outcome_tests {
                 &extended,
                 "replay-prefix",
                 None,
+                &BTreeSet::new(),
             );
         })
         .is_err());
@@ -10979,7 +11117,93 @@ mod outcome_tests {
             &replay,
             "replay-prefix",
             Some(&failure),
+            &BTreeSet::new(),
         );
+    }
+
+    #[test]
+    fn terminal_lifecycle_replay_divergence_requires_typed_disposition_and_omission() {
+        let source = vec![
+            replay_trace_record(
+                0,
+                ExecutionPhase::Workload,
+                Op::GetNamespace {
+                    actor: ActorSel::ADMIN,
+                    ns: "source-prefix-ns".to_string(),
+                },
+            ),
+            replay_trace_record(
+                1,
+                ExecutionPhase::Quiescence,
+                Op::CompactInline {
+                    actor: ActorSel::ADMIN,
+                    ns: "source-prefix-ns".to_string(),
+                },
+            ),
+        ];
+        let replay = vec![
+            replay_trace_record(
+                0,
+                ExecutionPhase::Workload,
+                Op::GetNamespace {
+                    actor: ActorSel::ADMIN,
+                    ns: "replay-prefix-ns".to_string(),
+                },
+            ),
+            replay_trace_record(
+                1,
+                ExecutionPhase::Quiescence,
+                Op::GcCycle {
+                    actor: ActorSel::ADMIN,
+                    ns: "replay-prefix-other".to_string(),
+                    keep_count: 1,
+                },
+            ),
+        ];
+        let failure = quiet_failure_manifest(1);
+        let terminal = BTreeSet::from(["replay-prefix-ns".to_string()]);
+
+        assert_normalized_full_replay_structure(
+            &source,
+            "source-prefix",
+            &replay,
+            "replay-prefix",
+            Some(&failure),
+            &terminal,
+        );
+        assert!(std::panic::catch_unwind(|| {
+            assert_normalized_full_replay_structure(
+                &source,
+                "source-prefix",
+                &replay,
+                "replay-prefix",
+                Some(&failure),
+                &BTreeSet::new(),
+            );
+        })
+        .is_err());
+
+        let mut retained = replay;
+        retained.push(replay_trace_record(
+            2,
+            ExecutionPhase::Quiescence,
+            Op::GcCycle {
+                actor: ActorSel::ADMIN,
+                ns: "replay-prefix-ns".to_string(),
+                keep_count: 1,
+            },
+        ));
+        assert!(std::panic::catch_unwind(|| {
+            assert_normalized_full_replay_structure(
+                &source,
+                "source-prefix",
+                &retained,
+                "replay-prefix",
+                Some(&failure),
+                &terminal,
+            );
+        })
+        .is_err());
     }
 
     #[test]
@@ -11207,6 +11431,307 @@ mod outcome_tests {
             }),
             "{resolutions:#?}"
         );
+    }
+
+    // F1 (seed 113): an ambiguous `DeleteNamespace` can leave metadata active
+    // after the manifest destruction fence commits, or metadata deleting
+    // before the live manifest is removed. Both are terminal quiet-period
+    // states even though `manifest.json` exists. An active but unfenced intent
+    // remains live. The barriers below pin every state without sleeps.
+    #[tokio::test]
+    async fn ambiguous_delete_resolution_uses_authoritative_lifecycle_state() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let spec = NamespaceSpec {
+            dims: 2,
+            metric: DistanceMetric::Cosine,
+            quantization: QuantizationType::None,
+            num_centroids: 4,
+            fts_fields: Vec::new(),
+            bitmap: false,
+        };
+        let ns_fenced = format!("{prefix}-f1-fenced");
+        let ns_deleting = format!("{prefix}-f1-deleting");
+        let ns_unfenced = format!("{prefix}-f1-unfenced");
+        let ns_live = format!("{prefix}-f1-live");
+        let ns_gone = format!("{prefix}-f1-gone");
+
+        let setup_server = start_test_server_full(
+            harness.store.clone(),
+            Some(prefix.clone()),
+            deterministic_config(),
+            false,
+            None,
+        )
+        .await;
+        let admin_bearer = setup_server.admin_bearer.clone();
+        let client = adversarial_client(&setup_server);
+        for ns in [&ns_fenced, &ns_deleting, &ns_unfenced, &ns_live] {
+            let create = client
+                .post(format!("{}/v1/namespaces", setup_server.base_url))
+                .json(&spec.create_body(ns))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(create.status(), StatusCode::CREATED);
+            let upsert = client
+                .post(format!(
+                    "{}/v1/namespaces/{ns}/vectors",
+                    setup_server.base_url
+                ))
+                .json(&json!({
+                    "vectors": [{ "id": "one", "values": [1.0, 0.0] }]
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(upsert.status(), StatusCode::OK);
+        }
+        setup_server.shutdown().await;
+
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Network,
+            events: vec![
+                // Exact seed-113 crash shape: the manifest fence commits, but
+                // the request fails before metadata records the generation.
+                FaultEvent {
+                    id: "f1-manifest-fence-post-commit".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Put),
+                        key_substring: Some(format!("{ns_fenced}/manifest.json")),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::PostCommitFail {
+                        error: InjectedErrorKind::Generic,
+                    },
+                },
+                // Later governed-deletion state: the tombstone commits, but
+                // manifest removal fails.
+                FaultEvent {
+                    id: "f1-manifest-delete-pre-fail".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Delete),
+                        key_substring: Some(format!("{ns_deleting}/manifest.json")),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::PreFail {
+                        error: InjectedErrorKind::Generic,
+                    },
+                },
+                // A deletion intent without a committed manifest fence remains
+                // active and must not be classified terminal.
+                FaultEvent {
+                    id: "f1-lease-pre-fail".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Put),
+                        key_substring: Some(format!("{ns_unfenced}/lease.json")),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::PreFail {
+                        error: InjectedErrorKind::Generic,
+                    },
+                },
+            ],
+        });
+        let faulted_store = store_fault_proxy(&harness.store, scheduler.clone());
+        let server = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
+            faulted_store,
+            Some(prefix),
+            deterministic_config(),
+            false,
+            None,
+            100 * 1024 * 1024,
+            &admin_bearer,
+        )
+        .await;
+        let client = adversarial_client(&server);
+        for ns in [&ns_fenced, &ns_deleting, &ns_unfenced] {
+            let delete = client
+                .delete(format!("{}/v1/namespaces/{ns}", server.base_url))
+                .send()
+                .await
+                .unwrap();
+            let status = delete.status().as_u16();
+            let body = delete.text().await.unwrap_or_default();
+            assert!(
+                (500..600).contains(&status),
+                "the interrupted delete for {ns} must fail ambiguously, got {status}: {body}"
+            );
+        }
+        let fired = scheduler
+            .timeline()
+            .into_iter()
+            .map(|event| event.event_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            fired,
+            BTreeSet::from([
+                "f1-lease-pre-fail".to_string(),
+                "f1-manifest-delete-pre-fail".to_string(),
+                "f1-manifest-fence-post-commit".to_string(),
+            ])
+        );
+
+        let fenced_meta = NamespaceMetadata::from_bytes(
+            &harness
+                .store
+                .get(&format!("{ns_fenced}/meta.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fenced_meta.state, NamespaceState::Active);
+        assert!(fenced_meta.deletion_intent.is_some());
+        let fenced_manifest = Manifest::read(&harness.store, &ns_fenced)
+            .await
+            .unwrap()
+            .expect("post-commit fault must retain the fenced manifest");
+        assert!(fenced_manifest.is_deletion_fenced());
+
+        let deleting_meta = NamespaceMetadata::from_bytes(
+            &harness
+                .store
+                .get(&format!("{ns_deleting}/meta.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deleting_meta.state, NamespaceState::Deleting);
+        assert!(harness
+            .store
+            .exists(&format!("{ns_deleting}/manifest.json"))
+            .await
+            .unwrap());
+
+        let unfenced_meta = NamespaceMetadata::from_bytes(
+            &harness
+                .store
+                .get(&format!("{ns_unfenced}/meta.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unfenced_meta.state, NamespaceState::Active);
+        assert!(unfenced_meta.deletion_intent.is_some());
+        let unfenced_manifest = Manifest::read(&harness.store, &ns_unfenced)
+            .await
+            .unwrap()
+            .expect("lease failure must retain the live manifest");
+        assert!(!unfenced_manifest.is_deletion_fenced());
+
+        let mut model = Model::default();
+        for ns in [&ns_fenced, &ns_deleting, &ns_unfenced, &ns_live, &ns_gone] {
+            let mut ns_model = NsModel::new(spec.clone(), 1);
+            ns_model
+                .indeterminate_ns
+                .push(NsIndeterminate::MaybeDeletedNs);
+            model.namespaces.insert(ns.clone(), ns_model);
+        }
+        let root = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 30,
+            seeds: vec![0],
+            max_ops: None,
+            artifacts: root.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Chaos,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let run_artifacts = RunArtifacts::create(&env);
+        let seed_dir = run_artifacts.root().join("seed-0");
+        let artifacts = run_artifacts.seed(
+            0,
+            &deterministic_config(),
+            &BTreeMap::new(),
+            RunMode::Chaos,
+            None,
+            None,
+            None,
+            None,
+        );
+        let violations = resolve_indeterminates(
+            &client,
+            &server,
+            &mut model,
+            &artifacts,
+            &CorruptionTracker::default(),
+            None,
+            0,
+        )
+        .await;
+        assert!(violations.is_empty(), "{violations:#?}");
+
+        assert!(
+            !model.namespaces.contains_key(&ns_fenced),
+            "a durably fenced namespace must leave the live model set"
+        );
+        assert!(
+            !model.namespaces.contains_key(&ns_deleting),
+            "a durably deleting namespace must leave the live model set"
+        );
+        assert!(
+            !model.namespaces.contains_key(&ns_gone),
+            "a fully tombstoned namespace must leave the live model set"
+        );
+        assert!(
+            model.namespaces.contains_key(&ns_unfenced),
+            "an active namespace with no durable fence must stay live"
+        );
+        assert!(
+            model.namespaces.contains_key(&ns_live),
+            "a namespace whose delete intent never landed must stay live"
+        );
+
+        let resolutions: Vec<serde_json::Value> =
+            serde_json::from_str(&fs::read_to_string(seed_dir.join("resolutions.json")).unwrap())
+                .unwrap();
+        let disposition = |ns: &str| {
+            resolutions
+                .iter()
+                .find(|resolution| resolution["namespace"] == ns)
+                .cloned()
+        };
+        let fenced = disposition(&ns_fenced).expect("missing fenced resolution");
+        assert_eq!(fenced["effect"], "maybe_deleted_namespace");
+        assert_eq!(fenced["resolved"], "applied");
+        assert_eq!(fenced["lifecycle_disposition"], "deletion_fenced");
+        let deleting = disposition(&ns_deleting).expect("missing deleting resolution");
+        assert_eq!(deleting["effect"], "maybe_deleted_namespace");
+        assert_eq!(deleting["resolved"], "applied");
+        assert_eq!(deleting["lifecycle_disposition"], "deleting");
+        let gone = disposition(&ns_gone).expect("missing tombstoned resolution");
+        assert_eq!(gone["resolved"], "applied");
+        assert_eq!(gone["lifecycle_disposition"], "absent");
+        let unfenced = disposition(&ns_unfenced).expect("missing unfenced resolution");
+        assert_eq!(unfenced["resolved"], "not_applied");
+        assert_eq!(unfenced["lifecycle_disposition"], "active_unfenced");
+        let live = disposition(&ns_live).expect("missing live resolution");
+        assert_eq!(live["resolved"], "not_applied");
+        assert_eq!(live["lifecycle_disposition"], "active");
+
+        // The product fence is unchanged: compaction against either terminal
+        // lifecycle shape still fails loudly instead of being swallowed.
+        for ns in [&ns_fenced, &ns_deleting] {
+            let fence = server.compactor.compact(ns).await;
+            assert!(
+                matches!(fence, Err(ZeppelinError::NamespaceDeleting { .. })),
+                "compaction must still reject terminal namespace {ns}: {fence:?}"
+            );
+        }
+
+        server.shutdown().await;
+        harness.cleanup().await;
     }
 
     #[tokio::test]
