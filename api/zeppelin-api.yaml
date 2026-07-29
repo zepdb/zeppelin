@@ -2682,7 +2682,7 @@ components:
 
     QuantizationType:
       type: string
-      enum: [none, scalar, product]
+      enum: [none, scalar, two_bit, product]
       description: Quantization mode recorded on the active segment.
 
     NamespaceIndexConfig:
