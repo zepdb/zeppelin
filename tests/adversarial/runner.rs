@@ -1076,6 +1076,7 @@ struct SeedOutcome {
     object_store: ObjectStorePhaseCensus,
     fired_faults: Vec<FiredFault>,
     repaired_terminal_lifecycle: bool,
+    repaired_clone_publication: bool,
 }
 
 pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
@@ -1284,7 +1285,9 @@ pub async fn replay_seed_from_env() {
             .first()
             .map_or(expected.op_index, |violation| violation.op_index);
         assert!(
-            limit <= expected_index || outcome.repaired_terminal_lifecycle,
+            limit <= expected_index
+                || outcome.repaired_terminal_lifecycle
+                || outcome.repaired_clone_publication,
             "replay did not reproduce expected violation {:?} at op {}",
             expected.violations.first().map(|violation| violation.id),
             expected_index
@@ -2019,6 +2022,19 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
                     ))
             })
         });
+    let non_applied_clone_targets = non_applied_clone_resolution_targets(&artifacts.dir);
+    let repaired_clone_publication = exact_execution_trace
+        && replayed_full_workload
+        && source_failure.as_ref().is_some_and(|failure| {
+            failure.violations.iter().any(|violation| {
+                violation.id == ViolationId::I16Quiescence
+                    && non_applied_clone_targets.contains(&rewrite_prefix(
+                        &violation.namespace,
+                        &old_prefix,
+                        &prefix,
+                    ))
+            })
+        });
     let object_store_total = object_store_breakdown(&counter);
     let object_store = ObjectStorePhaseCensus {
         quiet_period: object_store_delta(&object_store_total, &object_store_in_run),
@@ -2052,6 +2068,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         object_store,
         fired_faults,
         repaired_terminal_lifecycle,
+        repaired_clone_publication,
     }
 }
 
@@ -2399,6 +2416,42 @@ fn terminal_lifecycle_resolution_names(seed_dir: &Path) -> BTreeSet<String> {
                 resolution["namespace"]
                     .as_str()
                     .expect("terminal lifecycle resolution omitted namespace")
+                    .to_string()
+            })
+        })
+        .collect()
+}
+
+fn non_applied_clone_resolution_targets(seed_dir: &Path) -> BTreeSet<String> {
+    let path = seed_dir.join("resolutions.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeSet::new(),
+        Err(error) => panic!(
+            "failed to read clone resolutions {}: {error}",
+            path.display()
+        ),
+    };
+    let resolutions: Vec<serde_json::Value> =
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "failed to decode clone resolutions {}: {error}",
+                path.display()
+            )
+        });
+    resolutions
+        .into_iter()
+        .filter_map(|resolution| {
+            let disproved = resolution["effect"] == "maybe_cloned"
+                && resolution["resolved"] == "not_applied"
+                && matches!(
+                    resolution["publication_disposition"].as_str(),
+                    Some("candidate_mismatch" | "manifest_absent")
+                );
+            disproved.then(|| {
+                resolution["target"]
+                    .as_str()
+                    .expect("non-applied clone resolution omitted target")
                     .to_string()
             })
         })
@@ -4331,6 +4384,7 @@ async fn run_seed(
         object_store,
         fired_faults,
         repaired_terminal_lifecycle: false,
+        repaired_clone_publication: false,
     }
 }
 
@@ -10041,15 +10095,65 @@ async fn resolve_indeterminates(
                     }
                 }
                 NsIndeterminate::MaybeCloned { target, as_of } => {
-                    let exists = server
-                        .store
-                        .exists(&format!("{target}/manifest.json"))
-                        .await
-                        .unwrap_or_else(|error| {
-                            panic!("clone manifest existence probe failed for {target}: {error}")
-                        });
-                    if exists {
+                    // The copy-clone endpoint creates an empty target manifest
+                    // before it publishes the copied source view. Therefore
+                    // manifest existence proves only that target reservation
+                    // succeeded, not that the ambiguous clone applied. Resolve
+                    // against the candidate's complete authoritative contents.
+                    let expected = clone_source_records(model, &ns, &as_of);
+                    let manifest =
+                        Manifest::read(&server.store, &target)
+                            .await
+                            .unwrap_or_else(|error| {
+                                panic!("clone manifest resolution failed for {target}: {error}")
+                            });
+                    let manifest_vector_count = manifest.as_ref().map_or(0, Manifest::vector_count);
+                    let count_matches = manifest.is_some()
+                        && manifest_vector_count
+                            == u64::try_from(expected.len())
+                                .expect("clone candidate size must fit in u64");
+                    let content_matches = if count_matches && !expected.is_empty() {
+                        let path = format!("/v1/namespaces/{target}/vectors/get");
+                        let ids = expected.keys().cloned().collect::<Vec<_>>();
+                        let (status, response) = request_json(
+                            client,
+                            Method::POST,
+                            &format!("{}{}", server.base_url, path),
+                            Some(json!({
+                                "ids": ids,
+                                "include_vector": true,
+                                "include_attributes": true,
+                                "consistency": ConsistencyLevel::Strong,
+                            })),
+                        )
+                        .await;
+                        if !(200..300).contains(&status) {
+                            violations.push(indeterminate_violation(
+                                op_index,
+                                &ns,
+                                "strong fetch failed while proving ambiguous clone publication",
+                                json!({
+                                    "target": target,
+                                    "status": status,
+                                    "response": response,
+                                }),
+                            ));
+                            false
+                        } else {
+                            expected.iter().all(|(id, candidate)| {
+                                observed_fetch_record(&response, id)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|observed| observed.semantically_eq(candidate))
+                            })
+                        }
+                    } else {
+                        count_matches
+                    };
+                    let publication_matches = count_matches && content_matches;
+                    if publication_matches {
                         let generation = clone_source_generation(model, &ns, &as_of);
+                        let later_target = model.namespaces.remove(&target);
                         model.apply(
                             &Op::CloneNamespace {
                                 actor: ActorSel::ADMIN,
@@ -10062,18 +10166,38 @@ async fn resolve_indeterminates(
                             &json!({ "generation": generation }),
                             None,
                         );
+                        if let Some(later_target) = later_target {
+                            let resolved_target = model
+                                .namespaces
+                                .get_mut(&target)
+                                .expect("resolved clone target must exist");
+                            resolved_target.indeterminate = later_target.indeterminate;
+                            resolved_target
+                                .indeterminate_ns
+                                .extend(later_target.indeterminate_ns);
+                        }
                         resolutions.push(json!({
                             "namespace": ns,
                             "target": target,
                             "effect": "maybe_cloned",
-                            "resolved": "applied"
+                            "resolved": "applied",
+                            "publication_disposition": "candidate_match",
+                            "manifest_vector_count": manifest_vector_count,
+                            "expected_vector_count": expected.len(),
                         }));
                     } else {
                         resolutions.push(json!({
                             "namespace": ns,
                             "target": target,
                             "effect": "maybe_cloned",
-                            "resolved": "not_applied"
+                            "resolved": "not_applied",
+                            "publication_disposition": if manifest.is_some() {
+                                "candidate_mismatch"
+                            } else {
+                                "manifest_absent"
+                            },
+                            "manifest_vector_count": manifest_vector_count,
+                            "expected_vector_count": expected.len(),
                         }));
                     }
                 }
@@ -10224,6 +10348,23 @@ fn clone_source_generation(model: &Model, source: &str, as_of: &super::ops::AsOf
             .unwrap_or(source.live_generation),
         super::ops::AsOfTarget::Timestamp(_) => source.live_generation,
     }
+}
+
+fn clone_source_records(
+    model: &Model,
+    source: &str,
+    as_of: &super::ops::AsOfTarget,
+) -> BTreeMap<String, ModelRecord> {
+    let source_model = model
+        .namespaces
+        .get(source)
+        .unwrap_or_else(|| panic!("missing clone source model during resolution: {source}"));
+    let generation = clone_source_generation(model, source, as_of);
+    source_model
+        .checkpoints
+        .get(&generation)
+        .cloned()
+        .unwrap_or_else(|| source_model.live.clone())
 }
 
 fn observed_fetch_record(
@@ -10434,6 +10575,7 @@ mod outcome_tests {
     use super::*;
     use crate::adversarial::faults::{Direction, FaultEvent, InjectedErrorKind, TargetSelector};
     use crate::adversarial::model::NsModel;
+    use crate::adversarial::ops::AsOfTarget;
 
     #[test]
     fn i28_matches_destruction_evidence_only_through_the_current_tombstone() {
@@ -11207,6 +11349,50 @@ mod outcome_tests {
     }
 
     #[test]
+    fn repaired_clone_publication_requires_typed_non_applied_resolution() {
+        let root = tempfile::TempDir::new().unwrap();
+        fs::write(
+            root.path().join("resolutions.json"),
+            serde_json::to_vec(&json!([
+                {
+                    "effect": "maybe_cloned",
+                    "resolved": "not_applied",
+                    "publication_disposition": "candidate_mismatch",
+                    "target": "candidate-mismatch",
+                },
+                {
+                    "effect": "maybe_cloned",
+                    "resolved": "not_applied",
+                    "publication_disposition": "manifest_absent",
+                    "target": "manifest-absent",
+                },
+                {
+                    "effect": "maybe_cloned",
+                    "resolved": "applied",
+                    "publication_disposition": "candidate_match",
+                    "target": "applied",
+                },
+                {
+                    "effect": "maybe_deleted_namespace",
+                    "resolved": "applied",
+                    "lifecycle_disposition": "deletion_fenced",
+                    "target": "different-effect",
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            non_applied_clone_resolution_targets(root.path()),
+            BTreeSet::from([
+                "candidate-mismatch".to_string(),
+                "manifest-absent".to_string(),
+            ])
+        );
+    }
+
+    #[test]
     fn terminal_workload_failure_does_not_add_unrecorded_quiet_verification() {
         let source = vec![
             replay_trace_record(
@@ -11729,6 +11915,380 @@ mod outcome_tests {
                 "compaction must still reject terminal namespace {ns}: {fence:?}"
             );
         }
+
+        server.shutdown().await;
+        harness.cleanup().await;
+    }
+
+    // F5 (seed 1475): an ambiguous copy-clone can reserve an empty target
+    // manifest and then fail before publishing the source view. A later
+    // ambiguous delete and idempotent create leave that empty target active.
+    // Quiet resolution must prove the candidate contents rather than treating
+    // the bootstrap manifest's existence as proof that all source rows landed.
+    #[tokio::test]
+    async fn ambiguous_clone_resolution_requires_published_candidate_contents() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let source = format!("{prefix}-f5-source");
+        let target = format!("{prefix}-f5-target");
+        let spec = NamespaceSpec {
+            dims: 2,
+            metric: DistanceMetric::Cosine,
+            quantization: QuantizationType::None,
+            num_centroids: 4,
+            fts_fields: Vec::new(),
+            bitmap: false,
+        };
+        let vectors = (0..8)
+            .map(|index| GenVector {
+                id: format!("{source}-v{index}"),
+                values: vec![index as f32, 1.0],
+                attributes: None,
+            })
+            .collect::<Vec<_>>();
+
+        let setup_server = start_test_server_full(
+            harness.store.clone(),
+            Some(prefix.clone()),
+            deterministic_config(),
+            false,
+            None,
+        )
+        .await;
+        let admin_bearer = setup_server.admin_bearer.clone();
+        let setup_client = adversarial_client(&setup_server);
+        let create = setup_client
+            .post(format!("{}/v1/namespaces", setup_server.base_url))
+            .json(&spec.create_body(&source))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let upsert = setup_client
+            .post(format!(
+                "{}/v1/namespaces/{source}/vectors",
+                setup_server.base_url
+            ))
+            .json(&json!({ "vectors": vectors }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upsert.status(), StatusCode::OK);
+        let compacted = setup_server.compactor.compact(&source).await.unwrap();
+        assert_eq!(compacted.vectors_compacted, 8);
+        let source_manifest = Manifest::read(&harness.store, &source)
+            .await
+            .unwrap()
+            .expect("compacted source manifest must exist");
+        let source_generation = source_manifest.version();
+        assert_eq!(source_manifest.vector_count(), 8);
+        setup_server.shutdown().await;
+
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Network,
+            events: vec![
+                FaultEvent {
+                    id: "f5-clone-copy-pre-fail".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Copy),
+                        key_substring: Some(format!("->{target}/")),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::PreFail {
+                        error: InjectedErrorKind::Generic,
+                    },
+                },
+                FaultEvent {
+                    id: "f5-delete-lease-pre-fail".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Put),
+                        key_substring: Some(format!("{target}/lease.json")),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::PreFail {
+                        error: InjectedErrorKind::Generic,
+                    },
+                },
+                FaultEvent {
+                    id: "f5-target-wal-pre-fail".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Put),
+                        key_substring: Some(format!("{target}/wal/")),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::PreFail {
+                        error: InjectedErrorKind::Generic,
+                    },
+                },
+            ],
+        });
+        let server = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
+            store_fault_proxy(&harness.store, scheduler.clone()),
+            Some(prefix),
+            deterministic_config(),
+            false,
+            None,
+            100 * 1024 * 1024,
+            &admin_bearer,
+        )
+        .await;
+        let client = adversarial_client(&server);
+
+        let clone = client
+            .post(format!("{}/v1/namespaces/{source}/clone", server.base_url))
+            .json(&json!({
+                "target": target,
+                "as_of": source_generation.to_string(),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(clone.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let empty_target = Manifest::read(&harness.store, &target)
+            .await
+            .unwrap()
+            .expect("failed clone must retain its reserved target manifest");
+        assert_eq!(empty_target.vector_count(), 0);
+
+        let delete = client
+            .delete(format!("{}/v1/namespaces/{target}", server.base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let target_meta = NamespaceMetadata::from_bytes(
+            &harness
+                .store
+                .get(&format!("{target}/meta.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(target_meta.state, NamespaceState::Active);
+        assert!(target_meta.deletion_intent.is_some());
+
+        let recreate = client
+            .post(format!("{}/v1/namespaces", server.base_url))
+            .json(&spec.create_body(&target))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(recreate.status(), StatusCode::OK);
+        let rejected = client
+            .post(format!(
+                "{}/v1/namespaces/{target}/vectors",
+                server.base_url
+            ))
+            .json(&json!({ "vectors": vectors }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let compacted = server.compactor.compact(&target).await.unwrap();
+        assert_eq!(compacted.vectors_compacted, 0);
+        assert!(compacted.segment_id.is_none());
+
+        let fetch = client
+            .post(format!(
+                "{}/v1/namespaces/{target}/vectors/get",
+                server.base_url
+            ))
+            .json(&json!({
+                "ids": vectors.iter().map(|vector| &vector.id).collect::<Vec<_>>(),
+                "include_vector": true,
+                "include_attributes": true,
+                "consistency": ConsistencyLevel::Strong,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(fetch.status(), StatusCode::OK);
+        let fetch: serde_json::Value = fetch.json().await.unwrap();
+        assert_eq!(
+            fetch["missing"].as_array().map(Vec::len),
+            Some(vectors.len())
+        );
+        assert_eq!(
+            Manifest::read(&harness.store, &target)
+                .await
+                .unwrap()
+                .expect("target manifest must remain present")
+                .vector_count(),
+            0
+        );
+
+        let fired = scheduler
+            .timeline()
+            .into_iter()
+            .map(|event| event.event_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            fired,
+            BTreeSet::from([
+                "f5-clone-copy-pre-fail".to_string(),
+                "f5-delete-lease-pre-fail".to_string(),
+                "f5-target-wal-pre-fail".to_string(),
+            ])
+        );
+
+        let mut model = Model::default();
+        model.apply(
+            &Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
+                ns: source.clone(),
+                spec: spec.clone(),
+            },
+            StatusCode::CREATED.as_u16(),
+            Some(1),
+            &json!({}),
+            None,
+        );
+        model.apply(
+            &Op::Upsert {
+                actor: ActorSel::ADMIN,
+                ns: source.clone(),
+                vectors: vectors.clone(),
+            },
+            StatusCode::OK.as_u16(),
+            Some(source_generation),
+            &json!({}),
+            None,
+        );
+        model.apply(
+            &Op::CompactInline {
+                actor: ActorSel::ADMIN,
+                ns: source.clone(),
+            },
+            StatusCode::OK.as_u16(),
+            Some(source_generation),
+            &json!({}),
+            None,
+        );
+        model.apply_outcome(
+            &Op::CloneNamespace {
+                actor: ActorSel::ADMIN,
+                source: source.clone(),
+                target: target.clone(),
+                as_of: AsOfTarget::Generation(source_generation),
+            },
+            &OpOutcome::Ambiguous {
+                reason: AmbiguityReason::ServerError { status: 500 },
+                status: Some(500),
+            },
+            None,
+            None,
+            51,
+        );
+        model.apply_outcome(
+            &Op::DeleteNamespace {
+                actor: ActorSel::ADMIN,
+                ns: target.clone(),
+            },
+            &OpOutcome::Ambiguous {
+                reason: AmbiguityReason::ServerCrashed,
+                status: None,
+            },
+            None,
+            None,
+            57,
+        );
+        model.apply(
+            &Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
+                ns: target.clone(),
+                spec: spec.clone(),
+            },
+            StatusCode::OK.as_u16(),
+            Some(empty_target.version()),
+            &json!({}),
+            None,
+        );
+        model.apply_outcome(
+            &Op::Upsert {
+                actor: ActorSel::ADMIN,
+                ns: target.clone(),
+                vectors: vectors.clone(),
+            },
+            &OpOutcome::Ambiguous {
+                reason: AmbiguityReason::ServerError { status: 500 },
+                status: Some(500),
+            },
+            None,
+            None,
+            67,
+        );
+        model.apply(
+            &Op::CompactInline {
+                actor: ActorSel::ADMIN,
+                ns: target.clone(),
+            },
+            StatusCode::OK.as_u16(),
+            Some(empty_target.version()),
+            &json!({}),
+            None,
+        );
+
+        let root = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 30,
+            seeds: vec![1475],
+            max_ops: None,
+            artifacts: root.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Chaos,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let run_artifacts = RunArtifacts::create(&env);
+        let seed_dir = run_artifacts.root().join("seed-1475");
+        let artifacts = run_artifacts.seed(
+            1475,
+            &deterministic_config(),
+            &BTreeMap::new(),
+            RunMode::Chaos,
+            None,
+            None,
+            None,
+            None,
+        );
+        let violations = resolve_indeterminates(
+            &client,
+            &server,
+            &mut model,
+            &artifacts,
+            &CorruptionTracker::default(),
+            None,
+            515,
+        )
+        .await;
+        assert!(violations.is_empty(), "{violations:#?}");
+        assert!(model.namespaces[&target].live.is_empty());
+        assert!(model.namespaces[&target].indeterminate.is_empty());
+
+        let resolutions: Vec<serde_json::Value> =
+            serde_json::from_str(&fs::read_to_string(seed_dir.join("resolutions.json")).unwrap())
+                .unwrap();
+        let clone_resolution = resolutions
+            .iter()
+            .find(|resolution| resolution["effect"] == "maybe_cloned")
+            .expect("missing ambiguous clone resolution");
+        assert_eq!(clone_resolution["resolved"], "not_applied");
+        assert_eq!(
+            clone_resolution["publication_disposition"],
+            "candidate_mismatch"
+        );
+        assert_eq!(clone_resolution["manifest_vector_count"], 0);
+        assert_eq!(clone_resolution["expected_vector_count"], 8);
 
         server.shutdown().await;
         harness.cleanup().await;
