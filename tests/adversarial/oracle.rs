@@ -2311,10 +2311,9 @@ fn record_matches_filter(
     let Some(filter) = filter else {
         return true;
     };
-    let base = record
-        .attributes
-        .as_ref()
-        .is_some_and(|attributes| evaluate_filter(filter, attributes));
+    let empty_attributes = HashMap::new();
+    let attributes = record.attributes.as_ref().unwrap_or(&empty_attributes);
+    let base = evaluate_filter(filter, attributes);
     if mutation == Some(OracleMutation::FilterSkew) && first_id.is_some_and(|first| first == id) {
         !base
     } else {
@@ -2713,6 +2712,39 @@ mod tests {
             namespaces: BTreeMap::from([(NS.to_string(), ns_model)]),
             ..Model::default()
         }
+    }
+
+    #[test]
+    fn exact_filter_oracle_uses_empty_map_semantics_for_missing_attributes() {
+        let record = ModelRecord {
+            values: vec![0.0, 0.0],
+            attributes: None,
+        };
+        let not_eq = Filter::NotEq {
+            field: "flag".to_string(),
+            value: AttributeValue::Bool(true),
+        };
+        let not = Filter::Not {
+            filter: Box::new(Filter::Eq {
+                field: "group".to_string(),
+                value: AttributeValue::String("g0".to_string()),
+            }),
+        };
+
+        assert!(record_matches_filter(
+            None,
+            "row",
+            None,
+            &record,
+            Some(&not_eq)
+        ));
+        assert!(record_matches_filter(
+            None,
+            "row",
+            None,
+            &record,
+            Some(&not)
+        ));
     }
 
     fn fetch_record(values: [f32; 2]) -> OpRecord {
