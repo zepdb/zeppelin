@@ -1620,8 +1620,8 @@ struct WalScanResult {
 /// - `namespace`: Namespace prefix used to resolve fragment keys.
 /// - `manifest`: Fixed authoritative snapshot; refs must be in replay order.
 /// - `query`: Borrowed query coordinates matching stored vector dimensions.
-/// - `filter`: Optional metadata predicate. A record without attributes fails
-///   any supplied filter.
+/// - `filter`: Optional metadata predicate. A record without an attribute map
+///   is evaluated as an empty map, so negative predicates can match it.
 /// - `distance_metric`: Metric used for every live vector; lower is better.
 /// - `cache`: Optional immutable fragment cache.
 /// - `include_attributes`: Whether winning hits deep-clone their attributes.
@@ -1753,20 +1753,14 @@ async fn wal_scan(
     let mut top_results = TopK::new(top_k, |a: &ScoredWalVector<'_>, b: &ScoredWalVector<'_>| {
         a.score.total_cmp(&b.score).then_with(|| a.id.cmp(b.id))
     });
+    let empty_attributes = HashMap::new();
 
     // Score surviving vectors, but keep only the bounded top-k candidates.
     for (id, (values, attrs)) in &latest_vectors {
         overriding_ids.insert((*id).to_string());
-        let passes_filter = {
-            if let Some(f) = filter {
-                match attrs {
-                    Some(a) => evaluate_filter(f, a),
-                    None => false,
-                }
-            } else {
-                true
-            }
-        };
+        let passes_filter = filter.is_none_or(|f| {
+            evaluate_filter(f, attrs.as_ref().copied().unwrap_or(&empty_attributes))
+        });
         if !passes_filter {
             continue;
         }
@@ -4460,6 +4454,67 @@ mod tests {
             5,
             "WAL attrs should be cloned only for returned top-k results"
         );
+    }
+
+    #[tokio::test]
+    async fn test_wal_scan_negative_filter_matches_missing_attributes() {
+        let store = crate::storage::ZeppelinStore::new(std::sync::Arc::new(
+            object_store::memory::InMemory::new(),
+        ));
+        let namespace = "wal-scan-missing-attrs";
+        let mut initial_manifest = crate::wal::manifest::Manifest::new();
+        initial_manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(2))
+            .unwrap();
+        initial_manifest.write(&store, namespace).await.unwrap();
+
+        let vector = crate::types::VectorEntry {
+            id: "missing".to_string(),
+            values: vec![0.0, 0.0],
+            attributes: None,
+        };
+        let (_, manifest) = crate::wal::WalWriter::new(store.clone())
+            .append(namespace, vec![vector], vec![])
+            .await
+            .unwrap();
+        let wal_reader = WalReader::new(store);
+        let local_origin = manifest.local_origin().unwrap();
+        let located_fragments = manifest
+            .artifact_origin_resolver(&local_origin)
+            .unwrap()
+            .uncompacted_located_fragments()
+            .unwrap();
+        let filter = Filter::Not {
+            filter: Box::new(Filter::Eq {
+                field: "group".to_string(),
+                value: AttributeValue::String("g3".to_string()),
+            }),
+        };
+
+        let result = wal_scan(
+            &wal_reader,
+            &located_fragments,
+            &[0.0, 0.0],
+            Some(&filter),
+            DistanceMetric::Euclidean,
+            None,
+            None,
+            true,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result
+                .results
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<Vec<_>>(),
+            ["missing"],
+            "negative filters must evaluate a missing attribute map as empty"
+        );
+        assert!(result.results[0].attributes.is_none());
     }
 
     /// Ensures a WAL tombstone removes an already-compacted ANN hit.
