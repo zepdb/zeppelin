@@ -30,6 +30,15 @@ use zeppelin::wal::{FragmentCachePolicy, LeaseManager, WalReader, WalWriter};
 
 use common::assertions::*;
 
+/// Hang guard for waits on the background maintenance loop. This is not a
+/// latency assertion: the loop's first tick fires only after one
+/// `interval_secs` sleep, then runs discovery, GC, trigger evaluation, and
+/// health or deletion writes as serial object-store round trips. Against a
+/// shared MinIO under full-binary parallelism that serial work exceeds any
+/// tight fixed deadline, while a genuine lifecycle stall still trips this
+/// guard and fails the test.
+const BACKGROUND_LOOP_WAIT: Duration = Duration::from_secs(30);
+
 /// Create a Compactor with test-friendly settings.
 fn test_compactor(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
     let wal_reader = WalReader::new(store.clone());
@@ -1926,7 +1935,7 @@ async fn test_background_compaction_records_missing_active_manifest_failure() {
         })
     };
 
-    let health = tokio::time::timeout(Duration::from_secs(3), async {
+    let health = tokio::time::timeout(BACKGROUND_LOOP_WAIT, async {
         loop {
             let meta = namespace_manager.get(&ns).await.unwrap();
             if meta.compaction_health.consecutive_failures > 0 {
@@ -2206,7 +2215,7 @@ async fn test_background_discovery_resets_manifest_cache_across_remote_recreate_
         })
     };
 
-    let observed = tokio::time::timeout(Duration::from_secs(3), async {
+    let observed = tokio::time::timeout(BACKGROUND_LOOP_WAIT, async {
         loop {
             match manifest_cache.get_strong_required(&store, &ns).await {
                 Ok(manifest) if manifest.version() == recreated.version() => break manifest,
@@ -2304,7 +2313,7 @@ async fn test_background_compaction_accepts_missing_manifest_while_deleting() {
         }
     });
 
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(BACKGROUND_LOOP_WAIT, async {
         let metadata_key = zeppelin::namespace::manager::NamespaceMetadata::s3_key(&ns);
         while store.exists(&metadata_key).await.unwrap() {
             tokio::time::sleep(Duration::from_millis(20)).await;
