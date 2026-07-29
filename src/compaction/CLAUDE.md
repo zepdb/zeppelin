@@ -37,9 +37,10 @@ namespace deletes now depend on it.
 
 Centroids are reused when `new_from_wal / existing < retrain_imbalance_threshold`.
 
-Trap: **SQ8 is the default quantization.** Tests that build compaction configs
-with `..Default::default()` and are *not* testing quantization must explicitly
-set `quantization: None`, or they exercise a different path than intended.
+Trap: **TwoBit is the default quantization.** Tests that build compaction
+configs with `..Default::default()` and hand-build sketchless segments must
+pin `quantization: Scalar` or attach a rotation-seed sketch, or the segment
+fails validation. `segment_for_config` in `mod.rs` shows the pattern.
 
 ## CPU budget
 

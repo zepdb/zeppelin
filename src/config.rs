@@ -1917,7 +1917,8 @@ pub struct IndexingConfig {
     #[serde(default = "default_oversample_factor")]
     pub oversample_factor: usize,
     /// Quantization type for vector compression.
-    /// Default: Scalar (SQ8) for 4x compression and better cache utilization.
+    /// Default: TwoBit for ~16x compression; Scalar (SQ8) remains available
+    /// for 4x compression and better cache utilization.
     #[serde(default = "default_quantization")]
     pub quantization: crate::index::quantization::QuantizationType,
     /// Number of PQ subquantizers (only used when quantization = product).
@@ -2409,7 +2410,7 @@ impl Default for CacheConfig {
 impl Default for IndexingConfig {
     /// Builds the default IVF-Flat indexing and search policy.
     ///
-    /// Scalar quantization and bitmap indexes are enabled, while hierarchical
+    /// Two-bit quantization and bitmap indexes are enabled, while hierarchical
     /// IVF and full-text indexes remain opt-in.
     fn default() -> Self {
         Self {
