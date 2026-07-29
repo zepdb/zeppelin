@@ -356,6 +356,62 @@ struct EnvironmentCommandContext<'a> {
     op_index: u64,
 }
 
+#[derive(Default)]
+struct EnvironmentCommandOutcome {
+    crash: Option<CrashRequest>,
+    violations: Vec<Violation>,
+}
+
+struct OperationalQueryResult {
+    target_node: u8,
+    namespace: String,
+    exchange: RequestExchange,
+}
+
+async fn operational_query(
+    client: Client,
+    target_node: u8,
+    namespace: String,
+    base_url: String,
+    body: serde_json::Value,
+) -> OperationalQueryResult {
+    let path = format!("/v1/namespaces/{namespace}/query");
+    let exchange = request_exchange(
+        &client,
+        Method::POST,
+        &format!("{base_url}{path}"),
+        Some(body),
+        true,
+    )
+    .await;
+    OperationalQueryResult {
+        target_node,
+        namespace,
+        exchange,
+    }
+}
+
+fn operational_query_failure(
+    event_id: &str,
+    op_index: u64,
+    result: &OperationalQueryResult,
+    detail: impl Into<String>,
+) -> Violation {
+    Violation {
+        id: ViolationId::I19CrashRecovery,
+        op_index,
+        namespace: result.namespace.clone(),
+        detail: detail.into(),
+        evidence: json!({
+            "event_id": event_id,
+            "node": result.target_node,
+            "status": result.exchange.status,
+            "response": result.exchange.response,
+            "request_outcome": result.exchange.outcome.label(),
+        }),
+    }
+}
+
 impl OperationalState {
     fn record_second_node_started(&mut self) {
         assert!(
@@ -649,7 +705,8 @@ impl OperationalState {
         &mut self,
         commands: Vec<SchedulerCommand>,
         context: EnvironmentCommandContext<'_>,
-    ) {
+    ) -> EnvironmentCommandOutcome {
+        let mut outcome = EnvironmentCommandOutcome::default();
         let EnvironmentCommandContext {
             scheduler,
             operational_observer,
@@ -704,50 +761,144 @@ impl OperationalState {
                     );
                     const BURST_REQUESTS: usize = 8;
                     let mut tasks = tokio::task::JoinSet::new();
+                    let mut task_metadata = Vec::with_capacity(BURST_REQUESTS);
                     for burst in 0..BURST_REQUESTS {
                         let (ns, body) = queries[burst % queries.len()].clone();
                         let target_node = self.choose_read_target_node();
                         let base_url = self.target(primary, target_node).base_url.clone();
                         let client = client.clone();
-                        tasks.spawn(async move {
-                            let path = format!("/v1/namespaces/{ns}/query");
-                            let (status, response) = request_json(
-                                &client,
-                                Method::POST,
-                                &format!("{base_url}{path}"),
-                                Some(body),
-                            )
-                            .await;
-                            (target_node, ns, status, response)
-                        });
+                        let task = tasks.spawn(operational_query(
+                            client,
+                            target_node,
+                            ns.clone(),
+                            base_url,
+                            body,
+                        ));
+                        task_metadata.push((task.id(), target_node, ns));
                     }
                     let mut served = BTreeSet::new();
                     let mut completed = 0usize;
                     let mut successful = 0usize;
                     let mut load_shed = 0usize;
                     let mut storage_faulted = 0usize;
+                    let mut crash_ambiguous = 0usize;
+                    let controller = scheduler.and_then(FaultScheduler::process_controller);
+                    let mut crash = None;
                     let read_partition_active = scheduler
                         .is_some_and(|scheduler| scheduler.global_read_partition_active(op_index));
-                    while let Some(result) = tasks.join_next().await {
-                        let (target_node, ns, status, response) =
-                            result.expect("operational query task panicked");
+                    while !tasks.is_empty() {
+                        let joined = if crash.is_none() {
+                            if let Some(controller) = controller.as_ref() {
+                                tokio::select! {
+                                    () = controller.crash_requested.notified() => {
+                                        let requested = controller.take_request();
+                                        controller.park_token.cancel();
+                                        crash = Some(requested);
+                                        continue;
+                                    }
+                                    joined = tasks.join_next_with_id() => joined,
+                                }
+                            } else {
+                                tasks.join_next_with_id().await
+                            }
+                        } else {
+                            tasks.join_next_with_id().await
+                        };
+                        let Some(joined) = joined else {
+                            break;
+                        };
+                        let result = match joined {
+                            Ok((task_id, result)) => {
+                                task_metadata.retain(|(id, _, _)| *id != task_id);
+                                result
+                            }
+                            Err(error) => {
+                                let (_, target_node, namespace) = task_metadata
+                                    .iter()
+                                    .find(|(id, _, _)| *id == error.id())
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "operational query task {} had no request metadata",
+                                            error.id()
+                                        )
+                                    });
+                                task_metadata.retain(|(id, _, _)| *id != error.id());
+                                let failed = OperationalQueryResult {
+                                    target_node,
+                                    namespace,
+                                    exchange: ambiguous_exchange(
+                                        0,
+                                        AmbiguityReason::ConnectionError,
+                                    ),
+                                };
+                                outcome.violations.push(operational_query_failure(
+                                    &event_id,
+                                    op_index,
+                                    &failed,
+                                    format!(
+                                        "operational cache-fill child task failed while joining: \
+                                         {error}"
+                                    ),
+                                ));
+                                completed += 1;
+                                continue;
+                            }
+                        };
+                        let OperationalQueryResult {
+                            target_node,
+                            namespace: ns,
+                            exchange:
+                                RequestExchange {
+                                    status,
+                                    response,
+                                    outcome: request_outcome,
+                                },
+                        } = &result;
                         let expected_storage_fault = read_partition_active
-                            && is_expected_partitioned_cache_fill_response(status, &response);
-                        assert!(
-                            is_expected_cache_fill_response(status, &response)
-                                || expected_storage_fault,
-                            "operational cache-fill query failed for {ns}: \
-                             status={status} response={response}"
-                        );
+                            && is_expected_partitioned_cache_fill_response(*status, response);
+                        let request_was_ambiguous =
+                            matches!(request_outcome, OpOutcome::Ambiguous { .. });
+                        let crash_affected =
+                            crash.is_some() && (request_was_ambiguous || *status >= 500);
+                        if !is_expected_cache_fill_response(*status, response)
+                            && !expected_storage_fault
+                            && !crash_affected
+                        {
+                            outcome.violations.push(operational_query_failure(
+                                &event_id,
+                                op_index,
+                                &result,
+                                format!(
+                                    "unarmed operational cache-fill query failed for {ns}: \
+                                     status={status} response={response}"
+                                ),
+                            ));
+                        }
                         completed += 1;
-                        if (200..300).contains(&status) {
+                        if (200..300).contains(status) {
                             successful += 1;
                         } else if expected_storage_fault {
                             storage_faulted += 1;
+                        } else if crash_affected {
+                            crash_ambiguous += 1;
                         } else {
                             load_shed += 1;
                         }
-                        served.insert(target_node);
+                        served.insert(*target_node);
+                    }
+                    if crash.is_none() {
+                        if let Some(requested) = controller
+                            .as_ref()
+                            .and_then(ProcessController::try_take_request)
+                        {
+                            controller
+                                .as_ref()
+                                .expect("taken process crash requires a controller")
+                                .park_token
+                                .cancel();
+                            crash = Some(requested);
+                        }
                     }
                     assert_eq!(
                         completed, BURST_REQUESTS,
@@ -762,9 +913,14 @@ impl OperationalState {
                         Some(format!(
                             "completed={completed} successful={successful} \
                              load_shed={load_shed} storage_faulted={storage_faulted} \
-                             nodes={served:?}"
+                             crash_ambiguous={crash_ambiguous} nodes={served:?}"
                         )),
                     );
+                    assert!(
+                        outcome.crash.is_none(),
+                        "overlapping operational commands requested two process crashes"
+                    );
+                    outcome.crash = crash;
                 }
                 SchedulerCommand::DeleteNamespaceInFlight { event_id } => {
                     let operational_observer = operational_observer.expect(
@@ -901,6 +1057,7 @@ impl OperationalState {
                 other => panic!("node command was not enacted: {other:?}"),
             }
         }
+        outcome
     }
 }
 
@@ -1094,14 +1251,14 @@ pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
     };
 
     for seed in &env.seeds {
-        let outcome = run_seed(
+        let outcome = Box::pin(run_seed(
             &env,
             &artifacts,
             *seed,
             deadline,
             env.selftest,
             env.selftest,
-        )
+        ))
         .await;
         summary.seeds_run += 1;
         summary.failed_seeds += u64::from(outcome.failed && outcome.blocking_v1);
@@ -1185,7 +1342,15 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
 
     while Instant::now() < deadline || summary.seeds_run == 0 {
         let seed = overnight_seed(&env.seeds, seed_index);
-        let outcome = run_seed(&env, &artifacts, seed, deadline, env.selftest, env.selftest).await;
+        let outcome = Box::pin(run_seed(
+            &env,
+            &artifacts,
+            seed,
+            deadline,
+            env.selftest,
+            env.selftest,
+        ))
+        .await;
         summary.seeds_run += 1;
         summary.failed_seeds += u64::from(outcome.failed && outcome.blocking_v1);
         summary.non_blocking_findings += u64::from(outcome.failed && !outcome.blocking_v1);
@@ -1608,19 +1773,53 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
                 },
             )
             .await;
-        operational_state
-            .apply_environment_commands(
-                remaining,
-                EnvironmentCommandContext {
-                    scheduler: scheduler.as_ref(),
-                    operational_observer: operational_observer.as_ref(),
-                    client: &client,
-                    primary: &server,
-                    model: &mut model,
-                    op_index: source.index,
-                },
+        let environment = Box::pin(operational_state.apply_environment_commands(
+            remaining,
+            EnvironmentCommandContext {
+                scheduler: scheduler.as_ref(),
+                operational_observer: operational_observer.as_ref(),
+                client: &client,
+                primary: &server,
+                model: &mut model,
+                op_index: source.index,
+            },
+        ))
+        .await;
+        if !environment.violations.is_empty() {
+            failed = true;
+            failure_violations = environment.violations;
+            break;
+        }
+        if let Some(crash) = environment.crash {
+            let scheduler = scheduler
+                .as_ref()
+                .expect("replayed operational process crash requires a fault scheduler");
+            let controller = scheduler
+                .process_controller()
+                .expect("replayed operational process crash requires a controller");
+            let recovery = restart_after_crash(
+                &mut server,
+                &controller,
+                scheduler,
+                &mut injector,
+                &mut http_fault_context,
+                &store,
+                &harness.store,
+                &prefix,
+                &config,
+                true,
+                &client,
+                &model,
+                source.index,
+                crash,
             )
             .await;
+            if !recovery.is_empty() {
+                failed = true;
+                failure_violations = recovery;
+                break;
+            }
+        }
         let replay_lost_ack = replay_post_commit_selftest
             && source.status == 0
             && source.outcome == "ambiguous:connection_error";
@@ -3226,14 +3425,14 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
         let seed = 7;
         let clean_env = env.for_oracle_selftest(seed);
         let clean_artifacts = RunArtifacts::create(&clean_env);
-        let clean = run_seed(
+        let clean = Box::pin(run_seed(
             &clean_env,
             &clean_artifacts,
             seed,
             Instant::now() + Duration::from_secs(clean_env.seconds),
             None,
             Some(mutation),
-        )
+        ))
         .await;
         assert!(
             !clean.failed,
@@ -3244,14 +3443,14 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
 
         let mutated_env = env.for_oracle_selftest(seed);
         let mutated_artifacts = RunArtifacts::create(&mutated_env);
-        let mutated = run_seed(
+        let mutated = Box::pin(run_seed(
             &mutated_env,
             &mutated_artifacts,
             seed,
             Instant::now() + Duration::from_secs(mutated_env.seconds),
             Some(mutation),
             Some(mutation),
-        )
+        ))
         .await;
         assert!(
             mutated.failed,
@@ -3646,19 +3845,53 @@ async fn run_seed(
                 },
             )
             .await;
-        operational_state
-            .apply_environment_commands(
-                remaining,
-                EnvironmentCommandContext {
-                    scheduler: scheduler.as_ref(),
-                    operational_observer: operational_observer.as_ref(),
-                    client: &client,
-                    primary: &server,
-                    model: &mut model,
-                    op_index,
-                },
+        let environment = Box::pin(operational_state.apply_environment_commands(
+            remaining,
+            EnvironmentCommandContext {
+                scheduler: scheduler.as_ref(),
+                operational_observer: operational_observer.as_ref(),
+                client: &client,
+                primary: &server,
+                model: &mut model,
+                op_index,
+            },
+        ))
+        .await;
+        if !environment.violations.is_empty() {
+            failed = true;
+            failure_violations = environment.violations;
+            break;
+        }
+        if let Some(crash) = environment.crash {
+            let scheduler = scheduler
+                .as_ref()
+                .expect("operational process crash requires a fault scheduler");
+            let controller = scheduler
+                .process_controller()
+                .expect("operational process crash requires a controller");
+            let recovery = restart_after_crash(
+                &mut server,
+                &controller,
+                scheduler,
+                &mut injector,
+                &mut http_fault_context,
+                &store,
+                &harness.store,
+                &prefix,
+                &config,
+                true,
+                &client,
+                &model,
+                op_index,
+                crash,
             )
             .await;
+            if !recovery.is_empty() {
+                failed = true;
+                failure_violations = recovery;
+                break;
+            }
+        }
         let deferred_count =
             u64::try_from(deferred_ops.len()).expect("deferred operation count must fit in u64");
         let reserved_workload_slots = op_index
@@ -3892,19 +4125,53 @@ async fn run_seed(
                         },
                     )
                     .await;
-                operational_state
-                    .apply_environment_commands(
-                        remaining,
-                        EnvironmentCommandContext {
-                            scheduler: scheduler.as_ref(),
-                            operational_observer: operational_observer.as_ref(),
-                            client: &client,
-                            primary: &server,
-                            model: &mut model,
-                            op_index,
-                        },
+                let environment = Box::pin(operational_state.apply_environment_commands(
+                    remaining,
+                    EnvironmentCommandContext {
+                        scheduler: scheduler.as_ref(),
+                        operational_observer: operational_observer.as_ref(),
+                        client: &client,
+                        primary: &server,
+                        model: &mut model,
+                        op_index,
+                    },
+                ))
+                .await;
+                if !environment.violations.is_empty() {
+                    failed = true;
+                    failure_violations = environment.violations;
+                    break;
+                }
+                if let Some(crash) = environment.crash {
+                    let scheduler = scheduler
+                        .as_ref()
+                        .expect("operational process crash requires a fault scheduler");
+                    let controller = scheduler
+                        .process_controller()
+                        .expect("operational process crash requires a controller");
+                    let recovery = restart_after_crash(
+                        &mut server,
+                        &controller,
+                        scheduler,
+                        &mut injector,
+                        &mut http_fault_context,
+                        &store,
+                        &harness.store,
+                        &prefix,
+                        &config,
+                        true,
+                        &client,
+                        &model,
+                        op_index,
+                        crash,
                     )
                     .await;
+                    if !recovery.is_empty() {
+                        failed = true;
+                        failure_violations = recovery;
+                        break;
+                    }
+                }
                 assert_recorded_op_matches(recorded_ops.as_deref(), seed, op_index, &probe_op);
                 let target_node = operational_state.choose_target_node_for_op(&probe_op);
                 let target_server = operational_state.target(&server, target_node);
@@ -10299,6 +10566,39 @@ mod outcome_tests {
     use super::*;
     use crate::adversarial::faults::{Direction, FaultEvent, TargetSelector};
 
+    #[tokio::test]
+    async fn operational_query_returns_a_typed_transport_outcome() {
+        let result = operational_query(
+            raw_adversarial_client(),
+            1,
+            "operational-transport".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            json!({"sources": [], "top_k": 1}),
+        )
+        .await;
+
+        assert_eq!(result.target_node, 1);
+        assert_eq!(result.namespace, "operational-transport");
+        assert!(matches!(
+            result.exchange.outcome,
+            OpOutcome::Ambiguous {
+                reason: AmbiguityReason::ConnectionError,
+                status: None,
+            }
+        ));
+        let failure =
+            operational_query_failure("fill-disk-cache", 17, &result, "unarmed transport failure");
+        assert_eq!(failure.id, ViolationId::I19CrashRecovery);
+        assert_eq!(failure.op_index, 17);
+        assert_eq!(failure.namespace, "operational-transport");
+        assert_eq!(failure.evidence["event_id"], "fill-disk-cache");
+        assert_eq!(failure.evidence["node"], 1);
+        assert_eq!(
+            failure.evidence["request_outcome"],
+            "ambiguous:connection_error"
+        );
+    }
+
     #[test]
     fn i28_matches_destruction_evidence_only_through_the_current_tombstone() {
         let historical_key = "_audit/destruction/old-incarnation.json".to_string();
@@ -11108,14 +11408,14 @@ mod outcome_tests {
         };
         let artifacts = RunArtifacts::create(&env);
         let seed_dir = artifacts.root().join("seed-0");
-        let outcome = run_seed(
+        let outcome = Box::pin(run_seed(
             &env,
             &artifacts,
             0,
             Instant::now() + Duration::from_secs(30),
             None,
             None,
-        )
+        ))
         .await;
         assert!(!outcome.failed, "{:?}", outcome.violations);
 
@@ -11162,14 +11462,14 @@ mod outcome_tests {
         };
         let artifacts = RunArtifacts::create(&env);
         let seed_dir = artifacts.root().join("seed-49");
-        let outcome = run_seed(
+        let outcome = Box::pin(run_seed(
             &env,
             &artifacts,
             49,
             Instant::now() + Duration::from_secs(30),
             None,
             None,
-        )
+        ))
         .await;
         assert!(!outcome.failed, "{:?}", outcome.violations);
 
@@ -11371,14 +11671,14 @@ mod outcome_tests {
         };
         let artifacts = RunArtifacts::create(&env);
         let seed_dir = artifacts.root().join("seed-127");
-        let outcome = run_seed(
+        let outcome = Box::pin(run_seed(
             &env,
             &artifacts,
             127,
             Instant::now() + Duration::from_secs(60),
             None,
             None,
-        )
+        ))
         .await;
         assert!(!outcome.failed, "{:?}", outcome.violations);
         assert!(
@@ -12820,6 +13120,146 @@ mod outcome_tests {
         assert!(burst.contains("nodes={0}"), "{burst}");
 
         server.shutdown().await;
+        harness.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn supported_full_cache_fill_joins_an_armed_crash_and_restarts() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let namespace = format!("{prefix}-armed-cache-fill");
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::SupportedFull,
+            events: vec![FaultEvent {
+                id: "supported-full-cache-fill-crash".to_string(),
+                start_op: 9,
+                end_op: None,
+                boundary: Boundary::Process,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("cluster_".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::CrashAt {
+                    point: crate::adversarial::faults::process::CrashPoint::HydrationGet,
+                    position: TriggerPosition::Pre,
+                },
+            }],
+        });
+        let store = store_fault_proxy(&harness.store, scheduler.clone());
+        let config = deterministic_config();
+        let mut server = RestartableFullTestServer::new(
+            start_test_server_full(
+                store.clone(),
+                Some(prefix.clone()),
+                config.clone(),
+                false,
+                None,
+            )
+            .await,
+        );
+        let client = adversarial_client(&server);
+        let spec = NamespaceSpec {
+            dims: 2,
+            metric: DistanceMetric::Cosine,
+            quantization: QuantizationType::None,
+            num_centroids: 4,
+            fts_fields: Vec::new(),
+            bitmap: false,
+        };
+        let (create_status, _) = request_json(
+            &client,
+            Method::POST,
+            &format!("{}/v1/namespaces", server.base_url),
+            Some(spec.create_body(&namespace)),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::CREATED.as_u16());
+        let mut model = Model::default();
+        model.apply(
+            &Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
+                ns: namespace,
+                spec,
+            },
+            StatusCode::CREATED.as_u16(),
+            Some(1),
+            &json!({}),
+            None,
+        );
+
+        let controller = scheduler
+            .process_controller()
+            .expect("crash schedule must install a process controller");
+        controller.request_crash(CrashRequest {
+            event_id: "supported-full-cache-fill-crash".to_string(),
+            op_index: 9,
+            point: crate::adversarial::faults::process::CrashPoint::HydrationGet,
+            position: TriggerPosition::Pre,
+            key: format!("{prefix}/segments/pinned/cluster_0.bin"),
+        });
+        scheduler.advance_to(9);
+        let environment = OperationalState::default()
+            .apply_environment_commands(
+                vec![SchedulerCommand::FillDiskCache {
+                    event_id: "supported-full-cache-fill".to_string(),
+                }],
+                EnvironmentCommandContext {
+                    scheduler: Some(&scheduler),
+                    operational_observer: None,
+                    client: &client,
+                    primary: &server,
+                    model: &mut model,
+                    op_index: 9,
+                },
+            )
+            .await;
+        assert!(
+            environment.violations.is_empty(),
+            "{:?}",
+            environment
+                .violations
+                .iter()
+                .map(|violation| &violation.detail)
+                .collect::<Vec<_>>()
+        );
+        let crash = environment
+            .crash
+            .expect("armed operational crash was not surfaced");
+        let mut injector = None;
+        let mut http_fault_context = None;
+        let recovery = restart_after_crash(
+            &mut server,
+            &controller,
+            &scheduler,
+            &mut injector,
+            &mut http_fault_context,
+            &store,
+            &harness.store,
+            &prefix,
+            &config,
+            false,
+            &client,
+            &model,
+            9,
+            crash,
+        )
+        .await;
+        assert!(recovery.is_empty(), "{recovery:#?}");
+
+        let timeline = scheduler.timeline();
+        let burst = timeline
+            .iter()
+            .find(|event| event.event_id == "supported-full-cache-fill")
+            .and_then(|event| event.recovery.as_deref())
+            .expect("cache-fill completion proof missing");
+        assert!(burst.contains("completed=8"), "{burst}");
+        assert!(timeline.iter().any(|event| {
+            event.event_id == "supported-full-cache-fill-crash"
+                && event.recovery.as_deref() == Some("restart+health-wait")
+        }));
+
+        server.into_inner().shutdown().await;
         harness.cleanup().await;
     }
 
@@ -14276,14 +14716,14 @@ mod outcome_tests {
         };
         let source_artifacts = RunArtifacts::create(&source_env);
         let source_dir = source_artifacts.root().join("seed-3");
-        let source_outcome = run_seed(
+        let source_outcome = Box::pin(run_seed(
             &source_env,
             &source_artifacts,
             3,
             Instant::now() + Duration::from_secs(60),
             None,
             None,
-        )
+        ))
         .await;
         assert!(!source_outcome.failed, "{:?}", source_outcome.violations);
 
