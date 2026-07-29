@@ -217,6 +217,10 @@ pub mod error;
 /// indexes accelerate compacted text while the WAL path supplies strong-read
 /// coverage for visible uncompacted updates. BM25 relevance is higher-is-better.
 pub mod fts;
+/// Decode seams for the `fuzz/` libFuzzer targets, gated behind the `fuzz`
+/// feature so the crate-internal two-bit decoders stay internal otherwise.
+#[cfg(feature = "fuzz")]
+pub mod fuzz;
 /// Approximate-nearest-neighbor indexes, distance kernels, quantization, and bitmap filters.
 ///
 /// [`index::VectorIndex`] defines the build/search boundary implemented by

@@ -11,6 +11,8 @@ default = []
 profiling = ["dep:pprof"]
 managed = []
 branching-test-support = []
+# Exposes the crate-internal two-bit decoders to the fuzz/ targets.
+fuzz = []
 
 [[bin]]
 name = "zeppelin"

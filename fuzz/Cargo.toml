@@ -13,6 +13,7 @@ serde_json = "1"
 
 [dependencies.zeppelin]
 path = ".."
+features = ["fuzz"]
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -46,6 +47,11 @@ doc = false
 [[bin]]
 name = "fuzz_quantization"
 path = "fuzz_targets/fuzz_quantization.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_two_bit"
+path = "fuzz_targets/fuzz_two_bit.rs"
 doc = false
 
 [[bin]]
