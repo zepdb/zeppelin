@@ -136,7 +136,7 @@ exact = 0
 [assert.put_bytes.total]
 min = 26115
 max = 27362
-why = "manifest and history serialization grow with each measured batch commit Widened 256 B each side: manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance. Re-derived at 9adc1cb after receipt removal: the eight gate repeats spanned 26113..26848; the 256 B pad is unchanged. Re-derived at 20f7d40: 35d9f4d publishes one ClusterRowLayoutRef (8 integer fields, ~25 B) per cluster per object in every manifest carrying a quantized segment, on the default SQ8 path and not only for two-bit. Band method unchanged."
+why = "manifest and history serialization grow with each measured batch commit Widened 256 B each side: manifest-shaped objects encode timestamps at variable width and are not byte-deterministic; largest observed run-to-run drift on 23accb3 was 46 B, so the band pads 256 B each side. Still fails on a doubling or a disappearance. Re-derived at 9adc1cb after receipt removal: the eight gate repeats spanned 26113..26848; the 256 B pad is unchanged. Re-derived at 20f7d40: 35d9f4d publishes one ClusterRowLayoutRef (8 integer fields, ~25 B) per cluster per object in every manifest carrying a quantized segment, on the SQ8 contract path and not only for two-bit. Band method unchanged."
 [assert.put_bytes.wal]
 exact = 22506
 
