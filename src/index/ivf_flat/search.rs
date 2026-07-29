@@ -338,6 +338,10 @@ enum SqBytePhase {
 /// Independent async fetches share this value through [`Arc`]. Relaxed atomics
 /// are sufficient because the counters collect statistics only; they do not
 /// synchronize correctness state.
+///
+/// The `Sq` prefix is historical: the two-bit RaBitQ scan path charges the
+/// same counters and emission line. The D2 metric-rename track owns any
+/// naming change.
 struct SqSearchByteStats {
     /// Process-local diagnostic query identifier.
     query_id: u64,
@@ -380,7 +384,8 @@ impl SqSearchByteStats {
     ///
     /// # Parameters
     ///
-    /// - `enabled`: Whether the selected quantization mode is scalar.
+    /// - `enabled`: Whether the selected scan path reports byte diagnostics
+    ///   (scalar SQ8 or two-bit RaBitQ).
     ///
     /// # Returns
     ///
@@ -584,6 +589,18 @@ total_gets={total_gets} total_bytes={total_bytes}",
             rerank_bytes.saturating_sub(rerank_logical_bytes),
         );
     }
+}
+
+/// Returns whether a quantization mode's scan path reports byte diagnostics.
+///
+/// The two-bit RaBitQ scan shares the SQ counters and emission line, so both
+/// quantized coarse paths are eligible; unquantized and product-quantized
+/// scans carry no byte accounting.
+fn byte_stats_path(quantization: QuantizationType) -> bool {
+    matches!(
+        quantization,
+        QuantizationType::Scalar | QuantizationType::TwoBit
+    )
 }
 
 /// Returns the lazily initialized process-wide decoded-layout cache.
@@ -1280,8 +1297,7 @@ async fn search_ivf_flat_with_trace_inner(
     } else {
         top_k
     };
-    let sq_byte_stats =
-        SqSearchByteStats::new_if_enabled(matches!(index.quantization, QuantizationType::Scalar));
+    let sq_byte_stats = SqSearchByteStats::new_if_enabled(byte_stats_path(index.quantization));
 
     let scan_clusters = select_scan_clusters(
         index,
@@ -1326,6 +1342,7 @@ async fn search_ivf_flat_with_trace_inner(
                 fetch_k,
                 store,
                 cache,
+                sq_byte_stats.clone(),
                 rerank_coalesce_gap_bytes,
             )
             .await?
@@ -1342,6 +1359,7 @@ async fn search_ivf_flat_with_trace_inner(
                     fetch_k,
                     store,
                     cache,
+                    sq_byte_stats.clone(),
                     rerank_coalesce_gap_bytes,
                 )
                 .await?
@@ -2492,6 +2510,7 @@ async fn scan_clusters_rq(
     fetch_k: usize,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
+    byte_stats: Option<Arc<SqSearchByteStats>>,
     rerank_coalesce_gap_bytes: usize,
 ) -> Result<Vec<Candidate>> {
     use crate::index::quantization::rabitq::{self, StructuredRotation};
@@ -2532,13 +2551,23 @@ async fn scan_clusters_rq(
 
     // Phase 1: fetch only grouped coarse ranges and filter before truncation.
     let fetch_objects = cluster_fetch_objects(index, probe_clusters)?;
+    if let Some(stats) = &byte_stats {
+        SqSearchByteStats::set_usize(&stats.selected_clusters, probe_clusters.len());
+        SqSearchByteStats::set_usize(&stats.sq_objects, fetch_objects.len());
+    }
     let rq_prefetched =
-        futures::future::join_all(fetch_objects.iter().map(|object| async move {
-            load_rq_object_for_coarse(index, object, store, cache).await
-        }))
+        futures::future::join_all(
+            fetch_objects.iter().map(|object| {
+                let stats = byte_stats.clone();
+                async move {
+                    load_rq_object_for_coarse(index, object, store, cache, stats.as_deref()).await
+                }
+            }),
+        )
         .await;
     let meta_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
         let owner = index.cluster_owner(cluster_idx);
+        let stats = byte_stats.clone();
         async move {
             let metadata = load_filter_metadata(
                 index,
@@ -2548,7 +2577,7 @@ async fn scan_clusters_rq(
                 filter_metadata_path,
                 store,
                 cache,
-                None,
+                stats.as_deref(),
             )
             .await;
             (cluster_idx, metadata)
@@ -2671,7 +2700,7 @@ async fn scan_clusters_rq(
         fetch_k,
         store,
         cache,
-        None,
+        byte_stats,
         rerank_coalesce_gap_bytes,
         coarse_candidates,
         vector_ranges_by_cluster,
@@ -3193,18 +3222,22 @@ async fn load_sq_object_for_coarse(
 /// ZCL3 is accepted only through a grouped ranged layout. Missing directories,
 /// missing coarse spans, malformed RQ bytes, and row/full-vector misalignment
 /// are index errors; there is no whole-object or SQ sidecar fallback.
+///
+/// `stats` charges the coarse (SQ-phase) byte counters shared with the SQ8
+/// scan path; `None` disables accounting.
 async fn load_rq_object_for_coarse(
     index: &IvfFlatIndex,
     object: &ClusterFetchObject,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
+    stats: Option<&SqSearchByteStats>,
 ) -> Result<CoarseObjectRqFetch> {
     use crate::index::quantization::rq::{RqClusterCodes, RqClusterCodesOnly};
 
     // Manifest-declared layout: one range read covers the codes-only coarse
     // blocks and the hoisted ID blocks, and exact-vector spans are arithmetic.
     if !object.row_layouts.is_empty() {
-        let fetched = fetch_object_row_layout_range(object, store, cache, None).await?;
+        let fetched = fetch_object_row_layout_range(object, store, cache, stats).await?;
         let mut rq_clusters = Vec::with_capacity(object.clusters.len());
         let mut vector_ranges = Vec::with_capacity(object.clusters.len());
         for &cluster_idx in &object.clusters {
@@ -3239,7 +3272,7 @@ async fn load_rq_object_for_coarse(
         });
     }
 
-    let layout = load_cluster_object_layout(index, object, store, cache, None)
+    let layout = load_cluster_object_layout(index, object, store, cache, stats)
         .await?
         .ok_or_else(|| {
             ZeppelinError::Index(format!(
@@ -3261,7 +3294,7 @@ async fn load_rq_object_for_coarse(
         &object.clusters,
         store,
         cache,
-        None,
+        stats,
     )
     .await?;
     let mut rq_clusters = Vec::with_capacity(object.clusters.len());
@@ -5607,5 +5640,164 @@ mod tests {
         let err = coalesce_rerank_ranges(&requests, 1024).unwrap_err();
 
         assert!(err.to_string().contains("invalid rerank vector range"));
+    }
+
+    #[test]
+    /// Pins which quantization modes report per-query byte diagnostics.
+    ///
+    /// The two-bit RaBitQ scan shares the SQ counters and emission line, so the
+    /// default path must stay eligible; unquantized and product-quantized scans
+    /// never allocate counters.
+    fn byte_stats_eligibility_covers_scalar_and_two_bit() {
+        assert!(byte_stats_path(QuantizationType::Scalar));
+        assert!(byte_stats_path(QuantizationType::TwoBit));
+        assert!(!byte_stats_path(QuantizationType::None));
+        assert!(!byte_stats_path(QuantizationType::Product));
+    }
+
+    /// Builds a zeroed counter set without consulting the environment flag.
+    ///
+    /// Direct construction keeps the RQ accounting test deterministic under
+    /// parallel test execution: no `ZEPPELIN_SQ_BYTE_STATS` mutation and no
+    /// process-global query-id dependence.
+    fn zeroed_byte_stats() -> Arc<SqSearchByteStats> {
+        Arc::new(SqSearchByteStats {
+            query_id: 0,
+            sq_gets: AtomicU64::new(0),
+            sq_bytes: AtomicU64::new(0),
+            sq_logical_bytes: AtomicU64::new(0),
+            rerank_gets: AtomicU64::new(0),
+            rerank_bytes: AtomicU64::new(0),
+            rerank_logical_bytes: AtomicU64::new(0),
+            other_gets: AtomicU64::new(0),
+            other_bytes: AtomicU64::new(0),
+            local_bytes: AtomicU64::new(0),
+            selected_clusters: AtomicU64::new(0),
+            sq_objects: AtomicU64::new(0),
+            coarse_candidates: AtomicU64::new(0),
+            rerank_candidates: AtomicU64::new(0),
+            rerank_clusters: AtomicU64::new(0),
+            rerank_objects: AtomicU64::new(0),
+            final_results: AtomicU64::new(0),
+        })
+    }
+
+    #[tokio::test]
+    /// Proves the two-bit scan charges the shared byte counters end to end.
+    ///
+    /// A real `ZBP5` row-layout object with two-bit coarse codes is built
+    /// through the production serializers, stored in memory, and scanned via
+    /// `scan_clusters_rq` with counters injected. Every phase the SQ8 path
+    /// reports — object selection, coarse GET/byte and logical-byte accounting,
+    /// rerank candidate and object selection, rerank GET/bytes — must move.
+    async fn rq_scan_populates_byte_stats_like_the_sq_path() {
+        use crate::index::ivf_flat::build::{
+            serialize_cluster_data_object_v5, serialize_fixed_stride_f32_block, serialize_id_block,
+            Zbp5ClusterBlocks,
+        };
+        use crate::index::quantization::rabitq::{StructuredRotation, BLOCK_DIM};
+        use crate::index::quantization::rq::RqClusterCodes;
+        use crate::wal::manifest::{ClusterRowLayoutRef, SketchRef, CLUSTER_LAYOUT_VERSION_ZBP5};
+
+        const ROTATION_SEED: u64 = 7;
+        let store = ZeppelinStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
+
+        // One cluster, four two-dimensional rows padded into one 256-dim code.
+        let ids: Vec<String> = (0..4).map(|row| format!("rq-{row}")).collect();
+        let rows: Vec<Vec<f32>> = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 1.0],
+        ];
+        let rotation = StructuredRotation::new(BLOCK_DIM, ROTATION_SEED).unwrap();
+        let row_refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+        let codes = RqClusterCodes::encode(&ids, &row_refs, &[0.0, 0.0], &rotation).unwrap();
+        let coarse = codes.to_codes_only_bytes();
+        let id_block = serialize_id_block(&ids).unwrap();
+        let vector_block = serialize_fixed_stride_f32_block(&rows, 2).unwrap();
+        let object = serialize_cluster_data_object_v5(&[Zbp5ClusterBlocks {
+            cluster_idx: 0,
+            row_count: rows.len(),
+            dim: 2,
+            coarse: &coarse,
+            ids: &id_block,
+            vectors: &vector_block,
+        }])
+        .unwrap();
+
+        let object_key = "test_ns/segments/seg_001/cluster_group_0.bin".to_string();
+        store.put(&object_key, object.bytes.clone()).await.unwrap();
+
+        let mut index = make_index();
+        index.quantization = QuantizationType::TwoBit;
+        index.sketch_ref = Some(SketchRef {
+            key: "test_ns/segments/seg_001/coarse_sketch.bin".to_string(),
+            version: 4,
+            code_dims: BLOCK_DIM,
+            bytes_per_vector: 0,
+            size_bytes: 0,
+            rotation_seed: Some(ROTATION_SEED),
+        });
+        index.cluster_objects = vec![crate::wal::manifest::ClusterDataObjectRef {
+            key: object_key,
+            clusters: vec![0],
+            live_offset: 0,
+            live_len: 0,
+            size_bytes: object.bytes.len() as u64,
+            cluster_layout_version: CLUSTER_LAYOUT_VERSION_ZBP5,
+            row_layouts: object
+                .layout
+                .iter()
+                .map(ClusterRowLayoutRef::from)
+                .collect(),
+        }];
+        index.cluster_object_by_cluster = vec![0];
+
+        let stats = zeroed_byte_stats();
+        let candidates = scan_clusters_rq(
+            &index,
+            &[0],
+            &[0.0, 0.0],
+            DistanceMetric::Euclidean,
+            None,
+            select_filter_metadata_path(&index, None),
+            4,
+            &store,
+            None,
+            Some(stats.clone()),
+            crate::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            candidates.len(),
+            rows.len(),
+            "every row must survive rerank"
+        );
+
+        // Coarse phase: cluster/object selection and the row-layout range GET.
+        assert_eq!(stats.selected_clusters.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.sq_objects.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.sq_gets.load(Ordering::Relaxed), 1);
+        assert!(stats.sq_bytes.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            stats.sq_logical_bytes.load(Ordering::Relaxed),
+            (coarse.len() + id_block.len()) as u64,
+            "logical coarse bytes must exclude span slack"
+        );
+
+        // Rerank phase: candidate truncation, object selection, vector GETs.
+        assert_eq!(stats.coarse_candidates.load(Ordering::Relaxed), 4);
+        assert_eq!(stats.rerank_candidates.load(Ordering::Relaxed), 4);
+        assert_eq!(stats.rerank_clusters.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.rerank_objects.load(Ordering::Relaxed), 1);
+        assert!(stats.rerank_gets.load(Ordering::Relaxed) >= 1);
+        assert!(stats.rerank_bytes.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            stats.rerank_logical_bytes.load(Ordering::Relaxed),
+            (rows.len() * 2 * 4) as u64,
+            "rerank logical bytes must be rows × dim × f32"
+        );
     }
 }
