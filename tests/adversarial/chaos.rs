@@ -68,6 +68,10 @@ pub struct ChaosHandle {
 }
 
 impl ChaosHandle {
+    pub fn enable(&self) {
+        self.enabled.store(true, Ordering::SeqCst);
+    }
+
     pub fn disable(&self) {
         self.enabled.store(false, Ordering::SeqCst);
     }
@@ -586,6 +590,38 @@ mod tests {
             .put("ns/second.wal", Bytes::from_static(b"acked"))
             .await
             .expect("latched fault must not fire twice");
+        assert_eq!(handle.fired().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn disabled_chaos_does_not_consume_fault_ordinal_before_enable() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let plan = FaultPlan {
+            sites: vec![FaultSite {
+                id: "first-put".to_string(),
+                op: StoreOp::Put,
+                key_substring: "/".to_string(),
+                mode: FaultMode::FailNthMatch { n: 1 },
+                enabled: true,
+            }],
+        };
+        let (faulted, handle) = chaos_store(&inner, plan);
+        handle.disable();
+
+        faulted
+            .put("bootstrap/record", Bytes::from_static(b"ready"))
+            .await
+            .expect("disabled chaos must not fault harness bootstrap");
+        assert!(handle.fired().is_empty());
+
+        handle.enable();
+        let result = faulted
+            .put("workload/record", Bytes::from_static(b"fault"))
+            .await;
+        assert!(
+            result.is_err(),
+            "the first workload match must retain ordinal one"
+        );
         assert_eq!(handle.fired().len(), 1);
     }
 }

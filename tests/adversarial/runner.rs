@@ -1372,6 +1372,9 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let prefix = harness.prefix.clone();
     let (legacy_instrumented_store, chaos_handle) =
         wrap_chaos_store(&harness.store, chaos_plan.clone());
+    if let Some(chaos) = &chaos_handle {
+        chaos.disable();
+    }
     let instrumented_store = scheduler
         .as_ref()
         .map_or(legacy_instrumented_store.clone(), |scheduler| {
@@ -1442,6 +1445,9 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
                 proxy_base_url: injector.base_url(),
             });
     let client = adversarial_client(&server);
+    if let Some(chaos) = &chaos_handle {
+        chaos.enable();
+    }
     let mut model = Model::default();
     if let (Some(program), Some(policy_version)) =
         (security_program.clone(), bootstrapped_policy_version)
@@ -3438,6 +3444,9 @@ async fn run_seed(
         .or_else(|| branching_profile.then_some(FaultProfile::Branching));
     let (legacy_instrumented_store, chaos_handle) =
         wrap_chaos_store(&harness.store, chaos_plan.clone());
+    if let Some(chaos) = &chaos_handle {
+        chaos.disable();
+    }
     let instrumented_store = scheduler
         .as_ref()
         .map_or(legacy_instrumented_store.clone(), |scheduler| {
@@ -3502,6 +3511,9 @@ async fn run_seed(
                 proxy_base_url: injector.base_url(),
             });
     let client = adversarial_client(&server);
+    if let Some(chaos) = &chaos_handle {
+        chaos.enable();
+    }
     let mut model = Model::default();
     if let (Some(program), Some(policy_version)) =
         (security_program.clone(), bootstrapped_policy_version)
