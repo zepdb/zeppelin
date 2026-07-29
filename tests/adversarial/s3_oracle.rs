@@ -5,6 +5,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use zeppelin::compaction::gc::{
     load_gc_candidates, reachable_keys, reachable_keys_with_retained_history_and_staging,
 };
+use zeppelin::error::ZeppelinError;
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::wal::manifest::{ManifestHistoryRef, SketchRef};
 use zeppelin::wal::Manifest;
@@ -239,14 +240,23 @@ impl S3Tracker {
                 }
             }
         };
-        let mut missing = reachable
+        let mut missing_candidates = reachable
             .difference(&listed)
             .filter(|key| !known_tainted_keys.contains(*key))
             .cloned()
             .collect::<Vec<String>>();
         if inject_missing_reachable {
-            missing.push(format!("{namespace}/__adversarial_missing_live_key"));
+            missing_candidates.push(format!("{namespace}/__adversarial_missing_live_key"));
         }
+        let (missing, mut absence_violations) = confirm_missing_reachable_keys(
+            store,
+            namespace,
+            op_index,
+            missing_candidates,
+            fault_window_active,
+        )
+        .await;
+        violations.append(&mut absence_violations);
         if !missing.is_empty() {
             violations.push(violation(
                 ViolationId::I14S3Reachability,
@@ -935,6 +945,69 @@ async fn list_prefix_for_oracle(
     }
 }
 
+enum ReachableAbsenceProbe {
+    Present,
+    Missing,
+    ReadFailed(String),
+}
+
+async fn confirm_missing_reachable_keys(
+    store: &ZeppelinStore,
+    namespace: &str,
+    op_index: u64,
+    candidates: Vec<String>,
+    fault_window_active: bool,
+) -> (Vec<String>, Vec<Violation>) {
+    let mut missing = Vec::new();
+    let mut violations = Vec::new();
+    for key in candidates {
+        match probe_reachable_absence_for_oracle(store, &key).await {
+            ReachableAbsenceProbe::Present => {}
+            ReachableAbsenceProbe::Missing => missing.push(key),
+            ReachableAbsenceProbe::ReadFailed(error) if fault_window_active => {
+                eprintln!(
+                    "tolerated reachable-key HEAD failure in active fault window for \
+                     {namespace}: key={key}: {error}"
+                );
+            }
+            ReachableAbsenceProbe::ReadFailed(error) => {
+                violations.push(violation(
+                    ViolationId::I14S3Reachability,
+                    op_index,
+                    namespace,
+                    "manifest-reachable S3 key HEAD read-failed during absence confirmation",
+                    json!({ "key": key, "error": error }),
+                ));
+            }
+        }
+    }
+    (missing, violations)
+}
+
+async fn probe_reachable_absence_for_oracle(
+    store: &ZeppelinStore,
+    key: &str,
+) -> ReachableAbsenceProbe {
+    match store.head(key).await {
+        Ok(_) => ReachableAbsenceProbe::Present,
+        Err(first_error) => {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            match store.head(key).await {
+                Ok(_) => ReachableAbsenceProbe::Present,
+                Err(retry_error)
+                    if matches!(first_error, ZeppelinError::NotFound { .. })
+                        && matches!(retry_error, ZeppelinError::NotFound { .. }) =>
+                {
+                    ReachableAbsenceProbe::Missing
+                }
+                Err(retry_error) => ReachableAbsenceProbe::ReadFailed(format!(
+                    "first_error={first_error}; retry_error={retry_error}"
+                )),
+            }
+        }
+    }
+}
+
 async fn list_history_for_oracle(
     store: &ZeppelinStore,
     namespace: &str,
@@ -1136,6 +1209,100 @@ mod tests {
             )
             .await;
         assert!(tainted.is_empty(), "{tainted:#?}");
+    }
+
+    #[tokio::test]
+    async fn list_omitted_reachable_key_is_confirmed_by_head_before_i14() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let fragment_id = Ulid::from(2_u128);
+        let fragment_key = format!("ns/wal/{fragment_id}.wal");
+        inner
+            .put(&fragment_key, bytes::Bytes::from_static(b"wal"))
+            .await
+            .unwrap();
+        let mut manifest = Manifest::new();
+        manifest.add_fragment(FragmentRef {
+            id: fragment_id,
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 3,
+            artifact_origin: None,
+        });
+        manifest.write(&inner, "ns").await.unwrap();
+        let omit_nth = inner
+            .list_prefix("ns/")
+            .await
+            .unwrap()
+            .iter()
+            .position(|key| key == &fragment_key)
+            .map(|index| index as u32 + 1)
+            .expect("reachable fragment key must be listed before the injected omission");
+
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Semantic,
+            events: vec![FaultEvent {
+                id: "semantic-list-omit-reachable".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::List),
+                    key_substring: Some("ns/".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::ListOmit { nth: omit_nth },
+            }],
+        });
+        let faulted = store_fault_proxy(&inner, scheduler.clone());
+
+        let violations = S3Tracker::default()
+            .check_namespace(
+                &faulted,
+                "ns",
+                7,
+                &json!({ "manifest_generation": 1 }),
+                false,
+            )
+            .await;
+
+        assert_eq!(scheduler.timeline().len(), 1);
+        assert!(
+            violations.is_empty(),
+            "LIST omission alone must not prove physical S3 absence: {violations:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reachable_absence_confirmation_keeps_real_not_found_key() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let missing_key = "ns/wal/missing.wal".to_string();
+
+        let (missing, violations) =
+            confirm_missing_reachable_keys(&store, "ns", 7, vec![missing_key.clone()], false).await;
+
+        assert!(violations.is_empty(), "{violations:#?}");
+        assert_eq!(missing, vec![missing_key]);
+    }
+
+    #[tokio::test]
+    async fn reachable_absence_confirmation_reports_head_failure_outside_fault_window() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let key = "ns/wal/existing.wal".to_string();
+        inner
+            .put(&key, bytes::Bytes::from_static(b"wal"))
+            .await
+            .unwrap();
+        let faulted = pre_fail_store(&inner, StoreOp::Head, &key);
+
+        let (missing, violations) =
+            confirm_missing_reachable_keys(&faulted, "ns", 7, vec![key.clone()], false).await;
+
+        assert!(missing.is_empty(), "{missing:#?}");
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].id, ViolationId::I14S3Reachability);
+        assert!(violations[0].detail.contains("HEAD read-failed"));
+        assert_eq!(violations[0].evidence["key"], key);
     }
 
     #[tokio::test]
