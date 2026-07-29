@@ -30,7 +30,7 @@ use super::oracle::{Violation, ViolationId};
 use super::security_program::SecurityProgramConfig;
 use super::{effective_seed_assignment, RunMode, RunnerEnv, SeedAssignment};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RunArtifacts {
     root: PathBuf,
     start_manifest: RunManifest,
@@ -157,6 +157,23 @@ impl RunArtifacts {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn write_watchdog_failure(
+        &self,
+        seed: u64,
+        failure: &FailureManifest,
+        watchdog: &serde_json::Value,
+    ) {
+        let seed_dir = self.root.join(format!("seed-{seed}"));
+        fs::create_dir_all(&seed_dir).unwrap_or_else(|error| {
+            panic!(
+                "failed to create watchdog artifact dir {}: {error}",
+                seed_dir.display()
+            )
+        });
+        write_json(seed_dir.join("failure.json"), failure);
+        write_json(seed_dir.join("watchdog.json"), watchdog);
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -3,7 +3,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -31,7 +31,7 @@ use crate::common::server::{
     cleanup_ns, client_with_bearer, start_test_server_full,
     start_test_server_full_with_disk_cache_max_bytes,
     start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer, FullTestServer,
-    WorkloadCredentialRegistry,
+    FullTestServerWatchdogHandle, WorkloadCredentialRegistry,
 };
 
 use super::artifacts::{
@@ -74,6 +74,8 @@ use super::{effective_seed_assignment, PreserveMode, RunMode, RunnerEnv};
 const AMBIGUITY_MARKER: &str = "_adversarial_ambiguity";
 const STORE_FAULT_MARKER: &str = "_adversarial_store_fault";
 const DUAL_WRITER_LEASE_HOLD_EVENT_ID: &str = "ops-dual-writer-lease-hold";
+const SEED_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(60);
+const SEED_WATCHDOG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const SECURITY_OP_KINDS: [&str; 20] = [
     "create_key",
     "rotate_key",
@@ -242,6 +244,212 @@ impl HttpFaultContext {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct SeedProgressSnapshot {
+    seed: u64,
+    current_op: u64,
+    runner_phase: String,
+    active_event_ids: Vec<String>,
+    pending_held_operation: Option<serde_json::Value>,
+    deferred_operation_count: usize,
+    quiet_drain_operation_count: usize,
+    server_lifecycle: serde_json::Value,
+    artifact_path: PathBuf,
+    preserved_prefix: Option<String>,
+}
+
+#[derive(Clone)]
+struct SeedWatchdogContext {
+    progress: Arc<Mutex<SeedProgressSnapshot>>,
+    server: Arc<Mutex<Option<FullTestServerWatchdogHandle>>>,
+    scheduler: Arc<Mutex<Option<FaultScheduler>>>,
+}
+
+impl SeedWatchdogContext {
+    fn new(seed: u64, artifact_path: PathBuf) -> Self {
+        Self {
+            progress: Arc::new(Mutex::new(SeedProgressSnapshot {
+                seed,
+                current_op: 0,
+                runner_phase: "starting".to_string(),
+                active_event_ids: Vec::new(),
+                pending_held_operation: None,
+                deferred_operation_count: 0,
+                quiet_drain_operation_count: 0,
+                server_lifecycle: json!({"state": "not-started"}),
+                artifact_path,
+                preserved_prefix: None,
+            })),
+            server: Arc::new(Mutex::new(None)),
+            scheduler: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn register_scheduler(&self, scheduler: Option<&FaultScheduler>) {
+        *self
+            .scheduler
+            .lock()
+            .expect("seed watchdog scheduler mutex poisoned") = scheduler.cloned();
+    }
+
+    fn register_prefix(&self, prefix: &str) {
+        self.progress
+            .lock()
+            .expect("seed watchdog progress mutex poisoned")
+            .preserved_prefix = Some(prefix.to_string());
+    }
+
+    fn register_server(&self, server: &FullTestServer) {
+        let handle = server.watchdog_handle();
+        let lifecycle = handle.lifecycle_state();
+        *self
+            .server
+            .lock()
+            .expect("seed watchdog server mutex poisoned") = Some(handle);
+        self.progress
+            .lock()
+            .expect("seed watchdog progress mutex poisoned")
+            .server_lifecycle = lifecycle;
+    }
+
+    fn update(
+        &self,
+        phase: &str,
+        op_index: u64,
+        scheduler: Option<&FaultScheduler>,
+        pending_held_op: Option<&PendingHeldOp>,
+        deferred_operation_count: usize,
+        quiet_drain_operation_count: usize,
+    ) {
+        let active_event_ids =
+            scheduler.map_or_else(Vec::new, |scheduler| scheduler.active_event_ids(op_index));
+        let pending_held_operation = pending_held_op.map(|pending| {
+            json!({
+                "event_id": pending.event_id,
+                "operation_id": pending.op_index,
+                "namespace": pending.namespace,
+                "scheduled_release_op": pending.scheduled_release_op,
+                "actual_release_op": pending.release_op,
+                "release_cause": pending.release_cause,
+            })
+        });
+        let server_lifecycle = self
+            .server
+            .lock()
+            .expect("seed watchdog server mutex poisoned")
+            .as_ref()
+            .map_or_else(
+                || json!({"state": "not-started"}),
+                FullTestServerWatchdogHandle::lifecycle_state,
+            );
+        let previous = self.snapshot();
+        *self
+            .progress
+            .lock()
+            .expect("seed watchdog progress mutex poisoned") = SeedProgressSnapshot {
+            seed: previous.seed,
+            current_op: op_index,
+            runner_phase: phase.to_string(),
+            active_event_ids,
+            pending_held_operation,
+            deferred_operation_count,
+            quiet_drain_operation_count,
+            server_lifecycle,
+            artifact_path: previous.artifact_path,
+            preserved_prefix: previous.preserved_prefix,
+        };
+    }
+
+    fn snapshot(&self) -> SeedProgressSnapshot {
+        self.progress
+            .lock()
+            .expect("seed watchdog progress mutex poisoned")
+            .clone()
+    }
+
+    fn mark_phase(&self, phase: &str) {
+        let lifecycle = self
+            .server
+            .lock()
+            .expect("seed watchdog server mutex poisoned")
+            .as_ref()
+            .map_or_else(
+                || json!({"state": "not-started"}),
+                FullTestServerWatchdogHandle::lifecycle_state,
+            );
+        let mut progress = self
+            .progress
+            .lock()
+            .expect("seed watchdog progress mutex poisoned");
+        progress.runner_phase = phase.to_string();
+        progress.server_lifecycle = lifecycle;
+    }
+
+    fn refresh_server_lifecycle(&self) {
+        let lifecycle = self
+            .server
+            .lock()
+            .expect("seed watchdog server mutex poisoned")
+            .as_ref()
+            .map_or_else(
+                || json!({"state": "not-started"}),
+                FullTestServerWatchdogHandle::lifecycle_state,
+            );
+        self.progress
+            .lock()
+            .expect("seed watchdog progress mutex poisoned")
+            .server_lifecycle = lifecycle;
+    }
+
+    fn begin_abort(&self) {
+        if let Some(scheduler) = self
+            .scheduler
+            .lock()
+            .expect("seed watchdog scheduler mutex poisoned")
+            .as_ref()
+        {
+            scheduler.release_held_calls();
+            if let Some(controller) = scheduler.process_controller() {
+                controller.park_token.cancel();
+            }
+        }
+        if let Some(server) = self
+            .server
+            .lock()
+            .expect("seed watchdog server mutex poisoned")
+            .as_ref()
+        {
+            server.begin_abort();
+        }
+        let mut progress = self
+            .progress
+            .lock()
+            .expect("seed watchdog progress mutex poisoned");
+        progress.runner_phase = "watchdog-expired".to_string();
+        progress.server_lifecycle = self
+            .server
+            .lock()
+            .expect("seed watchdog server mutex poisoned")
+            .as_ref()
+            .map_or_else(
+                || json!({"state": "not-started"}),
+                FullTestServerWatchdogHandle::lifecycle_state,
+            );
+    }
+
+    async fn finish_cleanup(&self) -> Result<(), String> {
+        let server = self
+            .server
+            .lock()
+            .expect("seed watchdog server mutex poisoned")
+            .clone();
+        match server {
+            Some(server) => server.finish_cleanup().await,
+            None => Ok(()),
+        }
+    }
+}
+
 /// Owns the primary test server across simulated crashes.
 ///
 /// Keeping the server in an explicit slot makes the lifecycle boundary visible:
@@ -250,16 +458,29 @@ impl HttpFaultContext {
 /// refresh tasks are still alive.
 struct RestartableFullTestServer {
     server: Option<FullTestServer>,
+    watchdog: Option<SeedWatchdogContext>,
 }
 
 impl RestartableFullTestServer {
     fn new(server: FullTestServer) -> Self {
         Self {
             server: Some(server),
+            watchdog: None,
+        }
+    }
+
+    fn new_with_watchdog(server: FullTestServer, watchdog: SeedWatchdogContext) -> Self {
+        watchdog.register_server(&server);
+        Self {
+            server: Some(server),
+            watchdog: Some(watchdog),
         }
     }
 
     fn take(&mut self) -> FullTestServer {
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.mark_phase("crash-retirement");
+        }
         self.server
             .take()
             .expect("primary test server must be present before lifecycle transition")
@@ -270,11 +491,16 @@ impl RestartableFullTestServer {
             self.server.is_none(),
             "replacement may only be installed after the old primary test server is dropped"
         );
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.register_server(&replacement);
+        }
         self.server = Some(replacement);
     }
 
     fn into_inner(mut self) -> FullTestServer {
-        self.take()
+        self.server
+            .take()
+            .expect("primary test server must be present before final shutdown")
     }
 }
 
@@ -1234,6 +1460,195 @@ struct SeedOutcome {
     fired_faults: Vec<FiredFault>,
 }
 
+#[derive(Debug, Serialize)]
+struct SeedWatchdogExpiration {
+    progress: SeedProgressSnapshot,
+    watchdog_timeout_ms: u128,
+    owner_task_join: String,
+    cleanup_timeout_ms: u128,
+    cleanup_result: String,
+}
+
+enum OwnedSeedTask<T> {
+    Completed(T),
+    Expired(Box<SeedWatchdogExpiration>),
+}
+
+async fn run_owned_seed_task<F, T>(
+    future: F,
+    watchdog: SeedWatchdogContext,
+    watchdog_timeout: Duration,
+    cleanup_timeout: Duration,
+) -> OwnedSeedTask<T>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut owner = tokio::spawn(future);
+    match tokio::time::timeout(watchdog_timeout, &mut owner).await {
+        Ok(result) => OwnedSeedTask::Completed(
+            result
+                .unwrap_or_else(|error| panic!("bounded seed task failed while joining: {error}")),
+        ),
+        Err(_) => {
+            watchdog.begin_abort();
+            owner.abort();
+            let owner_task_join = match owner.await {
+                Err(error) if error.is_cancelled() => "cancelled-and-joined".to_string(),
+                Ok(_) => "completed-during-watchdog-cancellation".to_string(),
+                Err(error) => format!("join-failed:{error}"),
+            };
+
+            let cleanup_watchdog = watchdog.clone();
+            let mut cleanup = tokio::spawn(async move { cleanup_watchdog.finish_cleanup().await });
+            let cleanup_result = match tokio::time::timeout(cleanup_timeout, &mut cleanup).await {
+                Ok(Ok(Ok(()))) => "completed".to_string(),
+                Ok(Ok(Err(error))) => format!("failed:{error}"),
+                Ok(Err(error)) => format!("join-failed:{error}"),
+                Err(_) => {
+                    cleanup.abort();
+                    let joined = cleanup.await;
+                    format!("timed-out; abort_join={joined:?}")
+                }
+            };
+            watchdog.refresh_server_lifecycle();
+            OwnedSeedTask::Expired(Box::new(SeedWatchdogExpiration {
+                progress: watchdog.snapshot(),
+                watchdog_timeout_ms: watchdog_timeout.as_millis(),
+                owner_task_join,
+                cleanup_timeout_ms: cleanup_timeout.as_millis(),
+                cleanup_result,
+            }))
+        }
+    }
+}
+
+fn seed_watchdog_outcome(
+    env: &RunnerEnv,
+    artifacts: &RunArtifacts,
+    seed: u64,
+    mutation: Option<OracleMutation>,
+    started: Instant,
+    expiration: SeedWatchdogExpiration,
+) -> SeedOutcome {
+    let assignment = effective_seed_assignment(env.mode, env.profile, seed);
+    let profile = scheduled_profile(assignment.profile);
+    let mode = if profile.is_some() {
+        RunMode::Chaos
+    } else {
+        assignment.mode
+    };
+    let evidence =
+        serde_json::to_value(&expiration).expect("seed watchdog expiration must serialize");
+    let violation = Violation {
+        id: ViolationId::I19CrashRecovery,
+        op_index: expiration.progress.current_op,
+        namespace: expiration
+            .progress
+            .pending_held_operation
+            .as_ref()
+            .and_then(|pending| pending.get("namespace"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("_runner")
+            .to_string(),
+        detail: "per-seed watchdog expired before the runner reached a terminal outcome"
+            .to_string(),
+        evidence: evidence.clone(),
+    };
+    let backend = env
+        .env_echo
+        .get("TEST_BACKEND")
+        .map(String::as_str)
+        .unwrap_or("memory");
+    let replay_max_ops = expiration
+        .progress
+        .current_op
+        .checked_add(1)
+        .expect("watchdog replay max-ops overflowed");
+    artifacts.write_watchdog_failure(
+        seed,
+        &FailureManifest {
+            seed,
+            mode,
+            op_index: expiration.progress.current_op,
+            violations: vec![violation.clone()],
+            preserved_prefix: expiration
+                .progress
+                .preserved_prefix
+                .clone()
+                .unwrap_or_else(|| "_runner-watchdog".to_string()),
+            fault_plan: mutation.map(|mutation| mutation.key().to_string()),
+            repro_cmd: format!(
+                "TEST_BACKEND={backend} ZEPPELIN_ADVERSARIAL_REPLAY={} \
+                 ZEPPELIN_ADVERSARIAL_MAX_OPS={replay_max_ops} \
+                 cargo test --test adversarial_workload_tests replay_seed -- --ignored --nocapture",
+                expiration.progress.artifact_path.display(),
+            ),
+            inspect_cmd: format!(
+                "TEST_BACKEND={backend} ZEPPELIN_ADVERSARIAL_INSPECT={} \
+                 cargo test --test adversarial_workload_tests inspect -- --ignored --nocapture",
+                expiration.progress.artifact_path.display(),
+            ),
+        },
+        &evidence,
+    );
+
+    SeedOutcome {
+        mode,
+        profile,
+        failed: true,
+        blocking_v1: true,
+        ops: expiration.progress.current_op,
+        compactions: 0,
+        background_compactions: 0,
+        coverage: Coverage::default(),
+        violations: vec![violation],
+        wall_secs: started.elapsed().as_secs_f64().max(0.001),
+        object_store: ObjectStorePhaseCensus::default(),
+        fired_faults: Vec::new(),
+    }
+}
+
+async fn run_seed_bounded(
+    env: &RunnerEnv,
+    artifacts: &RunArtifacts,
+    seed: u64,
+    deadline: Instant,
+    mutation: Option<OracleMutation>,
+    selftest_probe: Option<OracleMutation>,
+) -> SeedOutcome {
+    let started = Instant::now();
+    let artifact_path = artifacts.root().join(format!("seed-{seed}"));
+    let watchdog = SeedWatchdogContext::new(seed, artifact_path.clone());
+    let task_watchdog = watchdog.clone();
+    let owned_env = env.clone();
+    let owned_artifacts = artifacts.clone();
+    let task = async move {
+        Box::pin(run_seed_inner(
+            &owned_env,
+            &owned_artifacts,
+            seed,
+            deadline,
+            mutation,
+            selftest_probe,
+            Some(&task_watchdog),
+        ))
+        .await
+    };
+    let expiration = match run_owned_seed_task(
+        task,
+        watchdog,
+        SEED_WATCHDOG_TIMEOUT,
+        SEED_WATCHDOG_CLEANUP_TIMEOUT,
+    )
+    .await
+    {
+        OwnedSeedTask::Completed(outcome) => return outcome,
+        OwnedSeedTask::Expired(expiration) => *expiration,
+    };
+    seed_watchdog_outcome(env, artifacts, seed, mutation, started, expiration)
+}
+
 pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
     let started = Instant::now();
     let deadline = started + Duration::from_secs(env.seconds);
@@ -1252,14 +1667,14 @@ pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
     };
 
     for seed in &env.seeds {
-        let outcome = Box::pin(run_seed(
+        let outcome = run_seed_bounded(
             &env,
             &artifacts,
             *seed,
             deadline,
             env.selftest,
             env.selftest,
-        ))
+        )
         .await;
         summary.seeds_run += 1;
         summary.failed_seeds += u64::from(outcome.failed && outcome.blocking_v1);
@@ -1343,15 +1758,8 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
 
     while Instant::now() < deadline || summary.seeds_run == 0 {
         let seed = overnight_seed(&env.seeds, seed_index);
-        let outcome = Box::pin(run_seed(
-            &env,
-            &artifacts,
-            seed,
-            deadline,
-            env.selftest,
-            env.selftest,
-        ))
-        .await;
+        let outcome =
+            run_seed_bounded(&env, &artifacts, seed, deadline, env.selftest, env.selftest).await;
         summary.seeds_run += 1;
         summary.failed_seeds += u64::from(outcome.failed && outcome.blocking_v1);
         summary.non_blocking_findings += u64::from(outcome.failed && !outcome.blocking_v1);
@@ -3627,6 +4035,27 @@ async fn run_seed(
     mutation: Option<OracleMutation>,
     selftest_probe: Option<OracleMutation>,
 ) -> SeedOutcome {
+    Box::pin(run_seed_inner(
+        env,
+        artifacts,
+        seed,
+        deadline,
+        mutation,
+        selftest_probe,
+        None,
+    ))
+    .await
+}
+
+async fn run_seed_inner(
+    env: &RunnerEnv,
+    artifacts: &RunArtifacts,
+    seed: u64,
+    deadline: Instant,
+    mutation: Option<OracleMutation>,
+    selftest_probe: Option<OracleMutation>,
+    watchdog: Option<&SeedWatchdogContext>,
+) -> SeedOutcome {
     let post_commit_selftest = matches!(
         mutation.or(selftest_probe),
         Some(OracleMutation::PostCommitLostWrite | OracleMutation::IndetResolutionLie)
@@ -3671,6 +4100,9 @@ async fn run_seed(
         || selftest_probe.is_some_and(OracleMutation::is_security);
     let harness = TestHarness::new().await;
     let prefix = harness.prefix.clone();
+    if let Some(watchdog) = watchdog {
+        watchdog.register_prefix(&prefix);
+    }
     let mut generator = if branching_profile {
         AdversarialGenerator::new_branching(seed, &prefix)
     } else if profile == Some(FaultProfile::Security) {
@@ -3709,6 +4141,9 @@ async fn run_seed(
     } else {
         profile.map(|profile| FaultScheduler::for_seed(seed, profile))
     };
+    if let Some(watchdog) = watchdog {
+        watchdog.register_scheduler(scheduler.as_ref());
+    }
     let test_clock = test_clock_for_scheduler(scheduler.as_ref());
     let chaos_plan = if matches!(
         mutation,
@@ -3771,17 +4206,21 @@ async fn run_seed(
         security_program.as_ref(),
     );
     let disk_cache_max_bytes = disk_cache_max_bytes_for_schedule(scheduler.as_ref());
-    let mut server = RestartableFullTestServer::new(
-        start_test_server_full_with_disk_cache_max_bytes(
-            primary_store,
-            Some(prefix.clone()),
-            config.clone(),
-            mode == RunMode::Chaos,
-            injected_clock(test_clock.as_ref()),
-            disk_cache_max_bytes,
-        )
-        .await,
-    );
+    let initial_server = start_test_server_full_with_disk_cache_max_bytes(
+        primary_store,
+        Some(prefix.clone()),
+        config.clone(),
+        mode == RunMode::Chaos,
+        injected_clock(test_clock.as_ref()),
+        disk_cache_max_bytes,
+    )
+    .await;
+    let mut server = match watchdog {
+        Some(watchdog) => {
+            RestartableFullTestServer::new_with_watchdog(initial_server, watchdog.clone())
+        }
+        None => RestartableFullTestServer::new(initial_server),
+    };
     let bootstrapped_policy_version = if let Some(program) = &security_program {
         Some(bootstrap_security_program(&server, program).await)
     } else {
@@ -3840,6 +4279,16 @@ async fn run_seed(
     let mut generation_cap_reached = false;
 
     loop {
+        if let Some(watchdog) = watchdog {
+            watchdog.update(
+                "workload",
+                op_index,
+                scheduler.as_ref(),
+                pending_held_op.as_ref(),
+                deferred_ops.len(),
+                quiet_drain_ops.len(),
+            );
+        }
         let commands = advance_scheduled_faults(scheduler.as_ref(), test_clock.as_ref(), op_index);
         if dual_writer_lease_hold.as_ref().is_some_and(
             |activation: &DualWriterLeaseHoldActivation| activation.release_op <= op_index,
@@ -4385,6 +4834,16 @@ async fn run_seed(
 
     let exact_quiescent_vector_count = operational_state.quiescent_vector_count_must_be_exact();
     let object_store_in_run = object_store_breakdown(&counter);
+    if let Some(watchdog) = watchdog {
+        watchdog.update(
+            "quiet-period",
+            op_index,
+            scheduler.as_ref(),
+            pending_held_op.as_ref(),
+            deferred_ops.len(),
+            quiet_drain_ops.len(),
+        );
+    }
     let quiet = QuietPeriod {
         client: &client,
         server: &mut server,
@@ -4509,8 +4968,28 @@ async fn run_seed(
     let audit_store = server.store.clone();
     let audit_day = server.clock.now().date_naive();
     let audit_node_id = server.audit_node_id.clone();
+    if let Some(watchdog) = watchdog {
+        watchdog.update(
+            "server-shutdown",
+            op_index,
+            scheduler.as_ref(),
+            pending_held_op.as_ref(),
+            deferred_ops.len(),
+            quiet_drain_ops.len(),
+        );
+    }
     drop(client);
     server.into_inner().shutdown().await;
+    if let Some(watchdog) = watchdog {
+        watchdog.update(
+            "artifact-finalization",
+            op_index,
+            scheduler.as_ref(),
+            pending_held_op.as_ref(),
+            deferred_ops.len(),
+            quiet_drain_ops.len(),
+        );
+    }
     if security_program_enabled {
         let verification =
             zeppelin::security::verify_audit_day(&audit_store, audit_day, &audit_node_id)
@@ -10695,6 +11174,89 @@ mod outcome_tests {
 
     use super::*;
     use crate::adversarial::faults::{Direction, FaultEvent, TargetSelector};
+
+    #[tokio::test]
+    async fn seed_watchdog_fails_loudly_and_retires_a_hung_server_owner() {
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let harness = TestHarness::new().await;
+        let server = start_test_server_full(
+            harness.store.clone(),
+            Some(harness.prefix.clone()),
+            deterministic_config(),
+            false,
+            None,
+        )
+        .await;
+        let artifact_parent = tempfile::tempdir().expect("watchdog artifact tempdir");
+        let env = RunnerEnv {
+            seconds: 1,
+            seeds: vec![2006],
+            max_ops: Some(500),
+            artifacts: artifact_parent.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Mixed,
+            profile: None,
+            env_echo: BTreeMap::from([("TEST_BACKEND".to_string(), "memory".to_string())]),
+        };
+        let artifacts = RunArtifacts::create(&env);
+        let seed_dir = artifacts.root().join("seed-2006");
+        let watchdog = SeedWatchdogContext::new(2006, seed_dir.clone());
+        watchdog.register_server(&server);
+        let owner_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owner_drop = Arc::clone(&owner_dropped);
+        let task = async move {
+            let _drop_flag = DropFlag(owner_drop);
+            let _server = server;
+            std::future::pending::<()>().await;
+        };
+
+        let started = Instant::now();
+        let OwnedSeedTask::Expired(expiration) = run_owned_seed_task(
+            task,
+            watchdog,
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+        )
+        .await
+        else {
+            panic!("synthetic hung seed unexpectedly completed")
+        };
+
+        assert_eq!(expiration.owner_task_join, "cancelled-and-joined");
+        assert_eq!(expiration.cleanup_result, "completed");
+        assert!(owner_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(expiration.progress.runner_phase, "watchdog-expired");
+        assert_eq!(
+            expiration.progress.server_lifecycle["http_task_finished"],
+            true
+        );
+        assert_eq!(
+            expiration.progress.server_lifecycle["compaction_task_finished"],
+            true
+        );
+        let outcome = seed_watchdog_outcome(&env, &artifacts, 2006, None, started, *expiration);
+        assert!(outcome.failed);
+        assert!(outcome.blocking_v1);
+        assert_eq!(outcome.violations[0].id, ViolationId::I19CrashRecovery);
+        let failure = read_failure_manifest(&seed_dir).expect("watchdog failure.json missing");
+        assert_eq!(failure.seed, 2006);
+        assert_eq!(failure.violations[0].id, ViolationId::I19CrashRecovery);
+        let watchdog_json: serde_json::Value = serde_json::from_slice(
+            &fs::read(seed_dir.join("watchdog.json")).expect("watchdog.json missing"),
+        )
+        .expect("watchdog.json must parse");
+        assert_eq!(watchdog_json["owner_task_join"], "cancelled-and-joined");
+        assert_eq!(watchdog_json["cleanup_result"], "completed");
+        harness.cleanup().await;
+    }
 
     #[tokio::test]
     async fn operational_query_returns_a_typed_transport_outcome() {

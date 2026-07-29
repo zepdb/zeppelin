@@ -14,7 +14,7 @@ use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::{AbortHandle, JoinError, JoinHandle};
 
 use super::harness::{TestHarness, TestServerRuntime};
 
@@ -1221,6 +1221,79 @@ pub enum FullTestServerRetirementError {
     HttpTask(#[source] JoinError),
 }
 
+/// Cloneable emergency-retirement handle for a test server owned by a bounded task.
+///
+/// The normal owner still performs ordered graceful or crash retirement. A
+/// per-seed watchdog uses this handle only after that owner has stopped making
+/// progress, so the watchdog can stop admission before cancelling and joining
+/// the owner task.
+#[derive(Clone)]
+pub struct FullTestServerWatchdogHandle {
+    shutdown_http: tokio::sync::watch::Sender<bool>,
+    http_task: AbortHandle,
+    shutdown_compaction: Option<tokio::sync::watch::Sender<bool>>,
+    compaction_task: Option<AbortHandle>,
+    compaction_lifecycle: CompactionLifecycle,
+    server_tasks: Arc<ServerTaskSupervisor>,
+    security: Arc<SecurityKernel>,
+}
+
+impl FullTestServerWatchdogHandle {
+    /// Stop new work and cancel the listener/background-loop task owners.
+    pub fn begin_abort(&self) {
+        let _ = self.shutdown_http.send_replace(true);
+        if let Some(shutdown) = &self.shutdown_compaction {
+            let _ = shutdown.send_replace(true);
+        }
+        self.http_task.abort();
+        if let Some(task) = &self.compaction_task {
+            task.abort();
+        }
+    }
+
+    /// Join authoritative child work after the bounded owner task is cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns a joined diagnostic when request-task or compaction-heartbeat
+    /// retirement fails.
+    pub async fn finish_cleanup(&self) -> Result<(), String> {
+        let request_tasks = self
+            .server_tasks
+            .abort_and_join()
+            .await
+            .map_err(|error| format!("request tasks: {error}"));
+        let heartbeats = self
+            .compaction_lifecycle
+            .close_and_abort_heartbeats()
+            .await
+            .map_err(|error| format!("compaction heartbeats: {error}"));
+        self.security.shutdown_refresh_tasks().await;
+
+        let failures = [request_tasks, heartbeats]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect::<Vec<_>>();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    /// Report whether the top-level HTTP and compaction owners have stopped.
+    #[must_use]
+    pub fn lifecycle_state(&self) -> serde_json::Value {
+        serde_json::json!({
+            "http_task_finished": self.http_task.is_finished(),
+            "compaction_task_finished": self
+                .compaction_task
+                .as_ref()
+                .is_none_or(AbortHandle::is_finished),
+        })
+    }
+}
+
 pub struct FullTestServer {
     pub base_url: String,
     pub admin_bearer: String,
@@ -1250,6 +1323,23 @@ pub struct FullTestServer {
 }
 
 impl FullTestServer {
+    /// Build an emergency-retirement handle for a runner watchdog.
+    #[must_use]
+    pub fn watchdog_handle(&self) -> FullTestServerWatchdogHandle {
+        FullTestServerWatchdogHandle {
+            shutdown_http: self.shutdown_http.clone(),
+            http_task: self.server_task.abort_handle(),
+            shutdown_compaction: self.shutdown_compaction.clone(),
+            compaction_task: self
+                .compaction_loop_task
+                .as_ref()
+                .map(JoinHandle::abort_handle),
+            compaction_lifecycle: self.compaction_lifecycle.clone(),
+            server_tasks: Arc::clone(&self.server_tasks),
+            security: Arc::clone(&self.security),
+        }
+    }
+
     /// Force this node to observe the authoritative policy head immediately.
     pub async fn force_policy_refresh(&self) {
         self.security

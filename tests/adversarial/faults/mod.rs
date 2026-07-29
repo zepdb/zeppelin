@@ -690,6 +690,20 @@ impl FaultScheduler {
         &self.schedule
     }
 
+    /// Return scheduled event ids whose logical windows are currently active.
+    #[must_use]
+    pub fn active_event_ids(&self, op_index: u64) -> Vec<String> {
+        self.schedule
+            .events
+            .iter()
+            .zip(&self.runtime.events)
+            .filter(|(event, runtime)| {
+                event_is_active(event, op_index) && !runtime.ended.load(Ordering::SeqCst)
+            })
+            .map(|(event, _)| event.id.clone())
+            .collect()
+    }
+
     pub fn advance_to(&self, op_index: u64) -> Vec<SchedulerCommand> {
         self.runtime.logical_op.store(op_index, Ordering::SeqCst);
         self.runtime.logical_op_tx.send_replace(op_index);
