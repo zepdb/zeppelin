@@ -140,6 +140,12 @@
 //! pure CPU: one Ed25519 verification and a hash-map lookup under a read lock.
 //! `verify_published_signature`, by contrast, reloads the inventory on every
 //! call — it is a verification-path helper, not a request-path one.
+//! Replacement composition reads signer documents and slots before attempting
+//! create-only publication, so an already-published signer needs no idempotent
+//! write during a write partition. Those composition GETs retry transient storage
+//! errors for at most three total attempts. Missing state still requires durable
+//! create-only publication, malformed state fails immediately, and persistent
+//! storage errors remain boot failures; no cached or empty inventory is substituted.
 //!
 //! ## Rust concepts used here
 //!
@@ -203,6 +209,7 @@ const MAX_PURPOSE_BYTES: usize = 512;
 const MAX_DELEGATED_NAMESPACES: usize = 64;
 const MAX_NARROWING_BYTES: usize = 12 * 1024;
 const MAX_PUBLISHED_SIGNERS: usize = 32;
+const COMPOSITION_SIGNER_GET_ATTEMPTS: usize = 3;
 
 /// Validated narrowing carried by one delegated credential.
 #[derive(Debug, Clone, Serialize)]
@@ -554,7 +561,7 @@ impl DelegationAuthority {
         let signer_node = signer_node_id(&signing_key.verifying_key());
         publish_signer(&store, &signer_node, &signing_key.verifying_key()).await?;
         claim_signer_slot(&store, &signer_node).await?;
-        let signers = load_signers(&store).await?;
+        let signers = load_signers_for_composition(&store).await?;
         let signer_cache = SignerCache::start(store.clone(), signers, refresh_interval)?;
         let monotonic_wall = MonotonicWall::new(clock.now());
         let verifier = Arc::new(DelegationVerifier {
@@ -1026,19 +1033,25 @@ async fn claim_signer_slot(store: &ZeppelinStore, node_id: &str) -> ZeppelinResu
             ))
         })?;
         let key = signer_slot_key(slot);
+        match get_signer_object_for_composition(store, &key).await {
+            Ok(existing) => {
+                let existing = decode_signer_slot(&key, &existing)?;
+                if existing.node_id == node_id {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(ZeppelinError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
         match store
             .put_create_outcome(&key, Bytes::from(body.clone()))
             .await?
         {
             CreateOnlyOutcome::Created { .. } => return Ok(()),
             CreateOnlyOutcome::AlreadyExists => {
-                let existing = store.get(&key).await?;
-                let existing: SignerSlot = serde_json::from_slice(&existing).map_err(|error| {
-                    ZeppelinError::Config(format!(
-                        "invalid delegated-token signer slot {key}: {error}"
-                    ))
-                })?;
-                validate_signer_slot(&key, &existing)?;
+                let existing = get_signer_object_for_composition(store, &key).await?;
+                let existing = decode_signer_slot(&key, &existing)?;
                 if existing.node_id == node_id {
                     return Ok(());
                 }
@@ -1052,6 +1065,16 @@ async fn claim_signer_slot(store: &ZeppelinStore, node_id: &str) -> ZeppelinResu
 
 fn signer_slot_key(slot: u8) -> String {
     format!("{SIGNER_SLOT_PREFIX}{slot:02}.json")
+}
+
+fn decode_signer_slot(key: &str, body: &[u8]) -> ZeppelinResult<SignerSlot> {
+    let document: SignerSlot = serde_json::from_slice(body).map_err(|error| {
+        ZeppelinError::Config(format!(
+            "invalid delegated-token signer slot {key}: {error}"
+        ))
+    })?;
+    validate_signer_slot(key, &document)?;
+    Ok(document)
 }
 
 fn validate_signer_slot(key: &str, document: &SignerSlot) -> ZeppelinResult<()> {
@@ -1079,13 +1102,24 @@ async fn publish_signer(
         ZeppelinError::Config(format!("delegation signer serialization failed: {error}"))
     })?;
     let key = format!("{SIGNER_PREFIX}{node_id}.json");
+    match get_signer_object_for_composition(store, &key).await {
+        Ok(existing) => {
+            return if existing.as_ref() == body.as_slice() {
+                Ok(())
+            } else {
+                Err(SecurityError::DelegationSignerCollision.into())
+            };
+        }
+        Err(ZeppelinError::NotFound { .. }) => {}
+        Err(error) => return Err(error),
+    }
     match store
         .put_create_outcome(&key, Bytes::from(body.clone()))
         .await?
     {
         CreateOnlyOutcome::Created { .. } => Ok(()),
         CreateOnlyOutcome::AlreadyExists => {
-            let existing = store.get(&key).await?;
+            let existing = get_signer_object_for_composition(store, &key).await?;
             if existing.as_ref() == body.as_slice() {
                 Ok(())
             } else {
@@ -1097,6 +1131,19 @@ async fn publish_signer(
 
 async fn load_signers(store: &ZeppelinStore) -> ZeppelinResult<HashMap<String, VerifyingKey>> {
     let signers = load_signers_allow_empty(store).await?;
+    require_nonempty_signers(signers)
+}
+
+async fn load_signers_for_composition(
+    store: &ZeppelinStore,
+) -> ZeppelinResult<HashMap<String, VerifyingKey>> {
+    let signers = load_signers_allow_empty_for_composition(store).await?;
+    require_nonempty_signers(signers)
+}
+
+fn require_nonempty_signers(
+    signers: HashMap<String, VerifyingKey>,
+) -> ZeppelinResult<HashMap<String, VerifyingKey>> {
     if signers.is_empty() {
         return Err(SecurityError::InvalidDelegationSigner.into());
     }
@@ -1129,6 +1176,19 @@ pub(crate) async fn verify_published_signature(
 async fn load_signers_allow_empty(
     store: &ZeppelinStore,
 ) -> ZeppelinResult<HashMap<String, VerifyingKey>> {
+    load_signers_allow_empty_with_composition_retries(store, false).await
+}
+
+async fn load_signers_allow_empty_for_composition(
+    store: &ZeppelinStore,
+) -> ZeppelinResult<HashMap<String, VerifyingKey>> {
+    load_signers_allow_empty_with_composition_retries(store, true).await
+}
+
+async fn load_signers_allow_empty_with_composition_retries(
+    store: &ZeppelinStore,
+    retry_composition_gets: bool,
+) -> ZeppelinResult<HashMap<String, VerifyingKey>> {
     let slot_keys = store.list_prefix(SIGNER_SLOT_PREFIX).await?;
     if slot_keys.len() > MAX_PUBLISHED_SIGNERS {
         return Err(ZeppelinError::Config(format!(
@@ -1137,7 +1197,7 @@ async fn load_signers_allow_empty(
     }
     let mut signers = HashMap::new();
     for slot_key in slot_keys {
-        let slot_body = store.get(&slot_key).await?;
+        let slot_body = get_signer_object(store, &slot_key, retry_composition_gets).await?;
         let slot: SignerSlot = serde_json::from_slice(&slot_body).map_err(|error| {
             ZeppelinError::Config(format!(
                 "invalid delegated-token signer slot {slot_key}: {error}"
@@ -1145,7 +1205,7 @@ async fn load_signers_allow_empty(
         })?;
         validate_signer_slot(&slot_key, &slot)?;
         let key = format!("{SIGNER_PREFIX}{}.json", slot.node_id);
-        let body = store.get(&key).await?;
+        let body = get_signer_object(store, &key, retry_composition_gets).await?;
         let document: SignerDocument = serde_json::from_slice(&body).map_err(|error| {
             ZeppelinError::Config(format!("invalid delegated-token signer {key}: {error}"))
         })?;
@@ -1175,6 +1235,40 @@ async fn load_signers_allow_empty(
         }
     }
     Ok(signers)
+}
+
+async fn get_signer_object(
+    store: &ZeppelinStore,
+    key: &str,
+    retry_composition_gets: bool,
+) -> ZeppelinResult<Bytes> {
+    if retry_composition_gets {
+        get_signer_object_for_composition(store, key).await
+    } else {
+        store.get(key).await
+    }
+}
+
+async fn get_signer_object_for_composition(
+    store: &ZeppelinStore,
+    key: &str,
+) -> ZeppelinResult<Bytes> {
+    for attempt in 1..=COMPOSITION_SIGNER_GET_ATTEMPTS {
+        match store.get(key).await {
+            Err(error @ ZeppelinError::Storage(_)) if attempt < COMPOSITION_SIGNER_GET_ATTEMPTS => {
+                tracing::warn!(
+                    error = %error,
+                    key,
+                    attempt,
+                    max_attempts = COMPOSITION_SIGNER_GET_ATTEMPTS,
+                    "transient signer GET failed during security composition; retrying"
+                );
+                tokio::task::yield_now().await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded signer composition retry loop must return on its final attempt")
 }
 
 #[cfg(test)]

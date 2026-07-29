@@ -1,11 +1,20 @@
 mod common;
 
+use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
+use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
+use futures::stream::BoxStream;
+use object_store::path::Path;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult, Result as OsResult,
+};
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,6 +23,7 @@ use zeppelin::security::{
     canonical_policy_checksum, verify_audit_day, Action, AuditRecord, AuditRuntime,
     DelegationNarrowing, Feature, NamespaceId, PolicyStore, SecurityKernel,
 };
+use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::{Clock, TimeSource};
 
 use common::harness::TestHarness;
@@ -85,6 +95,129 @@ fn delegation_signing_key(seed_byte: u8) -> tempfile::NamedTempFile {
             .expect("restrict delegation signing-key fixture");
     }
     file
+}
+
+#[derive(Debug)]
+struct FaultMatchingSignerOps {
+    inner: Arc<dyn ObjectStore>,
+    needle: String,
+    remaining_gets: AtomicUsize,
+    remaining_puts: AtomicUsize,
+    injected_gets: Arc<AtomicUsize>,
+    injected_puts: Arc<AtomicUsize>,
+}
+
+impl fmt::Display for FaultMatchingSignerOps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FaultMatchingSignerOps({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FaultMatchingSignerOps {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        let should_fail = location.as_ref().contains(&self.needle)
+            && self
+                .remaining_puts
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then(|| remaining - 1)
+                })
+                .is_ok();
+        if should_fail {
+            self.injected_puts.fetch_add(1, Ordering::SeqCst);
+            return Err(object_store::Error::Generic {
+                store: "signer_composition_test",
+                source: Box::new(std::io::Error::other(format!(
+                    "injected signer PUT failure for {location}"
+                ))),
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        let should_fail = location.as_ref().contains(&self.needle)
+            && self
+                .remaining_gets
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then(|| remaining - 1)
+                })
+                .is_ok();
+        if should_fail {
+            self.injected_gets.fetch_add(1, Ordering::SeqCst);
+            return Err(object_store::Error::Generic {
+                store: "signer_composition_test",
+                source: Box::new(std::io::Error::other(format!(
+                    "injected signer GET failure for {location}"
+                ))),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+fn fault_signer_ops(
+    store: &ZeppelinStore,
+    get_failures: usize,
+    put_failures: usize,
+) -> (ZeppelinStore, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let injected_gets = Arc::new(AtomicUsize::new(0));
+    let injected_puts = Arc::new(AtomicUsize::new(0));
+    let faulted = FaultMatchingSignerOps {
+        inner: store.inner(),
+        needle: "_security/signers/".to_string(),
+        remaining_gets: AtomicUsize::new(get_failures),
+        remaining_puts: AtomicUsize::new(put_failures),
+        injected_gets: Arc::clone(&injected_gets),
+        injected_puts: Arc::clone(&injected_puts),
+    };
+    (
+        ZeppelinStore::new(Arc::new(faulted)),
+        injected_gets,
+        injected_puts,
+    )
+}
+
+fn fail_signer_gets(store: &ZeppelinStore, failures: usize) -> (ZeppelinStore, Arc<AtomicUsize>) {
+    let (store, injected_gets, _) = fault_signer_ops(store, failures, 0);
+    (store, injected_gets)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -460,6 +593,128 @@ async fn overlapping_kernel_composition_rebinds_same_node_signer_to_replacement_
     drop(old_adapter);
     drop(replacement_adapter);
     drop(replacement_kernel);
+    drop(store);
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn replacement_composition_retries_one_signer_get_but_fails_loud_when_persistent() {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let mut config = Config::default();
+    let _admin_bearer = test_admin_bearer(&mut config);
+    let key = delegation_signing_key(0x56);
+    config.security.token_signing_key_path = key.path().to_string_lossy().into_owned();
+    let entitlements = Arc::new(test_entitlements([Feature::Rbac, Feature::Delegation]));
+
+    let (original_kernel, original_adapter) = SecurityKernel::from_resolved_entitlements(
+        store.clone(),
+        &config.security,
+        Clock::system(),
+        Arc::clone(&entitlements),
+    )
+    .await
+    .expect("original kernel must publish signer state before replacement");
+
+    let (one_shot_store, one_shot_injected) = fail_signer_gets(&store, 1);
+    let (replacement_kernel, replacement_adapter) = SecurityKernel::from_resolved_entitlements(
+        one_shot_store,
+        &config.security,
+        Clock::system(),
+        Arc::clone(&entitlements),
+    )
+    .await
+    .expect("one transient signer GET fault must not abort replacement composition");
+    assert_eq!(one_shot_injected.load(Ordering::SeqCst), 1);
+
+    let (persistent_store, persistent_injected) = fail_signer_gets(&store, usize::MAX);
+    let persistent = SecurityKernel::from_resolved_entitlements(
+        persistent_store,
+        &config.security,
+        Clock::system(),
+        entitlements,
+    )
+    .await;
+    let error = match persistent {
+        Ok(_) => panic!("persistent signer GET failure must abort composition"),
+        Err(error) => error,
+    };
+    let attempts = persistent_injected.load(Ordering::SeqCst);
+    assert_eq!(
+        attempts, 3,
+        "persistent signer GET failure must stop at the composition retry bound"
+    );
+    assert!(
+        error.to_string().contains("injected signer GET failure"),
+        "{error}"
+    );
+
+    drop(replacement_adapter);
+    drop(replacement_kernel);
+    drop(original_adapter);
+    drop(original_kernel);
+    drop(store);
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn replacement_composition_avoids_idempotent_signer_writes_but_new_signers_fail_loud() {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let mut config = Config::default();
+    let _admin_bearer = test_admin_bearer(&mut config);
+    let key = delegation_signing_key(0x57);
+    config.security.token_signing_key_path = key.path().to_string_lossy().into_owned();
+    let entitlements = Arc::new(test_entitlements([Feature::Rbac, Feature::Delegation]));
+
+    let (original_kernel, original_adapter) = SecurityKernel::from_resolved_entitlements(
+        store.clone(),
+        &config.security,
+        Clock::system(),
+        Arc::clone(&entitlements),
+    )
+    .await
+    .expect("original kernel must publish signer state before replacement");
+
+    let (write_partitioned_store, _, replacement_puts) = fault_signer_ops(&store, 0, usize::MAX);
+    let (replacement_kernel, replacement_adapter) = SecurityKernel::from_resolved_entitlements(
+        write_partitioned_store,
+        &config.security,
+        Clock::system(),
+        Arc::clone(&entitlements),
+    )
+    .await
+    .expect("replacement must reuse verified signer state during a write partition");
+    assert_eq!(
+        replacement_puts.load(Ordering::SeqCst),
+        0,
+        "replacement composition must not rewrite identical signer state"
+    );
+
+    let new_key = delegation_signing_key(0x58);
+    config.security.token_signing_key_path = new_key.path().to_string_lossy().into_owned();
+    let (new_signer_store, _, new_signer_puts) = fault_signer_ops(&store, 0, usize::MAX);
+    let new_signer = SecurityKernel::from_resolved_entitlements(
+        new_signer_store,
+        &config.security,
+        Clock::system(),
+        entitlements,
+    )
+    .await;
+    let error = match new_signer {
+        Ok(_) => panic!("a new signer must not compose without durable publication"),
+        Err(error) => error,
+    };
+    assert_eq!(new_signer_puts.load(Ordering::SeqCst), 1);
+    assert!(
+        error.to_string().contains("injected signer PUT failure"),
+        "{error}"
+    );
+
+    drop(replacement_adapter);
+    drop(replacement_kernel);
+    drop(original_adapter);
+    drop(original_kernel);
     drop(store);
     harness.cleanup().await;
 }
