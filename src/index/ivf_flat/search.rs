@@ -96,7 +96,7 @@ use tracing::{debug, error};
 use crate::cache::DiskCache;
 use crate::error::{Result, ZeppelinError};
 use crate::index::distance::compute_distance;
-use crate::index::filter::{evaluate_filter, oversampled_k};
+use crate::index::filter::{evaluate_filter_on_optional_attributes, oversampled_k};
 use crate::index::quantization::QuantizationType;
 use crate::index::topk::partial_topk_by;
 use crate::storage::ZeppelinStore;
@@ -1458,12 +1458,7 @@ async fn search_ivf_flat_with_trace_inner(
     let results: Vec<SearchResult> = if let Some(f) = post_filter {
         sorted
             .into_iter()
-            .filter(|c| {
-                match &c.attributes {
-                    Some(attrs) => evaluate_filter(f, attrs),
-                    None => false, // No attributes means filter cannot match.
-                }
-            })
+            .filter(|c| evaluate_filter_on_optional_attributes(f, c.attributes.as_ref()))
             .take(top_k)
             .map(|c| SearchResult {
                 id: c.id,
@@ -4879,7 +4874,7 @@ async fn load_filter_metadata(
 ///
 /// A resolved bitmap is the fast path. Otherwise the function evaluates a
 /// present filter against that row's attributes before approximate top-k
-/// truncation; missing attributes reject the row. With neither bitmap nor
+/// truncation; a missing map is evaluated as empty. With neither bitmap nor
 /// filter, every row passes. Hierarchical leaf search shares this helper because
 /// it has the same two-phase truncation hazard.
 ///
@@ -4918,14 +4913,13 @@ pub(crate) fn coarse_row_passes(
     }
     match filter {
         None => true,
-        Some(f) => match attrs
-            .as_ref()
-            .and_then(|a| a.get(j))
-            .and_then(|a| a.as_ref())
-        {
-            Some(a) => evaluate_filter(f, a),
-            None => false,
-        },
+        Some(f) => evaluate_filter_on_optional_attributes(
+            f,
+            attrs
+                .as_ref()
+                .and_then(|a| a.get(j))
+                .and_then(|a| a.as_ref()),
+        ),
     }
 }
 
@@ -5207,6 +5201,56 @@ mod tests {
         };
 
         assert!(error.to_string().contains("bitmap_0.bin"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn negative_filter_matches_flat_row_without_attribute_map() {
+        let store = ZeppelinStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        store
+            .put(
+                &cluster_key("test_ns", "seg_001", 0),
+                serialize_cluster(&["row-0".to_string()], &[vec![0.0, 0.0]], 2).unwrap(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &attrs_key("test_ns", "seg_001", 0),
+                serialize_attrs(&[None]).unwrap(),
+            )
+            .await
+            .unwrap();
+        let index = make_index();
+        let filter = Filter::NotIn {
+            field: "bucket".to_string(),
+            values: vec![AttributeValue::Integer(1), AttributeValue::Integer(3)],
+        };
+
+        let results = search_ivf_flat(
+            &index,
+            &[0.0, 0.0],
+            1,
+            1,
+            Some(&filter),
+            DistanceMetric::Euclidean,
+            &store,
+            1,
+            None,
+            true,
+            crate::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.id.as_str())
+                .collect::<Vec<_>>(),
+            ["row-0"],
+            "a row without an attribute map must be evaluated as an empty map"
+        );
+        assert!(results[0].attributes.is_none());
     }
 
     #[tokio::test]

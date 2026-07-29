@@ -80,7 +80,7 @@ use crate::fts::rank_by::{evaluate_rank_by, RankBy};
 use crate::fts::tokenizer::tokenize_text;
 use crate::fts::wal_cache::WalFtsCache;
 use crate::fts::FtsFieldConfig;
-use crate::index::filter::evaluate_filter;
+use crate::index::filter::evaluate_filter_on_optional_attributes;
 use crate::index::topk::TopK;
 use crate::namespace::branching::ArtifactOrigin;
 use crate::types::{AttributeValue, Filter, SearchResult};
@@ -512,11 +512,10 @@ pub(crate) fn wal_bm25_scan(
     });
 
     for (doc_id, attrs_opt) in &latest_vectors {
-        if let Some(f) = filter {
-            match attrs_opt {
-                Some(attrs) if evaluate_filter(f, attrs) => {}
-                _ => continue,
-            }
+        if filter.is_some_and(|f| {
+            !evaluate_filter_on_optional_attributes(f, attrs_opt.as_ref().copied())
+        }) {
+            continue;
         }
 
         let doc_data = doc_field_data.get(*doc_id);

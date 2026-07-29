@@ -95,7 +95,7 @@ use tracing::debug;
 use crate::cache::DiskCache;
 use crate::error::{Result, ZeppelinError};
 use crate::index::distance::compute_distance;
-use crate::index::filter::{evaluate_filter, oversampled_k};
+use crate::index::filter::{evaluate_filter_on_optional_attributes, oversampled_k};
 use crate::index::ivf_flat::build::{
     attrs_key, cluster_key, deserialize_attrs, deserialize_cluster,
     deserialize_colocated_sq_cluster,
@@ -711,10 +711,7 @@ async fn scan_leaf_clusters(
     let results: Vec<Candidate> = if let Some(f) = filter {
         sorted
             .into_iter()
-            .filter(|c| match &c.attributes {
-                Some(attrs) => evaluate_filter(f, attrs),
-                None => false,
-            })
+            .filter(|c| evaluate_filter_on_optional_attributes(f, c.attributes.as_ref()))
             .take(top_k)
             .collect()
     } else {

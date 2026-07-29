@@ -43,8 +43,11 @@
 //! with non-null access after the pattern succeeds.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use crate::types::{AttributeValue, Filter};
+
+static EMPTY_ATTRIBUTES: LazyLock<HashMap<String, AttributeValue>> = LazyLock::new(HashMap::new);
 
 /// Combines a server-owned mandatory filter with a caller-supplied filter.
 ///
@@ -214,6 +217,22 @@ pub fn evaluate_filter(filter: &Filter, attributes: &HashMap<String, AttributeVa
                 .any(|window| window == query_tokens.as_slice())
         }
     }
+}
+
+/// Evaluates a filter when the candidate may have no attribute map.
+///
+/// A missing map is semantically the same as an empty map: positive predicates
+/// reject its missing fields, while negative predicates can match them. Query
+/// paths should use this helper instead of rejecting `None` before the
+/// operator-specific semantics run. Security policy paths may deliberately
+/// remain fail-closed by requiring a present map before calling
+/// [`evaluate_filter`].
+#[must_use]
+pub fn evaluate_filter_on_optional_attributes(
+    filter: &Filter,
+    attributes: Option<&HashMap<String, AttributeValue>>,
+) -> bool {
+    evaluate_filter(filter, attributes.unwrap_or(&EMPTY_ATTRIBUTES))
 }
 
 /// Compares attribute values using filter equality and membership coercions.

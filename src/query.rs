@@ -146,7 +146,7 @@ use crate::fts::wal_cache::WalFtsCache;
 use crate::fts::wal_scan::wal_bm25_scan;
 use crate::fts::FtsFieldConfig;
 use crate::index::distance::compute_distance;
-use crate::index::filter::{combine_filters, evaluate_filter};
+use crate::index::filter::{combine_filters, evaluate_filter_on_optional_attributes};
 use crate::index::topk::{partial_topk_by, TopK};
 use crate::index::HierarchicalIndex;
 use crate::index::IvfFlatIndex;
@@ -1753,14 +1753,11 @@ async fn wal_scan(
     let mut top_results = TopK::new(top_k, |a: &ScoredWalVector<'_>, b: &ScoredWalVector<'_>| {
         a.score.total_cmp(&b.score).then_with(|| a.id.cmp(b.id))
     });
-    let empty_attributes = HashMap::new();
-
     // Score surviving vectors, but keep only the bounded top-k candidates.
     for (id, (values, attrs)) in &latest_vectors {
         overriding_ids.insert((*id).to_string());
-        let passes_filter = filter.is_none_or(|f| {
-            evaluate_filter(f, attrs.as_ref().copied().unwrap_or(&empty_attributes))
-        });
+        let passes_filter = filter
+            .is_none_or(|f| evaluate_filter_on_optional_attributes(f, attrs.as_ref().copied()));
         if !passes_filter {
             continue;
         }
@@ -3533,15 +3530,8 @@ async fn segment_bm25_search_global(
             .flatten();
 
         // Apply post-filter
-        if let Some(f) = filter {
-            match &attr {
-                Some(a) => {
-                    if !evaluate_filter(f, a) {
-                        continue;
-                    }
-                }
-                None => continue,
-            }
+        if filter.is_some_and(|f| !evaluate_filter_on_optional_attributes(f, attr.as_ref())) {
+            continue;
         }
 
         let response_attr = if include_attributes { attr } else { None };
@@ -4095,15 +4085,8 @@ async fn segment_bm25_search_full_scan(
                 .flatten();
 
             // Apply post-filter
-            if let Some(f) = filter {
-                match &attrs {
-                    Some(a) => {
-                        if !evaluate_filter(f, a) {
-                            continue;
-                        }
-                    }
-                    None => continue,
-                }
+            if filter.is_some_and(|f| !evaluate_filter_on_optional_attributes(f, attrs.as_ref())) {
+                continue;
             }
 
             // Accumulate: same ID might appear in multiple clusters (shouldn't, but be safe)

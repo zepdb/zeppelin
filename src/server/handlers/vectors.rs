@@ -145,7 +145,9 @@ use tracing::{info, instrument};
 
 use crate::cache::DiskCache;
 use crate::error::ZeppelinError;
-use crate::index::filter::{combine_filters, evaluate_filter};
+use crate::index::filter::{
+    combine_filters, evaluate_filter, evaluate_filter_on_optional_attributes,
+};
 use crate::index::ivf_flat::build::{
     attrs_key, cluster_key, deserialize_attrs, deserialize_cluster_from_object,
 };
@@ -1451,12 +1453,7 @@ async fn select_requested_ids_matching_filter(
     let matching = response
         .results
         .into_iter()
-        .filter(|record| {
-            record
-                .attributes
-                .as_ref()
-                .is_some_and(|attributes| evaluate_filter(filter, attributes))
-        })
+        .filter(|record| evaluate_filter_on_optional_attributes(filter, record.attributes.as_ref()))
         .map(|record| record.id)
         .collect::<HashSet<_>>();
     Ok(requested_ids
@@ -1514,12 +1511,7 @@ async fn select_all_ids_matching_filter(
     Ok(response
         .results
         .into_iter()
-        .filter(|record| {
-            record
-                .attributes
-                .as_ref()
-                .is_some_and(|attributes| evaluate_filter(filter, attributes))
-        })
+        .filter(|record| evaluate_filter_on_optional_attributes(filter, record.attributes.as_ref()))
         .map(|record| record.id)
         .collect())
 }
