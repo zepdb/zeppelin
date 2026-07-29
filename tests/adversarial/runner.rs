@@ -1609,6 +1609,8 @@ fn seed_watchdog_outcome(
         wall_secs: started.elapsed().as_secs_f64().max(0.001),
         object_store: ObjectStorePhaseCensus::default(),
         fired_faults: Vec::new(),
+        repaired_terminal_lifecycle: false,
+        repaired_clone_publication: false,
     }
 }
 
