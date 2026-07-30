@@ -127,7 +127,9 @@ use crate::namespace::manager::{NamespaceIncarnationId, NamespaceMetadata};
 use crate::namespace::{BranchId, BranchRoot, ManifestDigest, ManifestGeneration};
 use crate::security::{NamespaceId, PreservationService};
 use crate::storage::store::DELETE_MANY_MAX_KEYS;
-use crate::storage::{ListedObject, NamespaceObjectKey, StorageVersion, ZeppelinStore};
+use crate::storage::{
+    ListedObject, NamespaceObjectFamily, NamespaceObjectKey, StorageVersion, ZeppelinStore,
+};
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{
     Manifest, ManifestHistoryObservation, ManifestHistoryPruneResult, ManifestHistoryRetention,
@@ -574,8 +576,11 @@ impl NamespaceInventory {
     fn from_listed(namespace: &str, listed: Vec<ListedObject>) -> Result<Self> {
         let history_prefix = Manifest::history_prefix(namespace);
         let snapshot_prefix = NamedSnapshot::prefix(namespace);
-        let staging_prefix = format!("{namespace}/_staging/");
-        let gc_prefix = format!("{namespace}/_gc/");
+        let staging_prefix = NamespaceObjectFamily::Staging.namespace_prefix(namespace);
+        let gc_prefix = format!(
+            "{namespace}/{}",
+            NamespaceObjectFamily::Gc.relative_root_prefix()
+        );
         let candidate_key = gc_candidate_store_key(namespace);
         let mut objects = BTreeMap::new();
         let mut history_objects = Vec::new();
@@ -676,7 +681,7 @@ impl NamespaceInventory {
     }
 
     fn staging_objects(&self, namespace: &str) -> Vec<ListedObject> {
-        let prefix = format!("{namespace}/_staging/");
+        let prefix = NamespaceObjectFamily::Staging.namespace_prefix(namespace);
         self.objects
             .range(prefix.clone()..)
             .take_while(|(key, _)| key.starts_with(&prefix))
@@ -776,7 +781,10 @@ struct ActiveStagingObservation {
 /// `catalog/_staging/17.json`.
 #[must_use]
 pub fn staging_key(namespace: &str, fencing_token: u64) -> String {
-    format!("{namespace}/_staging/{fencing_token}.json")
+    format!(
+        "{}{fencing_token}.json",
+        NamespaceObjectFamily::Staging.namespace_prefix(namespace)
+    )
 }
 
 fn local_artifact_origin_for_gc(
@@ -923,101 +931,123 @@ pub fn reachable_keys_with_staging(
         .map(|local_origin| manifest.artifact_origin_resolver(local_origin))
         .transpose()?;
 
-    for fragment in &manifest.fragments {
-        let physical_namespace = match origins {
-            Some(origins) => origins
-                .locate_fragment(fragment)?
-                .physical_origin
-                .namespace(),
-            None => namespace,
-        };
-        keys.insert(WalFragment::s3_key(physical_namespace, &fragment.id));
-    }
-
-    for segment in &manifest.segments {
-        let physical_namespace = match origins {
-            Some(origins) => origins.locate_segment(segment)?.physical_namespace(),
-            None => namespace,
-        };
-        if segment.hierarchical {
-            keys.insert(tree_meta_key(physical_namespace, &segment.id));
-            for node_id in manifest.hierarchical_routing_nodes(&segment.id) {
-                keys.insert(crate::index::hierarchical::tree_node_key(
-                    physical_namespace,
-                    &segment.id,
-                    node_id,
-                ));
-            }
-        } else {
-            keys.insert(centroids_key(physical_namespace, &segment.id));
-        }
-
-        if let Some(sketch) = &segment.sketch {
-            keys.insert(sketch.key.clone());
-        }
-        if let Some(bootstrap) = &segment.bootstrap {
-            keys.insert(bootstrap.key.clone());
-        }
-        if let Some(membership) = &segment.membership {
-            keys.insert(membership.key.clone());
-        }
-
-        if segment.cluster_objects.is_empty() {
-            for cluster_idx in 0..segment.cluster_count {
-                keys.insert(cluster_key(
-                    physical_namespace,
-                    segment.cluster_owner(cluster_idx),
-                    cluster_idx,
-                ));
-            }
-        } else {
-            for object_ref in &segment.cluster_objects {
-                keys.insert(object_ref.key.clone());
-            }
-        }
-
-        for cluster_idx in 0..segment.cluster_count {
-            let owner = segment.cluster_owner(cluster_idx);
-            keys.insert(attrs_key(physical_namespace, owner, cluster_idx));
-
-            if !segment.bitmap_fields.is_empty() {
-                keys.insert(bitmap_key(physical_namespace, owner, cluster_idx));
-            }
-
-            if !segment.fts_fields.is_empty() {
-                keys.insert(fts_index_key(physical_namespace, owner, cluster_idx));
-            }
-
-            match segment.quantization {
-                QuantizationType::Scalar => {
-                    keys.insert(sq_cluster_key(physical_namespace, owner, cluster_idx));
+    for family in NamespaceObjectFamily::ALL {
+        let _declared_ownership = family.gc_ownership();
+        match family {
+            NamespaceObjectFamily::Wal => {
+                debug_assert!(family.participates_in_branch_locality());
+                for fragment in &manifest.fragments {
+                    let physical_namespace = match origins {
+                        Some(origins) => origins
+                            .locate_fragment(fragment)?
+                            .physical_origin
+                            .namespace(),
+                        None => namespace,
+                    };
+                    keys.insert(WalFragment::s3_key(physical_namespace, &fragment.id));
                 }
-                QuantizationType::TwoBit => {}
-                QuantizationType::Product => {
-                    keys.insert(pq_cluster_key(physical_namespace, owner, cluster_idx));
+            }
+            NamespaceObjectFamily::Segment => {
+                debug_assert!(family.participates_in_branch_locality());
+                for segment in &manifest.segments {
+                    let physical_namespace = match origins {
+                        Some(origins) => origins.locate_segment(segment)?.physical_namespace(),
+                        None => namespace,
+                    };
+                    if segment.hierarchical {
+                        keys.insert(tree_meta_key(physical_namespace, &segment.id));
+                        for node_id in manifest.hierarchical_routing_nodes(&segment.id) {
+                            keys.insert(crate::index::hierarchical::tree_node_key(
+                                physical_namespace,
+                                &segment.id,
+                                node_id,
+                            ));
+                        }
+                    } else {
+                        keys.insert(centroids_key(physical_namespace, &segment.id));
+                    }
+
+                    if let Some(sketch) = &segment.sketch {
+                        keys.insert(sketch.key.clone());
+                    }
+                    if let Some(bootstrap) = &segment.bootstrap {
+                        keys.insert(bootstrap.key.clone());
+                    }
+                    if let Some(membership) = &segment.membership {
+                        keys.insert(membership.key.clone());
+                    }
+
+                    if segment.cluster_objects.is_empty() {
+                        for cluster_idx in 0..segment.cluster_count {
+                            keys.insert(cluster_key(
+                                physical_namespace,
+                                segment.cluster_owner(cluster_idx),
+                                cluster_idx,
+                            ));
+                        }
+                    } else {
+                        for object_ref in &segment.cluster_objects {
+                            keys.insert(object_ref.key.clone());
+                        }
+                    }
+
+                    for cluster_idx in 0..segment.cluster_count {
+                        let owner = segment.cluster_owner(cluster_idx);
+                        keys.insert(attrs_key(physical_namespace, owner, cluster_idx));
+
+                        if !segment.bitmap_fields.is_empty() {
+                            keys.insert(bitmap_key(physical_namespace, owner, cluster_idx));
+                        }
+
+                        if !segment.fts_fields.is_empty() {
+                            keys.insert(fts_index_key(physical_namespace, owner, cluster_idx));
+                        }
+
+                        match segment.quantization {
+                            QuantizationType::Scalar => {
+                                keys.insert(sq_cluster_key(physical_namespace, owner, cluster_idx));
+                            }
+                            QuantizationType::TwoBit => {}
+                            QuantizationType::Product => {
+                                keys.insert(pq_cluster_key(physical_namespace, owner, cluster_idx));
+                            }
+                            QuantizationType::None => {}
+                        }
+                    }
+
+                    match segment.quantization {
+                        QuantizationType::Scalar => {
+                            keys.insert(sq_calibration_key(physical_namespace, &segment.id));
+                        }
+                        QuantizationType::TwoBit => {}
+                        QuantizationType::Product => {
+                            keys.insert(pq_codebook_key(physical_namespace, &segment.id));
+                        }
+                        QuantizationType::None => {}
+                    }
+
+                    if segment.has_global_fts {
+                        keys.insert(global_fts_key(physical_namespace, &segment.id));
+                    }
                 }
-                QuantizationType::None => {}
             }
-        }
-
-        match segment.quantization {
-            QuantizationType::Scalar => {
-                keys.insert(sq_calibration_key(physical_namespace, &segment.id));
+            NamespaceObjectFamily::Staging => {
+                debug_assert!(!family.participates_in_branch_locality());
+                keys.extend(staging.iter().cloned());
             }
-            QuantizationType::TwoBit => {}
-            QuantizationType::Product => {
-                keys.insert(pq_codebook_key(physical_namespace, &segment.id));
+            NamespaceObjectFamily::Metadata
+            | NamespaceObjectFamily::Manifest
+            | NamespaceObjectFamily::Lease
+            | NamespaceObjectFamily::ManifestHistory
+            | NamespaceObjectFamily::Snapshot
+            | NamespaceObjectFamily::Gc
+            | NamespaceObjectFamily::BranchVisibilityRemoved => {
+                debug_assert!(!family.participates_in_branch_locality());
             }
-            QuantizationType::None => {}
-        }
-
-        if segment.has_global_fts {
-            keys.insert(global_fts_key(physical_namespace, &segment.id));
         }
     }
 
     keys.extend(manifest.pending_deletes.iter().cloned());
-    keys.extend(staging.iter().cloned());
     Ok(keys)
 }
 
@@ -1430,7 +1460,7 @@ impl ParsedGcArtifact {
 /// Namespace `catalog` maps to `catalog/_gc/candidates.json`.
 #[must_use]
 pub fn gc_candidate_store_key(namespace: &str) -> String {
-    format!("{namespace}/_gc/candidates.json")
+    NamespaceObjectFamily::Gc.namespace_prefix(namespace)
 }
 
 /// Loads and decodes the persisted candidate ledger for a namespace.
@@ -3280,7 +3310,7 @@ async fn active_staging_from_inventory(
     inventory: &NamespaceInventory,
     require_etag: bool,
 ) -> Result<ActiveStagingObservation> {
-    let lease_key = format!("{namespace}/lease.json");
+    let lease_key = NamespaceObjectFamily::Lease.namespace_prefix(namespace);
     let Some(lease_data) = read_inventory_object(
         store,
         &lease_key,
@@ -4721,7 +4751,7 @@ fn extend_scoped_artifact_roots(
 /// there is no null pointer or sentinel ULID. The `?` operators return `None`
 /// from the helper as soon as a required path component is absent.
 fn parse_gc_artifact_key(namespace: &str, key: &str) -> Option<ParsedGcArtifact> {
-    let wal_prefix = format!("{namespace}/wal/");
+    let wal_prefix = NamespaceObjectFamily::Wal.namespace_prefix(namespace);
     if let Some(name) = key.strip_prefix(&wal_prefix) {
         let id = name.strip_suffix(".wal")?;
         if id.contains('/') {
@@ -4744,7 +4774,7 @@ fn parse_gc_artifact_key(namespace: &str, key: &str) -> Option<ParsedGcArtifact>
 }
 
 fn parse_segment_key<'a>(namespace: &str, key: &'a str) -> Option<(&'a str, &'a str, Ulid)> {
-    let segment_prefix = format!("{namespace}/segments/");
+    let segment_prefix = NamespaceObjectFamily::Segment.namespace_prefix(namespace);
     let rest = key.strip_prefix(&segment_prefix)?;
     let (segment_id, path) = rest.split_once('/')?;
     let ulid_text = segment_id.strip_prefix("seg_")?;
@@ -4774,7 +4804,7 @@ fn is_known_scoped_artifact_path(path: &str) -> bool {
         return is_sha256_hex(digest);
     }
     let Some((artifact_id, file_name)) = rest
-        .strip_prefix("segments/")
+        .strip_prefix(NamespaceObjectFamily::Segment.relative_prefix())
         .and_then(|nested| nested.split_once('/'))
     else {
         return false;
@@ -5168,7 +5198,10 @@ async fn active_staging_observation_at_with_mode(
     now: DateTime<Utc>,
     read_mode: GcReadMode,
 ) -> Result<ActiveStagingObservation> {
-    let lease_data = match store.get(&format!("{namespace}/lease.json")).await {
+    let lease_data = match store
+        .get(&NamespaceObjectFamily::Lease.namespace_prefix(namespace))
+        .await
+    {
         Ok(data) => data,
         Err(crate::error::ZeppelinError::NotFound { .. }) => {
             return Ok(ActiveStagingObservation {
@@ -5187,7 +5220,7 @@ async fn active_staging_observation_at_with_mode(
     }
 
     let mut staged = BTreeSet::new();
-    let prefix = format!("{namespace}/_staging/");
+    let prefix = NamespaceObjectFamily::Staging.namespace_prefix(namespace);
     let mut keys = store.list_prefix(&prefix).await?;
     if read_mode.is_bounded() {
         keys.sort();
@@ -6283,6 +6316,69 @@ mod tests {
                 "active lease staged key must be treated as reachable: {key}"
             );
         }
+    }
+
+    /// Pins the registry refactor to the byte-exact pre-refactor expansion.
+    #[test]
+    fn artifact_family_registry_reachability_matches_golden_fixture() {
+        let fragment_id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let mut segment = segment_ref("seg_registry", 2);
+        segment.quantization = QuantizationType::Product;
+        segment.bitmap_fields = vec!["color".to_string()];
+        segment.fts_fields = vec!["body".to_string()];
+        segment.has_global_fts = true;
+        segment.sketch = Some(SketchRef {
+            key: sketch_key(NS, "seg_registry"),
+            version: 3,
+            code_dims: 8,
+            bytes_per_vector: 8,
+            size_bytes: 512,
+            rotation_seed: None,
+        });
+        segment.bootstrap = Some(BootstrapRef {
+            key: bootstrap_key(NS, "seg_registry"),
+            size_bytes: 1024,
+        });
+        segment.membership = Some(MembershipRef {
+            key: membership_key(NS, "seg_registry"),
+            size_bytes: 256,
+            entry_count: 10,
+        });
+        segment.cluster_objects = vec![ClusterDataObjectRef {
+            key: format!("{NS}/segments/seg_registry/cluster_group_0.bin"),
+            clusters: vec![0, 1],
+            live_offset: 0,
+            live_len: 0,
+            size_bytes: 2048,
+            cluster_layout_version: 0,
+            row_layouts: Vec::new(),
+        }];
+
+        let mut manifest = Manifest::new();
+        manifest.fragments = vec![fragment_ref(fragment_id)];
+        manifest.segments = vec![segment];
+        manifest.pending_deletes = vec![format!("{NS}/wal/pending.wal")];
+        let staging = BTreeSet::from([format!("{NS}/segments/seg_staged/centroids.bin")]);
+        let retained_history = BTreeSet::from([
+            format!("{NS}/segments/seg_history/centroids.bin"),
+            format!("{NS}/wal/history.wal"),
+        ]);
+
+        let actual = reachable_keys_with_retained_history_and_staging_keys(
+            NS,
+            &manifest,
+            &staging,
+            &retained_history,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|key| format!("{key}\n"))
+        .collect::<String>();
+
+        assert_eq!(
+            actual.as_bytes(),
+            include_bytes!("../../tests/fixtures/mmli2/phase3_reachable_keys.txt")
+        );
     }
 
     /// Scope artifacts published after compaction's prefix LIST remain owned by

@@ -11,29 +11,54 @@ use crate::error::{Result, ZeppelinError};
 /// Production object families allowed directly beneath one namespace prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NamespaceObjectFamily {
-    /// The authoritative namespace lifecycle record at `meta.json`.
+    /// `meta.json`: control-protocol state, never deferred, expanded, or branch-local.
     Metadata,
-    /// The live visibility boundary at `manifest.json`.
+    /// `manifest.json`: control-protocol state, never deferred, expanded, or branch-local.
     Manifest,
-    /// The single-writer lease at `lease.json`.
+    /// `lease.json`: lease-protocol state, never deferred, expanded, or branch-local.
     Lease,
-    /// Immutable manifest history beneath `manifests/`.
+    /// `manifests/`: retention-protocol state, never deferred, expanded, or branch-local.
     ManifestHistory,
-    /// Named snapshot pins beneath `snapshots/`.
+    /// `snapshots/`: snapshot-protocol state, never deferred, expanded, or branch-local.
     Snapshot,
-    /// Immutable WAL fragments beneath `wal/`.
+    /// `wal/`: manifest-referenced immutable data, deferred and branch-local.
     Wal,
-    /// Immutable index artifacts beneath `segments/`.
+    /// `segments/`: manifest-referenced immutable data, deferred and branch-local.
     Segment,
-    /// Lease-scoped compaction roots beneath `_staging/`.
+    /// `_staging/`: fenced staging roots, never deferred or branch-local.
     Staging,
-    /// The persisted GC candidate ledger beneath `_gc/`.
+    /// `_gc/`: GC-protocol state, never deferred, expanded, or branch-local.
     Gc,
-    /// Durable branch-visibility removal markers beneath `_lifecycle/`.
+    /// `_lifecycle/`: lifecycle-protocol state, never deferred, expanded, or branch-local.
     BranchVisibilityRemoved,
 }
 
+/// Which lifecycle owns reachability for one namespace object family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GcOwnership {
+    /// A manifest or retained snapshot decides whether the immutable object is live.
+    ManifestReferenced,
+    /// A dedicated control-plane protocol owns creation and removal.
+    ControlProtocol,
+    /// The active fencing token temporarily roots in-flight compaction uploads.
+    StagingProtocol,
+}
+
 impl NamespaceObjectFamily {
+    /// Every production namespace object family, in stable registry order.
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Metadata,
+        Self::Manifest,
+        Self::Lease,
+        Self::ManifestHistory,
+        Self::Snapshot,
+        Self::Wal,
+        Self::Segment,
+        Self::Staging,
+        Self::Gc,
+        Self::BranchVisibilityRemoved,
+    ];
+
     /// Whether a manifest may name this family in `pending_deletes`.
     ///
     /// Deferred deletion is restricted to immutable data artifacts. Control,
@@ -41,13 +66,106 @@ impl NamespaceObjectFamily {
     /// ownership protocols and must never enter the artifact drain.
     #[must_use]
     pub(crate) const fn allows_deferred_delete(self) -> bool {
-        matches!(self, Self::Wal | Self::Segment)
+        match self {
+            Self::Wal | Self::Segment => true,
+            Self::Metadata
+            | Self::Manifest
+            | Self::Lease
+            | Self::ManifestHistory
+            | Self::Snapshot
+            | Self::Staging
+            | Self::Gc
+            | Self::BranchVisibilityRemoved => false,
+        }
+    }
+
+    /// Return the lifecycle that owns reachability and removal for this family.
+    #[must_use]
+    pub(crate) const fn gc_ownership(self) -> GcOwnership {
+        match self {
+            Self::Wal | Self::Segment => GcOwnership::ManifestReferenced,
+            Self::Staging => GcOwnership::StagingProtocol,
+            Self::Metadata
+            | Self::Manifest
+            | Self::Lease
+            | Self::ManifestHistory
+            | Self::Snapshot
+            | Self::Gc
+            | Self::BranchVisibilityRemoved => GcOwnership::ControlProtocol,
+        }
+    }
+
+    /// Whether physical origins for this family participate in branch locality.
+    #[must_use]
+    pub(crate) const fn participates_in_branch_locality(self) -> bool {
+        match self {
+            Self::Wal | Self::Segment => true,
+            Self::Metadata
+            | Self::Manifest
+            | Self::Lease
+            | Self::ManifestHistory
+            | Self::Snapshot
+            | Self::Staging
+            | Self::Gc
+            | Self::BranchVisibilityRemoved => false,
+        }
+    }
+
+    /// Return the namespace-relative exact key or descendant prefix.
+    #[must_use]
+    pub(crate) const fn relative_prefix(self) -> &'static str {
+        match self {
+            Self::Metadata => "meta.json",
+            Self::Manifest => "manifest.json",
+            Self::Lease => "lease.json",
+            Self::ManifestHistory => "manifests/",
+            Self::Snapshot => "snapshots/",
+            Self::Wal => "wal/",
+            Self::Segment => "segments/",
+            Self::Staging => "_staging/",
+            Self::Gc => "_gc/candidates.json",
+            Self::BranchVisibilityRemoved => "_lifecycle/branch_visibility_removed/",
+        }
+    }
+
+    /// Return the namespace-relative top-level family root.
+    #[must_use]
+    pub(crate) const fn relative_root_prefix(self) -> &'static str {
+        match self {
+            Self::Metadata => "meta.json",
+            Self::Manifest => "manifest.json",
+            Self::Lease => "lease.json",
+            Self::ManifestHistory => "manifests/",
+            Self::Snapshot => "snapshots/",
+            Self::Wal => "wal/",
+            Self::Segment => "segments/",
+            Self::Staging => "_staging/",
+            Self::Gc => "_gc/",
+            Self::BranchVisibilityRemoved => "_lifecycle/",
+        }
+    }
+
+    /// Build this family's exact namespace prefix or singleton key.
+    #[must_use]
+    pub(crate) fn namespace_prefix(self, namespace: &str) -> String {
+        format!("{namespace}/{}", self.relative_prefix())
     }
 
     /// Whether this is the exact metadata tombstone retained during cleanup.
     #[must_use]
     pub(crate) const fn is_metadata(self) -> bool {
-        matches!(self, Self::Metadata)
+        match self {
+            Self::Metadata => true,
+            Self::Manifest
+            | Self::Lease
+            | Self::ManifestHistory
+            | Self::Snapshot
+            | Self::Wal
+            | Self::Segment
+            | Self::Staging
+            | Self::Gc
+            | Self::BranchVisibilityRemoved => false,
+        }
     }
 }
 
@@ -77,11 +195,14 @@ impl NamespaceObjectKey {
             )
         })?;
 
-        let family = match suffix {
-            "meta.json" => NamespaceObjectFamily::Metadata,
-            "manifest.json" => NamespaceObjectFamily::Manifest,
-            "lease.json" => NamespaceObjectFamily::Lease,
-            _ => classify_nested_family(&key, suffix)?,
+        let family = if suffix == NamespaceObjectFamily::Metadata.relative_prefix() {
+            NamespaceObjectFamily::Metadata
+        } else if suffix == NamespaceObjectFamily::Manifest.relative_prefix() {
+            NamespaceObjectFamily::Manifest
+        } else if suffix == NamespaceObjectFamily::Lease.relative_prefix() {
+            NamespaceObjectFamily::Lease
+        } else {
+            classify_nested_family(&key, suffix)?
         };
 
         Ok(Self {
@@ -127,17 +248,26 @@ pub(crate) fn namespace_prefix(namespace: &str) -> Result<String> {
 }
 
 fn classify_nested_family(key: &str, suffix: &str) -> Result<NamespaceObjectFamily> {
-    if let Some(file_name) = suffix.strip_prefix("manifests/") {
+    if let Some(file_name) =
+        suffix.strip_prefix(NamespaceObjectFamily::ManifestHistory.relative_prefix())
+    {
         validate_manifest_history_file(key, file_name)?;
         return Ok(NamespaceObjectFamily::ManifestHistory);
     }
-    if let Some(file_name) = suffix.strip_prefix("snapshots/") {
+    if let Some(file_name) = suffix.strip_prefix(NamespaceObjectFamily::Snapshot.relative_prefix())
+    {
         validate_snapshot_file(key, file_name)?;
         return Ok(NamespaceObjectFamily::Snapshot);
     }
     for (prefix, family) in [
-        ("wal/", NamespaceObjectFamily::Wal),
-        ("segments/", NamespaceObjectFamily::Segment),
+        (
+            NamespaceObjectFamily::Wal.relative_prefix(),
+            NamespaceObjectFamily::Wal,
+        ),
+        (
+            NamespaceObjectFamily::Segment.relative_prefix(),
+            NamespaceObjectFamily::Segment,
+        ),
     ] {
         if let Some(descendant) = suffix.strip_prefix(prefix) {
             if descendant.is_empty() {
@@ -150,25 +280,27 @@ fn classify_nested_family(key: &str, suffix: &str) -> Result<NamespaceObjectFami
         }
     }
 
-    if let Some(file_name) = suffix.strip_prefix("_staging/") {
+    if let Some(file_name) = suffix.strip_prefix(NamespaceObjectFamily::Staging.relative_prefix()) {
         validate_staging_file(key, file_name)?;
         return Ok(NamespaceObjectFamily::Staging);
     }
-    if suffix == "_gc/candidates.json" {
+    if suffix == NamespaceObjectFamily::Gc.relative_prefix() {
         return Ok(NamespaceObjectFamily::Gc);
     }
-    if suffix.starts_with("_gc/") {
+    if suffix.starts_with(NamespaceObjectFamily::Gc.relative_root_prefix()) {
         return Err(malformed_namespace_family_key(
             "gc",
             key,
             "unrecognized reserved GC key",
         ));
     }
-    if let Some(file_name) = suffix.strip_prefix("_lifecycle/branch_visibility_removed/") {
+    if let Some(file_name) =
+        suffix.strip_prefix(NamespaceObjectFamily::BranchVisibilityRemoved.relative_prefix())
+    {
         validate_visibility_marker_file(key, file_name)?;
         return Ok(NamespaceObjectFamily::BranchVisibilityRemoved);
     }
-    if suffix.starts_with("_lifecycle/") {
+    if suffix.starts_with(NamespaceObjectFamily::BranchVisibilityRemoved.relative_root_prefix()) {
         return Err(malformed_namespace_family_key(
             "branch-visibility-removal",
             key,
@@ -279,41 +411,55 @@ fn malformed_namespace_family_key(
 
 #[cfg(test)]
 mod tests {
-    use super::{NamespaceObjectFamily, NamespaceObjectKey};
+    use super::{GcOwnership, NamespaceObjectFamily, NamespaceObjectKey};
 
     const NS: &str = "target";
 
     #[test]
     fn classifier_covers_every_production_namespace_family() {
-        let keys = [
-            ("target/meta.json", NamespaceObjectFamily::Metadata),
-            ("target/manifest.json", NamespaceObjectFamily::Manifest),
-            ("target/lease.json", NamespaceObjectFamily::Lease),
-            (
-                "target/manifests/00000000000000000001.msgpack",
-                NamespaceObjectFamily::ManifestHistory,
-            ),
-            ("target/snapshots/daily.msgpack", NamespaceObjectFamily::Snapshot),
-            ("target/wal/fragment.wal", NamespaceObjectFamily::Wal),
-            (
-                "target/segments/segment/centroids.bin",
-                NamespaceObjectFamily::Segment,
-            ),
-            ("target/_staging/17.json", NamespaceObjectFamily::Staging),
-            ("target/_gc/candidates.json", NamespaceObjectFamily::Gc),
-            (
-                "target/_lifecycle/branch_visibility_removed/01ARZ3NDEKTSV4RRFFQ69G5FAV.1234567890abcdef1234567890abcdef.json",
-                NamespaceObjectFamily::BranchVisibilityRemoved,
-            ),
-        ];
+        let mut conformance_rows =
+            include_str!("../../tests/fixtures/mmli2/phase3_family_conformance.tsv").lines();
 
-        for (key, expected) in keys {
-            let classified = NamespaceObjectKey::classify(NS, key)
+        for family in NamespaceObjectFamily::ALL {
+            let descendant = match family {
+                NamespaceObjectFamily::Metadata
+                | NamespaceObjectFamily::Manifest
+                | NamespaceObjectFamily::Lease
+                | NamespaceObjectFamily::Gc => "",
+                NamespaceObjectFamily::ManifestHistory => "00000000000000000001.msgpack",
+                NamespaceObjectFamily::Snapshot => "daily.msgpack",
+                NamespaceObjectFamily::Wal => "fragment.wal",
+                NamespaceObjectFamily::Segment => "segment/centroids.bin",
+                NamespaceObjectFamily::Staging => "17.json",
+                NamespaceObjectFamily::BranchVisibilityRemoved => {
+                    "01ARZ3NDEKTSV4RRFFQ69G5FAV.1234567890abcdef1234567890abcdef.json"
+                }
+            };
+            let key = format!("{}{descendant}", family.namespace_prefix(NS));
+            let row = conformance_rows
+                .next()
+                .unwrap_or_else(|| panic!("missing counting conformance row for {family:?}"));
+            let mut fields = row.split('\t');
+            assert_eq!(fields.next(), Some(format!("{family:?}").as_str()));
+            assert_eq!(fields.next(), Some(key.as_str()));
+            assert!(
+                fields.next().is_some_and(|class| !class.is_empty()),
+                "{family:?} must declare a counting class"
+            );
+            assert_eq!(fields.next(), None, "{family:?} row has extra fields");
+
+            let classified = NamespaceObjectKey::classify(NS, key.clone())
                 .unwrap_or_else(|error| panic!("{key} should classify: {error}"));
             assert_eq!(classified.namespace(), NS);
-            assert_eq!(classified.family(), expected);
+            assert_eq!(classified.family(), family);
             assert_eq!(classified.into_key(), key);
         }
+
+        assert_eq!(
+            conformance_rows.next(),
+            None,
+            "counting conformance fixture has a family absent from ALL"
+        );
     }
 
     #[test]
@@ -331,6 +477,32 @@ mod tests {
         assert!(wal.allows_deferred_delete());
         assert!(segment.allows_deferred_delete());
         assert!(!lifecycle.allows_deferred_delete());
+    }
+
+    #[test]
+    fn every_family_declares_gc_and_branch_locality_semantics() {
+        for family in NamespaceObjectFamily::ALL {
+            match family {
+                NamespaceObjectFamily::Wal | NamespaceObjectFamily::Segment => {
+                    assert_eq!(family.gc_ownership(), GcOwnership::ManifestReferenced);
+                    assert!(family.participates_in_branch_locality());
+                }
+                NamespaceObjectFamily::Staging => {
+                    assert_eq!(family.gc_ownership(), GcOwnership::StagingProtocol);
+                    assert!(!family.participates_in_branch_locality());
+                }
+                NamespaceObjectFamily::Metadata
+                | NamespaceObjectFamily::Manifest
+                | NamespaceObjectFamily::Lease
+                | NamespaceObjectFamily::ManifestHistory
+                | NamespaceObjectFamily::Snapshot
+                | NamespaceObjectFamily::Gc
+                | NamespaceObjectFamily::BranchVisibilityRemoved => {
+                    assert_eq!(family.gc_ownership(), GcOwnership::ControlProtocol);
+                    assert!(!family.participates_in_branch_locality());
+                }
+            }
+        }
     }
 
     #[test]

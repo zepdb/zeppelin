@@ -647,8 +647,8 @@ mod tests {
     };
 
     use super::{
-        counting_store, is_audit_key, is_control_plane_key, is_security_key, perf_counting_store,
-        ArtifactClass,
+        classify, counting_store, is_audit_key, is_control_plane_key, is_security_key,
+        perf_counting_store, ArtifactClass,
     };
     use zeppelin::storage::ZeppelinStore;
 
@@ -670,6 +670,30 @@ mod tests {
     impl std::fmt::Display for DeleteStreamProbe {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("DeleteStreamProbe")
+        }
+    }
+
+    #[test]
+    fn namespace_family_attribution_is_deliberate_and_complete() {
+        // The production completeness test consumes this same fixture against
+        // `NamespaceObjectFamily::ALL`, so a new family must add a row here.
+        for row in include_str!("../fixtures/mmli2/phase3_family_conformance.tsv").lines() {
+            let mut fields = row.split('\t');
+            let family = fields.next().expect("family field");
+            let key = fields.next().expect("key field");
+            let expected = match fields.next().expect("artifact class field") {
+                "Manifest" => ArtifactClass::Manifest,
+                "Wal" => ArtifactClass::Wal,
+                "Centroids" => ArtifactClass::Centroids,
+                "Other" => ArtifactClass::Other,
+                class => panic!("{family} declares unknown artifact class {class}"),
+            };
+            assert_eq!(fields.next(), None, "{family} row has extra fields");
+            assert_eq!(
+                classify(key),
+                expected,
+                "{family} must retain deliberate counting attribution"
+            );
         }
     }
 

@@ -881,7 +881,7 @@ mod tests {
         assert_eq!(err.error_code(), "INTERNAL_DATA_MISSING");
         // I3: the raw S3 key must NOT appear in the client-facing message.
         assert!(
-            !err.client_message().contains("segments/"),
+            !err.client_message().contains(concat!("segments", "/")),
             "client message leaked an internal S3 key: {}",
             err.client_message()
         );

@@ -1,0 +1,10 @@
+Metadata	target/meta.json	Other
+Manifest	target/manifest.json	Manifest
+Lease	target/lease.json	Other
+ManifestHistory	target/manifests/00000000000000000001.msgpack	Other
+Snapshot	target/snapshots/daily.msgpack	Other
+Wal	target/wal/fragment.wal	Wal
+Segment	target/segments/segment/centroids.bin	Centroids
+Staging	target/_staging/17.json	Other
+Gc	target/_gc/candidates.json	Other
+BranchVisibilityRemoved	target/_lifecycle/branch_visibility_removed/01ARZ3NDEKTSV4RRFFQ69G5FAV.1234567890abcdef1234567890abcdef.json	Other
