@@ -25,6 +25,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "mmli_lab"
+path = "src/bin/mmli_lab.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "zeppelin_license"
 path = "src/bin/zeppelin_license.rs"
 test = false

@@ -3,7 +3,12 @@ name = "zeppelin-mmli-reference"
 version = "0.0.0"
 requires-python = ">=3.11"
 dependencies = [
+    "datasets==5.0.1",
     "numpy==2.4.3",
+    "peft==0.19.0",
+    "pillow==12.1.1",
+    "torch==2.10.0",
+    "transformers==5.3.0",
 ]
 
 [tool.uv]
