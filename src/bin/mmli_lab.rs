@@ -29,6 +29,8 @@ const MAX_MATRIX_ROWS: usize = 1_000_000;
 const TRUTH_K: usize = 10;
 const ROUTING_TRUTH_K: usize = 100;
 const CANDIDATE_KS: [usize; 3] = [50, 100, 300];
+const TEXT_CANDIDATE_K_MAX: usize = 700;
+const VISUAL_DOCUMENT_POOLING_FACTOR: usize = 2;
 const ROUTING_NPROBES: [usize; 2] = [8, 16];
 const CENTERING_SAMPLE_ROWS: usize = 5_000;
 const GEOMETRY_SAMPLE_ROWS: usize = 256;
@@ -86,7 +88,7 @@ enum Centering {
     SubtractGlobalMeanRenormalize,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum DType {
     F16,
@@ -120,9 +122,13 @@ struct Job {
     chosen_algorithm: Option<Algorithm>,
     #[serde(default)]
     chosen_centering: Option<Centering>,
+    #[serde(default)]
+    full_precision_documents: Option<TensorInput>,
+    #[serde(default)]
+    full_precision_queries: Option<TensorInput>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TensorSidecar {
     rows: Vec<usize>,
@@ -169,6 +175,9 @@ struct ResultDocument {
     routing: Option<RoutingReport>,
     diagnostic_probes: Option<Vec<CellResult>>,
     diagnostics: Option<Vec<DiagnosticCell>>,
+    visual_diagnostics: Option<Vec<DiagnosticCell>>,
+    pooling_probes: Option<Vec<PoolingProbe>>,
+    precision_retention: Option<PrecisionRetentionReport>,
     exact_frontier_gaps: Option<Vec<ExactFrontierGap>>,
 }
 
@@ -218,6 +227,7 @@ struct Winner {
     config: &'static str,
     algorithm: Algorithm,
     centering: Centering,
+    document_pooling_factor: usize,
     output_dimension: usize,
     candidate_k: usize,
     recall: f64,
@@ -302,6 +312,40 @@ struct DiagnosticCell {
     score_pairs: Vec<ScorePairDiagnostic>,
 }
 
+impl DiagnosticCell {
+    fn cell_result(&self) -> CellResult {
+        CellResult {
+            config: self.config,
+            repetitions: self.repetitions,
+            simhash_bits: self.simhash_bits,
+            d_proj: self.d_proj,
+            algorithm: self.algorithm,
+            centering: self.centering,
+            output_dimension: self.output_dimension,
+            recall_at_50: self.recall_at_50,
+            recall_at_100: self.recall_at_100,
+            recall_at_300: self.recall_at_300,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PoolingProbe {
+    factor: usize,
+    original_mean_rows: f64,
+    pooled_mean_rows: f64,
+    result: CellResult,
+}
+
+#[derive(Debug, Serialize)]
+struct PrecisionRetentionReport {
+    query_count: usize,
+    gold_count: usize,
+    f32_top_1_same_rank_fraction: f64,
+    f32_top_1_in_f16_top_10_fraction: f64,
+    f32_top_10_recall_in_f16_top_10: f64,
+}
+
 #[derive(Debug, Serialize)]
 struct ExactFrontierGap {
     query_index: usize,
@@ -352,6 +396,8 @@ struct Evaluation {
     routing: Option<RoutingReport>,
     diagnostic_probes: Option<Vec<CellResult>>,
     diagnostics: Option<Vec<DiagnosticCell>>,
+    visual_diagnostics: Option<Vec<DiagnosticCell>>,
+    pooling_probes: Option<Vec<PoolingProbe>>,
     exact_frontier_gaps: Option<Vec<ExactFrontierGap>>,
 }
 
@@ -392,9 +438,23 @@ const CONFIG_D_DPROJ_DIAGNOSTIC: FdeConfig = FdeConfig {
 };
 
 const CONFIG_E_REPS_DIAGNOSTIC: FdeConfig = FdeConfig {
-    name: "E-reps-diagnostic",
+    name: "E",
     repetitions: 40,
     simhash_bits: 4,
+    d_proj: 16,
+};
+
+const CONFIG_F_VISUAL_FINE: FdeConfig = FdeConfig {
+    name: "F-visual-k6",
+    repetitions: 10,
+    simhash_bits: 6,
+    d_proj: 16,
+};
+
+const CONFIG_G_VISUAL_COARSE: FdeConfig = FdeConfig {
+    name: "G-visual-k3",
+    repetitions: 80,
+    simhash_bits: 3,
     d_proj: 16,
 };
 
@@ -426,11 +486,44 @@ fn run() -> Result<()> {
             documents.sidecar.ids.len()
         )));
     }
+    let full_precision_documents = job
+        .full_precision_documents
+        .as_ref()
+        .map(|input| load_tensor(input, base))
+        .transpose()?;
+    let full_precision_queries = job
+        .full_precision_queries
+        .as_ref()
+        .map(|input| load_tensor(input, base))
+        .transpose()?;
+    let identity = prepare_values(&documents, &queries, Centering::Identity)?;
+    let identity_truth = exhaustive_truth(&documents, &queries, &identity)?;
+    let precision_retention = match (&full_precision_documents, &full_precision_queries) {
+        (Some(full_documents), Some(full_queries)) => {
+            validate_precision_pair(&documents, &queries, full_documents, full_queries)?;
+            let f32_identity = prepare_values(full_documents, full_queries, Centering::Identity)?;
+            let f32_truth = exhaustive_truth(full_documents, full_queries, &f32_identity)?;
+            Some(compare_precision_truth(&f32_truth, &identity_truth))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(LabError::Invalid(
+                "full-precision documents and queries must be provided together".to_string(),
+            ));
+        }
+    };
 
     let official_path = resolve_path(base, &job.official_scores);
     let official_scores: Vec<OfficialScore> = read_json(&official_path)?;
     let parity = evaluate_parity(&documents, &queries, &official_scores)?;
-    let evaluation = evaluate_fixed_grid(&job, &documents, &queries, parity.passed)?;
+    let evaluation = evaluate_fixed_grid(
+        &job,
+        &documents,
+        &queries,
+        &identity,
+        &identity_truth,
+        parity.passed,
+    )?;
     let result = ResultDocument {
         schema_version: 2,
         lane: job.lane,
@@ -446,6 +539,9 @@ fn run() -> Result<()> {
         routing: evaluation.routing,
         diagnostic_probes: evaluation.diagnostic_probes,
         diagnostics: evaluation.diagnostics,
+        visual_diagnostics: evaluation.visual_diagnostics,
+        pooling_probes: evaluation.pooling_probes,
+        precision_retention,
         exact_frontier_gaps: evaluation.exact_frontier_gaps,
     };
 
@@ -487,9 +583,13 @@ fn parse_cli() -> Result<PathBuf> {
 fn validate_lane_contract(job: &Job) -> Result<()> {
     match job.lane {
         Lane::Text => {
-            if job.chosen_algorithm.is_some() || job.chosen_centering.is_some() {
+            if job.chosen_algorithm.is_some()
+                || job.chosen_centering.is_some()
+                || job.full_precision_documents.is_some()
+                || job.full_precision_queries.is_some()
+            {
                 return Err(LabError::Invalid(
-                    "text jobs must not provide chosen_algorithm or chosen_centering".to_string(),
+                    "text jobs must not provide visual-only settings".to_string(),
                 ));
             }
         }
@@ -499,6 +599,37 @@ fn validate_lane_contract(job: &Job) -> Result<()> {
                     "visual jobs require chosen_algorithm and chosen_centering".to_string(),
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_precision_pair(
+    documents: &TensorSet,
+    queries: &TensorSet,
+    full_documents: &TensorSet,
+    full_queries: &TensorSet,
+) -> Result<()> {
+    if documents.sidecar.dtype != DType::F16
+        || queries.sidecar.dtype != DType::F16
+        || full_documents.sidecar.dtype != DType::F32
+        || full_queries.sidecar.dtype != DType::F32
+    {
+        return Err(LabError::Invalid(
+            "precision retention requires f16 primary and f32 reference tensors".to_string(),
+        ));
+    }
+    for (label, quantized, full) in [
+        ("documents", documents, full_documents),
+        ("queries", queries, full_queries),
+    ] {
+        if quantized.sidecar.dim != full.sidecar.dim
+            || quantized.sidecar.rows != full.sidecar.rows
+            || quantized.sidecar.ids != full.sidecar.ids
+        {
+            return Err(LabError::Invalid(format!(
+                "f16 and f32 {label} tensor shapes or IDs differ"
+            )));
         }
     }
     Ok(())
@@ -876,6 +1007,49 @@ fn center_tensor(
     Ok(centered)
 }
 
+fn mean_pool_documents(documents: &TensorSet, values: &[f32], factor: usize) -> Result<TensorSet> {
+    if factor < 2 {
+        return Err(LabError::Invalid(
+            "document pooling factor must be at least two".to_string(),
+        ));
+    }
+    let dim = documents.sidecar.dim;
+    let mut pooled_values = Vec::with_capacity(values.len().div_ceil(factor));
+    let mut rows = Vec::with_capacity(documents.sidecar.rows.len());
+    let mut scalar_offsets = Vec::with_capacity(documents.sidecar.rows.len());
+    let mut total_rows = 0usize;
+    for document_index in 0..documents.sidecar.rows.len() {
+        let matrix = documents.matrix(values, document_index)?;
+        scalar_offsets.push(pooled_values.len());
+        let pooled_rows = matrix.vector_count().div_ceil(factor);
+        rows.push(pooled_rows);
+        total_rows = total_rows
+            .checked_add(pooled_rows)
+            .ok_or_else(|| LabError::Invalid("pooled row count overflows".to_string()))?;
+        for start in (0..matrix.vector_count()).step_by(factor) {
+            let end = (start + factor).min(matrix.vector_count());
+            let divisor = (end - start) as f64;
+            for coordinate in 0..dim {
+                let sum = (start..end)
+                    .map(|row| f64::from(matrix.row(row)[coordinate]))
+                    .sum::<f64>();
+                pooled_values.push((sum / divisor) as f32);
+            }
+        }
+    }
+    Ok(TensorSet {
+        sidecar: TensorSidecar {
+            rows,
+            dim,
+            dtype: DType::F32,
+            ids: documents.sidecar.ids.clone(),
+        },
+        values: pooled_values,
+        scalar_offsets,
+        total_rows,
+    })
+}
+
 fn exhaustive_truth(
     documents: &TensorSet,
     queries: &TensorSet,
@@ -905,6 +1079,35 @@ fn exhaustive_truth(
             rank_100: scores[ROUTING_TRUTH_K - 1],
         })
     })
+}
+
+fn compare_precision_truth(
+    reference: &[ExactTruth],
+    quantized: &[ExactTruth],
+) -> PrecisionRetentionReport {
+    assert_eq!(reference.len(), quantized.len());
+    let mut top_1_same_rank = 0usize;
+    let mut top_1_in_top_10 = 0usize;
+    let mut top_10_hits = 0usize;
+    for (reference_query, quantized_query) in reference.iter().zip(quantized) {
+        let reference_top_1 = reference_query.top_documents[0];
+        top_1_same_rank += usize::from(reference_top_1 == quantized_query.top_documents[0]);
+        top_1_in_top_10 += usize::from(quantized_query.top_documents.contains(&reference_top_1));
+        top_10_hits += reference_query
+            .top_documents
+            .iter()
+            .filter(|document| quantized_query.top_documents.contains(document))
+            .count();
+    }
+    let query_count = reference.len();
+    let gold_count = query_count * TRUTH_K;
+    PrecisionRetentionReport {
+        query_count,
+        gold_count,
+        f32_top_1_same_rank_fraction: top_1_same_rank as f64 / query_count as f64,
+        f32_top_1_in_f16_top_10_fraction: top_1_in_top_10 as f64 / query_count as f64,
+        f32_top_10_recall_in_f16_top_10: top_10_hits as f64 / gold_count as f64,
+    }
 }
 
 fn exact_frontier_gaps(
@@ -1233,10 +1436,10 @@ fn evaluate_fixed_grid(
     job: &Job,
     documents: &TensorSet,
     queries: &TensorSet,
+    identity: &PreparedValues<'_>,
+    identity_truth: &[ExactTruth],
     parity_passed: bool,
 ) -> Result<Evaluation> {
-    let identity = prepare_values(documents, queries, Centering::Identity)?;
-    let identity_truth = exhaustive_truth(documents, queries, &identity)?;
     let mut cells = Vec::new();
 
     let chosen_algorithm = match job.lane {
@@ -1246,8 +1449,8 @@ fn evaluate_fixed_grid(
                     cells.push(evaluate_cell(
                         documents,
                         queries,
-                        &identity,
-                        &identity_truth,
+                        identity,
+                        identity_truth,
                         config,
                         algorithm,
                         Centering::Identity,
@@ -1261,18 +1464,54 @@ fn evaluate_fixed_grid(
             .ok_or_else(|| LabError::Invalid("visual algorithm is missing".to_string()))?,
     };
 
+    let mut visual_diagnostics = None;
     if job.lane == Lane::Visual {
-        for config in [CONFIG_A, CONFIG_B] {
-            cells.push(evaluate_cell(
+        let diagnostics = [
+            CONFIG_A,
+            CONFIG_E_REPS_DIAGNOSTIC,
+            CONFIG_F_VISUAL_FINE,
+            CONFIG_G_VISUAL_COARSE,
+        ]
+        .into_iter()
+        .map(|config| {
+            diagnose_cell(
                 documents,
                 queries,
-                &identity,
-                &identity_truth,
+                identity,
+                identity,
+                identity_truth,
                 config,
                 chosen_algorithm,
                 Centering::Identity,
-            )?);
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+        for config in [
+            CONFIG_A,
+            CONFIG_B,
+            CONFIG_E_REPS_DIAGNOSTIC,
+            CONFIG_F_VISUAL_FINE,
+            CONFIG_G_VISUAL_COARSE,
+        ] {
+            if config.name == CONFIG_B.name {
+                cells.push(evaluate_cell(
+                    documents,
+                    queries,
+                    identity,
+                    identity_truth,
+                    config,
+                    chosen_algorithm,
+                    Centering::Identity,
+                )?);
+            } else {
+                let diagnostic = diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.config == config.name)
+                    .expect("visual diagnostic config is present");
+                cells.push(diagnostic.cell_result());
+            }
         }
+        visual_diagnostics = Some(diagnostics);
     }
 
     let centerings: Vec<Centering> = match job.lane {
@@ -1289,7 +1528,7 @@ fn evaluate_fixed_grid(
     let mut geometry = vec![measure_geometry(
         documents,
         queries,
-        &identity,
+        identity,
         Centering::Identity,
     )?];
     for centering in centerings {
@@ -1298,7 +1537,7 @@ fn evaluate_fixed_grid(
             documents,
             queries,
             &prepared,
-            &identity_truth,
+            identity_truth,
             CONFIG_A,
             chosen_algorithm,
             centering,
@@ -1310,12 +1549,152 @@ fn evaluate_fixed_grid(
         Lane::Text => 0.95,
         Lane::Visual => 0.90,
     };
+    let mut winner = choose_winner(&cells, job.lane, threshold);
+    let (diagnostic_probes, diagnostics, exact_frontier_gaps) = if job.lane == Lane::Text {
+        let prepared = prepare_values(documents, queries, winner.centering)?;
+        (
+            Some(vec![evaluate_cell(
+                documents,
+                queries,
+                &prepared,
+                identity_truth,
+                CONFIG_D_DPROJ_DIAGNOSTIC,
+                winner.algorithm,
+                winner.centering,
+            )?]),
+            Some(vec![
+                diagnose_cell(
+                    documents,
+                    queries,
+                    identity,
+                    &prepared,
+                    identity_truth,
+                    CONFIG_A,
+                    winner.algorithm,
+                    winner.centering,
+                )?,
+                diagnose_cell(
+                    documents,
+                    queries,
+                    identity,
+                    &prepared,
+                    identity_truth,
+                    CONFIG_C_DIAGNOSTIC,
+                    winner.algorithm,
+                    winner.centering,
+                )?,
+                diagnose_cell(
+                    documents,
+                    queries,
+                    identity,
+                    &prepared,
+                    identity_truth,
+                    CONFIG_E_REPS_DIAGNOSTIC,
+                    winner.algorithm,
+                    winner.centering,
+                )?,
+            ]),
+            Some(exact_frontier_gaps(documents, queries, identity_truth)),
+        )
+    } else {
+        (None, None, None)
+    };
+    let pooling_probes = if job.lane == Lane::Visual {
+        let selected = cells
+            .iter()
+            .filter(|cell| {
+                cell.centering == Centering::Identity
+                    && cell.output_dimension
+                        == CONFIG_A.repetitions as usize
+                            * (1usize << CONFIG_A.simhash_bits)
+                            * CONFIG_A.d_proj as usize
+            })
+            .max_by(|left, right| left.recall_at_300.total_cmp(&right.recall_at_300))
+            .expect("visual fixed-D identity cells are non-empty");
+        let config = config_by_name(selected.config);
+        let original_mean_rows = documents.total_rows as f64 / documents.sidecar.rows.len() as f64;
+        let mut probes = Vec::with_capacity(2);
+        for factor in [VISUAL_DOCUMENT_POOLING_FACTOR, 4] {
+            let pooled = mean_pool_documents(documents, &identity.documents, factor)?;
+            let pooled_prepared = PreparedValues {
+                documents: Cow::Borrowed(&pooled.values),
+                queries: Cow::Borrowed(identity.queries.as_ref()),
+            };
+            let result = evaluate_cell(
+                &pooled,
+                queries,
+                &pooled_prepared,
+                identity_truth,
+                config,
+                chosen_algorithm,
+                Centering::Identity,
+            )?;
+            probes.push(PoolingProbe {
+                factor,
+                original_mean_rows,
+                pooled_mean_rows: pooled.total_rows as f64 / pooled.sidecar.rows.len() as f64,
+                result,
+            });
+        }
+        Some(probes)
+    } else {
+        None
+    };
     let recall_gate_passed = match job.lane {
-        Lane::Text => cells.iter().any(|cell| cell.recall_at_100 >= threshold),
-        Lane::Visual => cells.iter().any(|cell| cell.recall_at_300 >= threshold),
+        Lane::Text => {
+            let selected = diagnostics
+                .as_ref()
+                .and_then(|cells| {
+                    cells
+                        .iter()
+                        .find(|cell| cell.config == CONFIG_E_REPS_DIAGNOSTIC.name)
+                })
+                .expect("text diagnostics include config E");
+            let candidate_k = candidate_k_for_recall(selected, threshold);
+            let bounded_k = candidate_k.min(TEXT_CANDIDATE_K_MAX);
+            let recall = diagnostic_recall_at(selected, bounded_k);
+            winner = Winner {
+                config: selected.config,
+                algorithm: selected.algorithm,
+                centering: selected.centering,
+                document_pooling_factor: 1,
+                output_dimension: selected.output_dimension,
+                candidate_k: bounded_k,
+                recall,
+            };
+            candidate_k <= TEXT_CANDIDATE_K_MAX && recall >= threshold
+        }
+        Lane::Visual => {
+            let unpooled_passed = cells.iter().any(|cell| cell.recall_at_300 >= threshold);
+            if unpooled_passed {
+                true
+            } else {
+                let approved = pooling_probes
+                    .as_ref()
+                    .and_then(|probes| {
+                        probes
+                            .iter()
+                            .find(|probe| probe.factor == VISUAL_DOCUMENT_POOLING_FACTOR)
+                    })
+                    .expect("visual diagnostics include the approved 2x pooling probe");
+                if approved.result.recall_at_300 >= threshold {
+                    winner = Winner {
+                        config: approved.result.config,
+                        algorithm: approved.result.algorithm,
+                        centering: approved.result.centering,
+                        document_pooling_factor: approved.factor,
+                        output_dimension: approved.result.output_dimension,
+                        candidate_k: 300,
+                        recall: approved.result.recall_at_300,
+                    };
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     };
     let gate_passed = parity_passed && recall_gate_passed;
-    let winner = choose_winner(&cells, job.lane, threshold);
     let routing = if job.lane == Lane::Text && gate_passed {
         let config = config_by_name(winner.config);
         let prepared = prepare_values(documents, queries, winner.centering)?;
@@ -1329,56 +1708,6 @@ fn evaluate_fixed_grid(
     } else {
         None
     };
-    let (diagnostic_probes, diagnostics, exact_frontier_gaps) = if job.lane == Lane::Text {
-        let prepared = prepare_values(documents, queries, winner.centering)?;
-        (
-            Some(vec![
-                evaluate_cell(
-                    documents,
-                    queries,
-                    &prepared,
-                    &identity_truth,
-                    CONFIG_D_DPROJ_DIAGNOSTIC,
-                    winner.algorithm,
-                    winner.centering,
-                )?,
-                evaluate_cell(
-                    documents,
-                    queries,
-                    &prepared,
-                    &identity_truth,
-                    CONFIG_E_REPS_DIAGNOSTIC,
-                    winner.algorithm,
-                    winner.centering,
-                )?,
-            ]),
-            Some(vec![
-                diagnose_cell(
-                    documents,
-                    queries,
-                    &identity,
-                    &prepared,
-                    &identity_truth,
-                    CONFIG_A,
-                    winner.algorithm,
-                    winner.centering,
-                )?,
-                diagnose_cell(
-                    documents,
-                    queries,
-                    &identity,
-                    &prepared,
-                    &identity_truth,
-                    CONFIG_C_DIAGNOSTIC,
-                    winner.algorithm,
-                    winner.centering,
-                )?,
-            ]),
-            Some(exact_frontier_gaps(documents, queries, &identity_truth)),
-        )
-    } else {
-        (None, None, None)
-    };
 
     Ok(Evaluation {
         geometry,
@@ -1388,6 +1717,8 @@ fn evaluate_fixed_grid(
         routing,
         diagnostic_probes,
         diagnostics,
+        visual_diagnostics,
+        pooling_probes,
         exact_frontier_gaps,
     })
 }
@@ -1448,6 +1779,7 @@ fn choose_winner(cells: &[CellResult], lane: Lane, threshold: f64) -> Winner {
         config: cell.config,
         algorithm: cell.algorithm,
         centering: cell.centering,
+        document_pooling_factor: 1,
         output_dimension: cell.output_dimension,
         candidate_k,
         recall: cell.recall_at(candidate_k),
@@ -1458,8 +1790,28 @@ fn config_by_name(name: &str) -> FdeConfig {
     match name {
         "A" => CONFIG_A,
         "B" => CONFIG_B,
+        "E" => CONFIG_E_REPS_DIAGNOSTIC,
+        "F-visual-k6" => CONFIG_F_VISUAL_FINE,
+        "G-visual-k3" => CONFIG_G_VISUAL_COARSE,
         _ => unreachable!("only fixed Phase 2 configs are emitted"),
     }
+}
+
+fn candidate_k_for_recall(cell: &DiagnosticCell, threshold: f64) -> usize {
+    let mut ranks: Vec<usize> = cell.gold_ranks.iter().map(|row| row.fde_rank).collect();
+    ranks.sort_unstable();
+    let index = ((threshold * ranks.len() as f64).ceil() as usize)
+        .saturating_sub(1)
+        .min(ranks.len() - 1);
+    ranks[index]
+}
+
+fn diagnostic_recall_at(cell: &DiagnosticCell, candidate_k: usize) -> f64 {
+    cell.gold_ranks
+        .iter()
+        .filter(|row| row.fde_rank <= candidate_k)
+        .count() as f64
+        / cell.gold_ranks.len() as f64
 }
 
 fn measure_geometry(

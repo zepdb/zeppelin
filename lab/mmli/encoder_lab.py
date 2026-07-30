@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import resource
@@ -61,6 +62,7 @@ BATCH_SIZE = 8
 PAIR_COUNT = 50
 VISUAL_TASK_CAP = 1_000
 PUNCTUATION = list('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~')
+DIAGNOSTIC_CANDIDATE_KS = (50, 100, 300, 500, 600, 700, 1_000, 2_000)
 
 
 @dataclass
@@ -69,6 +71,7 @@ class EncodingResult:
     ids: list[str]
     batch_one_cpu_seconds_per_item: float
     batch_eight_cpu_seconds_per_item: float
+    batch_eight_wall_seconds_per_item: float
     peak_rss_mib: float
 
 
@@ -283,6 +286,7 @@ def timed_text_encoding(
 
     matrices: list[np.ndarray] = []
     start = time.process_time()
+    wall_start = time.perf_counter()
     for ordinal, batch in enumerate(batches(texts, BATCH_SIZE), start=1):
         matrices.extend(encoder.encode_batch(batch, is_query))
         if ordinal % 25 == 0:
@@ -292,7 +296,15 @@ def timed_text_encoding(
                 flush=True,
             )
     batch_eight = (time.process_time() - start) / len(texts)
-    return EncodingResult(matrices, ids, batch_one, batch_eight, peak_rss_mib())
+    batch_eight_wall = (time.perf_counter() - wall_start) / len(texts)
+    return EncodingResult(
+        matrices,
+        ids,
+        batch_one,
+        batch_eight,
+        batch_eight_wall,
+        peak_rss_mib(),
+    )
 
 
 def redirected_visual_adapter(adapter: Path, base: Path, destination: Path) -> Path:
@@ -365,6 +377,7 @@ def timed_visual_encoding(
 
     matrices: list[np.ndarray] = []
     start = time.process_time()
+    wall_start = time.perf_counter()
     for ordinal, batch in enumerate(batches(values, BATCH_SIZE), start=1):
         matrices.extend(visual_batch(model, processor, batch, is_query))
         if ordinal % 10 == 0:
@@ -374,19 +387,32 @@ def timed_visual_encoding(
                 flush=True,
             )
     batch_eight = (time.process_time() - start) / len(values)
-    return EncodingResult(matrices, ids, batch_one, batch_eight, peak_rss_mib())
+    batch_eight_wall = (time.perf_counter() - wall_start) / len(values)
+    return EncodingResult(
+        matrices,
+        ids,
+        batch_one,
+        batch_eight,
+        batch_eight_wall,
+        peak_rss_mib(),
+    )
 
 
-def write_tensor(prefix: Path, result: EncodingResult) -> tuple[Path, Path]:
-    raw_path = prefix.with_suffix(".f16")
+def write_tensor(
+    prefix: Path, result: EncodingResult, dtype: str = "f16"
+) -> tuple[Path, Path]:
+    if dtype not in {"f16", "f32"}:
+        raise RuntimeError(f"unsupported tensor dtype: {dtype}")
+    raw_path = prefix.with_suffix(f".{dtype}")
     sidecar_path = prefix.with_suffix(".json")
+    numpy_dtype = "<f2" if dtype == "f16" else "<f4"
     with raw_path.open("wb") as output:
         for matrix in result.matrices:
-            np.asarray(matrix, dtype="<f2").tofile(output)
+            np.asarray(matrix, dtype=numpy_dtype).tofile(output)
     sidecar = {
         "rows": [int(matrix.shape[0]) for matrix in result.matrices],
         "dim": DIMENSION,
-        "dtype": "f16",
+        "dtype": dtype,
         "ids": result.ids,
     }
     sidecar_path.write_text(json.dumps(sidecar, separators=(",", ":")))
@@ -394,17 +420,18 @@ def write_tensor(prefix: Path, result: EncodingResult) -> tuple[Path, Path]:
 
 
 def read_tensor(prefix: Path, timing: dict) -> EncodingResult:
-    raw_path = prefix.with_suffix(".f16")
     sidecar_path = prefix.with_suffix(".json")
     sidecar = json.loads(sidecar_path.read_text())
-    if sidecar["dim"] != DIMENSION or sidecar["dtype"] != "f16":
+    if sidecar["dim"] != DIMENSION or sidecar["dtype"] not in {"f16", "f32"}:
         raise RuntimeError(f"unexpected cached tensor format in {sidecar_path}")
+    raw_path = prefix.with_suffix(f".{sidecar['dtype']}")
     rows = [int(value) for value in sidecar["rows"]]
     ids = [str(value) for value in sidecar["ids"]]
     if len(rows) != len(ids) or len(ids) != len(set(ids)):
         raise RuntimeError(f"invalid cached tensor IDs in {sidecar_path}")
     expected_scalars = sum(rows) * DIMENSION
-    values = np.fromfile(raw_path, dtype="<f2")
+    numpy_dtype = "<f2" if sidecar["dtype"] == "f16" else "<f4"
+    values = np.fromfile(raw_path, dtype=numpy_dtype)
     if values.size != expected_scalars:
         raise RuntimeError(
             f"{raw_path} has {values.size} scalars, expected {expected_scalars}"
@@ -421,6 +448,7 @@ def read_tensor(prefix: Path, timing: dict) -> EncodingResult:
         ids=ids,
         batch_one_cpu_seconds_per_item=float(timing["batch_1"]),
         batch_eight_cpu_seconds_per_item=float(timing["batch_8"]),
+        batch_eight_wall_seconds_per_item=float(timing["batch_8_wall"]),
         peak_rss_mib=float(timing["peak_rss_mib"]),
     )
 
@@ -500,12 +528,18 @@ def encoding_metadata(documents: EncodingResult, queries: EncodingResult) -> dic
             "count": len(documents.ids),
             "batch_1_cpu_seconds_per_item": documents.batch_one_cpu_seconds_per_item,
             "batch_8_cpu_seconds_per_item": documents.batch_eight_cpu_seconds_per_item,
+            "batch_8_wall_seconds_per_item": (
+                documents.batch_eight_wall_seconds_per_item
+            ),
             "peak_rss_mib": documents.peak_rss_mib,
         },
         "queries": {
             "count": len(queries.ids),
             "batch_1_cpu_seconds_per_item": queries.batch_one_cpu_seconds_per_item,
             "batch_8_cpu_seconds_per_item": queries.batch_eight_cpu_seconds_per_item,
+            "batch_8_wall_seconds_per_item": (
+                queries.batch_eight_wall_seconds_per_item
+            ),
             "peak_rss_mib": queries.peak_rss_mib,
         },
     }
@@ -520,6 +554,7 @@ def run_rust(
     official_scores: Sequence[float],
     chosen_algorithm: str | None = None,
     chosen_centering: str | None = None,
+    include_full_precision: bool = False,
 ) -> dict:
     doc_raw, doc_sidecar = write_tensor(work_dir / f"{lane}-documents", documents)
     query_raw, query_sidecar = write_tensor(work_dir / f"{lane}-queries", queries)
@@ -534,6 +569,28 @@ def run_rust(
     if lane == "visual":
         job["chosen_algorithm"] = chosen_algorithm
         job["chosen_centering"] = chosen_centering
+    full_precision_paths: list[Path] = []
+    if include_full_precision:
+        full_doc_raw, full_doc_sidecar = write_tensor(
+            work_dir / f"{lane}-documents-f32", documents, "f32"
+        )
+        full_query_raw, full_query_sidecar = write_tensor(
+            work_dir / f"{lane}-queries-f32", queries, "f32"
+        )
+        job["full_precision_documents"] = {
+            "raw": str(full_doc_raw),
+            "sidecar": str(full_doc_sidecar),
+        }
+        job["full_precision_queries"] = {
+            "raw": str(full_query_raw),
+            "sidecar": str(full_query_sidecar),
+        }
+        full_precision_paths = [
+            full_doc_raw,
+            full_doc_sidecar,
+            full_query_raw,
+            full_query_sidecar,
+        ]
     job_path = work_dir / f"{lane}-job.json"
     job_path.write_text(json.dumps(job, indent=2) + "\n")
     completed = subprocess.run(
@@ -542,7 +599,10 @@ def run_rust(
         stdout=subprocess.PIPE,
         text=True,
     )
-    return json.loads(completed.stdout)
+    result = json.loads(completed.stdout)
+    for path in full_precision_paths:
+        path.unlink()
+    return result
 
 
 def sha256_file(path: Path) -> str:
@@ -649,7 +709,7 @@ def diagnostic_summary(cell: dict) -> dict:
         recall_by_frontier[str(frontier)] = {
             str(candidate_k): sum(rank <= candidate_k for rank in ranks)
             / len(ranks)
-            for candidate_k in (50, 100, 300)
+            for candidate_k in DIAGNOSTIC_CANDIDATE_KS
         }
         k_for_95[str(frontier)] = ranks[int(np.ceil(0.95 * len(ranks))) - 1]
 
@@ -933,6 +993,222 @@ def write_diagnostic_artifacts(report_path: Path, result: dict) -> dict:
     }
 
 
+def grouped_candidate_recall(
+    gold_ranks: list[dict], candidate_k: int, group
+) -> dict:
+    totals: dict[str, list[int]] = {}
+    for row in gold_ranks:
+        label = str(group(row))
+        counts = totals.setdefault(label, [0, 0])
+        counts[0] += 1
+        counts[1] += int(row["fde_rank"] <= candidate_k)
+    return {
+        label: {
+            "gold_count": counts[0],
+            "recall": counts[1] / counts[0],
+        }
+        for label, counts in sorted(totals.items())
+    }
+
+
+def visual_diagnostic_summary(cell: dict) -> dict:
+    summary = diagnostic_summary(cell)
+    gold_ranks = cell["gold_ranks"]
+    query_rows = sorted(
+        {
+            int(row["query_index"]): int(row["query_rows"])
+            for row in gold_ranks
+        }.values()
+    )
+    quartile_bounds = [
+        query_rows[max(0, math.ceil(len(query_rows) * fraction) - 1)]
+        for fraction in (0.25, 0.50, 0.75)
+    ]
+
+    def query_row_quartile(row: dict) -> str:
+        value = int(row["query_rows"])
+        if value <= quartile_bounds[0]:
+            return f"Q1 <= {quartile_bounds[0]}"
+        if value <= quartile_bounds[1]:
+            return f"Q2 <= {quartile_bounds[1]}"
+        if value <= quartile_bounds[2]:
+            return f"Q3 <= {quartile_bounds[2]}"
+        return f"Q4 > {quartile_bounds[2]}"
+
+    summary["query_row_quartile_boundaries"] = quartile_bounds
+    summary["recall_at_300_splits"] = {
+        "corpus": grouped_candidate_recall(
+            gold_ranks,
+            300,
+            lambda row: row["query_id"].split(":", 1)[0],
+        ),
+        "document_rows": grouped_candidate_recall(
+            gold_ranks,
+            300,
+            lambda row: row["document_rows"],
+        ),
+        "query_rows": grouped_candidate_recall(
+            gold_ranks,
+            300,
+            query_row_quartile,
+        ),
+    }
+    return summary
+
+
+def write_visual_diagnostic_artifacts(
+    report_path: Path, result: dict
+) -> dict:
+    cells = result.get("visual_diagnostics") or []
+    pooling = result.get("pooling_probes") or []
+    precision = result.get("precision_retention")
+    json_path = report_path.with_name("lab-visual-diagnostics.json")
+    if precision is None and json_path.is_file():
+        previous = json.loads(json_path.read_text())
+        previous_precision = previous.get("precision_retention")
+        expected_queries = int(result["query_stats"]["matrix_count"])
+        if (
+            previous.get("seed") == result["seed"]
+            and previous_precision is not None
+            and previous_precision.get("query_count") == expected_queries
+            and previous_precision.get("gold_count") == expected_queries * 10
+        ):
+            precision = previous_precision
+    if not cells and not pooling and not precision:
+        return {}
+    approved_pooling_factor = int(
+        result["winner"]["document_pooling_factor"]
+    )
+    payload = {
+        "schema_version": 2,
+        "seed": result["seed"],
+        "gate_truth": "unpooled f16-roundtripped exhaustive MaxSim",
+        "approved_candidate_document_pooling_factor": (
+            approved_pooling_factor
+        ),
+        "pooling_semantics": (
+            "contiguous document-row arithmetic means; tail divided by its "
+            "actual row count; no renormalization; query and exact truth "
+            "remain unpooled"
+        ),
+        "cells": cells,
+        "pooling_probes": pooling,
+        "precision_retention": precision,
+    }
+    json_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    )
+    return {
+        "cells": [visual_diagnostic_summary(cell) for cell in cells],
+        "pooling_probes": pooling,
+        "precision_retention": precision,
+        "approved_candidate_document_pooling_factor": (
+            approved_pooling_factor
+        ),
+    }
+
+
+def render_visual_diagnostics(evidence: dict) -> list[str]:
+    if not evidence:
+        return []
+    summaries = evidence["cells"]
+    lines = [
+        "",
+        "### Visual fixed-D diagnostic",
+        "",
+        "- Raw per-gold ranks and probes: "
+        "[lab-visual-diagnostics.json](lab-visual-diagnostics.json).",
+        "- All k-line cells use identity, PaperV1, d=16, and D=10,240.",
+        "",
+        "| Config | R/k/d | K | Exact top-1 | Exact top-5 | Exact top-10 |",
+        "| --- | --- | ---: | ---: | ---: | ---: |",
+    ]
+    for summary in summaries:
+        frontiers = summary["recall_by_exact_frontier"]
+        for candidate_k in map(str, DIAGNOSTIC_CANDIDATE_KS):
+            lines.append(
+                f"| {summary['config']} | {summary['repetitions']}/"
+                f"{summary['simhash_bits']}/{summary['d_proj']} | "
+                f"{candidate_k} | {frontiers['1'][candidate_k]:.6f} | "
+                f"{frontiers['5'][candidate_k]:.6f} | "
+                f"{frontiers['10'][candidate_k]:.6f} |"
+            )
+        k_for_95 = summary["candidate_k_for_95_percent"]
+        lines.append(
+            f"| {summary['config']} K needed for 95% | — | — | "
+            f"{k_for_95['1']} | {k_for_95['5']} | {k_for_95['10']} |"
+        )
+        lines.append(
+            f"| {summary['config']} query-row quartiles | — | — | "
+            f"{summary['query_row_quartile_boundaries']} | — | — |"
+        )
+    lines.extend(
+        [
+            "",
+            "| Config | Split | Group | Golds | R@300 |",
+            "| --- | --- | --- | ---: | ---: |",
+        ]
+    )
+    for summary in summaries:
+        for split, groups in summary["recall_at_300_splits"].items():
+            for group, values in groups.items():
+                lines.append(
+                    f"| {summary['config']} | {split} | {group} | "
+                    f"{values['gold_count']} | {values['recall']:.6f} |"
+                )
+    pooling = evidence["pooling_probes"]
+    if pooling:
+        lines.extend(
+            [
+                "",
+                "| Pool factor | Config | Mean rows before/after | "
+                "R@50 | R@100 | R@300 |",
+                "| ---: | --- | --- | ---: | ---: | ---: |",
+            ]
+        )
+        for probe in pooling:
+            result = probe["result"]
+            lines.append(
+                f"| {probe['factor']}× | {result['config']} "
+                f"({result['repetitions']}/{result['simhash_bits']}/"
+                f"{result['d_proj']}) | {probe['original_mean_rows']:.3f}/"
+                f"{probe['pooled_mean_rows']:.3f} | "
+                f"{result['recall_at_50']:.6f} | "
+                f"{result['recall_at_100']:.6f} | "
+                f"{result['recall_at_300']:.6f} |"
+            )
+        lines.extend(
+            [
+                "",
+                f"- Approved visual candidate pooling: "
+                f"{evidence['approved_candidate_document_pooling_factor']}× "
+                "contiguous document-row arithmetic means, no "
+                "renormalization. Queries and exact truth remain unpooled; "
+                "4× remains diagnostic-only.",
+            ]
+        )
+    precision = evidence["precision_retention"]
+    if precision:
+        lines.extend(
+            [
+                "",
+                "### Visual f32 → f16 exact-ranking retention",
+                "",
+                f"- Queries: {precision['query_count']}; exact top-10 golds: "
+                f"{precision['gold_count']}.",
+                "- f32/f16 exact top-1 same-rank fraction: "
+                f"`{precision['f32_top_1_same_rank_fraction']:.6f}`.",
+                "- f32 top-1 present in f16 top-10: "
+                f"`{precision['f32_top_1_in_f16_top_10_fraction']:.6f}`.",
+                "- f32 exact top-10 recovered by f16 exact top-10: "
+                f"`{precision['f32_top_10_recall_in_f16_top_10']:.6f}`.",
+                "- This is diagnostic evidence only; no f16 qualification "
+                "threshold was introduced.",
+            ]
+        )
+    return lines
+
+
 def render_diagnostics(evidence: dict) -> list[str]:
     if not evidence:
         return []
@@ -943,11 +1219,12 @@ def render_diagnostics(evidence: dict) -> list[str]:
         "",
         "### FDE failure diagnostic",
         "",
-        "- Diagnostic-only configs C, D, and E are outside the fixed gate and "
-        "do not change the winner or go/no-go result.",
+        "- Configs C and D are diagnostic-only. Config E is the selected "
+        "same-budget operating-point probe and its measured cutoff curve "
+        "drives the text candidate K.",
         "- Exact per-gold ranks and score pairs: "
         "[lab-diagnostics.json](lab-diagnostics.json).",
-        "- Score/residual scatter for A and C: "
+        "- Score/residual scatter for A, C, and E: "
         "[lab-diagnostics.png](lab-diagnostics.png).",
         "",
         "| Config | R/k/d | R@100 | Missed | Rank p50/p95/p99/max | "
@@ -979,7 +1256,12 @@ def render_diagnostics(evidence: dict) -> list[str]:
             "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
-    for probe in probes:
+    selected_probe = next(
+        summary
+        for summary in summaries
+        if summary["config"] == "E"
+    )
+    for probe in [*probes, selected_probe]:
         lines.append(
             f"| {probe['config']} | "
             f"{probe['repetitions']}/{probe['simhash_bits']}/"
@@ -1000,7 +1282,7 @@ def render_diagnostics(evidence: dict) -> list[str]:
     )
     for summary in summaries:
         frontiers = summary["recall_by_exact_frontier"]
-        for candidate_k in ("50", "100", "300"):
+        for candidate_k in map(str, DIAGNOSTIC_CANDIDATE_KS):
             lines.append(
                 f"| {summary['config']} | {candidate_k} | "
                 f"{frontiers['1'][candidate_k]:.6f} | "
@@ -1050,11 +1332,7 @@ def render_diagnostics(evidence: dict) -> list[str]:
         for probe in probes
         if probe["config"] == "D-dproj-diagnostic"
     )
-    reps_probe = next(
-        probe
-        for probe in probes
-        if probe["config"] == "E-reps-diagnostic"
-    )
+    reps_probe = selected_probe
     lines.extend(
         [
             f"- Rank shape: for A, {bins['101_400'] / missed:.1%} of K=100 "
@@ -1099,10 +1377,15 @@ def render_diagnostics(evidence: dict) -> list[str]:
             "not a hard product ceiling. The source design explicitly lists "
             "20,480 dimensions and frames affordability of dimension/K as "
             "the constraint.",
-            "- Gate provenance: the 0.95-at-K=100 full-top-10 threshold is "
-            "introduced by the Phase 2 execution plan. The source design "
-            "requires both top-1 and top-10 candidate recall but does not "
-            "derive that threshold.",
+            "- Gate correction: the quality threshold remains 0.95 full "
+            "exact-top-10 recovery. Candidate K is the smallest measured "
+            "cutoff meeting it, bounded by the approved K=700 hard maximum; "
+            "K=100 is a cost point, not the quality threshold.",
+            "- Query augmentation: the pinned checkpoint sets "
+            "`do_query_expansion=false` and "
+            "`attend_to_expansion_tokens=false`; the lab therefore retains "
+            "only attention-mask query rows. `[MASK]` padding is not an "
+            "enabled semantic expansion for this checkpoint.",
         ]
     )
     if gap:
@@ -1168,6 +1451,11 @@ def render_report(
         if text_result is not None
         else {}
     )
+    visual_diagnostic_evidence = (
+        write_visual_diagnostic_artifacts(report_path, visual_result)
+        if visual_result is not None
+        else {}
+    )
     lines = [
         "# MMLI-2 Phase 2 encoder qualification",
         "",
@@ -1203,6 +1491,7 @@ def render_report(
         lines.extend(render_diagnostics(diagnostic_evidence))
     if visual_result is not None:
         lines.extend(render_lane("Visual", visual_result, visual_cost))
+        lines.extend(render_visual_diagnostics(visual_diagnostic_evidence))
     if text_result is not None:
         lines.extend(render_decisions(text_result, visual_result))
     report_path.write_text("\n".join(lines) + "\n")
@@ -1218,7 +1507,8 @@ def render_lane(name: str, result: dict, cost: dict | None) -> list[str]:
                 "- Row normalization: encoder L2-normalizes every retained row "
                 "before f16 exchange; documents retain attention-mask rows "
                 "except punctuation, queries retain attention-mask rows; no "
-                "post-f16 renormalization.",
+                "post-f16 renormalization. The pinned checkpoint disables "
+                "query expansion, so masked padding rows are excluded.",
             ]
         )
     else:
@@ -1269,6 +1559,8 @@ def render_lane(name: str, result: dict, cost: dict | None) -> list[str]:
                 f"- Algorithm: `{winner['algorithm']}`",
                 f"- FDE config: `{winner['config']}`",
                 f"- VectorTransformRecipe: `{winner['centering']}`",
+                "- Candidate document pooling: "
+                f"`{winner['document_pooling_factor']}×`",
                 f"- Candidate K: `{winner['candidate_k']}`",
             ]
         )
@@ -1279,8 +1571,8 @@ def render_lane(name: str, result: dict, cost: dict | None) -> list[str]:
                 "### Encoder cost",
                 "",
                 "| Role | Count | CPU s/item batch 1 | CPU s/item batch 8 | "
-                "Peak RSS MiB |",
-                "| --- | ---: | ---: | ---: | ---: |",
+                "Wall s/item batch 8 | Peak RSS MiB |",
+                "| --- | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         for role in ("documents", "queries"):
@@ -1289,6 +1581,7 @@ def render_lane(name: str, result: dict, cost: dict | None) -> list[str]:
                 f"| {role} | {row['count']} | "
                 f"{row['batch_1_cpu_seconds_per_item']:.6f} | "
                 f"{row['batch_8_cpu_seconds_per_item']:.6f} | "
+                f"{row['batch_8_wall_seconds_per_item']:.6f} | "
                 f"{row['peak_rss_mib']:.1f} |"
             )
     corpus = result.get("corpus_stats")
@@ -1333,7 +1626,6 @@ def render_decisions(
     text_result: dict, visual_result: dict | None
 ) -> list[str]:
     text_winner = text_result["winner"]
-    chosen = visual_result["winner"] if visual_result else text_winner
     lines = [
         "",
         "## Named decisions and resolved lateon unknowns",
@@ -1355,9 +1647,10 @@ def render_decisions(
         "is computed from at most 5,000 evenly spaced document rows and "
         "the same frozen mean is applied to queries and documents. "
         "Centering is candidate-only; official exact MaxSim remains raw.",
-        f"- Operating point: config `{chosen['config']}`, "
-        f"D={chosen['output_dimension']}, K={chosen['candidate_k']}, "
-        f"measured candidate recall={chosen['recall']:.6f}.",
+        f"- Text operating point: config `{text_winner['config']}`, "
+        f"D={text_winner['output_dimension']}, "
+        f"K={text_winner['candidate_k']}, measured full-top-10 candidate "
+        f"recall={text_winner['recall']:.6f}.",
         "- Exact-scoring transform: `Identity` over the model-normalized, "
         "row-filtered matrix.",
         "- Lab execution adapter: pinned Transformers CPU with remote code "
@@ -1388,8 +1681,16 @@ def render_decisions(
             "gate stopped or the visual lane has not run."
         )
     else:
+        visual_winner = visual_result["winner"]
         lines.extend(
             [
+                f"- Visual operating point: config "
+                f"`{visual_winner['config']}`, "
+                f"candidate document pooling="
+                f"{visual_winner['document_pooling_factor']}×, "
+                f"D={visual_winner['output_dimension']}, "
+                f"K={visual_winner['candidate_k']}, measured full-top-10 "
+                f"candidate recall={visual_winner['recall']:.6f}.",
                 "- Visual FDE geometry, centering, and candidate recall are "
                 "reported above; PQ was not run (optional stretch skipped).",
                 "- The pinned Hugging Face-native visual loader avoids remote "
@@ -1402,7 +1703,10 @@ def render_decisions(
 
 
 def delete_transient_lab_artifacts(work_dir: Path) -> None:
-    paths = [work_dir / "text-encoding-cost.json"]
+    paths = [
+        work_dir / "text-encoding-cost.json",
+        work_dir / "visual-encoding-cost.json",
+    ]
     for lane in ("text", "visual"):
         paths.extend(
             [
@@ -1415,6 +1719,14 @@ def delete_transient_lab_artifacts(work_dir: Path) -> None:
                 work_dir / f"{lane}-result.json",
             ]
         )
+    paths.extend(
+        [
+            work_dir / "visual-documents-f32.f32",
+            work_dir / "visual-documents-f32.json",
+            work_dir / "visual-queries-f32.f32",
+            work_dir / "visual-queries-f32.json",
+        ]
+    )
     for path in paths:
         if path.exists():
             path.unlink()
@@ -1470,11 +1782,17 @@ def text_lane(hf_home: Path, work_dir: Path, binary: Path):
                     "documents": {
                         "batch_1": documents.batch_one_cpu_seconds_per_item,
                         "batch_8": documents.batch_eight_cpu_seconds_per_item,
+                        "batch_8_wall": (
+                            documents.batch_eight_wall_seconds_per_item
+                        ),
                         "peak_rss_mib": documents.peak_rss_mib,
                     },
                     "queries": {
                         "batch_1": text_queries.batch_one_cpu_seconds_per_item,
                         "batch_8": text_queries.batch_eight_cpu_seconds_per_item,
+                        "batch_8_wall": (
+                            text_queries.batch_eight_wall_seconds_per_item
+                        ),
                         "peak_rss_mib": text_queries.peak_rss_mib,
                     },
                 },
@@ -1531,20 +1849,80 @@ def visual_lane(
         )
         query_texts.extend(str(row["query"]) for row in english)
         query_ids.extend(f"{label}:{int(row['query_id'])}" for row in english)
-    with tempfile.TemporaryDirectory(dir=work_dir) as temporary:
-        model, processor = load_visual_model(
-            base_path, adapter_path, Path(temporary)
+    cost_path = work_dir / "visual-encoding-cost.json"
+    cached_paths = (
+        work_dir / "visual-documents.f16",
+        work_dir / "visual-documents.json",
+        work_dir / "visual-queries.f16",
+        work_dir / "visual-queries.json",
+        cost_path,
+    )
+    if all(path.is_file() for path in cached_paths):
+        timing = json.loads(cost_path.read_text())
+        documents = read_tensor(
+            work_dir / "visual-documents", timing["documents"]
         )
-        documents = timed_visual_encoding(
-            model, processor, images, document_ids, is_query=False
+        visual_queries = read_tensor(
+            work_dir / "visual-queries", timing["queries"]
         )
-        visual_queries = timed_visual_encoding(
-            model, processor, query_texts, query_ids, is_query=True
+        if documents.ids != document_ids or visual_queries.ids != query_ids:
+            raise RuntimeError(
+                "cached visual tensor IDs do not match pinned ViDoRe tasks"
+            )
+        with tempfile.TemporaryDirectory(dir=work_dir) as temporary:
+            local_adapter = redirected_visual_adapter(
+                adapter_path, base_path, Path(temporary) / "visual-adapter-local"
+            )
+            processor = ColModernVBertProcessor.from_pretrained(
+                local_adapter,
+                trust_remote_code=False,
+                local_files_only=True,
+            )
+            official_scores = visual_official_pair_scores(
+                processor, visual_queries, documents
+            )
+        print("reused validated pinned ViDoRe tensors", flush=True)
+        include_full_precision = False
+    else:
+        with tempfile.TemporaryDirectory(dir=work_dir) as temporary:
+            model, processor = load_visual_model(
+                base_path, adapter_path, Path(temporary)
+            )
+            documents = timed_visual_encoding(
+                model, processor, images, document_ids, is_query=False
+            )
+            visual_queries = timed_visual_encoding(
+                model, processor, query_texts, query_ids, is_query=True
+            )
+            official_scores = visual_official_pair_scores(
+                processor, visual_queries, documents
+            )
+            del model, processor
+        cost_path.write_text(
+            json.dumps(
+                {
+                    "documents": {
+                        "batch_1": documents.batch_one_cpu_seconds_per_item,
+                        "batch_8": documents.batch_eight_cpu_seconds_per_item,
+                        "batch_8_wall": (
+                            documents.batch_eight_wall_seconds_per_item
+                        ),
+                        "peak_rss_mib": documents.peak_rss_mib,
+                    },
+                    "queries": {
+                        "batch_1": visual_queries.batch_one_cpu_seconds_per_item,
+                        "batch_8": visual_queries.batch_eight_cpu_seconds_per_item,
+                        "batch_8_wall": (
+                            visual_queries.batch_eight_wall_seconds_per_item
+                        ),
+                        "peak_rss_mib": visual_queries.peak_rss_mib,
+                    },
+                },
+                indent=2,
+            )
+            + "\n"
         )
-        official_scores = visual_official_pair_scores(
-            processor, visual_queries, documents
-        )
-        del model, processor
+        include_full_precision = True
     result = run_rust(
         binary,
         work_dir,
@@ -1554,6 +1932,7 @@ def visual_lane(
         official_scores,
         chosen_algorithm,
         chosen_centering,
+        include_full_precision=include_full_precision,
     )
     return result, encoding_metadata(documents, visual_queries)
 
@@ -1615,7 +1994,8 @@ def run(args) -> None:
         None,
     )
     if not text_result["gate_passed"]:
-        delete_transient_lab_artifacts(work_dir)
+        if not args.retain_tensors:
+            delete_transient_lab_artifacts(work_dir)
         raise SystemExit("text candidate-recall gate failed; stopped")
     winner = text_result["winner"]
     visual_result, visual_cost = visual_lane(
@@ -1635,9 +2015,11 @@ def run(args) -> None:
         visual_cost,
     )
     if not visual_result["gate_passed"]:
-        delete_transient_lab_artifacts(work_dir)
+        if not args.retain_tensors:
+            delete_transient_lab_artifacts(work_dir)
         raise SystemExit("visual candidate-recall gate failed; stopped")
-    delete_transient_lab_artifacts(work_dir)
+    if not args.retain_tensors:
+        delete_transient_lab_artifacts(work_dir)
 
 
 def parse_args():
@@ -1650,6 +2032,7 @@ def parse_args():
     execute.add_argument("--work-dir", type=Path, required=True)
     execute.add_argument("--binary", type=Path, required=True)
     execute.add_argument("--report", type=Path, required=True)
+    execute.add_argument("--retain-tensors", action="store_true")
     return parser.parse_args()
 
 
