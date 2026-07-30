@@ -28,6 +28,8 @@
 //!    prefiltering and exact predicate evaluation.
 //! 6. Read [`crate::index::quantization`] for the memory, I/O, and recall
 //!    tradeoffs of SQ8 and product-quantized candidate scoring.
+//! 7. Read [`crate::index::late_interaction`] for MUVERA FDE construction and
+//!    scalar MaxSim scoring.
 //!
 //! ## Build and search boundaries
 //!
@@ -83,6 +85,7 @@ pub mod distance;
 pub mod filter;
 pub mod hierarchical;
 pub mod ivf_flat;
+pub mod late_interaction;
 pub mod quantization;
 pub(crate) mod topk;
 

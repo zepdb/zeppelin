@@ -282,6 +282,10 @@ pub enum ZeppelinError {
     #[error("membership artifact error: {0}")]
     Membership(String),
 
+    /// A late-interaction matrix, FDE, or MaxSim operation failed.
+    #[error("late-interaction error: {0}")]
+    LateInteraction(#[from] crate::index::late_interaction::LateInteractionError),
+
     /// K-means clustering did not converge within the iteration limit.
     #[error("k-means failed to converge after {iterations} iterations")]
     KMeansConvergence {
@@ -614,6 +618,7 @@ impl ZeppelinError {
             ZeppelinError::Rabitq(_) => "INTERNAL_ERROR",
             ZeppelinError::Rq(_) => "INTERNAL_ERROR",
             ZeppelinError::Membership(_) => "INTERNAL_ERROR",
+            ZeppelinError::LateInteraction(_) => "INTERNAL_ERROR",
             ZeppelinError::KMeansConvergence { .. } => "INTERNAL_ERROR",
             ZeppelinError::DimensionMismatch { .. } => "DIMENSION_MISMATCH",
             ZeppelinError::VectorNotFound { .. } => "VECTOR_NOT_FOUND",
@@ -786,6 +791,7 @@ impl ZeppelinError {
             | ZeppelinError::Rabitq(_)
             | ZeppelinError::Rq(_)
             | ZeppelinError::Membership(_)
+            | ZeppelinError::LateInteraction(_)
             | ZeppelinError::KMeansConvergence { .. }
             | ZeppelinError::Config(_)
             | ZeppelinError::Branch(_)
