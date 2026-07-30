@@ -75,6 +75,8 @@ pub mod config;
 pub mod namespace;
 /// Vector similarity, BM25, hybrid, and batch query endpoints.
 pub mod query;
+/// Typed source ingestion for late-interaction namespaces.
+pub mod retrieval_units;
 /// Security principal, credential, grant, and policy administration endpoints.
 pub mod security;
 /// Vector upsert, lookup, and delete endpoints.

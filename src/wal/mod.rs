@@ -67,6 +67,8 @@
 /// Defines immutable WAL fragment payloads, versioned serialization, and checksum validation.
 pub mod fragment;
 pub mod fragment_cache;
+/// Defines immutable typed-input WAL fragments for late-interaction namespaces.
+pub mod input_fragment;
 /// Defines immutable content-addressed manifest late-state sections.
 pub mod late_section;
 /// Coordinates namespace lease acquisition, renewal, fencing generations, and release.
@@ -81,12 +83,14 @@ pub mod writer;
 /// Re-exports the primary immutable WAL fragment type for crate consumers.
 pub use fragment::WalFragment;
 pub use fragment_cache::WalFragmentCache;
-/// Re-exports the late-state section and its root-manifest reference.
-pub use late_section::{LateStateSection, ManifestSectionRef};
+/// Re-exports the typed-input WAL fragment.
+pub use input_fragment::EncoderInputWalFragment;
+/// Re-exports late-state section, root reference, and retained-source reference.
+pub use late_section::{LateStateSection, ManifestSectionRef, SourceInventoryRef};
 /// Re-exports namespace lease snapshots and their object-store manager.
 pub use lease::{Lease, LeaseManager};
 /// Re-exports the authoritative manifest and its object-store version token.
-pub use manifest::{Manifest, ManifestVersion};
+pub use manifest::{InputFragmentRef, Manifest, ManifestVersion};
 /// Re-exports the fragment reader and its explicit immutable-byte cache policy.
 pub use reader::{FragmentCachePolicy, WalReader};
 /// Re-exports the fragment uploader and manifest group-commit coordinator.

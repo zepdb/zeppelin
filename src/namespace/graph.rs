@@ -49,6 +49,7 @@ use crate::namespace::{
 use crate::security::{RootReleaseAuditProgress, RootReleaseFailureClass, SecurityError};
 use crate::storage::{CreateOnlyOutcome, NamespaceObjectKey, StorageVersion, ZeppelinStore};
 use crate::time::Clock;
+use crate::types::IndexType;
 use crate::wal::manifest::{BranchLineageSeed, PreparedManifestPublication, PreparedZeroCopyFork};
 use crate::wal::{Lease, LeaseManager, Manifest};
 
@@ -4006,7 +4007,20 @@ impl NamespaceGraph {
                         return Err(BranchError::BranchIntegrity.into());
                     }
                 };
-                match live.visible_refs_are_local() {
+                let late_state = match live.load_late_state(&self.store).await {
+                    Ok(section) => section,
+                    Err(error) => {
+                        warn!(
+                            source = %request.source,
+                            target = %root.target_namespace,
+                            branch_id = %root.branch_id,
+                            error = %error,
+                            "authorized branch late-state read failed integrity validation"
+                        );
+                        return Err(BranchError::BranchIntegrity.into());
+                    }
+                };
+                match live.visible_refs_are_local_with_late_state(late_state.as_ref()) {
                     Ok(materialized) => materialized,
                     Err(error) => {
                         warn!(
@@ -4233,9 +4247,8 @@ impl NamespaceGraph {
             ))
         })?;
         let depth = self.target_depth(&source)?;
-        let resolved_index_config = self.resolved_index_config(&source);
-        resolved_index_config.validate(source.dimensions)?;
-        let provisional = self.data_plane_snapshot(&source, &resolved_index_config)?;
+        let resolved_index_config = self.resolved_index_config(&source)?;
+        let provisional = self.data_plane_snapshot(&source, resolved_index_config.as_ref())?;
         let created_at = self.clock.now();
         let target_incarnation = NamespaceIncarnationId::new();
         let reservation = ForkReservationIdentity {
@@ -4259,7 +4272,7 @@ impl NamespaceGraph {
             destruction_record_key: None,
             deletion_intent: None,
             full_text_search: source.full_text_search.clone(),
-            index_config: Some(resolved_index_config),
+            index_config: resolved_index_config,
             compaction_health: CompactionHealth::default(),
             creation_kind: NamespaceCreationKind::Fork(reservation.clone()),
             branch_identity: None,
@@ -4270,6 +4283,7 @@ impl NamespaceGraph {
                 provisional: Some(provisional),
             }),
             branch_activation: None,
+            late_interaction: source.late_interaction.clone(),
             incarnation_id: Some(target_incarnation),
         };
 
@@ -4345,17 +4359,40 @@ impl NamespaceGraph {
         }
     }
 
-    fn resolved_index_config(&self, metadata: &NamespaceMetadata) -> NamespaceIndexConfig {
-        metadata
+    fn resolved_index_config(
+        &self,
+        metadata: &NamespaceMetadata,
+    ) -> Result<Option<NamespaceIndexConfig>> {
+        if metadata.index_type == IndexType::LateInteractionFde {
+            if metadata.dimensions != 0
+                || metadata.late_interaction.is_none()
+                || metadata.index_config.is_some()
+            {
+                return Err(ZeppelinError::Serialization(format!(
+                    "late-interaction namespace {} has invalid admission configuration",
+                    metadata.name
+                )));
+            }
+            return Ok(None);
+        }
+        if metadata.dimensions == 0 || metadata.late_interaction.is_some() {
+            return Err(ZeppelinError::Serialization(format!(
+                "dense namespace {} has invalid admission configuration",
+                metadata.name
+            )));
+        }
+        let resolved = metadata
             .index_config
             .clone()
-            .unwrap_or_else(|| NamespaceIndexConfig::from_indexing_config(&self.indexing))
+            .unwrap_or_else(|| NamespaceIndexConfig::from_indexing_config(&self.indexing));
+        resolved.validate(metadata.dimensions)?;
+        Ok(Some(resolved))
     }
 
     fn data_plane_snapshot(
         &self,
         metadata: &NamespaceMetadata,
-        resolved_index_config: &NamespaceIndexConfig,
+        resolved_index_config: Option<&NamespaceIndexConfig>,
     ) -> Result<ForkDataPlaneConfig> {
         let full_text_search = metadata
             .full_text_search
@@ -4367,7 +4404,8 @@ impl NamespaceGraph {
             distance_metric: metadata.distance_metric,
             index_type: metadata.index_type,
             full_text_search,
-            index_config: resolved_index_config.clone(),
+            index_config: resolved_index_config.cloned(),
+            late_interaction: metadata.late_interaction.clone(),
         })
     }
 
@@ -4429,13 +4467,15 @@ impl NamespaceGraph {
                 // rewrite the target before crash recovery installs identity.
                 (self.rebuild_candidate_from_root(&target, root).await?, None)
             } else {
-                let resolved_index_config = self.resolved_index_config(&source);
-                resolved_index_config.validate(source.dimensions)?;
-                let latest_snapshot = self.data_plane_snapshot(&source, &resolved_index_config)?;
+                let resolved_index_config = self.resolved_index_config(&source)?;
+                let latest_snapshot =
+                    self.data_plane_snapshot(&source, resolved_index_config.as_ref())?;
                 if prepare.provisional.as_ref() != Some(&latest_snapshot)
-                    || target.index_config.as_ref() != Some(&resolved_index_config)
+                    || target.index_config != resolved_index_config
+                    || target.late_interaction != source.late_interaction
                 {
-                    target.index_config = Some(resolved_index_config.clone());
+                    target.index_config = resolved_index_config.clone();
+                    target.late_interaction = source.late_interaction.clone();
                     target.updated_at = self.clock.now();
                     target.branch_prepare = Some(ForkPrepareIntent {
                         branch_id: reservation.branch_id,
@@ -4456,7 +4496,7 @@ impl NamespaceGraph {
                     &source_manifest,
                     source_version.exact_manifest_digest()?,
                     &reservation,
-                    source_data_plane_config_digest(&source, &resolved_index_config)?,
+                    source_data_plane_config_digest(&source, resolved_index_config.as_ref())?,
                 )?;
                 (candidate, Some(resolved_index_config))
             };
@@ -4472,7 +4512,7 @@ impl NamespaceGraph {
                     &self.namespace_manager,
                     &self.lease_manager,
                     lease,
-                    resolved_index_config,
+                    resolved_index_config.as_ref(),
                     InsertBranchRootRequest {
                         source_namespace: request.source.clone(),
                         root: candidate.branch.root.clone(),
@@ -4543,6 +4583,7 @@ impl NamespaceGraph {
             || source.index_type != target.index_type
             || serde_json::to_value(&source.full_text_search)?
                 != serde_json::to_value(&target.full_text_search)?
+            || source.late_interaction != target.late_interaction
             || target.created_at != reservation.created_at
         {
             return Err(BranchError::IntentMismatch {
@@ -4676,13 +4717,9 @@ impl NamespaceGraph {
             }
             .into());
         }
-        let resolved_index_config = target.index_config.as_ref().ok_or_else(|| {
-            ZeppelinError::Serialization(format!(
-                "branch target {} lost its resolved index configuration",
-                target.name
-            ))
-        })?;
-        let source_config_sha256 = source_data_plane_config_digest(target, resolved_index_config)?;
+        let resolved_index_config = self.resolved_index_config(target)?;
+        let source_config_sha256 =
+            source_data_plane_config_digest(target, resolved_index_config.as_ref())?;
         if source_config_sha256 != root.source_config_sha256 {
             return Err(BranchError::BranchRootMismatch {
                 branch_id: root.branch_id,

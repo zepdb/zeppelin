@@ -185,6 +185,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::embedding::LateInteractionNamespaceConfig;
 use crate::namespace::manager::NamespaceIndexConfig;
 use crate::namespace::{
     BranchId, BranchRoot, ForkViewDigest, ManifestDigest, ManifestGeneration, NamespaceId,
@@ -469,8 +470,12 @@ pub struct ForkDataPlaneConfig {
     pub index_type: IndexType,
     /// Canonically ordered analyzer JSON, independent of source HashMap order.
     pub full_text_search: BTreeMap<String, serde_json::Value>,
-    /// Fully resolved per-namespace indexing configuration.
-    pub index_config: NamespaceIndexConfig,
+    /// Fully resolved dense indexing configuration, absent for late interaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_config: Option<NamespaceIndexConfig>,
+    /// Late-interaction admission settings, absent for dense namespaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_interaction: Option<LateInteractionNamespaceConfig>,
 }
 
 /// Creation family controlling recovery of a `creating` metadata record.

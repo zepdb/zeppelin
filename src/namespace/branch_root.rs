@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::config::IndexingConfig;
+use crate::embedding::LateInteractionNamespaceConfig;
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
 use crate::namespace::branching::BranchError;
@@ -29,6 +30,8 @@ use crate::types::{DistanceMetric, IndexType};
 use crate::wal::{Lease, LeaseManager, Manifest};
 
 const SOURCE_DATA_PLANE_CONFIG_DOMAIN: &str = "zeppelin.source-data-plane-config.v1";
+const LATE_SOURCE_DATA_PLANE_CONFIG_DOMAIN: &str =
+    "zeppelin.source-data-plane-config.late-interaction.v1";
 
 /// Complete identity required to publish one exact source-generation root.
 ///
@@ -65,6 +68,16 @@ struct SourceDataPlaneConfigBindingV1<'a> {
     index_config: &'a NamespaceIndexConfig,
 }
 
+#[derive(Serialize)]
+struct LateSourceDataPlaneConfigBindingV1<'a> {
+    domain: &'static str,
+    dimensions: usize,
+    distance_metric: DistanceMetric,
+    index_type: IndexType,
+    full_text_search: BTreeMap<&'a str, &'a FtsFieldConfig>,
+    late_interaction: &'a LateInteractionNamespaceConfig,
+}
+
 /// Compute the canonical interpretation-config digest used by roots and forks.
 ///
 /// Namespace metadata stores FTS fields in a `HashMap`; collecting borrowed
@@ -72,22 +85,56 @@ struct SourceDataPlaneConfigBindingV1<'a> {
 /// independent of randomized map iteration order.
 pub(crate) fn source_data_plane_config_digest(
     metadata: &NamespaceMetadata,
-    resolved_index_config: &NamespaceIndexConfig,
+    resolved_index_config: Option<&NamespaceIndexConfig>,
 ) -> Result<SourceDataPlaneConfigDigest> {
     let full_text_search = metadata
         .full_text_search
         .iter()
         .map(|(field, config)| (field.as_str(), config))
         .collect::<BTreeMap<_, _>>();
-    let binding = SourceDataPlaneConfigBindingV1 {
-        domain: SOURCE_DATA_PLANE_CONFIG_DOMAIN,
-        dimensions: metadata.dimensions,
-        distance_metric: metadata.distance_metric,
-        index_type: metadata.index_type,
-        full_text_search,
-        index_config: resolved_index_config,
+    let bytes = if metadata.index_type == IndexType::LateInteractionFde {
+        if resolved_index_config.is_some() || metadata.index_config.is_some() {
+            return Err(ZeppelinError::Serialization(format!(
+                "late-interaction namespace {} carries dense index configuration",
+                metadata.name
+            )));
+        }
+        let late_interaction = metadata.late_interaction.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "late-interaction namespace {} has no admission configuration",
+                metadata.name
+            ))
+        })?;
+        serde_json::to_vec(&LateSourceDataPlaneConfigBindingV1 {
+            domain: LATE_SOURCE_DATA_PLANE_CONFIG_DOMAIN,
+            dimensions: metadata.dimensions,
+            distance_metric: metadata.distance_metric,
+            index_type: metadata.index_type,
+            full_text_search,
+            late_interaction,
+        })?
+    } else {
+        if metadata.late_interaction.is_some() {
+            return Err(ZeppelinError::Serialization(format!(
+                "dense namespace {} carries late-interaction configuration",
+                metadata.name
+            )));
+        }
+        let resolved_index_config = resolved_index_config.ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "dense namespace {} has no resolved index configuration",
+                metadata.name
+            ))
+        })?;
+        serde_json::to_vec(&SourceDataPlaneConfigBindingV1 {
+            domain: SOURCE_DATA_PLANE_CONFIG_DOMAIN,
+            dimensions: metadata.dimensions,
+            distance_metric: metadata.distance_metric,
+            index_type: metadata.index_type,
+            full_text_search,
+            index_config: resolved_index_config,
+        })?
     };
-    let bytes = serde_json::to_vec(&binding)?;
     Ok(SourceDataPlaneConfigDigest::new(
         Sha256::digest(bytes).into(),
     ))
@@ -111,15 +158,19 @@ pub(crate) async fn insert_branch_root(
         let metadata = namespace_manager
             .get_active_metadata_for_guarded_write(&namespace)
             .await?;
-        let resolved_index_config = metadata.index_config.clone().unwrap_or_else(|| {
-            NamespaceIndexConfig::from_indexing_config(&IndexingConfig::default())
-        });
+        let resolved_index_config = if metadata.index_type == IndexType::LateInteractionFde {
+            None
+        } else {
+            Some(metadata.index_config.clone().unwrap_or_else(|| {
+                NamespaceIndexConfig::from_indexing_config(&IndexingConfig::default())
+            }))
+        };
         insert_branch_root_with_lease(
             store,
             namespace_manager,
             lease_manager,
             &mut lease,
-            &resolved_index_config,
+            resolved_index_config.as_ref(),
             request,
         )
         .await
@@ -140,7 +191,7 @@ pub(crate) async fn insert_branch_root_with_lease(
     namespace_manager: &NamespaceManager,
     lease_manager: &LeaseManager,
     lease: &mut Lease,
-    resolved_index_config: &NamespaceIndexConfig,
+    resolved_index_config: Option<&NamespaceIndexConfig>,
     request: InsertBranchRootRequest,
 ) -> Result<BranchRoot> {
     let namespace = request.source_namespace.as_str();
@@ -169,18 +220,38 @@ pub(crate) async fn insert_branch_root_with_lease(
         };
     }
 
-    resolved_index_config.validate(metadata.dimensions)?;
-    if metadata
-        .index_config
-        .as_ref()
-        .is_some_and(|authoritative| authoritative != resolved_index_config)
-    {
-        return Err(BranchError::BranchRootInvalid {
-            branch_id: Some(request.root.branch_id),
-            reason: "resolved source index config does not match authoritative metadata"
-                .to_string(),
+    if metadata.index_type == IndexType::LateInteractionFde {
+        if metadata.dimensions != 0
+            || metadata.late_interaction.is_none()
+            || metadata.index_config.is_some()
+            || resolved_index_config.is_some()
+        {
+            return Err(BranchError::BranchRootInvalid {
+                branch_id: Some(request.root.branch_id),
+                reason: "late-interaction source has invalid admission configuration".to_string(),
+            }
+            .into());
         }
-        .into());
+    } else {
+        let resolved_index_config =
+            resolved_index_config.ok_or_else(|| BranchError::BranchRootInvalid {
+                branch_id: Some(request.root.branch_id),
+                reason: "dense source has no resolved index configuration".to_string(),
+            })?;
+        resolved_index_config.validate(metadata.dimensions)?;
+        if metadata.late_interaction.is_some()
+            || metadata
+                .index_config
+                .as_ref()
+                .is_some_and(|authoritative| authoritative != resolved_index_config)
+        {
+            return Err(BranchError::BranchRootInvalid {
+                branch_id: Some(request.root.branch_id),
+                reason: "resolved source index config does not match authoritative metadata"
+                    .to_string(),
+            }
+            .into());
+        }
     }
     let config_digest = source_data_plane_config_digest(&metadata, resolved_index_config)?;
     if config_digest != request.root.source_config_sha256 {

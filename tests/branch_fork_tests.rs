@@ -14,6 +14,7 @@ use common::server::scoped_test_security_store;
 use common::vectors::random_vectors;
 use zeppelin::compaction::{CompactionResult, Compactor};
 use zeppelin::config::{BranchingConfig, CompactionConfig, IndexingConfig};
+use zeppelin::embedding::{InputModality, LateInteractionNamespaceConfig};
 use zeppelin::error::ZeppelinError;
 use zeppelin::fts::FtsFieldConfig;
 use zeppelin::index::quantization::QuantizationType;
@@ -32,7 +33,7 @@ use zeppelin::namespace::manager::{
     CompactionStatus, NamespaceIndexConfig, NamespaceMetadata, NamespaceState,
 };
 use zeppelin::namespace::{NamespaceId, NamespaceManager};
-use zeppelin::types::{DistanceMetric, VectorEntry};
+use zeppelin::types::{DistanceMetric, IndexType, VectorEntry};
 use zeppelin::wal::{LeaseManager, Manifest, WalReader, WalWriter};
 
 fn fork_indexing() -> IndexingConfig {
@@ -833,6 +834,103 @@ async fn prepare_copies_data_plane_config_and_resets_operational_metadata() {
 
     harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn late_namespace_activates_zero_copy_without_dense_index_config() {
+    let harness = TestHarness::new().await;
+    let first_source = harness.artifact_origin_namespace("late-branch-source-text");
+    let first_target = harness.artifact_origin_namespace("late-branch-target-text");
+    let second_source = harness.artifact_origin_namespace("late-branch-source-image");
+    let second_target = harness.artifact_origin_namespace("late-branch-target-image");
+    let text_config = LateInteractionNamespaceConfig {
+        accepted_modalities: vec![InputModality::Text],
+    };
+    let image_config = LateInteractionNamespaceConfig {
+        accepted_modalities: vec![InputModality::Image],
+    };
+    let manager = NamespaceManager::new(harness.store.clone());
+    for (namespace, config) in [
+        (&first_source, text_config.clone()),
+        (&second_source, image_config.clone()),
+    ] {
+        manager
+            .create_typed_with_fts_and_index_config(
+                namespace,
+                0,
+                DistanceMetric::DotProduct,
+                IndexType::LateInteractionFde,
+                Some(config),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let first = activate_fork_for_test(
+        harness.store.clone(),
+        NamespaceId::new(first_source.clone()).unwrap(),
+        NamespaceId::new(first_target.clone()).unwrap(),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .unwrap();
+    let second = activate_fork_for_test(
+        harness.store.clone(),
+        NamespaceId::new(second_source.clone()).unwrap(),
+        NamespaceId::new(second_target.clone()).unwrap(),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .unwrap();
+    let first = match first {
+        PrepareForkOutcome::Prepared(prepared) | PrepareForkOutcome::ExistingPrepared(prepared) => {
+            prepared
+        }
+    };
+    let second = match second {
+        PrepareForkOutcome::Prepared(prepared) | PrepareForkOutcome::ExistingPrepared(prepared) => {
+            prepared
+        }
+    };
+
+    assert_ne!(
+        first.identity.source_config_sha256, second.identity.source_config_sha256,
+        "the frozen source proof must bind the late-interaction admission config"
+    );
+    for (target, expected_config) in [
+        (&first_target, &text_config),
+        (&second_target, &image_config),
+    ] {
+        let metadata = manager.get(target).await.unwrap();
+        assert_eq!(metadata.state, NamespaceState::Active);
+        assert_eq!(metadata.dimensions, 0);
+        assert_eq!(metadata.index_type, IndexType::LateInteractionFde);
+        assert_eq!(metadata.late_interaction.as_ref(), Some(expected_config));
+        assert!(
+            metadata.index_config.is_none(),
+            "late branches must not synthesize dense index configuration"
+        );
+        let objects = harness
+            .store
+            .list_prefix(&format!("{target}/"))
+            .await
+            .unwrap();
+        assert!(
+            objects
+                .iter()
+                .all(|key| !key.contains("/wal/") && !key.contains("/segments/")),
+            "late branch activation must remain zero-copy"
+        );
+    }
+
+    for namespace in [&first_source, &first_target, &second_source, &second_target] {
+        harness.cleanup_artifact_origin_namespace(namespace).await;
+    }
     harness.cleanup().await;
 }
 

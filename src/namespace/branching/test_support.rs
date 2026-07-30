@@ -30,7 +30,7 @@ use crate::query::{
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
 use crate::types::{
-    AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult, VectorId,
+    AttributeValue, ConsistencyLevel, DistanceMetric, Filter, IndexType, SearchResult, VectorId,
 };
 use crate::wal::manifest::{Manifest, ManifestBindingVersion};
 use crate::wal::{LeaseManager, WalReader};
@@ -666,16 +666,22 @@ pub async fn prepare_head_branch_root(
             "invalid branch target namespace: {target_namespace}"
         ))
     })?;
-    let resolved_index_config = metadata
-        .index_config
-        .clone()
-        .unwrap_or_else(|| NamespaceIndexConfig::from_indexing_config(&IndexingConfig::default()));
+    let resolved_index_config = if metadata.index_type == IndexType::LateInteractionFde {
+        None
+    } else {
+        Some(metadata.index_config.clone().unwrap_or_else(|| {
+            NamespaceIndexConfig::from_indexing_config(&IndexingConfig::default())
+        }))
+    };
     Ok(BranchRoot {
         branch_id,
         source_generation: ManifestGeneration::new(manifest.version())?,
         source_manifest_sha256: version.exact_manifest_digest()?,
         fork_view_sha256,
-        source_config_sha256: source_data_plane_config_digest(&metadata, &resolved_index_config)?,
+        source_config_sha256: source_data_plane_config_digest(
+            &metadata,
+            resolved_index_config.as_ref(),
+        )?,
         target_namespace,
         target_incarnation: NamespaceIncarnationId::from_uuid(target_incarnation),
         created_at,

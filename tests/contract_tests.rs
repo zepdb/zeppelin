@@ -2531,6 +2531,7 @@ async fn seed_deleting_namespace(store: &zeppelin::storage::ZeppelinStore, ns: &
         branch_identity: None,
         branch_prepare: None,
         branch_activation: None,
+        late_interaction: None,
         incarnation_id: None,
     };
     store

@@ -131,6 +131,8 @@ use crate::storage::{
     ListedObject, NamespaceObjectFamily, NamespaceObjectKey, StorageVersion, ZeppelinStore,
 };
 use crate::wal::fragment::WalFragment;
+use crate::wal::input_fragment::EncoderInputWalFragment;
+use crate::wal::late_section::LateStateSection;
 use crate::wal::manifest::{
     Manifest, ManifestHistoryObservation, ManifestHistoryPruneResult, ManifestHistoryRetention,
     ManifestVersion, NamedSnapshot, NamedSnapshotObservation,
@@ -331,7 +333,12 @@ struct CachedHistory {
 
 #[derive(Debug)]
 struct HistorySnapshot {
-    entries: Vec<(ManifestHistoryObservation, Manifest, Bytes)>,
+    entries: Vec<(
+        ManifestHistoryObservation,
+        Manifest,
+        Bytes,
+        BTreeSet<String>,
+    )>,
     cacheable: BTreeMap<String, CachedHistory>,
 }
 
@@ -364,6 +371,7 @@ struct LiveRootObservation {
 
 struct MemoizedHistoryPruneResult {
     result: ManifestHistoryPruneResult,
+    retained_reachable_keys: BTreeSet<String>,
     retained_history_observations: Vec<ManifestHistoryObservation>,
     snapshot_observations: Vec<NamedSnapshotObservation>,
 }
@@ -799,7 +807,15 @@ fn local_artifact_origin_for_gc(
         || manifest
             .segments
             .iter()
-            .any(|segment| segment.artifact_origin.is_some());
+            .any(|segment| segment.artifact_origin.is_some())
+        || manifest
+            .input_fragments
+            .iter()
+            .any(|fragment| fragment.artifact_origin.is_some())
+        || manifest
+            .late_state
+            .as_ref()
+            .is_some_and(|reference| reference.artifact_origin.is_some());
     let Some(incarnation) = manifest.namespace_incarnation() else {
         if has_explicit_origins {
             return Err(ZeppelinError::Serialization(format!(
@@ -869,22 +885,68 @@ pub fn reachable_keys(namespace: &str, manifest: &Manifest) -> Result<BTreeSet<S
     reachable_keys_with_staging(namespace, manifest, &BTreeSet::new())
 }
 
-/// Unions immutable artifact roots from already-decoded retained manifests.
+/// Expand root-manifest artifacts plus a checked, decoded late-state section.
 ///
-/// The helper performs no storage I/O. Garbage collection uses it immediately
-/// after the retention pass so mark planning and conservative pending-delete
-/// checks do not re-list and re-download the same history bodies. A caller must
-/// still take a fresh history observation before any physical deletion whose
-/// safety depends on retained history.
-fn reachable_keys_from_manifests(
+/// Version-2 sections carry source inventory outside the root manifest, so
+/// destructive callers must load the selected section and use this function.
+pub fn reachable_keys_with_late_state(
     namespace: &str,
-    manifests: &[Manifest],
+    manifest: &Manifest,
+    late_state: Option<&LateStateSection>,
 ) -> Result<BTreeSet<String>> {
-    let mut keys = BTreeSet::new();
-    for manifest in manifests {
-        keys.extend(reachable_keys(namespace, manifest)?);
+    reachable_keys_with_staging_and_late_state(namespace, manifest, &BTreeSet::new(), late_state)
+}
+
+fn reachable_keys_with_staging_and_late_state(
+    namespace: &str,
+    manifest: &Manifest,
+    staging: &BTreeSet<String>,
+    late_state: Option<&LateStateSection>,
+) -> Result<BTreeSet<String>> {
+    let mut keys = reachable_keys_with_staging(namespace, manifest, staging)?;
+    match (manifest.late_state.as_ref(), late_state) {
+        (None, None) => {}
+        (None, Some(_)) => {
+            return Err(ZeppelinError::Serialization(
+                "late-state section supplied without a manifest reference".to_string(),
+            ));
+        }
+        (Some(reference), None) if reference.format_version >= 2 => {
+            return Err(ZeppelinError::Serialization(
+                "version-2 late-state reachability requires the decoded section".to_string(),
+            ));
+        }
+        (Some(_), None) => {}
+        (Some(reference), Some(section)) => {
+            let section_origin = manifest.late_section_origin(reference)?;
+            section.validate_for_origin(&section_origin)?;
+            for source in &section.source_inventory {
+                let source_origin = manifest.source_inventory_origin(section, source)?;
+                let owned = NamespaceObjectKey::classify(
+                    source_origin.namespace.as_str(),
+                    source.key.clone(),
+                )?;
+                if owned.family() != NamespaceObjectFamily::Source {
+                    return Err(ZeppelinError::Validation(format!(
+                        "source inventory key is outside the registered source family: {}",
+                        source.key
+                    )));
+                }
+                keys.insert(source.key.clone());
+            }
+        }
     }
     Ok(keys)
+}
+
+async fn reachable_keys_with_loaded_late_state(
+    store: &ZeppelinStore,
+    namespace: &str,
+    manifest: &Manifest,
+    staging: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let late_state = manifest.load_late_state(store).await?;
+    reachable_keys_with_staging_and_late_state(namespace, manifest, staging, late_state.as_ref())
 }
 
 /// Unions one manifest's references with caller-validated staged uploads.
@@ -946,6 +1008,24 @@ pub fn reachable_keys_with_staging(
                     };
                     keys.insert(WalFragment::s3_key(physical_namespace, &fragment.id));
                 }
+            }
+            NamespaceObjectFamily::InputWal => {
+                debug_assert!(family.participates_in_branch_locality());
+                for fragment in &manifest.input_fragments {
+                    let physical_namespace = match origins {
+                        Some(origins) => origins
+                            .locate_input_fragment(fragment)?
+                            .physical_namespace(),
+                        None => namespace,
+                    };
+                    keys.insert(EncoderInputWalFragment::s3_key(
+                        physical_namespace,
+                        &fragment.id,
+                    ));
+                }
+            }
+            NamespaceObjectFamily::Source => {
+                debug_assert!(family.participates_in_branch_locality());
             }
             NamespaceObjectFamily::Segment => {
                 debug_assert!(family.participates_in_branch_locality());
@@ -1103,7 +1183,17 @@ pub async fn retained_manifest_history_reachable_keys(
         let manifest = Manifest::read_history(store, namespace, entry.version)
             .await?
             .ok_or_else(|| crate::error::ZeppelinError::NotFound { key: entry.key })?;
-        keys.extend(reachable_keys(namespace, &manifest)?);
+        let mut historical_roots = manifest;
+        historical_roots.pending_deletes.clear();
+        keys.extend(
+            reachable_keys_with_loaded_late_state(
+                store,
+                namespace,
+                &historical_roots,
+                &BTreeSet::new(),
+            )
+            .await?,
+        );
     }
     Ok(keys)
 }
@@ -1142,12 +1232,10 @@ pub async fn reachable_keys_with_retained_history_and_staging(
     staging: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>> {
     let retained_history = retained_manifest_history_reachable_keys(store, namespace).await?;
-    reachable_keys_with_retained_history_and_staging_keys(
-        namespace,
-        manifest,
-        staging,
-        &retained_history,
-    )
+    let mut keys =
+        reachable_keys_with_loaded_late_state(store, namespace, manifest, staging).await?;
+    keys.extend(retained_history);
+    Ok(keys)
 }
 
 /// Unions already-loaded retained-history keys with live and staged roots.
@@ -1167,6 +1255,7 @@ pub async fn reachable_keys_with_retained_history_and_staging(
 ///
 /// The mark and sweep phases use this helper with separately loaded snapshots
 /// so the second phase can revalidate instead of reusing the first phase's set.
+#[cfg_attr(not(test), allow(dead_code))]
 fn reachable_keys_with_retained_history_and_staging_keys(
     namespace: &str,
     manifest: &Manifest,
@@ -1426,6 +1515,11 @@ enum ParsedGcArtifact {
         /// Creation and ordering identifier decoded from the WAL fragment key.
         ulid: Ulid,
     },
+    /// One immutable typed-input WAL fragment.
+    InputWalFragment {
+        /// Creation and ordering identifier decoded from the key.
+        ulid: Ulid,
+    },
     /// One known segment artifact with its `seg_<ulid>` creation identifier.
     SegmentArtifact {
         /// Creation identifier decoded from the enclosing segment directory.
@@ -1433,6 +1527,8 @@ enum ParsedGcArtifact {
     },
     /// One immutable late-state section named by its exact SHA-256.
     LateSection,
+    /// One checksum-addressed retained source object.
+    Source,
 }
 
 impl ParsedGcArtifact {
@@ -1450,8 +1546,10 @@ impl ParsedGcArtifact {
     /// encoded in their path. A `late/state/<sha256>` key returns `None`.
     fn ulid(self) -> Option<Ulid> {
         match self {
-            Self::WalFragment { ulid } | Self::SegmentArtifact { ulid } => Some(ulid),
-            Self::LateSection => None,
+            Self::WalFragment { ulid }
+            | Self::InputWalFragment { ulid }
+            | Self::SegmentArtifact { ulid } => Some(ulid),
+            Self::LateSection | Self::Source => None,
         }
     }
 }
@@ -1793,7 +1891,7 @@ async fn drain_pending_deletes_with_retained_history_from(
             ));
         }
 
-        let late_section_inventory = pending_late_section_inventory(
+        let content_addressed_inventory = pending_content_addressed_inventory(
             store,
             namespace,
             &manifest.pending_deletes,
@@ -1808,7 +1906,7 @@ async fn drain_pending_deletes_with_retained_history_from(
                         key,
                         now,
                         gc.horizon_secs,
-                        late_section_inventory.as_ref(),
+                        content_addressed_inventory.as_ref(),
                     )
             });
         let retry_roots = if retry_may_delete {
@@ -1830,7 +1928,9 @@ async fn drain_pending_deletes_with_retained_history_from(
         let mut eligible = BTreeSet::new();
         let mut live = manifest.clone();
         live.pending_deletes.clear();
-        let live_reachable = reachable_keys(namespace, &live)?;
+        let live_late_state = live.load_late_state(store).await?;
+        let live_reachable =
+            reachable_keys_with_late_state(namespace, &live, live_late_state.as_ref())?;
 
         for key in &pending {
             let deletion_key = TargetOwnedDeletionKey::classify(namespace, key.clone())?;
@@ -1844,7 +1944,7 @@ async fn drain_pending_deletes_with_retained_history_from(
                 key,
                 now,
                 gc.horizon_secs,
-                late_section_inventory.as_ref(),
+                content_addressed_inventory.as_ref(),
             ) {
                 retained.insert(key.clone());
                 continue;
@@ -1985,7 +2085,9 @@ async fn drain_pending_deletes_with_inventory_authority_from(
         if attempt == 0 {
             let mut live = manifest.clone();
             live.pending_deletes.clear();
-            let live_reachable = reachable_keys(namespace, &live)?;
+            let live_late_state = live.load_late_state(store).await?;
+            let live_reachable =
+                reachable_keys_with_late_state(namespace, &live, live_late_state.as_ref())?;
             let mut eligible = BTreeSet::new();
             for key in &manifest.pending_deletes {
                 let deletion_key = TargetOwnedDeletionKey::classify(namespace, key.clone())?;
@@ -2064,7 +2166,9 @@ async fn drain_pending_deletes_with_inventory_authority_from(
 
         let mut live = manifest.clone();
         live.pending_deletes.clear();
-        let live_reachable = reachable_keys(namespace, &live)?;
+        let live_late_state = live.load_late_state(store).await?;
+        let live_reachable =
+            reachable_keys_with_late_state(namespace, &live, live_late_state.as_ref())?;
         if let Some(key) = removable.iter().find(|key| live_reachable.contains(*key)) {
             return Err(ZeppelinError::Serialization(format!(
                 "pending-delete key {key} became live after it was confirmed absent"
@@ -2145,7 +2249,7 @@ async fn prepare_warm_pending_delete_drain(
         if gc.horizon_secs > 0
             && matches!(
                 parse_gc_artifact_key(namespace, key),
-                Some(ParsedGcArtifact::LateSection)
+                Some(ParsedGcArtifact::LateSection | ParsedGcArtifact::Source)
             )
         {
             return true;
@@ -2220,7 +2324,7 @@ async fn prepare_warm_pending_delete_drain(
     })
 }
 
-async fn pending_late_section_inventory(
+async fn pending_content_addressed_inventory(
     store: &ZeppelinStore,
     namespace: &str,
     pending: &[String],
@@ -2230,24 +2334,30 @@ async fn pending_late_section_inventory(
         || !pending.iter().any(|key| {
             matches!(
                 parse_gc_artifact_key(namespace, key),
-                Some(ParsedGcArtifact::LateSection)
+                Some(ParsedGcArtifact::LateSection | ParsedGcArtifact::Source)
             )
         })
     {
         return Ok(None);
     }
 
-    let prefix = NamespaceObjectFamily::LateSection.namespace_prefix(namespace);
-    NamespaceInventory::from_listed(namespace, store.list_prefix_meta(&prefix).await?).map(Some)
+    let late_prefix = NamespaceObjectFamily::LateSection.namespace_prefix(namespace);
+    let source_prefix = NamespaceObjectFamily::Source.namespace_prefix(namespace);
+    let (mut late, sources) = tokio::try_join!(
+        store.list_prefix_meta(&late_prefix),
+        store.list_prefix_meta(&source_prefix),
+    )?;
+    late.extend(sources);
+    NamespaceInventory::from_listed(namespace, late).map(Some)
 }
 
 /// Checks whether a deferred-delete key is old enough for physical removal.
 ///
 /// WAL and segment age comes from the artifact ULID embedded in the key, not
-/// `Manifest::updated_at`. Content-addressed late-section age comes from one
-/// authoritative LIST observation. Unknown key shapes or a missing required
-/// observation fail closed. A zero horizon is an explicit test/emergency
-/// override that accepts every shape immediately.
+/// `Manifest::updated_at`. Content-addressed late-section and source age comes
+/// from one authoritative LIST observation. Unknown key shapes or a missing
+/// required observation fail closed. A zero horizon is an explicit
+/// test/emergency override that accepts every shape immediately.
 ///
 /// # Parameters
 ///
@@ -2255,8 +2365,8 @@ async fn pending_late_section_inventory(
 /// - `key`: Candidate WAL or known segment-artifact object key.
 /// - `now`: Reference wall-clock time for deterministic age calculation.
 /// - `horizon_secs`: Required minimum creation age in whole seconds.
-/// - `late_section_inventory`: Authoritative LIST metadata when `key` names a
-///   late-state section. An absent key is already safe to prune.
+/// - `content_addressed_inventory`: Authoritative LIST metadata when `key`
+///   names a late-state section or source. An absent key is safe to prune.
 ///
 /// # Returns
 ///
@@ -2272,7 +2382,7 @@ fn pending_delete_horizon_satisfied(
     key: &str,
     now: DateTime<Utc>,
     horizon_secs: u64,
-    late_section_inventory: Option<&NamespaceInventory>,
+    content_addressed_inventory: Option<&NamespaceInventory>,
 ) -> bool {
     if horizon_secs == 0 {
         return true;
@@ -2282,15 +2392,18 @@ fn pending_delete_horizon_satisfied(
         return false;
     };
     match parsed {
-        ParsedGcArtifact::WalFragment { ulid } | ParsedGcArtifact::SegmentArtifact { ulid } => {
+        ParsedGcArtifact::WalFragment { ulid }
+        | ParsedGcArtifact::InputWalFragment { ulid }
+        | ParsedGcArtifact::SegmentArtifact { ulid } => {
             let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
             super::fragment_age_secs(&ulid, now_ms) >= horizon_secs
         }
-        ParsedGcArtifact::LateSection => late_section_inventory.is_some_and(|inventory| {
-            inventory
-                .object(key)
-                .is_none_or(|object| listed_object_horizon_satisfied(object, now, horizon_secs))
-        }),
+        ParsedGcArtifact::LateSection | ParsedGcArtifact::Source => content_addressed_inventory
+            .is_some_and(|inventory| {
+                inventory
+                    .object(key)
+                    .is_none_or(|object| listed_object_horizon_satisfied(object, now, horizon_secs))
+            }),
     }
 }
 
@@ -2729,7 +2842,7 @@ async fn load_history_observation(
     namespace: &str,
     observation: &ManifestHistoryObservation,
     prior: Option<&BTreeMap<String, CachedHistory>>,
-) -> Result<(Manifest, Bytes, Option<CachedHistory>)> {
+) -> Result<(Manifest, Bytes, BTreeSet<String>, Option<CachedHistory>)> {
     let cached = matching_cached_history(observation, prior);
     load_history_observation_owned(store, namespace, observation, cached).await
 }
@@ -2751,17 +2864,23 @@ async fn load_history_observation_owned(
     namespace: &str,
     observation: &ManifestHistoryObservation,
     cached: Option<CachedHistory>,
-) -> Result<(Manifest, Bytes, Option<CachedHistory>)> {
+) -> Result<(Manifest, Bytes, BTreeSet<String>, Option<CachedHistory>)> {
     if let Some(cached) = cached {
         return Ok((
             cached.manifest.clone(),
             cached.stored_bytes.clone(),
+            cached.reachable_keys.clone(),
             Some(cached),
         ));
     }
 
     let (bytes, get_version) = store.get_with_meta(&observation.history.key).await?;
     let manifest = Manifest::decode_history_body(&bytes, namespace, &observation.history)?;
+    let mut historical_roots = manifest.clone();
+    historical_roots.pending_deletes.clear();
+    let late_state = historical_roots.load_late_state(store).await?;
+    let reachable_keys =
+        reachable_keys_with_late_state(namespace, &historical_roots, late_state.as_ref())?;
     let listed_version = observation.storage_version.as_ref();
     let cacheable = match listed_version.and_then(StorageVersion::etag) {
         Some(list_etag) => {
@@ -2781,12 +2900,12 @@ async fn load_history_observation_owned(
                 })?,
                 manifest: manifest.clone(),
                 stored_bytes: bytes.clone(),
-                reachable_keys: reachable_keys(namespace, &manifest)?,
+                reachable_keys: reachable_keys.clone(),
             })
         }
         None => None,
     };
-    Ok((manifest, bytes, cacheable))
+    Ok((manifest, bytes, reachable_keys, cacheable))
 }
 
 async fn collect_bounded_ordered<T>(futures: Vec<BoxFuture<'static, Result<T>>>) -> Vec<Result<T>> {
@@ -2801,7 +2920,7 @@ async fn load_history_observations_bounded(
     namespace: &str,
     observations: &[ManifestHistoryObservation],
     prior: Option<&BTreeMap<String, CachedHistory>>,
-) -> Vec<Result<(Manifest, Bytes, Option<CachedHistory>)>> {
+) -> Vec<Result<(Manifest, Bytes, BTreeSet<String>, Option<CachedHistory>)>> {
     let futures = observations
         .iter()
         .map(|observation| {
@@ -2857,20 +2976,20 @@ async fn load_history_snapshot_from_observations(
         let loaded =
             load_history_observations_bounded(store, namespace, &observations, prior).await;
         for (observation, result) in observations.into_iter().zip(loaded) {
-            let (manifest, bytes, cached) = result?;
+            let (manifest, bytes, reachable, cached) = result?;
             if let Some(cached) = cached {
                 cacheable.insert(observation.history.key.clone(), cached);
             }
-            entries.push((observation, manifest, bytes));
+            entries.push((observation, manifest, bytes, reachable));
         }
     } else {
         for observation in observations {
-            let (manifest, bytes, cached) =
+            let (manifest, bytes, reachable, cached) =
                 load_history_observation(store, namespace, &observation, prior).await?;
             if let Some(cached) = cached {
                 cacheable.insert(observation.history.key.clone(), cached);
             }
-            entries.push((observation, manifest, bytes));
+            entries.push((observation, manifest, bytes, reachable));
         }
     }
     Ok(HistorySnapshot { entries, cacheable })
@@ -2902,7 +3021,7 @@ fn validate_rooted_history_snapshot(
     snapshot: &HistorySnapshot,
 ) -> Result<()> {
     let mut observed = BTreeSet::new();
-    for (observation, _, stored_bytes) in &snapshot.entries {
+    for (observation, _, stored_bytes, _) in &snapshot.entries {
         if let Some(generation) = live_roots
             .rooted_generations
             .keys()
@@ -2949,12 +3068,13 @@ async fn prune_history_with_memo_at(
         .pitr_retention_secs
         .saturating_add(retention.skew_slop_secs);
     let mut retained_manifests = Vec::new();
+    let mut retained_reachable_keys = BTreeSet::new();
     let mut retained_history_observations = Vec::new();
     let mut prunable = Vec::new();
     let mut observed_rooted_generations = BTreeSet::new();
 
     for (index, observation) in observations.into_iter().enumerate() {
-        let (manifest, stored_bytes, _) =
+        let (manifest, stored_bytes, reachable, _) =
             load_history_observation(store, namespace, &observation, prior).await?;
         let keep_by_count = index >= keep_from;
         let keep_by_pin = pinned_generations.contains(&observation.history.version);
@@ -2975,6 +3095,7 @@ async fn prune_history_with_memo_at(
                 <= retention_window as i64;
         if keep_by_count || keep_by_time || keep_by_pin || keep_by_root {
             retained_history_observations.push(observation.clone());
+            retained_reachable_keys.extend(reachable);
             retained_manifests.push(manifest.clone());
         } else {
             prunable.push(observation.history.key);
@@ -2998,6 +3119,7 @@ async fn prune_history_with_memo_at(
             pruned: prunable.len(),
             retained_manifests,
         },
+        retained_reachable_keys,
         retained_history_observations,
         snapshot_observations,
     })
@@ -3091,11 +3213,12 @@ async fn prune_history_with_memo_parallel_from_observations(
         .pitr_retention_secs
         .saturating_add(retention.skew_slop_secs);
     let mut retained_manifests = Vec::new();
+    let mut retained_reachable_keys = BTreeSet::new();
     let mut retained_history_observations = Vec::new();
     let mut prunable = Vec::new();
     let mut observed_rooted_generations = BTreeSet::new();
 
-    for (index, (observation, (manifest, stored_bytes, _))) in
+    for (index, (observation, (manifest, stored_bytes, reachable, _))) in
         observations.into_iter().zip(history_entries).enumerate()
     {
         let keep_by_count = index >= keep_from;
@@ -3117,6 +3240,7 @@ async fn prune_history_with_memo_parallel_from_observations(
                 <= retention_window as i64;
         if keep_by_count || keep_by_time || keep_by_pin || keep_by_root {
             retained_history_observations.push(observation);
+            retained_reachable_keys.extend(reachable);
             retained_manifests.push(manifest);
         } else {
             prunable.push(observation.history.key);
@@ -3145,22 +3269,19 @@ async fn prune_history_with_memo_parallel_from_observations(
             pruned: prunable.len(),
             retained_manifests,
         },
+        retained_reachable_keys,
         retained_history_observations,
         snapshot_observations,
     })
 }
 
 fn history_snapshot_reachable_keys(
-    namespace: &str,
+    _namespace: &str,
     snapshot: &HistorySnapshot,
 ) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
-    for (observation, manifest, _) in &snapshot.entries {
-        if let Some(cached) = snapshot.cacheable.get(&observation.history.key) {
-            keys.extend(cached.reachable_keys.iter().cloned());
-        } else {
-            keys.extend(reachable_keys(namespace, manifest)?);
-        }
+    for (_, _, _, reachable) in &snapshot.entries {
+        keys.extend(reachable.iter().cloned());
     }
     Ok(keys)
 }
@@ -3169,9 +3290,10 @@ fn history_observations_match_snapshot(
     expected: &[ManifestHistoryObservation],
     actual: &HistorySnapshot,
 ) -> bool {
-    expected
+    expected.iter().eq(actual
+        .entries
         .iter()
-        .eq(actual.entries.iter().map(|(observation, _, _)| observation))
+        .map(|(observation, _, _, _)| observation))
 }
 
 enum NextGcDeadlineError {
@@ -3188,6 +3310,7 @@ impl From<ZeppelinError> for NextGcDeadlineError {
 struct NextGcDeadlineInputs<'a> {
     candidates: &'a [GcCandidate],
     manifest: &'a Manifest,
+    late_state: Option<&'a LateStateSection>,
     history: &'a HistorySnapshot,
     staging: &'a ActiveStagingObservation,
     inventory: Option<&'a NamespaceInventory>,
@@ -3202,6 +3325,7 @@ fn next_gc_deadline(
     let NextGcDeadlineInputs {
         candidates,
         manifest,
+        late_state,
         history,
         staging,
         inventory,
@@ -3219,20 +3343,18 @@ fn next_gc_deadline(
     };
 
     let retained_history = history_snapshot_reachable_keys(namespace, history)?;
-    let candidate_reachable = reachable_keys_with_retained_history_and_staging_keys(
-        namespace,
-        manifest,
-        &staging.keys,
-        &retained_history,
-    )?;
+    let mut candidate_reachable =
+        reachable_keys_with_staging_and_late_state(namespace, manifest, &staging.keys, late_state)?;
+    candidate_reachable.extend(retained_history.iter().cloned());
     let mut live_without_pending = manifest.clone();
     live_without_pending.pending_deletes.clear();
-    let pending_reachable = reachable_keys_with_retained_history_and_staging_keys(
+    let mut pending_reachable = reachable_keys_with_staging_and_late_state(
         namespace,
         &live_without_pending,
         &staging.keys,
-        &retained_history,
+        late_state,
     )?;
+    pending_reachable.extend(retained_history);
 
     for candidate in candidates {
         if candidate_reachable.contains(&candidate.key) {
@@ -3289,7 +3411,7 @@ fn next_gc_deadline(
             .checked_add(gc.skew_slop_secs)
             .and_then(|seconds| seconds.checked_add(1))
             .ok_or(NextGcDeadlineError::InvalidSchedule)?;
-        for (_, manifest, _) in &history.entries {
+        for (_, manifest, _, _) in &history.entries {
             consider_deadline(
                 deadline_after_secs(manifest.updated_at, retention)
                     .map_err(|()| NextGcDeadlineError::InvalidSchedule)?,
@@ -3787,12 +3909,11 @@ async fn run_gc_cycle_at_inner(
     };
     let MemoizedHistoryPruneResult {
         result: history_prune,
+        retained_reachable_keys: prune_reachable,
         retained_history_observations: prune_history_observations,
         snapshot_observations: prune_snapshot_observations,
     } = history_prune;
     let manifest_history_pruned = history_prune.pruned;
-    let prune_reachable =
-        reachable_keys_from_manifests(namespace, &history_prune.retained_manifests)?;
     if prior_entries.is_none() && initial_inventory.is_none() {
         let prefix = format!("{namespace}/");
         let listed = match store.list_prefix_meta(&prefix).await {
@@ -4027,6 +4148,13 @@ async fn run_gc_cycle_at_inner(
         );
         return Ok(GcCycleOutcome::incomplete(base_report));
     }
+    let mark_late_state = match mark_manifest.load_late_state(store).await {
+        Ok(section) => section,
+        Err(error) => {
+            warn!(namespace, error = %error, "gc mark late-state read failed");
+            return Ok(GcCycleOutcome::incomplete(base_report));
+        }
+    };
     let persisted_is_canonical = persisted_ledger.is_canonical();
     let persisted = persisted_ledger.candidates;
     if force_candidate_phase {
@@ -4049,12 +4177,13 @@ async fn run_gc_cycle_at_inner(
             Err(error) => return Err(error),
         },
     };
-    let mut mark_reachable = reachable_keys_with_retained_history_and_staging_keys(
+    let mut mark_reachable = reachable_keys_with_staging_and_late_state(
         namespace,
         &mark_manifest,
         &mark_staging.keys,
-        &retained_history,
+        mark_late_state.as_ref(),
     )?;
+    mark_reachable.extend(retained_history.iter().cloned());
     extend_scoped_artifact_roots(
         namespace,
         &mark_manifest,
@@ -4282,6 +4411,16 @@ async fn run_gc_cycle_at_inner(
         report.candidates_skipped = unknown_shape_skips;
         return Ok(GcCycleOutcome::incomplete(report));
     }
+    let sweep_late_state = match sweep_manifest.load_late_state(store).await {
+        Ok(section) => section,
+        Err(error) => {
+            warn!(namespace, error = %error, "gc sweep late-state read failed");
+            let mut report = base_report;
+            report.candidates_marked = candidates_marked;
+            report.candidates_skipped = unknown_shape_skips;
+            return Ok(GcCycleOutcome::incomplete(report));
+        }
+    };
     let sweep_history = match completed_inventory
         .as_ref()
         .filter(|_| read_mode.is_bounded())
@@ -4331,12 +4470,13 @@ async fn run_gc_cycle_at_inner(
     let sweep_listed_keys = completed_inventory
         .as_ref()
         .map_or_else(|| listed_keys.clone(), NamespaceInventory::all_keys);
-    let mut sweep_reachable = reachable_keys_with_retained_history_and_staging_keys(
+    let mut sweep_reachable = reachable_keys_with_staging_and_late_state(
         namespace,
         &sweep_manifest,
         &sweep_staging.keys,
-        &sweep_retained_history,
+        sweep_late_state.as_ref(),
     )?;
+    sweep_reachable.extend(sweep_retained_history.iter().cloned());
     extend_scoped_artifact_roots(
         namespace,
         &sweep_manifest,
@@ -4579,6 +4719,7 @@ async fn run_gc_cycle_at_inner(
             NextGcDeadlineInputs {
                 candidates: &retained,
                 manifest: &sweep_manifest,
+                late_state: sweep_late_state.as_ref(),
                 history: &sweep_history_snapshot,
                 staging: &sweep_staging,
                 inventory: completed_inventory.as_ref(),
@@ -4873,6 +5014,26 @@ fn parse_gc_artifact_key(namespace: &str, key: &str) -> Option<ParsedGcArtifact>
             Ulid::from_string(id)
                 .ok()
                 .map(|ulid| ParsedGcArtifact::WalFragment { ulid })
+        }
+        NamespaceObjectFamily::InputWal => {
+            let prefix = NamespaceObjectFamily::InputWal.namespace_prefix(namespace);
+            let name = key.strip_prefix(&prefix)?;
+            let id = name.strip_suffix(".wal")?;
+            if id.contains('/') {
+                return None;
+            }
+            Ulid::from_string(id)
+                .ok()
+                .map(|ulid| ParsedGcArtifact::InputWalFragment { ulid })
+        }
+        NamespaceObjectFamily::Source => {
+            let prefix = NamespaceObjectFamily::Source.namespace_prefix(namespace);
+            let checksum = key.strip_prefix(&prefix)?;
+            (checksum.len() == 64
+                && checksum
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+            .then_some(ParsedGcArtifact::Source)
         }
         NamespaceObjectFamily::Segment => {
             let (_, path, ulid) = parse_segment_key(namespace, key)?;
@@ -6643,6 +6804,46 @@ mod tests {
         ));
         assert!(!pending_delete_horizon_satisfied(NS, &key, now, 5, None));
 
+        let source_key = crate::wal::SourceInventoryRef::s3_key(
+            NS,
+            crate::embedding::ContentHash::new([0xef; 32]),
+        );
+        let young_source = ListedObject {
+            key: source_key.clone(),
+            size: 7,
+            last_modified: now - chrono::Duration::seconds(1),
+            version: None,
+        };
+        let source_inventory = NamespaceInventory::from_listed(NS, vec![young_source.clone()])
+            .expect("young source inventory must classify");
+        assert!(!pending_delete_horizon_satisfied(
+            NS,
+            &source_key,
+            now,
+            5,
+            Some(&source_inventory)
+        ));
+        let old_source = ListedObject {
+            last_modified: now - chrono::Duration::seconds(30),
+            ..young_source
+        };
+        let source_inventory = NamespaceInventory::from_listed(NS, vec![old_source])
+            .expect("old source inventory must classify");
+        assert!(pending_delete_horizon_satisfied(
+            NS,
+            &source_key,
+            now,
+            5,
+            Some(&source_inventory)
+        ));
+        assert!(!pending_delete_horizon_satisfied(
+            NS,
+            &source_key,
+            now,
+            5,
+            None
+        ));
+
         let mut pending_manifest = Manifest::new_at(now);
         pending_manifest.pending_deletes.push(key);
         let gc = GcConfig {
@@ -6665,6 +6866,7 @@ mod tests {
             NextGcDeadlineInputs {
                 candidates: &[],
                 manifest: &pending_manifest,
+                late_state: None,
                 history: &history,
                 staging: &staging,
                 inventory: Some(&young_inventory),
@@ -6682,6 +6884,7 @@ mod tests {
                 NextGcDeadlineInputs {
                     candidates: &[],
                     manifest: &pending_manifest,
+                    late_state: None,
                     history: &history,
                     staging: &staging,
                     inventory: None,

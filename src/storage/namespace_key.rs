@@ -23,6 +23,10 @@ pub(crate) enum NamespaceObjectFamily {
     Snapshot,
     /// `wal/`: manifest-referenced immutable data, deferred and branch-local.
     Wal,
+    /// `input-wal/`: typed-input immutable data, deferred and branch-local.
+    InputWal,
+    /// `sources/`: checksum-addressed source data, deferred and branch-local.
+    Source,
     /// `segments/`: manifest-referenced immutable data, deferred and branch-local.
     Segment,
     /// `late/`: manifest-referenced immutable late state, deferred and branch-local.
@@ -48,13 +52,15 @@ pub(crate) enum GcOwnership {
 
 impl NamespaceObjectFamily {
     /// Every production namespace object family, in stable registry order.
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 13] = [
         Self::Metadata,
         Self::Manifest,
         Self::Lease,
         Self::ManifestHistory,
         Self::Snapshot,
         Self::Wal,
+        Self::InputWal,
+        Self::Source,
         Self::Segment,
         Self::LateSection,
         Self::Staging,
@@ -70,7 +76,7 @@ impl NamespaceObjectFamily {
     #[must_use]
     pub(crate) const fn allows_deferred_delete(self) -> bool {
         match self {
-            Self::Wal | Self::Segment | Self::LateSection => true,
+            Self::Wal | Self::InputWal | Self::Source | Self::Segment | Self::LateSection => true,
             Self::Metadata
             | Self::Manifest
             | Self::Lease
@@ -86,7 +92,9 @@ impl NamespaceObjectFamily {
     #[must_use]
     pub(crate) const fn gc_ownership(self) -> GcOwnership {
         match self {
-            Self::Wal | Self::Segment | Self::LateSection => GcOwnership::ManifestReferenced,
+            Self::Wal | Self::InputWal | Self::Source | Self::Segment | Self::LateSection => {
+                GcOwnership::ManifestReferenced
+            }
             Self::Staging => GcOwnership::StagingProtocol,
             Self::Metadata
             | Self::Manifest
@@ -102,7 +110,7 @@ impl NamespaceObjectFamily {
     #[must_use]
     pub(crate) const fn participates_in_branch_locality(self) -> bool {
         match self {
-            Self::Wal | Self::Segment | Self::LateSection => true,
+            Self::Wal | Self::InputWal | Self::Source | Self::Segment | Self::LateSection => true,
             Self::Metadata
             | Self::Manifest
             | Self::Lease
@@ -124,6 +132,8 @@ impl NamespaceObjectFamily {
             Self::ManifestHistory => "manifests/",
             Self::Snapshot => "snapshots/",
             Self::Wal => "wal/",
+            Self::InputWal => "input-wal/",
+            Self::Source => "sources/",
             Self::Segment => "segments/",
             Self::LateSection => "late/",
             Self::Staging => "_staging/",
@@ -142,6 +152,8 @@ impl NamespaceObjectFamily {
             Self::ManifestHistory => "manifests/",
             Self::Snapshot => "snapshots/",
             Self::Wal => "wal/",
+            Self::InputWal => "input-wal/",
+            Self::Source => "sources/",
             Self::Segment => "segments/",
             Self::LateSection => "late/",
             Self::Staging => "_staging/",
@@ -166,6 +178,8 @@ impl NamespaceObjectFamily {
             | Self::ManifestHistory
             | Self::Snapshot
             | Self::Wal
+            | Self::InputWal
+            | Self::Source
             | Self::Segment
             | Self::LateSection
             | Self::Staging
@@ -269,6 +283,14 @@ fn classify_nested_family(key: &str, suffix: &str) -> Result<NamespaceObjectFami
         (
             NamespaceObjectFamily::Wal.relative_prefix(),
             NamespaceObjectFamily::Wal,
+        ),
+        (
+            NamespaceObjectFamily::InputWal.relative_prefix(),
+            NamespaceObjectFamily::InputWal,
+        ),
+        (
+            NamespaceObjectFamily::Source.relative_prefix(),
+            NamespaceObjectFamily::Source,
         ),
         (
             NamespaceObjectFamily::Segment.relative_prefix(),
@@ -439,6 +461,10 @@ mod tests {
                 NamespaceObjectFamily::ManifestHistory => "00000000000000000001.msgpack",
                 NamespaceObjectFamily::Snapshot => "daily.msgpack",
                 NamespaceObjectFamily::Wal => "fragment.wal",
+                NamespaceObjectFamily::InputWal => "fragment.wal",
+                NamespaceObjectFamily::Source => {
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                }
                 NamespaceObjectFamily::Segment => "segment/centroids.bin",
                 NamespaceObjectFamily::LateSection => {
                     "state/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -483,6 +509,10 @@ mod tests {
             .unwrap_or_else(|error| panic!("segment key should classify: {error}"));
         let late = NamespaceObjectKey::classify(NS, "target/late/state/0123456789abcdef")
             .unwrap_or_else(|error| panic!("late section key should classify: {error}"));
+        let input = NamespaceObjectKey::classify(NS, "target/input-wal/f.wal")
+            .unwrap_or_else(|error| panic!("input WAL key should classify: {error}"));
+        let source = NamespaceObjectKey::classify(NS, "target/sources/0123456789abcdef")
+            .unwrap_or_else(|error| panic!("source key should classify: {error}"));
         let lifecycle = NamespaceObjectKey::classify(
             NS,
             "target/_lifecycle/branch_visibility_removed/01ARZ3NDEKTSV4RRFFQ69G5FAV.1234567890abcdef1234567890abcdef.json",
@@ -492,6 +522,8 @@ mod tests {
         assert!(wal.allows_deferred_delete());
         assert!(segment.allows_deferred_delete());
         assert!(late.allows_deferred_delete());
+        assert!(input.allows_deferred_delete());
+        assert!(source.allows_deferred_delete());
         assert!(!lifecycle.allows_deferred_delete());
     }
 
@@ -500,6 +532,8 @@ mod tests {
         for family in NamespaceObjectFamily::ALL {
             match family {
                 NamespaceObjectFamily::Wal
+                | NamespaceObjectFamily::InputWal
+                | NamespaceObjectFamily::Source
                 | NamespaceObjectFamily::Segment
                 | NamespaceObjectFamily::LateSection => {
                     assert_eq!(family.gc_ownership(), GcOwnership::ManifestReferenced);

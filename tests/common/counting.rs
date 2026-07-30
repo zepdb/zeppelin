@@ -139,7 +139,9 @@ pub fn classify(key: &str) -> ArtifactClass {
         ArtifactClass::Sketch
     } else if filename == "global_fts.bin" || filename.starts_with("fts_") {
         ArtifactClass::Fts
-    } else if filename.ends_with(".wal") {
+    } else if filename.ends_with(".wal")
+        && key.rsplit('/').nth(1).is_some_and(|parent| parent == "wal")
+    {
         ArtifactClass::Wal
     } else if filename == "manifest.json" {
         ArtifactClass::Manifest

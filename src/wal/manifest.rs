@@ -137,6 +137,7 @@ use sha2::{Digest, Sha256};
 use std::ops::Range;
 use ulid::Ulid;
 
+use crate::embedding::{ModalityCounts, SemanticCoverageState};
 use crate::error::{Result, ZeppelinError};
 use crate::namespace::branching::{
     ArtifactOrigin, ArtifactOriginIndex, ArtifactOriginSetBuilder, BranchError, BranchLineage,
@@ -149,7 +150,10 @@ use crate::storage::store::DELETE_MANY_MAX_KEYS;
 use crate::storage::{
     CreateOnlyOutcome, ListedObject, NamespaceObjectKey, StorageVersion, ZeppelinStore,
 };
-use crate::wal::late_section::{LateStateSection, ManifestSectionRef, LATE_STATE_FORMAT_VERSION};
+use crate::wal::late_section::{
+    is_supported_late_state_format_version, LateStateSection, ManifestSectionRef,
+    SourceInventoryRef, LATE_STATE_FORMAT_VERSION,
+};
 
 fn checksum_hex(checksum: &[u8; 32]) -> String {
     checksum.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -195,6 +199,35 @@ pub struct FragmentRef {
     /// Physical owner of this fragment, or local ownership when absent.
     ///
     /// NOTE: this field must remain last for positional MessagePack decoding.
+    #[serde(default)]
+    pub artifact_origin: Option<ArtifactOriginIndex>,
+}
+
+/// Manifest metadata for one immutable typed-input WAL fragment.
+///
+/// Input fragments share [`Manifest::next_sequence`] with dense fragments so
+/// replay order remains one namespace-local total order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputFragmentRef {
+    /// Stable ULID used to derive the immutable input-WAL object key.
+    pub id: Ulid,
+    /// Number of typed retrieval-unit upserts.
+    pub upsert_count: usize,
+    /// Number of deletion tombstones.
+    pub delete_count: usize,
+    /// Namespace-local replay order shared with dense fragments.
+    #[serde(default)]
+    pub sequence_number: u64,
+    /// Serialized input-fragment bytes.
+    #[serde(default)]
+    pub size_bytes: u64,
+    /// Inline text plus referenced encoded-source bytes.
+    #[serde(default)]
+    pub referenced_content_bytes: u64,
+    /// Typed upserts grouped by input modality.
+    #[serde(default)]
+    pub modality_counts: ModalityCounts,
+    /// Physical owner of this input fragment, or local ownership when absent.
     #[serde(default)]
     pub artifact_origin: Option<ArtifactOriginIndex>,
 }
@@ -787,6 +820,45 @@ impl LocatedFragmentRef<'_> {
     }
 }
 
+/// Globally unique identity of one immutable typed-input WAL fragment.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct LocatedInputFragmentIdentity {
+    /// Namespace lifetime that owns the physical object.
+    pub(crate) physical_origin: ArtifactOrigin,
+    /// ULID embedded in the immutable input-fragment key and body.
+    pub(crate) id: Ulid,
+}
+
+/// Input-fragment descriptor paired with its logical and physical identities.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocatedInputFragmentRef<'a> {
+    /// Namespace whose manifest authorizes visibility.
+    pub(crate) logical_namespace: &'a str,
+    /// Exact target lifetime whose manifest authorizes this read.
+    pub(crate) logical_origin: ResolvedArtifactOrigin<'a>,
+    /// Namespace lifetime whose prefix contains the immutable object.
+    pub(crate) physical_origin: ResolvedArtifactOrigin<'a>,
+    /// Exact descriptor selected from the authoritative manifest.
+    pub(crate) fragment: &'a InputFragmentRef,
+}
+
+impl<'a> LocatedInputFragmentRef<'a> {
+    /// Build the global cache and deduplication identity.
+    #[must_use]
+    pub(crate) fn identity(self) -> LocatedInputFragmentIdentity {
+        LocatedInputFragmentIdentity {
+            physical_origin: self.physical_origin.as_origin().clone(),
+            id: self.fragment.id,
+        }
+    }
+
+    /// Return the physical namespace used by the input-WAL key helper.
+    #[must_use]
+    pub(crate) fn physical_namespace(self) -> &'a str {
+        self.physical_origin.namespace()
+    }
+}
+
 /// Globally unique identity of one immutable segment descriptor.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct LocatedSegmentIdentity {
@@ -886,6 +958,42 @@ impl<'a> ArtifactOriginResolver<'a> {
             .fragments
             .iter()
             .map(|fragment| self.locate_fragment(fragment))
+            .collect()
+    }
+
+    /// Resolve one typed-input fragment without exposing its table index.
+    pub(crate) fn locate_input_fragment(
+        &self,
+        fragment: &'a InputFragmentRef,
+    ) -> Result<LocatedInputFragmentRef<'a>> {
+        let physical_origin = match fragment.artifact_origin {
+            Some(index) => ResolvedArtifactOrigin {
+                origin: self.manifest.indexed_artifact_origin_ref(
+                    "input-fragment",
+                    &fragment.id.to_string(),
+                    index,
+                )?,
+            },
+            None => ResolvedArtifactOrigin {
+                origin: self.authoritative_local,
+            },
+        };
+        Ok(LocatedInputFragmentRef {
+            logical_namespace: self.authoritative_local.namespace.as_str(),
+            logical_origin: ResolvedArtifactOrigin {
+                origin: self.authoritative_local,
+            },
+            physical_origin,
+            fragment,
+        })
+    }
+
+    /// Resolve all retained typed-input fragments in replay order.
+    pub(crate) fn located_input_fragments(&self) -> Result<Vec<LocatedInputFragmentRef<'a>>> {
+        self.manifest
+            .input_fragments
+            .iter()
+            .map(|fragment| self.locate_input_fragment(fragment))
             .collect()
     }
 
@@ -1091,9 +1199,21 @@ pub struct Manifest {
     /// Immutable content-addressed late-interaction state section.
     ///
     /// Dense namespaces keep this absent. It must remain the final persisted
-    /// field because MessagePack encodes manifests positionally.
+    /// Phase-4 field position because MessagePack encodes manifests positionally.
     #[serde(default)]
     pub late_state: Option<ManifestSectionRef>,
+    /// Visible typed-input WAL fragments in shared sequence-number order.
+    ///
+    /// This field is the first half of the final Phase-5 root-shape change.
+    #[serde(default)]
+    pub input_fragments: Vec<InputFragmentRef>,
+    /// Contiguous semantic coverage for the active recipe.
+    ///
+    /// Phase 5 defines the shape but leaves it absent. It must remain the final
+    /// persisted root field because positional MessagePack compatibility only
+    /// permits trailing additions.
+    #[serde(default)]
+    pub semantic_coverage: Option<SemanticCoverageState>,
 }
 
 /// Stable manifest execution projection version.
@@ -1114,6 +1234,9 @@ pub enum ManifestBindingVersion {
     /// Late-state reference plus optional lineage/roots control projection.
     #[serde(rename = "v5_late_state")]
     V5LateState,
+    /// Typed-input fragments and semantic coverage root projection.
+    #[serde(rename = "v6_typed_ingest")]
+    V6TypedIngest,
 }
 
 #[derive(Serialize)]
@@ -1197,6 +1320,18 @@ struct FragmentExecutionBindingV2 {
 }
 
 #[derive(Serialize)]
+struct InputFragmentExecutionBindingV1 {
+    id: String,
+    upsert_count: usize,
+    delete_count: usize,
+    sequence_number: u64,
+    size_bytes: u64,
+    referenced_content_bytes: u64,
+    modality_counts: ModalityCounts,
+    artifact_origin: Option<u32>,
+}
+
+#[derive(Serialize)]
 struct SegmentExecutionBindingV2<'a> {
     id: &'a str,
     vector_count: usize,
@@ -1276,6 +1411,17 @@ struct ManifestExecutionBindingV4<'a> {
     late_state_origin: ArtifactOriginExecutionBindingV2<'a>,
 }
 
+/// Typed-input-aware execution projection introduced by manifest binding V6.
+#[derive(Serialize)]
+struct ManifestExecutionBindingV5<'a> {
+    format: &'static str,
+    prior: ManifestExecutionBindingV3<'a>,
+    late_state: Option<&'a ManifestSectionRef>,
+    late_state_origin: Option<ArtifactOriginExecutionBindingV2<'a>>,
+    input_fragments: Vec<InputFragmentExecutionBindingV1>,
+    semantic_coverage: Option<&'a SemanticCoverageState>,
+}
+
 #[derive(Serialize)]
 struct ManifestExecutionBindingV2<'a> {
     format: &'static str,
@@ -1317,6 +1463,20 @@ struct ControlLateStateV3<'a> {
     branch_lineage: Option<&'a BranchLineage>,
     late_state: &'a ManifestSectionRef,
     late_state_origin: Option<ArtifactOriginExecutionBindingV2<'a>>,
+}
+
+/// Exact typed-ingest, lineage, and retention projection introduced by V6.
+#[derive(Serialize)]
+struct ControlTypedIngestV4<'a> {
+    namespace: &'a str,
+    incarnation: Option<[u8; 16]>,
+    deletion_fence: Option<&'a ManifestDeletionFence>,
+    branch_roots: &'a BTreeMap<BranchId, BranchRoot>,
+    branch_lineage: Option<&'a BranchLineage>,
+    late_state: Option<&'a ManifestSectionRef>,
+    late_state_origin: Option<ArtifactOriginExecutionBindingV2<'a>>,
+    input_fragments: Vec<InputFragmentExecutionBindingV1>,
+    semantic_coverage: Option<&'a SemanticCoverageState>,
 }
 
 /// Non-circular immutable inputs used to construct a target branch lineage.
@@ -1452,6 +1612,22 @@ struct ForkViewProjectionV3<'a> {
     source_config_sha256: SourceDataPlaneConfigDigest,
     depth: u16,
     execution: ManifestExecutionBindingV4<'a>,
+}
+
+/// Initial-view projection for typed-input manifests.
+#[derive(Serialize)]
+struct ForkViewProjectionV4<'a> {
+    domain: &'static str,
+    target_namespace: &'a str,
+    target_incarnation: [u8; 16],
+    source_namespace: &'a str,
+    source_incarnation: [u8; 16],
+    branch_id: BranchId,
+    source_generation: ManifestGeneration,
+    source_manifest_sha256: ManifestDigest,
+    source_config_sha256: SourceDataPlaneConfigDigest,
+    depth: u16,
+    execution: ManifestExecutionBindingV5<'a>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1598,6 +1774,8 @@ impl Manifest {
             branch_lineage: None,
             coarse_payload_encodings: BTreeMap::new(),
             late_state: None,
+            input_fragments: Vec::new(),
+            semantic_coverage: None,
         }
     }
 
@@ -1606,7 +1784,7 @@ impl Manifest {
         let Some(reference) = self.late_state.as_ref() else {
             return Ok(None);
         };
-        if reference.format_version != LATE_STATE_FORMAT_VERSION {
+        if !is_supported_late_state_format_version(reference.format_version) {
             return Err(ZeppelinError::Serialization(format!(
                 "late-state reference {} declares unsupported format version {}",
                 reference.key, reference.format_version
@@ -1639,6 +1817,8 @@ impl Manifest {
             )));
         }
         let section = LateStateSection::from_bytes(&bytes)?;
+        let section_origin = self.late_section_origin(reference)?;
+        section.validate_for_origin(&section_origin)?;
         crate::cache::late_section_cache::insert(reference, section.clone());
         Ok(Some(section))
     }
@@ -1655,8 +1835,6 @@ impl Manifest {
         version: &ManifestVersion,
         section: &LateStateSection,
     ) -> Result<ManifestVersion> {
-        const MAX_PUBLISH_ATTEMPTS: usize = 8;
-
         let desired_bytes = section.to_bytes()?;
         let desired_checksum = LateStateSection::checksum(&desired_bytes);
         let desired_size = u64::try_from(desired_bytes.len()).map_err(|_| {
@@ -1664,46 +1842,114 @@ impl Manifest {
                 "late-state section size does not fit persisted u64".to_string(),
             )
         })?;
+        let current_section = self.load_late_state(store).await?;
+        let converged = current_section.is_some()
+            && self.late_state.as_ref().is_some_and(|reference| {
+                reference.checksum == desired_checksum
+                    && reference.size_bytes == desired_size
+                    && reference.format_version == LATE_STATE_FORMAT_VERSION
+            });
+        let next_reference = if converged {
+            self.late_state.clone().ok_or_else(|| {
+                ZeppelinError::Serialization(
+                    "late-state convergence lost its manifest reference".to_string(),
+                )
+            })?
+        } else {
+            section.put_create(store, namespace).await?
+        };
+        self.publish_root_mutations(store, namespace, version, Some(next_reference), None)
+            .await
+    }
+
+    /// CAS-publish one already-uploaded input fragment and optional new section.
+    ///
+    /// `new_late_state` is `None` for text-only input. When present it must name
+    /// an already-created local section object; this method performs no artifact
+    /// PUTs. Every conflict reloads authority, assigns the input fragment from
+    /// the fresh shared sequence counter, and reapplies both root mutations.
+    pub async fn publish_input_fragment(
+        &mut self,
+        store: &ZeppelinStore,
+        namespace: &str,
+        version: &ManifestVersion,
+        new_late_state: Option<ManifestSectionRef>,
+        input_fragment: InputFragmentRef,
+    ) -> Result<ManifestVersion> {
+        self.publish_root_mutations(
+            store,
+            namespace,
+            version,
+            new_late_state,
+            Some(input_fragment),
+        )
+        .await
+    }
+
+    async fn publish_root_mutations(
+        &mut self,
+        store: &ZeppelinStore,
+        namespace: &str,
+        version: &ManifestVersion,
+        new_late_state: Option<ManifestSectionRef>,
+        input_fragment: Option<InputFragmentRef>,
+    ) -> Result<ManifestVersion> {
+        const MAX_PUBLISH_ATTEMPTS: usize = 8;
+
+        if let Some(reference) = new_late_state.as_ref() {
+            if reference.artifact_origin.is_some() {
+                return Err(ZeppelinError::Validation(
+                    "new late-state publication must name a local section".to_string(),
+                ));
+            }
+            let owned = NamespaceObjectKey::classify(namespace, reference.key.clone())?;
+            if owned.family() != crate::storage::NamespaceObjectFamily::LateSection {
+                return Err(ZeppelinError::Validation(format!(
+                    "new late-state key is not in the late section family: {}",
+                    reference.key
+                )));
+            }
+        }
+
         let mut current_version = version.clone();
-
         for _ in 0..MAX_PUBLISH_ATTEMPTS {
-            let current_section = self.load_late_state(store).await?;
-            let converged = current_section.is_some()
-                && self.late_state.as_ref().is_some_and(|reference| {
-                    reference.checksum == desired_checksum
-                        && reference.size_bytes == desired_size
-                        && reference.format_version == LATE_STATE_FORMAT_VERSION
-                });
-            let next_reference = if converged {
-                self.late_state.clone().ok_or_else(|| {
-                    ZeppelinError::Serialization(
-                        "late-state convergence lost its manifest reference".to_string(),
-                    )
-                })?
-            } else {
-                section.put_create(store, namespace).await?
-            };
-
-            if let Some(previous) = self.late_state.replace(next_reference.clone()) {
-                if previous.key != next_reference.key {
-                    let previous_origin = self.late_section_origin(&previous)?;
-                    if previous_origin == self.local_origin()? {
-                        let owned = NamespaceObjectKey::classify(namespace, previous.key.clone())?;
-                        if owned.family() != crate::storage::NamespaceObjectFamily::LateSection {
-                            return Err(ZeppelinError::Validation(format!(
-                                "superseded late-state key is not in the late section family: {}",
-                                previous.key
-                            )));
-                        }
-                        if !self
-                            .pending_deletes
-                            .iter()
-                            .any(|pending| pending == &previous.key)
-                        {
-                            self.pending_deletes.push(previous.key);
+            if let Some(next_reference) = new_late_state.as_ref() {
+                if let Some(previous) = self.late_state.replace(next_reference.clone()) {
+                    if previous.key != next_reference.key {
+                        let previous_origin = self.late_section_origin(&previous)?;
+                        if previous_origin == self.local_origin()? {
+                            let owned =
+                                NamespaceObjectKey::classify(namespace, previous.key.clone())?;
+                            if owned.family() != crate::storage::NamespaceObjectFamily::LateSection
+                            {
+                                return Err(ZeppelinError::Validation(format!(
+                                    "superseded late-state key is not in the late section family: {}",
+                                    previous.key
+                                )));
+                            }
+                            if !self
+                                .pending_deletes
+                                .iter()
+                                .any(|pending| pending == &previous.key)
+                            {
+                                self.pending_deletes.push(previous.key);
+                            }
                         }
                     }
                 }
+            }
+            if let Some(fragment) = input_fragment.as_ref() {
+                if self
+                    .input_fragments
+                    .iter()
+                    .any(|existing| existing.id == fragment.id)
+                {
+                    return Err(ZeppelinError::Validation(format!(
+                        "input fragment {} is already visible",
+                        fragment.id
+                    )));
+                }
+                self.add_input_fragment(fragment.clone());
             }
 
             match self
@@ -2017,6 +2263,20 @@ impl Manifest {
                 ));
             }
         }
+        let mut input_fragment_identities = HashSet::with_capacity(self.input_fragments.len());
+        for fragment in &self.input_fragments {
+            let located = resolver.locate_input_fragment(fragment)?;
+            if !input_fragment_identities.insert(located.identity()) {
+                return Err(self.artifact_origin_error(
+                    "input-fragment",
+                    fragment.id.to_string(),
+                    fragment.artifact_origin,
+                    None,
+                    Some(located.physical_origin.as_origin().clone()),
+                    "duplicate full located input-fragment identity",
+                ));
+            }
+        }
 
         let mut segment_identities = HashSet::with_capacity(self.segments.len());
         for segment in &self.segments {
@@ -2100,6 +2360,19 @@ impl Manifest {
         }
     }
 
+    /// Resolve one typed-input WAL fragment's physical namespace lifetime.
+    pub(crate) fn input_fragment_origin(
+        &self,
+        fragment: &InputFragmentRef,
+    ) -> Result<ArtifactOrigin> {
+        match fragment.artifact_origin {
+            Some(index) => {
+                self.indexed_artifact_origin("input-fragment", &fragment.id.to_string(), index)
+            }
+            None => self.local_origin(),
+        }
+    }
+
     /// Resolve one immutable segment's exact physical namespace lifetime.
     pub(crate) fn segment_origin(&self, segment: &SegmentRef) -> Result<ArtifactOrigin> {
         match segment.artifact_origin {
@@ -2117,6 +2390,21 @@ impl Manifest {
             Some(index) => self.indexed_artifact_origin("late-section", &reference.key, index),
             None => self.local_origin(),
         }
+    }
+
+    /// Resolve one section-resident source through the section-local origin table.
+    pub(crate) fn source_inventory_origin(
+        &self,
+        section: &LateStateSection,
+        source: &SourceInventoryRef,
+    ) -> Result<ArtifactOrigin> {
+        let reference = self.late_state.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(
+                "source inventory resolution requires a late-state reference".to_string(),
+            )
+        })?;
+        let section_origin = self.late_section_origin(reference)?;
+        section.source_origin(source, &section_origin).cloned()
     }
 
     fn validate_origin_entry(&self, origin: &ArtifactOrigin, index: usize) -> Result<()> {
@@ -2222,6 +2510,11 @@ impl Manifest {
                 self.fragment_origin(fragment)?;
             }
         }
+        for fragment in &self.input_fragments {
+            if fragment.artifact_origin.is_some() {
+                self.input_fragment_origin(fragment)?;
+            }
+        }
         for segment in &self.segments {
             let origin = match segment.artifact_origin {
                 Some(_) => self.segment_origin(segment)?,
@@ -2260,7 +2553,7 @@ impl Manifest {
         let Some(reference) = self.late_state.as_ref() else {
             return Ok(());
         };
-        if reference.format_version != LATE_STATE_FORMAT_VERSION {
+        if !is_supported_late_state_format_version(reference.format_version) {
             return Err(ZeppelinError::Serialization(format!(
                 "late-state reference {} declares unsupported format version {}",
                 reference.key, reference.format_version
@@ -2345,6 +2638,11 @@ impl Manifest {
                 referenced.insert(index);
             }
         }
+        for fragment in &self.input_fragments {
+            if let Some(index) = fragment.artifact_origin {
+                referenced.insert(index);
+            }
+        }
         for segment in &self.segments {
             if let Some(index) = segment.artifact_origin {
                 referenced.insert(index);
@@ -2384,6 +2682,10 @@ impl Manifest {
                 .segments
                 .iter()
                 .any(|segment| segment.artifact_origin.is_some())
+            && !self
+                .input_fragments
+                .iter()
+                .any(|fragment| fragment.artifact_origin.is_some())
             && self
                 .late_state
                 .as_ref()
@@ -2407,13 +2709,25 @@ impl Manifest {
                     .is_ok_and(|origin| origin != local)
             })
         });
+        let foreign_input_fragment = self.input_fragments.iter().find_map(|fragment| {
+            fragment
+                .artifact_origin
+                .map(|_| fragment)
+                .filter(|fragment| {
+                    self.input_fragment_origin(fragment)
+                        .is_ok_and(|origin| origin != local)
+                })
+        });
         let foreign_late_state = self.late_state.as_ref().is_some_and(|reference| {
             reference.artifact_origin.is_some()
                 && self
                     .late_section_origin(reference)
                     .is_ok_and(|origin| origin != local)
         });
-        if (foreign_fragment.is_some() || foreign_segment.is_some() || foreign_late_state)
+        if (foreign_fragment.is_some()
+            || foreign_input_fragment.is_some()
+            || foreign_segment.is_some()
+            || foreign_late_state)
             && self.branch_lineage.is_none()
         {
             return Err(BranchError::BranchingNotReady {
@@ -2433,6 +2747,11 @@ impl Manifest {
             .iter()
             .map(|fragment| self.fragment_origin(fragment))
             .collect::<Result<Vec<_>>>()?;
+        let input_fragment_origins = self
+            .input_fragments
+            .iter()
+            .map(|fragment| self.input_fragment_origin(fragment))
+            .collect::<Result<Vec<_>>>()?;
         let segment_origins = self
             .segments
             .iter()
@@ -2447,6 +2766,7 @@ impl Manifest {
         let mut builder = ArtifactOriginSetBuilder::default();
         for origin in fragment_origins
             .iter()
+            .chain(&input_fragment_origins)
             .chain(&segment_origins)
             .chain(late_section_origin.iter())
         {
@@ -2480,6 +2800,19 @@ impl Manifest {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        let input_fragment_indices = self
+            .input_fragments
+            .iter()
+            .zip(&input_fragment_origins)
+            .map(|(fragment, origin)| {
+                self.canonical_origin_index(
+                    &canonical.indices,
+                    "input-fragment",
+                    fragment.id.to_string(),
+                    origin,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         let late_section_index = late_section_origin
             .as_ref()
             .map(|origin| {
@@ -2495,6 +2828,9 @@ impl Manifest {
             .transpose()?;
 
         for (fragment, index) in self.fragments.iter_mut().zip(fragment_indices) {
+            fragment.artifact_origin = Some(index);
+        }
+        for (fragment, index) in self.input_fragments.iter_mut().zip(input_fragment_indices) {
             fragment.artifact_origin = Some(index);
         }
         for (segment, index) in self.segments.iter_mut().zip(segment_indices) {
@@ -2538,6 +2874,14 @@ impl Manifest {
                 None => Ok(None),
             })
             .collect::<Result<Vec<_>>>()?;
+        let input_fragment_origins = self
+            .input_fragments
+            .iter()
+            .map(|fragment| match fragment.artifact_origin {
+                Some(_) => self.input_fragment_origin(fragment).map(Some),
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<_>>>()?;
         let segment_origins = self
             .segments
             .iter()
@@ -2559,6 +2903,7 @@ impl Manifest {
         let mut builder = ArtifactOriginSetBuilder::default();
         for origin in fragment_origins
             .iter()
+            .chain(&input_fragment_origins)
             .chain(&segment_origins)
             .flatten()
             .chain(late_section_origin.iter())
@@ -2603,6 +2948,24 @@ impl Manifest {
                     .transpose()
             })
             .collect::<Result<Vec<_>>>()?;
+        let input_fragment_indices = self
+            .input_fragments
+            .iter()
+            .zip(&input_fragment_origins)
+            .map(|(fragment, origin)| {
+                origin
+                    .as_ref()
+                    .map(|origin| {
+                        self.canonical_origin_index(
+                            &canonical.indices,
+                            "input-fragment",
+                            fragment.id.to_string(),
+                            origin,
+                        )
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
         let late_section_index = late_section_origin
             .as_ref()
             .map(|origin| {
@@ -2618,6 +2981,9 @@ impl Manifest {
             .transpose()?;
 
         for (fragment, index) in self.fragments.iter_mut().zip(fragment_indices) {
+            fragment.artifact_origin = index;
+        }
+        for (fragment, index) in self.input_fragments.iter_mut().zip(input_fragment_indices) {
             fragment.artifact_origin = index;
         }
         for (segment, index) in self.segments.iter_mut().zip(segment_indices) {
@@ -2893,9 +3259,11 @@ impl Manifest {
             Some(ManifestBindingVersion::V5LateState) => {
                 self.compute_control_late_state_digest(namespace)
             }
+            Some(ManifestBindingVersion::V6TypedIngest) => {
+                self.compute_control_typed_ingest_digest(namespace)
+            }
             _ => Err(ZeppelinError::Serialization(
-                "manifest control digest requires binding v3_roots, v4_lineage, or v5_late_state"
-                    .to_string(),
+                "manifest control digest requires binding v3_roots or newer".to_string(),
             )),
         }
     }
@@ -2981,6 +3349,58 @@ impl Manifest {
         .map_err(|error| {
             ZeppelinError::Serialization(format!(
                 "manifest late-state control binding serialization failed: {error}"
+            ))
+        })?;
+        Ok(Sha256::digest(bytes).into())
+    }
+
+    fn input_fragment_execution_bindings(&self) -> Vec<InputFragmentExecutionBindingV1> {
+        self.input_fragments
+            .iter()
+            .map(|fragment| InputFragmentExecutionBindingV1 {
+                id: fragment.id.to_string(),
+                upsert_count: fragment.upsert_count,
+                delete_count: fragment.delete_count,
+                sequence_number: fragment.sequence_number,
+                size_bytes: fragment.size_bytes,
+                referenced_content_bytes: fragment.referenced_content_bytes,
+                modality_counts: fragment.modality_counts,
+                artifact_origin: fragment.artifact_origin.map(ArtifactOriginIndex::get),
+            })
+            .collect()
+    }
+
+    fn compute_control_typed_ingest_digest(&self, namespace: &str) -> Result<[u8; 32]> {
+        self.validate_namespace_binding(namespace)?;
+        self.validate_branch_root_state(namespace)?;
+        self.validate_branch_lineage_state(namespace)?;
+        self.validate_late_state_reference(namespace)?;
+        let late_state_origin = self
+            .late_state
+            .as_ref()
+            .and_then(|reference| reference.artifact_origin.map(|index| (reference, index)))
+            .map(|(reference, index)| {
+                self.indexed_artifact_origin_ref("late-section", &reference.key, index)
+            })
+            .transpose()?
+            .map(|origin| ArtifactOriginExecutionBindingV2 {
+                namespace: origin.namespace.as_str(),
+                incarnation: *origin.incarnation.as_uuid().as_bytes(),
+            });
+        let bytes = serde_json::to_vec(&ControlTypedIngestV4 {
+            namespace,
+            incarnation: self.namespace_incarnation.map(|incarnation| incarnation.0),
+            deletion_fence: self.deletion_fence.as_ref(),
+            branch_roots: &self.branch_roots,
+            branch_lineage: self.branch_lineage.as_ref(),
+            late_state: self.late_state.as_ref(),
+            late_state_origin,
+            input_fragments: self.input_fragment_execution_bindings(),
+            semantic_coverage: self.semantic_coverage.as_ref(),
+        })
+        .map_err(|error| {
+            ZeppelinError::Serialization(format!(
+                "manifest typed-ingest control binding serialization failed: {error}"
             ))
         })?;
         Ok(Sha256::digest(bytes).into())
@@ -3168,6 +3588,39 @@ impl Manifest {
         })
     }
 
+    fn execution_binding_v5<'a>(
+        &'a self,
+        namespace: &'a str,
+        authoritative_local: &'a ArtifactOrigin,
+    ) -> Result<ManifestExecutionBindingV5<'a>> {
+        let late_state_origin = self
+            .late_state
+            .as_ref()
+            .map(|late_state| {
+                let physical_origin = match late_state.artifact_origin {
+                    Some(index) => {
+                        self.indexed_artifact_origin_ref("late-section", &late_state.key, index)?
+                    }
+                    None => authoritative_local,
+                };
+                Ok::<ArtifactOriginExecutionBindingV2<'_>, ZeppelinError>(
+                    ArtifactOriginExecutionBindingV2 {
+                        namespace: physical_origin.namespace.as_str(),
+                        incarnation: *physical_origin.incarnation.as_uuid().as_bytes(),
+                    },
+                )
+            })
+            .transpose()?;
+        Ok(ManifestExecutionBindingV5 {
+            format: "zeppelin-manifest-execution-v5-typed-ingest",
+            prior: self.execution_binding_v3(namespace),
+            late_state: self.late_state.as_ref(),
+            late_state_origin,
+            input_fragments: self.input_fragment_execution_bindings(),
+            semantic_coverage: self.semantic_coverage.as_ref(),
+        })
+    }
+
     #[allow(dead_code)]
     fn execution_binding_v1<'a>(&'a self, namespace: &'a str) -> ManifestExecutionBindingV1<'a> {
         let fragments = self
@@ -3271,8 +3724,13 @@ impl Manifest {
             .map_or(&[], Vec::as_slice)
     }
 
-    pub(crate) fn clone_reachable_keys(&self, namespace: &str) -> Result<BTreeSet<String>> {
-        let mut reachable = crate::compaction::gc::reachable_keys(namespace, self)?;
+    pub(crate) fn clone_reachable_keys(
+        &self,
+        namespace: &str,
+        late_state: Option<&LateStateSection>,
+    ) -> Result<BTreeSet<String>> {
+        let mut reachable =
+            crate::compaction::gc::reachable_keys_with_late_state(namespace, self, late_state)?;
         let located_segments = match self.namespace_incarnation() {
             Some(incarnation) => {
                 let local_origin = ArtifactOrigin {
@@ -3401,7 +3859,11 @@ impl Manifest {
         let has_roots_control = self.deletion_fence.is_some() || !self.branch_roots.is_empty();
         let has_lineage_control = self.branch_lineage.is_some();
         let has_late_state = self.late_state.is_some();
+        let has_typed_ingest_state =
+            !self.input_fragments.is_empty() || self.semantic_coverage.is_some();
         let binding_version = match self.manifest_binding_version {
+            Some(ManifestBindingVersion::V6TypedIngest) => ManifestBindingVersion::V6TypedIngest,
+            _ if has_typed_ingest_state => ManifestBindingVersion::V6TypedIngest,
             Some(ManifestBindingVersion::V5LateState) => ManifestBindingVersion::V5LateState,
             _ if has_late_state => ManifestBindingVersion::V5LateState,
             Some(ManifestBindingVersion::V4Lineage) => ManifestBindingVersion::V4Lineage,
@@ -3422,6 +3884,9 @@ impl Manifest {
             }
             ManifestBindingVersion::V5LateState => {
                 Some(self.compute_control_late_state_digest(namespace)?)
+            }
+            ManifestBindingVersion::V6TypedIngest => {
+                Some(self.compute_control_typed_ingest_digest(namespace)?)
             }
             ManifestBindingVersion::V1 | ManifestBindingVersion::V2Origins => None,
         };
@@ -3469,6 +3934,14 @@ impl Manifest {
                 )));
             }
         }
+        for fragment in &self.input_fragments {
+            if self.input_fragment_origin(fragment)? != local {
+                return Err(ZeppelinError::Validation(format!(
+                    "copy clone input fragment {} is not owned by the source namespace incarnation",
+                    fragment.id
+                )));
+            }
+        }
         for segment in &self.segments {
             if self.segment_origin(segment)? != local {
                 return Err(ZeppelinError::Validation(format!(
@@ -3487,6 +3960,9 @@ impl Manifest {
         }
 
         for fragment in &mut self.fragments {
+            fragment.artifact_origin = None;
+        }
+        for fragment in &mut self.input_fragments {
             fragment.artifact_origin = None;
         }
         for segment in &mut self.segments {
@@ -3515,6 +3991,7 @@ impl Manifest {
                 ManifestBindingVersion::V3Roots
                     | ManifestBindingVersion::V4Lineage
                     | ManifestBindingVersion::V5LateState
+                    | ManifestBindingVersion::V6TypedIngest
             )
         ) {
             self.manifest_binding_version = None;
@@ -3594,6 +4071,17 @@ impl Manifest {
             })
             .collect::<Vec<_>>();
         fragments.sort_by_key(|(fragment, _)| fragment.sequence_number);
+        let mut input_fragments = resolver
+            .located_input_fragments()?
+            .into_iter()
+            .map(|located| {
+                (
+                    located.fragment.clone(),
+                    located.physical_origin.as_origin().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        input_fragments.sort_by_key(|(fragment, _)| fragment.sequence_number);
 
         let active = resolver.active_located_segment()?.map(|located| {
             (
@@ -3612,6 +4100,9 @@ impl Manifest {
             .transpose()?;
         let mut origins = ArtifactOriginSetBuilder::default();
         for (_, origin) in &fragments {
+            origins.collect(origin.clone())?;
+        }
+        for (_, origin) in &input_fragments {
             origins.collect(origin.clone())?;
         }
         if let Some((_, origin)) = &active {
@@ -3638,6 +4129,27 @@ impl Manifest {
                             expected_origin: Some(origin),
                             reason: "canonical fork origin table omitted a visible fragment owner"
                                 .to_string(),
+                        }
+                    })?);
+                Ok(fragment)
+            })
+            .collect::<std::result::Result<Vec<_>, BranchError>>()?;
+        target.input_fragments = input_fragments
+            .into_iter()
+            .map(|(mut fragment, origin)| {
+                fragment.artifact_origin =
+                    Some(origins.indices.get(&origin).copied().ok_or_else(|| {
+                        BranchError::ArtifactOriginInvalid {
+                            manifest_namespace: target_identity.namespace.to_string(),
+                            manifest_incarnation: Some(target_identity.incarnation.clone()),
+                            descriptor_kind: "input-fragment",
+                            descriptor_id: fragment.id.to_string(),
+                            offending_index: None,
+                            offending_key: None,
+                            expected_origin: Some(origin),
+                            reason:
+                                "canonical fork origin table omitted a visible input-fragment owner"
+                                    .to_string(),
                         }
                     })?);
                 Ok(fragment)
@@ -3690,6 +4202,7 @@ impl Manifest {
             target.late_state = Some(reference);
         }
         target.next_sequence = source.next_sequence;
+        target.semantic_coverage = source.semantic_coverage.clone();
         target.namespace = Some(target_identity.namespace.to_string());
         target.bind_namespace_incarnation(target_identity.incarnation.as_uuid())?;
         target.artifact_origins = origins.table;
@@ -3730,7 +4243,22 @@ impl Manifest {
             .into());
         }
         self.validate_artifact_origins()?;
-        let bytes = if self.late_state.is_some() {
+        let bytes = if !self.input_fragments.is_empty() || self.semantic_coverage.is_some() {
+            serde_json::to_vec(&ForkViewProjectionV4 {
+                domain: "zeppelin-fork-view-projection-v4-typed-ingest",
+                target_namespace: target_identity.namespace.as_str(),
+                target_incarnation: *target_identity.incarnation.as_uuid().as_bytes(),
+                source_namespace: source_identity.namespace.as_str(),
+                source_incarnation: *source_identity.incarnation.as_uuid().as_bytes(),
+                branch_id: lineage_seed.branch_id,
+                source_generation: lineage_seed.fork_generation,
+                source_manifest_sha256: lineage_seed.fork_manifest_sha256,
+                source_config_sha256: lineage_seed.source_config_sha256,
+                depth: lineage_seed.depth,
+                execution: self
+                    .execution_binding_v5(target_identity.namespace.as_str(), target_identity)?,
+            })
+        } else if self.late_state.is_some() {
             serde_json::to_vec(&ForkViewProjectionV3 {
                 domain: "zeppelin-fork-view-projection-v3-late-state",
                 target_namespace: target_identity.namespace.as_str(),
@@ -3831,11 +4359,14 @@ impl Manifest {
         let mut manifest = self.clone();
         manifest.version = 1;
         manifest.finalize_manifest_binding(target_identity.namespace.as_str())?;
-        let expected_binding = if manifest.late_state.is_some() {
-            ManifestBindingVersion::V5LateState
-        } else {
-            ManifestBindingVersion::V4Lineage
-        };
+        let expected_binding =
+            if !manifest.input_fragments.is_empty() || manifest.semantic_coverage.is_some() {
+                ManifestBindingVersion::V6TypedIngest
+            } else if manifest.late_state.is_some() {
+                ManifestBindingVersion::V5LateState
+            } else {
+                ManifestBindingVersion::V4Lineage
+            };
         if manifest.manifest_binding_version != Some(expected_binding) {
             return Err(ZeppelinError::Serialization(
                 "fork generation one did not select the required manifest binding".to_string(),
@@ -3970,8 +4501,11 @@ impl Manifest {
         self.validate_namespace_binding(target_namespace)?;
         if self.namespace_incarnation() != Some(target_incarnation)
             || !self.fragments.is_empty()
+            || !self.input_fragments.is_empty()
             || !self.segments.is_empty()
             || self.active_segment.is_some()
+            || self.late_state.is_some()
+            || self.semantic_coverage.is_some()
             || !self.pending_deletes.is_empty()
             || self.deletion_fence.is_some()
             || !self.branch_roots.is_empty()
@@ -4053,6 +4587,27 @@ impl Manifest {
         self.next_sequence += 1;
         self.fragments.push(fref);
         self.updated_at = now;
+    }
+
+    /// Append a typed-input fragment with the next shared replay sequence.
+    pub fn add_input_fragment(&mut self, fragment: InputFragmentRef) {
+        self.add_input_fragment_at(fragment, Utc::now());
+    }
+
+    /// Append a typed-input fragment using an explicit manifest stamp.
+    pub fn add_input_fragment_at(&mut self, mut fragment: InputFragmentRef, now: DateTime<Utc>) {
+        fragment.sequence_number = self.next_sequence;
+        self.next_sequence += 1;
+        self.input_fragments.push(fragment);
+        self.input_fragments
+            .sort_by_key(|fragment| fragment.sequence_number);
+        self.updated_at = now;
+    }
+
+    /// Borrow typed-input fragments in authoritative replay order.
+    #[must_use]
+    pub fn uncompacted_input_fragments(&self) -> &[InputFragmentRef] {
+        &self.input_fragments
     }
 
     /// Remove exactly the fragments that were compacted (by ID).
@@ -4345,18 +4900,58 @@ impl Manifest {
             .uncompacted_located_fragments()?
             .iter()
             .any(|fragment| fragment.physical_origin.as_origin() != &local);
+        let foreign_input_fragment = resolver
+            .located_input_fragments()?
+            .iter()
+            .any(|fragment| fragment.physical_origin.as_origin() != &local);
         let foreign_late_state = self
             .late_state
             .as_ref()
             .map(|reference| self.late_section_origin(reference))
             .transpose()?
             .is_some_and(|origin| origin != local);
-        Ok(foreign_segment || foreign_fragment || foreign_late_state)
+        Ok(foreign_segment || foreign_fragment || foreign_input_fragment || foreign_late_state)
     }
 
     /// Returns true when every visible artifact is target-local.
     pub fn visible_refs_are_local(&self) -> Result<bool> {
         Ok(!self.has_foreign_visible_artifacts()?)
+    }
+
+    /// Returns true when root refs and loaded section-resident sources are local.
+    ///
+    /// A version-2 section must be supplied because its nested immutable source
+    /// refs cannot be inferred from the root reference alone.
+    pub fn visible_refs_are_local_with_late_state(
+        &self,
+        section: Option<&LateStateSection>,
+    ) -> Result<bool> {
+        if !self.visible_refs_are_local()? {
+            return Ok(false);
+        }
+        let Some(reference) = self.late_state.as_ref() else {
+            if section.is_some() {
+                return Err(ZeppelinError::Serialization(
+                    "late-state section supplied without a root reference".to_string(),
+                ));
+            }
+            return Ok(true);
+        };
+        let Some(section) = section else {
+            if reference.format_version >= 2 {
+                return Err(ZeppelinError::Serialization(
+                    "version-2 late-state locality requires the decoded section".to_string(),
+                ));
+            }
+            return Ok(true);
+        };
+        let local = self.local_origin()?;
+        for source in &section.source_inventory {
+            if self.source_inventory_origin(section, source)? != local {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Rejects deferred-delete entries that are not owned by `namespace`.
@@ -4418,12 +5013,22 @@ impl Manifest {
                 .fragments
                 .iter()
                 .map(|fragment| fragment.vector_count as u64)
+                .sum::<u64>()
+            + self
+                .input_fragments
+                .iter()
+                .map(|fragment| fragment.upsert_count as u64)
                 .sum::<u64>();
         let tombstones = self
             .fragments
             .iter()
             .map(|fragment| fragment.delete_count as u64)
-            .sum::<u64>();
+            .sum::<u64>()
+            + self
+                .input_fragments
+                .iter()
+                .map(|fragment| fragment.delete_count as u64)
+                .sum::<u64>();
 
         entries.saturating_sub(tombstones)
     }
@@ -4454,6 +5059,11 @@ impl Manifest {
             .fragments
             .iter()
             .map(|fragment| fragment.size_bytes)
+            .chain(
+                self.input_fragments
+                    .iter()
+                    .map(|fragment| fragment.size_bytes),
+            )
             .sum();
         let segment_bytes: u64 = self
             .segments
@@ -4461,7 +5071,12 @@ impl Manifest {
             .map(SegmentRef::approximate_storage_bytes)
             .sum();
 
-        fragment_bytes + segment_bytes
+        let late_section_bytes = self
+            .late_state
+            .as_ref()
+            .map_or(0, |reference| reference.size_bytes);
+
+        fragment_bytes + segment_bytes + late_section_bytes
     }
 
     /// Serializes this manifest as version-prefixed MessagePack bytes.
@@ -4579,12 +5194,26 @@ impl Manifest {
                 .iter()
                 .any(|segment| segment.artifact_origin.is_some())
             || self
+                .input_fragments
+                .iter()
+                .any(|fragment| fragment.artifact_origin.is_some())
+            || self
                 .late_state
                 .as_ref()
                 .is_some_and(|reference| reference.artifact_origin.is_some())
     }
 
     fn validate_manifest_binding_state(&self, namespace: &str) -> Result<()> {
+        let has_typed_ingest_state =
+            !self.input_fragments.is_empty() || self.semantic_coverage.is_some();
+        if has_typed_ingest_state
+            && self.manifest_binding_version != Some(ManifestBindingVersion::V6TypedIngest)
+        {
+            return Err(ZeppelinError::Serialization(
+                "typed-input fragments and semantic coverage require manifest binding v6_typed_ingest"
+                    .to_string(),
+            ));
+        }
         match self.manifest_binding_version {
             None => {
                 if self.late_state.is_some() {
@@ -4721,6 +5350,18 @@ impl Manifest {
                 if self.compute_control_late_state_digest(namespace)? != control {
                     return Err(ZeppelinError::Serialization(
                         "manifest binding v5_late_state control digest mismatch".to_string(),
+                    ));
+                }
+            }
+            Some(ManifestBindingVersion::V6TypedIngest) => {
+                let control = self.control_state_digest.ok_or_else(|| {
+                    ZeppelinError::Serialization(
+                        "manifest binding v6_typed_ingest requires a control digest".to_string(),
+                    )
+                })?;
+                if self.compute_control_typed_ingest_digest(namespace)? != control {
+                    return Err(ZeppelinError::Serialization(
+                        "manifest binding v6_typed_ingest control digest mismatch".to_string(),
                     ));
                 }
             }
@@ -4987,6 +5628,7 @@ impl Manifest {
                         ManifestBindingVersion::V3Roots
                             | ManifestBindingVersion::V4Lineage
                             | ManifestBindingVersion::V5LateState
+                            | ManifestBindingVersion::V6TypedIngest
                     )
                 )
         };
@@ -5017,6 +5659,13 @@ impl Manifest {
             kind: &'static str,
             origin: &'a ArtifactOrigin,
             descriptor: SegmentRef,
+        }
+
+        #[derive(Serialize)]
+        struct ForeignInputFragment<'a> {
+            kind: &'static str,
+            origin: &'a ArtifactOrigin,
+            descriptor: InputFragmentRef,
         }
 
         let local = self.local_origin()?;
@@ -5054,6 +5703,24 @@ impl Manifest {
             .map_err(|error| {
                 ZeppelinError::Serialization(format!(
                     "foreign segment closure serialization failed: {error}"
+                ))
+            })?;
+            closure.insert(bytes);
+        }
+        for located in resolver.located_input_fragments()? {
+            if located.physical_origin.as_origin() == &local {
+                continue;
+            }
+            let mut descriptor = located.fragment.clone();
+            descriptor.artifact_origin = None;
+            let bytes = serde_json::to_vec(&ForeignInputFragment {
+                kind: "input-fragment",
+                origin: located.physical_origin.as_origin(),
+                descriptor,
+            })
+            .map_err(|error| {
+                ZeppelinError::Serialization(format!(
+                    "foreign input-fragment closure serialization failed: {error}"
                 ))
             })?;
             closure.insert(bytes);
@@ -10077,9 +10744,60 @@ mod tests {
                 decoded.late_state.is_none(),
                 "legacy bytes must default late_state to None"
             );
+            assert!(
+                decoded.input_fragments.is_empty(),
+                "legacy bytes must default input_fragments to empty"
+            );
+            assert!(
+                decoded.semantic_coverage.is_none(),
+                "legacy bytes must default semantic_coverage to None"
+            );
         }
 
-        assert_eq!(deltas, vec![1, 1, 1]);
+        assert_eq!(deltas, vec![3, 3, 3]);
+    }
+
+    #[test]
+    fn typed_ingest_fields_round_trip_under_v6_binding() {
+        let identity = origin("typed-roundtrip", 0x994);
+        let mut manifest = bound_manifest(&identity, 5);
+        manifest.input_fragments.push(InputFragmentRef {
+            id: Ulid::from(0x123_u128),
+            upsert_count: 3,
+            delete_count: 1,
+            sequence_number: 7,
+            size_bytes: 512,
+            referenced_content_bytes: 4_096,
+            modality_counts: ModalityCounts {
+                text: 1,
+                image: 1,
+                image_text: 1,
+            },
+            artifact_origin: None,
+        });
+        manifest
+            .finalize_manifest_binding(identity.namespace.as_str())
+            .expect("typed-ingest binding must finalize");
+
+        let decoded = Manifest::from_bytes_for_namespace(
+            &manifest.to_bytes().expect("typed manifest must serialize"),
+            identity.namespace.as_str(),
+        )
+        .expect("typed manifest fixture must decode");
+        assert_eq!(decoded.input_fragments, manifest.input_fragments);
+        assert!(decoded.semantic_coverage.is_none());
+        assert_eq!(
+            decoded.manifest_binding_version(),
+            Some(ManifestBindingVersion::V6TypedIngest)
+        );
+        assert_eq!(
+            decoded
+                .recompute_control_state_digest(identity.namespace.as_str())
+                .expect("V6 control digest must recompute"),
+            decoded
+                .control_state_digest()
+                .expect("V6 must carry a digest")
+        );
     }
 
     #[test]
@@ -10137,5 +10855,40 @@ mod tests {
         assert!(!manifest
             .visible_refs_are_local()
             .expect("foreign late-state origin must resolve"));
+    }
+
+    #[test]
+    fn foreign_section_source_is_not_branch_local() {
+        let target = origin("late-source-locality-target", 0x995);
+        let source = origin("late-source-locality-source", 0x996);
+        let mut manifest = bound_manifest(&target, 1);
+        let checksum = [0x66; 32];
+        manifest.late_state = Some(ManifestSectionRef {
+            key: LateStateSection::s3_key(target.namespace.as_str(), &checksum),
+            checksum,
+            size_bytes: 6,
+            format_version: LATE_STATE_FORMAT_VERSION,
+            artifact_origin: None,
+        });
+        let section = LateStateSection {
+            source_inventory: vec![SourceInventoryRef {
+                key: SourceInventoryRef::s3_key(
+                    source.namespace.as_str(),
+                    crate::embedding::ContentHash::new([0x77; 32]),
+                ),
+                checksum: crate::embedding::ArtifactChecksum::new([0x88; 32]),
+                size_bytes: 12,
+                media_type: "image/png".to_string(),
+                artifact_origin: Some(ArtifactOriginIndex::new(0)),
+            }],
+            artifact_origins: vec![source],
+        };
+
+        assert!(manifest
+            .visible_refs_are_local()
+            .expect("root references must resolve"));
+        assert!(!manifest
+            .visible_refs_are_local_with_late_state(Some(&section))
+            .expect("nested source ownership must resolve"));
     }
 }

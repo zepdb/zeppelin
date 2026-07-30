@@ -145,6 +145,7 @@ use uuid::Uuid;
 
 use crate::cache::hydration::HydrationTarget;
 use crate::compaction::background::run_compaction_with_reserved_lease;
+use crate::embedding::{EncoderInputRef, LateInteractionNamespaceConfig};
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
@@ -165,9 +166,11 @@ use crate::security::{
 use crate::server::{
     authorize_namespace_action, namespace_graph, AppState, AuditRequest, RateLimitIdentity,
 };
+use crate::storage::CreateOnlyOutcome;
 use crate::types::{DistanceMetric, IndexType};
+use crate::wal::late_section::LateStateSection;
 use crate::wal::manifest::{NamedSnapshot, NamedSnapshotRef, SegmentRef};
-use crate::wal::{FragmentCachePolicy, Manifest};
+use crate::wal::{EncoderInputWalFragment, FragmentCachePolicy, Manifest};
 
 use super::{as_of, ApiError};
 
@@ -315,8 +318,12 @@ pub async fn create_branch(
     )
     .await
     .map_err(ApiError::from)?;
+    let target_late_state = target_manifest
+        .load_late_state(&state.store)
+        .await
+        .map_err(ApiError::from)?;
     let materialized = target_manifest
-        .visible_refs_are_local()
+        .visible_refs_are_local_with_late_state(target_late_state.as_ref())
         .map_err(ApiError::from)?;
     let status = if created {
         StatusCode::CREATED
@@ -432,6 +439,12 @@ pub struct CreateNamespaceRequest {
     /// Number of floating-point components in every vector; must be in the
     /// inclusive range `1..=server.max_dimensions`.
     pub dimensions: usize,
+    /// Dense or late-interaction storage/search family.
+    #[serde(default)]
+    pub index_type: IndexType,
+    /// Required admission settings for a late-interaction namespace.
+    #[serde(default)]
+    pub late_interaction: Option<LateInteractionNamespaceConfig>,
     /// Namespace-wide vector distance metric; omitted JSON defaults to cosine.
     #[serde(default = "default_distance_metric")]
     pub distance_metric: DistanceMetric,
@@ -564,7 +577,10 @@ pub struct NamespaceResponse {
     pub index_kind: IndexType,
     /// Complete desired settings for future compactions; legacy metadata
     /// without an override is resolved from current server defaults.
-    pub index_config: NamespaceIndexConfig,
+    pub index_config: Option<NamespaceIndexConfig>,
+    /// Late-interaction admission settings, absent for dense namespaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub late_interaction: Option<LateInteractionNamespaceConfig>,
     /// Number of vectors represented by the active segment alone, excluding
     /// uncompacted WAL fragments.
     pub active_segment_vector_count: usize,
@@ -857,6 +873,7 @@ impl NamespaceResponse {
     pub fn from_manifest(
         meta: NamespaceMetadata,
         manifest: &Manifest,
+        late_state: Option<&LateStateSection>,
         default_indexing: &crate::config::IndexingConfig,
     ) -> Result<Self, ZeppelinError> {
         let index_kind = namespace_index_kind(&meta, manifest);
@@ -864,7 +881,7 @@ impl NamespaceResponse {
         let compaction_health = meta.compaction_health.clone();
         let materialized = if meta.branch_identity.is_some() && meta.state == NamespaceState::Active
         {
-            manifest.visible_refs_are_local()?
+            manifest.visible_refs_are_local_with_late_state(late_state)?
         } else {
             false
         };
@@ -893,14 +910,20 @@ impl NamespaceResponse {
             dimensions: meta.dimensions,
             distance_metric: meta.distance_metric,
             vector_count: manifest.vector_count(),
-            uncompacted_fragments: manifest.uncompacted_fragments().len(),
+            uncompacted_fragments: manifest.uncompacted_fragments().len()
+                + manifest.input_fragments.len(),
             segment_count: manifest.segments.len(),
             approximate_storage_bytes: manifest.approximate_storage_bytes(),
             quantization: active_segment.map(|segment| segment.quantization),
             index_kind,
-            index_config: meta
-                .index_config
-                .unwrap_or_else(|| NamespaceIndexConfig::from_indexing_config(default_indexing)),
+            index_config: if meta.index_type == IndexType::LateInteractionFde {
+                None
+            } else {
+                Some(meta.index_config.unwrap_or_else(|| {
+                    NamespaceIndexConfig::from_indexing_config(default_indexing)
+                }))
+            },
+            late_interaction: meta.late_interaction,
             active_segment_vector_count: active_segment.map_or(0, |segment| segment.vector_count),
             last_compaction_at: compaction_health
                 .last_compaction_at
@@ -1298,18 +1321,35 @@ pub async fn create_namespace(
     Extension(audit): Extension<AuditRequest>,
     Json(req): Json<CreateNamespaceRequest>,
 ) -> Result<(StatusCode, Json<CreateNamespaceResponse>), ApiError> {
-    if req.dimensions == 0 || req.dimensions > state.config.server.max_dimensions {
+    if req.index_type == IndexType::LateInteractionFde {
+        if req.dimensions != 0 {
+            return Err(ApiError(ZeppelinError::Validation(
+                "late-interaction namespaces must set dimensions to 0".to_string(),
+            )));
+        }
+    } else if req.dimensions == 0 || req.dimensions > state.config.server.max_dimensions {
         return Err(ApiError(ZeppelinError::Validation(format!(
             "dimensions {} must be between 1 and {}",
             req.dimensions, state.config.server.max_dimensions
         ))));
     }
-    let index_config = resolve_namespace_index_config(
-        req.index_config.as_ref(),
-        &state.config.indexing,
-        req.dimensions,
-    )
-    .map_err(ApiError::from)?;
+    let index_config = if req.index_type == IndexType::LateInteractionFde {
+        if req.index_config.is_some() {
+            return Err(ApiError(ZeppelinError::Validation(
+                "index_config is not valid for a late-interaction namespace".to_string(),
+            )));
+        }
+        None
+    } else {
+        Some(
+            resolve_namespace_index_config(
+                req.index_config.as_ref(),
+                &state.config.indexing,
+                req.dimensions,
+            )
+            .map_err(ApiError::from)?,
+        )
+    };
 
     if let Some(name) = req.name {
         let target_decision = crate::server::authorize_namespace_action(
@@ -1329,12 +1369,14 @@ pub async fn create_namespace(
         info!(namespace = %name, dimensions = req.dimensions, "creating namespace by client name");
         let outcome = state
             .namespace_manager
-            .create_idempotent_with_fts_and_index_config(
+            .create_idempotent_typed_with_fts_and_index_config(
                 &name,
                 req.dimensions,
                 req.distance_metric,
+                req.index_type,
+                req.late_interaction,
                 req.full_text_search,
-                Some(index_config),
+                index_config,
             )
             .await
             .map_err(ApiError::from)?;
@@ -1354,6 +1396,7 @@ pub async fn create_namespace(
                 namespace: NamespaceResponse::from_manifest(
                     meta,
                     &Manifest::new_at(state.clock.now()),
+                    None,
                     &state.config.indexing,
                 )
                 .map_err(ApiError::from)?,
@@ -1382,12 +1425,14 @@ pub async fn create_namespace(
     info!(namespace = %name, dimensions = req.dimensions, "creating generated namespace");
     let meta = state
         .namespace_manager
-        .create_with_fts_and_index_config(
+        .create_typed_with_fts_and_index_config(
             &name,
             req.dimensions,
             req.distance_metric,
+            req.index_type,
+            req.late_interaction,
             req.full_text_search,
-            Some(index_config),
+            index_config,
         )
         .await
         .map_err(ApiError::from)?;
@@ -1399,6 +1444,7 @@ pub async fn create_namespace(
             namespace: NamespaceResponse::from_manifest(
                 meta,
                 &Manifest::new_at(state.clock.now()),
+                None,
                 &state.config.indexing,
             )
             .map_err(ApiError::from)?,
@@ -1558,19 +1604,40 @@ pub async fn clone_namespace(
     .await
     .map_err(ApiError::from)?;
 
-    let index_config = source_meta
-        .index_config
-        .clone()
-        .unwrap_or_else(|| NamespaceIndexConfig::from_indexing_config(&state.config.indexing));
+    let source_late_state = match source_manifest.load_late_state(&state.store).await {
+        Ok(section) => section,
+        Err(error) => {
+            release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+            return Err(ApiError::from(error));
+        }
+    };
+    let source_has_foreign_artifacts =
+        match source_manifest.visible_refs_are_local_with_late_state(source_late_state.as_ref()) {
+            Ok(local) => !local,
+            Err(error) => {
+                release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+                return Err(ApiError::from(error));
+            }
+        };
+    let index_config =
+        if source_meta.index_type == IndexType::LateInteractionFde {
+            None
+        } else {
+            Some(source_meta.index_config.clone().unwrap_or_else(|| {
+                NamespaceIndexConfig::from_indexing_config(&state.config.indexing)
+            }))
+        };
 
     let target_meta = match state
         .namespace_manager
-        .create_with_fts_and_index_config(
+        .create_typed_with_fts_and_index_config(
             &target,
             source_meta.dimensions,
             source_meta.distance_metric,
+            source_meta.index_type,
+            source_meta.late_interaction.clone(),
             source_meta.full_text_search.clone(),
-            Some(index_config),
+            index_config,
         )
         .await
     {
@@ -1611,14 +1678,6 @@ pub async fn clone_namespace(
         return Err(ApiError::from(error));
     }
 
-    let source_has_foreign_artifacts = match source_manifest.has_foreign_visible_artifacts() {
-        Ok(value) => value,
-        Err(error) => {
-            retain_failed_clone_target(&state, &target, "source origin validation failed");
-            release_internal_clone_pin(&state, &source, &clone_pin_name).await;
-            return Err(ApiError::from(error));
-        }
-    };
     let target_manifest = if source_has_foreign_artifacts {
         let target_origin = match target_base_manifest.local_origin() {
             Ok(origin) => origin,
@@ -1653,7 +1712,17 @@ pub async fn clone_namespace(
             release_internal_clone_pin(&state, &source, &clone_pin_name).await;
             return Err(ApiError(ZeppelinError::from(error)));
         }
-        let visible_refs_are_local = match manifest.visible_refs_are_local() {
+        let owned_late_state = match manifest.load_late_state(&state.store).await {
+            Ok(section) => section,
+            Err(error) => {
+                retain_failed_clone_target(&state, &target, "owned late-state load failed");
+                release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+                return Err(ApiError::from(error));
+            }
+        };
+        let visible_refs_are_local = match manifest
+            .visible_refs_are_local_with_late_state(owned_late_state.as_ref())
+        {
             Ok(local) => local,
             Err(error) => {
                 retain_failed_clone_target(&state, &target, "owned manifest origin check failed");
@@ -1689,15 +1758,22 @@ pub async fn clone_namespace(
         }
         manifest
     } else {
-        let mut manifest =
-            match materialize_clone_manifest(&state, &source, &target, source_manifest).await {
-                Ok(manifest) => manifest,
-                Err(error) => {
-                    retain_failed_clone_target(&state, &target, "artifact materialization failed");
-                    release_internal_clone_pin(&state, &source, &clone_pin_name).await;
-                    return Err(ApiError::from(error));
-                }
-            };
+        let mut manifest = match materialize_clone_manifest(
+            &state,
+            &source,
+            &target,
+            source_manifest,
+            source_late_state,
+        )
+        .await
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                retain_failed_clone_target(&state, &target, "artifact materialization failed");
+                release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+                return Err(ApiError::from(error));
+            }
+        };
         if let Err(error) =
             manifest.prepare_clone_publication(&target, target_incarnation, &target_base_manifest)
         {
@@ -1728,6 +1804,10 @@ pub async fn clone_namespace(
         .manifest_cache
         .insert(&target, target_manifest.clone());
     release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+    let target_late_state = target_manifest
+        .load_late_state(&state.store)
+        .await
+        .map_err(ApiError::from)?;
 
     info!(
         source = %source,
@@ -1749,6 +1829,7 @@ pub async fn clone_namespace(
             namespace: NamespaceResponse::from_manifest(
                 target_meta,
                 &target_manifest,
+                target_late_state.as_ref(),
                 &state.config.indexing,
             )
             .map_err(ApiError::from)?,
@@ -2079,9 +2160,24 @@ async fn materialize_clone_manifest(
     source: &str,
     target: &str,
     mut manifest: Manifest,
+    mut late_state: Option<LateStateSection>,
 ) -> Result<Manifest, ZeppelinError> {
+    if !manifest.visible_refs_are_local_with_late_state(late_state.as_ref())? {
+        return Err(BranchError::BranchingNotReady {
+            feature: "copy clone of a foreign-backed manifest",
+        }
+        .into());
+    }
     manifest.pending_deletes.clear();
-    let copies = clone_copy_map(source, target, &manifest)?;
+    let mut copies = clone_copy_map(source, target, &manifest, late_state.as_ref())?;
+    if late_state.is_some() {
+        if let Some(reference) = manifest.late_state.as_ref() {
+            copies.remove(&reference.key);
+        }
+    }
+    for reference in &manifest.input_fragments {
+        copies.remove(&EncoderInputWalFragment::s3_key(source, &reference.id));
+    }
     manifest.normalize_copy_clone_artifact_ownership()?;
     rewrite_manifest_stored_keys(source, target, &mut manifest)?;
     manifest.fencing_token = 0;
@@ -2097,7 +2193,71 @@ async fn materialize_clone_manifest(
     .try_collect::<Vec<_>>()
     .await?;
 
+    if let Some(section) = late_state.as_mut() {
+        for source_ref in &mut section.source_inventory {
+            source_ref.key = rewrite_namespace_key(source, target, &source_ref.key)?;
+            source_ref.artifact_origin = None;
+        }
+        section.artifact_origins.clear();
+        manifest.late_state = Some(section.put_create(&state.store, target).await?);
+    }
+    rewrite_clone_input_fragments(&state.store, source, target, &mut manifest).await?;
+
     Ok(manifest)
+}
+
+async fn rewrite_clone_input_fragments(
+    store: &crate::storage::ZeppelinStore,
+    source: &str,
+    target: &str,
+    manifest: &mut Manifest,
+) -> Result<(), ZeppelinError> {
+    for reference in &mut manifest.input_fragments {
+        let source_key = EncoderInputWalFragment::s3_key(source, &reference.id);
+        let source_bytes = store.get(&source_key).await?;
+        let mut source_fragment = EncoderInputWalFragment::from_bytes(&source_bytes)?;
+        if source_fragment.id != reference.id {
+            return Err(ZeppelinError::Serialization(format!(
+                "clone source input WAL {source_key} contains fragment ID {}, expected {}",
+                source_fragment.id, reference.id
+            )));
+        }
+        for record in &mut source_fragment.upserts {
+            let image = match &mut record.input {
+                EncoderInputRef::Text { .. } => continue,
+                EncoderInputRef::Image { image } | EncoderInputRef::ImageText { image, .. } => {
+                    image
+                }
+            };
+            image.key = rewrite_namespace_key(source, target, &image.key)?;
+        }
+
+        let mut target_fragment =
+            EncoderInputWalFragment::try_new(source_fragment.upserts, source_fragment.deletes)?;
+        target_fragment.id = reference.id;
+        let target_bytes = target_fragment.to_bytes()?;
+        reference.size_bytes = u64::try_from(target_bytes.len()).map_err(|_| {
+            ZeppelinError::Serialization(
+                "cloned input WAL fragment size does not fit persisted u64".to_string(),
+            )
+        })?;
+        let target_key = EncoderInputWalFragment::s3_key(target, &reference.id);
+        match store
+            .put_create_outcome(&target_key, target_bytes.clone())
+            .await?
+        {
+            CreateOnlyOutcome::Created { .. } => {}
+            CreateOnlyOutcome::AlreadyExists => {
+                let existing = store.get(&target_key).await?;
+                if existing != target_bytes {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "clone input WAL collision at {target_key}: existing bytes differ"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Maps every manifest-reachable source key to its target-prefixed destination.
@@ -2129,6 +2289,7 @@ fn clone_copy_map(
     source: &str,
     target: &str,
     manifest: &Manifest,
+    late_state: Option<&LateStateSection>,
 ) -> Result<BTreeMap<String, String>, ZeppelinError> {
     // Materialize the complete physical inventory before classifying it. A
     // foreign-backed manifest is a valid read view, but raw prefix substitution
@@ -2137,7 +2298,7 @@ fn clone_copy_map(
     // before scheduling any copy; Phase 06 rebuilds such views through the
     // production owned-view materialization seam.
     let source_keys = manifest
-        .clone_reachable_keys(source)?
+        .clone_reachable_keys(source, late_state)?
         .into_iter()
         .collect::<Vec<_>>();
     let source_prefix = format!("{source}/");
@@ -2305,9 +2466,18 @@ pub async fn list_namespaces(
         } else {
             Manifest::new_at(state.clock.now())
         };
+        let late_state = manifest
+            .load_late_state(&state.store)
+            .await
+            .map_err(ApiError::from)?;
         responses.push(
-            NamespaceResponse::from_manifest(meta, &manifest, &state.config.indexing)
-                .map_err(ApiError::from)?,
+            NamespaceResponse::from_manifest(
+                meta,
+                &manifest,
+                late_state.as_ref(),
+                &state.config.indexing,
+            )
+            .map_err(ApiError::from)?,
         );
     }
     Ok(Json(responses))
@@ -2390,10 +2560,19 @@ pub async fn get_namespace(
         NamespaceState::Deleting => state.manifest_cache.get_strong(&state.store, &ns).await,
     }
     .map_err(ApiError::from)?;
+    let late_state = manifest
+        .load_late_state(&state.store)
+        .await
+        .map_err(ApiError::from)?;
 
     Ok(Json(
-        NamespaceResponse::from_manifest(meta, &manifest, &state.config.indexing)
-            .map_err(ApiError::from)?,
+        NamespaceResponse::from_manifest(
+            meta,
+            &manifest,
+            late_state.as_ref(),
+            &state.config.indexing,
+        )
+        .map_err(ApiError::from)?,
     ))
 }
 
@@ -2720,6 +2899,11 @@ pub async fn patch_index_config(
         .get(&ns)
         .await
         .map_err(ApiError::from)?;
+    if meta.index_type == IndexType::LateInteractionFde {
+        return Err(ApiError(ZeppelinError::Validation(
+            "index_config is not valid for a late-interaction namespace".to_string(),
+        )));
+    }
     let current = meta
         .index_config
         .clone()
@@ -3028,7 +3212,8 @@ fn compaction_status_from_manifest(
     manifest: &Manifest,
 ) -> CompactionStatusResponse {
     let active_segment = active_segment_ref(manifest);
-    let uncompacted_fragments = manifest.uncompacted_fragments().len();
+    let uncompacted_fragments =
+        manifest.uncompacted_fragments().len() + manifest.input_fragments.len();
     CompactionStatusResponse {
         namespace: namespace.to_string(),
         manifest_generation: manifest.version(),

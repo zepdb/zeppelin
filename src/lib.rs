@@ -205,6 +205,8 @@ pub mod compaction;
 /// unsafe or contradictory settings before services start; individual subsystem
 /// structs preserve units and bounds close to the values they control.
 pub mod config;
+/// Typed source inputs and semantic-coverage vocabulary for late interaction.
+pub mod embedding;
 /// Typed failure vocabulary and the crate-wide result alias.
 ///
 /// [`error::ZeppelinError`] classifies validation, storage, manifest, WAL,

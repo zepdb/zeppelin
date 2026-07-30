@@ -4177,6 +4177,11 @@ fn validate_query_source_metadata(
             Ok(())
         }
         QuerySourceRef::Ann { vector, .. } => {
+            if meta.index_type == crate::types::IndexType::LateInteractionFde {
+                return Err(ZeppelinError::UnsupportedInputModality {
+                    modality: "dense_vector",
+                });
+            }
             if vector.as_ref().len() != meta.dimensions {
                 return Err(ZeppelinError::DimensionMismatch {
                     expected: meta.dimensions,

@@ -702,6 +702,7 @@ async fn test_list_namespaces_ignores_nested_meta_objects() {
         branch_identity: None,
         branch_prepare: None,
         branch_activation: None,
+        late_interaction: None,
         incarnation_id: None,
     };
     harness

@@ -619,6 +619,12 @@ pub async fn upsert_vectors(
     }
     .map_err(ApiError::from)?;
 
+    if meta.index_type == crate::types::IndexType::LateInteractionFde {
+        return Err(ApiError(ZeppelinError::UnsupportedInputModality {
+            modality: "dense_vector",
+        }));
+    }
+
     for vec in &vectors {
         if vec.values.len() != meta.dimensions {
             // Name the offending vector: in a 50k-vector batch, "expected
@@ -1300,6 +1306,12 @@ pub async fn delete_vectors(
         state.namespace_manager.get(&ns).await
     }
     .map_err(ApiError::from)?;
+
+    if meta.index_type == crate::types::IndexType::LateInteractionFde {
+        return Err(ApiError(ZeppelinError::UnsupportedInputModality {
+            modality: "dense_vector",
+        }));
+    }
 
     let authoritative_origin = meta.artifact_origin().map_err(ApiError::from)?;
     let (delete_ids, guard) = match selection {

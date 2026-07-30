@@ -78,6 +78,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, instrument, warn};
 
 use crate::config::IndexingConfig;
+use crate::embedding::LateInteractionNamespaceConfig;
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
@@ -384,6 +385,9 @@ pub struct NamespaceMetadata {
     /// Non-visible monotonic prepare milestone, valid only while `creating`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_prepare: Option<ForkPrepareIntent>,
+    /// Late-interaction admission settings, present only for late namespaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_interaction: Option<LateInteractionNamespaceConfig>,
     /// Runtime identity read from S3 user metadata, absent only for legacy
     /// objects written before incarnation IDs were introduced.
     #[serde(skip)]
@@ -730,7 +734,10 @@ impl NamespaceMetadata {
                                     || provisional.distance_metric != self.distance_metric
                                     || provisional.index_type != self.index_type
                                     || provisional.full_text_search != full_text_search
-                                    || self.index_config.as_ref() != Some(&provisional.index_config)
+                                    || self.index_config.as_ref()
+                                        != provisional.index_config.as_ref()
+                                    || self.late_interaction.as_ref()
+                                        != provisional.late_interaction.as_ref()
                                 {
                                     return Err(BranchError::IntentMismatch {
                                         target: reservation.target_namespace.clone(),
@@ -1395,6 +1402,31 @@ impl NamespaceManager {
         full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
         index_config: Option<NamespaceIndexConfig>,
     ) -> Result<NamespaceMetadata> {
+        self.create_typed_with_fts_and_index_config(
+            name,
+            dimensions,
+            distance_metric,
+            IndexType::default(),
+            None,
+            full_text_search,
+            index_config,
+        )
+        .await
+    }
+
+    /// Creates a namespace with an explicit dense or late-interaction admission type.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(self, full_text_search, late_interaction), fields(namespace = name))]
+    pub async fn create_typed_with_fts_and_index_config(
+        &self,
+        name: &str,
+        dimensions: usize,
+        distance_metric: DistanceMetric,
+        index_type: IndexType,
+        late_interaction: Option<LateInteractionNamespaceConfig>,
+        full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
+        index_config: Option<NamespaceIndexConfig>,
+    ) -> Result<NamespaceMetadata> {
         // Validate namespace name
         if !is_valid_namespace_name(name) {
             return Err(ZeppelinError::Validation(format!(
@@ -1403,13 +1435,14 @@ impl NamespaceManager {
                 name,
             )));
         }
-        if dimensions == 0 {
-            return Err(ZeppelinError::Validation(
-                "dimensions must be > 0".to_string(),
-            ));
-        }
+        validate_namespace_admission(index_type, dimensions, late_interaction.as_ref())?;
         for (field, config) in &full_text_search {
             config.validate(&format!("full_text_search.{field}"))?;
+        }
+        if index_type == IndexType::LateInteractionFde && index_config.is_some() {
+            return Err(ZeppelinError::Validation(
+                "index_config is not valid for a late-interaction namespace".to_string(),
+            ));
         }
         if let Some(index_config) = index_config.as_ref() {
             index_config.validate(dimensions)?;
@@ -1426,7 +1459,7 @@ impl NamespaceManager {
             name: name.to_string(),
             dimensions,
             distance_metric,
-            index_type: IndexType::default(),
+            index_type,
             vector_count: 0,
             created_at: now,
             updated_at: now,
@@ -1440,6 +1473,7 @@ impl NamespaceManager {
             branch_identity: None,
             branch_activation: None,
             branch_prepare: None,
+            late_interaction,
             incarnation_id: Some(NamespaceIncarnationId::new()),
         };
 
@@ -2008,14 +2042,47 @@ impl NamespaceManager {
         full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
         index_config: Option<NamespaceIndexConfig>,
     ) -> Result<CreateNamespaceOutcome> {
+        self.create_idempotent_typed_with_fts_and_index_config(
+            name,
+            dimensions,
+            distance_metric,
+            IndexType::default(),
+            None,
+            full_text_search,
+            index_config,
+        )
+        .await
+    }
+
+    /// Idempotently creates or verifies an explicitly typed namespace.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(self, full_text_search, late_interaction), fields(namespace = name))]
+    pub async fn create_idempotent_typed_with_fts_and_index_config(
+        &self,
+        name: &str,
+        dimensions: usize,
+        distance_metric: DistanceMetric,
+        index_type: IndexType,
+        late_interaction: Option<LateInteractionNamespaceConfig>,
+        full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
+        index_config: Option<NamespaceIndexConfig>,
+    ) -> Result<CreateNamespaceOutcome> {
+        validate_namespace_admission(index_type, dimensions, late_interaction.as_ref())?;
+        if index_type == IndexType::LateInteractionFde && index_config.is_some() {
+            return Err(ZeppelinError::Validation(
+                "index_config is not valid for a late-interaction namespace".to_string(),
+            ));
+        }
         if let Some(index_config) = index_config.as_ref() {
             index_config.validate(dimensions)?;
         }
         match self
-            .create_with_fts_and_index_config(
+            .create_typed_with_fts_and_index_config(
                 name,
                 dimensions,
                 distance_metric,
+                index_type,
+                late_interaction.clone(),
                 full_text_search.clone(),
                 index_config.clone(),
             )
@@ -2033,6 +2100,8 @@ impl NamespaceManager {
                     &existing,
                     dimensions,
                     distance_metric,
+                    index_type,
+                    late_interaction.as_ref(),
                     &full_text_search,
                     &index_config,
                 )? {
@@ -3459,6 +3528,11 @@ impl NamespaceManager {
                 let (mut meta, etag) = self.read_metadata_versioned(name).await?;
                 let meta_name = meta.name.clone();
                 self.ensure_active(meta.clone())?;
+                if meta.index_type == IndexType::LateInteractionFde {
+                    return Err(ZeppelinError::Validation(
+                        "index_config is not valid for a late-interaction namespace".to_string(),
+                    ));
+                }
                 index_config.validate(meta.dimensions)?;
 
                 meta.index_config = Some(index_config.clone());
@@ -3840,15 +3914,51 @@ impl NamespaceManager {
 ///
 /// Map insertion order does not create a false conflict, but changing one
 /// analyzer or the vector dimensions returns `false`.
+fn validate_namespace_admission(
+    index_type: IndexType,
+    dimensions: usize,
+    late_interaction: Option<&LateInteractionNamespaceConfig>,
+) -> Result<()> {
+    match (index_type, late_interaction) {
+        (IndexType::LateInteractionFde, Some(config)) => {
+            if dimensions != 0 {
+                return Err(ZeppelinError::Validation(
+                    "late-interaction namespaces must set dimensions to 0".to_string(),
+                ));
+            }
+            if config.accepted_modalities.is_empty() {
+                return Err(ZeppelinError::Validation(
+                    "late_interaction.accepted_modalities cannot be empty".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        (IndexType::LateInteractionFde, None) => Err(ZeppelinError::Validation(
+            "late_interaction config is required for a late-interaction namespace".to_string(),
+        )),
+        (_, Some(_)) => Err(ZeppelinError::Validation(
+            "late_interaction config is forbidden for a dense namespace".to_string(),
+        )),
+        (_, None) if dimensions == 0 => Err(ZeppelinError::Validation(
+            "dense namespace dimensions must be greater than zero".to_string(),
+        )),
+        (_, None) => Ok(()),
+    }
+}
+
 fn namespace_config_matches(
     existing: &NamespaceMetadata,
     dimensions: usize,
     distance_metric: DistanceMetric,
+    index_type: IndexType,
+    late_interaction: Option<&LateInteractionNamespaceConfig>,
     full_text_search: &std::collections::HashMap<String, FtsFieldConfig>,
     index_config: &Option<NamespaceIndexConfig>,
 ) -> Result<bool> {
     Ok(existing.dimensions == dimensions
         && existing.distance_metric == distance_metric
+        && existing.index_type == index_type
+        && existing.late_interaction.as_ref() == late_interaction
         && fts_config_value(&existing.full_text_search)? == fts_config_value(full_text_search)?
         && existing.index_config == *index_config)
 }
@@ -3947,6 +4057,7 @@ mod tests {
                 stage: BranchPrepareStage::ManifestPublished,
                 provisional: None,
             }),
+            late_interaction: None,
             incarnation_id: Some(target_incarnation),
         };
         Ok((metadata, target_namespace, identity))
@@ -4321,6 +4432,7 @@ mod tests {
             branch_identity: None,
             branch_activation: None,
             branch_prepare: None,
+            late_interaction: None,
             incarnation_id: None,
         };
         let mut user_metadata = ObjectUserMetadata::new();

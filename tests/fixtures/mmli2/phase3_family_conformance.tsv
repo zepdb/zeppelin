@@ -4,6 +4,8 @@ Lease	target/lease.json	Other
 ManifestHistory	target/manifests/00000000000000000001.msgpack	Other
 Snapshot	target/snapshots/daily.msgpack	Other
 Wal	target/wal/fragment.wal	Wal
+InputWal	target/input-wal/fragment.wal	Other
+Source	target/sources/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef	Other
 Segment	target/segments/segment/centroids.bin	Centroids
 LateSection	target/late/state/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef	Other
 Staging	target/_staging/17.json	Other

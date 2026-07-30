@@ -84,7 +84,7 @@ use crate::index::filter::evaluate_filter_on_optional_attributes;
 use crate::index::topk::TopK;
 use crate::namespace::branching::ArtifactOrigin;
 use crate::types::{AttributeValue, Filter, SearchResult};
-use crate::wal::reader::LocatedWalFragment;
+use crate::wal::reader::{LocatedInputFragment, LocatedWalFragment};
 
 /// Ephemeral token statistics keyed first by document ID and then field name.
 ///
@@ -292,6 +292,7 @@ pub struct WalBm25ScanResult {
 /// after top-k selection, avoiding Java-style eager object copies and manual C
 /// ownership bookkeeping.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn wal_bm25_scan(
     fragments: &[LocatedWalFragment],
     logical_origin: &ArtifactOrigin,
@@ -303,9 +304,37 @@ pub(crate) fn wal_bm25_scan(
     include_attributes: bool,
     top_k: Option<usize>,
 ) -> WalBm25ScanResult {
-    let frag_count = fragments.len();
+    wal_bm25_scan_with_inputs(
+        fragments,
+        &[],
+        logical_origin,
+        rank_by,
+        fts_configs,
+        last_as_prefix,
+        fts_cache,
+        filter,
+        include_attributes,
+        top_k,
+    )
+}
 
-    if fragments.is_empty() {
+/// Replays dense and typed-input WAL fragments in their shared manifest order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wal_bm25_scan_with_inputs(
+    fragments: &[LocatedWalFragment],
+    input_fragments: &[LocatedInputFragment],
+    logical_origin: &ArtifactOrigin,
+    rank_by: &RankBy,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+    last_as_prefix: bool,
+    fts_cache: Option<&WalFtsCache>,
+    filter: Option<&Filter>,
+    include_attributes: bool,
+    top_k: Option<usize>,
+) -> WalBm25ScanResult {
+    let frag_count = fragments.len() + input_fragments.len();
+
+    if fragments.is_empty() && input_fragments.is_empty() {
         return WalBm25ScanResult {
             results: Vec::new(),
             overriding_ids: HashSet::new(),
@@ -319,16 +348,53 @@ pub(crate) fn wal_bm25_scan(
     let mut deleted_ids: HashSet<String> = HashSet::new();
     let mut latest_vectors: HashMap<&str, Option<&HashMap<String, AttributeValue>>> =
         HashMap::new();
+    let mut latest_sequences: HashMap<&str, u64> = HashMap::new();
 
-    for fragment in fragments {
-        let fragment = fragment.fragment.as_ref();
-        for del_id in &fragment.deletes {
-            deleted_ids.insert(del_id.clone());
-            latest_vectors.remove(del_id.as_str());
+    enum ReplayFragment<'a> {
+        Dense(&'a LocatedWalFragment),
+        Input(&'a LocatedInputFragment),
+    }
+    impl ReplayFragment<'_> {
+        fn sequence_number(&self) -> u64 {
+            match self {
+                Self::Dense(fragment) => fragment.sequence_number,
+                Self::Input(fragment) => fragment.sequence_number,
+            }
         }
-        for vec in &fragment.vectors {
-            deleted_ids.remove(&vec.id);
-            latest_vectors.insert(vec.id.as_str(), vec.attributes.as_ref());
+    }
+    let mut replay = fragments
+        .iter()
+        .map(ReplayFragment::Dense)
+        .chain(input_fragments.iter().map(ReplayFragment::Input))
+        .collect::<Vec<_>>();
+    replay.sort_by_key(ReplayFragment::sequence_number);
+
+    for fragment in &replay {
+        match fragment {
+            ReplayFragment::Dense(located) => {
+                for del_id in &located.fragment.deletes {
+                    deleted_ids.insert(del_id.clone());
+                    latest_vectors.remove(del_id.as_str());
+                    latest_sequences.remove(del_id.as_str());
+                }
+                for vector in &located.fragment.vectors {
+                    deleted_ids.remove(&vector.id);
+                    latest_vectors.insert(vector.id.as_str(), vector.attributes.as_ref());
+                    latest_sequences.insert(vector.id.as_str(), located.sequence_number);
+                }
+            }
+            ReplayFragment::Input(located) => {
+                for del_id in &located.fragment.deletes {
+                    deleted_ids.insert(del_id.clone());
+                    latest_vectors.remove(del_id.as_str());
+                    latest_sequences.remove(del_id.as_str());
+                }
+                for record in &located.fragment.upserts {
+                    deleted_ids.remove(&record.id);
+                    latest_vectors.insert(record.id.as_str(), record.attributes.as_ref());
+                    latest_sequences.insert(record.id.as_str(), located.sequence_number);
+                }
+            }
         }
     }
 
@@ -403,19 +469,34 @@ pub(crate) fn wal_bm25_scan(
 
     if let Some(cache) = fts_cache {
         // Cache hits avoid tokenizer CPU but still clone owned maps.
-        for fragment in fragments {
-            let cached = cache.get_or_tokenize(
-                logical_origin,
-                &fragment.identity,
-                fragment.fragment.as_ref(),
-                fts_configs,
-                &fields_needed,
-            );
+        for fragment in &replay {
+            let (cached, sequence_number) = match fragment {
+                ReplayFragment::Dense(fragment) => (
+                    cache.get_or_tokenize(
+                        logical_origin,
+                        &fragment.identity,
+                        fragment.fragment.as_ref(),
+                        fts_configs,
+                        &fields_needed,
+                    ),
+                    fragment.sequence_number,
+                ),
+                ReplayFragment::Input(fragment) => (
+                    cache.get_or_tokenize_input(
+                        logical_origin,
+                        &fragment.identity,
+                        fragment.fragment.as_ref(),
+                        fts_configs,
+                        &fields_needed,
+                    ),
+                    fragment.sequence_number,
+                ),
+            };
             for ((doc_id, field_name), token_data) in &cached.doc_field_data {
-                // Exclude IDs whose final operation is a delete. Notice that an
-                // older version of a still-live ID also passes this membership
-                // check; a later cached field overwrites it only when present.
-                if latest_vectors.contains_key(doc_id.as_str()) {
+                // Only the fragment owning the final upsert may contribute
+                // fields. This prevents a removed/non-string field in a newer
+                // record from retaining stale tokens from an older cache entry.
+                if latest_sequences.get(doc_id.as_str()) == Some(&sequence_number) {
                     doc_field_data.entry(doc_id.clone()).or_default().insert(
                         field_name.clone(),
                         (token_data.doc_length, token_data.term_freqs.clone()),
@@ -674,6 +755,7 @@ mod tests {
                 deletes,
                 checksum: 0,
             }),
+            sequence_number: 0,
         }
     }
 

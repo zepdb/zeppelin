@@ -82,7 +82,11 @@ use crate::storage::ZeppelinStore;
 
 use super::fragment::WalFragment;
 use super::fragment_cache::WalFragmentCache;
-use super::manifest::{FragmentRef, LocatedFragmentIdentity, LocatedFragmentRef, Manifest};
+use super::input_fragment::EncoderInputWalFragment;
+use super::manifest::{
+    FragmentRef, LocatedFragmentIdentity, LocatedFragmentRef, LocatedInputFragmentIdentity,
+    LocatedInputFragmentRef, Manifest,
+};
 
 /// Decoded immutable WAL body retaining its exact physical identity.
 #[derive(Debug, Clone)]
@@ -91,6 +95,8 @@ pub(crate) struct LocatedWalFragment {
     pub(crate) identity: LocatedFragmentIdentity,
     /// Shared checksum-validated body.
     pub(crate) fragment: Arc<WalFragment>,
+    /// Manifest-assigned total replay order.
+    pub(crate) sequence_number: u64,
 }
 
 impl Borrow<WalFragment> for LocatedWalFragment {
@@ -101,6 +107,25 @@ impl Borrow<WalFragment> for LocatedWalFragment {
 
 impl Deref for LocatedWalFragment {
     type Target = WalFragment;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fragment
+    }
+}
+
+/// Decoded typed-input WAL body retaining its exact physical identity.
+#[derive(Debug, Clone)]
+pub(crate) struct LocatedInputFragment {
+    /// Origin-qualified immutable identity.
+    pub(crate) identity: LocatedInputFragmentIdentity,
+    /// Shared checksum-validated body.
+    pub(crate) fragment: Arc<EncoderInputWalFragment>,
+    /// Manifest-assigned total replay order.
+    pub(crate) sequence_number: u64,
+}
+
+impl Deref for LocatedInputFragment {
+    type Target = EncoderInputWalFragment;
 
     fn deref(&self) -> &Self::Target {
         &self.fragment
@@ -242,6 +267,70 @@ impl WalReader {
             .read_fragment_bytes(namespace, fragment_id, FragmentCachePolicy::Bypass)
             .await?;
         Self::validate_fragment_identity(WalFragment::from_bytes(&data)?, fragment_id)
+    }
+
+    /// Reads and checksum-validates one typed-input fragment by physical owner.
+    #[instrument(skip(self), fields(namespace = namespace, fragment_id = %fragment_id))]
+    pub async fn read_input_fragment(
+        &self,
+        namespace: &str,
+        fragment_id: &Ulid,
+    ) -> Result<EncoderInputWalFragment> {
+        let key = EncoderInputWalFragment::s3_key(namespace, fragment_id);
+        let bytes = self.store.get(&key).await?;
+        let fragment = EncoderInputWalFragment::from_bytes(&bytes)?;
+        if fragment.id != *fragment_id {
+            return Err(ZeppelinError::Serialization(format!(
+                "input WAL object {key} contains fragment ID {}, expected {fragment_id}",
+                fragment.id
+            )));
+        }
+        Ok(fragment)
+    }
+
+    /// Reads manifest-selected typed-input fragments in total replay order.
+    pub(crate) async fn read_located_input_fragments(
+        &self,
+        refs: &[LocatedInputFragmentRef<'_>],
+    ) -> Result<Vec<LocatedInputFragment>> {
+        Self::validate_located_input_batch(refs)?;
+        let reads = refs.iter().copied().map(|located| async move {
+            let fragment = self
+                .read_input_fragment(located.physical_namespace(), &located.fragment.id)
+                .await?;
+            Ok::<_, ZeppelinError>(LocatedInputFragment {
+                identity: located.identity(),
+                fragment: Arc::new(fragment),
+                sequence_number: located.fragment.sequence_number,
+            })
+        });
+        futures::future::try_join_all(reads).await
+    }
+
+    fn validate_located_input_batch(refs: &[LocatedInputFragmentRef<'_>]) -> Result<()> {
+        let Some(first) = refs.first() else {
+            return Ok(());
+        };
+        let logical_origin = first.logical_origin.as_origin();
+        let logical_namespace = first.logical_namespace;
+        let mut identities = HashSet::with_capacity(refs.len());
+        for located in refs {
+            if located.logical_namespace != logical_namespace
+                || located.logical_origin.as_origin() != logical_origin
+            {
+                return Err(ZeppelinError::Serialization(
+                    "one input WAL read batch cannot mix logical namespace lifetimes".to_string(),
+                ));
+            }
+            if !identities.insert(located.identity()) {
+                return Err(ZeppelinError::Serialization(format!(
+                    "duplicate located input WAL fragment identity in read batch: {}/{}",
+                    located.physical_origin.namespace(),
+                    located.fragment.id
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Reads every currently uncompacted fragment in authoritative manifest order.
@@ -531,7 +620,11 @@ impl WalReader {
             let identity = located.identity();
             if let Some(cache) = fragment_cache {
                 if let Some(fragment) = cache.get(&identity) {
-                    return Ok(LocatedWalFragment { identity, fragment });
+                    return Ok(LocatedWalFragment {
+                        identity,
+                        fragment,
+                        sequence_number: located.fragment.sequence_number,
+                    });
                 }
             }
 
@@ -546,7 +639,11 @@ impl WalReader {
                     Arc::clone(&fragment),
                 );
             }
-            Ok(LocatedWalFragment { identity, fragment })
+            Ok(LocatedWalFragment {
+                identity,
+                fragment,
+                sequence_number: located.fragment.sequence_number,
+            })
         }))
         .await;
         self.finish_located_fragment_results(refs, results).await

@@ -75,7 +75,8 @@ use crate::fts::{FtsFieldConfig, FtsLanguage};
 use crate::namespace::branching::ArtifactOrigin;
 use crate::types::AttributeValue;
 use crate::wal::fragment::WalFragment;
-use crate::wal::manifest::LocatedFragmentIdentity;
+use crate::wal::input_fragment::EncoderInputWalFragment;
+use crate::wal::manifest::{LocatedFragmentIdentity, LocatedInputFragmentIdentity};
 
 /// BM25 input derived from one document's value for one configured text field.
 ///
@@ -142,8 +143,14 @@ pub struct WalFtsCache {
 /// Complete identity of one cached tokenization result.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct WalFtsCacheKey {
-    identity: LocatedFragmentIdentity,
+    identity: WalFtsFragmentIdentity,
     discriminator: FtsCacheDiscriminator,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum WalFtsFragmentIdentity {
+    Dense(LocatedFragmentIdentity),
+    Input(LocatedInputFragmentIdentity),
 }
 
 /// Canonical requested-field and configuration projection.
@@ -312,7 +319,7 @@ impl WalFtsCache {
             "WAL FTS cache identity does not match decoded fragment"
         );
         let cache_key = WalFtsCacheKey {
-            identity: identity.clone(),
+            identity: WalFtsFragmentIdentity::Dense(identity.clone()),
             discriminator: FtsCacheDiscriminator::new(fts_configs, fields_needed),
         };
         // Clone while the DashMap guard is alive, then release the shard before
@@ -357,6 +364,78 @@ impl WalFtsCache {
 
                 doc_field_data.insert(
                     (vec.id.clone(), field_name.to_string()),
+                    DocTokenData {
+                        doc_length,
+                        term_freqs,
+                    },
+                );
+            }
+        }
+
+        let token_data = CachedFragmentFts { doc_field_data };
+        match self.cache.entry(cache_key) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                occupied
+                    .get_mut()
+                    .logical_origins
+                    .insert(logical_origin.clone());
+                occupied.get().token_data.clone()
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(CacheEntry {
+                    logical_origins: HashSet::from([logical_origin.clone()]),
+                    token_data: token_data.clone(),
+                });
+                token_data
+            }
+        }
+    }
+
+    /// Returns cached token statistics for one immutable typed-input fragment.
+    pub(crate) fn get_or_tokenize_input(
+        &self,
+        logical_origin: &ArtifactOrigin,
+        identity: &LocatedInputFragmentIdentity,
+        fragment: &EncoderInputWalFragment,
+        fts_configs: &HashMap<String, FtsFieldConfig>,
+        fields_needed: &[&str],
+    ) -> CachedFragmentFts {
+        assert_eq!(
+            identity.id, fragment.id,
+            "input WAL FTS cache identity does not match decoded fragment"
+        );
+        let cache_key = WalFtsCacheKey {
+            identity: WalFtsFragmentIdentity::Input(identity.clone()),
+            discriminator: FtsCacheDiscriminator::new(fts_configs, fields_needed),
+        };
+        if let Some(mut cached) = self.cache.get_mut(&cache_key) {
+            cached.logical_origins.insert(logical_origin.clone());
+            return cached.token_data.clone();
+        }
+
+        let mut doc_field_data = HashMap::new();
+        for record in &fragment.upserts {
+            let Some(attributes) = record.attributes.as_ref() else {
+                continue;
+            };
+            for &field_name in fields_needed {
+                let Some(config) = fts_configs.get(field_name) else {
+                    continue;
+                };
+                let Some(AttributeValue::String(text)) = attributes.get(field_name) else {
+                    continue;
+                };
+                let tokens = tokenize_text(text, config, false);
+                let doc_length = tokens.len() as u32;
+                if doc_length == 0 {
+                    continue;
+                }
+                let mut term_freqs = HashMap::new();
+                for token in tokens {
+                    *term_freqs.entry(token).or_insert(0) += 1;
+                }
+                doc_field_data.insert(
+                    (record.id.clone(), field_name.to_string()),
                     DocTokenData {
                         doc_length,
                         term_freqs,
@@ -430,7 +509,33 @@ impl WalFtsCache {
             .cloned()
             .collect::<HashSet<_>>();
         self.cache.retain(|key, entry| {
-            if entry.logical_origins.contains(logical_origin) && !active.contains(&key.identity) {
+            let remains_active = match &key.identity {
+                WalFtsFragmentIdentity::Dense(identity) => active.contains(identity),
+                WalFtsFragmentIdentity::Input(_) => true,
+            };
+            if entry.logical_origins.contains(logical_origin) && !remains_active {
+                entry.logical_origins.remove(logical_origin);
+            }
+            !entry.logical_origins.is_empty()
+        });
+    }
+
+    /// Retires typed-input cache entries absent from one authoritative manifest.
+    pub(crate) fn evict_input_fragments_located(
+        &self,
+        logical_origin: &ArtifactOrigin,
+        active_fragment_identities: &[LocatedInputFragmentIdentity],
+    ) {
+        let active = active_fragment_identities
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        self.cache.retain(|key, entry| {
+            let remains_active = match &key.identity {
+                WalFtsFragmentIdentity::Dense(_) => true,
+                WalFtsFragmentIdentity::Input(identity) => active.contains(identity),
+            };
+            if entry.logical_origins.contains(logical_origin) && !remains_active {
                 entry.logical_origins.remove(logical_origin);
             }
             !entry.logical_origins.is_empty()

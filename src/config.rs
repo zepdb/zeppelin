@@ -1568,6 +1568,24 @@ pub struct ServerConfig {
     /// Maximum request body size in megabytes. Default: `512`.
     #[serde(default = "default_max_request_body_mb")]
     pub max_request_body_mb: usize,
+    /// Maximum UTF-8 bytes accepted for one inline retrieval-unit text input.
+    #[serde(default = "default_max_retrieval_text_bytes")]
+    pub max_retrieval_text_bytes: usize,
+    /// Maximum decoded bytes accepted for one retrieval-unit image input.
+    #[serde(default = "default_max_retrieval_image_bytes")]
+    pub max_retrieval_image_bytes: usize,
+    /// Maximum width accepted from a retrieval-unit image declaration.
+    #[serde(default = "default_max_retrieval_image_dimension")]
+    pub max_retrieval_image_width: u32,
+    /// Maximum height accepted from a retrieval-unit image declaration.
+    #[serde(default = "default_max_retrieval_image_dimension")]
+    pub max_retrieval_image_height: u32,
+    /// Maximum combined upserts and tombstones in one retrieval-unit request.
+    #[serde(default = "default_max_retrieval_units_per_request")]
+    pub max_retrieval_units_per_request: usize,
+    /// Exact media types accepted for retrieval-unit images.
+    #[serde(default = "default_retrieval_image_media_types")]
+    pub retrieval_image_media_types: Vec<String>,
     /// Default `top_k` when the client omits it. Default: `10`.
     #[serde(default = "default_top_k")]
     pub default_top_k: usize,
@@ -1646,6 +1664,29 @@ fn default_rate_limit_idle_ttl_secs() -> u64 {
 /// Returns the default maximum number of query entries accepted in one batch request.
 fn default_max_query_batch_size() -> usize {
     256
+}
+
+fn default_max_retrieval_text_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_max_retrieval_image_bytes() -> usize {
+    20 * 1024 * 1024
+}
+
+fn default_max_retrieval_image_dimension() -> u32 {
+    32_768
+}
+
+fn default_max_retrieval_units_per_request() -> usize {
+    1_000
+}
+
+fn default_retrieval_image_media_types() -> Vec<String> {
+    ["image/jpeg", "image/png", "image/webp"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Checks whether a trusted-proxy entry is a syntactically valid IP CIDR range.
@@ -2349,6 +2390,12 @@ impl Default for ServerConfig {
             max_dimensions: default_max_dimensions(),
             max_vector_id_length: default_max_vector_id_length(),
             max_request_body_mb: default_max_request_body_mb(),
+            max_retrieval_text_bytes: default_max_retrieval_text_bytes(),
+            max_retrieval_image_bytes: default_max_retrieval_image_bytes(),
+            max_retrieval_image_width: default_max_retrieval_image_dimension(),
+            max_retrieval_image_height: default_max_retrieval_image_dimension(),
+            max_retrieval_units_per_request: default_max_retrieval_units_per_request(),
+            retrieval_image_media_types: default_retrieval_image_media_types(),
             default_top_k: default_top_k(),
             rate_limit_rps: default_rate_limit_rps(),
             rate_limit_burst: default_rate_limit_burst(),
@@ -2873,6 +2920,38 @@ impl Config {
         if self.server.max_top_k == 0 {
             violations.push("server.max_top_k must be greater than zero".to_string());
         }
+        if self.server.max_retrieval_text_bytes == 0 {
+            violations
+                .push("server.max_retrieval_text_bytes must be greater than zero".to_string());
+        }
+        if self.server.max_retrieval_image_bytes == 0 {
+            violations
+                .push("server.max_retrieval_image_bytes must be greater than zero".to_string());
+        }
+        if self.server.max_retrieval_image_width == 0 {
+            violations
+                .push("server.max_retrieval_image_width must be greater than zero".to_string());
+        }
+        if self.server.max_retrieval_image_height == 0 {
+            violations
+                .push("server.max_retrieval_image_height must be greater than zero".to_string());
+        }
+        if self.server.max_retrieval_units_per_request == 0 {
+            violations.push(
+                "server.max_retrieval_units_per_request must be greater than zero".to_string(),
+            );
+        }
+        if self.server.retrieval_image_media_types.is_empty()
+            || self
+                .server
+                .retrieval_image_media_types
+                .iter()
+                .any(|media_type| media_type.trim().is_empty())
+        {
+            violations.push(
+                "server.retrieval_image_media_types must contain nonempty media types".to_string(),
+            );
+        }
         if self.server.default_top_k == 0 {
             violations.push("server.default_top_k must be greater than zero".to_string());
         } else if self.server.default_top_k > self.server.max_top_k {
@@ -3300,6 +3379,29 @@ impl Config {
         }
         if let Some(v) = env_override("ZEPPELIN_MAX_REQUEST_BODY_MB")? {
             self.server.max_request_body_mb = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_MAX_RETRIEVAL_TEXT_BYTES")? {
+            self.server.max_retrieval_text_bytes = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_MAX_RETRIEVAL_IMAGE_BYTES")? {
+            self.server.max_retrieval_image_bytes = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_MAX_RETRIEVAL_IMAGE_WIDTH")? {
+            self.server.max_retrieval_image_width = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_MAX_RETRIEVAL_IMAGE_HEIGHT")? {
+            self.server.max_retrieval_image_height = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_MAX_RETRIEVAL_UNITS_PER_REQUEST")? {
+            self.server.max_retrieval_units_per_request = v;
+        }
+        if let Some(v) = env_override::<String>("ZEPPELIN_RETRIEVAL_IMAGE_MEDIA_TYPES")? {
+            self.server.retrieval_image_media_types = v
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
         }
         if let Some(v) = env_override("ZEPPELIN_DEFAULT_TOP_K")? {
             self.server.default_top_k = v;

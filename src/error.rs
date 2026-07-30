@@ -327,6 +327,48 @@ pub enum ZeppelinError {
         limit: usize,
     },
 
+    /// A retrieval-unit field exceeded its configured byte or record limit.
+    #[error("retrieval unit {resource} size {actual} exceeds maximum of {limit}")]
+    RetrievalUnitTooLarge {
+        /// Non-sensitive logical field or collection name.
+        resource: &'static str,
+        /// Submitted size.
+        actual: usize,
+        /// Configured maximum.
+        limit: usize,
+    },
+
+    /// A retrieval unit omitted every meaningful input.
+    #[error("retrieval unit input cannot be empty")]
+    RetrievalUnitEmpty,
+
+    /// The namespace admission policy does not allow this typed input.
+    #[error("unsupported input modality: {modality}")]
+    UnsupportedInputModality {
+        /// Stable modality name; never caller content.
+        modality: &'static str,
+    },
+
+    /// The declared image media type is not on the configured allowlist.
+    #[error("unsupported image media type: {media_type}")]
+    UnsupportedImageMediaType {
+        /// Declared media type; image bytes are never retained here.
+        media_type: String,
+    },
+
+    /// Declared image dimensions exceed the configured bounds.
+    #[error("image dimensions {width}x{height} exceed maximum {max_width}x{max_height}")]
+    ImageDimensionsExceeded {
+        /// Declared image width.
+        width: u32,
+        /// Declared image height.
+        height: u32,
+        /// Configured maximum width.
+        max_width: u32,
+        /// Configured maximum height.
+        max_height: u32,
+    },
+
     /// The request selected a recognized feature that is reserved but not implemented yet.
     #[error("not implemented: {feature}")]
     NotImplemented {
@@ -533,7 +575,14 @@ impl ZeppelinError {
             | ZeppelinError::Validation(_)
             | ZeppelinError::FtsFieldNotConfigured { .. } => 400,
 
-            ZeppelinError::PayloadTooLarge { .. } => 413,
+            ZeppelinError::PayloadTooLarge { .. } | ZeppelinError::RetrievalUnitTooLarge { .. } => {
+                413
+            }
+
+            ZeppelinError::RetrievalUnitEmpty
+            | ZeppelinError::UnsupportedInputModality { .. }
+            | ZeppelinError::UnsupportedImageMediaType { .. }
+            | ZeppelinError::ImageDimensionsExceeded { .. } => 400,
 
             ZeppelinError::NotImplemented { .. } => 501,
 
@@ -624,6 +673,11 @@ impl ZeppelinError {
             ZeppelinError::VectorNotFound { .. } => "VECTOR_NOT_FOUND",
             ZeppelinError::Validation(_) => "VALIDATION_ERROR",
             ZeppelinError::PayloadTooLarge { .. } => "PAYLOAD_TOO_LARGE",
+            ZeppelinError::RetrievalUnitTooLarge { .. } => "RETRIEVAL_UNIT_TOO_LARGE",
+            ZeppelinError::RetrievalUnitEmpty => "RETRIEVAL_UNIT_EMPTY",
+            ZeppelinError::UnsupportedInputModality { .. } => "UNSUPPORTED_INPUT_MODALITY",
+            ZeppelinError::UnsupportedImageMediaType { .. } => "UNSUPPORTED_IMAGE_MEDIA_TYPE",
+            ZeppelinError::ImageDimensionsExceeded { .. } => "IMAGE_DIMENSIONS_EXCEEDED",
             ZeppelinError::NotImplemented { .. } => "NOT_IMPLEMENTED",
             ZeppelinError::Config(_) => "INTERNAL_ERROR",
             ZeppelinError::Security(error) => error.code(),
@@ -844,6 +898,11 @@ impl ZeppelinError {
             | ZeppelinError::VectorNotFound { .. }
             | ZeppelinError::Validation(_)
             | ZeppelinError::PayloadTooLarge { .. }
+            | ZeppelinError::RetrievalUnitTooLarge { .. }
+            | ZeppelinError::RetrievalUnitEmpty
+            | ZeppelinError::UnsupportedInputModality { .. }
+            | ZeppelinError::UnsupportedImageMediaType { .. }
+            | ZeppelinError::ImageDimensionsExceeded { .. }
             | ZeppelinError::NotImplemented { .. }
             | ZeppelinError::HydrationDisabled
             | ZeppelinError::FtsFieldNotConfigured { .. }

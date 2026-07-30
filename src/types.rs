@@ -408,6 +408,8 @@ pub enum IndexType {
     IvfPq,
     /// Approximate index that navigates a multi-level centroid tree.
     Hierarchical,
+    /// Fixed-dimensional candidate retrieval with token-level late reranking.
+    LateInteractionFde,
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -429,6 +431,13 @@ mod tests {
             let back: DistanceMetric = serde_json::from_str(&json).unwrap();
             assert_eq!(back, variant);
         }
+    }
+
+    #[test]
+    fn unknown_index_type_fails_loudly() {
+        let error = serde_json::from_str::<IndexType>("\"future_index\"")
+            .expect_err("unknown index type must not decode");
+        assert!(error.to_string().contains("unknown variant"));
     }
 
     /// Verifies that display output matches the metric names used in JSON and diagnostics.

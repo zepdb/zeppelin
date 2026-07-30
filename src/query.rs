@@ -143,7 +143,7 @@ use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
 use crate::fts::rank_by::{evaluate_rank_by, RankBy};
 use crate::fts::tokenizer::tokenize_text;
 use crate::fts::wal_cache::WalFtsCache;
-use crate::fts::wal_scan::wal_bm25_scan;
+use crate::fts::wal_scan::wal_bm25_scan_with_inputs;
 use crate::fts::FtsFieldConfig;
 use crate::index::distance::compute_distance;
 use crate::index::filter::{combine_filters, evaluate_filter_on_optional_attributes};
@@ -158,7 +158,8 @@ use crate::retrieval_scope::{
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult};
 use crate::wal::manifest::{
-    CoarsePayloadEncoding, LocatedFragmentRef, LocatedSegmentRef, SegmentRef,
+    CoarsePayloadEncoding, LocatedFragmentRef, LocatedInputFragmentRef, LocatedSegmentRef,
+    SegmentRef,
 };
 use crate::wal::Manifest;
 use crate::wal::{FragmentCachePolicy, WalFragmentCache, WalReader};
@@ -2538,19 +2539,27 @@ async fn execute_bm25_query_with_manifest_scoped(
     };
     let origin_resolver = manifest.artifact_origin_resolver(&local_origin)?;
     let located_fragments = origin_resolver.uncompacted_located_fragments()?;
+    let located_input_fragments = origin_resolver.located_input_fragments()?;
     let active_segment = origin_resolver.active_located_segment()?;
-    let eventual_skipped_wal =
-        consistency == ConsistencyLevel::Eventual && !manifest.uncompacted_fragments().is_empty();
+    let has_visible_wal =
+        !manifest.uncompacted_fragments().is_empty() || !manifest.input_fragments.is_empty();
+    let eventual_skipped_wal = consistency == ConsistencyLevel::Eventual && has_visible_wal;
 
     let active_identities = located_fragments
         .iter()
         .copied()
         .map(LocatedFragmentRef::identity)
         .collect::<Vec<_>>();
+    let active_input_identities = located_input_fragments
+        .iter()
+        .copied()
+        .map(LocatedInputFragmentRef::identity)
+        .collect::<Vec<_>>();
 
     // Evict compacted fragments from the derived caches to bound local memory.
     if let Some(cache) = fts_cache {
         cache.evict_compacted_located(&local_origin, &active_identities);
+        cache.evict_input_fragments_located(&local_origin, &active_input_identities);
     }
     if let Some(cache) = fragment_cache {
         cache.evict_compacted_located(&local_origin, &active_identities);
@@ -2584,6 +2593,7 @@ async fn execute_bm25_query_with_manifest_scoped(
             include_attributes,
             &manifest,
             &located_fragments,
+            &located_input_fragments,
             active_segment,
             cache_diagnostics,
             eventual_skipped_wal,
@@ -2601,7 +2611,7 @@ async fn execute_bm25_query_with_manifest_scoped(
         let mut wal_deleted_ids = std::collections::HashSet::new();
         let mut wal_overriding_ids = std::collections::HashSet::new();
         let wal_results = match consistency {
-            ConsistencyLevel::Strong if !manifest.uncompacted_fragments().is_empty() => {
+            ConsistencyLevel::Strong if has_visible_wal => {
                 // The historical `unchecked` name is compatibility-only;
                 // misses still validate checksums before memo insertion.
                 let fragments = wal_reader
@@ -2611,8 +2621,12 @@ async fn execute_bm25_query_with_manifest_scoped(
                         fragment_cache,
                     )
                     .await?;
-                let scan_result = wal_bm25_scan(
+                let input_fragments = wal_reader
+                    .read_located_input_fragments(&located_input_fragments)
+                    .await?;
+                let scan_result = wal_bm25_scan_with_inputs(
                     &fragments,
+                    &input_fragments,
                     &local_origin,
                     rank_by,
                     fts_configs,
@@ -2627,7 +2641,7 @@ async fn execute_bm25_query_with_manifest_scoped(
                 wal_overriding_ids = scan_result.overriding_ids;
                 scan_result.results
             }
-            ConsistencyLevel::Eventual if !manifest.uncompacted_fragments().is_empty() => {
+            ConsistencyLevel::Eventual if has_visible_wal => {
                 wal_deleted_ids = wal_reader
                     .read_located_delete_ids_unchecked(
                         &located_fragments,
@@ -2635,6 +2649,12 @@ async fn execute_bm25_query_with_manifest_scoped(
                         fragment_cache,
                     )
                     .await?;
+                let input_fragments = wal_reader
+                    .read_located_input_fragments(&located_input_fragments)
+                    .await?;
+                for fragment in input_fragments {
+                    wal_deleted_ids.extend(fragment.deletes.iter().cloned());
+                }
                 Vec::new()
             }
             _ => Vec::new(),
@@ -2773,6 +2793,7 @@ async fn execute_filtered_bm25_query_with_manifest(
     include_attributes: bool,
     manifest: &Manifest,
     located_fragments: &[LocatedFragmentRef<'_>],
+    located_input_fragments: &[LocatedInputFragmentRef<'_>],
     segment_ref: Option<LocatedSegmentRef<'_>>,
     cache_diagnostics: Option<Arc<CacheDiagnostics>>,
     eventual_skipped_wal: bool,
@@ -2780,7 +2801,7 @@ async fn execute_filtered_bm25_query_with_manifest(
     let scanned_segments = usize::from(segment_ref.is_some());
     let clusters_probed = segment_ref.map_or(0, |segment| segment.segment.cluster_count);
     let scanned_fragments = if consistency == ConsistencyLevel::Strong {
-        manifest.uncompacted_fragments().len()
+        manifest.uncompacted_fragments().len() + manifest.input_fragments.len()
     } else {
         0
     };
@@ -2792,11 +2813,10 @@ async fn execute_filtered_bm25_query_with_manifest(
         mandatory_filter,
         fts_configs,
     )?;
-    let durable_source_segment_id = manifest
-        .uncompacted_fragments()
-        .is_empty()
-        .then(|| segment_ref.map(|segment| segment.segment.id.as_str()))
-        .flatten();
+    let durable_source_segment_id = (manifest.uncompacted_fragments().is_empty()
+        && manifest.input_fragments.is_empty())
+    .then(|| segment_ref.map(|segment| segment.segment.id.as_str()))
+    .flatten();
     let index = match decoded_artifact_cache {
         Some(decoded_artifact_cache) => {
             decoded_artifact_cache
@@ -2818,6 +2838,7 @@ async fn execute_filtered_bm25_query_with_manifest(
                                 Some(decoded_artifact_cache),
                                 cache,
                                 located_fragments,
+                                located_input_fragments,
                                 segment_ref,
                             )
                             .await
@@ -2845,6 +2866,7 @@ async fn execute_filtered_bm25_query_with_manifest(
                         None,
                         cache,
                         located_fragments,
+                        located_input_fragments,
                         segment_ref,
                     )
                     .await
@@ -2913,6 +2935,7 @@ async fn build_scoped_fts_snapshot(
     decoded_artifact_cache: Option<&Arc<DecodedArtifactCache>>,
     cache: Option<&Arc<DiskCache>>,
     located_fragments: &[LocatedFragmentRef<'_>],
+    located_input_fragments: &[LocatedInputFragmentRef<'_>],
     segment_ref: Option<LocatedSegmentRef<'_>>,
 ) -> Result<ScopedFtsIndex> {
     let mut dimensions = 0;
@@ -2937,6 +2960,7 @@ async fn build_scoped_fts_snapshot(
     };
 
     let mut strong_fragments = Vec::new();
+    let mut strong_input_fragments = Vec::new();
     let mut eventual_deleted_ids = HashSet::new();
     match consistency {
         ConsistencyLevel::Strong if !located_fragments.is_empty() => {
@@ -2959,6 +2983,22 @@ async fn build_scoped_fts_snapshot(
         }
         _ => {}
     }
+    match consistency {
+        ConsistencyLevel::Strong if !located_input_fragments.is_empty() => {
+            strong_input_fragments = wal_reader
+                .read_located_input_fragments(located_input_fragments)
+                .await?;
+        }
+        ConsistencyLevel::Eventual if !located_input_fragments.is_empty() => {
+            let fragments = wal_reader
+                .read_located_input_fragments(located_input_fragments)
+                .await?;
+            for fragment in fragments {
+                eventual_deleted_ids.extend(fragment.deletes.iter().cloned());
+            }
+        }
+        _ => {}
+    }
 
     let mandatory_filter = mandatory_filter.clone();
     let fts_configs = fts_configs.clone();
@@ -2975,12 +3015,44 @@ async fn build_scoped_fts_snapshot(
                     .map(|row| (row.id.clone(), row)),
             );
         }
-        for fragment in strong_fragments {
-            for deleted_id in &fragment.deletes {
-                logical_rows.remove(deleted_id);
-            }
-            for vector in &fragment.vectors {
-                logical_rows.insert(vector.id.clone(), vector.clone());
+        enum StrongWal {
+            Dense(crate::wal::reader::LocatedWalFragment),
+            Input(crate::wal::reader::LocatedInputFragment),
+        }
+        let mut replay = strong_fragments
+            .into_iter()
+            .map(StrongWal::Dense)
+            .chain(strong_input_fragments.into_iter().map(StrongWal::Input))
+            .collect::<Vec<_>>();
+        replay.sort_by_key(|fragment| match fragment {
+            StrongWal::Dense(fragment) => fragment.sequence_number,
+            StrongWal::Input(fragment) => fragment.sequence_number,
+        });
+        for fragment in replay {
+            match fragment {
+                StrongWal::Dense(fragment) => {
+                    for deleted_id in &fragment.deletes {
+                        logical_rows.remove(deleted_id);
+                    }
+                    for vector in &fragment.vectors {
+                        logical_rows.insert(vector.id.clone(), vector.clone());
+                    }
+                }
+                StrongWal::Input(fragment) => {
+                    for deleted_id in &fragment.deletes {
+                        logical_rows.remove(deleted_id);
+                    }
+                    for record in &fragment.upserts {
+                        logical_rows.insert(
+                            record.id.clone(),
+                            crate::types::VectorEntry {
+                                id: record.id.clone(),
+                                values: Vec::new(),
+                                attributes: record.attributes.clone(),
+                            },
+                        );
+                    }
+                }
             }
         }
         for deleted_id in eventual_deleted_ids {

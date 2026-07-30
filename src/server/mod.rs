@@ -125,7 +125,8 @@ use crate::time::Clock;
 use crate::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
 use self::handlers::{
-    config as config_handler, namespace, query, security as security_handler, vectors, ApiError,
+    config as config_handler, namespace, query, retrieval_units, security as security_handler,
+    vectors, ApiError,
 };
 
 tokio::task_local! {
@@ -1595,6 +1596,59 @@ pub(crate) fn authorize_namespace_action(
     }
 }
 
+/// Authorize one body-selected namespace action, including approval obligations.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn authorize_secondary_namespace_action(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    principal: &Principal,
+    context: &RequestContext,
+    source_ip: IpAddr,
+    audit: &AuditRequest,
+    action: Action,
+    namespace: &str,
+) -> Result<AllowDecision, SecurityError> {
+    let resource = Resource::Namespace(NamespaceId::new(namespace.to_string())?);
+    let mut allow = match state
+        .security
+        .authorize(principal, action, &resource, context)
+    {
+        Decision::Allow(allow) => *allow,
+        Decision::Deny(deny) => {
+            emit_authorization_denial(
+                state, principal, action, &resource, context, source_ip, &deny,
+            );
+            audit.set_deny(action, ResourceRef::from(&resource), deny.clone());
+            return Err(SecurityError::Authorization(deny.reason));
+        }
+    };
+    if allow
+        .obligations
+        .contains(&crate::security::Obligation::Approval)
+    {
+        let (approver, approval) = authorize_approval(
+            state,
+            headers,
+            principal,
+            ApprovalCheck {
+                action,
+                resource: &resource,
+                context,
+                expected_policy_version: allow.policy_version,
+                source_ip,
+            },
+        )
+        .map_err(|()| SecurityError::ApprovalRequired)?;
+        allow.mandatory_filter = crate::index::filter::combine_filters(
+            allow.mandatory_filter.take(),
+            approval.mandatory_filter,
+        );
+        audit.set_approval_principal(approver);
+    }
+    audit.set_allow(action, ResourceRef::from(&resource), allow.clone());
+    Ok(allow)
+}
+
 /// Rejects a declared oversized request while continuing to drain its body.
 ///
 /// [`RequestBodyLimitLayer`] returns immediately when `Content-Length` exceeds
@@ -2678,6 +2732,10 @@ pub fn build_router(state: AppState) -> Router {
                 post(vectors::upsert_vectors).delete(vectors::delete_vectors),
                 &state,
             ),
+        )
+        .route(
+            "/v1/namespaces/:ns/retrieval-units",
+            secure_route(post(retrieval_units::append_retrieval_units), &state),
         );
 
     if state.config.branching.enabled {

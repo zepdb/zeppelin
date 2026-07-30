@@ -5171,6 +5171,7 @@ mod tests {
             branch_identity: None,
             branch_prepare: None,
             branch_activation: None,
+            late_interaction: None,
             incarnation_id: None,
         }
     }

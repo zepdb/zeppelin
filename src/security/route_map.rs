@@ -347,6 +347,11 @@ pub static ROUTE_ACTIONS: &[RouteAction] = &[
     },
     RouteAction {
         method: Method::POST,
+        path: "/v1/namespaces/:ns/retrieval-units",
+        class: RouteClass::Protected(Action::VectorUpsert),
+    },
+    RouteAction {
+        method: Method::POST,
         path: "/v1/namespaces/:ns/query",
         class: RouteClass::Protected(Action::Query),
     },

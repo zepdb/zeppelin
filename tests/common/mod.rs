@@ -90,6 +90,7 @@ pub async fn write_active_namespace_metadata_for_incarnation(
         branch_identity: None,
         branch_prepare: None,
         branch_activation: None,
+        late_interaction: None,
         // A namespace that owns objects must carry a lifetime identity.
         // `local_origin` refuses to resolve an artifact origin without one, so
         // metadata written with `None` yields a namespace whose manifests

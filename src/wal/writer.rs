@@ -90,20 +90,25 @@
 //! ensure each queued reply sender has one destination and is consumed exactly
 //! once when sending.
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use rand::Rng;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, error, instrument, warn};
 
+use crate::embedding::{ArtifactChecksum, EncoderInputRef, RetrievalUnitRecord};
 use crate::error::{Result, ZeppelinError};
-use crate::storage::ZeppelinStore;
+use crate::storage::{CreateOnlyOutcome, NamespaceObjectFamily, NamespaceObjectKey, ZeppelinStore};
 use crate::time::Clock;
 use crate::types::{VectorEntry, VectorId};
 
 use super::fragment::WalFragment;
-use super::manifest::{FragmentRef, Manifest, ManifestVersion};
+use super::input_fragment::EncoderInputWalFragment;
+use super::late_section::{LateStateSection, SourceInventoryRef};
+use super::manifest::{FragmentRef, InputFragmentRef, Manifest, ManifestVersion};
 
 /// Maximum number of manifest CAS attempts made for one commit batch.
 ///
@@ -251,6 +256,117 @@ impl GroupCommitState {
     fn clear_committed(&self) {
         self.replace_committed(None);
     }
+}
+
+fn validate_source_uploads(
+    namespace: &str,
+    fragment: &EncoderInputWalFragment,
+    sources: &[(SourceInventoryRef, Bytes)],
+) -> Result<()> {
+    let mut by_key = BTreeMap::new();
+    for (source, bytes) in sources {
+        if source.artifact_origin.is_some() {
+            return Err(ZeppelinError::Validation(
+                "new source uploads must be owned by the local namespace".to_string(),
+            ));
+        }
+        let owned = NamespaceObjectKey::classify(namespace, source.key.clone())?;
+        if owned.family() != NamespaceObjectFamily::Source {
+            return Err(ZeppelinError::Validation(format!(
+                "source upload key is outside the registered source family: {}",
+                source.key
+            )));
+        }
+        let actual_size = u64::try_from(bytes.len()).map_err(|_| {
+            ZeppelinError::Validation("source byte length does not fit u64".to_string())
+        })?;
+        if actual_size != source.size_bytes {
+            return Err(ZeppelinError::Validation(format!(
+                "source {} declared {} bytes but received {actual_size}",
+                source.key, source.size_bytes
+            )));
+        }
+        if ArtifactChecksum::digest(bytes) != source.checksum {
+            return Err(ZeppelinError::Validation(format!(
+                "source {} checksum does not match uploaded bytes",
+                source.key
+            )));
+        }
+        if let Some((prior, prior_bytes)) =
+            by_key.insert(source.key.as_str(), (source, bytes.as_ref()))
+        {
+            if prior != source || prior_bytes != bytes.as_ref() {
+                return Err(ZeppelinError::Validation(format!(
+                    "source upload {} appears with conflicting content",
+                    source.key
+                )));
+            }
+        }
+    }
+
+    let mut referenced = BTreeMap::new();
+    for record in &fragment.upserts {
+        let image = match &record.input {
+            EncoderInputRef::Text { .. } => continue,
+            EncoderInputRef::Image { image } | EncoderInputRef::ImageText { image, .. } => image,
+        };
+        let expected_key = SourceInventoryRef::s3_key(namespace, record.content_hash);
+        if image.key != expected_key {
+            return Err(ZeppelinError::Validation(format!(
+                "retrieval-unit {} image key does not match its content hash",
+                record.id
+            )));
+        }
+        let Some((source, _)) = by_key.get(image.key.as_str()) else {
+            return Err(ZeppelinError::Validation(format!(
+                "retrieval-unit {} image has no matching source upload",
+                record.id
+            )));
+        };
+        if source.checksum != image.checksum
+            || source.size_bytes != image.encoded_size_bytes
+            || source.media_type != image.media_type
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "retrieval-unit {} image metadata disagrees with its source inventory entry",
+                record.id
+            )));
+        }
+        referenced.insert(image.key.as_str(), ());
+    }
+    if let Some(extra) = by_key.keys().find(|key| !referenced.contains_key(*key)) {
+        return Err(ZeppelinError::Validation(format!(
+            "source upload {extra} is not referenced by this input fragment"
+        )));
+    }
+    Ok(())
+}
+
+fn merge_source_inventory<'a>(
+    section: &mut LateStateSection,
+    incoming: impl Iterator<Item = &'a SourceInventoryRef>,
+) -> Result<()> {
+    let mut existing = section
+        .source_inventory
+        .iter()
+        .map(|source| (source.key.clone(), source.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for source in incoming {
+        match existing.get(&source.key) {
+            Some(current) if current == source => {}
+            Some(_) => {
+                return Err(ZeppelinError::Serialization(format!(
+                    "source inventory key {} has conflicting immutable metadata",
+                    source.key
+                )));
+            }
+            None => {
+                existing.insert(source.key.clone(), source.clone());
+            }
+        }
+    }
+    section.source_inventory = existing.into_values().collect();
+    Ok(())
 }
 
 /// Writes immutable fragments and group-commits their manifest references.
@@ -433,6 +549,106 @@ impl WalWriter {
     ) -> Result<(WalFragment, Manifest)> {
         self.append_with_lease(namespace, vectors, deletes, None)
             .await
+    }
+
+    /// Appends typed retrieval-unit mutations with source and section visibility atomicity.
+    #[instrument(skip(self, upserts, deletes, sources), fields(namespace = namespace))]
+    pub async fn append_retrieval_units(
+        &self,
+        namespace: &str,
+        upserts: Vec<RetrievalUnitRecord>,
+        deletes: Vec<VectorId>,
+        sources: Vec<(SourceInventoryRef, Bytes)>,
+    ) -> Result<(EncoderInputWalFragment, Manifest)> {
+        let fragment = EncoderInputWalFragment::try_new(upserts, deletes)?;
+        validate_source_uploads(namespace, &fragment, &sources)?;
+
+        let group = self.group(namespace);
+        let _guard = group.commit_lock.lock().await;
+        group.clear_committed();
+
+        let Some((mut manifest, version)) =
+            Manifest::read_versioned(&self.store, namespace).await?
+        else {
+            return Err(ZeppelinError::ManifestNotFound {
+                namespace: namespace.to_string(),
+            });
+        };
+
+        for (source, bytes) in &sources {
+            match self
+                .store
+                .put_create_outcome(&source.key, bytes.clone())
+                .await?
+            {
+                CreateOnlyOutcome::Created { .. } => {}
+                CreateOnlyOutcome::AlreadyExists => {
+                    let existing = self.store.get(&source.key).await?;
+                    if existing != *bytes {
+                        return Err(ZeppelinError::Serialization(format!(
+                            "source content-address collision at {}: existing bytes differ",
+                            source.key
+                        )));
+                    }
+                }
+            }
+        }
+
+        let new_late_state = if sources.is_empty() {
+            None
+        } else {
+            let mut section = manifest
+                .load_late_state(&self.store)
+                .await?
+                .unwrap_or_default();
+            if let Some(reference) = manifest.late_state.as_ref() {
+                let previous_owner = manifest.late_section_origin(reference)?;
+                let next_owner = manifest.local_origin()?;
+                section.rebase_source_origins(&previous_owner, &next_owner)?;
+            }
+            merge_source_inventory(&mut section, sources.iter().map(|(source, _)| source))?;
+            section
+                .source_inventory
+                .sort_unstable_by(|left, right| left.key.cmp(&right.key));
+            section.canonicalize_artifact_origins()?;
+            Some(section.put_create(&self.store, namespace).await?)
+        };
+
+        let fragment_bytes = fragment.to_bytes()?;
+        let size_bytes = u64::try_from(fragment_bytes.len()).map_err(|_| {
+            ZeppelinError::Serialization(
+                "input WAL fragment size does not fit persisted u64".to_string(),
+            )
+        })?;
+        let fragment_key = EncoderInputWalFragment::s3_key(namespace, &fragment.id);
+        self.store.put(&fragment_key, fragment_bytes).await?;
+        let input_ref = InputFragmentRef {
+            id: fragment.id,
+            upsert_count: fragment.upserts.len(),
+            delete_count: fragment.deletes.len(),
+            sequence_number: 0,
+            size_bytes,
+            referenced_content_bytes: fragment.referenced_content_bytes()?,
+            modality_counts: fragment.modality_counts(),
+            artifact_origin: None,
+        };
+
+        match manifest
+            .publish_input_fragment(&self.store, namespace, &version, new_late_state, input_ref)
+            .await
+        {
+            Ok(published_version) => {
+                let memo = published_version
+                    .has_version()
+                    .then(|| (manifest.clone(), published_version));
+                group.replace_committed(memo);
+                Ok((fragment, manifest))
+            }
+            Err(error) => {
+                group.clear_committed();
+                Err(error)
+            }
+        }
     }
 
     /// Uploads one immutable fragment and group-commits its manifest reference.
@@ -1127,6 +1343,88 @@ mod tests {
     //! CAS contention, fencing, and orphan cleanup.
 
     use super::*;
+
+    fn image_source_fixture(
+        namespace: &str,
+    ) -> (RetrievalUnitRecord, SourceInventoryRef, bytes::Bytes) {
+        let bytes = bytes::Bytes::from_static(b"fixture-image");
+        let checksum = ArtifactChecksum::digest(&bytes);
+        let mut input = EncoderInputRef::Image {
+            image: crate::embedding::ImageObjectRef {
+                key: String::new(),
+                checksum,
+                media_type: "image/png".to_string(),
+                encoded_size_bytes: bytes.len() as u64,
+                width: 2,
+                height: 2,
+            },
+        };
+        let content_hash = input.content_hash().unwrap();
+        let key = SourceInventoryRef::s3_key(namespace, content_hash);
+        if let EncoderInputRef::Image { image } = &mut input {
+            image.key = key.clone();
+        }
+        (
+            RetrievalUnitRecord {
+                id: "image".to_string(),
+                input,
+                content_hash,
+                parent_id: None,
+                unit_ordinal: None,
+                attributes: None,
+            },
+            SourceInventoryRef {
+                key,
+                checksum,
+                size_bytes: bytes.len() as u64,
+                media_type: "image/png".to_string(),
+                artifact_origin: None,
+            },
+            bytes,
+        )
+    }
+
+    #[test]
+    fn source_uploads_require_exact_content_key_and_complete_references() {
+        const NAMESPACE: &str = "typed-source-validation";
+        let (mut record, mut source, bytes) = image_source_fixture(NAMESPACE);
+        let arbitrary = format!(
+            "{}{}",
+            NamespaceObjectFamily::Source.namespace_prefix(NAMESPACE),
+            "a".repeat(64)
+        );
+        if let EncoderInputRef::Image { image } = &mut record.input {
+            image.key = arbitrary.clone();
+        }
+        source.key = arbitrary;
+        let fragment =
+            EncoderInputWalFragment::try_new(vec![record], Vec::new()).expect("valid input hash");
+        assert!(matches!(
+            validate_source_uploads(NAMESPACE, &fragment, &[(source, bytes)]),
+            Err(ZeppelinError::Validation(message))
+                if message.contains("does not match its content hash")
+        ));
+
+        let (record, source, bytes) = image_source_fixture(NAMESPACE);
+        let fragment =
+            EncoderInputWalFragment::try_new(vec![record], Vec::new()).expect("valid input hash");
+        let extra_bytes = bytes::Bytes::from_static(b"extra");
+        let extra = SourceInventoryRef {
+            key: SourceInventoryRef::s3_key(NAMESPACE, crate::embedding::ContentHash::new([9; 32])),
+            checksum: ArtifactChecksum::digest(&extra_bytes),
+            size_bytes: extra_bytes.len() as u64,
+            media_type: "image/png".to_string(),
+            artifact_origin: None,
+        };
+        assert!(matches!(
+            validate_source_uploads(
+                NAMESPACE,
+                &fragment,
+                &[(source, bytes), (extra, extra_bytes)]
+            ),
+            Err(ZeppelinError::Validation(message)) if message.contains("is not referenced")
+        ));
+    }
 
     /// Verifies that deleting namespaces removes their independent local states.
     ///
