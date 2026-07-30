@@ -690,6 +690,87 @@ def diagnostic_summary(cell: dict) -> dict:
     }
 
 
+def exact_gap_summary(
+    rows: list[dict], baseline_cell: dict, construction_rmse: float
+) -> dict:
+    if not rows:
+        raise RuntimeError("exact frontier-gap diagnostic is empty")
+    query_rows = np.asarray(
+        [row["query_rows"] for row in rows], dtype=np.float64
+    )
+    rank_10 = (
+        np.asarray([row["rank_10_score"] for row in rows], dtype=np.float64)
+        / query_rows
+    )
+    rank_100 = (
+        np.asarray([row["rank_100_score"] for row in rows], dtype=np.float64)
+        / query_rows
+    )
+    raw_gap = np.asarray(
+        [row["rank_10_to_rank_100_gap"] for row in rows],
+        dtype=np.float64,
+    )
+    gap = raw_gap / query_rows
+    if np.any(gap < -1.0e-7):
+        raise RuntimeError("rank-100 exact score exceeds rank-10 exact score")
+    relative_gap = gap / np.maximum(np.abs(rank_10), 1.0e-12)
+    recovered_by_query: dict[int, int] = {}
+    for row in baseline_cell["gold_ranks"]:
+        query_index = int(row["query_index"])
+        recovered_by_query.setdefault(query_index, 0)
+        recovered_by_query[query_index] += int(row["fde_rank"] <= 100)
+    if set(recovered_by_query) != {
+        int(row["query_index"]) for row in rows
+    }:
+        raise RuntimeError("frontier gaps and baseline recovery queries differ")
+    recovery = np.asarray(
+        [
+            recovered_by_query[int(row["query_index"])] / 10.0
+            for row in rows
+        ],
+        dtype=np.float64,
+    )
+    gap_order = np.argsort(gap, kind="stable")
+    gap_deciles = np.array_split(gap_order, 10)
+
+    def distribution(values: np.ndarray) -> dict:
+        return {
+            "min": float(values.min()),
+            "p01": float(np.quantile(values, 0.01)),
+            "p05": float(np.quantile(values, 0.05)),
+            "p50": float(np.quantile(values, 0.50)),
+            "p95": float(np.quantile(values, 0.95)),
+            "p99": float(np.quantile(values, 0.99)),
+            "max": float(values.max()),
+        }
+
+    return {
+        "query_count": len(rows),
+        "normalization": "exact MaxSim divided by query rows",
+        "rank_10_score": distribution(rank_10),
+        "rank_100_score": distribution(rank_100),
+        "rank_10_to_rank_100_gap": distribution(gap),
+        "relative_gap_over_rank_10": distribution(relative_gap),
+        "gap_vs_top10_recovery_at_100_pearson": pearson(gap, recovery),
+        "lowest_gap_decile_recall_at_100": float(
+            recovery[gap_deciles[0]].mean()
+        ),
+        "highest_gap_decile_recall_at_100": float(
+            recovery[gap_deciles[-1]].mean()
+        ),
+        "construction_residual_rmse": construction_rmse,
+        "fraction_gap_below_1x_construction_rmse": float(
+            np.mean(gap <= construction_rmse)
+        ),
+        "fraction_gap_below_2x_construction_rmse": float(
+            np.mean(gap <= 2.0 * construction_rmse)
+        ),
+        "fraction_gap_below_3x_construction_rmse": float(
+            np.mean(gap <= 3.0 * construction_rmse)
+        ),
+    }
+
+
 def diagnostic_axis(
     values: np.ndarray, start: int, end: int
 ) -> tuple[np.ndarray, float, float]:
@@ -802,39 +883,71 @@ def render_diagnostic_scatter(cells: list[dict], path: Path) -> None:
     image.save(path)
 
 
-def write_diagnostic_artifacts(report_path: Path, result: dict) -> list[dict]:
+def write_diagnostic_artifacts(report_path: Path, result: dict) -> dict:
     cells = result.get("diagnostics")
-    if not cells:
-        return []
+    probes = result.get("diagnostic_probes") or []
+    exact_gaps = result.get("exact_frontier_gaps") or []
+    if not cells and not probes and not exact_gaps:
+        return {}
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "seed": result["seed"],
-        "score_normalization": (
+        "diagnostic_cell_score_normalization": (
             "FDE inner product divided by repetitions and query rows; exact "
             "MaxSim divided by query rows"
         ),
-        "cells": cells,
+        "exact_frontier_gap_normalization": (
+            "per-query JSON fields are raw MaxSim sums; report summaries "
+            "divide scores and gaps by query rows"
+        ),
+        "cells": cells or [],
+        "fixed_budget_probes": probes,
+        "exact_frontier_gaps": exact_gaps,
     }
     json_path = report_path.with_name("lab-diagnostics.json")
     json_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    render_diagnostic_scatter(
-        cells, report_path.with_name("lab-diagnostics.png")
+    if cells:
+        render_diagnostic_scatter(
+            cells, report_path.with_name("lab-diagnostics.png")
+        )
+    summaries = [diagnostic_summary(cell) for cell in cells or []]
+    baseline_cell = next(
+        cell for cell in cells or [] if cell["config"] == "A"
     )
-    return [diagnostic_summary(cell) for cell in cells]
+    baseline_summary = next(
+        summary for summary in summaries if summary["config"] == "A"
+    )
+    construction_rmse = baseline_summary[
+        "construction_transformed_exact_fit"
+    ]["residual_rmse"]
+    return {
+        "cells": summaries,
+        "probes": probes,
+        "exact_gap": (
+            exact_gap_summary(
+                exact_gaps, baseline_cell, construction_rmse
+            )
+            if exact_gaps
+            else None
+        ),
+    }
 
 
-def render_diagnostics(summaries: list[dict]) -> list[str]:
-    if not summaries:
+def render_diagnostics(evidence: dict) -> list[str]:
+    if not evidence:
         return []
+    summaries = evidence["cells"]
+    probes = evidence["probes"]
+    gap = evidence["exact_gap"]
     lines = [
         "",
         "### FDE failure diagnostic",
         "",
-        "- Diagnostic-only config C is outside the fixed gate and does not "
-        "change the winner or go/no-go result.",
+        "- Diagnostic-only configs C, D, and E are outside the fixed gate and "
+        "do not change the winner or go/no-go result.",
         "- Exact per-gold ranks and score pairs: "
         "[lab-diagnostics.json](lab-diagnostics.json).",
-        "- Score/residual scatter: "
+        "- Score/residual scatter for A and C: "
         "[lab-diagnostics.png](lab-diagnostics.png).",
         "",
         "| Config | R/k/d | R@100 | Missed | Rank p50/p95/p99/max | "
@@ -854,6 +967,28 @@ def render_diagnostics(summaries: list[dict]) -> list[str]:
             f"{summary['missed_rank_max']} | "
             f"{bins['101_400']} | {bins['401_1000']} | "
             f"{bins['1001_2000']} | {bins['2001_plus']} |"
+        )
+    baseline = next(
+        summary for summary in summaries if summary["config"] == "A"
+    )
+    lines.extend(
+        [
+            "",
+            "| Fixed-budget probe | R/k/d | D | R@50 | R@100 | R@300 | "
+            "R@100 delta vs A |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for probe in probes:
+        lines.append(
+            f"| {probe['config']} | "
+            f"{probe['repetitions']}/{probe['simhash_bits']}/"
+            f"{probe['d_proj']} "
+            f"| {probe['output_dimension']} | "
+            f"{probe['recall_at_50']:.6f} | "
+            f"{probe['recall_at_100']:.6f} | "
+            f"{probe['recall_at_300']:.6f} | "
+            f"{probe['recall_at_100'] - baseline['recall_at_100']:+.6f} |"
         )
     lines.extend(
         [
@@ -901,9 +1036,6 @@ def render_diagnostics(summaries: list[dict]) -> list[str]:
             f"- {summary['config']} transform SHA-256: "
             f"`{summary['transform_checksum_sha256']}`."
         )
-    baseline = next(
-        summary for summary in summaries if summary["config"] == "A"
-    )
     diagnostic = next(
         summary
         for summary in summaries
@@ -913,6 +1045,16 @@ def render_diagnostics(summaries: list[dict]) -> list[str]:
     missed = baseline["missed_at_100"]
     semantic = baseline["semantic_raw_exact_fit"]
     construction = baseline["construction_transformed_exact_fit"]
+    d_proj_probe = next(
+        probe
+        for probe in probes
+        if probe["config"] == "D-dproj-diagnostic"
+    )
+    reps_probe = next(
+        probe
+        for probe in probes
+        if probe["config"] == "E-reps-diagnostic"
+    )
     lines.extend(
         [
             f"- Rank shape: for A, {bins['101_400'] / missed:.1%} of K=100 "
@@ -932,6 +1074,11 @@ def render_diagnostics(summaries: list[dict]) -> list[str]:
             "failure: C-diagnostic reduced top-10 R@100 from "
             f"`{baseline['recall_at_100']:.6f}` to "
             f"`{diagnostic['recall_at_100']:.6f}`.",
+            "- At the same 10,240-D budget, coarser buckets plus wider inner "
+            "projection changed top-10 R@100 by "
+            f"`{d_proj_probe['recall_at_100'] - baseline['recall_at_100']:+.6f}`; "
+            "coarser buckets plus more repetitions changed it by "
+            f"`{reps_probe['recall_at_100'] - baseline['recall_at_100']:+.6f}`.",
             "- Metric provenance: the Phase 2 gate measures the fraction of "
             "every exact top-10 frontier recovered. The MUVERA paper's "
             "offline `1Recall@N` measures recovery of the single exact "
@@ -948,8 +1095,61 @@ def render_diagnostics(summaries: list[dict]) -> list[str]:
             "final-projection experiment first builds `R=40`, `k_sim=6`, "
             "`d_proj=128` (327,680-D), then projects to 10,240-D; "
             "C-diagnostic is not a paper operating point.",
+            "- Budget provenance: 10,240 is the selected Phase 2 paper point, "
+            "not a hard product ceiling. The source design explicitly lists "
+            "20,480 dimensions and frames affordability of dimension/K as "
+            "the constraint.",
+            "- Gate provenance: the 0.95-at-K=100 full-top-10 threshold is "
+            "introduced by the Phase 2 execution plan. The source design "
+            "requires both top-1 and top-10 candidate recall but does not "
+            "derive that threshold.",
         ]
     )
+    if gap:
+        lines.extend(
+            [
+                "",
+                "| Exact-score quantity | p1 | p5 | p50 | p95 | p99 |",
+                "| --- | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for label, key in (
+            ("Rank 10 / query rows", "rank_10_score"),
+            ("Rank 100 / query rows", "rank_100_score"),
+            ("Rank 10 − rank 100 / query rows", "rank_10_to_rank_100_gap"),
+            ("Gap / rank-10 score", "relative_gap_over_rank_10"),
+        ):
+            distribution = gap[key]
+            lines.append(
+                f"| {label} | {distribution['p01']:.6f} | "
+                f"{distribution['p05']:.6f} | "
+                f"{distribution['p50']:.6f} | "
+                f"{distribution['p95']:.6f} | "
+                f"{distribution['p99']:.6f} |"
+            )
+        lines.extend(
+            [
+                "",
+                f"- Exact frontier-gap sample: {gap['query_count']} queries; "
+                "scores are normalized by query rows.",
+                "- Gap/recovery relationship: Pearson r="
+                f"`{gap['gap_vs_top10_recovery_at_100_pearson']:.6f}`; "
+                "top-10 R@100 is "
+                f"`{gap['lowest_gap_decile_recall_at_100']:.6f}` in the "
+                "smallest-gap decile and "
+                f"`{gap['highest_gap_decile_recall_at_100']:.6f}` in the "
+                "largest-gap decile.",
+                "- Against A's centered-exact/FDE construction residual RMSE "
+                f"of `{gap['construction_residual_rmse']:.6f}`, "
+                f"{gap['fraction_gap_below_1x_construction_rmse']:.1%}/"
+                f"{gap['fraction_gap_below_2x_construction_rmse']:.1%}/"
+                f"{gap['fraction_gap_below_3x_construction_rmse']:.1%} of "
+                "rank-10→rank-100 gaps are below 1×/2×/3× that scale.",
+                "- Encoder checkpoint/seed stability is not measured by this "
+                "one-checkpoint, one-seed phase. The gap distribution alone "
+                "cannot justify changing the gate.",
+            ]
+        )
     return lines
 
 
@@ -963,10 +1163,10 @@ def render_report(
     visual_cost: dict | None,
 ) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    diagnostic_summaries = (
+    diagnostic_evidence = (
         write_diagnostic_artifacts(report_path, text_result)
         if text_result is not None
-        else []
+        else {}
     )
     lines = [
         "# MMLI-2 Phase 2 encoder qualification",
@@ -1000,7 +1200,7 @@ def render_report(
     )
     if text_result is not None:
         lines.extend(render_lane("Text", text_result, text_cost))
-        lines.extend(render_diagnostics(diagnostic_summaries))
+        lines.extend(render_diagnostics(diagnostic_evidence))
     if visual_result is not None:
         lines.extend(render_lane("Visual", visual_result, visual_cost))
     if text_result is not None:

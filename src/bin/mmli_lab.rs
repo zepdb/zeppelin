@@ -167,7 +167,9 @@ struct ResultDocument {
     winner: Winner,
     gate_passed: bool,
     routing: Option<RoutingReport>,
+    diagnostic_probes: Option<Vec<CellResult>>,
     diagnostics: Option<Vec<DiagnosticCell>>,
+    exact_frontier_gaps: Option<Vec<ExactFrontierGap>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +191,9 @@ struct ParityReport {
 #[derive(Clone, Debug, Serialize)]
 struct CellResult {
     config: &'static str,
+    repetitions: u32,
+    simhash_bits: u32,
+    d_proj: u32,
     algorithm: Algorithm,
     centering: Centering,
     output_dimension: usize,
@@ -297,10 +302,30 @@ struct DiagnosticCell {
     score_pairs: Vec<ScorePairDiagnostic>,
 }
 
+#[derive(Debug, Serialize)]
+struct ExactFrontierGap {
+    query_index: usize,
+    query_id: String,
+    query_rows: usize,
+    rank_10_document_index: usize,
+    rank_10_document_id: String,
+    rank_10_score: f32,
+    rank_100_document_index: usize,
+    rank_100_document_id: String,
+    rank_100_score: f32,
+    rank_10_to_rank_100_gap: f32,
+}
+
 struct PerQueryDiagnostic {
     hits: [usize; 3],
     gold_ranks: Vec<GoldRankDiagnostic>,
     score_pairs: Vec<ScorePairDiagnostic>,
+}
+
+struct ExactTruth {
+    top_documents: Vec<usize>,
+    rank_10: (usize, f32),
+    rank_100: (usize, f32),
 }
 
 struct PreparedValues<'a> {
@@ -325,7 +350,9 @@ struct Evaluation {
     winner: Winner,
     gate_passed: bool,
     routing: Option<RoutingReport>,
+    diagnostic_probes: Option<Vec<CellResult>>,
     diagnostics: Option<Vec<DiagnosticCell>>,
+    exact_frontier_gaps: Option<Vec<ExactFrontierGap>>,
 }
 
 #[derive(Clone, Copy)]
@@ -355,6 +382,20 @@ const CONFIG_C_DIAGNOSTIC: FdeConfig = FdeConfig {
     repetitions: 20,
     simhash_bits: 6,
     d_proj: 8,
+};
+
+const CONFIG_D_DPROJ_DIAGNOSTIC: FdeConfig = FdeConfig {
+    name: "D-dproj-diagnostic",
+    repetitions: 20,
+    simhash_bits: 4,
+    d_proj: 32,
+};
+
+const CONFIG_E_REPS_DIAGNOSTIC: FdeConfig = FdeConfig {
+    name: "E-reps-diagnostic",
+    repetitions: 40,
+    simhash_bits: 4,
+    d_proj: 16,
 };
 
 fn main() {
@@ -391,7 +432,7 @@ fn run() -> Result<()> {
     let parity = evaluate_parity(&documents, &queries, &official_scores)?;
     let evaluation = evaluate_fixed_grid(&job, &documents, &queries, parity.passed)?;
     let result = ResultDocument {
-        schema_version: 1,
+        schema_version: 2,
         lane: job.lane,
         seed: FDE_SEED,
         corpus_stats: summarize(&documents),
@@ -403,7 +444,9 @@ fn run() -> Result<()> {
         winner: evaluation.winner,
         gate_passed: evaluation.gate_passed,
         routing: evaluation.routing,
+        diagnostic_probes: evaluation.diagnostic_probes,
         diagnostics: evaluation.diagnostics,
+        exact_frontier_gaps: evaluation.exact_frontier_gaps,
     };
 
     let stdout = io::stdout();
@@ -837,7 +880,7 @@ fn exhaustive_truth(
     documents: &TensorSet,
     queries: &TensorSet,
     prepared: &PreparedValues<'_>,
-) -> Result<Vec<Vec<usize>>> {
+) -> Result<Vec<ExactTruth>> {
     parallel_indexed_map(queries.sidecar.ids.len(), |query_index| {
         let query = queries.matrix(&prepared.queries, query_index)?;
         let mut scores = Vec::with_capacity(documents.sidecar.ids.len());
@@ -852,12 +895,43 @@ fn exhaustive_truth(
             scores.push((document_index, score));
         }
         rank_scores(&mut scores);
-        Ok(scores
-            .into_iter()
-            .take(TRUTH_K)
-            .map(|(index, _)| index)
-            .collect())
+        Ok(ExactTruth {
+            top_documents: scores
+                .iter()
+                .take(TRUTH_K)
+                .map(|&(index, _)| index)
+                .collect(),
+            rank_10: scores[TRUTH_K - 1],
+            rank_100: scores[ROUTING_TRUTH_K - 1],
+        })
     })
+}
+
+fn exact_frontier_gaps(
+    documents: &TensorSet,
+    queries: &TensorSet,
+    truth: &[ExactTruth],
+) -> Vec<ExactFrontierGap> {
+    truth
+        .iter()
+        .enumerate()
+        .map(|(query_index, query_truth)| {
+            let (rank_10_document_index, rank_10_score) = query_truth.rank_10;
+            let (rank_100_document_index, rank_100_score) = query_truth.rank_100;
+            ExactFrontierGap {
+                query_index,
+                query_id: queries.sidecar.ids[query_index].clone(),
+                query_rows: queries.sidecar.rows[query_index],
+                rank_10_document_index,
+                rank_10_document_id: documents.sidecar.ids[rank_10_document_index].clone(),
+                rank_10_score,
+                rank_100_document_index,
+                rank_100_document_id: documents.sidecar.ids[rank_100_document_index].clone(),
+                rank_100_score,
+                rank_10_to_rank_100_gap: rank_10_score - rank_100_score,
+            }
+        })
+        .collect()
 }
 
 fn rank_scores(scores: &mut [(usize, f32)]) {
@@ -933,7 +1007,7 @@ fn evaluate_cell(
     documents: &TensorSet,
     queries: &TensorSet,
     prepared: &PreparedValues<'_>,
-    truth: &[Vec<usize>],
+    truth: &[ExactTruth],
     config: FdeConfig,
     algorithm: Algorithm,
     centering: Centering,
@@ -945,6 +1019,9 @@ fn evaluate_cell(
     let recalls = candidate_recalls(&document_fdes, &query_fdes, output_dimension, truth)?;
     Ok(CellResult {
         config: config.name,
+        repetitions: config.repetitions,
+        simhash_bits: config.simhash_bits,
+        d_proj: config.d_proj,
         algorithm,
         centering,
         output_dimension,
@@ -958,7 +1035,7 @@ fn candidate_recalls(
     document_fdes: &[f32],
     query_fdes: &[f32],
     dim: usize,
-    truth: &[Vec<usize>],
+    truth: &[ExactTruth],
 ) -> Result<[f64; 3]> {
     let document_count = document_fdes.len() / dim;
     let query_count = query_fdes.len() / dim;
@@ -979,6 +1056,7 @@ fn candidate_recalls(
         for (readout, candidate_k) in CANDIDATE_KS.into_iter().enumerate() {
             let candidates = &scores[..candidate_k];
             hits[readout] += truth[query_index]
+                .top_documents
                 .iter()
                 .filter(|truth_index| {
                     candidates
@@ -1005,7 +1083,7 @@ fn diagnose_cell(
     queries: &TensorSet,
     exact: &PreparedValues<'_>,
     prepared: &PreparedValues<'_>,
-    truth: &[Vec<usize>],
+    truth: &[ExactTruth],
     config: FdeConfig,
     algorithm: Algorithm,
     centering: Centering,
@@ -1052,13 +1130,14 @@ fn diagnose_cell(
         let mut hits = [0usize; 3];
         for (readout, candidate_k) in CANDIDATE_KS.into_iter().enumerate() {
             hits[readout] = truth[query_index]
+                .top_documents
                 .iter()
                 .filter(|&&document_index| rank_by_document[document_index] <= candidate_k)
                 .count();
         }
 
         let mut gold_ranks = Vec::with_capacity(TRUTH_K);
-        for (exact_rank, &document_index) in truth[query_index].iter().enumerate() {
+        for (exact_rank, &document_index) in truth[query_index].top_documents.iter().enumerate() {
             let exact_document = documents.matrix(&exact.documents, document_index)?;
             let transformed_document = documents.matrix(&prepared.documents, document_index)?;
             let exact_score = max_sim(&exact_query, &exact_document)?;
@@ -1085,7 +1164,7 @@ fn diagnose_cell(
                 sampled_documents.push(document_index);
             }
         }
-        sampled_documents.push(truth[query_index][0]);
+        sampled_documents.push(truth[query_index].top_documents[0]);
         sampled_documents.sort_unstable();
         sampled_documents.dedup();
 
@@ -1250,32 +1329,55 @@ fn evaluate_fixed_grid(
     } else {
         None
     };
-    let diagnostics = if job.lane == Lane::Text {
+    let (diagnostic_probes, diagnostics, exact_frontier_gaps) = if job.lane == Lane::Text {
         let prepared = prepare_values(documents, queries, winner.centering)?;
-        Some(vec![
-            diagnose_cell(
-                documents,
-                queries,
-                &identity,
-                &prepared,
-                &identity_truth,
-                CONFIG_A,
-                winner.algorithm,
-                winner.centering,
-            )?,
-            diagnose_cell(
-                documents,
-                queries,
-                &identity,
-                &prepared,
-                &identity_truth,
-                CONFIG_C_DIAGNOSTIC,
-                winner.algorithm,
-                winner.centering,
-            )?,
-        ])
+        (
+            Some(vec![
+                evaluate_cell(
+                    documents,
+                    queries,
+                    &prepared,
+                    &identity_truth,
+                    CONFIG_D_DPROJ_DIAGNOSTIC,
+                    winner.algorithm,
+                    winner.centering,
+                )?,
+                evaluate_cell(
+                    documents,
+                    queries,
+                    &prepared,
+                    &identity_truth,
+                    CONFIG_E_REPS_DIAGNOSTIC,
+                    winner.algorithm,
+                    winner.centering,
+                )?,
+            ]),
+            Some(vec![
+                diagnose_cell(
+                    documents,
+                    queries,
+                    &identity,
+                    &prepared,
+                    &identity_truth,
+                    CONFIG_A,
+                    winner.algorithm,
+                    winner.centering,
+                )?,
+                diagnose_cell(
+                    documents,
+                    queries,
+                    &identity,
+                    &prepared,
+                    &identity_truth,
+                    CONFIG_C_DIAGNOSTIC,
+                    winner.algorithm,
+                    winner.centering,
+                )?,
+            ]),
+            Some(exact_frontier_gaps(documents, queries, &identity_truth)),
+        )
     } else {
-        None
+        (None, None, None)
     };
 
     Ok(Evaluation {
@@ -1284,7 +1386,9 @@ fn evaluate_fixed_grid(
         winner,
         gate_passed,
         routing,
+        diagnostic_probes,
         diagnostics,
+        exact_frontier_gaps,
     })
 }
 

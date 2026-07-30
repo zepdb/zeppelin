@@ -91,8 +91,8 @@ One seed and one repeat were used. Model and dataset files were downloaded at ex
 
 | Role | Count | CPU s/item batch 1 | CPU s/item batch 8 | Peak RSS MiB |
 | --- | ---: | ---: | ---: | ---: |
-| documents | 5183 | 0.260959 | 0.171419 | 1758.2 |
-| queries | 1109 | 0.032722 | 0.020407 | 1791.6 |
+| documents | 5183 | 0.260273 | 0.171704 | 1757.5 |
+| queries | 1109 | 0.032950 | 0.020735 | 1790.4 |
 
 ### Storage cost
 
@@ -188,14 +188,19 @@ One seed and one repeat were used. Model and dataset files were downloaded at ex
 
 ### FDE failure diagnostic
 
-- Diagnostic-only config C is outside the fixed gate and does not change the winner or go/no-go result.
+- Diagnostic-only configs C, D, and E are outside the fixed gate and do not change the winner or go/no-go result.
 - Exact per-gold ranks and score pairs: [lab-diagnostics.json](lab-diagnostics.json).
-- Score/residual scatter: [lab-diagnostics.png](lab-diagnostics.png).
+- Score/residual scatter for A and C: [lab-diagnostics.png](lab-diagnostics.png).
 
 | Config | R/k/d | R@100 | Missed | Rank p50/p95/p99/max | 101–400 | 401–1000 | 1001–2000 | 2001+ |
 | --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
 | A | 20/5/16 | 0.733814 | 2952 | 271/1454/2442/4666 | 1921 | 718 | 254 | 59 |
 | C-diagnostic | 20/6/8 | 0.679531 | 3554 | 312/1873/3050/4827 | 2087 | 940 | 377 | 150 |
+
+| Fixed-budget probe | R/k/d | D | R@50 | R@100 | R@300 | R@100 delta vs A |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| D-dproj-diagnostic | 20/4/32 | 10240 | 0.645086 | 0.758070 | 0.892876 | +0.024256 |
+| E-reps-diagnostic | 40/4/16 | 10240 | 0.660325 | 0.767899 | 0.901443 | +0.034085 |
 
 | Config | K | Exact top-1 recovered | Exact top-5 recovered | Exact top-10 recovered |
 | --- | ---: | ---: | ---: | ---: |
@@ -215,24 +220,26 @@ One seed and one repeat were used. Model and dataset files were downloaded at ex
 
 - A transform SHA-256: `31d3abb61a5362f3ce5a4986bfde7d3ad54f75b78be7174cb78a9970b5cf2e5d`.
 - C-diagnostic transform SHA-256: `19a1a19ab3a722bd82cc9157c17d3ac571841f97709d47c6c1a22f07be44af20`.
-- Rank shape: for A, 65.1% of K=100 misses land at ranks 101–400,
-  89.4% at ranks ≤1,000, and 2.0% beyond rank 2,000. The ordering is
-  mostly noisy near the candidate frontier with a smaller long tail; it is
-  not near-random.
-- Document-length bias is not supported: A's absolute residual/document-row
-  correlation is `0.001263` against raw exact MaxSim and `-0.088864` against
-  transformed exact MaxSim.
-- Raising `k_sim` while cutting `d_proj` did not cure the failure:
-  C-diagnostic reduced top-10 R@100 from `0.733814` to `0.679531`.
-- Metric provenance: the Phase 2 gate measures the fraction of every exact
-  top-10 frontier recovered. The MUVERA paper's offline `1Recall@N` measures
-  recovery of the single exact Chamfer nearest neighbor. Under that paper
-  metric A reaches `0.944995` at K=100 and `0.979261` at K=300; 95% recovery
-  requires K=109. Recovering 95% of the entire exact top-10 requires K=700.
-- Parameter provenance: A (`R=20`, `k_sim=5`, `d_proj=16`) is the paper's
-  direct 10,240-D Pareto cell. Its headline final-projection experiment first
-  builds `R=40`, `k_sim=6`, `d_proj=128` (327,680-D), then projects to
-  10,240-D; C-diagnostic is not a paper operating point.
+- Rank shape: for A, 65.1% of K=100 misses land at ranks 101–400, 89.4% at ranks ≤1,000, and 2.0% beyond rank 2,000. The ordering is mostly noisy near the candidate frontier with a smaller long tail; it is not near-random.
+- Document-length bias is not supported: A's absolute residual/document-row correlation is `0.001263` against raw exact MaxSim and `-0.088864` against transformed exact MaxSim.
+- Raising `k_sim` while cutting `d_proj` did not cure the failure: C-diagnostic reduced top-10 R@100 from `0.733814` to `0.679531`.
+- At the same 10,240-D budget, coarser buckets plus wider inner projection changed top-10 R@100 by `+0.024256`; coarser buckets plus more repetitions changed it by `+0.034085`.
+- Metric provenance: the Phase 2 gate measures the fraction of every exact top-10 frontier recovered. The MUVERA paper's offline `1Recall@N` measures recovery of the single exact Chamfer nearest neighbor. Under that paper metric A reaches `0.944995` at K=100 and `0.979261` at K=300; 95% recovery requires K=109. Recovering 95% of the entire exact top-10 requires K=700.
+- Parameter provenance: A (`R=20`, `k_sim=5`, `d_proj=16`) is the paper's direct 10,240-D Pareto cell. Its headline final-projection experiment first builds `R=40`, `k_sim=6`, `d_proj=128` (327,680-D), then projects to 10,240-D; C-diagnostic is not a paper operating point.
+- Budget provenance: 10,240 is the selected Phase 2 paper point, not a hard product ceiling. The source design explicitly lists 20,480 dimensions and frames affordability of dimension/K as the constraint.
+- Gate provenance: the 0.95-at-K=100 full-top-10 threshold is introduced by the Phase 2 execution plan. The source design requires both top-1 and top-10 candidate recall but does not derive that threshold.
+
+| Exact-score quantity | p1 | p5 | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Rank 10 / query rows | 0.881429 | 0.890680 | 0.917960 | 0.944406 | 0.952535 |
+| Rank 100 / query rows | 0.871159 | 0.881736 | 0.908502 | 0.935608 | 0.943139 |
+| Rank 10 − rank 100 / query rows | 0.003484 | 0.004483 | 0.008316 | 0.016971 | 0.024178 |
+| Gap / rank-10 score | 0.003864 | 0.004843 | 0.009107 | 0.018607 | 0.026023 |
+
+- Exact frontier-gap sample: 1109 queries; scores are normalized by query rows.
+- Gap/recovery relationship: Pearson r=`0.462177`; top-10 R@100 is `0.563063` in the smallest-gap decile and `0.923636` in the largest-gap decile.
+- Against A's centered-exact/FDE construction residual RMSE of `0.004342`, 3.7%/54.3%/84.9% of rank-10→rank-100 gaps are below 1×/2×/3× that scale.
+- Encoder checkpoint/seed stability is not measured by this one-checkpoint, one-seed phase. The gap distribution alone cannot justify changing the gate.
 
 ## Named decisions and resolved lateon unknowns
 
