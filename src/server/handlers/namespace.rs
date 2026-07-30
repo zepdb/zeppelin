@@ -2206,6 +2206,9 @@ fn rewrite_manifest_stored_keys(
             object_ref.key = rewrite_namespace_key(source, target, &object_ref.key)?;
         }
     }
+    if let Some(reference) = &mut manifest.late_state {
+        reference.key = rewrite_namespace_key(source, target, &reference.key)?;
+    }
     Ok(())
 }
 

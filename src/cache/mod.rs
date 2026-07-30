@@ -146,6 +146,8 @@
 pub mod decoded_cache;
 /// Warm-set hydration policy and worker support.
 pub mod hydration;
+/// Bounded immutable memo for manifest late-state sections.
+pub(crate) mod late_section_cache;
 /// Manifest-level TTL cache to avoid repeated S3 reads.
 pub mod manifest_cache;
 

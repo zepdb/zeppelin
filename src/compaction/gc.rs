@@ -1031,6 +1031,12 @@ pub fn reachable_keys_with_staging(
                     }
                 }
             }
+            NamespaceObjectFamily::LateSection => {
+                debug_assert!(family.participates_in_branch_locality());
+                if let Some(reference) = manifest.late_state.as_ref() {
+                    keys.insert(reference.key.clone());
+                }
+            }
             NamespaceObjectFamily::Staging => {
                 debug_assert!(!family.participates_in_branch_locality());
                 keys.extend(staging.iter().cloned());
@@ -1412,7 +1418,7 @@ struct DeletePredicateContext {
     min_newer_manifest_versions: Option<u64>,
 }
 
-/// Recognized immutable artifact families whose keys carry a creation ULID.
+/// Recognized immutable artifact families whose keys GC may sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParsedGcArtifact {
     /// One immutable WAL fragment with its file-name creation/time-ordering ULID.
@@ -1425,22 +1431,27 @@ enum ParsedGcArtifact {
         /// Creation identifier decoded from the enclosing segment directory.
         ulid: Ulid,
     },
+    /// One immutable late-state section named by its exact SHA-256.
+    LateSection,
 }
 
 impl ParsedGcArtifact {
-    /// Extracts the creation/time-ordering ULID shared by both artifact families.
+    /// Extracts the creation/time-ordering ULID when the key carries one.
     ///
     /// # Returns
     ///
-    /// The copied [`Ulid`] embedded in this parsed value.
+    /// The copied [`Ulid`] embedded in WAL and segment keys. Content-addressed
+    /// late-section keys return `None`; their LIST modification time and
+    /// candidate first-seen time provide the two horizon floors.
     ///
     /// # Examples
     ///
     /// Both a WAL key and `segments/seg_<ulid>/centroids.bin` return the ULID
-    /// encoded in their path.
-    fn ulid(self) -> Ulid {
+    /// encoded in their path. A `late/state/<sha256>` key returns `None`.
+    fn ulid(self) -> Option<Ulid> {
         match self {
-            Self::WalFragment { ulid } | Self::SegmentArtifact { ulid } => ulid,
+            Self::WalFragment { ulid } | Self::SegmentArtifact { ulid } => Some(ulid),
+            Self::LateSection => None,
         }
     }
 }
@@ -1782,10 +1793,23 @@ async fn drain_pending_deletes_with_retained_history_from(
             ));
         }
 
+        let late_section_inventory = pending_late_section_inventory(
+            store,
+            namespace,
+            &manifest.pending_deletes,
+            gc.horizon_secs,
+        )
+        .await?;
         let retry_may_delete = attempt > 0
             && manifest.pending_deletes.iter().any(|key| {
                 !retained_history.contains(key)
-                    && pending_delete_horizon_satisfied(namespace, key, now, gc.horizon_secs)
+                    && pending_delete_horizon_satisfied(
+                        namespace,
+                        key,
+                        now,
+                        gc.horizon_secs,
+                        late_section_inventory.as_ref(),
+                    )
             });
         let retry_roots = if retry_may_delete {
             let snapshot = load_history_snapshot(store, namespace, retry_history).await?;
@@ -1815,7 +1839,13 @@ async fn drain_pending_deletes_with_retained_history_from(
                 continue;
             }
 
-            if !pending_delete_horizon_satisfied(namespace, key, now, gc.horizon_secs) {
+            if !pending_delete_horizon_satisfied(
+                namespace,
+                key,
+                now,
+                gc.horizon_secs,
+                late_section_inventory.as_ref(),
+            ) {
                 retained.insert(key.clone());
                 continue;
             }
@@ -1914,6 +1944,7 @@ async fn drain_pending_deletes_with_retained_history_from(
 /// A CAS conflict may retry publication of keys already confirmed absent, but
 /// it never expands the destructive set. Newly observed pending entries wait
 /// for a later cycle and a new full inventory.
+#[allow(clippy::too_many_arguments)]
 async fn drain_pending_deletes_with_inventory_authority_from(
     store: &ZeppelinStore,
     namespace: &str,
@@ -1921,6 +1952,7 @@ async fn drain_pending_deletes_with_inventory_authority_from(
     retained_history: &BTreeSet<String>,
     now: DateTime<Utc>,
     initial_manifest: (Manifest, ManifestVersion),
+    inventory: &NamespaceInventory,
     live_roots: Option<&LiveRootObservation>,
 ) -> Result<PendingDeleteDrainOutcome> {
     let mut observed = Some(initial_manifest);
@@ -1958,7 +1990,13 @@ async fn drain_pending_deletes_with_inventory_authority_from(
             for key in &manifest.pending_deletes {
                 let deletion_key = TargetOwnedDeletionKey::classify(namespace, key.clone())?;
                 if retained_history.contains(key)
-                    || !pending_delete_horizon_satisfied(namespace, key, now, gc.horizon_secs)
+                    || !pending_delete_horizon_satisfied(
+                        namespace,
+                        key,
+                        now,
+                        gc.horizon_secs,
+                        Some(inventory),
+                    )
                 {
                     continue;
                 }
@@ -2101,8 +2139,18 @@ async fn prepare_warm_pending_delete_drain(
     };
 
     let requires_history_refresh = manifest.pending_deletes.iter().any(|key| {
-        !prune_reachable.contains(key)
-            && pending_delete_horizon_satisfied(namespace, key, now, gc.horizon_secs)
+        if prune_reachable.contains(key) {
+            return false;
+        }
+        if gc.horizon_secs > 0
+            && matches!(
+                parse_gc_artifact_key(namespace, key),
+                Some(ParsedGcArtifact::LateSection)
+            )
+        {
+            return true;
+        }
+        pending_delete_horizon_satisfied(namespace, key, now, gc.horizon_secs, None)
     });
     if !requires_history_refresh {
         let retained = manifest
@@ -2161,6 +2209,7 @@ async fn prepare_warm_pending_delete_drain(
         &retained_history,
         now,
         observed,
+        &predelete_inventory,
         Some(live_roots),
     )
     .await?;
@@ -2171,12 +2220,34 @@ async fn prepare_warm_pending_delete_drain(
     })
 }
 
+async fn pending_late_section_inventory(
+    store: &ZeppelinStore,
+    namespace: &str,
+    pending: &[String],
+    horizon_secs: u64,
+) -> Result<Option<NamespaceInventory>> {
+    if horizon_secs == 0
+        || !pending.iter().any(|key| {
+            matches!(
+                parse_gc_artifact_key(namespace, key),
+                Some(ParsedGcArtifact::LateSection)
+            )
+        })
+    {
+        return Ok(None);
+    }
+
+    let prefix = NamespaceObjectFamily::LateSection.namespace_prefix(namespace);
+    NamespaceInventory::from_listed(namespace, store.list_prefix_meta(&prefix).await?).map(Some)
+}
+
 /// Checks whether a deferred-delete key is old enough for physical removal.
 ///
-/// Age comes from the artifact ULID embedded in the key, not
-/// `Manifest::updated_at`, because unrelated writes continually refresh the
-/// manifest timestamp. Unknown key shapes fail closed. A zero horizon is an
-/// explicit test/emergency override that accepts every shape immediately.
+/// WAL and segment age comes from the artifact ULID embedded in the key, not
+/// `Manifest::updated_at`. Content-addressed late-section age comes from one
+/// authoritative LIST observation. Unknown key shapes or a missing required
+/// observation fail closed. A zero horizon is an explicit test/emergency
+/// override that accepts every shape immediately.
 ///
 /// # Parameters
 ///
@@ -2184,11 +2255,13 @@ async fn prepare_warm_pending_delete_drain(
 /// - `key`: Candidate WAL or known segment-artifact object key.
 /// - `now`: Reference wall-clock time for deterministic age calculation.
 /// - `horizon_secs`: Required minimum creation age in whole seconds.
+/// - `late_section_inventory`: Authoritative LIST metadata when `key` names a
+///   late-state section. An absent key is already safe to prune.
 ///
 /// # Returns
 ///
-/// `true` when the horizon is zero or the parsed artifact ULID is at least that
-/// old; `false` for young or unrecognized keys.
+/// `true` when the horizon is zero, the parsed artifact ULID is old enough, the
+/// listed late object is old enough, or that late object is absent.
 ///
 /// # Examples
 ///
@@ -2199,22 +2272,26 @@ fn pending_delete_horizon_satisfied(
     key: &str,
     now: DateTime<Utc>,
     horizon_secs: u64,
+    late_section_inventory: Option<&NamespaceInventory>,
 ) -> bool {
     if horizon_secs == 0 {
         return true;
     }
 
-    // Pending-delete artifacts carry their creation ULID in the key itself:
-    // WAL fragments use the fragment ID, and segment artifacts live under
-    // `segments/seg_<ulid>/`. That per-artifact creation clock is the
-    // authoritative age; manifest.updated_at moves on every write and must not
-    // gate deletion in a busy namespace. Unknown key shapes stay retained.
     let Some(parsed) = parse_gc_artifact_key(namespace, key) else {
         return false;
     };
-    let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
-    let ulid_age_secs = super::fragment_age_secs(&parsed.ulid(), now_ms);
-    ulid_age_secs >= horizon_secs
+    match parsed {
+        ParsedGcArtifact::WalFragment { ulid } | ParsedGcArtifact::SegmentArtifact { ulid } => {
+            let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+            super::fragment_age_secs(&ulid, now_ms) >= horizon_secs
+        }
+        ParsedGcArtifact::LateSection => late_section_inventory.is_some_and(|inventory| {
+            inventory
+                .object(key)
+                .is_none_or(|object| listed_object_horizon_satisfied(object, now, horizon_secs))
+        }),
+    }
 }
 
 /// Decodes empty, versioned, or legacy candidate-ledger JSON.
@@ -3108,15 +3185,27 @@ impl From<ZeppelinError> for NextGcDeadlineError {
     }
 }
 
+struct NextGcDeadlineInputs<'a> {
+    candidates: &'a [GcCandidate],
+    manifest: &'a Manifest,
+    history: &'a HistorySnapshot,
+    staging: &'a ActiveStagingObservation,
+    inventory: Option<&'a NamespaceInventory>,
+}
+
 fn next_gc_deadline(
     namespace: &str,
     gc: &GcConfig,
     now: DateTime<Utc>,
-    candidates: &[GcCandidate],
-    manifest: &Manifest,
-    history: &HistorySnapshot,
-    staging: &ActiveStagingObservation,
+    inputs: NextGcDeadlineInputs<'_>,
 ) -> std::result::Result<Option<DateTime<Utc>>, NextGcDeadlineError> {
+    let NextGcDeadlineInputs {
+        candidates,
+        manifest,
+        history,
+        staging,
+        inventory,
+    } = inputs;
     let mut next = None;
     let mut consider_deadline = |deadline: DateTime<Utc>, include_overdue: bool| {
         let deadline = if include_overdue && deadline <= now {
@@ -3153,14 +3242,18 @@ fn next_gc_deadline(
             .map_err(|()| NextGcDeadlineError::InvalidSchedule)?;
         let artifact = parse_gc_artifact_key(namespace, &candidate.key)
             .ok_or(NextGcDeadlineError::InvalidSchedule)?;
-        let artifact_created = DateTime::<Utc>::from_timestamp_millis(
-            i64::try_from(artifact.ulid().timestamp_ms())
-                .map_err(|_| NextGcDeadlineError::InvalidSchedule)?,
-        )
-        .ok_or(NextGcDeadlineError::InvalidSchedule)?;
-        let artifact_due = deadline_after_secs(artifact_created, gc.horizon_secs)
-            .map_err(|()| NextGcDeadlineError::InvalidSchedule)?;
-        let deadline = first_seen.max(artifact_due);
+        let deadline = if let Some(ulid) = artifact.ulid() {
+            let artifact_created = DateTime::<Utc>::from_timestamp_millis(
+                i64::try_from(ulid.timestamp_ms())
+                    .map_err(|_| NextGcDeadlineError::InvalidSchedule)?,
+            )
+            .ok_or(NextGcDeadlineError::InvalidSchedule)?;
+            let artifact_due = deadline_after_secs(artifact_created, gc.horizon_secs)
+                .map_err(|()| NextGcDeadlineError::InvalidSchedule)?;
+            first_seen.max(artifact_due)
+        } else {
+            first_seen
+        };
         consider_deadline(deadline, true);
     }
 
@@ -3171,13 +3264,22 @@ fn next_gc_deadline(
         let Some(artifact) = parse_gc_artifact_key(namespace, key) else {
             continue;
         };
-        let artifact_created = DateTime::<Utc>::from_timestamp_millis(
-            i64::try_from(artifact.ulid().timestamp_ms())
-                .map_err(|_| NextGcDeadlineError::InvalidSchedule)?,
-        )
-        .ok_or(NextGcDeadlineError::InvalidSchedule)?;
-        let deadline = deadline_after_secs(artifact_created, gc.horizon_secs)
-            .map_err(|()| NextGcDeadlineError::InvalidSchedule)?;
+        let deadline = if let Some(ulid) = artifact.ulid() {
+            let artifact_created = DateTime::<Utc>::from_timestamp_millis(
+                i64::try_from(ulid.timestamp_ms())
+                    .map_err(|_| NextGcDeadlineError::InvalidSchedule)?,
+            )
+            .ok_or(NextGcDeadlineError::InvalidSchedule)?;
+            deadline_after_secs(artifact_created, gc.horizon_secs)
+                .map_err(|()| NextGcDeadlineError::InvalidSchedule)?
+        } else {
+            let inventory = inventory.ok_or(NextGcDeadlineError::InvalidSchedule)?;
+            match inventory.object(key) {
+                Some(object) => deadline_after_secs(object.last_modified, gc.horizon_secs)
+                    .map_err(|()| NextGcDeadlineError::InvalidSchedule)?,
+                None => now,
+            }
+        };
         consider_deadline(deadline, true);
     }
 
@@ -4474,10 +4576,13 @@ async fn run_gc_cycle_at_inner(
             namespace,
             gc,
             now,
-            &retained,
-            &sweep_manifest,
-            &sweep_history_snapshot,
-            &sweep_staging,
+            NextGcDeadlineInputs {
+                candidates: &retained,
+                manifest: &sweep_manifest,
+                history: &sweep_history_snapshot,
+                staging: &sweep_staging,
+                inventory: completed_inventory.as_ref(),
+            },
         ) {
             Ok(deadline) => deadline,
             Err(NextGcDeadlineError::Reachability(error)) => return Err(error),
@@ -4592,15 +4697,16 @@ fn should_delete_candidate(
         }
     }
 
-    let now_ms = u64::try_from(context.now.timestamp_millis()).unwrap_or(0);
-    let artifact_ulid = parsed.ulid();
-    let ulid_age_secs = super::fragment_age_secs(&artifact_ulid, now_ms);
-    if ulid_age_secs < context.horizon_secs {
-        return DeleteDecision::Skip(SkipReason::UlidTooYoung);
-    }
-    if let Some(oldest_ms) = context.oldest_inflight_ulid_ms {
-        if artifact_ulid.timestamp_ms() > oldest_ms {
-            return DeleteDecision::Skip(SkipReason::NewerThanInflightCompaction);
+    if let Some(artifact_ulid) = parsed.ulid() {
+        let now_ms = u64::try_from(context.now.timestamp_millis()).unwrap_or(0);
+        let ulid_age_secs = super::fragment_age_secs(&artifact_ulid, now_ms);
+        if ulid_age_secs < context.horizon_secs {
+            return DeleteDecision::Skip(SkipReason::UlidTooYoung);
+        }
+        if let Some(oldest_ms) = context.oldest_inflight_ulid_ms {
+            if artifact_ulid.timestamp_ms() > oldest_ms {
+                return DeleteDecision::Skip(SkipReason::NewerThanInflightCompaction);
+            }
         }
     }
 
@@ -4628,7 +4734,8 @@ fn oldest_inflight_ulid_ms(namespace: &str, staged: &BTreeSet<String>) -> Option
     staged
         .iter()
         .filter_map(|key| parse_gc_artifact_key(namespace, key))
-        .map(|artifact| artifact.ulid().timestamp_ms())
+        .filter_map(ParsedGcArtifact::ulid)
+        .map(|ulid| ulid.timestamp_ms())
         .min()
 }
 
@@ -4726,8 +4833,9 @@ fn extend_scoped_artifact_roots(
 ///
 /// Valid WAL keys are `<namespace>/wal/<ulid>.wal`. Valid segment keys live
 /// directly beneath `<namespace>/segments/seg_<ulid>/` or in the explicit
-/// `security_scopes` derivative grammar. Invalid ULIDs, arbitrary nested paths,
-/// and maintenance/control objects are rejected.
+/// `security_scopes` derivative grammar. Valid late-section keys are exactly
+/// `<namespace>/late/state/<sha256>`. Invalid identifiers, arbitrary nested
+/// paths, and maintenance/control objects are rejected.
 ///
 /// # Parameters
 ///
@@ -4751,25 +4859,52 @@ fn extend_scoped_artifact_roots(
 /// there is no null pointer or sentinel ULID. The `?` operators return `None`
 /// from the helper as soon as a required path component is absent.
 fn parse_gc_artifact_key(namespace: &str, key: &str) -> Option<ParsedGcArtifact> {
-    let wal_prefix = NamespaceObjectFamily::Wal.namespace_prefix(namespace);
-    if let Some(name) = key.strip_prefix(&wal_prefix) {
-        let id = name.strip_suffix(".wal")?;
-        if id.contains('/') {
-            return None;
+    let family = NamespaceObjectKey::classify(namespace, key.to_string())
+        .ok()?
+        .family();
+    match family {
+        NamespaceObjectFamily::Wal => {
+            let wal_prefix = NamespaceObjectFamily::Wal.namespace_prefix(namespace);
+            let name = key.strip_prefix(&wal_prefix)?;
+            let id = name.strip_suffix(".wal")?;
+            if id.contains('/') {
+                return None;
+            }
+            Ulid::from_string(id)
+                .ok()
+                .map(|ulid| ParsedGcArtifact::WalFragment { ulid })
         }
-        return Ulid::from_string(id)
-            .ok()
-            .map(|ulid| ParsedGcArtifact::WalFragment { ulid });
-    }
-
-    let (_, path, ulid) = parse_segment_key(namespace, key)?;
-    if (!path.contains('/')
-        && (is_known_segment_artifact_name(path) || is_known_tree_node_name(path)))
-        || is_known_scoped_artifact_path(path)
-    {
-        Some(ParsedGcArtifact::SegmentArtifact { ulid })
-    } else {
-        None
+        NamespaceObjectFamily::Segment => {
+            let (_, path, ulid) = parse_segment_key(namespace, key)?;
+            if (!path.contains('/')
+                && (is_known_segment_artifact_name(path) || is_known_tree_node_name(path)))
+                || is_known_scoped_artifact_path(path)
+            {
+                Some(ParsedGcArtifact::SegmentArtifact { ulid })
+            } else {
+                None
+            }
+        }
+        NamespaceObjectFamily::LateSection => {
+            let prefix = format!(
+                "{}state/",
+                NamespaceObjectFamily::LateSection.namespace_prefix(namespace)
+            );
+            let checksum = key.strip_prefix(&prefix)?;
+            (checksum.len() == 64
+                && checksum
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+            .then_some(ParsedGcArtifact::LateSection)
+        }
+        NamespaceObjectFamily::Metadata
+        | NamespaceObjectFamily::Manifest
+        | NamespaceObjectFamily::Lease
+        | NamespaceObjectFamily::ManifestHistory
+        | NamespaceObjectFamily::Snapshot
+        | NamespaceObjectFamily::Staging
+        | NamespaceObjectFamily::Gc
+        | NamespaceObjectFamily::BranchVisibilityRemoved => None,
     }
 }
 
@@ -6452,6 +6587,111 @@ mod tests {
     }
 
     #[test]
+    fn late_section_gc_grammar_accepts_only_canonical_content_address() {
+        let key = crate::wal::LateStateSection::s3_key(NS, &[0xab; 32]);
+        assert_eq!(
+            parse_gc_artifact_key(NS, &key),
+            Some(ParsedGcArtifact::LateSection)
+        );
+        let uppercase_checksum = format!(
+            "{}state/{}",
+            NamespaceObjectFamily::LateSection.namespace_prefix(NS),
+            "AB".repeat(32)
+        );
+        assert!(parse_gc_artifact_key(NS, &uppercase_checksum).is_none());
+        assert!(parse_gc_artifact_key(NS, &format!("{key}/extra")).is_none());
+    }
+
+    #[test]
+    fn late_section_horizons_use_authoritative_list_metadata() {
+        let now = Utc::now();
+        let key = crate::wal::LateStateSection::s3_key(NS, &[0xcd; 32]);
+        let candidate = GcCandidate {
+            key: key.clone(),
+            first_seen_unreachable_at: now - chrono::Duration::seconds(30),
+            unreachable_since_manifest_version: 1,
+        };
+        assert_eq!(
+            should_delete_candidate(NS, &candidate, &BTreeSet::new(), delete_context(5, now)),
+            DeleteDecision::Delete,
+            "the sweep-level LIST floor remains separate from the pure predicate"
+        );
+
+        let young = ListedObject {
+            key: key.clone(),
+            size: 6,
+            last_modified: now - chrono::Duration::seconds(1),
+            version: None,
+        };
+        assert!(!listed_object_horizon_satisfied(&young, now, 5));
+        let young_inventory = NamespaceInventory::from_listed(NS, vec![young.clone()])
+            .expect("young fixture inventory must classify");
+        let old = ListedObject {
+            last_modified: now - chrono::Duration::seconds(30),
+            ..young
+        };
+        assert!(listed_object_horizon_satisfied(&old, now, 5));
+
+        let inventory = NamespaceInventory::from_listed(NS, vec![old])
+            .expect("fixture inventory must classify");
+        assert!(pending_delete_horizon_satisfied(
+            NS,
+            &key,
+            now,
+            5,
+            Some(&inventory)
+        ));
+        assert!(!pending_delete_horizon_satisfied(NS, &key, now, 5, None));
+
+        let mut pending_manifest = Manifest::new_at(now);
+        pending_manifest.pending_deletes.push(key);
+        let gc = GcConfig {
+            horizon_secs: 5,
+            pitr_retention_secs: 0,
+            ..GcConfig::default()
+        };
+        let history = HistorySnapshot {
+            entries: Vec::new(),
+            cacheable: BTreeMap::new(),
+        };
+        let staging = ActiveStagingObservation {
+            keys: BTreeSet::new(),
+            lease_expires_at: None,
+        };
+        let deadline = match next_gc_deadline(
+            NS,
+            &gc,
+            now,
+            NextGcDeadlineInputs {
+                candidates: &[],
+                manifest: &pending_manifest,
+                history: &history,
+                staging: &staging,
+                inventory: Some(&young_inventory),
+            },
+        ) {
+            Ok(deadline) => deadline,
+            Err(_) => panic!("listed late-section deadline must be schedulable"),
+        };
+        assert_eq!(deadline, Some(now + chrono::Duration::seconds(4)));
+        assert!(matches!(
+            next_gc_deadline(
+                NS,
+                &gc,
+                now,
+                NextGcDeadlineInputs {
+                    candidates: &[],
+                    manifest: &pending_manifest,
+                    history: &history,
+                    staging: &staging,
+                    inventory: None,
+                },
+            ),
+            Err(NextGcDeadlineError::InvalidSchedule)
+        ));
+    }
+
+    #[test]
     fn direct_hierarchical_nodes_enter_pending_delete_and_orphan_gc_grammar() {
         let now = Utc::now();
         let segment_ulid = ulid_seconds_ago(30, 301);
@@ -6465,7 +6705,7 @@ mod tests {
             "a direct routing node must be a production GC artifact"
         );
         assert!(
-            pending_delete_horizon_satisfied(NS, &key, now, 5),
+            pending_delete_horizon_satisfied(NS, &key, now, 5, None),
             "an old direct routing node must drain from pending_deletes"
         );
 
@@ -6542,7 +6782,7 @@ mod tests {
         let key = WalFragment::s3_key(NS, &old_id);
 
         assert!(
-            pending_delete_horizon_satisfied(NS, &key, now, 5),
+            pending_delete_horizon_satisfied(NS, &key, now, 5, None),
             "a busy namespace must drain old pending deletes even when manifest.updated_at is fresh"
         );
     }
@@ -6557,7 +6797,7 @@ mod tests {
         let key = WalFragment::s3_key(NS, &young_id);
 
         assert!(
-            !pending_delete_horizon_satisfied(NS, &key, now, 5),
+            !pending_delete_horizon_satisfied(NS, &key, now, 5, None),
             "manifest.updated_at must not allow a key younger than the horizon to drain"
         );
     }
@@ -6572,7 +6812,7 @@ mod tests {
         let key = format!("{NS}/wal/not-a-ulid.wal");
 
         assert!(
-            !pending_delete_horizon_satisfied(NS, &key, now, 5),
+            !pending_delete_horizon_satisfied(NS, &key, now, 5, None),
             "keys without parseable artifact ULIDs must be retained fail-closed"
         );
     }
@@ -6587,7 +6827,7 @@ mod tests {
         let key = format!("{NS}/wal/not-a-ulid.wal");
 
         assert!(
-            pending_delete_horizon_satisfied(NS, &key, now, 0),
+            pending_delete_horizon_satisfied(NS, &key, now, 0, None),
             "zero horizon remains the test hook for immediate drain"
         );
     }

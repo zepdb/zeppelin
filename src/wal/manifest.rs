@@ -149,6 +149,11 @@ use crate::storage::store::DELETE_MANY_MAX_KEYS;
 use crate::storage::{
     CreateOnlyOutcome, ListedObject, NamespaceObjectKey, StorageVersion, ZeppelinStore,
 };
+use crate::wal::late_section::{LateStateSection, ManifestSectionRef, LATE_STATE_FORMAT_VERSION};
+
+fn checksum_hex(checksum: &[u8; 32]) -> String {
+    checksum.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 /// Prefix byte identifying Zeppelin's current MessagePack manifest encoding.
 ///
@@ -1083,6 +1088,12 @@ pub struct Manifest {
     /// field existed. New persisted fields must remain after this position.
     #[serde(default)]
     coarse_payload_encodings: BTreeMap<String, CoarsePayloadEncoding>,
+    /// Immutable content-addressed late-interaction state section.
+    ///
+    /// Dense namespaces keep this absent. It must remain the final persisted
+    /// field because MessagePack encodes manifests positionally.
+    #[serde(default)]
+    pub late_state: Option<ManifestSectionRef>,
 }
 
 /// Stable manifest execution projection version.
@@ -1100,6 +1111,9 @@ pub enum ManifestBindingVersion {
     /// Origin-aware execution plus immutable lineage/roots control projection.
     #[serde(rename = "v4_lineage")]
     V4Lineage,
+    /// Late-state reference plus optional lineage/roots control projection.
+    #[serde(rename = "v5_late_state")]
+    V5LateState,
 }
 
 #[derive(Serialize)]
@@ -1253,6 +1267,15 @@ struct ManifestExecutionBindingV3<'a> {
     artifact_origins: Vec<ArtifactOriginExecutionBindingV2<'a>>,
 }
 
+/// Late-state-aware execution projection introduced by manifest binding V5.
+#[derive(Serialize)]
+struct ManifestExecutionBindingV4<'a> {
+    format: &'static str,
+    prior: ManifestExecutionBindingV3<'a>,
+    late_state: &'a ManifestSectionRef,
+    late_state_origin: ArtifactOriginExecutionBindingV2<'a>,
+}
+
 #[derive(Serialize)]
 struct ManifestExecutionBindingV2<'a> {
     format: &'static str,
@@ -1282,6 +1305,18 @@ struct ControlBranchV2<'a> {
     deletion_fence: Option<&'a ManifestDeletionFence>,
     branch_roots: &'a BTreeMap<BranchId, BranchRoot>,
     branch_lineage: &'a BranchLineage,
+}
+
+/// Exact late-state, lineage, and retention projection introduced by V5.
+#[derive(Serialize)]
+struct ControlLateStateV3<'a> {
+    namespace: &'a str,
+    incarnation: Option<[u8; 16]>,
+    deletion_fence: Option<&'a ManifestDeletionFence>,
+    branch_roots: &'a BTreeMap<BranchId, BranchRoot>,
+    branch_lineage: Option<&'a BranchLineage>,
+    late_state: &'a ManifestSectionRef,
+    late_state_origin: Option<ArtifactOriginExecutionBindingV2<'a>>,
 }
 
 /// Non-circular immutable inputs used to construct a target branch lineage.
@@ -1398,6 +1433,25 @@ struct ForkViewProjectionV2<'a> {
     source_config_sha256: SourceDataPlaneConfigDigest,
     depth: u16,
     execution: ManifestExecutionBindingV3<'a>,
+}
+
+/// Initial-view projection for a manifest carrying a late-state section.
+///
+/// Frozen V1/V2 projections remain untouched. This variant binds the exact
+/// section reference and its resolved physical namespace lifetime.
+#[derive(Serialize)]
+struct ForkViewProjectionV3<'a> {
+    domain: &'static str,
+    target_namespace: &'a str,
+    target_incarnation: [u8; 16],
+    source_namespace: &'a str,
+    source_incarnation: [u8; 16],
+    branch_id: BranchId,
+    source_generation: ManifestGeneration,
+    source_manifest_sha256: ManifestDigest,
+    source_config_sha256: SourceDataPlaneConfigDigest,
+    depth: u16,
+    execution: ManifestExecutionBindingV4<'a>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1543,7 +1597,138 @@ impl Manifest {
             branch_roots: BTreeMap::new(),
             branch_lineage: None,
             coarse_payload_encodings: BTreeMap::new(),
+            late_state: None,
         }
+    }
+
+    /// Load and verify the manifest-selected immutable late-state section.
+    pub async fn load_late_state(&self, store: &ZeppelinStore) -> Result<Option<LateStateSection>> {
+        let Some(reference) = self.late_state.as_ref() else {
+            return Ok(None);
+        };
+        if reference.format_version != LATE_STATE_FORMAT_VERSION {
+            return Err(ZeppelinError::Serialization(format!(
+                "late-state reference {} declares unsupported format version {}",
+                reference.key, reference.format_version
+            )));
+        }
+        if let Some(section) = crate::cache::late_section_cache::get(reference) {
+            return Ok(Some(section));
+        }
+
+        let bytes = store.get(&reference.key).await?;
+        let actual_size = u64::try_from(bytes.len()).map_err(|_| {
+            ZeppelinError::Serialization(format!(
+                "late-state section {} size does not fit persisted u64",
+                reference.key
+            ))
+        })?;
+        if actual_size != reference.size_bytes {
+            return Err(ZeppelinError::Serialization(format!(
+                "late-state section {} size mismatch: expected {}, got {}",
+                reference.key, reference.size_bytes, actual_size
+            )));
+        }
+        let actual_checksum = LateStateSection::checksum(&bytes);
+        if actual_checksum != reference.checksum {
+            return Err(ZeppelinError::Serialization(format!(
+                "late-state section {} checksum mismatch: expected {}, got {}",
+                reference.key,
+                checksum_hex(&reference.checksum),
+                checksum_hex(&actual_checksum)
+            )));
+        }
+        let section = LateStateSection::from_bytes(&bytes)?;
+        crate::cache::late_section_cache::insert(reference, section.clone());
+        Ok(Some(section))
+    }
+
+    /// Publish one late-state section with the root-manifest CAS as visibility.
+    ///
+    /// A conflict reloads the authoritative root, preserves unrelated live
+    /// fields, and reapplies only the section reference plus any local
+    /// superseded-section pending delete.
+    pub async fn publish_with_late_state(
+        &mut self,
+        store: &ZeppelinStore,
+        namespace: &str,
+        version: &ManifestVersion,
+        section: &LateStateSection,
+    ) -> Result<ManifestVersion> {
+        const MAX_PUBLISH_ATTEMPTS: usize = 8;
+
+        let desired_bytes = section.to_bytes()?;
+        let desired_checksum = LateStateSection::checksum(&desired_bytes);
+        let desired_size = u64::try_from(desired_bytes.len()).map_err(|_| {
+            ZeppelinError::Serialization(
+                "late-state section size does not fit persisted u64".to_string(),
+            )
+        })?;
+        let mut current_version = version.clone();
+
+        for _ in 0..MAX_PUBLISH_ATTEMPTS {
+            let current_section = self.load_late_state(store).await?;
+            let converged = current_section.is_some()
+                && self.late_state.as_ref().is_some_and(|reference| {
+                    reference.checksum == desired_checksum
+                        && reference.size_bytes == desired_size
+                        && reference.format_version == LATE_STATE_FORMAT_VERSION
+                });
+            let next_reference = if converged {
+                self.late_state.clone().ok_or_else(|| {
+                    ZeppelinError::Serialization(
+                        "late-state convergence lost its manifest reference".to_string(),
+                    )
+                })?
+            } else {
+                section.put_create(store, namespace).await?
+            };
+
+            if let Some(previous) = self.late_state.replace(next_reference.clone()) {
+                if previous.key != next_reference.key {
+                    let previous_origin = self.late_section_origin(&previous)?;
+                    if previous_origin == self.local_origin()? {
+                        let owned = NamespaceObjectKey::classify(namespace, previous.key.clone())?;
+                        if owned.family() != crate::storage::NamespaceObjectFamily::LateSection {
+                            return Err(ZeppelinError::Validation(format!(
+                                "superseded late-state key is not in the late section family: {}",
+                                previous.key
+                            )));
+                        }
+                        if !self
+                            .pending_deletes
+                            .iter()
+                            .any(|pending| pending == &previous.key)
+                        {
+                            self.pending_deletes.push(previous.key);
+                        }
+                    }
+                }
+            }
+
+            match self
+                .write_conditional(store, namespace, &current_version)
+                .await
+            {
+                Ok(published) => return Ok(published),
+                Err(ZeppelinError::ManifestConflict { .. }) => {
+                    let Some((authoritative, authoritative_version)) =
+                        Self::read_versioned(store, namespace).await?
+                    else {
+                        return Err(ZeppelinError::ManifestNotFound {
+                            namespace: namespace.to_string(),
+                        });
+                    };
+                    *self = authoritative;
+                    current_version = authoritative_version;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(ZeppelinError::ManifestConflict {
+            namespace: namespace.to_string(),
+        })
     }
 
     /// Returns the manifest-selected coarse decoder for one segment.
@@ -1923,6 +2108,17 @@ impl Manifest {
         }
     }
 
+    /// Resolve one immutable late-state section's physical namespace lifetime.
+    pub(crate) fn late_section_origin(
+        &self,
+        reference: &ManifestSectionRef,
+    ) -> Result<ArtifactOrigin> {
+        match reference.artifact_origin {
+            Some(index) => self.indexed_artifact_origin("late-section", &reference.key, index),
+            None => self.local_origin(),
+        }
+    }
+
     fn validate_origin_entry(&self, origin: &ArtifactOrigin, index: usize) -> Result<()> {
         NamespaceId::parse(origin.namespace.as_str().to_string()).map_err(|_| {
             self.artifact_origin_error(
@@ -2047,12 +2243,60 @@ impl Manifest {
                 self.validate_explicit_origin_key(segment, &origin, &object.key)?;
             }
         }
+        if let Some(reference) = &self.late_state {
+            if reference.artifact_origin.is_some() {
+                self.late_section_origin(reference)?;
+            }
+        }
         Ok(())
     }
 
     /// Validate the complete persisted origin table and every descriptor index.
     pub(crate) fn validate_artifact_origins(&self) -> Result<()> {
         self.validate_artifact_origins_structural(true)
+    }
+
+    fn validate_late_state_reference(&self, namespace: &str) -> Result<()> {
+        let Some(reference) = self.late_state.as_ref() else {
+            return Ok(());
+        };
+        if reference.format_version != LATE_STATE_FORMAT_VERSION {
+            return Err(ZeppelinError::Serialization(format!(
+                "late-state reference {} declares unsupported format version {}",
+                reference.key, reference.format_version
+            )));
+        }
+        let physical_namespace = match reference.artifact_origin {
+            Some(index) => self
+                .indexed_artifact_origin_ref("late-section", &reference.key, index)?
+                .namespace
+                .as_str(),
+            None => namespace,
+        };
+        let expected_key = LateStateSection::s3_key(physical_namespace, &reference.checksum);
+        if reference.key != expected_key {
+            let expected_origin = reference.artifact_origin.and_then(|index| {
+                self.indexed_artifact_origin_ref("late-section", &reference.key, index)
+                    .ok()
+                    .cloned()
+            });
+            return Err(self.artifact_origin_error(
+                "late-section",
+                &reference.key,
+                reference.artifact_origin,
+                Some(reference.key.clone()),
+                expected_origin,
+                format!("late-state key must equal content-addressed key {expected_key}"),
+            ));
+        }
+        let classified = NamespaceObjectKey::classify(physical_namespace, reference.key.clone())?;
+        if classified.family() != crate::storage::NamespaceObjectFamily::LateSection {
+            return Err(ZeppelinError::Validation(format!(
+                "late-state reference is outside the registered late section family: {}",
+                reference.key
+            )));
+        }
+        Ok(())
     }
 
     fn validate_branch_lineage_state(&self, namespace: &str) -> Result<()> {
@@ -2106,6 +2350,13 @@ impl Manifest {
                 referenced.insert(index);
             }
         }
+        if let Some(index) = self
+            .late_state
+            .as_ref()
+            .and_then(|reference| reference.artifact_origin)
+        {
+            referenced.insert(index);
+        }
         if self.artifact_origins.iter().enumerate().any(|(index, _)| {
             u32::try_from(index)
                 .ok()
@@ -2133,6 +2384,10 @@ impl Manifest {
                 .segments
                 .iter()
                 .any(|segment| segment.artifact_origin.is_some())
+            && self
+                .late_state
+                .as_ref()
+                .is_none_or(|reference| reference.artifact_origin.is_none())
         {
             return Ok(());
         }
@@ -2152,7 +2407,13 @@ impl Manifest {
                     .is_ok_and(|origin| origin != local)
             })
         });
-        if (foreign_fragment.is_some() || foreign_segment.is_some())
+        let foreign_late_state = self.late_state.as_ref().is_some_and(|reference| {
+            reference.artifact_origin.is_some()
+                && self
+                    .late_section_origin(reference)
+                    .is_ok_and(|origin| origin != local)
+        });
+        if (foreign_fragment.is_some() || foreign_segment.is_some() || foreign_late_state)
             && self.branch_lineage.is_none()
         {
             return Err(BranchError::BranchingNotReady {
@@ -2177,9 +2438,18 @@ impl Manifest {
             .iter()
             .map(|segment| self.segment_origin(segment))
             .collect::<Result<Vec<_>>>()?;
+        let late_section_origin = self
+            .late_state
+            .as_ref()
+            .map(|reference| self.late_section_origin(reference))
+            .transpose()?;
 
         let mut builder = ArtifactOriginSetBuilder::default();
-        for origin in fragment_origins.iter().chain(&segment_origins) {
+        for origin in fragment_origins
+            .iter()
+            .chain(&segment_origins)
+            .chain(late_section_origin.iter())
+        {
             builder.collect(origin.clone())?;
         }
         let canonical = builder.finish()?;
@@ -2210,12 +2480,28 @@ impl Manifest {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        let late_section_index = late_section_origin
+            .as_ref()
+            .map(|origin| {
+                self.canonical_origin_index(
+                    &canonical.indices,
+                    "late-section",
+                    self.late_state
+                        .as_ref()
+                        .map_or_else(String::new, |reference| reference.key.clone()),
+                    origin,
+                )
+            })
+            .transpose()?;
 
         for (fragment, index) in self.fragments.iter_mut().zip(fragment_indices) {
             fragment.artifact_origin = Some(index);
         }
         for (segment, index) in self.segments.iter_mut().zip(segment_indices) {
             segment.artifact_origin = Some(index);
+        }
+        if let Some(reference) = self.late_state.as_mut() {
+            reference.artifact_origin = late_section_index;
         }
         self.artifact_origins = canonical.table;
         Ok(())
@@ -2260,9 +2546,23 @@ impl Manifest {
                 None => Ok(None),
             })
             .collect::<Result<Vec<_>>>()?;
+        let late_section_origin = self
+            .late_state
+            .as_ref()
+            .map(|reference| match reference.artifact_origin {
+                Some(_) => self.late_section_origin(reference).map(Some),
+                None => Ok(None),
+            })
+            .transpose()?
+            .flatten();
 
         let mut builder = ArtifactOriginSetBuilder::default();
-        for origin in fragment_origins.iter().chain(&segment_origins).flatten() {
+        for origin in fragment_origins
+            .iter()
+            .chain(&segment_origins)
+            .flatten()
+            .chain(late_section_origin.iter())
+        {
             builder.collect(origin.clone())?;
         }
         let canonical = builder.finish()?;
@@ -2303,12 +2603,28 @@ impl Manifest {
                     .transpose()
             })
             .collect::<Result<Vec<_>>>()?;
+        let late_section_index = late_section_origin
+            .as_ref()
+            .map(|origin| {
+                self.canonical_origin_index(
+                    &canonical.indices,
+                    "late-section",
+                    self.late_state
+                        .as_ref()
+                        .map_or_else(String::new, |reference| reference.key.clone()),
+                    origin,
+                )
+            })
+            .transpose()?;
 
         for (fragment, index) in self.fragments.iter_mut().zip(fragment_indices) {
             fragment.artifact_origin = index;
         }
         for (segment, index) in self.segments.iter_mut().zip(segment_indices) {
             segment.artifact_origin = index;
+        }
+        if let Some(reference) = self.late_state.as_mut() {
+            reference.artifact_origin = late_section_index;
         }
         self.artifact_origins = canonical.table;
         Ok(())
@@ -2574,8 +2890,11 @@ impl Manifest {
             Some(ManifestBindingVersion::V4Lineage) => {
                 self.compute_control_branch_digest(namespace)
             }
+            Some(ManifestBindingVersion::V5LateState) => {
+                self.compute_control_late_state_digest(namespace)
+            }
             _ => Err(ZeppelinError::Serialization(
-                "manifest control digest requires manifest binding v3_roots or v4_lineage"
+                "manifest control digest requires binding v3_roots, v4_lineage, or v5_late_state"
                     .to_string(),
             )),
         }
@@ -2627,6 +2946,41 @@ impl Manifest {
         .map_err(|error| {
             ZeppelinError::Serialization(format!(
                 "manifest branch control binding serialization failed: {error}"
+            ))
+        })?;
+        Ok(Sha256::digest(bytes).into())
+    }
+
+    fn compute_control_late_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
+        self.validate_namespace_binding(namespace)?;
+        self.validate_branch_root_state(namespace)?;
+        self.validate_branch_lineage_state(namespace)?;
+        self.validate_late_state_reference(namespace)?;
+        let late_state = self.late_state.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(
+                "manifest binding v5_late_state requires a late-state reference".to_string(),
+            )
+        })?;
+        let late_state_origin = late_state
+            .artifact_origin
+            .map(|index| self.indexed_artifact_origin_ref("late-section", &late_state.key, index))
+            .transpose()?
+            .map(|origin| ArtifactOriginExecutionBindingV2 {
+                namespace: origin.namespace.as_str(),
+                incarnation: *origin.incarnation.as_uuid().as_bytes(),
+            });
+        let bytes = serde_json::to_vec(&ControlLateStateV3 {
+            namespace,
+            incarnation: self.namespace_incarnation.map(|incarnation| incarnation.0),
+            deletion_fence: self.deletion_fence.as_ref(),
+            branch_roots: &self.branch_roots,
+            branch_lineage: self.branch_lineage.as_ref(),
+            late_state,
+            late_state_origin,
+        })
+        .map_err(|error| {
+            ZeppelinError::Serialization(format!(
+                "manifest late-state control binding serialization failed: {error}"
             ))
         })?;
         Ok(Sha256::digest(bytes).into())
@@ -2785,6 +3139,33 @@ impl Manifest {
             hierarchical_routing_nodes: v2.hierarchical_routing_nodes,
             artifact_origins: v2.artifact_origins,
         }
+    }
+
+    fn execution_binding_v4<'a>(
+        &'a self,
+        namespace: &'a str,
+        authoritative_local: &'a ArtifactOrigin,
+    ) -> Result<ManifestExecutionBindingV4<'a>> {
+        let late_state = self.late_state.as_ref().ok_or_else(|| {
+            ZeppelinError::Serialization(
+                "late-state execution binding requires a section reference".to_string(),
+            )
+        })?;
+        let physical_origin = match late_state.artifact_origin {
+            Some(index) => {
+                self.indexed_artifact_origin_ref("late-section", &late_state.key, index)?
+            }
+            None => authoritative_local,
+        };
+        Ok(ManifestExecutionBindingV4 {
+            format: "zeppelin-manifest-execution-v4-late-state",
+            prior: self.execution_binding_v3(namespace),
+            late_state,
+            late_state_origin: ArtifactOriginExecutionBindingV2 {
+                namespace: physical_origin.namespace.as_str(),
+                incarnation: *physical_origin.incarnation.as_uuid().as_bytes(),
+            },
+        })
     }
 
     #[allow(dead_code)]
@@ -3013,12 +3394,16 @@ impl Manifest {
         self.validate_branch_root_state(namespace)?;
         self.canonicalize_explicit_artifact_origins()?;
         self.validate_artifact_origins()?;
+        self.validate_late_state_reference(namespace)?;
         self.validate_branch_lineage_state(namespace)?;
         self.validate_foreign_origin_admission()?;
 
         let has_roots_control = self.deletion_fence.is_some() || !self.branch_roots.is_empty();
         let has_lineage_control = self.branch_lineage.is_some();
+        let has_late_state = self.late_state.is_some();
         let binding_version = match self.manifest_binding_version {
+            Some(ManifestBindingVersion::V5LateState) => ManifestBindingVersion::V5LateState,
+            _ if has_late_state => ManifestBindingVersion::V5LateState,
             Some(ManifestBindingVersion::V4Lineage) => ManifestBindingVersion::V4Lineage,
             _ if has_lineage_control => ManifestBindingVersion::V4Lineage,
             Some(ManifestBindingVersion::V3Roots) => ManifestBindingVersion::V3Roots,
@@ -3034,6 +3419,9 @@ impl Manifest {
             ManifestBindingVersion::V3Roots => Some(self.compute_control_roots_digest(namespace)?),
             ManifestBindingVersion::V4Lineage => {
                 Some(self.compute_control_branch_digest(namespace)?)
+            }
+            ManifestBindingVersion::V5LateState => {
+                Some(self.compute_control_late_state_digest(namespace)?)
             }
             ManifestBindingVersion::V1 | ManifestBindingVersion::V2Origins => None,
         };
@@ -3089,12 +3477,23 @@ impl Manifest {
                 )));
             }
         }
+        if let Some(reference) = &self.late_state {
+            if self.late_section_origin(reference)? != local {
+                return Err(ZeppelinError::Validation(format!(
+                    "copy clone late-state section {} is not owned by the source namespace incarnation",
+                    reference.key
+                )));
+            }
+        }
 
         for fragment in &mut self.fragments {
             fragment.artifact_origin = None;
         }
         for segment in &mut self.segments {
             segment.artifact_origin = None;
+        }
+        if let Some(reference) = &mut self.late_state {
+            reference.artifact_origin = None;
         }
         self.artifact_origins.clear();
         Ok(())
@@ -3112,7 +3511,11 @@ impl Manifest {
         self.control_state_digest = None;
         if matches!(
             self.manifest_binding_version,
-            Some(ManifestBindingVersion::V3Roots | ManifestBindingVersion::V4Lineage)
+            Some(
+                ManifestBindingVersion::V3Roots
+                    | ManifestBindingVersion::V4Lineage
+                    | ManifestBindingVersion::V5LateState
+            )
         ) {
             self.manifest_binding_version = None;
         }
@@ -3198,11 +3601,23 @@ impl Manifest {
                 located.physical_origin.as_origin().clone(),
             )
         });
+        let late_state = source
+            .late_state
+            .as_ref()
+            .map(|reference| {
+                source
+                    .late_section_origin(reference)
+                    .map(|origin| (reference.clone(), origin))
+            })
+            .transpose()?;
         let mut origins = ArtifactOriginSetBuilder::default();
         for (_, origin) in &fragments {
             origins.collect(origin.clone())?;
         }
         if let Some((_, origin)) = &active {
+            origins.collect(origin.clone())?;
+        }
+        if let Some((_, origin)) = &late_state {
             origins.collect(origin.clone())?;
         }
         let origins = origins.finish()?;
@@ -3257,6 +3672,23 @@ impl Manifest {
             target.set_coarse_payload_encoding(segment.id.clone(), encoding);
             target.segments.push(segment);
         }
+        if let Some((mut reference, origin)) = late_state {
+            reference.artifact_origin =
+                Some(origins.indices.get(&origin).copied().ok_or_else(|| {
+                    BranchError::ArtifactOriginInvalid {
+                        manifest_namespace: target_identity.namespace.to_string(),
+                        manifest_incarnation: Some(target_identity.incarnation.clone()),
+                        descriptor_kind: "late-section",
+                        descriptor_id: reference.key.clone(),
+                        offending_index: None,
+                        offending_key: Some(reference.key.clone()),
+                        expected_origin: Some(origin),
+                        reason: "canonical fork origin table omitted the visible late-state owner"
+                            .to_string(),
+                    }
+                })?);
+            target.late_state = Some(reference);
+        }
         target.next_sequence = source.next_sequence;
         target.namespace = Some(target_identity.namespace.to_string());
         target.bind_namespace_incarnation(target_identity.incarnation.as_uuid())?;
@@ -3298,7 +3730,22 @@ impl Manifest {
             .into());
         }
         self.validate_artifact_origins()?;
-        let bytes = if self.declares_cluster_row_layout() {
+        let bytes = if self.late_state.is_some() {
+            serde_json::to_vec(&ForkViewProjectionV3 {
+                domain: "zeppelin-fork-view-projection-v3-late-state",
+                target_namespace: target_identity.namespace.as_str(),
+                target_incarnation: *target_identity.incarnation.as_uuid().as_bytes(),
+                source_namespace: source_identity.namespace.as_str(),
+                source_incarnation: *source_identity.incarnation.as_uuid().as_bytes(),
+                branch_id: lineage_seed.branch_id,
+                source_generation: lineage_seed.fork_generation,
+                source_manifest_sha256: lineage_seed.fork_manifest_sha256,
+                source_config_sha256: lineage_seed.source_config_sha256,
+                depth: lineage_seed.depth,
+                execution: self
+                    .execution_binding_v4(target_identity.namespace.as_str(), target_identity)?,
+            })
+        } else if self.declares_cluster_row_layout() {
             serde_json::to_vec(&ForkViewProjectionV2 {
                 domain: "zeppelin-fork-view-projection-v2",
                 target_namespace: target_identity.namespace.as_str(),
@@ -3384,9 +3831,14 @@ impl Manifest {
         let mut manifest = self.clone();
         manifest.version = 1;
         manifest.finalize_manifest_binding(target_identity.namespace.as_str())?;
-        if manifest.manifest_binding_version != Some(ManifestBindingVersion::V4Lineage) {
+        let expected_binding = if manifest.late_state.is_some() {
+            ManifestBindingVersion::V5LateState
+        } else {
+            ManifestBindingVersion::V4Lineage
+        };
+        if manifest.manifest_binding_version != Some(expected_binding) {
             return Err(ZeppelinError::Serialization(
-                "fork generation one did not select manifest binding v4_lineage".to_string(),
+                "fork generation one did not select the required manifest binding".to_string(),
             ));
         }
         let bytes = manifest.to_bytes()?;
@@ -3893,7 +4345,13 @@ impl Manifest {
             .uncompacted_located_fragments()?
             .iter()
             .any(|fragment| fragment.physical_origin.as_origin() != &local);
-        Ok(foreign_segment || foreign_fragment)
+        let foreign_late_state = self
+            .late_state
+            .as_ref()
+            .map(|reference| self.late_section_origin(reference))
+            .transpose()?
+            .is_some_and(|origin| origin != local);
+        Ok(foreign_segment || foreign_fragment || foreign_late_state)
     }
 
     /// Returns true when every visible artifact is target-local.
@@ -4102,6 +4560,7 @@ impl Manifest {
         manifest.validate_namespace_binding(namespace)?;
         manifest.validate_branch_root_state(namespace)?;
         manifest.validate_artifact_origins()?;
+        manifest.validate_late_state_reference(namespace)?;
         manifest.validate_branch_lineage_state(namespace)?;
         manifest.validate_manifest_binding_state(namespace)?;
         manifest.validate_foreign_origin_admission()?;
@@ -4119,11 +4578,20 @@ impl Manifest {
                 .segments
                 .iter()
                 .any(|segment| segment.artifact_origin.is_some())
+            || self
+                .late_state
+                .as_ref()
+                .is_some_and(|reference| reference.artifact_origin.is_some())
     }
 
     fn validate_manifest_binding_state(&self, namespace: &str) -> Result<()> {
         match self.manifest_binding_version {
             None => {
+                if self.late_state.is_some() {
+                    return Err(ZeppelinError::Serialization(
+                        "late-state reference requires manifest binding v5_late_state".to_string(),
+                    ));
+                }
                 if self.control_state_digest.is_some() {
                     return Err(ZeppelinError::Serialization(
                         "manifest control digest requires a manifest binding version".to_string(),
@@ -4146,6 +4614,11 @@ impl Manifest {
                 }
             }
             Some(ManifestBindingVersion::V1) => {
+                if self.late_state.is_some() {
+                    return Err(ZeppelinError::Serialization(
+                        "late-state reference requires manifest binding v5_late_state".to_string(),
+                    ));
+                }
                 if self.control_state_digest.is_some() {
                     return Err(ZeppelinError::Serialization(
                         "manifest binding v1 forbids a control digest".to_string(),
@@ -4168,6 +4641,11 @@ impl Manifest {
                 }
             }
             Some(ManifestBindingVersion::V2Origins) => {
+                if self.late_state.is_some() {
+                    return Err(ZeppelinError::Serialization(
+                        "late-state reference requires manifest binding v5_late_state".to_string(),
+                    ));
+                }
                 if self.control_state_digest.is_some() {
                     return Err(ZeppelinError::Serialization(
                         "manifest binding v2_origins forbids a control digest".to_string(),
@@ -4185,6 +4663,11 @@ impl Manifest {
                 }
             }
             Some(ManifestBindingVersion::V3Roots) => {
+                if self.late_state.is_some() {
+                    return Err(ZeppelinError::Serialization(
+                        "late-state reference requires manifest binding v5_late_state".to_string(),
+                    ));
+                }
                 if self.branch_lineage.is_some() {
                     return Err(ZeppelinError::Serialization(
                         "branch lineage requires manifest binding v4_lineage".to_string(),
@@ -4202,6 +4685,11 @@ impl Manifest {
                 }
             }
             Some(ManifestBindingVersion::V4Lineage) => {
+                if self.late_state.is_some() {
+                    return Err(ZeppelinError::Serialization(
+                        "late-state reference requires manifest binding v5_late_state".to_string(),
+                    ));
+                }
                 let control = self.control_state_digest.ok_or_else(|| {
                     ZeppelinError::Serialization(
                         "manifest binding v4_lineage requires a control digest".to_string(),
@@ -4215,6 +4703,24 @@ impl Manifest {
                 if self.compute_control_branch_digest(namespace)? != control {
                     return Err(ZeppelinError::Serialization(
                         "manifest binding v4_lineage control digest mismatch".to_string(),
+                    ));
+                }
+            }
+            Some(ManifestBindingVersion::V5LateState) => {
+                let control = self.control_state_digest.ok_or_else(|| {
+                    ZeppelinError::Serialization(
+                        "manifest binding v5_late_state requires a control digest".to_string(),
+                    )
+                })?;
+                if self.late_state.is_none() {
+                    return Err(ZeppelinError::Serialization(
+                        "manifest binding v5_late_state requires a late-state reference"
+                            .to_string(),
+                    ));
+                }
+                if self.compute_control_late_state_digest(namespace)? != control {
+                    return Err(ZeppelinError::Serialization(
+                        "manifest binding v5_late_state control digest mismatch".to_string(),
                     ));
                 }
             }
@@ -4477,7 +4983,11 @@ impl Manifest {
                 || manifest.control_state_digest.is_some()
                 || matches!(
                     manifest.manifest_binding_version,
-                    Some(ManifestBindingVersion::V3Roots | ManifestBindingVersion::V4Lineage)
+                    Some(
+                        ManifestBindingVersion::V3Roots
+                            | ManifestBindingVersion::V4Lineage
+                            | ManifestBindingVersion::V5LateState
+                    )
                 )
         };
         if (is_branch_bound(self) || is_branch_bound(live))
@@ -6402,6 +6912,59 @@ mod tests {
         manifest
     }
 
+    /// Exact root-manifest wire shape committed immediately before Phase 4.
+    #[derive(Serialize)]
+    struct ManifestBeforeLateState {
+        fragments: Vec<FragmentRef>,
+        segments: Vec<SegmentRef>,
+        compaction_watermark: Option<Ulid>,
+        active_segment: Option<String>,
+        next_sequence: u64,
+        pending_deletes: Vec<String>,
+        fencing_token: u64,
+        updated_at: DateTime<Utc>,
+        version: u64,
+        namespace: Option<String>,
+        namespace_incarnation: Option<ManifestNamespaceIncarnation>,
+        deletion_fence: Option<ManifestDeletionFence>,
+        hierarchical_routing_nodes: BTreeMap<String, Vec<String>>,
+        manifest_binding_version: Option<ManifestBindingVersion>,
+        artifact_origins: Vec<ArtifactOrigin>,
+        control_state_digest: Option<[u8; 32]>,
+        branch_roots: BTreeMap<BranchId, BranchRoot>,
+        branch_lineage: Option<BranchLineage>,
+        coarse_payload_encodings: BTreeMap<String, CoarsePayloadEncoding>,
+    }
+
+    fn before_late_state_bytes(manifest: &Manifest) -> Bytes {
+        let fixture = ManifestBeforeLateState {
+            fragments: manifest.fragments.clone(),
+            segments: manifest.segments.clone(),
+            compaction_watermark: manifest.compaction_watermark,
+            active_segment: manifest.active_segment.clone(),
+            next_sequence: manifest.next_sequence,
+            pending_deletes: manifest.pending_deletes.clone(),
+            fencing_token: manifest.fencing_token,
+            updated_at: manifest.updated_at,
+            version: manifest.version,
+            namespace: manifest.namespace.clone(),
+            namespace_incarnation: manifest.namespace_incarnation,
+            deletion_fence: manifest.deletion_fence.clone(),
+            hierarchical_routing_nodes: manifest.hierarchical_routing_nodes.clone(),
+            manifest_binding_version: manifest.manifest_binding_version,
+            artifact_origins: manifest.artifact_origins.clone(),
+            control_state_digest: manifest.control_state_digest,
+            branch_roots: manifest.branch_roots.clone(),
+            branch_lineage: manifest.branch_lineage.clone(),
+            coarse_payload_encodings: manifest.coarse_payload_encodings.clone(),
+        };
+        let payload = rmp_serde::to_vec(&fixture).expect("pre-Phase-4 fixture must serialize");
+        let mut bytes = Vec::with_capacity(1 + payload.len());
+        bytes.push(MANIFEST_FORMAT_MSGPACK);
+        bytes.extend_from_slice(&payload);
+        Bytes::from(bytes)
+    }
+
     #[test]
     fn execution_v2_projection_binds_segment_origin_index() {
         let mut manifest = Manifest::new();
@@ -7611,6 +8174,58 @@ mod tests {
             fork(layout_free_object),
             layout_free_digest,
             "the frozen projection must remain deterministic"
+        );
+    }
+
+    #[test]
+    fn fork_view_binds_late_state_reference_and_resolved_origin() {
+        let source_identity = origin("late-fork-source", 0x921);
+        let target_identity = origin("late-fork-target", 0x922);
+
+        let fork = |checksum: [u8; 32]| {
+            let mut source = bound_manifest(&source_identity, 7);
+            source.late_state = Some(ManifestSectionRef {
+                key: LateStateSection::s3_key(source_identity.namespace.as_str(), &checksum),
+                checksum,
+                size_bytes: 6,
+                format_version: LATE_STATE_FORMAT_VERSION,
+                artifact_origin: None,
+            });
+            source
+                .finalize_manifest_binding(source_identity.namespace.as_str())
+                .expect("source late-state binding must finalize");
+            let prepared = Manifest::prepare_zero_copy_fork(
+                &source,
+                &source_identity,
+                &target_identity,
+                lineage_seed(&source_identity, 7, 0x923, 1),
+                DateTime::from_timestamp(1_700_000_003, 0).unwrap(),
+            )
+            .expect("late-state fork must prepare");
+            assert_eq!(
+                prepared
+                    .manifest
+                    .late_section_origin(
+                        prepared
+                            .manifest
+                            .late_state
+                            .as_ref()
+                            .expect("fork must retain late state")
+                    )
+                    .expect("late section origin must resolve"),
+                source_identity
+            );
+            prepared
+                .manifest
+                .validate_initial_fork_view()
+                .expect("late-state fork view must validate");
+            prepared.lineage.fork_view_sha256
+        };
+
+        assert_ne!(
+            fork([0x11; 32]),
+            fork([0x12; 32]),
+            "changing the late-state reference must change the fork-view digest"
         );
     }
 
@@ -9412,5 +10027,115 @@ mod tests {
             .is_err());
         let bytes = manifest.to_bytes().unwrap();
         assert!(Manifest::from_bytes_for_namespace(&bytes, "target").is_err());
+    }
+
+    #[test]
+    fn dense_manifest_late_state_none_adds_one_constant_byte() {
+        const PRE_PHASE4_DENSE_ONE_FRAGMENT_HEX: &str = concat!(
+            "01dc00139196ba3030303030303030303030303030303030303030303030303031",
+            "01000064c0919eaf64656e73652d7365676d656e742d306404a46e6f6e65c290",
+            "90c290c090c0c0c0c0af64656e73652d7365676d656e742d30009000b432303233",
+            "2d31312d31345432323a31353a30305a00c0c0c080c090c080c080"
+        );
+        let fixed_time = DateTime::from_timestamp(1_700_000_100, 0).unwrap();
+        let mut deltas = Vec::new();
+
+        for fragment_count in [0_usize, 1, 64] {
+            let mut manifest = Manifest::new_at(fixed_time);
+            manifest.fragments = (0..fragment_count)
+                .map(|index| FragmentRef {
+                    id: Ulid::from(index as u128 + 1),
+                    vector_count: index + 1,
+                    delete_count: index % 2,
+                    sequence_number: index as u64,
+                    size_bytes: 100 + index as u64,
+                    artifact_origin: None,
+                })
+                .collect();
+            manifest.segments = (0..fragment_count.min(8))
+                .map(|index| make_segment(&format!("dense-segment-{index}")))
+                .collect();
+            manifest.active_segment = manifest.segments.last().map(|segment| segment.id.clone());
+            manifest.updated_at = fixed_time;
+
+            let before = before_late_state_bytes(&manifest);
+            let after = manifest.to_bytes().expect("dense manifest must serialize");
+            let delta = after.len() - before.len();
+            deltas.push(delta);
+
+            if fragment_count == 1 {
+                let fixture_hex = before
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                assert_eq!(fixture_hex, PRE_PHASE4_DENSE_ONE_FRAGMENT_HEX);
+            }
+
+            let decoded =
+                Manifest::from_bytes(&before).expect("pre-Phase-4 manifest fixture must decode");
+            assert!(
+                decoded.late_state.is_none(),
+                "legacy bytes must default late_state to None"
+            );
+        }
+
+        assert_eq!(deltas, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn manifest_late_state_reference_round_trips_under_v5_binding() {
+        let identity = origin("late-roundtrip", 0x991);
+        let mut manifest = bound_manifest(&identity, 4);
+        let checksum = [0x44; 32];
+        let reference = ManifestSectionRef {
+            key: LateStateSection::s3_key(identity.namespace.as_str(), &checksum),
+            checksum,
+            size_bytes: 6,
+            format_version: LATE_STATE_FORMAT_VERSION,
+            artifact_origin: None,
+        };
+        manifest.late_state = Some(reference.clone());
+        manifest
+            .finalize_manifest_binding(identity.namespace.as_str())
+            .expect("late-state binding must finalize");
+
+        let decoded = Manifest::from_bytes_for_namespace(
+            &manifest.to_bytes().expect("late manifest must serialize"),
+            identity.namespace.as_str(),
+        )
+        .expect("late-state manifest fixture must decode");
+        assert_eq!(decoded.late_state, Some(reference));
+        assert_eq!(
+            decoded.manifest_binding_version(),
+            Some(ManifestBindingVersion::V5LateState)
+        );
+        assert_eq!(
+            decoded
+                .recompute_control_state_digest(identity.namespace.as_str())
+                .expect("V5 control digest must recompute"),
+            decoded
+                .control_state_digest()
+                .expect("V5 must carry a digest")
+        );
+    }
+
+    #[test]
+    fn foreign_late_state_reference_is_not_branch_local() {
+        let target = origin("late-locality-target", 0x992);
+        let source = origin("late-locality-source", 0x993);
+        let mut manifest = bound_manifest(&target, 1);
+        manifest.artifact_origins = vec![source.clone()];
+        let checksum = [0x55; 32];
+        manifest.late_state = Some(ManifestSectionRef {
+            key: LateStateSection::s3_key(source.namespace.as_str(), &checksum),
+            checksum,
+            size_bytes: 6,
+            format_version: LATE_STATE_FORMAT_VERSION,
+            artifact_origin: Some(ArtifactOriginIndex::new(0)),
+        });
+
+        assert!(!manifest
+            .visible_refs_are_local()
+            .expect("foreign late-state origin must resolve"));
     }
 }
