@@ -511,6 +511,24 @@ One seed and one repeat were used. Model and dataset files were downloaded at ex
 - f32 exact top-10 recovered by f16 exact top-10: `1.000000`.
 - This is diagnostic evidence only; no f16 qualification threshold was introduced.
 
+## int8 matrix payload probe
+
+- Text candidate recipe: `E`, `subtract_global_mean`, document pooling `1×`.
+- Visual candidate recipe: `E`, `identity`, document pooling `2×`.
+
+| Lane | Variant | f32/int8 top-1 same | f32 top-10 recovered | Max error (50 pairs) | Row L2 p50/p95/p99 | R@50 | R@100 | R@300 | Bytes/unit | Passed |
+| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |
+| Text | `global_scale` | 0.965735 | 0.921641 | 0.068658829 | 0.025707/0.027343/0.028024 | 0.659243 | 0.766366 | 0.898828 | 29428.3 | `false` |
+| Text | `per_row_calibrated` | 0.988278 | 0.980613 | 0.012350082 | 0.005575/0.006404/0.006852 | 0.661767 | 0.768981 | 0.900541 | 31267.6 | `false` |
+| Visual | `global_scale` | 0.981238 | 0.981801 | 0.057832718 | 0.025700/0.027347/0.028004 | 0.399625 | 0.618762 | 0.904503 | 130172.7 | `false` |
+| Visual | `per_row_calibrated` | 0.992495 | 0.995872 | 0.013231277 | 0.005801/0.006908/0.007465 | 0.399812 | 0.618386 | 0.904128 | 138308.5 | `false` |
+
+- Global-scale overall passed: `false`.
+- Per-row calibrated overall passed: `false`.
+- Overall passed: `false`.
+- Decision: reject int8 document matrix payloads; retain f16 for Phase 6.
+- The binding candidate gate remains measured against f32 exact truth. These probe readouts keep the FDE ranking unchanged and use each int8 variant's exact top-10 as the diagnostic truth.
+
 ## Named decisions and resolved lateon unknowns
 
 - Candidate algorithm: `paper_v1`.

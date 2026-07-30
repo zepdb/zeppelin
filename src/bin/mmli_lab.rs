@@ -32,6 +32,8 @@ const CANDIDATE_KS: [usize; 3] = [50, 100, 300];
 const TEXT_CANDIDATE_K_MAX: usize = 700;
 const VISUAL_DOCUMENT_POOLING_FACTOR: usize = 2;
 const ROUTING_NPROBES: [usize; 2] = [8, 16];
+const INT8_TOP_10_RECOVERY_THRESHOLD: f64 = 0.999;
+const INT8_MAX_SIM_ERROR_THRESHOLD: f64 = 1.0e-3;
 const CENTERING_SAMPLE_ROWS: usize = 5_000;
 const GEOMETRY_SAMPLE_ROWS: usize = 256;
 const SIMHASH_SAMPLE_ROWS: usize = 5_000;
@@ -119,6 +121,8 @@ struct Job {
     queries: TensorInput,
     official_scores: PathBuf,
     #[serde(default)]
+    int8_probe: bool,
+    #[serde(default)]
     chosen_algorithm: Option<Algorithm>,
     #[serde(default)]
     chosen_centering: Option<Centering>,
@@ -178,6 +182,7 @@ struct ResultDocument {
     visual_diagnostics: Option<Vec<DiagnosticCell>>,
     pooling_probes: Option<Vec<PoolingProbe>>,
     precision_retention: Option<PrecisionRetentionReport>,
+    int8_probe: Option<Int8ProbeReport>,
     exact_frontier_gaps: Option<Vec<ExactFrontierGap>>,
 }
 
@@ -346,6 +351,38 @@ struct PrecisionRetentionReport {
     f32_top_10_recall_in_f16_top_10: f64,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Int8Variant {
+    GlobalScale,
+    PerRowCalibrated,
+}
+
+#[derive(Debug, Serialize)]
+struct Int8ProbeReport {
+    candidate_config: &'static str,
+    candidate_centering: Centering,
+    candidate_document_pooling_factor: usize,
+    global_scale_passed: bool,
+    variants: Vec<Int8VariantReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct Int8VariantReport {
+    variant: Int8Variant,
+    f32_top_1_same_rank_fraction: f64,
+    f32_top_10_recall_in_int8_top_10: f64,
+    max_sim_50_pair_max_absolute_error: f64,
+    first_100_document_row_l2_error_p50: f64,
+    first_100_document_row_l2_error_p95: f64,
+    first_100_document_row_l2_error_p99: f64,
+    mean_payload_bytes_per_document: f64,
+    candidate_recall_at_50: f64,
+    candidate_recall_at_100: f64,
+    candidate_recall_at_300: f64,
+    passed: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ExactFrontierGap {
     query_index: usize,
@@ -498,12 +535,12 @@ fn run() -> Result<()> {
         .transpose()?;
     let identity = prepare_values(&documents, &queries, Centering::Identity)?;
     let identity_truth = exhaustive_truth(&documents, &queries, &identity)?;
-    let precision_retention = match (&full_precision_documents, &full_precision_queries) {
+    let full_precision = match (&full_precision_documents, &full_precision_queries) {
         (Some(full_documents), Some(full_queries)) => {
             validate_precision_pair(&documents, &queries, full_documents, full_queries)?;
             let f32_identity = prepare_values(full_documents, full_queries, Centering::Identity)?;
             let f32_truth = exhaustive_truth(full_documents, full_queries, &f32_identity)?;
-            Some(compare_precision_truth(&f32_truth, &identity_truth))
+            Some((f32_identity, f32_truth))
         }
         (None, None) => None,
         _ => {
@@ -512,6 +549,9 @@ fn run() -> Result<()> {
             ));
         }
     };
+    let precision_retention = full_precision
+        .as_ref()
+        .map(|(_, f32_truth)| compare_precision_truth(f32_truth, &identity_truth));
 
     let official_path = resolve_path(base, &job.official_scores);
     let official_scores: Vec<OfficialScore> = read_json(&official_path)?;
@@ -524,6 +564,35 @@ fn run() -> Result<()> {
         &identity_truth,
         parity.passed,
     )?;
+    let int8_probe = if job.int8_probe {
+        let (full_documents, full_queries, (f32_identity, f32_truth)) = match (
+            &full_precision_documents,
+            &full_precision_queries,
+            &full_precision,
+        ) {
+            (Some(full_documents), Some(full_queries), Some(full_precision)) => {
+                (full_documents, full_queries, full_precision)
+            }
+            _ => {
+                return Err(LabError::Invalid(
+                    "int8_probe requires paired f32 document and query references".to_string(),
+                ));
+            }
+        };
+        Some(evaluate_int8_probe(
+            job.lane,
+            &documents,
+            &queries,
+            full_documents,
+            full_queries,
+            f32_identity,
+            f32_truth,
+            &official_scores,
+            &evaluation.winner,
+        )?)
+    } else {
+        None
+    };
     let result = ResultDocument {
         schema_version: 2,
         lane: job.lane,
@@ -542,6 +611,7 @@ fn run() -> Result<()> {
         visual_diagnostics: evaluation.visual_diagnostics,
         pooling_probes: evaluation.pooling_probes,
         precision_retention,
+        int8_probe,
         exact_frontier_gaps: evaluation.exact_frontier_gaps,
     };
 
@@ -583,11 +653,7 @@ fn parse_cli() -> Result<PathBuf> {
 fn validate_lane_contract(job: &Job) -> Result<()> {
     match job.lane {
         Lane::Text => {
-            if job.chosen_algorithm.is_some()
-                || job.chosen_centering.is_some()
-                || job.full_precision_documents.is_some()
-                || job.full_precision_queries.is_some()
-            {
+            if job.chosen_algorithm.is_some() || job.chosen_centering.is_some() {
                 return Err(LabError::Invalid(
                     "text jobs must not provide visual-only settings".to_string(),
                 ));
@@ -600,6 +666,13 @@ fn validate_lane_contract(job: &Job) -> Result<()> {
                 ));
             }
         }
+    }
+    if job.int8_probe
+        && (job.full_precision_documents.is_none() || job.full_precision_queries.is_none())
+    {
+        return Err(LabError::Invalid(
+            "int8_probe requires paired f32 document and query references".to_string(),
+        ));
     }
     Ok(())
 }
@@ -1108,6 +1181,289 @@ fn compare_precision_truth(
         f32_top_1_in_f16_top_10_fraction: top_1_in_top_10 as f64 / query_count as f64,
         f32_top_10_recall_in_f16_top_10: top_10_hits as f64 / gold_count as f64,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_int8_probe(
+    lane: Lane,
+    documents: &TensorSet,
+    queries: &TensorSet,
+    full_documents: &TensorSet,
+    full_queries: &TensorSet,
+    f32_identity: &PreparedValues<'_>,
+    f32_truth: &[ExactTruth],
+    official_scores: &[OfficialScore],
+    winner: &Winner,
+) -> Result<Int8ProbeReport> {
+    if winner.config != CONFIG_E_REPS_DIAGNOSTIC.name {
+        return Err(LabError::Invalid(format!(
+            "int8 probe requires selected config E, got {}",
+            winner.config
+        )));
+    }
+    let (document_fdes, query_fdes, candidate_centering, pooling_factor) =
+        selected_int8_candidate_fdes(lane, documents, queries, winner)?;
+    let fde_dimension = generate_transform(
+        documents.sidecar.dim,
+        CONFIG_E_REPS_DIAGNOSTIC,
+        winner.algorithm,
+    )?
+    .output_dimension();
+
+    let mut variants = Vec::with_capacity(2);
+    for variant in [Int8Variant::GlobalScale, Int8Variant::PerRowCalibrated] {
+        let dequantized_documents = quantize_documents(documents, variant)?;
+        let int8_identity = PreparedValues {
+            documents: Cow::Borrowed(&dequantized_documents),
+            queries: Cow::Borrowed(&queries.values),
+        };
+        let int8_truth = exhaustive_truth(documents, queries, &int8_identity)?;
+        let (top_1_same_rank, top_10_recovery) = compare_int8_truth(f32_truth, &int8_truth);
+        let max_sim_error = int8_max_sim_error(
+            documents,
+            queries,
+            full_documents,
+            full_queries,
+            f32_identity,
+            &dequantized_documents,
+            official_scores,
+        )?;
+        let row_errors = int8_row_l2_errors(documents, full_documents, &dequantized_documents)?;
+        let recalls = candidate_recalls(&document_fdes, &query_fdes, fde_dimension, &int8_truth)?;
+        let metadata_bytes_per_row = match variant {
+            Int8Variant::GlobalScale => 0usize,
+            Int8Variant::PerRowCalibrated => 8,
+        };
+        let payload_bytes = documents
+            .values
+            .len()
+            .checked_add(
+                documents
+                    .total_rows
+                    .checked_mul(metadata_bytes_per_row)
+                    .ok_or_else(|| {
+                        LabError::Invalid("int8 calibration payload size overflows".to_string())
+                    })?,
+            )
+            .ok_or_else(|| LabError::Invalid("int8 payload size overflows".to_string()))?;
+        let passed = top_10_recovery >= INT8_TOP_10_RECOVERY_THRESHOLD
+            && max_sim_error <= INT8_MAX_SIM_ERROR_THRESHOLD;
+        variants.push(Int8VariantReport {
+            variant,
+            f32_top_1_same_rank_fraction: top_1_same_rank,
+            f32_top_10_recall_in_int8_top_10: top_10_recovery,
+            max_sim_50_pair_max_absolute_error: max_sim_error,
+            first_100_document_row_l2_error_p50: nearest_rank_f64(&row_errors, 50),
+            first_100_document_row_l2_error_p95: nearest_rank_f64(&row_errors, 95),
+            first_100_document_row_l2_error_p99: nearest_rank_f64(&row_errors, 99),
+            mean_payload_bytes_per_document: payload_bytes as f64
+                / documents.sidecar.ids.len() as f64,
+            candidate_recall_at_50: recalls[0],
+            candidate_recall_at_100: recalls[1],
+            candidate_recall_at_300: recalls[2],
+            passed,
+        });
+    }
+    let global_scale_passed = variants.first().is_some_and(|variant| variant.passed);
+    Ok(Int8ProbeReport {
+        candidate_config: CONFIG_E_REPS_DIAGNOSTIC.name,
+        candidate_centering,
+        candidate_document_pooling_factor: pooling_factor,
+        global_scale_passed,
+        variants,
+    })
+}
+
+fn selected_int8_candidate_fdes(
+    lane: Lane,
+    documents: &TensorSet,
+    queries: &TensorSet,
+    winner: &Winner,
+) -> Result<(Vec<f32>, Vec<f32>, Centering, usize)> {
+    let transform = generate_transform(
+        documents.sidecar.dim,
+        CONFIG_E_REPS_DIAGNOSTIC,
+        winner.algorithm,
+    )?;
+    match lane {
+        Lane::Text => {
+            if winner.document_pooling_factor != 1 {
+                return Err(LabError::Invalid(format!(
+                    "text int8 probe expected unpooled documents, got factor {}",
+                    winner.document_pooling_factor
+                )));
+            }
+            let prepared = prepare_values(documents, queries, winner.centering)?;
+            Ok((
+                encode_set(documents, &prepared.documents, &transform, true)?,
+                encode_set(queries, &prepared.queries, &transform, false)?,
+                winner.centering,
+                1,
+            ))
+        }
+        Lane::Visual => {
+            if winner.centering != Centering::Identity
+                || winner.document_pooling_factor != VISUAL_DOCUMENT_POOLING_FACTOR
+            {
+                return Err(LabError::Invalid(format!(
+                    "visual int8 probe requires identity centering and {}x pooling",
+                    VISUAL_DOCUMENT_POOLING_FACTOR
+                )));
+            }
+            let pooled =
+                mean_pool_documents(documents, &documents.values, VISUAL_DOCUMENT_POOLING_FACTOR)?;
+            Ok((
+                encode_set(&pooled, &pooled.values, &transform, true)?,
+                encode_set(queries, &queries.values, &transform, false)?,
+                Centering::Identity,
+                VISUAL_DOCUMENT_POOLING_FACTOR,
+            ))
+        }
+    }
+}
+
+fn quantize_documents(documents: &TensorSet, variant: Int8Variant) -> Result<Vec<f32>> {
+    if documents.sidecar.dtype != DType::F16 {
+        return Err(LabError::Invalid(
+            "int8 probe requires f16 primary documents".to_string(),
+        ));
+    }
+    let mut dequantized = Vec::with_capacity(documents.values.len());
+    for row in documents.values.chunks_exact(documents.sidecar.dim) {
+        match variant {
+            Int8Variant::GlobalScale => {
+                dequantized.extend(row.iter().map(|value| {
+                    let quantized = (*value * 127.0).round().clamp(-127.0, 127.0) as i8;
+                    f32::from(quantized) / 127.0
+                }));
+            }
+            Int8Variant::PerRowCalibrated => {
+                let minimum = row.iter().copied().fold(f32::INFINITY, f32::min);
+                let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                if minimum == maximum {
+                    dequantized.extend(std::iter::repeat_n(minimum, row.len()));
+                    continue;
+                }
+                let offset = minimum + (maximum - minimum) * 0.5;
+                let scale = (maximum - minimum) / 254.0;
+                if !scale.is_finite() || scale <= 0.0 {
+                    return Err(LabError::Invalid(
+                        "per-row int8 calibration produced an invalid scale".to_string(),
+                    ));
+                }
+                dequantized.extend(row.iter().map(|value| {
+                    let quantized = ((*value - offset) / scale).round().clamp(-127.0, 127.0) as i8;
+                    f32::from(quantized) * scale + offset
+                }));
+            }
+        }
+    }
+    Ok(dequantized)
+}
+
+fn compare_int8_truth(reference: &[ExactTruth], int8: &[ExactTruth]) -> (f64, f64) {
+    assert_eq!(reference.len(), int8.len());
+    let mut top_1_same_rank = 0usize;
+    let mut top_10_hits = 0usize;
+    for (reference_query, int8_query) in reference.iter().zip(int8) {
+        top_1_same_rank +=
+            usize::from(reference_query.top_documents[0] == int8_query.top_documents[0]);
+        top_10_hits += reference_query
+            .top_documents
+            .iter()
+            .filter(|document| int8_query.top_documents.contains(document))
+            .count();
+    }
+    (
+        top_1_same_rank as f64 / reference.len() as f64,
+        top_10_hits as f64 / (reference.len() * TRUTH_K) as f64,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn int8_max_sim_error(
+    documents: &TensorSet,
+    queries: &TensorSet,
+    full_documents: &TensorSet,
+    full_queries: &TensorSet,
+    f32_identity: &PreparedValues<'_>,
+    dequantized_documents: &[f32],
+    official_scores: &[OfficialScore],
+) -> Result<f64> {
+    let document_ids: HashMap<&str, usize> = documents
+        .sidecar
+        .ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect();
+    let query_ids: HashMap<&str, usize> = queries
+        .sidecar
+        .ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect();
+    let mut maximum = 0.0_f64;
+    for pair in official_scores {
+        let query_index = *query_ids.get(pair.query_id.as_str()).ok_or_else(|| {
+            LabError::Invalid(format!(
+                "int8 pair references unknown query id {:?}",
+                pair.query_id
+            ))
+        })?;
+        let document_index = *document_ids.get(pair.document_id.as_str()).ok_or_else(|| {
+            LabError::Invalid(format!(
+                "int8 pair references unknown document id {:?}",
+                pair.document_id
+            ))
+        })?;
+        let reference_query = full_queries.matrix(&f32_identity.queries, query_index)?;
+        let reference_document = full_documents.matrix(&f32_identity.documents, document_index)?;
+        let int8_query = queries.matrix(&queries.values, query_index)?;
+        let int8_document = documents.matrix(dequantized_documents, document_index)?;
+        let reference_score = max_sim(&reference_query, &reference_document)?;
+        let int8_score = max_sim(&int8_query, &int8_document)?;
+        maximum = maximum.max(f64::from((reference_score - int8_score).abs()));
+    }
+    Ok(maximum)
+}
+
+fn int8_row_l2_errors(
+    documents: &TensorSet,
+    full_documents: &TensorSet,
+    dequantized_documents: &[f32],
+) -> Result<Vec<f64>> {
+    let document_count = documents.sidecar.ids.len().min(100);
+    let sampled_rows = documents.sidecar.rows[..document_count]
+        .iter()
+        .try_fold(0usize, |total, rows| total.checked_add(*rows))
+        .ok_or_else(|| LabError::Invalid("int8 sampled row count overflows".to_string()))?;
+    let scalar_count = sampled_rows
+        .checked_mul(documents.sidecar.dim)
+        .ok_or_else(|| LabError::Invalid("int8 sampled scalar count overflows".to_string()))?;
+    let mut errors = Vec::with_capacity(sampled_rows);
+    for (int8_row, f32_row) in dequantized_documents[..scalar_count]
+        .chunks_exact(documents.sidecar.dim)
+        .zip(full_documents.values[..scalar_count].chunks_exact(documents.sidecar.dim))
+    {
+        errors.push(squared_l2(int8_row, f32_row).sqrt());
+    }
+    if errors.is_empty() {
+        return Err(LabError::Invalid(
+            "int8 row-error sample is empty".to_string(),
+        ));
+    }
+    errors.sort_unstable_by(f64::total_cmp);
+    Ok(errors)
+}
+
+fn nearest_rank_f64(ordered: &[f64], percentile: usize) -> f64 {
+    let rank = percentile
+        .checked_mul(ordered.len())
+        .expect("validated int8 row count fits percentile arithmetic")
+        .div_ceil(100);
+    ordered[rank.saturating_sub(1)]
 }
 
 fn exact_frontier_gaps(

@@ -307,6 +307,25 @@ def timed_text_encoding(
     )
 
 
+def text_encoding_once(
+    encoder: TextEncoder,
+    texts: list[str],
+    ids: list[str],
+    is_query: bool,
+) -> EncodingResult:
+    matrices: list[np.ndarray] = []
+    for ordinal, batch in enumerate(batches(texts, BATCH_SIZE), start=1):
+        matrices.extend(encoder.encode_batch(batch, is_query))
+        if ordinal % 25 == 0:
+            print(
+                f"int8 f32 text "
+                f"{'queries' if is_query else 'documents'}: "
+                f"{len(matrices)}/{len(texts)}",
+                flush=True,
+            )
+    return EncodingResult(matrices, ids, 0.0, 0.0, 0.0, peak_rss_mib())
+
+
 def redirected_visual_adapter(adapter: Path, base: Path, destination: Path) -> Path:
     shutil.copytree(adapter, destination, symlinks=False)
     config_path = destination / "adapter_config.json"
@@ -398,6 +417,26 @@ def timed_visual_encoding(
     )
 
 
+def visual_encoding_once(
+    model,
+    processor,
+    values: list[Image.Image | str],
+    ids: list[str],
+    is_query: bool,
+) -> EncodingResult:
+    matrices: list[np.ndarray] = []
+    for ordinal, batch in enumerate(batches(values, BATCH_SIZE), start=1):
+        matrices.extend(visual_batch(model, processor, batch, is_query))
+        if ordinal % 10 == 0:
+            print(
+                f"int8 f32 visual "
+                f"{'queries' if is_query else 'pages'}: "
+                f"{len(matrices)}/{len(values)}",
+                flush=True,
+            )
+    return EncodingResult(matrices, ids, 0.0, 0.0, 0.0, peak_rss_mib())
+
+
 def write_tensor(
     prefix: Path, result: EncodingResult, dtype: str = "f16"
 ) -> tuple[Path, Path]:
@@ -451,6 +490,38 @@ def read_tensor(prefix: Path, timing: dict) -> EncodingResult:
         batch_eight_wall_seconds_per_item=float(timing["batch_8_wall"]),
         peak_rss_mib=float(timing["peak_rss_mib"]),
     )
+
+
+def validate_precision_reference(
+    primary: EncodingResult,
+    reference: EncodingResult,
+    lane: str,
+    role: str,
+) -> None:
+    if primary.ids != reference.ids:
+        raise RuntimeError(
+            f"{lane} {role} f16/f32 tensor IDs differ"
+        )
+    if len(primary.matrices) != len(reference.matrices):
+        raise RuntimeError(
+            f"{lane} {role} f16/f32 matrix counts differ"
+        )
+    for index, (primary_matrix, reference_matrix) in enumerate(
+        zip(primary.matrices, reference.matrices)
+    ):
+        if primary_matrix.shape != reference_matrix.shape:
+            raise RuntimeError(
+                f"{lane} {role} f16/f32 shape differs at index {index}: "
+                f"{primary_matrix.shape} != {reference_matrix.shape}"
+            )
+        if (
+            primary_matrix.ndim != 2
+            or primary_matrix.shape[1] != DIMENSION
+        ):
+            raise RuntimeError(
+                f"{lane} {role} tensor at index {index} has invalid shape "
+                f"{primary_matrix.shape}"
+            )
 
 
 def quantized_matrices(result: EncodingResult) -> list[torch.Tensor]:
@@ -554,10 +625,28 @@ def run_rust(
     official_scores: Sequence[float],
     chosen_algorithm: str | None = None,
     chosen_centering: str | None = None,
-    include_full_precision: bool = False,
+    full_precision_documents: EncodingResult | None = None,
+    full_precision_queries: EncodingResult | None = None,
+    int8_probe: bool = False,
+    reuse_primary_exchange: bool = False,
 ) -> dict:
-    doc_raw, doc_sidecar = write_tensor(work_dir / f"{lane}-documents", documents)
-    query_raw, query_sidecar = write_tensor(work_dir / f"{lane}-queries", queries)
+    if reuse_primary_exchange:
+        doc_raw = work_dir / f"{lane}-documents.f16"
+        doc_sidecar = work_dir / f"{lane}-documents.json"
+        query_raw = work_dir / f"{lane}-queries.f16"
+        query_sidecar = work_dir / f"{lane}-queries.json"
+        for path in (doc_raw, doc_sidecar, query_raw, query_sidecar):
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"missing retained primary tensor exchange file: {path}"
+                )
+    else:
+        doc_raw, doc_sidecar = write_tensor(
+            work_dir / f"{lane}-documents", documents
+        )
+        query_raw, query_sidecar = write_tensor(
+            work_dir / f"{lane}-queries", queries
+        )
     pair_path = work_dir / f"{lane}-pairs.json"
     write_pair_scores(pair_path, queries, documents, official_scores)
     job = {
@@ -565,17 +654,30 @@ def run_rust(
         "documents": {"raw": str(doc_raw), "sidecar": str(doc_sidecar)},
         "queries": {"raw": str(query_raw), "sidecar": str(query_sidecar)},
         "official_scores": str(pair_path),
+        "int8_probe": int8_probe,
     }
     if lane == "visual":
         job["chosen_algorithm"] = chosen_algorithm
         job["chosen_centering"] = chosen_centering
+    if (full_precision_documents is None) != (
+        full_precision_queries is None
+    ):
+        raise RuntimeError(
+            "full-precision documents and queries must be supplied together"
+        )
+    if int8_probe and full_precision_documents is None:
+        raise RuntimeError("int8 probe requires fresh f32 reference tensors")
     full_precision_paths: list[Path] = []
-    if include_full_precision:
+    if full_precision_documents is not None:
         full_doc_raw, full_doc_sidecar = write_tensor(
-            work_dir / f"{lane}-documents-f32", documents, "f32"
+            work_dir / f"{lane}-documents-f32",
+            full_precision_documents,
+            "f32",
         )
         full_query_raw, full_query_sidecar = write_tensor(
-            work_dir / f"{lane}-queries-f32", queries, "f32"
+            work_dir / f"{lane}-queries-f32",
+            full_precision_queries,
+            "f32",
         )
         job["full_precision_documents"] = {
             "raw": str(full_doc_raw),
@@ -600,6 +702,50 @@ def run_rust(
         text=True,
     )
     result = json.loads(completed.stdout)
+    if int8_probe:
+        probe = result.get("int8_probe")
+        probe_fields = {
+            "candidate_config",
+            "candidate_centering",
+            "candidate_document_pooling_factor",
+            "global_scale_passed",
+            "variants",
+        }
+        variant_fields = {
+            "variant",
+            "f32_top_1_same_rank_fraction",
+            "f32_top_10_recall_in_int8_top_10",
+            "max_sim_50_pair_max_absolute_error",
+            "first_100_document_row_l2_error_p50",
+            "first_100_document_row_l2_error_p95",
+            "first_100_document_row_l2_error_p99",
+            "mean_payload_bytes_per_document",
+            "candidate_recall_at_50",
+            "candidate_recall_at_100",
+            "candidate_recall_at_300",
+            "passed",
+        }
+        if (
+            not isinstance(probe, dict)
+            or not probe_fields.issubset(probe)
+            or not isinstance(probe.get("variants"), list)
+            or len(probe["variants"]) != 2
+            or not isinstance(probe.get("global_scale_passed"), bool)
+            or {
+                row.get("variant")
+                for row in probe["variants"]
+                if isinstance(row, dict)
+            }
+            != {"global_scale", "per_row_calibrated"}
+            or any(
+                not isinstance(row, dict)
+                or not variant_fields.issubset(row)
+                for row in probe["variants"]
+            )
+        ):
+            raise RuntimeError(
+                f"{lane} Rust result omitted a complete int8 probe"
+            )
     for path in full_precision_paths:
         path.unlink()
     return result
@@ -1456,6 +1602,9 @@ def render_report(
         if visual_result is not None
         else {}
     )
+    selected_int8_variant = selected_int8_variant_name(
+        text_result, visual_result
+    )
     lines = [
         "# MMLI-2 Phase 2 encoder qualification",
         "",
@@ -1487,17 +1636,38 @@ def render_report(
         ]
     )
     if text_result is not None:
-        lines.extend(render_lane("Text", text_result, text_cost))
+        lines.extend(
+            render_lane(
+                "Text",
+                text_result,
+                text_cost,
+                selected_int8_variant,
+            )
+        )
         lines.extend(render_diagnostics(diagnostic_evidence))
     if visual_result is not None:
-        lines.extend(render_lane("Visual", visual_result, visual_cost))
+        lines.extend(
+            render_lane(
+                "Visual",
+                visual_result,
+                visual_cost,
+                selected_int8_variant,
+            )
+        )
         lines.extend(render_visual_diagnostics(visual_diagnostic_evidence))
+    if text_result is not None and visual_result is not None:
+        lines.extend(render_int8_matrix_probe(text_result, visual_result))
     if text_result is not None:
         lines.extend(render_decisions(text_result, visual_result))
     report_path.write_text("\n".join(lines) + "\n")
 
 
-def render_lane(name: str, result: dict, cost: dict | None) -> list[str]:
+def render_lane(
+    name: str,
+    result: dict,
+    cost: dict | None,
+    selected_int8_variant: str | None,
+) -> list[str]:
     lines = ["", f"## {name} lane", ""]
     if name == "Text":
         lines.extend(
@@ -1601,6 +1771,27 @@ def render_lane(name: str, result: dict, cost: dict | None) -> list[str]:
                 f"{corpus['dim']} × 4 bytes).",
             ]
         )
+        probe = result.get("int8_probe")
+        if probe is not None and selected_int8_variant is not None:
+            variant = next(
+                (
+                    row
+                    for row in probe["variants"]
+                    if row["variant"] == selected_int8_variant
+                ),
+                None,
+            )
+            if variant is None:
+                raise RuntimeError(
+                    f"{name} int8 probe omitted selected variant "
+                    f"{selected_int8_variant}"
+                )
+            lines.append(
+                f"- Selected int8 matrix payload "
+                f"(`{selected_int8_variant}`): "
+                f"`{variant['mean_payload_bytes_per_document']:.1f}` "
+                f"bytes/{unit}."
+            )
         for config in sorted(fde_dimensions):
             dimension = fde_dimensions[config]
             lines.append(
@@ -1619,6 +1810,122 @@ def render_lane(name: str, result: dict, cost: dict | None) -> list[str]:
                     "```",
                 ]
             )
+    return lines
+
+
+def selected_int8_variant_name(
+    text_result: dict | None,
+    visual_result: dict | None,
+) -> str | None:
+    if text_result is None or visual_result is None:
+        return None
+    text_probe = text_result.get("int8_probe")
+    visual_probe = visual_result.get("int8_probe")
+    if text_probe is None or visual_probe is None:
+        return None
+    text_by_name = {
+        row["variant"]: bool(row["passed"])
+        for row in text_probe["variants"]
+    }
+    visual_by_name = {
+        row["variant"]: bool(row["passed"])
+        for row in visual_probe["variants"]
+    }
+    if set(text_by_name) != set(visual_by_name):
+        raise RuntimeError("text and visual int8 probe variants differ")
+    expected_names = {"global_scale", "per_row_calibrated"}
+    if set(text_by_name) != expected_names:
+        raise RuntimeError("int8 probe variant names are not recognized")
+    global_name = "global_scale"
+    if text_by_name[global_name] and visual_by_name[global_name]:
+        return global_name
+    calibrated_name = "per_row_calibrated"
+    if (
+        text_by_name[calibrated_name]
+        and visual_by_name[calibrated_name]
+    ):
+        return calibrated_name
+    return None
+
+
+def render_int8_matrix_probe(
+    text_result: dict,
+    visual_result: dict,
+) -> list[str]:
+    text_probe = text_result.get("int8_probe")
+    visual_probe = visual_result.get("int8_probe")
+    if text_probe is None and visual_probe is None:
+        return []
+    if text_probe is None or visual_probe is None:
+        raise RuntimeError("int8 probe result must exist for both lanes")
+    selected = selected_int8_variant_name(text_result, visual_result)
+    overall_passed = selected is not None
+    global_scale_overall_passed = bool(
+        text_probe["global_scale_passed"]
+        and visual_probe["global_scale_passed"]
+    )
+    calibrated_overall_passed = all(
+        next(
+            row["passed"]
+            for row in probe["variants"]
+            if row["variant"] == "per_row_calibrated"
+        )
+        for probe in (text_probe, visual_probe)
+    )
+    lines = [
+        "",
+        "## int8 matrix payload probe",
+        "",
+        f"- Text candidate recipe: `{text_probe['candidate_config']}`, "
+        f"`{text_probe['candidate_centering']}`, document pooling "
+        f"`{text_probe['candidate_document_pooling_factor']}×`.",
+        f"- Visual candidate recipe: `{visual_probe['candidate_config']}`, "
+        f"`{visual_probe['candidate_centering']}`, document pooling "
+        f"`{visual_probe['candidate_document_pooling_factor']}×`.",
+        "",
+        "| Lane | Variant | f32/int8 top-1 same | "
+        "f32 top-10 recovered | Max error (50 pairs) | "
+        "Row L2 p50/p95/p99 | R@50 | R@100 | R@300 | "
+        "Bytes/unit | Passed |",
+        "| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | "
+        "---: | ---: | --- |",
+    ]
+    for lane, probe in (("Text", text_probe), ("Visual", visual_probe)):
+        for variant in probe["variants"]:
+            lines.append(
+                f"| {lane} | `{variant['variant']}` | "
+                f"{variant['f32_top_1_same_rank_fraction']:.6f} | "
+                f"{variant['f32_top_10_recall_in_int8_top_10']:.6f} | "
+                f"{variant['max_sim_50_pair_max_absolute_error']:.8g} | "
+                f"{variant['first_100_document_row_l2_error_p50']:.6f}/"
+                f"{variant['first_100_document_row_l2_error_p95']:.6f}/"
+                f"{variant['first_100_document_row_l2_error_p99']:.6f} | "
+                f"{variant['candidate_recall_at_50']:.6f} | "
+                f"{variant['candidate_recall_at_100']:.6f} | "
+                f"{variant['candidate_recall_at_300']:.6f} | "
+                f"{variant['mean_payload_bytes_per_document']:.1f} | "
+                f"`{str(variant['passed']).lower()}` |"
+            )
+    lines.extend(
+        [
+            "",
+            "- Global-scale overall passed: "
+            f"`{str(global_scale_overall_passed).lower()}`.",
+            "- Per-row calibrated overall passed: "
+            f"`{str(calibrated_overall_passed).lower()}`.",
+            f"- Overall passed: `{str(overall_passed).lower()}`.",
+            (
+                f"- Decision: approve `{selected}` int8 document matrix "
+                "payloads for Phases 6, 7, and 9; query matrices remain f16."
+                if overall_passed
+                else "- Decision: reject int8 document matrix payloads; "
+                "retain f16 for Phase 6."
+            ),
+            "- The binding candidate gate remains measured against f32 exact "
+            "truth. These probe readouts keep the FDE ranking unchanged and "
+            "use each int8 variant's exact top-10 as the diagnostic truth.",
+        ]
+    )
     return lines
 
 
@@ -1732,7 +2039,12 @@ def delete_transient_lab_artifacts(work_dir: Path) -> None:
             path.unlink()
 
 
-def text_lane(hf_home: Path, work_dir: Path, binary: Path):
+def text_lane(
+    hf_home: Path,
+    work_dir: Path,
+    binary: Path,
+    int8_probe: bool,
+):
     model_path = snapshot_path(hf_home, TEXT_REPO, TEXT_REVISION, "model")
     dataset_path = snapshot_path(
         hf_home, SCIFACT_REPO, SCIFACT_REVISION, "dataset"
@@ -1756,7 +2068,16 @@ def text_lane(hf_home: Path, work_dir: Path, binary: Path):
         work_dir / "text-queries.json",
         cost_path,
     )
-    if all(path.is_file() for path in cached_paths):
+    cache_available = all(path.is_file() for path in cached_paths)
+    if int8_probe and not cache_available:
+        missing = [str(path) for path in cached_paths if not path.is_file()]
+        raise FileNotFoundError(
+            "int8 probe requires the retained text f16 cache; missing "
+            + ", ".join(missing)
+        )
+    full_precision_documents = None
+    full_precision_queries = None
+    if cache_available:
         timing = json.loads(cost_path.read_text())
         documents = read_tensor(
             work_dir / "text-documents", timing["documents"]
@@ -1767,6 +2088,27 @@ def text_lane(hf_home: Path, work_dir: Path, binary: Path):
         if documents.ids != document_ids or text_queries.ids != query_ids:
             raise RuntimeError("cached text tensor IDs do not match pinned SciFact")
         print("reused validated pinned SciFact tensors", flush=True)
+        if int8_probe:
+            encoder = TextEncoder(model_path)
+            full_precision_documents = text_encoding_once(
+                encoder, document_texts, document_ids, is_query=False
+            )
+            full_precision_queries = text_encoding_once(
+                encoder, query_texts, query_ids, is_query=True
+            )
+            del encoder
+            validate_precision_reference(
+                documents,
+                full_precision_documents,
+                "text",
+                "documents",
+            )
+            validate_precision_reference(
+                text_queries,
+                full_precision_queries,
+                "text",
+                "queries",
+            )
     else:
         encoder = TextEncoder(model_path)
         documents = timed_text_encoding(
@@ -1807,6 +2149,10 @@ def text_lane(hf_home: Path, work_dir: Path, binary: Path):
         documents,
         text_queries,
         text_official_pair_scores(text_queries, documents),
+        full_precision_documents=full_precision_documents,
+        full_precision_queries=full_precision_queries,
+        int8_probe=int8_probe,
+        reuse_primary_exchange=int8_probe,
     )
     return result, encoding_metadata(documents, text_queries)
 
@@ -1817,6 +2163,7 @@ def visual_lane(
     binary: Path,
     chosen_algorithm: str,
     chosen_centering: str,
+    int8_probe: bool,
 ):
     base_path = snapshot_path(
         hf_home, VISUAL_BASE_REPO, VISUAL_BASE_REVISION, "model"
@@ -1857,7 +2204,16 @@ def visual_lane(
         work_dir / "visual-queries.json",
         cost_path,
     )
-    if all(path.is_file() for path in cached_paths):
+    cache_available = all(path.is_file() for path in cached_paths)
+    if int8_probe and not cache_available:
+        missing = [str(path) for path in cached_paths if not path.is_file()]
+        raise FileNotFoundError(
+            "int8 probe requires the retained visual f16 cache; missing "
+            + ", ".join(missing)
+        )
+    full_precision_documents = None
+    full_precision_queries = None
+    if cache_available:
         timing = json.loads(cost_path.read_text())
         documents = read_tensor(
             work_dir / "visual-documents", timing["documents"]
@@ -1870,19 +2226,52 @@ def visual_lane(
                 "cached visual tensor IDs do not match pinned ViDoRe tasks"
             )
         with tempfile.TemporaryDirectory(dir=work_dir) as temporary:
-            local_adapter = redirected_visual_adapter(
-                adapter_path, base_path, Path(temporary) / "visual-adapter-local"
-            )
-            processor = ColModernVBertProcessor.from_pretrained(
-                local_adapter,
-                trust_remote_code=False,
-                local_files_only=True,
-            )
+            if int8_probe:
+                model, processor = load_visual_model(
+                    base_path, adapter_path, Path(temporary)
+                )
+                full_precision_documents = visual_encoding_once(
+                    model,
+                    processor,
+                    images,
+                    document_ids,
+                    is_query=False,
+                )
+                full_precision_queries = visual_encoding_once(
+                    model,
+                    processor,
+                    query_texts,
+                    query_ids,
+                    is_query=True,
+                )
+                del model
+                validate_precision_reference(
+                    documents,
+                    full_precision_documents,
+                    "visual",
+                    "documents",
+                )
+                validate_precision_reference(
+                    visual_queries,
+                    full_precision_queries,
+                    "visual",
+                    "queries",
+                )
+            else:
+                local_adapter = redirected_visual_adapter(
+                    adapter_path,
+                    base_path,
+                    Path(temporary) / "visual-adapter-local",
+                )
+                processor = ColModernVBertProcessor.from_pretrained(
+                    local_adapter,
+                    trust_remote_code=False,
+                    local_files_only=True,
+                )
             official_scores = visual_official_pair_scores(
                 processor, visual_queries, documents
             )
         print("reused validated pinned ViDoRe tensors", flush=True)
-        include_full_precision = False
     else:
         with tempfile.TemporaryDirectory(dir=work_dir) as temporary:
             model, processor = load_visual_model(
@@ -1897,6 +2286,8 @@ def visual_lane(
             official_scores = visual_official_pair_scores(
                 processor, visual_queries, documents
             )
+            full_precision_documents = documents
+            full_precision_queries = visual_queries
             del model, processor
         cost_path.write_text(
             json.dumps(
@@ -1922,7 +2313,6 @@ def visual_lane(
             )
             + "\n"
         )
-        include_full_precision = True
     result = run_rust(
         binary,
         work_dir,
@@ -1932,7 +2322,10 @@ def visual_lane(
         official_scores,
         chosen_algorithm,
         chosen_centering,
-        include_full_precision=include_full_precision,
+        full_precision_documents=full_precision_documents,
+        full_precision_queries=full_precision_queries,
+        int8_probe=int8_probe,
+        reuse_primary_exchange=int8_probe,
     )
     return result, encoding_metadata(documents, visual_queries)
 
@@ -1982,7 +2375,12 @@ def run(args) -> None:
         "adapter_revision": VISUAL_ADAPTER_REVISION,
         "lora_modules": 89,
     }
-    text_result, text_cost = text_lane(hf_home, work_dir, binary)
+    text_result, text_cost = text_lane(
+        hf_home,
+        work_dir,
+        binary,
+        args.int8_probe,
+    )
     pins = artifact_hashes(snapshots)
     render_report(
         args.report,
@@ -2004,6 +2402,7 @@ def run(args) -> None:
         binary,
         winner["algorithm"],
         winner["centering"],
+        args.int8_probe,
     )
     render_report(
         args.report,
@@ -2033,6 +2432,7 @@ def parse_args():
     execute.add_argument("--binary", type=Path, required=True)
     execute.add_argument("--report", type=Path, required=True)
     execute.add_argument("--retain-tensors", action="store_true")
+    execute.add_argument("--int8-probe", action="store_true")
     return parser.parse_args()
 
 
