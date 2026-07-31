@@ -36,6 +36,8 @@ pub mod store;
 
 /// Classifies exact namespace-owned object keys into production families.
 mod namespace_key;
+/// Plans bounded coalesced range reads across immutable objects.
+pub mod read_plan;
 
 pub(crate) use namespace_key::{namespace_prefix, NamespaceObjectFamily, NamespaceObjectKey};
 
