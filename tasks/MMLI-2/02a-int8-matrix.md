@@ -201,6 +201,33 @@ this lab result. Until the operator resolves that gate and the
 production stamp passes, `int8_sym_v1` activation remains refused
 and f16 remains the usable default.
 
+### Production writer/decoder measurement (2026-07-31)
+
+The fixed G32 cell was measured on both full lanes through actual
+production `MatrixArtifact::to_bytes` persistence and
+`MatrixArtifact::from_bytes` decoding. Queries remained f16 and the
+f32/f16 references came from the same encoder pass.
+
+| Lane | Reference | Top-10 recovered | Misses | Same set | Same order | Same top-1 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Text | f32 | 99.296664% | 78/11090 | 93.056808% | 69.161407% | 99.819657% |
+| Text | f16 | 99.269612% | 81/11090 | 92.786294% | 69.251578% | 99.909829% |
+| Visual | f32 | 99.737336% | 14/5330 | 97.373358% | 81.801126% | 99.249531% |
+| Visual | f16 | 99.737336% | 14/5330 | 97.373358% | 81.238274% | 99.249531% |
+
+Text misses moved 70→78, inside the draft 55–85 band, and text
+same-top-1 met the draft 99.5% bar. Visual misses stayed 14, inside
+the draft 0–29 band, but visual same-top-1 was 99.250% and did not
+meet the draft 99.5% bar. Both lanes saved 46.875% of matrix payload
+bytes relative to f16.
+
+Decision: **measured, awaiting operator threshold**. The final visual
+threshold remains unsigned. No qualification tuple or stamp is
+approved, `int8_sym_v1` activation remains fail-closed, and f16
+remains the usable default. Full evidence is in
+`results/int8-production-qualification.md` and
+`results/int8-production-qualification.json`.
+
 ## Implementation Plan (dual-format, decided 2026-07-30)
 
 ### Phase 6 changes (enrichment)

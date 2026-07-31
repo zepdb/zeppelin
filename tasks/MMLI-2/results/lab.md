@@ -564,6 +564,32 @@ per-rank results and exact decode-operation counts are in
   groupwise lab cell meets it (G32 98.874%, G16 98.687%), so final per-lane
   thresholds remain unsigned and INT8 activation remains refused.
 
+## int8 production writer/decoder qualification
+
+The fixed G32 cell was rerun through actual production `ZME1` artifact
+write, persistence, read, checksum/header validation, decode, and exhaustive
+MaxSim scoring. Queries remained f16; f32 and f16 references came from the
+same encoder pass.
+
+| Lane | Reference | Top-10 recovered | Misses | Same set | Same order | Same top-1 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Text | f32 | 0.992967 | 78/11090 | 0.930568 | 0.691614 | 0.998197 |
+| Text | f16 | 0.992696 | 81/11090 | 0.927863 | 0.692516 | 0.999098 |
+| Visual | f32 | 0.997373 | 14/5330 | 0.973734 | 0.818011 | 0.992495 |
+| Visual | f16 | 0.997373 | 14/5330 | 0.973734 | 0.812383 | 0.992495 |
+
+- Text reproduced the 70-miss lab cell at 78 misses, inside its 55–85
+  draft band, and met the draft ≥99.5% same-top-1 check.
+- Visual exactly reproduced the 14-miss lab cell, inside its 0–29 draft
+  band, but its 99.250% same-top-1 result missed the draft ≥99.5% check.
+- Both lanes saved 46.875% of matrix payload bytes relative to f16.
+- Result: measured, awaiting operator threshold. No qualification stamp was
+  minted; `int8_sym_v1` activation remains refused and f16 remains default.
+
+Full per-rank results, byte counts, checksums, and evidence digests:
+`results/int8-production-qualification.md` and
+`results/int8-production-qualification.json`.
+
 ## Named decisions and resolved lateon unknowns
 
 - Candidate algorithm: `paper_v1`.

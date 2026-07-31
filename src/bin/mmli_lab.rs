@@ -8,15 +8,20 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeppelin::config::IndexingConfig;
+use zeppelin::embedding::{
+    ArtifactChecksum, ContentHash, MatrixArtifact, MatrixArtifactRow, MatrixDtype,
+    MultiVectorEmbedding, MultiVectorEpochId,
+};
 use zeppelin::error::ZeppelinError;
 use zeppelin::index::ivf_flat::kmeans::train_kmeans;
 use zeppelin::index::late_interaction::{
@@ -39,6 +44,7 @@ const GEOMETRY_SAMPLE_ROWS: usize = 256;
 const SIMHASH_SAMPLE_ROWS: usize = 5_000;
 const SIMHASH_SAMPLE_DOCUMENTS: usize = 256;
 const FDE_SEED: u64 = 0x4d4d_4c49_0000_0002;
+const QUALIFICATION_SOURCE_FRAGMENT_CHECKSUM: u64 = 0x4d4d_4c49_5132_4131;
 
 type Result<T> = std::result::Result<T, LabError>;
 
@@ -73,6 +79,15 @@ enum LabError {
 enum Lane {
     Text,
     Visual,
+}
+
+impl Lane {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Visual => "visual",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -115,6 +130,13 @@ struct TensorInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ProductionInt8QualificationJob {
+    group_sizes: Vec<u16>,
+    artifact_directory: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Job {
     lane: Lane,
     documents: TensorInput,
@@ -127,6 +149,8 @@ struct Job {
     precision_ranking_audit: bool,
     #[serde(default)]
     precision_ranking_candidates: Option<Vec<PrecisionRankingCandidate>>,
+    #[serde(default)]
+    production_int8_qualification: Option<ProductionInt8QualificationJob>,
     #[serde(default)]
     chosen_algorithm: Option<Algorithm>,
     #[serde(default)]
@@ -199,6 +223,63 @@ struct PrecisionRankingAuditResultDocument {
     corpus_stats: TensorSummary,
     query_stats: TensorSummary,
     precision_ranking_audit: PrecisionRankingAuditReport,
+}
+
+#[derive(Debug, Serialize)]
+struct ProductionInt8QualificationResultDocument {
+    schema_version: u32,
+    mode: &'static str,
+    lane: Lane,
+    decision_state: &'static str,
+    f32_reference: &'static str,
+    f16_reference: &'static str,
+    candidate_query_dtype: DType,
+    corpus_stats: TensorSummary,
+    query_stats: TensorSummary,
+    f16_f32_id_parity_verified: bool,
+    input_tensor_digests: InputTensorDigests,
+    f16_vs_f32_ranking: RankingAgreement,
+    group_results: Vec<ProductionInt8GroupResult>,
+    evidence_digest_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct InputTensorDigests {
+    f16_documents_sha256: String,
+    f16_queries_sha256: String,
+    f32_documents_sha256: String,
+    f32_queries_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProductionInt8GroupResult {
+    group_size: u16,
+    dtype: MatrixDtype,
+    decision_state: &'static str,
+    artifact_file: String,
+    artifact_checksum_sha256: String,
+    artifact_file_bytes: usize,
+    matrix_payload_bytes: usize,
+    f16_matrix_payload_bytes: usize,
+    mean_matrix_payload_bytes_per_document: f64,
+    saving_fraction_vs_f16: f64,
+    artifact_write_read_verified: bool,
+    authoritative_dtype_verified: bool,
+    id_parity_verified: bool,
+    int8_vs_f32_ranking: RankingAgreement,
+    int8_vs_f16_ranking: RankingAgreement,
+}
+
+#[derive(Serialize)]
+struct ProductionInt8EvidenceDigestMaterial<'a> {
+    schema_version: u32,
+    lane: Lane,
+    f32_reference: &'static str,
+    f16_reference: &'static str,
+    candidate_query_dtype: DType,
+    input_tensor_digests: &'a InputTensorDigests,
+    f16_vs_f32_ranking: &'a RankingAgreement,
+    group_results: &'a [ProductionInt8GroupResult],
 }
 
 #[derive(Debug, Deserialize)]
@@ -430,10 +511,23 @@ const ALL_PRECISION_RANKING_CANDIDATES: [PrecisionRankingCandidate; 7] = [
     PrecisionRankingCandidate::Int8Groupwise16SymmetricRenormalized,
 ];
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct RankSameDocumentFraction {
     rank: usize,
     fraction: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RankingAgreement {
+    query_count: usize,
+    gold_count: usize,
+    top_10_set_exactly_equal_query_fraction: f64,
+    top_10_recovered_in_candidate_top_10: f64,
+    ordered_top_10_exactly_equal_query_fraction: f64,
+    per_rank_same_document_fractions: Vec<RankSameDocumentFraction>,
+    top_1_same_document_fraction: f64,
+    top_1_in_candidate_top_10_fraction: f64,
+    missed_top_10_memberships: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -609,10 +703,14 @@ fn run() -> Result<()> {
             documents.sidecar.dim, queries.sidecar.dim
         )));
     }
-    if documents.sidecar.ids.len() < CANDIDATE_KS[2] {
+    let minimum_document_count = if job.production_int8_qualification.is_some() {
+        ROUTING_TRUTH_K
+    } else {
+        CANDIDATE_KS[2]
+    };
+    if documents.sidecar.ids.len() < minimum_document_count {
         return Err(LabError::Invalid(format!(
-            "candidate recall requires at least {} documents, got {}",
-            CANDIDATE_KS[2],
+            "job requires at least {minimum_document_count} documents, got {}",
             documents.sidecar.ids.len()
         )));
     }
@@ -626,6 +724,34 @@ fn run() -> Result<()> {
         .as_ref()
         .map(|input| load_tensor(input, base))
         .transpose()?;
+    if let Some(qualification) = &job.production_int8_qualification {
+        let (full_documents, full_queries) = full_precision_documents
+            .as_ref()
+            .zip(full_precision_queries.as_ref())
+            .ok_or_else(|| {
+                LabError::Invalid(
+                    "production_int8_qualification requires paired f32 document and query references"
+                        .to_string(),
+                )
+            })?;
+        validate_precision_pair(&documents, &queries, full_documents, full_queries)?;
+        let f16_identity = prepare_values(&documents, &queries, Centering::Identity)?;
+        let f16_truth = exhaustive_truth(&documents, &queries, &f16_identity)?;
+        let f32_identity = prepare_values(full_documents, full_queries, Centering::Identity)?;
+        let f32_truth = exhaustive_truth(full_documents, full_queries, &f32_identity)?;
+        let input_tensor_digests = qualification_input_tensor_digests(&job, base)?;
+        let result = evaluate_production_int8_qualification(
+            job.lane,
+            &documents,
+            &queries,
+            &f32_truth,
+            &f16_truth,
+            qualification,
+            base,
+            input_tensor_digests,
+        )?;
+        return write_stdout_json(&result);
+    }
     let identity = prepare_values(&documents, &queries, Centering::Identity)?;
     let identity_truth = exhaustive_truth(&documents, &queries, &identity)?;
     let full_precision = match (&full_precision_documents, &full_precision_queries) {
@@ -777,6 +903,45 @@ fn parse_cli() -> Result<PathBuf> {
 }
 
 fn validate_lane_contract(job: &Job) -> Result<()> {
+    if let Some(qualification) = &job.production_int8_qualification {
+        if job.official_scores.is_some()
+            || job.int8_probe
+            || job.precision_ranking_audit
+            || job.precision_ranking_candidates.is_some()
+            || job.chosen_algorithm.is_some()
+            || job.chosen_centering.is_some()
+        {
+            return Err(LabError::Invalid(
+                "production_int8_qualification cannot be combined with another lab mode"
+                    .to_string(),
+            ));
+        }
+        if job.full_precision_documents.is_none() || job.full_precision_queries.is_none() {
+            return Err(LabError::Invalid(
+                "production_int8_qualification requires paired f32 document and query references"
+                    .to_string(),
+            ));
+        }
+        if qualification.group_sizes.is_empty() {
+            return Err(LabError::Invalid(
+                "production_int8_qualification requires at least one group size".to_string(),
+            ));
+        }
+        let mut seen = HashSet::with_capacity(qualification.group_sizes.len());
+        for &group_size in &qualification.group_sizes {
+            if !matches!(group_size, 16 | 32 | 128) {
+                return Err(LabError::Invalid(format!(
+                    "production int8 group size must be one of 16, 32, or 128, got {group_size}"
+                )));
+            }
+            if !seen.insert(group_size) {
+                return Err(LabError::Invalid(format!(
+                    "production int8 qualification repeats group size {group_size}"
+                )));
+            }
+        }
+        return Ok(());
+    }
     if !job.precision_ranking_audit && job.official_scores.is_none() {
         return Err(LabError::Invalid(
             "non-audit jobs require official_scores".to_string(),
@@ -890,6 +1055,62 @@ fn resolve_path(base: &Path, path: &Path) -> PathBuf {
     } else {
         base.join(path)
     }
+}
+
+fn qualification_input_tensor_digests(job: &Job, base: &Path) -> Result<InputTensorDigests> {
+    let full_documents = job
+        .full_precision_documents
+        .as_ref()
+        .ok_or_else(|| LabError::Invalid("qualification is missing f32 documents".to_string()))?;
+    let full_queries = job
+        .full_precision_queries
+        .as_ref()
+        .ok_or_else(|| LabError::Invalid("qualification is missing f32 queries".to_string()))?;
+    Ok(InputTensorDigests {
+        f16_documents_sha256: digest_tensor_input(&job.documents, base)?,
+        f16_queries_sha256: digest_tensor_input(&job.queries, base)?,
+        f32_documents_sha256: digest_tensor_input(full_documents, base)?,
+        f32_queries_sha256: digest_tensor_input(full_queries, base)?,
+    })
+}
+
+fn digest_tensor_input(input: &TensorInput, base: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for (label, path) in [
+        (b"sidecar".as_slice(), resolve_path(base, &input.sidecar)),
+        (b"raw".as_slice(), resolve_path(base, &input.raw)),
+    ] {
+        let file = File::open(&path).map_err(|source| LabError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let metadata = file.metadata().map_err(|source| LabError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(LabError::Invalid(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
+        }
+        hasher.update((label.len() as u64).to_le_bytes());
+        hasher.update(label);
+        hasher.update(metadata.len().to_le_bytes());
+        let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, file);
+        let mut buffer = vec![0_u8; IO_BUFFER_BYTES];
+        loop {
+            let read = reader.read(&mut buffer).map_err(|source| LabError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    Ok(ArtifactChecksum::new(hasher.finalize().into()).to_hex())
 }
 
 fn load_tensor(input: &TensorInput, base: &Path) -> Result<TensorSet> {
@@ -1348,6 +1569,281 @@ fn compare_precision_truth(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn evaluate_production_int8_qualification(
+    lane: Lane,
+    documents: &TensorSet,
+    queries: &TensorSet,
+    f32_truth: &[ExactTruth],
+    f16_truth: &[ExactTruth],
+    qualification: &ProductionInt8QualificationJob,
+    base: &Path,
+    input_tensor_digests: InputTensorDigests,
+) -> Result<ProductionInt8QualificationResultDocument> {
+    if documents.sidecar.dtype != DType::F16 || queries.sidecar.dtype != DType::F16 {
+        return Err(LabError::Invalid(
+            "production int8 qualification requires f16 document and query tensors".to_string(),
+        ));
+    }
+    if documents.sidecar.dim != 128 {
+        return Err(LabError::Invalid(format!(
+            "production int8 qualification requires dimension 128, got {}",
+            documents.sidecar.dim
+        )));
+    }
+    let artifact_directory = resolve_path(base, &qualification.artifact_directory);
+    let metadata = fs::metadata(&artifact_directory).map_err(|source| LabError::Io {
+        path: artifact_directory.clone(),
+        source,
+    })?;
+    if !metadata.is_dir() {
+        return Err(LabError::Invalid(format!(
+            "{} is not an artifact directory",
+            artifact_directory.display()
+        )));
+    }
+
+    let f16_vs_f32_ranking = compare_ranking_agreement(f32_truth, f16_truth);
+    let mut group_results = Vec::with_capacity(qualification.group_sizes.len());
+    for &group_size in &qualification.group_sizes {
+        let dtype = MatrixDtype::Int8SymV1 { group_size };
+        dtype.validate_for_dimension(
+            u32::try_from(documents.sidecar.dim)
+                .map_err(|_| LabError::Invalid("matrix dimension exceeds u32".to_string()))?,
+        )?;
+        let semantic_epoch = qualification_epoch(lane, group_size);
+        let artifact = matrix_artifact_from_tensor(documents, dtype, semantic_epoch)?;
+        let encoded = artifact.to_bytes()?;
+        let artifact_checksum = encoded.checksum();
+        let artifact_file = format!("{}-int8-sym-v1-g{group_size}.zme1", lane.as_str());
+        let artifact_path = artifact_directory.join(&artifact_file);
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&artifact_path)
+            .map_err(|source| LabError::Io {
+                path: artifact_path.clone(),
+                source,
+            })?;
+        output
+            .write_all(encoded.bytes())
+            .map_err(|source| LabError::Io {
+                path: artifact_path.clone(),
+                source,
+            })?;
+        output.sync_all().map_err(|source| LabError::Io {
+            path: artifact_path.clone(),
+            source,
+        })?;
+        drop(output);
+        let artifact_file_bytes = encoded.bytes().len();
+        drop(artifact);
+        drop(encoded);
+
+        let persisted = fs::read(&artifact_path).map_err(|source| LabError::Io {
+            path: artifact_path.clone(),
+            source,
+        })?;
+        if persisted.len() != artifact_file_bytes {
+            return Err(LabError::Invalid(format!(
+                "{} persisted {} bytes, expected {artifact_file_bytes}",
+                artifact_path.display(),
+                persisted.len()
+            )));
+        }
+        let decoded = MatrixArtifact::from_bytes(
+            &persisted,
+            artifact_checksum,
+            dtype,
+            semantic_epoch,
+            QUALIFICATION_SOURCE_FRAGMENT_CHECKSUM,
+            documents.sidecar.dim,
+            documents.sidecar.ids.len(),
+            MAX_MATRIX_ROWS,
+        )?;
+        if decoded.dtype() != dtype {
+            return Err(LabError::Invalid(
+                "production decoder returned a dtype that differs from the authoritative header"
+                    .to_string(),
+            ));
+        }
+        verify_artifact_id_parity(&decoded, &documents.sidecar.ids)?;
+        let candidate_truth = exhaustive_artifact_truth(&decoded, queries)?;
+        let bytes_per_vector = documents
+            .sidecar
+            .dim
+            .checked_add(
+                (documents.sidecar.dim / usize::from(group_size))
+                    .checked_mul(DType::F16.byte_width())
+                    .ok_or_else(|| {
+                        LabError::Invalid("production int8 scale bytes overflow".to_string())
+                    })?,
+            )
+            .ok_or_else(|| {
+                LabError::Invalid("production int8 bytes per vector overflow".to_string())
+            })?;
+        let matrix_payload_bytes = documents
+            .total_rows
+            .checked_mul(bytes_per_vector)
+            .ok_or_else(|| {
+                LabError::Invalid("production int8 matrix payload bytes overflow".to_string())
+            })?;
+        let f16_matrix_payload_bytes = documents
+            .values
+            .len()
+            .checked_mul(DType::F16.byte_width())
+            .ok_or_else(|| {
+                LabError::Invalid("production f16 matrix payload bytes overflow".to_string())
+            })?;
+        group_results.push(ProductionInt8GroupResult {
+            group_size,
+            dtype,
+            decision_state: if group_size == 128 {
+                "measurement_only_no_durable_visual_baseline"
+            } else {
+                "measured_awaiting_operator_threshold"
+            },
+            artifact_file,
+            artifact_checksum_sha256: artifact_checksum.to_hex(),
+            artifact_file_bytes,
+            matrix_payload_bytes,
+            f16_matrix_payload_bytes,
+            mean_matrix_payload_bytes_per_document: matrix_payload_bytes as f64
+                / documents.sidecar.ids.len() as f64,
+            saving_fraction_vs_f16: 1.0
+                - matrix_payload_bytes as f64 / f16_matrix_payload_bytes as f64,
+            artifact_write_read_verified: true,
+            authoritative_dtype_verified: true,
+            id_parity_verified: true,
+            int8_vs_f32_ranking: compare_ranking_agreement(f32_truth, &candidate_truth),
+            int8_vs_f16_ranking: compare_ranking_agreement(f16_truth, &candidate_truth),
+        });
+    }
+
+    let digest_material = ProductionInt8EvidenceDigestMaterial {
+        schema_version: 1,
+        lane,
+        f32_reference: "same_pass_f32_documents_and_queries",
+        f16_reference: "same_pass_f16_documents_and_queries",
+        candidate_query_dtype: DType::F16,
+        input_tensor_digests: &input_tensor_digests,
+        f16_vs_f32_ranking: &f16_vs_f32_ranking,
+        group_results: &group_results,
+    };
+    let digest_bytes = serde_json::to_vec(&digest_material).map_err(|source| LabError::Json {
+        path: PathBuf::from("<production-int8-evidence>"),
+        source,
+    })?;
+    Ok(ProductionInt8QualificationResultDocument {
+        schema_version: 1,
+        mode: "production_int8_matrix_qualification",
+        lane,
+        decision_state: "measured_awaiting_operator_threshold",
+        f32_reference: "same_pass_f32_documents_and_queries",
+        f16_reference: "same_pass_f16_documents_and_queries",
+        candidate_query_dtype: DType::F16,
+        corpus_stats: summarize(documents),
+        query_stats: summarize(queries),
+        f16_f32_id_parity_verified: true,
+        input_tensor_digests,
+        f16_vs_f32_ranking,
+        group_results,
+        evidence_digest_sha256: ArtifactChecksum::digest(&digest_bytes).to_hex(),
+    })
+}
+
+fn qualification_epoch(lane: Lane, group_size: u16) -> MultiVectorEpochId {
+    let identity = format!(
+        "mmli-2-production-int8-qualification-v1:{}:{group_size}",
+        lane.as_str()
+    );
+    let digest = ArtifactChecksum::digest(identity.as_bytes());
+    MultiVectorEpochId::new(*digest.as_bytes())
+}
+
+fn matrix_artifact_from_tensor(
+    documents: &TensorSet,
+    dtype: MatrixDtype,
+    semantic_epoch: MultiVectorEpochId,
+) -> Result<MatrixArtifact> {
+    let mut rows = Vec::with_capacity(documents.sidecar.ids.len());
+    for (document_index, document_id) in documents.sidecar.ids.iter().enumerate() {
+        let matrix = documents.matrix(&documents.values, document_index)?;
+        let content_digest = ArtifactChecksum::digest(document_id.as_bytes());
+        rows.push(MatrixArtifactRow::new(
+            ContentHash::new(*content_digest.as_bytes()),
+            MultiVectorEmbedding::new(
+                matrix.values().to_vec(),
+                matrix.vector_count(),
+                matrix.vector_dimension(),
+                MAX_MATRIX_ROWS,
+            )?,
+        ));
+    }
+    MatrixArtifact::new(
+        dtype,
+        semantic_epoch,
+        QUALIFICATION_SOURCE_FRAGMENT_CHECKSUM,
+        documents.sidecar.dim,
+        rows,
+    )
+    .map_err(Into::into)
+}
+
+fn verify_artifact_id_parity(artifact: &MatrixArtifact, expected_ids: &[String]) -> Result<()> {
+    if artifact.rows().len() != expected_ids.len() {
+        return Err(LabError::Invalid(format!(
+            "decoded artifact has {} rows, expected {} IDs",
+            artifact.rows().len(),
+            expected_ids.len()
+        )));
+    }
+    for (index, (row, expected_id)) in artifact.rows().iter().zip(expected_ids).enumerate() {
+        let digest = ArtifactChecksum::digest(expected_id.as_bytes());
+        if row.content_hash().as_bytes() != digest.as_bytes() {
+            return Err(LabError::Invalid(format!(
+                "decoded artifact ID parity failed at row {index}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn exhaustive_artifact_truth(
+    documents: &MatrixArtifact,
+    queries: &TensorSet,
+) -> Result<Vec<ExactTruth>> {
+    if documents.rows().len() < ROUTING_TRUTH_K {
+        return Err(LabError::Invalid(format!(
+            "production qualification requires at least {ROUTING_TRUTH_K} decoded documents"
+        )));
+    }
+    parallel_indexed_map(queries.sidecar.ids.len(), |query_index| {
+        let query = queries.matrix(&queries.values, query_index)?;
+        let mut scores = Vec::with_capacity(documents.rows().len());
+        for (document_index, document) in documents.rows().iter().enumerate() {
+            let matrix = document.embedding().matrix_ref()?;
+            let score = max_sim(&query, &matrix)?;
+            if !score.is_finite() {
+                return Err(LabError::Invalid(format!(
+                    "MaxSim overflowed for query {query_index}, decoded document {document_index}"
+                )));
+            }
+            scores.push((document_index, score));
+        }
+        rank_scores(&mut scores);
+        Ok(ExactTruth {
+            top_documents: scores
+                .iter()
+                .take(TRUTH_K)
+                .map(|&(index, _)| index)
+                .collect(),
+            rank_10: scores[TRUTH_K - 1],
+            rank_100: scores[ROUTING_TRUTH_K - 1],
+        })
+    })
+}
+
 fn evaluate_precision_ranking_audit(
     documents: &TensorSet,
     queries: &TensorSet,
@@ -1528,6 +2024,28 @@ fn compare_precision_ranking_candidate(
     payload: CandidatePayload,
     retrieval_decode_cost: RetrievalDecodeCost,
 ) -> PrecisionRankingCandidateReport {
+    let agreement = compare_ranking_agreement(reference, candidate_truth);
+    PrecisionRankingCandidateReport {
+        candidate,
+        top_10_set_exactly_equal_query_fraction: agreement.top_10_set_exactly_equal_query_fraction,
+        f32_top_10_recovered_in_candidate_top_10: agreement.top_10_recovered_in_candidate_top_10,
+        ordered_top_10_exactly_equal_query_fraction: agreement
+            .ordered_top_10_exactly_equal_query_fraction,
+        per_rank_same_document_fractions: agreement.per_rank_same_document_fractions,
+        f32_top_1_same_document_fraction: agreement.top_1_same_document_fraction,
+        f32_top_1_in_candidate_top_10_fraction: agreement.top_1_in_candidate_top_10_fraction,
+        coordinate_bytes_total: payload.coordinate_bytes_total,
+        metadata_bytes_per_row: payload.metadata_bytes_per_row,
+        mean_payload_bytes_per_unit: payload.mean_payload_bytes_per_unit,
+        saving_fraction_vs_f16: payload.saving_fraction_vs_f16,
+        retrieval_decode_cost,
+    }
+}
+
+fn compare_ranking_agreement(
+    reference: &[ExactTruth],
+    candidate_truth: &[ExactTruth],
+) -> RankingAgreement {
     assert_eq!(reference.len(), candidate_truth.len());
     let mut top_10_set_exactly_equal_queries = 0usize;
     let mut top_10_recovered = 0usize;
@@ -1565,12 +2083,13 @@ fn compare_precision_ranking_candidate(
     }
 
     let query_count = reference.len();
-    PrecisionRankingCandidateReport {
-        candidate,
+    let gold_count = query_count * TRUTH_K;
+    RankingAgreement {
+        query_count,
+        gold_count,
         top_10_set_exactly_equal_query_fraction: top_10_set_exactly_equal_queries as f64
             / query_count as f64,
-        f32_top_10_recovered_in_candidate_top_10: top_10_recovered as f64
-            / (query_count * TRUTH_K) as f64,
+        top_10_recovered_in_candidate_top_10: top_10_recovered as f64 / gold_count as f64,
         ordered_top_10_exactly_equal_query_fraction: ordered_top_10_exactly_equal_queries as f64
             / query_count as f64,
         per_rank_same_document_fractions: per_rank_same_document
@@ -1581,14 +2100,9 @@ fn compare_precision_ranking_candidate(
                 fraction: count as f64 / query_count as f64,
             })
             .collect(),
-        f32_top_1_same_document_fraction: top_1_same_document as f64 / query_count as f64,
-        f32_top_1_in_candidate_top_10_fraction: top_1_in_candidate_top_10 as f64
-            / query_count as f64,
-        coordinate_bytes_total: payload.coordinate_bytes_total,
-        metadata_bytes_per_row: payload.metadata_bytes_per_row,
-        mean_payload_bytes_per_unit: payload.mean_payload_bytes_per_unit,
-        saving_fraction_vs_f16: payload.saving_fraction_vs_f16,
-        retrieval_decode_cost,
+        top_1_same_document_fraction: top_1_same_document as f64 / query_count as f64,
+        top_1_in_candidate_top_10_fraction: top_1_in_candidate_top_10 as f64 / query_count as f64,
+        missed_top_10_memberships: gold_count - top_10_recovered,
     }
 }
 

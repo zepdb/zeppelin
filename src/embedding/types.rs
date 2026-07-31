@@ -429,6 +429,12 @@ impl MatrixDtype {
 /// Current profile-carried INT8 qualification evidence schema.
 pub const INT8_QUALIFICATION_STAMP_VERSION: u32 = 1;
 
+/// Exact INT8 qualification evidence approved for this release.
+///
+/// Keep this empty until an operator accepts production writer/decoder
+/// evidence for a specific semantic epoch and matrix dtype.
+const APPROVED_INT8_QUALIFICATIONS: &[(MultiVectorEpochId, MatrixDtype, ArtifactChecksum)] = &[];
+
 /// Operator-minted evidence binding one qualified INT8 profile epoch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Int8QualificationStamp {
@@ -468,6 +474,18 @@ impl Int8QualificationStamp {
         if !matches!(self.dtype, MatrixDtype::Int8SymV1 { .. }) {
             return Err(ZeppelinError::Validation(
                 "int8 qualification stamp must bind int8_sym_v1".to_string(),
+            ));
+        }
+        if !APPROVED_INT8_QUALIFICATIONS
+            .iter()
+            .any(|&(semantic_epoch, dtype, evidence_digest)| {
+                semantic_epoch == self.semantic_epoch
+                    && dtype == self.dtype
+                    && evidence_digest == self.evidence_digest
+            })
+        {
+            return Err(ZeppelinError::Validation(
+                "int8 qualification evidence is not operator-approved for this release".to_string(),
             ));
         }
         Ok(())
@@ -1265,11 +1283,21 @@ mod tests {
     }
 
     #[test]
-    fn int8_profile_requires_a_matching_qualification_stamp() {
+    fn int8_profile_requires_an_operator_approved_qualification_stamp() {
         let mut epoch = config_e_epoch(BTreeMap::from([(
             "model".to_string(),
             ArtifactChecksum::new([1; 32]),
         )]));
+        let f16_profile = EmbeddingProfileRef {
+            profile: EmbeddingProfileId::new("f16-unqualified"),
+            epoch: epoch.clone(),
+            fde: config_e_recipe(&epoch),
+            int8_qualification: None,
+        };
+        f16_profile
+            .validate_for_modalities(&[InputModality::Text])
+            .expect("f16 profile does not require int8 qualification");
+
         epoch.matrix_dtype = MatrixDtype::Int8SymV1 { group_size: 32 };
         epoch.id = epoch.canonical_id().expect("int8 epoch canonicalizes");
         let recipe = config_e_recipe(&epoch);
@@ -1291,9 +1319,10 @@ mod tests {
             evidence_digest: ArtifactChecksum::digest(b"production-ranking-evidence"),
             evidence_version: INT8_QUALIFICATION_STAMP_VERSION,
         });
-        profile
+        let error = profile
             .validate_for_modalities(&[InputModality::Text])
-            .expect("matching qualification stamp");
+            .expect_err("arbitrary structurally matching stamp");
+        assert!(error.to_string().contains("not operator-approved"));
 
         profile.int8_qualification.as_mut().unwrap().dtype =
             MatrixDtype::Int8SymV1 { group_size: 16 };

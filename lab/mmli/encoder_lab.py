@@ -78,6 +78,8 @@ PRECISION_RANKING_ALL_CANDIDATES = (
     *PRECISION_RANKING_BASELINES,
     *PRECISION_RANKING_NEW_CANDIDATES,
 )
+PRODUCTION_INT8_GROUP_SIZES = (16, 32, 128)
+DEFAULT_PRODUCTION_INT8_GROUP_SIZES = (32,)
 
 
 @dataclass
@@ -652,6 +654,190 @@ def validate_precision_ranking_audit(
                 rank.get("fraction"),
                 f"{label}.per_rank[{expected_rank}].fraction",
             )
+
+
+def resolve_production_int8_group_sizes(
+    selected: list[int] | None,
+) -> tuple[int, ...]:
+    group_sizes = tuple(selected or DEFAULT_PRODUCTION_INT8_GROUP_SIZES)
+    if len(group_sizes) != len(set(group_sizes)):
+        raise RuntimeError("production INT8 group sizes must be unique")
+    if any(size not in PRODUCTION_INT8_GROUP_SIZES for size in group_sizes):
+        raise RuntimeError(
+            "production INT8 group size must be one of 16, 32, or 128"
+        )
+    return group_sizes
+
+
+def require_sha256(value, label: str) -> None:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RuntimeError(f"{label} must be a lowercase SHA-256 digest")
+
+
+def validate_ranking_agreement(
+    agreement: dict,
+    label: str,
+    query_count: int,
+) -> None:
+    if not isinstance(agreement, dict):
+        raise RuntimeError(f"{label} must be an object")
+    if (
+        agreement.get("query_count") != query_count
+        or agreement.get("gold_count") != query_count * 10
+    ):
+        raise RuntimeError(f"{label} does not cover the complete query set")
+    for field in (
+        "top_10_set_exactly_equal_query_fraction",
+        "top_10_recovered_in_candidate_top_10",
+        "ordered_top_10_exactly_equal_query_fraction",
+        "top_1_same_document_fraction",
+        "top_1_in_candidate_top_10_fraction",
+    ):
+        require_fraction(agreement.get(field), f"{label}.{field}")
+    require_count(
+        agreement.get("missed_top_10_memberships"),
+        f"{label}.missed_top_10_memberships",
+    )
+    ranks = agreement.get("per_rank_same_document_fractions")
+    if not isinstance(ranks, list) or len(ranks) != 10:
+        raise RuntimeError(f"{label} must report ranks 1 through 10")
+    for expected_rank, rank in enumerate(ranks, start=1):
+        if not isinstance(rank, dict) or rank.get("rank") != expected_rank:
+            raise RuntimeError(f"{label} rank sequence is incomplete")
+        require_fraction(
+            rank.get("fraction"),
+            f"{label}.per_rank[{expected_rank}].fraction",
+        )
+
+
+def validate_production_int8_qualification(
+    result: dict,
+    lane: str,
+    queries: EncodingResult,
+    group_sizes: Sequence[int],
+    artifact_directory: Path,
+) -> None:
+    if (
+        not isinstance(result, dict)
+        or result.get("schema_version") != 1
+        or result.get("mode") != "production_int8_matrix_qualification"
+        or result.get("lane") != lane
+    ):
+        raise RuntimeError("Rust production INT8 result has the wrong identity")
+    if result.get("decision_state") != "measured_awaiting_operator_threshold":
+        raise RuntimeError("production INT8 result invented a gate decision")
+    if (
+        result.get("f32_reference")
+        != "same_pass_f32_documents_and_queries"
+        or result.get("f16_reference")
+        != "same_pass_f16_documents_and_queries"
+        or result.get("candidate_query_dtype") != "f16"
+        or result.get("f16_f32_id_parity_verified") is not True
+    ):
+        raise RuntimeError("production INT8 result has an invalid reference")
+    require_sha256(
+        result.get("evidence_digest_sha256"),
+        "evidence_digest_sha256",
+    )
+    input_digests = result.get("input_tensor_digests")
+    if not isinstance(input_digests, dict):
+        raise RuntimeError("production INT8 result omitted input digests")
+    for field in (
+        "f16_documents_sha256",
+        "f16_queries_sha256",
+        "f32_documents_sha256",
+        "f32_queries_sha256",
+    ):
+        require_sha256(input_digests.get(field), f"input_tensor_digests.{field}")
+    validate_ranking_agreement(
+        result.get("f16_vs_f32_ranking"),
+        "f16_vs_f32_ranking",
+        len(queries.ids),
+    )
+    groups = result.get("group_results")
+    if not isinstance(groups, list):
+        raise RuntimeError("production INT8 result omitted group cells")
+    actual_group_sizes = [
+        group.get("group_size") for group in groups if isinstance(group, dict)
+    ]
+    if actual_group_sizes != list(group_sizes):
+        raise RuntimeError(
+            "production INT8 result group order differs: "
+            f"expected {list(group_sizes)}, got {actual_group_sizes}"
+        )
+    for group_size, group in zip(group_sizes, groups):
+        label = f"production_int8.group_{group_size}"
+        if not isinstance(group, dict):
+            raise RuntimeError(f"{label} must be an object")
+        expected_state = (
+            "measurement_only_no_durable_visual_baseline"
+            if group_size == 128
+            else "measured_awaiting_operator_threshold"
+        )
+        if (
+            group.get("dtype")
+            != {"type": "int8_sym_v1", "group_size": group_size}
+            or group.get("decision_state") != expected_state
+        ):
+            raise RuntimeError(f"{label} has an invalid dtype or state")
+        for field in (
+            "artifact_write_read_verified",
+            "authoritative_dtype_verified",
+            "id_parity_verified",
+        ):
+            if group.get(field) is not True:
+                raise RuntimeError(f"{label}.{field} must be true")
+        for field in (
+            "artifact_file_bytes",
+            "matrix_payload_bytes",
+            "f16_matrix_payload_bytes",
+        ):
+            require_count(group.get(field), f"{label}.{field}")
+            if group[field] == 0:
+                raise RuntimeError(f"{label}.{field} must be positive")
+        require_fraction(
+            group.get("saving_fraction_vs_f16"),
+            f"{label}.saving_fraction_vs_f16",
+        )
+        mean_bytes = group.get("mean_matrix_payload_bytes_per_document")
+        if (
+            isinstance(mean_bytes, bool)
+            or not isinstance(mean_bytes, (int, float))
+            or not math.isfinite(float(mean_bytes))
+            or mean_bytes <= 0
+        ):
+            raise RuntimeError(f"{label} has invalid mean payload bytes")
+        expected_file = f"{lane}-int8-sym-v1-g{group_size}.zme1"
+        if group.get("artifact_file") != expected_file:
+            raise RuntimeError(f"{label} has an unexpected artifact name")
+        artifact_path = artifact_directory / expected_file
+        if (
+            not artifact_path.is_file()
+            or artifact_path.stat().st_size != group["artifact_file_bytes"]
+        ):
+            raise RuntimeError(f"{label} artifact write did not persist")
+        require_sha256(
+            group.get("artifact_checksum_sha256"),
+            f"{label}.artifact_checksum_sha256",
+        )
+        if sha256_file(artifact_path) != group["artifact_checksum_sha256"]:
+            raise RuntimeError(f"{label} artifact checksum differs on disk")
+        validate_ranking_agreement(
+            group.get("int8_vs_f32_ranking"),
+            f"{label}.int8_vs_f32_ranking",
+            len(queries.ids),
+        )
+        validate_ranking_agreement(
+            group.get("int8_vs_f16_ranking"),
+            f"{label}.int8_vs_f16_ranking",
+            len(queries.ids),
+        )
+        if "passed" in group:
+            raise RuntimeError(f"{label} must not auto-decide an unsigned gate")
 
 
 def analytic_retrieval_decode_cost(
@@ -2725,6 +2911,109 @@ def run_precision_ranking_job(
     )
 
 
+def run_production_int8_qualification_job(
+    binary: Path,
+    work_dir: Path,
+    lane: str,
+    documents: EncodingResult,
+    queries: EncodingResult,
+    group_sizes: Sequence[int],
+    artifact_directory: Path,
+) -> tuple[dict, tuple[Path, ...]]:
+    prefix = f"production-int8-{lane}"
+    doc_raw, doc_sidecar = write_tensor(
+        work_dir / f"{prefix}-documents",
+        documents,
+        "f16",
+    )
+    query_raw, query_sidecar = write_tensor(
+        work_dir / f"{prefix}-queries",
+        queries,
+        "f16",
+    )
+    f32_doc_raw, f32_doc_sidecar = write_tensor(
+        work_dir / f"{prefix}-documents-f32",
+        documents,
+        "f32",
+    )
+    f32_query_raw, f32_query_sidecar = write_tensor(
+        work_dir / f"{prefix}-queries-f32",
+        queries,
+        "f32",
+    )
+    job = {
+        "lane": lane,
+        "documents": {"raw": str(doc_raw), "sidecar": str(doc_sidecar)},
+        "queries": {"raw": str(query_raw), "sidecar": str(query_sidecar)},
+        "full_precision_documents": {
+            "raw": str(f32_doc_raw),
+            "sidecar": str(f32_doc_sidecar),
+        },
+        "full_precision_queries": {
+            "raw": str(f32_query_raw),
+            "sidecar": str(f32_query_sidecar),
+        },
+        "production_int8_qualification": {
+            "group_sizes": list(group_sizes),
+            "artifact_directory": str(artifact_directory),
+        },
+    }
+    job_path = work_dir / f"{prefix}-job.json"
+    job_path.write_text(json.dumps(job, indent=2) + "\n")
+    completed = subprocess.run(
+        [binary, job_path],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    result = json.loads(completed.stdout)
+    validate_production_int8_qualification(
+        result,
+        lane,
+        queries,
+        group_sizes,
+        artifact_directory,
+    )
+    artifact_paths = tuple(
+        artifact_directory / f"{lane}-int8-sym-v1-g{size}.zme1"
+        for size in group_sizes
+    )
+    return result, (
+        doc_raw,
+        doc_sidecar,
+        query_raw,
+        query_sidecar,
+        f32_doc_raw,
+        f32_doc_sidecar,
+        f32_query_raw,
+        f32_query_sidecar,
+        job_path,
+        *artifact_paths,
+    )
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temporary_path = Path(output.name)
+            json.dump(payload, output, indent=2, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
 def write_precision_ranking_probe(
     path: Path,
     lane: str,
@@ -2745,25 +3034,35 @@ def write_precision_ranking_probe(
     payload["lanes"] = {**payload["lanes"], lane: result}
     for lane_result in payload["lanes"].values():
         backfill_retrieval_decode_cost(lane_result)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as output:
-            temporary_path = Path(output.name)
-            json.dump(payload, output, indent=2, sort_keys=True)
-            output.write("\n")
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary_path, path)
-    finally:
-        if temporary_path is not None and temporary_path.exists():
-            temporary_path.unlink()
+    atomic_write_json(path, payload)
+
+
+def write_production_int8_qualification(
+    path: Path,
+    lane: str,
+    result: dict,
+) -> None:
+    if path.is_file():
+        payload = json.loads(path.read_text())
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 1
+            or payload.get("mode")
+            != "production_int8_matrix_qualification"
+            or not isinstance(payload.get("lanes"), dict)
+        ):
+            raise RuntimeError(
+                f"existing production INT8 result has an incompatible schema: {path}"
+            )
+    else:
+        payload = {
+            "schema_version": 1,
+            "mode": "production_int8_matrix_qualification",
+            "decision_state": "measured_awaiting_operator_threshold",
+            "lanes": {},
+        }
+    payload["lanes"] = {**payload["lanes"], lane: result}
+    atomic_write_json(path, payload)
 
 
 def run_precision_ranking_audit(args) -> None:
@@ -2814,6 +3113,83 @@ def run_precision_ranking_audit(args) -> None:
         for path in ranking_artifacts:
             path.unlink()
     print(f"wrote {args.lane} ranking retention: {probe_output}", flush=True)
+
+
+def run_production_int8_qualification(args) -> None:
+    require_offline()
+    group_sizes = resolve_production_int8_group_sizes(args.group_sizes)
+    hf_home = args.hf_home.resolve()
+    work_dir = args.work_dir.resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    probe_output = args.probe_output.resolve()
+    if probe_output.suffix.lower() != ".json":
+        raise RuntimeError("--probe-output must name a dedicated JSON file")
+    prefix = f"production-int8-{args.lane}"
+    reserved_outputs = {
+        (work_dir / f"{prefix}-{suffix}").resolve()
+        for suffix in (
+            "documents.json",
+            "queries.json",
+            "documents-f32.json",
+            "queries-f32.json",
+            "job.json",
+        )
+    }
+    if probe_output in reserved_outputs:
+        raise RuntimeError(
+            "--probe-output must not overwrite a production qualification sidecar"
+        )
+    probe_output.parent.mkdir(parents=True, exist_ok=True)
+    artifact_directory = Path(
+        tempfile.mkdtemp(
+            prefix=f"{prefix}-artifacts-",
+            dir=work_dir,
+        )
+    )
+    if args.lane == "text":
+        documents, queries = encode_text_precision_ranking(hf_home)
+    else:
+        documents, queries = encode_visual_precision_ranking(
+            hf_home,
+            work_dir,
+        )
+    result, transient_paths = run_production_int8_qualification_job(
+        args.binary.resolve(),
+        work_dir,
+        args.lane,
+        documents,
+        queries,
+        group_sizes,
+        artifact_directory,
+    )
+    write_production_int8_qualification(
+        probe_output,
+        args.lane,
+        result,
+    )
+    durable = json.loads(probe_output.read_text())
+    durable_lane = durable.get("lanes", {}).get(args.lane)
+    if (
+        not isinstance(durable_lane, dict)
+        or durable_lane.get("evidence_digest_sha256")
+        != result["evidence_digest_sha256"]
+    ):
+        raise RuntimeError("durable production INT8 result verification failed")
+    if not args.retain_tensors:
+        for path in transient_paths:
+            path.unlink()
+        artifact_directory.rmdir()
+    print(
+        f"wrote {args.lane} production INT8 qualification "
+        f"for groups {list(group_sizes)}: {probe_output}",
+        flush=True,
+    )
+    if args.retain_tensors:
+        print(
+            f"retained production qualification artifacts: "
+            f"{artifact_directory}",
+            flush=True,
+        )
 
 
 def run(args) -> None:
@@ -2937,6 +3313,28 @@ def parse_args():
     ranking.add_argument("--binary", type=Path, required=True)
     ranking.add_argument("--probe-output", type=Path, required=True)
     ranking.add_argument("--retain-tensors", action="store_true")
+    qualification = subparsers.add_parser("production-int8-qualification")
+    qualification.add_argument(
+        "--lane",
+        choices=("text", "visual"),
+        required=True,
+    )
+    qualification.add_argument(
+        "--group-size",
+        dest="group_sizes",
+        action="append",
+        type=int,
+        choices=PRODUCTION_INT8_GROUP_SIZES,
+        help=(
+            "production int8_sym_v1 group size; repeat for multiple cells; "
+            "defaults to the mandatory group-32 attempt"
+        ),
+    )
+    qualification.add_argument("--hf-home", type=Path, required=True)
+    qualification.add_argument("--work-dir", type=Path, required=True)
+    qualification.add_argument("--binary", type=Path, required=True)
+    qualification.add_argument("--probe-output", type=Path, required=True)
+    qualification.add_argument("--retain-tensors", action="store_true")
     return parser.parse_args()
 
 
@@ -2946,6 +3344,8 @@ def main() -> None:
         download_pins(args.hf_home.resolve())
     elif args.command == "ranking-retention":
         run_precision_ranking_audit(args)
+    elif args.command == "production-int8-qualification":
+        run_production_int8_qualification(args)
     else:
         run(args)
 
