@@ -100,6 +100,47 @@ const GC_ALLOW_UNSAFE_SHORT_HORIZON_ENV: &str = "ZEPPELIN_GC_ALLOW_UNSAFE_SHORT_
 const GC_MANIFEST_HISTORY_KEEP_COUNT_ENV: &str = "ZEPPELIN_GC_MANIFEST_HISTORY_KEEP_COUNT";
 /// Environment key for time-based point-in-time-recovery retention in seconds.
 const GC_PITR_RETENTION_SECS_ENV: &str = "ZEPPELIN_GC_PITR_RETENTION_SECS";
+/// Environment key for enabling the deterministic development encoder.
+const MMLI_ALLOW_DEV_ENCODER_ENV: &str = "ZEPPELIN_MMLI_ALLOW_DEV_ENCODER";
+/// Environment key for the bounded enrichment work queue.
+const MMLI_ENRICHMENT_QUEUE_CAPACITY_ENV: &str = "ZEPPELIN_MMLI_ENRICHMENT_QUEUE_CAPACITY";
+/// Environment key for the maximum input fragments admitted per maintenance tick.
+const MMLI_MAX_FRAGMENTS_PER_TICK_ENV: &str = "ZEPPELIN_MMLI_MAX_FRAGMENTS_PER_TICK";
+/// Environment key for the maximum input bytes admitted per maintenance tick.
+const MMLI_MAX_BYTES_PER_TICK_ENV: &str = "ZEPPELIN_MMLI_MAX_BYTES_PER_TICK";
+/// Environment key for the maximum transient enrichment attempts.
+const MMLI_MAX_RETRY_ATTEMPTS_ENV: &str = "ZEPPELIN_MMLI_MAX_RETRY_ATTEMPTS";
+/// Environment key for the enrichment-plane shutdown deadline.
+const MMLI_SHUTDOWN_TIMEOUT_SECS_ENV: &str = "ZEPPELIN_MMLI_SHUTDOWN_TIMEOUT_SECS";
+/// Environment key for the pinned worker virtual environment.
+const MMLI_WORKER_VENV_DIR_ENV: &str = "ZEPPELIN_MMLI_WORKER_VENV_DIR";
+/// Environment key for the pinned worker Python executable.
+const MMLI_WORKER_PYTHON_BINARY_ENV: &str = "ZEPPELIN_MMLI_WORKER_PYTHON_BINARY";
+/// Environment key for the committed pinned worker script.
+const MMLI_WORKER_SCRIPT_ENV: &str = "ZEPPELIN_MMLI_WORKER_SCRIPT";
+/// Environment key for disposable worker request state.
+const MMLI_WORKER_SCRATCH_DIR_ENV: &str = "ZEPPELIN_MMLI_WORKER_SCRATCH_DIR";
+/// Environment key for disposable S3 bundle materialization.
+const MMLI_WORKER_BUNDLE_CACHE_DIR_ENV: &str = "ZEPPELIN_MMLI_WORKER_BUNDLE_CACHE_DIR";
+/// Environment key for the maximum document units in one worker request.
+const MMLI_WORKER_MAX_BATCH_UNITS_ENV: &str = "ZEPPELIN_MMLI_WORKER_MAX_BATCH_UNITS";
+/// Environment key for the maximum source bytes in one worker request.
+const MMLI_WORKER_MAX_BATCH_INPUT_BYTES_ENV: &str = "ZEPPELIN_MMLI_WORKER_MAX_BATCH_INPUT_BYTES";
+/// Environment key for the maximum declared image pixels in one worker request.
+const MMLI_WORKER_MAX_BATCH_PIXELS_ENV: &str = "ZEPPELIN_MMLI_WORKER_MAX_BATCH_PIXELS";
+/// Environment key for the maximum embedding rows in one worker response.
+const MMLI_WORKER_MAX_BATCH_ROWS_ENV: &str = "ZEPPELIN_MMLI_WORKER_MAX_BATCH_ROWS";
+/// Environment key for the maximum bytes in one tensor sidecar.
+const MMLI_WORKER_MAX_TENSOR_BYTES_ENV: &str = "ZEPPELIN_MMLI_WORKER_MAX_TENSOR_BYTES";
+/// Environment key for the maximum JSON protocol-frame bytes.
+const MMLI_WORKER_MAX_PROTOCOL_LINE_BYTES_ENV: &str =
+    "ZEPPELIN_MMLI_WORKER_MAX_PROTOCOL_LINE_BYTES";
+/// Environment key for the retained worker stderr tail.
+const MMLI_WORKER_MAX_STDERR_BYTES_ENV: &str = "ZEPPELIN_MMLI_WORKER_MAX_STDERR_BYTES";
+/// Environment key for the worker startup timeout.
+const MMLI_WORKER_HANDSHAKE_TIMEOUT_SECS_ENV: &str = "ZEPPELIN_MMLI_WORKER_HANDSHAKE_TIMEOUT_SECS";
+/// Environment key for the per-request worker timeout.
+const MMLI_WORKER_REQUEST_TIMEOUT_SECS_ENV: &str = "ZEPPELIN_MMLI_WORKER_REQUEST_TIMEOUT_SECS";
 
 /// Default maximum gap, in bytes, between rerank `f32` ranges that are merged
 /// into one physical GET.
@@ -170,6 +211,9 @@ pub struct Config {
     /// Background WAL-to-segment compaction schedule, triggers, retention, and lease.
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// Multimodal late-interaction enrichment admission and lifecycle bounds.
+    #[serde(default)]
+    pub mmli: MmliConfig,
     /// Structured logging level and output format.
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -187,6 +231,132 @@ pub struct Config {
     pub branching: BranchingConfig,
     /// Authentication, durable audit, bootstrap-key, and security refresh settings.
     pub security: SecurityConfig,
+}
+
+/// Multimodal late-interaction background-enrichment settings.
+///
+/// The maintenance scan admits at most the configured fragment and byte
+/// budgets into a bounded queue. Encoder execution remains disabled for the
+/// deterministic development adapter unless the operator opts in explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MmliConfig {
+    /// Permit the deterministic development encoder. Default: `false`.
+    #[serde(default)]
+    pub allow_dev_encoder: bool,
+    /// Maximum admitted enrichment work items waiting for execution. Default: `64`.
+    #[serde(default = "default_mmli_enrichment_queue_capacity")]
+    pub enrichment_queue_capacity: usize,
+    /// Maximum input fragments admitted during one maintenance tick. Default: `8`.
+    #[serde(default = "default_mmli_max_fragments_per_tick")]
+    pub max_fragments_per_tick: usize,
+    /// Maximum input bytes admitted during one maintenance tick. Default: `67_108_864`.
+    #[serde(default = "default_mmli_max_bytes_per_tick")]
+    pub max_bytes_per_tick: u64,
+    /// Maximum attempts for one transient enrichment failure. Default: `3`.
+    #[serde(default = "default_mmli_max_retry_attempts")]
+    pub max_retry_attempts: usize,
+    /// Maximum time to join enrichment workers during shutdown. Default: `30`.
+    #[serde(default = "default_mmli_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
+    /// Production worker execution paths and bounds.
+    ///
+    /// This stays absent for development-only deployments. Selecting a pinned
+    /// profile without it fails when the provider resolves that profile.
+    #[serde(default)]
+    pub worker: Option<MmliWorkerConfig>,
+}
+
+/// Local execution and resource configuration for a pinned encoder worker.
+///
+/// Model identity is deliberately absent: the selected epoch binds its own S3
+/// bundle prefix and per-file digests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MmliWorkerConfig {
+    /// Absolute virtual-environment directory.
+    pub venv_dir: PathBuf,
+    /// Absolute Python executable inside `venv_dir`.
+    pub python_binary: PathBuf,
+    /// Absolute path to the committed worker script.
+    pub worker_script: PathBuf,
+    /// Absolute root for disposable request sidecars.
+    pub scratch_dir: PathBuf,
+    /// Absolute root for disposable S3 bundle materialization.
+    pub bundle_cache_dir: PathBuf,
+    /// Maximum document units in one request.
+    pub max_batch_units: usize,
+    /// Maximum aggregate source bytes in one request.
+    pub max_batch_input_bytes: u64,
+    /// Maximum aggregate declared image pixels in one request.
+    pub max_batch_pixels: u64,
+    /// Maximum aggregate embedding rows in one response.
+    pub max_batch_rows: usize,
+    /// Maximum bytes in any one tensor sidecar.
+    pub max_tensor_bytes: u64,
+    /// Maximum bytes in one line-delimited JSON frame.
+    pub max_protocol_line_bytes: usize,
+    /// Maximum retained worker stderr bytes.
+    pub max_stderr_bytes: usize,
+    /// Worker startup and identity-handshake deadline.
+    pub handshake_timeout_secs: u64,
+    /// Per-request execution deadline.
+    pub request_timeout_secs: u64,
+}
+
+impl Default for MmliWorkerConfig {
+    fn default() -> Self {
+        Self {
+            venv_dir: PathBuf::new(),
+            python_binary: PathBuf::new(),
+            worker_script: PathBuf::new(),
+            scratch_dir: PathBuf::new(),
+            bundle_cache_dir: PathBuf::new(),
+            max_batch_units: 8,
+            max_batch_input_bytes: 32 * 1024 * 1024,
+            max_batch_pixels: 64 * 1024 * 1024,
+            max_batch_rows: 16_384,
+            max_tensor_bytes: 64 * 1024 * 1024,
+            max_protocol_line_bytes: 1024 * 1024,
+            max_stderr_bytes: 64 * 1024,
+            handshake_timeout_secs: 120,
+            request_timeout_secs: 120,
+        }
+    }
+}
+
+const fn default_mmli_enrichment_queue_capacity() -> usize {
+    64
+}
+
+const fn default_mmli_max_fragments_per_tick() -> usize {
+    8
+}
+
+const fn default_mmli_max_bytes_per_tick() -> u64 {
+    64 * 1024 * 1024
+}
+
+const fn default_mmli_max_retry_attempts() -> usize {
+    3
+}
+
+const fn default_mmli_shutdown_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for MmliConfig {
+    fn default() -> Self {
+        Self {
+            allow_dev_encoder: false,
+            enrichment_queue_capacity: default_mmli_enrichment_queue_capacity(),
+            max_fragments_per_tick: default_mmli_max_fragments_per_tick(),
+            max_bytes_per_tick: default_mmli_max_bytes_per_tick(),
+            max_retry_attempts: default_mmli_max_retry_attempts(),
+            shutdown_timeout_secs: default_mmli_shutdown_timeout_secs(),
+            worker: None,
+        }
+    }
 }
 
 /// Base namespace-branching configuration.
@@ -603,6 +773,26 @@ mod tests {
                 GC_SKEW_SLOP_SECS_ENV,
                 GC_ALLOW_UNSAFE_SHORT_HORIZON_ENV,
                 GC_PITR_RETENTION_SECS_ENV,
+                MMLI_ALLOW_DEV_ENCODER_ENV,
+                MMLI_ENRICHMENT_QUEUE_CAPACITY_ENV,
+                MMLI_MAX_FRAGMENTS_PER_TICK_ENV,
+                MMLI_MAX_BYTES_PER_TICK_ENV,
+                MMLI_MAX_RETRY_ATTEMPTS_ENV,
+                MMLI_SHUTDOWN_TIMEOUT_SECS_ENV,
+                MMLI_WORKER_VENV_DIR_ENV,
+                MMLI_WORKER_PYTHON_BINARY_ENV,
+                MMLI_WORKER_SCRIPT_ENV,
+                MMLI_WORKER_SCRATCH_DIR_ENV,
+                MMLI_WORKER_BUNDLE_CACHE_DIR_ENV,
+                MMLI_WORKER_MAX_BATCH_UNITS_ENV,
+                MMLI_WORKER_MAX_BATCH_INPUT_BYTES_ENV,
+                MMLI_WORKER_MAX_BATCH_PIXELS_ENV,
+                MMLI_WORKER_MAX_BATCH_ROWS_ENV,
+                MMLI_WORKER_MAX_TENSOR_BYTES_ENV,
+                MMLI_WORKER_MAX_PROTOCOL_LINE_BYTES_ENV,
+                MMLI_WORKER_MAX_STDERR_BYTES_ENV,
+                MMLI_WORKER_HANDSHAKE_TIMEOUT_SECS_ENV,
+                MMLI_WORKER_REQUEST_TIMEOUT_SECS_ENV,
                 "ZEPPELIN_QUERY_WORKERS",
                 "ZEPPELIN_COMPACTION_WORKERS",
                 "ZEPPELIN_RAYON_THREADS",
@@ -825,6 +1015,132 @@ mod tests {
             assert!(
                 error.contains(needle),
                 "expected {error:?} to contain {needle:?}"
+            );
+        }
+    }
+
+    /// Pins MMLI defaults and proves environment values override TOML values.
+    #[test]
+    fn mmli_defaults_toml_and_env_overrides() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        let defaults = load_toml("").unwrap().mmli;
+        assert!(!defaults.allow_dev_encoder);
+        assert_eq!(defaults.enrichment_queue_capacity, 64);
+        assert_eq!(defaults.max_fragments_per_tick, 8);
+        assert_eq!(defaults.max_bytes_per_tick, 64 * 1024 * 1024);
+        assert_eq!(defaults.max_retry_attempts, 3);
+        assert_eq!(defaults.shutdown_timeout_secs, 30);
+        assert!(defaults.worker.is_none());
+
+        let source = r#"
+            [mmli]
+            allow_dev_encoder = false
+            enrichment_queue_capacity = 2
+            max_fragments_per_tick = 3
+            max_bytes_per_tick = 1024
+            max_retry_attempts = 4
+            shutdown_timeout_secs = 5
+        "#;
+        let configured = load_toml(source).unwrap().mmli;
+        assert!(!configured.allow_dev_encoder);
+        assert_eq!(configured.enrichment_queue_capacity, 2);
+        assert_eq!(configured.max_fragments_per_tick, 3);
+        assert_eq!(configured.max_bytes_per_tick, 1024);
+        assert_eq!(configured.max_retry_attempts, 4);
+        assert_eq!(configured.shutdown_timeout_secs, 5);
+
+        std::env::set_var(MMLI_ALLOW_DEV_ENCODER_ENV, "true");
+        std::env::set_var(MMLI_ENRICHMENT_QUEUE_CAPACITY_ENV, "17");
+        std::env::set_var(MMLI_MAX_FRAGMENTS_PER_TICK_ENV, "5");
+        std::env::set_var(MMLI_MAX_BYTES_PER_TICK_ENV, "4096");
+        std::env::set_var(MMLI_MAX_RETRY_ATTEMPTS_ENV, "7");
+        std::env::set_var(MMLI_SHUTDOWN_TIMEOUT_SECS_ENV, "11");
+
+        let overridden = load_toml(source).unwrap().mmli;
+        assert!(overridden.allow_dev_encoder);
+        assert_eq!(overridden.enrichment_queue_capacity, 17);
+        assert_eq!(overridden.max_fragments_per_tick, 5);
+        assert_eq!(overridden.max_bytes_per_tick, 4096);
+        assert_eq!(overridden.max_retry_attempts, 7);
+        assert_eq!(overridden.shutdown_timeout_secs, 11);
+    }
+
+    /// Pinned-worker configuration is optional, strict, and environment-overridable.
+    #[test]
+    fn mmli_worker_paths_and_bounds_are_strict() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+        let source = r#"
+            [mmli.worker]
+            venv_dir = "/opt/zeppelin/mmli/venv"
+            python_binary = "/opt/zeppelin/mmli/venv/bin/python"
+            worker_script = "/opt/zeppelin/mmli/worker.py"
+            scratch_dir = "/var/cache/zeppelin/mmli/scratch"
+            bundle_cache_dir = "/var/cache/zeppelin/mmli/bundles"
+            max_batch_units = 4
+            request_timeout_secs = 45
+        "#;
+
+        let configured = load_toml(source).unwrap().mmli.worker.unwrap();
+        assert_eq!(
+            configured.python_binary,
+            PathBuf::from("/opt/zeppelin/mmli/venv/bin/python")
+        );
+        assert_eq!(configured.max_batch_units, 4);
+        assert_eq!(configured.request_timeout_secs, 45);
+        assert_eq!(configured.max_batch_rows, 16_384);
+
+        std::env::set_var(
+            MMLI_WORKER_BUNDLE_CACHE_DIR_ENV,
+            "/srv/zeppelin/mmli/bundles",
+        );
+        std::env::set_var(MMLI_WORKER_REQUEST_TIMEOUT_SECS_ENV, "90");
+        let overridden = load_toml(source).unwrap().mmli.worker.unwrap();
+        assert_eq!(
+            overridden.bundle_cache_dir,
+            PathBuf::from("/srv/zeppelin/mmli/bundles")
+        );
+        assert_eq!(overridden.request_timeout_secs, 90);
+
+        let error = load_toml(
+            r#"
+            [mmli.worker]
+            venv_dir = "relative"
+            unknown_model_prefix = "models/mutable"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unknown field `unknown_model_prefix`"),
+            "unexpected strict worker config error: {error}"
+        );
+    }
+
+    /// Every MMLI work and lifecycle bound must be positive.
+    #[test]
+    fn mmli_zero_bounds_fail_loudly() {
+        let mut config = Config::default();
+        config.security.mode = SecurityMode::OpenUnsafe;
+        config.mmli.enrichment_queue_capacity = 0;
+        config.mmli.max_fragments_per_tick = 0;
+        config.mmli.max_bytes_per_tick = 0;
+        config.mmli.max_retry_attempts = 0;
+        config.mmli.shutdown_timeout_secs = 0;
+
+        let error = config.validate().unwrap_err().to_string();
+        for field in [
+            "mmli.enrichment_queue_capacity",
+            "mmli.max_fragments_per_tick",
+            "mmli.max_bytes_per_tick",
+            "mmli.max_retry_attempts",
+            "mmli.shutdown_timeout_secs",
+        ] {
+            assert!(
+                error.contains(field),
+                "expected aggregate validation error to contain {field:?}, got: {error}"
             );
         }
     }
@@ -3029,6 +3345,60 @@ impl Config {
         if self.compaction.lease_duration_secs == 0 {
             violations.push("compaction.lease_duration_secs must be greater than zero".to_string());
         }
+        if self.mmli.enrichment_queue_capacity == 0 {
+            violations.push("mmli.enrichment_queue_capacity must be greater than zero".to_string());
+        }
+        if self.mmli.max_fragments_per_tick == 0 {
+            violations.push("mmli.max_fragments_per_tick must be greater than zero".to_string());
+        }
+        if self.mmli.max_bytes_per_tick == 0 {
+            violations.push("mmli.max_bytes_per_tick must be greater than zero".to_string());
+        }
+        if self.mmli.max_retry_attempts == 0 {
+            violations.push("mmli.max_retry_attempts must be greater than zero".to_string());
+        }
+        if self.mmli.shutdown_timeout_secs == 0 {
+            violations.push("mmli.shutdown_timeout_secs must be greater than zero".to_string());
+        }
+        if let Some(worker) = &self.mmli.worker {
+            for (field, path) in [
+                ("venv_dir", &worker.venv_dir),
+                ("python_binary", &worker.python_binary),
+                ("worker_script", &worker.worker_script),
+                ("scratch_dir", &worker.scratch_dir),
+                ("bundle_cache_dir", &worker.bundle_cache_dir),
+            ] {
+                if !path.is_absolute() {
+                    violations.push(format!("mmli.worker.{field} must be an absolute path"));
+                }
+            }
+            if worker.python_binary.is_absolute()
+                && worker.venv_dir.is_absolute()
+                && !worker.python_binary.starts_with(&worker.venv_dir)
+            {
+                violations.push(
+                    "mmli.worker.python_binary must be inside mmli.worker.venv_dir".to_string(),
+                );
+            }
+            for (field, value) in [
+                ("max_batch_units", worker.max_batch_units as u64),
+                ("max_batch_input_bytes", worker.max_batch_input_bytes),
+                ("max_batch_pixels", worker.max_batch_pixels),
+                ("max_batch_rows", worker.max_batch_rows as u64),
+                ("max_tensor_bytes", worker.max_tensor_bytes),
+                (
+                    "max_protocol_line_bytes",
+                    worker.max_protocol_line_bytes as u64,
+                ),
+                ("max_stderr_bytes", worker.max_stderr_bytes as u64),
+                ("handshake_timeout_secs", worker.handshake_timeout_secs),
+                ("request_timeout_secs", worker.request_timeout_secs),
+            ] {
+                if value == 0 {
+                    violations.push(format!("mmli.worker.{field} must be greater than zero"));
+                }
+            }
+        }
         if self.gc.compaction_upload_window_secs == 0 {
             violations
                 .push("gc.compaction_upload_window_secs must be greater than zero".to_string());
@@ -3585,6 +3955,102 @@ impl Config {
         }
         if let Some(v) = env_override("ZEPPELIN_MAX_OLD_SEGMENTS")? {
             self.compaction.max_old_segments = v;
+        }
+
+        // Multimodal late interaction
+        if let Some(v) = env_override(MMLI_ALLOW_DEV_ENCODER_ENV)? {
+            self.mmli.allow_dev_encoder = v;
+        }
+        if let Some(v) = env_override(MMLI_ENRICHMENT_QUEUE_CAPACITY_ENV)? {
+            self.mmli.enrichment_queue_capacity = v;
+        }
+        if let Some(v) = env_override(MMLI_MAX_FRAGMENTS_PER_TICK_ENV)? {
+            self.mmli.max_fragments_per_tick = v;
+        }
+        if let Some(v) = env_override(MMLI_MAX_BYTES_PER_TICK_ENV)? {
+            self.mmli.max_bytes_per_tick = v;
+        }
+        if let Some(v) = env_override(MMLI_MAX_RETRY_ATTEMPTS_ENV)? {
+            self.mmli.max_retry_attempts = v;
+        }
+        if let Some(v) = env_override(MMLI_SHUTDOWN_TIMEOUT_SECS_ENV)? {
+            self.mmli.shutdown_timeout_secs = v;
+        }
+        let worker_venv_dir = env_override::<PathBuf>(MMLI_WORKER_VENV_DIR_ENV)?;
+        let worker_python_binary = env_override::<PathBuf>(MMLI_WORKER_PYTHON_BINARY_ENV)?;
+        let worker_script = env_override::<PathBuf>(MMLI_WORKER_SCRIPT_ENV)?;
+        let worker_scratch_dir = env_override::<PathBuf>(MMLI_WORKER_SCRATCH_DIR_ENV)?;
+        let worker_bundle_cache_dir = env_override::<PathBuf>(MMLI_WORKER_BUNDLE_CACHE_DIR_ENV)?;
+        let worker_max_batch_units = env_override(MMLI_WORKER_MAX_BATCH_UNITS_ENV)?;
+        let worker_max_batch_input_bytes = env_override(MMLI_WORKER_MAX_BATCH_INPUT_BYTES_ENV)?;
+        let worker_max_batch_pixels = env_override(MMLI_WORKER_MAX_BATCH_PIXELS_ENV)?;
+        let worker_max_batch_rows = env_override(MMLI_WORKER_MAX_BATCH_ROWS_ENV)?;
+        let worker_max_tensor_bytes = env_override(MMLI_WORKER_MAX_TENSOR_BYTES_ENV)?;
+        let worker_max_protocol_line_bytes = env_override(MMLI_WORKER_MAX_PROTOCOL_LINE_BYTES_ENV)?;
+        let worker_max_stderr_bytes = env_override(MMLI_WORKER_MAX_STDERR_BYTES_ENV)?;
+        let worker_handshake_timeout_secs = env_override(MMLI_WORKER_HANDSHAKE_TIMEOUT_SECS_ENV)?;
+        let worker_request_timeout_secs = env_override(MMLI_WORKER_REQUEST_TIMEOUT_SECS_ENV)?;
+        if worker_venv_dir.is_some()
+            || worker_python_binary.is_some()
+            || worker_script.is_some()
+            || worker_scratch_dir.is_some()
+            || worker_bundle_cache_dir.is_some()
+            || worker_max_batch_units.is_some()
+            || worker_max_batch_input_bytes.is_some()
+            || worker_max_batch_pixels.is_some()
+            || worker_max_batch_rows.is_some()
+            || worker_max_tensor_bytes.is_some()
+            || worker_max_protocol_line_bytes.is_some()
+            || worker_max_stderr_bytes.is_some()
+            || worker_handshake_timeout_secs.is_some()
+            || worker_request_timeout_secs.is_some()
+        {
+            let worker = self
+                .mmli
+                .worker
+                .get_or_insert_with(MmliWorkerConfig::default);
+            if let Some(value) = worker_venv_dir {
+                worker.venv_dir = value;
+            }
+            if let Some(value) = worker_python_binary {
+                worker.python_binary = value;
+            }
+            if let Some(value) = worker_script {
+                worker.worker_script = value;
+            }
+            if let Some(value) = worker_scratch_dir {
+                worker.scratch_dir = value;
+            }
+            if let Some(value) = worker_bundle_cache_dir {
+                worker.bundle_cache_dir = value;
+            }
+            if let Some(value) = worker_max_batch_units {
+                worker.max_batch_units = value;
+            }
+            if let Some(value) = worker_max_batch_input_bytes {
+                worker.max_batch_input_bytes = value;
+            }
+            if let Some(value) = worker_max_batch_pixels {
+                worker.max_batch_pixels = value;
+            }
+            if let Some(value) = worker_max_batch_rows {
+                worker.max_batch_rows = value;
+            }
+            if let Some(value) = worker_max_tensor_bytes {
+                worker.max_tensor_bytes = value;
+            }
+            if let Some(value) = worker_max_protocol_line_bytes {
+                worker.max_protocol_line_bytes = value;
+            }
+            if let Some(value) = worker_max_stderr_bytes {
+                worker.max_stderr_bytes = value;
+            }
+            if let Some(value) = worker_handshake_timeout_secs {
+                worker.handshake_timeout_secs = value;
+            }
+            if let Some(value) = worker_request_timeout_secs {
+                worker.request_timeout_secs = value;
+            }
         }
 
         // Logging

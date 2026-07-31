@@ -1,4 +1,5 @@
 use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::Result;
@@ -9,7 +10,8 @@ const TRANSFORM_MAGIC: &[u8; 4] = b"ZFT1";
 const TRANSFORM_FORMAT_VERSION: u8 = 1;
 
 /// Versioned FDE construction semantics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum FdeAlgorithmVersion {
     /// The paper construction with a dense scaled Rademacher projection.
     PaperV1,
@@ -18,7 +20,8 @@ pub enum FdeAlgorithmVersion {
 }
 
 /// Projection applied independently to every bucket block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum InnerProjection {
     /// Retain the input vector coordinates.
     Identity,
@@ -35,7 +38,8 @@ pub enum InnerProjection {
 }
 
 /// Optional projection over the concatenated FDE.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum FinalProjection {
     /// Retain the concatenated repetitions and buckets.
     None,
@@ -47,7 +51,7 @@ pub enum FinalProjection {
 }
 
 /// Complete parameters for one materialized FDE transform.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FdeParams {
     /// Construction and projection semantics.
     pub algorithm: FdeAlgorithmVersion,
@@ -362,6 +366,12 @@ impl FdeTransform {
     #[must_use]
     pub const fn output_dimension(&self) -> usize {
         self.output_dimension
+    }
+
+    /// Return the complete persisted construction parameters.
+    #[must_use]
+    pub const fn params(&self) -> FdeParams {
+        self.params
     }
 
     /// Encodes a document with average bucket contents and deterministic fill.

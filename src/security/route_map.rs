@@ -316,6 +316,11 @@ pub static ROUTE_ACTIONS: &[RouteAction] = &[
         class: RouteClass::Protected(Action::IndexConfigWrite),
     },
     RouteAction {
+        method: Method::PUT,
+        path: "/v1/namespaces/:ns/embedding_profile",
+        class: RouteClass::Protected(Action::IndexConfigWrite),
+    },
+    RouteAction {
         method: Method::POST,
         path: "/v1/namespaces/:ns/compact",
         class: RouteClass::Protected(Action::CompactionTrigger),

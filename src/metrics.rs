@@ -68,6 +68,12 @@ mod inner {
         pub static ref WAL_APPENDS_TOTAL: IntCounterVec = register_int_counter_vec!(
             "zeppelin_wal_appends_total", "WAL appends", &["namespace"]
         ).unwrap();
+        /// Records durably quarantined after deterministic semantic-enrichment rejection.
+        pub static ref SEMANTIC_ENRICHMENT_QUARANTINED_RECORDS_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_semantic_enrichment_quarantined_records_total",
+            "Records durably quarantined after deterministic semantic-enrichment rejection",
+            &["namespace"]
+        ).unwrap();
         /// Cache lookups partitioned by the resulting hit or miss classification.
         pub static ref CACHE_HITS_TOTAL: IntCounterVec = register_int_counter_vec!(
             "zeppelin_cache_hits_total", "Cache hits", &["result"]
@@ -416,6 +422,7 @@ pub fn init() {
     lazy_static::initialize(&QUERY_DURATION);
     lazy_static::initialize(&QUERIES_TOTAL);
     lazy_static::initialize(&WAL_APPENDS_TOTAL);
+    lazy_static::initialize(&SEMANTIC_ENRICHMENT_QUARANTINED_RECORDS_TOTAL);
     lazy_static::initialize(&CACHE_HITS_TOTAL);
     lazy_static::initialize(&COMPACTIONS_TOTAL);
     lazy_static::initialize(&COMPACTION_READ_BYTES_TOTAL);

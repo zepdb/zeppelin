@@ -29,8 +29,18 @@ pub(crate) enum NamespaceObjectFamily {
     Source,
     /// `segments/`: manifest-referenced immutable data, deferred and branch-local.
     Segment,
-    /// `late/`: manifest-referenced immutable late state, deferred and branch-local.
+    /// `late/state/`: content-addressed manifest late-state sections.
     LateSection,
+    /// `late/matrix-fragments/`: immutable exact-scoring matrix fragments.
+    MatrixFragment,
+    /// `late/fde-fragments/`: immutable fixed-dimensional candidate fragments.
+    FdeFragment,
+    /// `late/transforms/`: immutable materialized FDE transforms.
+    FdeTransform,
+    /// `late/centering/`: immutable frozen centering means.
+    Centering,
+    /// `late/quarantine/`: immutable deterministic-failure evidence.
+    Quarantine,
     /// `_staging/`: fenced staging roots, never deferred or branch-local.
     Staging,
     /// `_gc/`: GC-protocol state, never deferred, expanded, or branch-local.
@@ -52,7 +62,7 @@ pub(crate) enum GcOwnership {
 
 impl NamespaceObjectFamily {
     /// Every production namespace object family, in stable registry order.
-    pub(crate) const ALL: [Self; 13] = [
+    pub(crate) const ALL: [Self; 18] = [
         Self::Metadata,
         Self::Manifest,
         Self::Lease,
@@ -63,6 +73,11 @@ impl NamespaceObjectFamily {
         Self::Source,
         Self::Segment,
         Self::LateSection,
+        Self::MatrixFragment,
+        Self::FdeFragment,
+        Self::FdeTransform,
+        Self::Centering,
+        Self::Quarantine,
         Self::Staging,
         Self::Gc,
         Self::BranchVisibilityRemoved,
@@ -76,7 +91,16 @@ impl NamespaceObjectFamily {
     #[must_use]
     pub(crate) const fn allows_deferred_delete(self) -> bool {
         match self {
-            Self::Wal | Self::InputWal | Self::Source | Self::Segment | Self::LateSection => true,
+            Self::Wal
+            | Self::InputWal
+            | Self::Source
+            | Self::Segment
+            | Self::LateSection
+            | Self::MatrixFragment
+            | Self::FdeFragment
+            | Self::FdeTransform
+            | Self::Centering
+            | Self::Quarantine => true,
             Self::Metadata
             | Self::Manifest
             | Self::Lease
@@ -92,9 +116,16 @@ impl NamespaceObjectFamily {
     #[must_use]
     pub(crate) const fn gc_ownership(self) -> GcOwnership {
         match self {
-            Self::Wal | Self::InputWal | Self::Source | Self::Segment | Self::LateSection => {
-                GcOwnership::ManifestReferenced
-            }
+            Self::Wal
+            | Self::InputWal
+            | Self::Source
+            | Self::Segment
+            | Self::LateSection
+            | Self::MatrixFragment
+            | Self::FdeFragment
+            | Self::FdeTransform
+            | Self::Centering
+            | Self::Quarantine => GcOwnership::ManifestReferenced,
             Self::Staging => GcOwnership::StagingProtocol,
             Self::Metadata
             | Self::Manifest
@@ -110,7 +141,16 @@ impl NamespaceObjectFamily {
     #[must_use]
     pub(crate) const fn participates_in_branch_locality(self) -> bool {
         match self {
-            Self::Wal | Self::InputWal | Self::Source | Self::Segment | Self::LateSection => true,
+            Self::Wal
+            | Self::InputWal
+            | Self::Source
+            | Self::Segment
+            | Self::LateSection
+            | Self::MatrixFragment
+            | Self::FdeFragment
+            | Self::FdeTransform
+            | Self::Centering
+            | Self::Quarantine => true,
             Self::Metadata
             | Self::Manifest
             | Self::Lease
@@ -135,7 +175,12 @@ impl NamespaceObjectFamily {
             Self::InputWal => "input-wal/",
             Self::Source => "sources/",
             Self::Segment => "segments/",
-            Self::LateSection => "late/",
+            Self::LateSection => "late/state/",
+            Self::MatrixFragment => "late/matrix-fragments/",
+            Self::FdeFragment => "late/fde-fragments/",
+            Self::FdeTransform => "late/transforms/",
+            Self::Centering => "late/centering/",
+            Self::Quarantine => "late/quarantine/",
             Self::Staging => "_staging/",
             Self::Gc => "_gc/candidates.json",
             Self::BranchVisibilityRemoved => "_lifecycle/branch_visibility_removed/",
@@ -155,7 +200,12 @@ impl NamespaceObjectFamily {
             Self::InputWal => "input-wal/",
             Self::Source => "sources/",
             Self::Segment => "segments/",
-            Self::LateSection => "late/",
+            Self::LateSection
+            | Self::MatrixFragment
+            | Self::FdeFragment
+            | Self::FdeTransform
+            | Self::Centering
+            | Self::Quarantine => "late/",
             Self::Staging => "_staging/",
             Self::Gc => "_gc/",
             Self::BranchVisibilityRemoved => "_lifecycle/",
@@ -182,6 +232,11 @@ impl NamespaceObjectFamily {
             | Self::Source
             | Self::Segment
             | Self::LateSection
+            | Self::MatrixFragment
+            | Self::FdeFragment
+            | Self::FdeTransform
+            | Self::Centering
+            | Self::Quarantine
             | Self::Staging
             | Self::Gc
             | Self::BranchVisibilityRemoved => false,
@@ -299,6 +354,26 @@ fn classify_nested_family(key: &str, suffix: &str) -> Result<NamespaceObjectFami
         (
             NamespaceObjectFamily::LateSection.relative_prefix(),
             NamespaceObjectFamily::LateSection,
+        ),
+        (
+            NamespaceObjectFamily::MatrixFragment.relative_prefix(),
+            NamespaceObjectFamily::MatrixFragment,
+        ),
+        (
+            NamespaceObjectFamily::FdeFragment.relative_prefix(),
+            NamespaceObjectFamily::FdeFragment,
+        ),
+        (
+            NamespaceObjectFamily::FdeTransform.relative_prefix(),
+            NamespaceObjectFamily::FdeTransform,
+        ),
+        (
+            NamespaceObjectFamily::Centering.relative_prefix(),
+            NamespaceObjectFamily::Centering,
+        ),
+        (
+            NamespaceObjectFamily::Quarantine.relative_prefix(),
+            NamespaceObjectFamily::Quarantine,
         ),
     ] {
         if let Some(descendant) = suffix.strip_prefix(prefix) {
@@ -467,7 +542,14 @@ mod tests {
                 }
                 NamespaceObjectFamily::Segment => "segment/centroids.bin",
                 NamespaceObjectFamily::LateSection => {
-                    "state/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                }
+                NamespaceObjectFamily::MatrixFragment
+                | NamespaceObjectFamily::FdeFragment
+                | NamespaceObjectFamily::FdeTransform
+                | NamespaceObjectFamily::Centering
+                | NamespaceObjectFamily::Quarantine => {
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 }
                 NamespaceObjectFamily::Staging => "17.json",
                 NamespaceObjectFamily::BranchVisibilityRemoved => {
@@ -513,6 +595,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("input WAL key should classify: {error}"));
         let source = NamespaceObjectKey::classify(NS, "target/sources/0123456789abcdef")
             .unwrap_or_else(|error| panic!("source key should classify: {error}"));
+        let transform = NamespaceObjectKey::classify(NS, "target/late/transforms/0123456789abcdef")
+            .unwrap_or_else(|error| panic!("FDE transform key should classify: {error}"));
         let lifecycle = NamespaceObjectKey::classify(
             NS,
             "target/_lifecycle/branch_visibility_removed/01ARZ3NDEKTSV4RRFFQ69G5FAV.1234567890abcdef1234567890abcdef.json",
@@ -524,6 +608,7 @@ mod tests {
         assert!(late.allows_deferred_delete());
         assert!(input.allows_deferred_delete());
         assert!(source.allows_deferred_delete());
+        assert!(transform.allows_deferred_delete());
         assert!(!lifecycle.allows_deferred_delete());
     }
 
@@ -535,7 +620,12 @@ mod tests {
                 | NamespaceObjectFamily::InputWal
                 | NamespaceObjectFamily::Source
                 | NamespaceObjectFamily::Segment
-                | NamespaceObjectFamily::LateSection => {
+                | NamespaceObjectFamily::LateSection
+                | NamespaceObjectFamily::MatrixFragment
+                | NamespaceObjectFamily::FdeFragment
+                | NamespaceObjectFamily::FdeTransform
+                | NamespaceObjectFamily::Centering
+                | NamespaceObjectFamily::Quarantine => {
                     assert_eq!(family.gc_ownership(), GcOwnership::ManifestReferenced);
                     assert!(family.participates_in_branch_locality());
                 }

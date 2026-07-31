@@ -140,6 +140,32 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # retrain_imbalance_threshold = 5.0
 # lease_duration_secs = 300          # per-namespace compaction lease (multi-node); must be > 0
 
+[mmli]
+# allow_dev_encoder = false          # ZEPPELIN_MMLI_ALLOW_DEV_ENCODER; local/test opt-in only
+# enrichment_queue_capacity = 64     # ZEPPELIN_MMLI_ENRICHMENT_QUEUE_CAPACITY; must be > 0
+# max_fragments_per_tick = 8         # ZEPPELIN_MMLI_MAX_FRAGMENTS_PER_TICK; must be > 0
+# max_bytes_per_tick = 67108864      # ZEPPELIN_MMLI_MAX_BYTES_PER_TICK; must be > 0
+# max_retry_attempts = 3             # ZEPPELIN_MMLI_MAX_RETRY_ATTEMPTS; must be > 0
+# shutdown_timeout_secs = 30         # ZEPPELIN_MMLI_SHUTDOWN_TIMEOUT_SECS; must be > 0
+
+# Optional. Required only when an active profile selects a pinned worker.
+# The profile epoch, not this mutable config, owns the S3 model-bundle prefix.
+# [mmli.worker]
+# venv_dir = "/opt/zeppelin/mmli/venv"                 # ZEPPELIN_MMLI_WORKER_VENV_DIR
+# python_binary = "/opt/zeppelin/mmli/venv/bin/python" # ZEPPELIN_MMLI_WORKER_PYTHON_BINARY
+# worker_script = "/opt/zeppelin/mmli/worker.py"       # ZEPPELIN_MMLI_WORKER_SCRIPT
+# scratch_dir = "/var/cache/zeppelin/mmli/scratch"     # ZEPPELIN_MMLI_WORKER_SCRATCH_DIR
+# bundle_cache_dir = "/var/cache/zeppelin/mmli/bundles" # ZEPPELIN_MMLI_WORKER_BUNDLE_CACHE_DIR
+# max_batch_units = 8                 # ZEPPELIN_MMLI_WORKER_MAX_BATCH_UNITS
+# max_batch_input_bytes = 33554432    # ZEPPELIN_MMLI_WORKER_MAX_BATCH_INPUT_BYTES
+# max_batch_pixels = 67108864         # ZEPPELIN_MMLI_WORKER_MAX_BATCH_PIXELS
+# max_batch_rows = 16384              # ZEPPELIN_MMLI_WORKER_MAX_BATCH_ROWS
+# max_tensor_bytes = 67108864         # ZEPPELIN_MMLI_WORKER_MAX_TENSOR_BYTES
+# max_protocol_line_bytes = 1048576   # ZEPPELIN_MMLI_WORKER_MAX_PROTOCOL_LINE_BYTES
+# max_stderr_bytes = 65536            # ZEPPELIN_MMLI_WORKER_MAX_STDERR_BYTES
+# handshake_timeout_secs = 120        # ZEPPELIN_MMLI_WORKER_HANDSHAKE_TIMEOUT_SECS
+# request_timeout_secs = 120          # ZEPPELIN_MMLI_WORKER_REQUEST_TIMEOUT_SECS
+
 [logging]
 # level = "info"                     # RUST_LOG compatible
 # format = "json"                    # ZEPPELIN_LOG_FORMAT — "json" or "pretty"

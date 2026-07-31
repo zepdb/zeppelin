@@ -91,7 +91,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, State};
 use axum::http::{Method, Request};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post, MethodRouter};
+use axum::routing::{delete, get, patch, post, put, MethodRouter};
 use axum::Router;
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -2709,6 +2709,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/namespaces/:ns/index_config",
             secure_route(patch(namespace::patch_index_config), &state),
+        )
+        .route(
+            "/v1/namespaces/:ns/embedding_profile",
+            secure_route(put(namespace::activate_embedding_profile), &state),
         )
         .route(
             "/v1/namespaces/:ns/compact",

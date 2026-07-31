@@ -604,7 +604,7 @@ impl WalWriter {
             if let Some(reference) = manifest.late_state.as_ref() {
                 let previous_owner = manifest.late_section_origin(reference)?;
                 let next_owner = manifest.local_origin()?;
-                section.rebase_source_origins(&previous_owner, &next_owner)?;
+                section.rebase_nested_artifact_origins(&previous_owner, &next_owner)?;
             }
             merge_source_inventory(&mut section, sources.iter().map(|(source, _)| source))?;
             section

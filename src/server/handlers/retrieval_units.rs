@@ -12,7 +12,7 @@ use tracing::{info, instrument};
 
 use crate::embedding::{
     ArtifactChecksum, EncoderInputRef, ImageObjectRef, InputModality, RetrievalUnitRecord,
-    TextContentRef,
+    SemanticState, TextContentRef,
 };
 use crate::error::ZeppelinError;
 use crate::security::{
@@ -104,6 +104,10 @@ pub struct RetrievalUnitsResponse {
     pub deleted: usize,
     /// Committed root-manifest generation.
     pub manifest_generation: u64,
+    /// Semantic materialization state in the same committed manifest snapshot.
+    pub semantic_state: SemanticState,
+    /// Highest mutation sequence with contiguous semantic coverage.
+    pub semantic_sequence: u64,
 }
 
 /// Validate, retain, and atomically publish typed retrieval-unit mutations.
@@ -279,6 +283,12 @@ pub async fn append_retrieval_units(
         .await
         .map_err(ApiError::from)?;
     state.manifest_cache.insert(&namespace, manifest.clone());
+    let (semantic_state, semantic_sequence) = manifest
+        .semantic_coverage
+        .as_ref()
+        .map_or((SemanticState::Pending, 0), |coverage| {
+            (coverage.state, coverage.contiguous_sequence)
+        });
     info!(upserted, deleted, "retrieval units appended");
     Ok((
         StatusCode::OK,
@@ -286,6 +296,8 @@ pub async fn append_retrieval_units(
             upserted,
             deleted,
             manifest_generation: manifest.version(),
+            semantic_state,
+            semantic_sequence,
         }),
     ))
 }

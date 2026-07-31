@@ -219,7 +219,7 @@ async fn typed_lifecycle_restarts_with_checked_sources_and_fts_ordering() {
     )
     .await;
 
-    append_units(
+    let ack = append_units(
         &client,
         &base_url,
         &namespace,
@@ -256,6 +256,12 @@ async fn typed_lifecycle_restarts_with_checked_sources_and_fts_ordering() {
         }),
     )
     .await;
+    assert_eq!(ack["semantic_state"], json!("pending"));
+    assert_eq!(ack["semantic_sequence"], json!(0));
+    assert!(
+        ack["manifest_generation"].as_u64().is_some(),
+        "typed write acknowledgement must carry its committed manifest generation"
+    );
 
     assert_eq!(
         bm25_ids(&client, &base_url, &namespace, "oldterm").await,
@@ -313,7 +319,7 @@ async fn typed_lifecycle_restarts_with_checked_sources_and_fts_ordering() {
             visible.remove(&id);
         }
     }
-    assert_eq!(sequence_numbers, vec![0, 1, 2]);
+    assert_eq!(sequence_numbers, vec![1, 2, 3]);
     assert_eq!(
         visible.keys().cloned().collect::<BTreeSet<_>>(),
         BTreeSet::from(["image".to_string(), "text".to_string()])
@@ -437,6 +443,7 @@ async fn typed_sources_obey_gc_and_snapshot_roots() {
     let replacement = LateStateSection {
         source_inventory: vec![new_source.clone()],
         artifact_origins: Vec::new(),
+        ..LateStateSection::new()
     };
     let (mut current, version) = Manifest::read_versioned(&harness.store, &namespace)
         .await

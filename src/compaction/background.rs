@@ -144,7 +144,10 @@ use tokio::task::JoinHandle;
 
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
-use crate::config::{Config, GcConfig};
+use crate::config::{Config, GcConfig, MmliConfig};
+use crate::embedding::{
+    EnrichmentCoordinator, EnrichmentCoordinatorOptions, MultiVectorEncoderProvider,
+};
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
 use crate::namespace::branching::activation::BranchActivationRecovery;
@@ -155,6 +158,7 @@ use crate::namespace::manager::{NamespaceMetadata, NamespaceState};
 use crate::namespace::{BranchReadinessObserver, NamespaceId, NamespaceManager};
 use crate::security::SecurityKernel;
 use crate::storage::ZeppelinStore;
+use crate::types::IndexType;
 use crate::wal::FragmentCachePolicy;
 use crate::wal::Lease;
 use crate::wal::LeaseManager;
@@ -568,6 +572,15 @@ pub struct CompactionThreadOptions {
     /// This same snapshot also constrains which unreachable immutable artifacts
     /// the background loop may physically delete.
     pub gc_config: GcConfig,
+    /// Bounded semantic-enrichment admission and shutdown settings.
+    pub mmli: MmliConfig,
+}
+
+#[derive(Clone, Copy)]
+struct EnrichmentMaintenance<'a> {
+    coordinator: &'a EnrichmentCoordinator,
+    max_fragments_per_tick: usize,
+    max_bytes_per_tick: u64,
 }
 
 /// Settings consumed by one invocation of the asynchronous maintenance loop.
@@ -1432,11 +1445,13 @@ pub fn start_compaction_thread(
     lease_manager: Arc<LeaseManager>,
     cache: Arc<DiskCache>,
     deletion_worker: GovernedDeletionWorker,
+    encoder_provider: Arc<dyn MultiVectorEncoderProvider>,
     lifecycle: CompactionLifecycle,
     options: CompactionThreadOptions,
 ) -> std::thread::JoinHandle<()> {
     let compaction_workers = options.compaction_workers;
     let gc_config = options.gc_config;
+    let mmli = options.mmli;
     info!(compaction_workers, "starting compaction runtime");
     std::thread::Builder::new()
         .name("compaction-runtime".to_string())
@@ -1448,20 +1463,64 @@ pub fn start_compaction_thread(
                 .build()
                 .expect("failed to build compaction runtime");
 
-            rt.block_on(compaction_loop_with_governed_deletion(
-                compactor,
-                namespace_manager,
-                shutdown,
-                manifest_cache,
-                lease_manager,
-                cache,
-                CompactionLoopOptions {
-                    gc_config,
-                    namespace_prefix: None,
-                },
-                deletion_worker,
-                &lifecycle,
-            ));
+            rt.block_on(async move {
+                let enrichment = EnrichmentCoordinator::start(
+                    compactor.store().clone(),
+                    Arc::clone(&lease_manager),
+                    encoder_provider,
+                    EnrichmentCoordinatorOptions {
+                        queue_capacity: mmli.enrichment_queue_capacity,
+                        max_retry_attempts: mmli.max_retry_attempts,
+                        checkpoint: None,
+                    },
+                );
+                let enrichment_maintenance = EnrichmentMaintenance {
+                    coordinator: &enrichment,
+                    max_fragments_per_tick: mmli.max_fragments_per_tick,
+                    max_bytes_per_tick: mmli.max_bytes_per_tick,
+                };
+                tokio::select! {
+                    () = compaction_loop_with_lifecycle_inner(
+                        compactor,
+                        namespace_manager,
+                        shutdown,
+                        manifest_cache,
+                        lease_manager,
+                        cache,
+                        CompactionLoopOptions {
+                            gc_config,
+                            namespace_prefix: None,
+                        },
+                        Some(&deletion_worker),
+                        Some(enrichment_maintenance),
+                        &lifecycle,
+                    ) => {}
+                    failure = enrichment.wait_for_executor_failure() => {
+                        panic!("semantic enrichment executor failed: {failure}");
+                    }
+                }
+
+                let shutdown_timeout = Duration::from_secs(mmli.shutdown_timeout_secs);
+                let shutdown_result = tokio::time::timeout(shutdown_timeout, async move {
+                    let idle_result = enrichment.wait_for_idle().await;
+                    let stop_result = enrichment.shutdown().await;
+                    idle_result?;
+                    stop_result
+                })
+                .await;
+                match shutdown_result {
+                    Ok(Ok(())) => info!("semantic enrichment executor shut down"),
+                    Ok(Err(error)) => {
+                        panic!("semantic enrichment shutdown failed: {error}");
+                    }
+                    Err(_) => {
+                        panic!(
+                            "semantic enrichment shutdown exceeded {}s",
+                            mmli.shutdown_timeout_secs
+                        );
+                    }
+                }
+            });
         })
         .expect("failed to spawn compaction thread")
 }
@@ -1660,6 +1719,7 @@ pub async fn compaction_loop_with_lifecycle(
         cache,
         options,
         None,
+        None,
         lifecycle,
     )
     .await;
@@ -1693,6 +1753,7 @@ pub async fn compaction_loop_with_governed_deletion(
         cache,
         options,
         Some(&deletion_worker),
+        None,
         lifecycle,
     )
     .await;
@@ -1710,6 +1771,7 @@ async fn compaction_loop_with_lifecycle_inner(
     cache: Arc<DiskCache>,
     options: CompactionLoopOptions,
     deletion_worker: Option<&GovernedDeletionWorker>,
+    enrichment: Option<EnrichmentMaintenance<'_>>,
     lifecycle: &CompactionLifecycle,
 ) {
     let CompactionLoopOptions {
@@ -1790,6 +1852,14 @@ async fn compaction_loop_with_lifecycle_inner(
             tick, "compaction loop tick"
         );
 
+        let mut enrichment_fragments_remaining = enrichment
+            .map(|maintenance| maintenance.max_fragments_per_tick)
+            .unwrap_or(0);
+        let mut enrichment_bytes_remaining = enrichment
+            .map(|maintenance| maintenance.max_bytes_per_tick)
+            .unwrap_or(0);
+        let mut enrichment_queue_full = false;
+
         for ns in &namespaces {
             let deletion_recovery_required = ns.state == NamespaceState::Deleting
                 || ((ns.state == NamespaceState::Active || ns.state == NamespaceState::Creating)
@@ -1864,6 +1934,60 @@ async fn compaction_loop_with_lifecycle_inner(
                     "skipping namespace whose initial manifest is not yet active"
                 );
                 continue;
+            }
+            if let Some(maintenance) = enrichment {
+                if ns.index_type == IndexType::LateInteractionFde
+                    && !enrichment_queue_full
+                    && enrichment_fragments_remaining > 0
+                    && enrichment_bytes_remaining > 0
+                {
+                    if let Some(incarnation) = ns.incarnation_id.as_ref() {
+                        match maintenance
+                            .coordinator
+                            .discover_and_admit(
+                                &ns.name,
+                                incarnation.as_uuid(),
+                                enrichment_fragments_remaining,
+                                enrichment_bytes_remaining,
+                            )
+                            .await
+                        {
+                            Ok(report) => {
+                                enrichment_fragments_remaining = enrichment_fragments_remaining
+                                    .saturating_sub(report.discovered_fragments);
+                                enrichment_bytes_remaining = enrichment_bytes_remaining
+                                    .saturating_sub(report.inspected_bytes);
+                                enrichment_queue_full = report.queue_full;
+                                if report.discovered_fragments > 0
+                                    || report.admitted_fragments > 0
+                                    || report.queue_full
+                                {
+                                    info!(
+                                        namespace = %ns.name,
+                                        discovered_fragments = report.discovered_fragments,
+                                        inspected_bytes = report.inspected_bytes,
+                                        admitted_fragments = report.admitted_fragments,
+                                        admitted_bytes = report.admitted_bytes,
+                                        queue_full = report.queue_full,
+                                        "semantic enrichment admission completed"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                warn!(
+                                    namespace = %ns.name,
+                                    error = %error,
+                                    "semantic enrichment discovery failed"
+                                );
+                            }
+                        }
+                    } else {
+                        error!(
+                            namespace = %ns.name,
+                            "late-interaction namespace lacks an incarnation identity"
+                        );
+                    }
+                }
             }
             match gc_runner
                 .run_cycle_at(

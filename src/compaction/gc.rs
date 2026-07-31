@@ -920,19 +920,18 @@ fn reachable_keys_with_staging_and_late_state(
         (Some(reference), Some(section)) => {
             let section_origin = manifest.late_section_origin(reference)?;
             section.validate_for_origin(&section_origin)?;
-            for source in &section.source_inventory {
-                let source_origin = manifest.source_inventory_origin(section, source)?;
+            for artifact in section.resolved_artifacts(&section_origin)? {
                 let owned = NamespaceObjectKey::classify(
-                    source_origin.namespace.as_str(),
-                    source.key.clone(),
+                    artifact.origin.namespace.as_str(),
+                    &artifact.key,
                 )?;
-                if owned.family() != NamespaceObjectFamily::Source {
+                if owned.family() != artifact.family {
                     return Err(ZeppelinError::Validation(format!(
-                        "source inventory key is outside the registered source family: {}",
-                        source.key
+                        "late-state key is outside its registered {:?} family: {}",
+                        artifact.family, artifact.key
                     )));
                 }
-                keys.insert(source.key.clone());
+                keys.insert(artifact.key);
             }
         }
     }
@@ -1026,6 +1025,15 @@ pub fn reachable_keys_with_staging(
             }
             NamespaceObjectFamily::Source => {
                 debug_assert!(family.participates_in_branch_locality());
+            }
+            NamespaceObjectFamily::MatrixFragment
+            | NamespaceObjectFamily::FdeFragment
+            | NamespaceObjectFamily::FdeTransform
+            | NamespaceObjectFamily::Centering
+            | NamespaceObjectFamily::Quarantine => {
+                debug_assert!(family.participates_in_branch_locality());
+                // Section-resident refs are expanded only after the selected
+                // immutable section has been loaded and verified.
             }
             NamespaceObjectFamily::Segment => {
                 debug_assert!(family.participates_in_branch_locality());
@@ -1529,6 +1537,8 @@ enum ParsedGcArtifact {
     LateSection,
     /// One checksum-addressed retained source object.
     Source,
+    /// One checksum-addressed matrix, FDE, transform, centering, or quarantine object.
+    LateArtifact,
 }
 
 impl ParsedGcArtifact {
@@ -1549,7 +1559,7 @@ impl ParsedGcArtifact {
             Self::WalFragment { ulid }
             | Self::InputWalFragment { ulid }
             | Self::SegmentArtifact { ulid } => Some(ulid),
-            Self::LateSection | Self::Source => None,
+            Self::LateSection | Self::LateArtifact | Self::Source => None,
         }
     }
 }
@@ -2249,7 +2259,11 @@ async fn prepare_warm_pending_delete_drain(
         if gc.horizon_secs > 0
             && matches!(
                 parse_gc_artifact_key(namespace, key),
-                Some(ParsedGcArtifact::LateSection | ParsedGcArtifact::Source)
+                Some(
+                    ParsedGcArtifact::LateSection
+                        | ParsedGcArtifact::Source
+                        | ParsedGcArtifact::LateArtifact
+                )
             )
         {
             return true;
@@ -2334,14 +2348,21 @@ async fn pending_content_addressed_inventory(
         || !pending.iter().any(|key| {
             matches!(
                 parse_gc_artifact_key(namespace, key),
-                Some(ParsedGcArtifact::LateSection | ParsedGcArtifact::Source)
+                Some(
+                    ParsedGcArtifact::LateSection
+                        | ParsedGcArtifact::Source
+                        | ParsedGcArtifact::LateArtifact
+                )
             )
         })
     {
         return Ok(None);
     }
 
-    let late_prefix = NamespaceObjectFamily::LateSection.namespace_prefix(namespace);
+    let late_prefix = format!(
+        "{namespace}/{}",
+        NamespaceObjectFamily::LateSection.relative_root_prefix()
+    );
     let source_prefix = NamespaceObjectFamily::Source.namespace_prefix(namespace);
     let (mut late, sources) = tokio::try_join!(
         store.list_prefix_meta(&late_prefix),
@@ -2398,12 +2419,13 @@ fn pending_delete_horizon_satisfied(
             let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
             super::fragment_age_secs(&ulid, now_ms) >= horizon_secs
         }
-        ParsedGcArtifact::LateSection | ParsedGcArtifact::Source => content_addressed_inventory
-            .is_some_and(|inventory| {
-                inventory
-                    .object(key)
-                    .is_none_or(|object| listed_object_horizon_satisfied(object, now, horizon_secs))
-            }),
+        ParsedGcArtifact::LateSection
+        | ParsedGcArtifact::Source
+        | ParsedGcArtifact::LateArtifact => content_addressed_inventory.is_some_and(|inventory| {
+            inventory
+                .object(key)
+                .is_none_or(|object| listed_object_horizon_satisfied(object, now, horizon_secs))
+        }),
     }
 }
 
@@ -5047,16 +5069,25 @@ fn parse_gc_artifact_key(namespace: &str, key: &str) -> Option<ParsedGcArtifact>
             }
         }
         NamespaceObjectFamily::LateSection => {
-            let prefix = format!(
-                "{}state/",
-                NamespaceObjectFamily::LateSection.namespace_prefix(namespace)
-            );
+            let prefix = NamespaceObjectFamily::LateSection.namespace_prefix(namespace);
             let checksum = key.strip_prefix(&prefix)?;
             (checksum.len() == 64
                 && checksum
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
             .then_some(ParsedGcArtifact::LateSection)
+        }
+        NamespaceObjectFamily::MatrixFragment
+        | NamespaceObjectFamily::FdeFragment
+        | NamespaceObjectFamily::FdeTransform
+        | NamespaceObjectFamily::Centering
+        | NamespaceObjectFamily::Quarantine => {
+            let checksum = key.strip_prefix(&family.namespace_prefix(namespace))?;
+            (checksum.len() == 64
+                && checksum
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+            .then_some(ParsedGcArtifact::LateArtifact)
         }
         NamespaceObjectFamily::Metadata
         | NamespaceObjectFamily::Manifest
@@ -6755,7 +6786,7 @@ mod tests {
             Some(ParsedGcArtifact::LateSection)
         );
         let uppercase_checksum = format!(
-            "{}state/{}",
+            "{}{}",
             NamespaceObjectFamily::LateSection.namespace_prefix(NS),
             "AB".repeat(32)
         );

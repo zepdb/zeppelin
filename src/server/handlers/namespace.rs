@@ -145,7 +145,7 @@ use uuid::Uuid;
 
 use crate::cache::hydration::HydrationTarget;
 use crate::compaction::background::run_compaction_with_reserved_lease;
-use crate::embedding::{EncoderInputRef, LateInteractionNamespaceConfig};
+use crate::embedding::{EmbeddingProfileRef, EncoderInputRef, LateInteractionNamespaceConfig};
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
@@ -649,6 +649,29 @@ pub struct UpdateIndexConfigResponse {
     pub status: &'static str,
     /// Human-readable polling guidance for observing a later rewrite.
     pub observe: String,
+}
+
+/// Administrative request to fill a late namespace's single active-profile slot.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivateEmbeddingProfileRequest {
+    /// Complete immutable profile, epoch, and FDE generation recipe.
+    pub profile: EmbeddingProfileRef,
+}
+
+/// Confirms the manifest-selected profile and generation identities.
+#[derive(Debug, Serialize)]
+pub struct ActivateEmbeddingProfileResponse {
+    /// Namespace whose late-state section selected the profile.
+    pub namespace: String,
+    /// Operator-facing profile identity.
+    pub profile: String,
+    /// Canonical semantic epoch SHA-256.
+    pub epoch: String,
+    /// Canonical FDE generation SHA-256.
+    pub fde_generation: String,
+    /// Root manifest generation that selects the active profile.
+    pub manifest_generation: u64,
 }
 
 /// Lightweight compaction readiness derived from one authoritative manifest.
@@ -2938,6 +2961,72 @@ pub async fn patch_index_config(
             ),
         }),
     ))
+}
+
+/// Activates the first immutable semantic profile for a late namespace.
+#[instrument(skip(state, decision, audit, req), fields(namespace = %ns))]
+pub async fn activate_embedding_profile(
+    State(state): State<AppState>,
+    Extension(decision): Extension<AllowDecision>,
+    Extension(audit): Extension<AuditRequest>,
+    Path(ns): Path<String>,
+    Json(req): Json<ActivateEmbeddingProfileRequest>,
+) -> Result<Json<ActivateEmbeddingProfileResponse>, ApiError> {
+    require_unconstrained_namespace_operation(&decision)?;
+    let metadata = state
+        .namespace_manager
+        .get(&ns)
+        .await
+        .map_err(ApiError::from)?;
+    if metadata.index_type != IndexType::LateInteractionFde {
+        return Err(ApiError(ZeppelinError::Validation(
+            "embedding profiles are valid only for late-interaction namespaces".to_string(),
+        )));
+    }
+    let admission = metadata.late_interaction.as_ref().ok_or_else(|| {
+        ApiError(ZeppelinError::Serialization(
+            "late-interaction namespace is missing admission config".to_string(),
+        ))
+    })?;
+    req.profile
+        .validate_for_modalities(&admission.accepted_modalities)
+        .map_err(ApiError::from)?;
+    LateStateSection::validate_local_profile_artifacts(&state.store, &ns, &req.profile)
+        .await
+        .map_err(ApiError::from)?;
+
+    let incarnation = metadata
+        .incarnation_id
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError(ZeppelinError::Serialization(format!(
+                "namespace {ns} is missing its namespace incarnation"
+            )))
+        })?
+        .as_uuid();
+    audit.set_params(AuditParams::EmbeddingProfileActivation {
+        namespace: NamespaceId::new(ns.clone()).map_err(ZeppelinError::from)?,
+        profile: req.profile.profile.as_str().to_string(),
+        epoch: req.profile.epoch.id.to_hex(),
+        fde_generation: req.profile.fde.generation.to_hex(),
+    });
+    let (mut manifest, version) =
+        Manifest::read_versioned_required_for_incarnation(&state.store, &ns, incarnation)
+            .await
+            .map_err(ApiError::from)?;
+    manifest
+        .activate_embedding_profile(&state.store, &ns, &version, &req.profile)
+        .await
+        .map_err(ApiError::from)?;
+    state.manifest_cache.insert(&ns, manifest.clone());
+
+    Ok(Json(ActivateEmbeddingProfileResponse {
+        namespace: ns,
+        profile: req.profile.profile.as_str().to_string(),
+        epoch: req.profile.epoch.id.to_hex(),
+        fde_generation: req.profile.fde.generation.to_hex(),
+        manifest_generation: manifest.version(),
+    }))
 }
 
 /// Tombstones a namespace and resumes destructive cleanup in the background.

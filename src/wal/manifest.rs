@@ -137,7 +137,10 @@ use sha2::{Digest, Sha256};
 use std::ops::Range;
 use ulid::Ulid;
 
-use crate::embedding::{ModalityCounts, SemanticCoverageState};
+use crate::embedding::{
+    EmbeddingProfileRef, ModalityCounts, PhysicalInputFragmentIdentity, RecordVersionRef,
+    SemanticCoverageState, SemanticOverlayRef, SemanticState,
+};
 use crate::error::{Result, ZeppelinError};
 use crate::namespace::branching::{
     ArtifactOrigin, ArtifactOriginIndex, ArtifactOriginSetBuilder, BranchError, BranchLineage,
@@ -152,8 +155,9 @@ use crate::storage::{
 };
 use crate::wal::late_section::{
     is_supported_late_state_format_version, LateStateSection, ManifestSectionRef,
-    SourceInventoryRef, LATE_STATE_FORMAT_VERSION,
+    QuarantineEvidenceRef, LATE_STATE_FORMAT_VERSION,
 };
+use crate::wal::{EncoderInputWalFragment, Lease, LeaseManager};
 
 fn checksum_hex(checksum: &[u8; 32]) -> String {
     checksum.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -1862,6 +1866,863 @@ impl Manifest {
             .await
     }
 
+    /// Activate one immutable profile without overwriting concurrent section state.
+    ///
+    /// Every CAS conflict reloads both the authoritative root and its selected
+    /// section, then reapplies only the `active_profile` mutation. This is
+    /// deliberately separate from generic section publication because reusing
+    /// a pre-conflict section reference could discard concurrently appended
+    /// source inventory or overlays.
+    pub async fn activate_embedding_profile(
+        &mut self,
+        store: &ZeppelinStore,
+        namespace: &str,
+        version: &ManifestVersion,
+        profile: &EmbeddingProfileRef,
+    ) -> Result<ManifestVersion> {
+        const MAX_ACTIVATION_ATTEMPTS: usize = 8;
+
+        profile.validate()?;
+        let mut current_version = version.clone();
+        for _ in 0..MAX_ACTIVATION_ATTEMPTS {
+            let mut section = self.load_late_state(store).await?.unwrap_or_default();
+            match section.active_profile.as_ref() {
+                Some(active) if active == profile => {
+                    let coverage = self
+                        .compute_semantic_coverage(store, &section, profile)
+                        .await?;
+                    if self.semantic_coverage.as_ref() == Some(&coverage) {
+                        return Ok(current_version);
+                    }
+                    self.semantic_coverage = Some(coverage);
+                }
+                Some(active) => {
+                    return Err(ZeppelinError::EmbeddingProfileAlreadyActive {
+                        namespace: namespace.to_string(),
+                        active_profile: active.profile.as_str().to_string(),
+                        requested_profile: profile.profile.as_str().to_string(),
+                    });
+                }
+                None => {}
+            }
+
+            if let Some(reference) = self.late_state.as_ref() {
+                let previous_owner = self.late_section_origin(reference)?;
+                let next_owner = self.local_origin()?;
+                section.rebase_nested_artifact_origins(&previous_owner, &next_owner)?;
+            }
+            section.active_profile = Some(profile.clone());
+            self.semantic_coverage = Some(
+                self.compute_semantic_coverage(store, &section, profile)
+                    .await?,
+            );
+            section.canonicalize_artifact_origins()?;
+            let next_reference = section.put_create(store, namespace).await?;
+
+            if let Some(previous) = self.late_state.replace(next_reference.clone()) {
+                if previous.key != next_reference.key {
+                    let previous_origin = self.late_section_origin(&previous)?;
+                    if previous_origin == self.local_origin()? {
+                        let owned = NamespaceObjectKey::classify(namespace, previous.key.clone())?;
+                        if owned.family() != crate::storage::NamespaceObjectFamily::LateSection {
+                            return Err(ZeppelinError::Validation(format!(
+                                "superseded late-state key is not in the late section family: {}",
+                                previous.key
+                            )));
+                        }
+                        if !self
+                            .pending_deletes
+                            .iter()
+                            .any(|pending| pending == &previous.key)
+                        {
+                            self.pending_deletes.push(previous.key);
+                        }
+                    }
+                }
+            }
+
+            match self
+                .write_conditional(store, namespace, &current_version)
+                .await
+            {
+                Ok(published) => return Ok(published),
+                Err(ZeppelinError::ManifestConflict { .. }) => {
+                    let Some((authoritative, authoritative_version)) =
+                        Self::read_versioned(store, namespace).await?
+                    else {
+                        return Err(ZeppelinError::ManifestNotFound {
+                            namespace: namespace.to_string(),
+                        });
+                    };
+                    *self = authoritative;
+                    current_version = authoritative_version;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(ZeppelinError::ManifestConflict {
+            namespace: namespace.to_string(),
+        })
+    }
+
+    /// Publish one completed semantic overlay through a fenced root CAS.
+    ///
+    /// Artifact construction happens before this method. Every CAS retry reloads
+    /// the root and section, revalidates the exact physical source, and
+    /// recomputes hole-aware coverage without re-encoding.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn publish_semantic_overlay<F>(
+        store: &ZeppelinStore,
+        lease_manager: &LeaseManager,
+        lease: &Lease,
+        namespace: &str,
+        expected_incarnation: uuid::Uuid,
+        profile: &EmbeddingProfileRef,
+        source_origin: &ArtifactOrigin,
+        mut overlay: SemanticOverlayRef,
+        max_attempts: usize,
+        mut after_section_put: F,
+    ) -> Result<(Self, Lease)>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        profile.validate()?;
+        if max_attempts == 0 {
+            return Err(ZeppelinError::Validation(
+                "semantic overlay publication retry bound must be positive".to_string(),
+            ));
+        }
+        let mut current_lease = lease.clone();
+        for _ in 0..max_attempts {
+            let (mut manifest, version) = Self::read_versioned_required_for_incarnation(
+                store,
+                namespace,
+                expected_incarnation,
+            )
+            .await?;
+            version.require_version(namespace, "semantic overlay publication")?;
+            let mut section = manifest.load_late_state(store).await?.ok_or_else(|| {
+                ZeppelinError::Validation(
+                    "semantic overlay publication requires an active late-state section"
+                        .to_string(),
+                )
+            })?;
+            let active = section.active_profile.as_ref().ok_or_else(|| {
+                ZeppelinError::Validation(
+                    "semantic overlay publication requires an active profile".to_string(),
+                )
+            })?;
+            if active != profile {
+                return Err(ZeppelinError::Validation(
+                    "semantic overlay profile changed before publication".to_string(),
+                ));
+            }
+
+            let source_ref = manifest
+                .input_fragments
+                .iter()
+                .find(|candidate| candidate.id == overlay.source_fragment.id)
+                .ok_or_else(|| {
+                    ZeppelinError::Validation(format!(
+                        "semantic overlay source fragment {} is no longer retained",
+                        overlay.source_fragment.id
+                    ))
+                })?;
+            let authoritative_origin = manifest.input_fragment_origin(source_ref)?;
+            if &authoritative_origin != source_origin {
+                return Err(ZeppelinError::ManifestConflict {
+                    namespace: namespace.to_string(),
+                });
+            }
+            let source =
+                Self::read_input_fragment_checked(store, source_ref, source_origin).await?;
+            Self::validate_overlay_source(&overlay, source_ref, &source, source_origin)?;
+            Self::validate_overlay_artifacts(store, profile, &overlay, &source).await?;
+
+            let local_origin = manifest.local_origin()?;
+            if let Some(reference) = manifest.late_state.as_ref() {
+                let previous_owner = manifest.late_section_origin(reference)?;
+                section.rebase_nested_artifact_origins(&previous_owner, &local_origin)?;
+            }
+            overlay.source_fragment.artifact_origin =
+                section.intern_artifact_origin(source_origin, &local_origin)?;
+            overlay.embeddings.artifact_origin = None;
+            overlay.fde_vectors.artifact_origin = None;
+            overlay.published_at_generation =
+                manifest.version().checked_add(1).ok_or_else(|| {
+                    ZeppelinError::Serialization(
+                        "semantic overlay publication generation overflows u64".to_string(),
+                    )
+                })?;
+
+            let same_source_recipe = |existing: &SemanticOverlayRef| {
+                existing.source_fragment.key == overlay.source_fragment.key
+                    && existing.source_fragment.id == overlay.source_fragment.id
+                    && existing.source_fragment.checksum == overlay.source_fragment.checksum
+                    && existing.source_fragment.artifact_origin
+                        == overlay.source_fragment.artifact_origin
+                    && existing.semantic_epoch == overlay.semantic_epoch
+                    && existing.fde_generation == overlay.fde_generation
+            };
+            let identity_matches = |existing: &SemanticOverlayRef| {
+                same_source_recipe(existing)
+                    && existing.covered_versions == overlay.covered_versions
+            };
+            if let Some(existing) = section
+                .semantic_overlays
+                .iter()
+                .find(|item| identity_matches(item))
+            {
+                let mut expected = overlay.clone();
+                expected.published_at_generation = existing.published_at_generation;
+                if existing != &expected {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "semantic overlay identity collision for input fragment {}",
+                        overlay.source_fragment.id
+                    )));
+                }
+                let coverage = manifest
+                    .compute_semantic_coverage(store, &section, profile)
+                    .await?;
+                if manifest.semantic_coverage.as_ref() == Some(&coverage) {
+                    return Ok((manifest, current_lease));
+                }
+                manifest.semantic_coverage = Some(coverage);
+            } else {
+                if section.semantic_overlays.iter().any(|existing| {
+                    same_source_recipe(existing)
+                        && existing
+                            .covered_versions
+                            .records
+                            .iter()
+                            .any(|record| overlay.covered_versions.records.contains(record))
+                }) || section.quarantine_evidence.iter().any(|evidence| {
+                    evidence.source_fragment.key == overlay.source_fragment.key
+                        && evidence.source_fragment.id == overlay.source_fragment.id
+                        && evidence.source_fragment.checksum == overlay.source_fragment.checksum
+                        && evidence.source_fragment.artifact_origin
+                            == overlay.source_fragment.artifact_origin
+                        && evidence.semantic_epoch == overlay.semantic_epoch
+                        && evidence.fde_generation == overlay.fde_generation
+                        && evidence
+                            .failed_versions
+                            .records
+                            .iter()
+                            .any(|record| overlay.covered_versions.records.contains(record))
+                }) {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "semantic overlay coverage overlaps prior derived state for input fragment {}",
+                        overlay.source_fragment.id
+                    )));
+                }
+                section.semantic_overlays.push(overlay.clone());
+                manifest.semantic_coverage = Some(
+                    manifest
+                        .compute_semantic_coverage(store, &section, profile)
+                        .await?,
+                );
+            }
+
+            section.canonicalize_artifact_origins()?;
+            current_lease = lease_manager.renew(namespace, &current_lease).await?;
+            if !lease_manager.validate(&current_lease) {
+                return Err(ZeppelinError::LeaseExpired {
+                    namespace: namespace.to_string(),
+                });
+            }
+            let next_reference = section.put_create(store, namespace).await?;
+            after_section_put()?;
+            current_lease = lease_manager.renew(namespace, &current_lease).await?;
+            if !lease_manager.validate(&current_lease) {
+                return Err(ZeppelinError::LeaseExpired {
+                    namespace: namespace.to_string(),
+                });
+            }
+            if manifest.fencing_token() > current_lease.fencing_token {
+                return Err(ZeppelinError::FencingTokenStale {
+                    namespace: namespace.to_string(),
+                    our_token: current_lease.fencing_token,
+                    manifest_token: manifest.fencing_token(),
+                });
+            }
+            manifest.fencing_token = current_lease.fencing_token;
+            if let Some(previous) = manifest.late_state.replace(next_reference.clone()) {
+                if previous.key != next_reference.key {
+                    let previous_origin = manifest.late_section_origin(&previous)?;
+                    if previous_origin == local_origin
+                        && !manifest
+                            .pending_deletes
+                            .iter()
+                            .any(|key| key == &previous.key)
+                    {
+                        manifest.pending_deletes.push(previous.key);
+                    }
+                }
+            }
+
+            match manifest
+                .write_conditional_candidate(store, namespace, &version)
+                .await
+            {
+                Ok(_) => return Ok((manifest, current_lease)),
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ZeppelinError::ManifestConflict {
+            namespace: namespace.to_string(),
+        })
+    }
+
+    /// Publish deterministic enrichment-failure evidence and failed coverage.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn publish_semantic_quarantine(
+        store: &ZeppelinStore,
+        lease_manager: &LeaseManager,
+        lease: &Lease,
+        namespace: &str,
+        expected_incarnation: uuid::Uuid,
+        profile: &EmbeddingProfileRef,
+        source_origin: &ArtifactOrigin,
+        mut evidence: QuarantineEvidenceRef,
+        max_attempts: usize,
+    ) -> Result<(Self, Lease)> {
+        if max_attempts == 0 {
+            return Err(ZeppelinError::Validation(
+                "semantic quarantine publication retry bound must be positive".to_string(),
+            ));
+        }
+        let mut current_lease = lease.clone();
+        for _ in 0..max_attempts {
+            let (mut manifest, version) = Self::read_versioned_required_for_incarnation(
+                store,
+                namespace,
+                expected_incarnation,
+            )
+            .await?;
+            version.require_version(namespace, "semantic quarantine publication")?;
+            let mut section = manifest.load_late_state(store).await?.ok_or_else(|| {
+                ZeppelinError::Validation(
+                    "semantic quarantine publication requires late state".to_string(),
+                )
+            })?;
+            if section.active_profile.as_ref() != Some(profile) {
+                return Err(ZeppelinError::Validation(
+                    "semantic quarantine profile changed before publication".to_string(),
+                ));
+            }
+            let source_ref = manifest
+                .input_fragments
+                .iter()
+                .find(|candidate| candidate.id == evidence.source_fragment.id)
+                .ok_or_else(|| {
+                    ZeppelinError::Validation(format!(
+                        "semantic quarantine source fragment {} is no longer retained",
+                        evidence.source_fragment.id
+                    ))
+                })?;
+            if &manifest.input_fragment_origin(source_ref)? != source_origin {
+                return Err(ZeppelinError::ManifestConflict {
+                    namespace: namespace.to_string(),
+                });
+            }
+            let source =
+                Self::read_input_fragment_checked(store, source_ref, source_origin).await?;
+            let failed_row_count =
+                u32::try_from(evidence.failed_versions.records.len()).map_err(|_| {
+                    ZeppelinError::Validation(
+                        "semantic quarantine row count exceeds u32".to_string(),
+                    )
+                })?;
+            let source_overlay = SemanticOverlayRef {
+                source_fragment: evidence.source_fragment.clone(),
+                semantic_epoch: evidence.semantic_epoch,
+                fde_generation: evidence.fde_generation,
+                embeddings: crate::embedding::MultiVectorEmbeddingFragmentRef {
+                    key: String::new(),
+                    checksum: crate::embedding::ArtifactChecksum::new([0; 32]),
+                    source_fragment_checksum: source.checksum,
+                    semantic_epoch: evidence.semantic_epoch,
+                    row_count: failed_row_count,
+                    total_vectors: 0,
+                    vector_dimension: profile.epoch.vector_dimension,
+                    dtype: profile.epoch.matrix_dtype,
+                    format_version: 0,
+                    size_bytes: 0,
+                    artifact_origin: None,
+                },
+                fde_vectors: crate::embedding::FdeFragmentRef {
+                    key: String::new(),
+                    checksum: crate::embedding::ArtifactChecksum::new([0; 32]),
+                    embedding_fragment_checksum: crate::embedding::ArtifactChecksum::new([0; 32]),
+                    generation: evidence.fde_generation,
+                    row_count: failed_row_count,
+                    fde_dimension: 0,
+                    format_version: 0,
+                    size_bytes: 0,
+                    artifact_origin: None,
+                },
+                covered_versions: evidence.failed_versions.clone(),
+                published_at_generation: 0,
+            };
+            Self::validate_overlay_source(&source_overlay, source_ref, &source, source_origin)?;
+            let bytes = store.get(&evidence.key).await?;
+            if u64::try_from(bytes.len()).ok() != Some(evidence.size_bytes)
+                || crate::embedding::ArtifactChecksum::digest(&bytes) != evidence.checksum
+            {
+                return Err(ZeppelinError::Serialization(
+                    "semantic quarantine evidence size or checksum mismatch".to_string(),
+                ));
+            }
+
+            let local_origin = manifest.local_origin()?;
+            if let Some(reference) = manifest.late_state.as_ref() {
+                let previous_owner = manifest.late_section_origin(reference)?;
+                section.rebase_nested_artifact_origins(&previous_owner, &local_origin)?;
+            }
+            evidence.source_fragment.artifact_origin =
+                section.intern_artifact_origin(source_origin, &local_origin)?;
+            evidence.artifact_origin = None;
+            if let Some(existing) = section
+                .quarantine_evidence
+                .iter()
+                .find(|candidate| candidate.work_id == evidence.work_id)
+            {
+                if existing != &evidence {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "semantic quarantine identity collision for input fragment {}",
+                        evidence.source_fragment.id
+                    )));
+                }
+            } else {
+                let overlaps_overlay = section.semantic_overlays.iter().any(|overlay| {
+                    overlay.source_fragment.key == evidence.source_fragment.key
+                        && overlay.source_fragment.id == evidence.source_fragment.id
+                        && overlay.source_fragment.checksum == evidence.source_fragment.checksum
+                        && overlay.source_fragment.artifact_origin
+                            == evidence.source_fragment.artifact_origin
+                        && overlay.semantic_epoch == evidence.semantic_epoch
+                        && overlay.fde_generation == evidence.fde_generation
+                        && overlay
+                            .covered_versions
+                            .records
+                            .iter()
+                            .any(|record| evidence.failed_versions.records.contains(record))
+                });
+                let overlaps_quarantine = section.quarantine_evidence.iter().any(|existing| {
+                    existing.source_fragment.key == evidence.source_fragment.key
+                        && existing.source_fragment.id == evidence.source_fragment.id
+                        && existing.source_fragment.checksum == evidence.source_fragment.checksum
+                        && existing.source_fragment.artifact_origin
+                            == evidence.source_fragment.artifact_origin
+                        && existing.semantic_epoch == evidence.semantic_epoch
+                        && existing.fde_generation == evidence.fde_generation
+                        && existing
+                            .failed_versions
+                            .records
+                            .iter()
+                            .any(|record| evidence.failed_versions.records.contains(record))
+                });
+                if overlaps_overlay || overlaps_quarantine {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "semantic quarantine coverage overlaps prior derived state for input fragment {}",
+                        evidence.source_fragment.id
+                    )));
+                }
+                section.quarantine_evidence.push(evidence.clone());
+            }
+            manifest.semantic_coverage = Some(
+                manifest
+                    .compute_semantic_coverage(store, &section, profile)
+                    .await?,
+            );
+            section.canonicalize_artifact_origins()?;
+            current_lease = lease_manager.renew(namespace, &current_lease).await?;
+            if !lease_manager.validate(&current_lease) {
+                return Err(ZeppelinError::LeaseExpired {
+                    namespace: namespace.to_string(),
+                });
+            }
+            let next_reference = section.put_create(store, namespace).await?;
+            current_lease = lease_manager.renew(namespace, &current_lease).await?;
+            if manifest.fencing_token() > current_lease.fencing_token {
+                return Err(ZeppelinError::FencingTokenStale {
+                    namespace: namespace.to_string(),
+                    our_token: current_lease.fencing_token,
+                    manifest_token: manifest.fencing_token(),
+                });
+            }
+            manifest.fencing_token = current_lease.fencing_token;
+            if let Some(previous) = manifest.late_state.replace(next_reference.clone()) {
+                if previous.key != next_reference.key {
+                    let previous_origin = manifest.late_section_origin(&previous)?;
+                    if previous_origin == local_origin
+                        && !manifest
+                            .pending_deletes
+                            .iter()
+                            .any(|key| key == &previous.key)
+                    {
+                        manifest.pending_deletes.push(previous.key);
+                    }
+                }
+            }
+            match manifest
+                .write_conditional_candidate(store, namespace, &version)
+                .await
+            {
+                Ok(_) => return Ok((manifest, current_lease)),
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ZeppelinError::ManifestConflict {
+            namespace: namespace.to_string(),
+        })
+    }
+
+    async fn validate_overlay_artifacts(
+        store: &ZeppelinStore,
+        profile: &EmbeddingProfileRef,
+        overlay: &SemanticOverlayRef,
+        source: &EncoderInputWalFragment,
+    ) -> Result<()> {
+        use crate::embedding::{FdeArtifact, MatrixArtifact};
+        use crate::index::late_interaction::FdeTransform;
+
+        let matrix_bytes = store.get(&overlay.embeddings.key).await?;
+        if u64::try_from(matrix_bytes.len()).ok() != Some(overlay.embeddings.size_bytes) {
+            return Err(ZeppelinError::Serialization(
+                "semantic overlay matrix size mismatch".to_string(),
+            ));
+        }
+        let matrix = MatrixArtifact::from_bytes(
+            &matrix_bytes,
+            overlay.embeddings.checksum,
+            profile.epoch.matrix_dtype,
+            profile.epoch.id,
+            source.checksum,
+            profile.epoch.vector_dimension as usize,
+            overlay.covered_versions.records.len(),
+            profile.epoch.max_document_vectors as usize,
+        )?;
+        if overlay.embeddings.dtype != matrix.dtype()
+            || overlay.embeddings.row_count as usize != matrix.rows().len()
+            || overlay.embeddings.source_fragment_checksum != source.checksum
+            || overlay.embeddings.semantic_epoch != profile.epoch.id
+        {
+            return Err(ZeppelinError::Validation(
+                "semantic overlay matrix metadata disagrees with artifact".to_string(),
+            ));
+        }
+        if matrix
+            .rows()
+            .iter()
+            .zip(&overlay.covered_versions.records)
+            .any(|(row, version)| row.content_hash() != version.content_hash)
+        {
+            return Err(ZeppelinError::Validation(
+                "semantic overlay matrix rows disagree with covered versions".to_string(),
+            ));
+        }
+        let total_vectors = matrix.rows().iter().try_fold(0_u64, |total, row| {
+            total
+                .checked_add(row.embedding().vector_count() as u64)
+                .ok_or_else(|| {
+                    ZeppelinError::Validation(
+                        "semantic overlay matrix vector count overflows u64".to_string(),
+                    )
+                })
+        })?;
+        if overlay.embeddings.total_vectors != total_vectors {
+            return Err(ZeppelinError::Validation(
+                "semantic overlay matrix total-vector metadata mismatch".to_string(),
+            ));
+        }
+
+        let fde_bytes = store.get(&overlay.fde_vectors.key).await?;
+        if u64::try_from(fde_bytes.len()).ok() != Some(overlay.fde_vectors.size_bytes) {
+            return Err(ZeppelinError::Serialization(
+                "semantic overlay FDE size mismatch".to_string(),
+            ));
+        }
+        let transform_bytes = store.get(&profile.fde.transform_artifact.key).await?;
+        if u64::try_from(transform_bytes.len()).ok()
+            != Some(profile.fde.transform_artifact.size_bytes)
+            || crate::embedding::ArtifactChecksum::digest(&transform_bytes)
+                != profile.fde.transform_artifact.checksum
+        {
+            return Err(ZeppelinError::Serialization(
+                "semantic overlay FDE transform metadata mismatch".to_string(),
+            ));
+        }
+        let transform = FdeTransform::from_bytes(&transform_bytes)?;
+        if transform.params() != profile.fde.params {
+            return Err(ZeppelinError::Validation(
+                "semantic overlay FDE transform recipe mismatch".to_string(),
+            ));
+        }
+        let fde = FdeArtifact::from_bytes(
+            &fde_bytes,
+            overlay.fde_vectors.checksum,
+            profile.fde.generation,
+            overlay.embeddings.checksum,
+            transform.output_dimension(),
+            overlay.covered_versions.records.len(),
+        )?;
+        if overlay.fde_vectors.row_count as usize != fde.rows().len()
+            || overlay.fde_vectors.generation != profile.fde.generation
+            || overlay.fde_vectors.embedding_fragment_checksum != overlay.embeddings.checksum
+        {
+            return Err(ZeppelinError::Validation(
+                "semantic overlay FDE metadata disagrees with artifact".to_string(),
+            ));
+        }
+        if fde
+            .rows()
+            .iter()
+            .zip(&overlay.covered_versions.records)
+            .any(|(row, version)| row.content_hash() != version.content_hash)
+        {
+            return Err(ZeppelinError::Validation(
+                "semantic overlay FDE rows disagree with covered versions".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_overlay_source(
+        overlay: &SemanticOverlayRef,
+        source_ref: &InputFragmentRef,
+        source: &EncoderInputWalFragment,
+        source_origin: &ArtifactOrigin,
+    ) -> Result<()> {
+        let expected_key =
+            EncoderInputWalFragment::s3_key(source_origin.namespace.as_str(), &source_ref.id);
+        if overlay.source_fragment
+            != (PhysicalInputFragmentIdentity {
+                key: expected_key,
+                id: source_ref.id,
+                checksum: source.checksum,
+                size_bytes: source_ref.size_bytes,
+                artifact_origin: overlay.source_fragment.artifact_origin,
+            })
+        {
+            return Err(ZeppelinError::Validation(
+                "semantic overlay source identity mismatch".to_string(),
+            ));
+        }
+        if overlay.semantic_epoch != overlay.embeddings.semantic_epoch
+            || overlay.fde_generation != overlay.fde_vectors.generation
+            || overlay.covered_versions.records.is_empty()
+            || overlay.embeddings.row_count as usize != overlay.covered_versions.records.len()
+            || overlay.fde_vectors.row_count as usize != overlay.covered_versions.records.len()
+        {
+            return Err(ZeppelinError::Validation(
+                "semantic overlay recipe or row-count mismatch".to_string(),
+            ));
+        }
+        let mut previous = None;
+        for covered in &overlay.covered_versions.records {
+            if previous.is_some_and(|ordinal| ordinal >= covered.row_ordinal) {
+                return Err(ZeppelinError::Validation(
+                    "semantic overlay coverage rows are not strictly increasing".to_string(),
+                ));
+            }
+            previous = Some(covered.row_ordinal);
+            let ordinal = usize::try_from(covered.row_ordinal).map_err(|_| {
+                ZeppelinError::Validation("semantic overlay row ordinal exceeds usize".to_string())
+            })?;
+            let record = source.upserts.get(ordinal).ok_or_else(|| {
+                ZeppelinError::Validation(
+                    "semantic overlay row ordinal is out of bounds".to_string(),
+                )
+            })?;
+            if covered
+                != &(RecordVersionRef {
+                    row_ordinal: covered.row_ordinal,
+                    record_id: record.id.clone(),
+                    content_hash: record.content_hash,
+                    sequence: source_ref.sequence_number,
+                })
+            {
+                return Err(ZeppelinError::Validation(
+                    "semantic overlay covered-version identity mismatch".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_input_fragment_checked(
+        store: &ZeppelinStore,
+        reference: &InputFragmentRef,
+        origin: &ArtifactOrigin,
+    ) -> Result<EncoderInputWalFragment> {
+        let key = EncoderInputWalFragment::s3_key(origin.namespace.as_str(), &reference.id);
+        let bytes = store.get(&key).await?;
+        if u64::try_from(bytes.len()).ok() != Some(reference.size_bytes) {
+            return Err(ZeppelinError::Serialization(format!(
+                "input fragment {} size mismatch",
+                reference.id
+            )));
+        }
+        let fragment = EncoderInputWalFragment::from_bytes(&bytes)?;
+        if fragment.id != reference.id
+            || fragment.upserts.len() != reference.upsert_count
+            || fragment.deletes.len() != reference.delete_count
+        {
+            return Err(ZeppelinError::Serialization(format!(
+                "input fragment {} metadata mismatch",
+                reference.id
+            )));
+        }
+        Ok(fragment)
+    }
+
+    async fn compute_semantic_coverage(
+        &self,
+        store: &ZeppelinStore,
+        section: &LateStateSection,
+        profile: &EmbeddingProfileRef,
+    ) -> Result<SemanticCoverageState> {
+        #[derive(Clone)]
+        struct LiveVersion {
+            source_key: String,
+            source_checksum: u64,
+            row_ordinal: u32,
+            content_hash: crate::embedding::ContentHash,
+            sequence: u64,
+            bytes: u64,
+        }
+
+        let mut refs = self.input_fragments.iter().collect::<Vec<_>>();
+        refs.sort_by_key(|reference| reference.sequence_number);
+        let mut live = BTreeMap::<String, LiveVersion>::new();
+        for reference in refs {
+            let origin = self.input_fragment_origin(reference)?;
+            let source = Self::read_input_fragment_checked(store, reference, &origin).await?;
+            let source_key =
+                EncoderInputWalFragment::s3_key(origin.namespace.as_str(), &reference.id);
+            for (ordinal, record) in source.upserts.iter().enumerate() {
+                live.insert(
+                    record.id.clone(),
+                    LiveVersion {
+                        source_key: source_key.clone(),
+                        source_checksum: source.checksum,
+                        row_ordinal: u32::try_from(ordinal).map_err(|_| {
+                            ZeppelinError::Validation(
+                                "input fragment row ordinal exceeds u32".to_string(),
+                            )
+                        })?,
+                        content_hash: record.content_hash,
+                        sequence: reference.sequence_number,
+                        bytes: record.input.referenced_content_bytes()?,
+                    },
+                );
+            }
+            for deleted in &source.deletes {
+                live.remove(deleted);
+            }
+        }
+
+        let covered = section
+            .semantic_overlays
+            .iter()
+            .flat_map(|overlay| {
+                overlay.covered_versions.records.iter().map(move |record| {
+                    (
+                        overlay.source_fragment.key.clone(),
+                        overlay.source_fragment.checksum,
+                        record.row_ordinal,
+                        record.record_id.clone(),
+                        record.content_hash,
+                        record.sequence,
+                        overlay.semantic_epoch,
+                        overlay.fde_generation,
+                    )
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let failed = section
+            .quarantine_evidence
+            .iter()
+            .flat_map(|evidence| {
+                evidence.failed_versions.records.iter().map(move |record| {
+                    (
+                        evidence.source_fragment.key.clone(),
+                        evidence.source_fragment.checksum,
+                        record.row_ordinal,
+                        record.record_id.clone(),
+                        record.content_hash,
+                        record.sequence,
+                        evidence.semantic_epoch,
+                        evidence.fde_generation,
+                    )
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let mut pending_record_count = 0_u64;
+        let mut pending_bytes = 0_u64;
+        let mut failed_record_count = 0_u64;
+        let mut first_hole = None;
+        for (record_id, version) in &live {
+            let key = (
+                version.source_key.clone(),
+                version.source_checksum,
+                version.row_ordinal,
+                record_id.clone(),
+                version.content_hash,
+                version.sequence,
+                profile.epoch.id,
+                profile.fde.generation,
+            );
+            if failed.contains(&key) {
+                failed_record_count = failed_record_count.checked_add(1).ok_or_else(|| {
+                    ZeppelinError::Validation(
+                        "semantic failed-record count overflows u64".to_string(),
+                    )
+                })?;
+                first_hole = Some(first_hole.map_or(version.sequence, |current: u64| {
+                    current.min(version.sequence)
+                }));
+            } else if !covered.contains(&key) {
+                pending_record_count = pending_record_count.checked_add(1).ok_or_else(|| {
+                    ZeppelinError::Validation(
+                        "semantic pending-record count overflows u64".to_string(),
+                    )
+                })?;
+                pending_bytes = pending_bytes.checked_add(version.bytes).ok_or_else(|| {
+                    ZeppelinError::Validation(
+                        "semantic pending-byte count overflows u64".to_string(),
+                    )
+                })?;
+                first_hole = Some(first_hole.map_or(version.sequence, |current: u64| {
+                    current.min(version.sequence)
+                }));
+            }
+        }
+        let contiguous_sequence = first_hole
+            .map(|sequence| sequence.saturating_sub(1))
+            .unwrap_or_else(|| self.next_sequence.saturating_sub(1));
+        Ok(SemanticCoverageState {
+            profile: profile.profile.clone(),
+            epoch: profile.epoch.id,
+            fde_generation: profile.fde.generation,
+            contiguous_sequence,
+            pending_record_count,
+            pending_bytes,
+            failed_record_count,
+            state: if failed_record_count > 0 {
+                SemanticState::Failed
+            } else if pending_record_count == 0 {
+                SemanticState::Ready
+            } else {
+                SemanticState::Pending
+            },
+        })
+    }
+
     /// CAS-publish one already-uploaded input fragment and optional new section.
     ///
     /// `new_late_state` is `None` for text-only input. When present it must name
@@ -1911,9 +2772,76 @@ impl Manifest {
             }
         }
 
+        let source_additions = if input_fragment.is_some() {
+            if let Some(reference) = new_late_state.as_ref() {
+                let current = self.load_late_state(store).await?.unwrap_or_default();
+                let mut desired_root = self.clone();
+                desired_root.late_state = Some(reference.clone());
+                let desired = desired_root.load_late_state(store).await?.ok_or_else(|| {
+                    ZeppelinError::Serialization(
+                        "input publication late-state reference did not resolve".to_string(),
+                    )
+                })?;
+                let current_keys = current
+                    .source_inventory
+                    .iter()
+                    .map(|source| source.key.as_str())
+                    .collect::<BTreeSet<_>>();
+                Some(
+                    desired
+                        .source_inventory
+                        .into_iter()
+                        .filter(|source| !current_keys.contains(source.key.as_str()))
+                        .map(|source| {
+                            if source.artifact_origin.is_some() {
+                                return Err(ZeppelinError::Validation(
+                                    "new input source inventory must be locally owned".to_string(),
+                                ));
+                            }
+                            Ok(source)
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut current_version = version.clone();
         for _ in 0..MAX_PUBLISH_ATTEMPTS {
-            if let Some(next_reference) = new_late_state.as_ref() {
+            let merged_reference = if let Some(additions) = source_additions.as_ref() {
+                let mut section = self.load_late_state(store).await?.unwrap_or_default();
+                if let Some(reference) = self.late_state.as_ref() {
+                    let previous_owner = self.late_section_origin(reference)?;
+                    let local_owner = self.local_origin()?;
+                    section.rebase_nested_artifact_origins(&previous_owner, &local_owner)?;
+                }
+                for addition in additions {
+                    if let Some(existing) = section
+                        .source_inventory
+                        .iter()
+                        .find(|source| source.key == addition.key)
+                    {
+                        if existing != addition {
+                            return Err(ZeppelinError::Serialization(format!(
+                                "source inventory identity collision at {}",
+                                addition.key
+                            )));
+                        }
+                    } else {
+                        section.source_inventory.push(addition.clone());
+                    }
+                }
+                section
+                    .source_inventory
+                    .sort_unstable_by(|left, right| left.key.cmp(&right.key));
+                section.canonicalize_artifact_origins()?;
+                Some(section.put_create(store, namespace).await?)
+            } else {
+                new_late_state.clone()
+            };
+            if let Some(next_reference) = merged_reference.as_ref() {
                 if let Some(previous) = self.late_state.replace(next_reference.clone()) {
                     if previous.key != next_reference.key {
                         let previous_origin = self.late_section_origin(&previous)?;
@@ -1950,6 +2878,14 @@ impl Manifest {
                     )));
                 }
                 self.add_input_fragment(fragment.clone());
+                if let Some(section) = self.load_late_state(store).await? {
+                    if let Some(profile) = section.active_profile.as_ref() {
+                        self.semantic_coverage = Some(
+                            self.compute_semantic_coverage(store, &section, profile)
+                                .await?,
+                        );
+                    }
+                }
             }
 
             match self
@@ -2390,21 +3326,6 @@ impl Manifest {
             Some(index) => self.indexed_artifact_origin("late-section", &reference.key, index),
             None => self.local_origin(),
         }
-    }
-
-    /// Resolve one section-resident source through the section-local origin table.
-    pub(crate) fn source_inventory_origin(
-        &self,
-        section: &LateStateSection,
-        source: &SourceInventoryRef,
-    ) -> Result<ArtifactOrigin> {
-        let reference = self.late_state.as_ref().ok_or_else(|| {
-            ZeppelinError::Serialization(
-                "source inventory resolution requires a late-state reference".to_string(),
-            )
-        })?;
-        let section_origin = self.late_section_origin(reference)?;
-        section.source_origin(source, &section_origin).cloned()
     }
 
     fn validate_origin_entry(&self, origin: &ArtifactOrigin, index: usize) -> Result<()> {
@@ -4595,7 +5516,14 @@ impl Manifest {
     }
 
     /// Append a typed-input fragment using an explicit manifest stamp.
+    ///
+    /// Typed input reserves sequence `0` as the empty semantic watermark. The
+    /// first typed fragment therefore receives sequence `1`; later dense or
+    /// typed fragments continue through the same shared counter.
     pub fn add_input_fragment_at(&mut self, mut fragment: InputFragmentRef, now: DateTime<Utc>) {
+        if self.next_sequence == 0 {
+            self.next_sequence = 1;
+        }
         fragment.sequence_number = self.next_sequence;
         self.next_sequence += 1;
         self.input_fragments.push(fragment);
@@ -4918,7 +5846,7 @@ impl Manifest {
         Ok(!self.has_foreign_visible_artifacts()?)
     }
 
-    /// Returns true when root refs and loaded section-resident sources are local.
+    /// Returns true when root refs and all loaded section-resident artifacts are local.
     ///
     /// A version-2 section must be supplied because its nested immutable source
     /// refs cannot be inferred from the root reference alone.
@@ -4946,8 +5874,9 @@ impl Manifest {
             return Ok(true);
         };
         let local = self.local_origin()?;
-        for source in &section.source_inventory {
-            if self.source_inventory_origin(section, source)? != local {
+        let section_origin = self.late_section_origin(reference)?;
+        for artifact in section.resolved_artifacts(&section_origin)? {
+            if artifact.origin != local {
                 return Ok(false);
             }
         }
@@ -7486,6 +8415,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::storage::ZeppelinStore;
+    use crate::wal::SourceInventoryRef;
 
     /// Builds a minimal legacy-layout segment descriptor for state-model tests.
     ///
@@ -7577,6 +8507,86 @@ mod tests {
             .unwrap();
         manifest.version = generation;
         manifest
+    }
+
+    fn embedding_profile_fixture(
+        namespace: &str,
+        name: &str,
+    ) -> crate::embedding::EmbeddingProfileRef {
+        let mut epoch = crate::embedding::MultiVectorEpoch {
+            id: crate::embedding::MultiVectorEpochId::new([0; 32]),
+            encoder: crate::embedding::EncoderExecutionRef {
+                implementation: "activation-worker".to_string(),
+                version: "v1".to_string(),
+                bundle_prefix: Some("models/activation-worker/v1".to_string()),
+                artifact_digests: BTreeMap::from([(
+                    "model".to_string(),
+                    crate::embedding::ArtifactChecksum::new([0x11; 32]),
+                )]),
+                supported_modalities: vec![crate::embedding::InputModality::Text],
+            },
+            preprocessing_digest: crate::embedding::ArtifactChecksum::new([0x12; 32]),
+            vector_dimension: 2,
+            max_query_vectors: 4,
+            max_document_vectors: 8,
+            output_normalization: crate::embedding::NormalizationRecipe::L2,
+            exact_scoring_transform: crate::embedding::VectorTransformRecipe::Identity,
+            matrix_dtype: crate::embedding::MatrixDtype::F16,
+            exact_scorer: crate::embedding::ExactScorerVersion::MaxSimV1,
+        };
+        epoch.id = epoch.canonical_id().unwrap();
+        let params = crate::index::late_interaction::FdeParams {
+            algorithm: crate::index::late_interaction::FdeAlgorithmVersion::PaperV1,
+            repetitions: 1,
+            simhash_bits: 1,
+            input_dimension: 2,
+            inner: crate::index::late_interaction::InnerProjection::Rademacher { d_proj: 1 },
+            final_projection: crate::index::late_interaction::FinalProjection::None,
+        };
+        let transform = crate::index::late_interaction::FdeTransform::generate(&params, 13)
+            .unwrap()
+            .to_bytes();
+        let transform_checksum = crate::embedding::ArtifactChecksum::digest(&transform);
+        let mean_checksum = crate::embedding::ArtifactChecksum::new([0x13; 32]);
+        let mut fde = crate::embedding::FdeRecipe {
+            generation: crate::embedding::FdeGenerationId::new([0; 32]),
+            semantic_epoch: epoch.id,
+            params,
+            transform_artifact: crate::embedding::FdeTransformArtifactRef {
+                key: LateStateSection::artifact_s3_key(
+                    namespace,
+                    crate::storage::NamespaceObjectFamily::FdeTransform,
+                    transform_checksum,
+                ),
+                checksum: transform_checksum,
+                size_bytes: transform.len() as u64,
+                format_version: 1,
+                artifact_origin: None,
+            },
+            candidate_vector_transform: crate::embedding::VectorTransformRecipe::SubtractMean {
+                mean: crate::embedding::MeanVectorRef {
+                    key: LateStateSection::artifact_s3_key(
+                        namespace,
+                        crate::storage::NamespaceObjectFamily::Centering,
+                        mean_checksum,
+                    ),
+                    checksum: mean_checksum,
+                    size_bytes: 18,
+                    vector_dimension: 2,
+                    format_version: 1,
+                    artifact_origin: None,
+                },
+                renormalize: false,
+            },
+            candidate_document_pooling: crate::embedding::CandidateDocumentPooling::Identity,
+        };
+        fde.generation = fde.canonical_generation().unwrap();
+        crate::embedding::EmbeddingProfileRef {
+            profile: crate::embedding::EmbeddingProfileId::new(name),
+            epoch,
+            fde,
+            int8_qualification: None,
+        }
     }
 
     /// Exact root-manifest wire shape committed immediately before Phase 4.
@@ -10801,6 +11811,28 @@ mod tests {
     }
 
     #[test]
+    fn typed_input_reserves_zero_as_the_empty_semantic_watermark() {
+        let mut manifest = Manifest::new();
+        manifest.add_input_fragment(InputFragmentRef {
+            id: Ulid::from(0x124_u128),
+            upsert_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 128,
+            referenced_content_bytes: 16,
+            modality_counts: ModalityCounts {
+                text: 1,
+                image: 0,
+                image_text: 0,
+            },
+            artifact_origin: None,
+        });
+
+        assert_eq!(manifest.input_fragments[0].sequence_number, 1);
+        assert_eq!(manifest.next_sequence, 2);
+    }
+
+    #[test]
     fn manifest_late_state_reference_round_trips_under_v5_binding() {
         let identity = origin("late-roundtrip", 0x991);
         let mut manifest = bound_manifest(&identity, 4);
@@ -10882,6 +11914,7 @@ mod tests {
                 artifact_origin: Some(ArtifactOriginIndex::new(0)),
             }],
             artifact_origins: vec![source],
+            ..LateStateSection::new()
         };
 
         assert!(manifest
@@ -10890,5 +11923,125 @@ mod tests {
         assert!(!manifest
             .visible_refs_are_local_with_late_state(Some(&section))
             .expect("nested source ownership must resolve"));
+    }
+
+    #[tokio::test]
+    async fn profile_activation_merges_authoritative_section_and_is_single_assignment() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let namespace = "profile-activation";
+        let incarnation = uuid::Uuid::from_u128(0x997);
+        let mut initial = Manifest::new();
+        initial.bind_namespace_incarnation(incarnation).unwrap();
+        initial.write(&store, namespace).await.unwrap();
+        let (mut stale, stale_version) = Manifest::read_versioned(&store, namespace)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let source = SourceInventoryRef {
+            key: SourceInventoryRef::s3_key(
+                namespace,
+                crate::embedding::ContentHash::new([0x21; 32]),
+            ),
+            checksum: crate::embedding::ArtifactChecksum::new([0x22; 32]),
+            size_bytes: 12,
+            media_type: "image/png".to_string(),
+            artifact_origin: None,
+        };
+        let (mut concurrent, concurrent_version) = Manifest::read_versioned(&store, namespace)
+            .await
+            .unwrap()
+            .unwrap();
+        concurrent
+            .publish_with_late_state(
+                &store,
+                namespace,
+                &concurrent_version,
+                &LateStateSection {
+                    source_inventory: vec![source.clone()],
+                    ..LateStateSection::new()
+                },
+            )
+            .await
+            .unwrap();
+
+        let profile = embedding_profile_fixture(namespace, "config-e");
+        let published = stale
+            .activate_embedding_profile(&store, namespace, &stale_version, &profile)
+            .await
+            .unwrap();
+        let section = stale.load_late_state(&store).await.unwrap().unwrap();
+        assert_eq!(section.source_inventory, vec![source]);
+        assert_eq!(section.active_profile.as_ref(), Some(&profile));
+
+        let generation = stale.version();
+        let retry = stale
+            .activate_embedding_profile(&store, namespace, &published, &profile)
+            .await
+            .unwrap();
+        assert_eq!(retry, published);
+        assert_eq!(stale.version(), generation);
+
+        let different = embedding_profile_fixture(namespace, "different-profile");
+        assert!(matches!(
+            stale
+                .activate_embedding_profile(&store, namespace, &published, &different)
+                .await,
+            Err(ZeppelinError::EmbeddingProfileAlreadyActive { .. })
+        ));
+    }
+
+    #[test]
+    fn profile_transform_and_mean_participate_in_locality_and_gc_reachability() {
+        let local = origin("profile-locality", 0x998);
+        let foreign = origin("profile-foreign", 0x999);
+        let profile = embedding_profile_fixture(local.namespace.as_str(), "config-e");
+        let transform_key = profile.fde.transform_artifact.key.clone();
+        let mean_key = profile
+            .fde
+            .candidate_vector_transform
+            .mean()
+            .unwrap()
+            .key
+            .clone();
+        let mut manifest = bound_manifest(&local, 1);
+        let mut section = LateStateSection {
+            active_profile: Some(profile),
+            ..LateStateSection::new()
+        };
+        let bytes = section.to_bytes().unwrap();
+        let checksum = LateStateSection::checksum(&bytes);
+        manifest.late_state = Some(ManifestSectionRef {
+            key: LateStateSection::s3_key(local.namespace.as_str(), &checksum),
+            checksum,
+            size_bytes: bytes.len() as u64,
+            format_version: LATE_STATE_FORMAT_VERSION,
+            artifact_origin: None,
+        });
+
+        let reachable = crate::compaction::gc::reachable_keys_with_late_state(
+            local.namespace.as_str(),
+            &manifest,
+            Some(&section),
+        )
+        .unwrap();
+        assert!(reachable.contains(&transform_key));
+        assert!(reachable.contains(&mean_key));
+        assert!(manifest
+            .visible_refs_are_local_with_late_state(Some(&section))
+            .unwrap());
+
+        section.artifact_origins = vec![foreign];
+        let profile = section.active_profile.as_mut().unwrap();
+        profile.fde.transform_artifact.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        profile
+            .fde
+            .candidate_vector_transform
+            .mean_mut()
+            .unwrap()
+            .artifact_origin = Some(ArtifactOriginIndex::new(0));
+        assert!(!manifest
+            .visible_refs_are_local_with_late_state(Some(&section))
+            .unwrap());
     }
 }

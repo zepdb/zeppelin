@@ -257,6 +257,27 @@ pub enum ZeppelinError {
         remaining_keys: usize,
     },
 
+    /// A late-interaction namespace already selected a different immutable profile.
+    #[error(
+        "embedding profile already active on namespace {namespace}: active={active_profile}, requested={requested_profile}"
+    )]
+    EmbeddingProfileAlreadyActive {
+        /// Namespace whose single-profile slot is already occupied.
+        namespace: String,
+        /// Currently selected operator-facing profile identity.
+        active_profile: String,
+        /// Different requested operator-facing profile identity.
+        requested_profile: String,
+    },
+
+    /// Encoder-worker configuration, protocol, or transport failure.
+    #[error("encoder worker error: {0}")]
+    EncoderWorker(String),
+
+    /// A late-interaction embedding artifact carried an invalid matrix dtype.
+    #[error(transparent)]
+    EmbeddingArtifact(#[from] crate::embedding::EmbeddingArtifactError),
+
     // Index errors
     /// A vector indexing operation failed.
     #[error("index error: {0}")]
@@ -355,6 +376,10 @@ pub enum ZeppelinError {
         /// Declared media type; image bytes are never retained here.
         media_type: String,
     },
+
+    /// The declared image bytes could not be decoded or did not match their declaration.
+    #[error("invalid image input")]
+    InvalidImageInput,
 
     /// Declared image dimensions exceed the configured bounds.
     #[error("image dimensions {width}x{height} exceed maximum {max_width}x{max_height}")]
@@ -569,6 +594,7 @@ impl ZeppelinError {
             | ZeppelinError::LeaseHeld { .. }
             | ZeppelinError::LeaseExpired { .. }
             | ZeppelinError::FencingTokenStale { .. }
+            | ZeppelinError::EmbeddingProfileAlreadyActive { .. }
             | ZeppelinError::HydrationDisabled => 409,
 
             ZeppelinError::DimensionMismatch { .. }
@@ -582,6 +608,7 @@ impl ZeppelinError {
             ZeppelinError::RetrievalUnitEmpty
             | ZeppelinError::UnsupportedInputModality { .. }
             | ZeppelinError::UnsupportedImageMediaType { .. }
+            | ZeppelinError::InvalidImageInput
             | ZeppelinError::ImageDimensionsExceeded { .. } => 400,
 
             ZeppelinError::NotImplemented { .. } => 501,
@@ -661,6 +688,11 @@ impl ZeppelinError {
             ZeppelinError::PointInTimeNotRetained { .. } => "POINT_IN_TIME_NOT_RETAINED",
             ZeppelinError::NamespaceDeleting { .. } => "NAMESPACE_DELETING",
             ZeppelinError::NamespaceDeleteIncomplete { .. } => "INTERNAL_ERROR",
+            ZeppelinError::EmbeddingProfileAlreadyActive { .. } => {
+                "EMBEDDING_PROFILE_ALREADY_ACTIVE"
+            }
+            ZeppelinError::EncoderWorker(_) => "INTERNAL_ERROR",
+            ZeppelinError::EmbeddingArtifact(_) => "DATA_CORRUPTION",
             ZeppelinError::Index(_) => "INTERNAL_ERROR",
             ZeppelinError::RetrievalScope(_) => "INTERNAL_ERROR",
             ZeppelinError::CoarseSketch(_) => "INTERNAL_ERROR",
@@ -677,6 +709,7 @@ impl ZeppelinError {
             ZeppelinError::RetrievalUnitEmpty => "RETRIEVAL_UNIT_EMPTY",
             ZeppelinError::UnsupportedInputModality { .. } => "UNSUPPORTED_INPUT_MODALITY",
             ZeppelinError::UnsupportedImageMediaType { .. } => "UNSUPPORTED_IMAGE_MEDIA_TYPE",
+            ZeppelinError::InvalidImageInput => "INVALID_IMAGE_INPUT",
             ZeppelinError::ImageDimensionsExceeded { .. } => "IMAGE_DIMENSIONS_EXCEEDED",
             ZeppelinError::NotImplemented { .. } => "NOT_IMPLEMENTED",
             ZeppelinError::Config(_) => "INTERNAL_ERROR",
@@ -856,6 +889,8 @@ impl ZeppelinError {
             | ZeppelinError::Io(_)
             | ZeppelinError::Cache(_)
             | ZeppelinError::FullTextSearch(_)
+            | ZeppelinError::EncoderWorker(_)
+            | ZeppelinError::EmbeddingArtifact(_)
             | ZeppelinError::NamespaceDeleteIncomplete { .. } => {
                 "an internal error occurred".to_string()
             }
@@ -892,6 +927,14 @@ impl ZeppelinError {
             ZeppelinError::NamespaceDeleting { namespace } => {
                 format!("namespace is being deleted: {namespace}")
             }
+            ZeppelinError::EmbeddingProfileAlreadyActive {
+                namespace,
+                active_profile,
+                requested_profile,
+            } => format!(
+                "namespace {namespace} already uses embedding profile {active_profile}; \
+                 changing to {requested_profile} requires epoch migration"
+            ),
             ZeppelinError::NamespaceAlreadyExists { .. }
             | ZeppelinError::SnapshotAlreadyExists { .. }
             | ZeppelinError::DimensionMismatch { .. }
@@ -902,6 +945,7 @@ impl ZeppelinError {
             | ZeppelinError::RetrievalUnitEmpty
             | ZeppelinError::UnsupportedInputModality { .. }
             | ZeppelinError::UnsupportedImageMediaType { .. }
+            | ZeppelinError::InvalidImageInput
             | ZeppelinError::ImageDimensionsExceeded { .. }
             | ZeppelinError::NotImplemented { .. }
             | ZeppelinError::HydrationDisabled

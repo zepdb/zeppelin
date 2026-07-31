@@ -1,11 +1,14 @@
 //! Durable typed inputs for late-interaction namespaces.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use ulid::Ulid;
 
 use crate::error::{Result, ZeppelinError};
+use crate::index::late_interaction::FdeParams;
+use crate::namespace::branching::ArtifactOriginIndex;
 use crate::types::{AttributeValue, VectorId};
 
 /// SHA-256 identity of one canonical typed encoder input.
@@ -56,10 +59,16 @@ impl ArtifactChecksum {
     pub fn digest(bytes: &[u8]) -> Self {
         Self(Sha256::digest(bytes).into())
     }
+
+    /// Render the digest as lowercase hexadecimal for content-addressed keys.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
 }
 
 /// Input modality accepted by a late-interaction namespace.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum InputModality {
     /// Inline UTF-8 text.
@@ -303,6 +312,18 @@ impl MultiVectorEpochId {
     pub const fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    /// Return the underlying digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Render the digest as lowercase hexadecimal.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
 }
 
 /// Stable identity of one fixed-dimensional encoding generation.
@@ -316,6 +337,684 @@ impl FdeGenerationId {
     pub const fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    /// Return the underlying digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Render the digest as lowercase hexadecimal.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+/// Immutable encoder implementation and artifact identity.
+///
+/// Artifact names are canonical map keys rather than an ordered list so
+/// registration order cannot change the semantic epoch ID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EncoderExecutionRef {
+    /// Stable adapter implementation name.
+    pub implementation: String,
+    /// Pinned adapter/runtime version.
+    pub version: String,
+    /// Canonical S3 prefix for this immutable production model bundle.
+    ///
+    /// The deterministic development encoder has no bundle. Every other
+    /// implementation must bind one non-empty, relative prefix into the epoch
+    /// identity so changing mutable process configuration cannot change model
+    /// bytes beneath an existing epoch.
+    #[serde(default)]
+    pub bundle_prefix: Option<String>,
+    /// SHA-256 of every model, tokenizer, processor, and adapter artifact.
+    pub artifact_digests: BTreeMap<String, ArtifactChecksum>,
+    /// Input modalities this exact immutable encoder bundle accepts.
+    pub supported_modalities: Vec<InputModality>,
+}
+
+/// Row normalization performed by the registered encoder.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizationRecipe {
+    /// Preserve finite encoder output without normalization.
+    Identity,
+    /// L2-normalize every retained row.
+    L2,
+}
+
+/// Persisted scalar representation for exact multi-vector matrices.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MatrixDtype {
+    /// IEEE-754 binary16 values. Artifact byte order is little-endian.
+    #[default]
+    F16,
+    /// Symmetric groupwise INT8 with folded row normalization.
+    Int8SymV1 {
+        /// Number of coordinates sharing one stored f16 scale.
+        group_size: u16,
+    },
+}
+
+impl MatrixDtype {
+    /// Validate the canonical `int8_sym_v1` shape contract.
+    pub fn validate_for_dimension(self, vector_dimension: u32) -> Result<()> {
+        match self {
+            Self::F16 => Ok(()),
+            Self::Int8SymV1 { group_size } => {
+                if !matches!(group_size, 16 | 32 | 128) {
+                    return Err(ZeppelinError::Validation(format!(
+                        "int8_sym_v1 group size must be one of 16, 32, or 128, got {group_size}"
+                    )));
+                }
+                if vector_dimension != 128 {
+                    return Err(ZeppelinError::Validation(format!(
+                        "int8_sym_v1 requires vector dimension 128, got {vector_dimension}"
+                    )));
+                }
+                if vector_dimension % u32::from(group_size) != 0 {
+                    return Err(ZeppelinError::Validation(format!(
+                        "int8_sym_v1 group size {group_size} does not divide vector dimension {vector_dimension}"
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Current profile-carried INT8 qualification evidence schema.
+pub const INT8_QUALIFICATION_STAMP_VERSION: u32 = 1;
+
+/// Operator-minted evidence binding one qualified INT8 profile epoch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Int8QualificationStamp {
+    /// Qualified semantic epoch.
+    pub semantic_epoch: MultiVectorEpochId,
+    /// Exact qualified matrix dtype and group size.
+    pub dtype: MatrixDtype,
+    /// Digest of the durable production-writer/decoder evidence.
+    pub evidence_digest: ArtifactChecksum,
+    /// Version of the qualification evidence schema.
+    pub evidence_version: u32,
+}
+
+impl Int8QualificationStamp {
+    fn validate_for(&self, epoch: &MultiVectorEpoch) -> Result<()> {
+        if self.evidence_version != INT8_QUALIFICATION_STAMP_VERSION {
+            return Err(ZeppelinError::Validation(format!(
+                "unsupported int8 qualification evidence version {}",
+                self.evidence_version
+            )));
+        }
+        if self
+            .evidence_digest
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        {
+            return Err(ZeppelinError::Validation(
+                "int8 qualification evidence digest must be non-zero".to_string(),
+            ));
+        }
+        if self.semantic_epoch != epoch.id || self.dtype != epoch.matrix_dtype {
+            return Err(ZeppelinError::Validation(
+                "int8 qualification stamp does not match the profile epoch and dtype".to_string(),
+            ));
+        }
+        if !matches!(self.dtype, MatrixDtype::Int8SymV1 { .. }) {
+            return Err(ZeppelinError::Validation(
+                "int8 qualification stamp must bind int8_sym_v1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Versioned exact set-similarity semantics.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExactScorerVersion {
+    /// Sum, over query rows, of the maximum document-row dot product.
+    MaxSimV1,
+}
+
+/// Immutable mean vector used by candidate-only centering.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeanVectorRef {
+    /// Exact namespace-owned content-addressed key.
+    pub key: String,
+    /// SHA-256 over the complete immutable mean bytes.
+    pub checksum: ArtifactChecksum,
+    /// Exact artifact size.
+    pub size_bytes: u64,
+    /// Number of f32 coordinates in the mean.
+    pub vector_dimension: u32,
+    /// Artifact format version.
+    pub format_version: u32,
+    /// Section-local physical-origin index, or the section owner when absent.
+    #[serde(default)]
+    pub artifact_origin: Option<ArtifactOriginIndex>,
+}
+
+/// Typed transform applied to each multi-vector row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorTransformRecipe {
+    /// Preserve the encoder-produced row.
+    Identity,
+    /// Subtract one frozen global mean, optionally normalizing afterward.
+    SubtractMean {
+        /// Immutable global mean.
+        mean: MeanVectorRef,
+        /// Whether to L2-normalize the centered row.
+        renormalize: bool,
+    },
+}
+
+impl VectorTransformRecipe {
+    /// Return the referenced mean artifact, if this transform uses one.
+    #[must_use]
+    pub const fn mean(&self) -> Option<&MeanVectorRef> {
+        match self {
+            Self::Identity => None,
+            Self::SubtractMean { mean, .. } => Some(mean),
+        }
+    }
+
+    pub(crate) fn mean_mut(&mut self) -> Option<&mut MeanVectorRef> {
+        match self {
+            Self::Identity => None,
+            Self::SubtractMean { mean, .. } => Some(mean),
+        }
+    }
+}
+
+/// Candidate-only document-row pooling selected by the measured FDE recipe.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CandidateDocumentPooling {
+    /// Preserve every candidate document row (the approved 1x recipe).
+    Identity,
+    /// Average each contiguous group without renormalizing the pooled row.
+    ContiguousMean {
+        /// Number of contiguous rows in each group.
+        factor: u8,
+    },
+}
+
+impl CandidateDocumentPooling {
+    /// Validate this recipe against the candidate pooling cells approved by the lab.
+    pub fn validate(self) -> Result<()> {
+        match self {
+            Self::Identity | Self::ContiguousMean { factor: 2 } => Ok(()),
+            Self::ContiguousMean { factor } => Err(ZeppelinError::Validation(format!(
+                "candidate document pooling supports only 1x identity or approved 2x contiguous mean, got factor {factor}"
+            ))),
+        }
+    }
+}
+
+/// One complete, immutable semantic embedding epoch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MultiVectorEpoch {
+    /// SHA-256 over the canonical recipe fields below.
+    pub id: MultiVectorEpochId,
+    /// Pinned encoder adapter and complete artifact digest set.
+    pub encoder: EncoderExecutionRef,
+    /// Digest of tokenizer/processor/row-selection preprocessing.
+    pub preprocessing_digest: ArtifactChecksum,
+    /// Number of coordinates in every retained row.
+    pub vector_dimension: u32,
+    /// Maximum query rows admitted from this encoder.
+    pub max_query_vectors: u32,
+    /// Maximum document rows admitted from this encoder.
+    pub max_document_vectors: u32,
+    /// Encoder output normalization.
+    pub output_normalization: NormalizationRecipe,
+    /// Exact-scoring row transform.
+    pub exact_scoring_transform: VectorTransformRecipe,
+    /// Exact persisted matrix scalar representation selected by the profile.
+    #[serde(default)]
+    pub matrix_dtype: MatrixDtype,
+    /// Versioned exact scorer.
+    pub exact_scorer: ExactScorerVersion,
+}
+
+impl MultiVectorEpoch {
+    /// Derive the canonical semantic epoch ID, excluding the stored ID itself.
+    pub fn canonical_id(&self) -> Result<MultiVectorEpochId> {
+        #[derive(Serialize)]
+        struct CanonicalEpoch<'a> {
+            encoder: CanonicalEncoder<'a>,
+            preprocessing_digest: ArtifactChecksum,
+            vector_dimension: u32,
+            max_query_vectors: u32,
+            max_document_vectors: u32,
+            output_normalization: NormalizationRecipe,
+            exact_scoring_transform: VectorTransformRecipe,
+            matrix_dtype: MatrixDtype,
+            exact_scorer: ExactScorerVersion,
+        }
+
+        #[derive(Serialize)]
+        struct CanonicalEncoder<'a> {
+            implementation: &'a str,
+            version: &'a str,
+            bundle_prefix: Option<&'a str>,
+            artifact_digests: &'a BTreeMap<String, ArtifactChecksum>,
+            supported_modalities: Vec<InputModality>,
+        }
+
+        let mut supported_modalities = self.encoder.supported_modalities.clone();
+        supported_modalities.sort_unstable();
+        supported_modalities.dedup();
+        let mut exact_scoring_transform = self.exact_scoring_transform.clone();
+        if let Some(mean) = exact_scoring_transform.mean_mut() {
+            mean.artifact_origin = None;
+        }
+        let canonical = CanonicalEpoch {
+            encoder: CanonicalEncoder {
+                implementation: &self.encoder.implementation,
+                version: &self.encoder.version,
+                bundle_prefix: self.encoder.bundle_prefix.as_deref(),
+                artifact_digests: &self.encoder.artifact_digests,
+                supported_modalities,
+            },
+            preprocessing_digest: self.preprocessing_digest,
+            vector_dimension: self.vector_dimension,
+            max_query_vectors: self.max_query_vectors,
+            max_document_vectors: self.max_document_vectors,
+            output_normalization: self.output_normalization,
+            exact_scoring_transform,
+            matrix_dtype: self.matrix_dtype,
+            exact_scorer: self.exact_scorer,
+        };
+        canonical_sha256(b"zeppelin-multi-vector-epoch-v1", &canonical).map(MultiVectorEpochId::new)
+    }
+
+    /// Validate the stored canonical ID and load-bearing shape invariants.
+    pub fn validate(&self) -> Result<()> {
+        if self.encoder.implementation.is_empty() || self.encoder.version.is_empty() {
+            return Err(ZeppelinError::Validation(
+                "embedding epoch encoder implementation and version must be non-empty".to_string(),
+            ));
+        }
+        match (
+            self.encoder.implementation.as_str(),
+            self.encoder.bundle_prefix.as_deref(),
+        ) {
+            ("deterministic_dev", None) => {}
+            ("deterministic_dev", Some(_)) => {
+                return Err(ZeppelinError::Validation(
+                    "deterministic development encoder must not bind an S3 bundle prefix"
+                        .to_string(),
+                ));
+            }
+            (_, Some(prefix)) => validate_bundle_prefix(prefix)?,
+            (_, None) => {
+                return Err(ZeppelinError::Validation(
+                    "pinned encoder epoch must bind an S3 bundle prefix".to_string(),
+                ));
+            }
+        }
+        if self.encoder.artifact_digests.is_empty() {
+            return Err(ZeppelinError::Validation(
+                "embedding epoch must bind at least one encoder artifact digest".to_string(),
+            ));
+        }
+        if self.encoder.supported_modalities.is_empty() {
+            return Err(ZeppelinError::Validation(
+                "embedding epoch must support at least one input modality".to_string(),
+            ));
+        }
+        if self.vector_dimension == 0
+            || self.max_query_vectors == 0
+            || self.max_document_vectors == 0
+        {
+            return Err(ZeppelinError::Validation(
+                "embedding epoch dimensions and vector-count limits must be positive".to_string(),
+            ));
+        }
+        if let Some(mean) = self.exact_scoring_transform.mean() {
+            validate_mean_shape(mean, self.vector_dimension)?;
+        }
+        self.matrix_dtype
+            .validate_for_dimension(self.vector_dimension)?;
+        if matches!(self.matrix_dtype, MatrixDtype::Int8SymV1 { .. })
+            && self.output_normalization != NormalizationRecipe::L2
+        {
+            return Err(ZeppelinError::Validation(
+                "int8_sym_v1 requires encoder L2-normalized rows".to_string(),
+            ));
+        }
+        let expected = self.canonical_id()?;
+        if self.id != expected {
+            return Err(ZeppelinError::Validation(format!(
+                "multi-vector epoch ID mismatch: expected {}, got {}",
+                expected.to_hex(),
+                self.id.to_hex()
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_bundle_prefix(prefix: &str) -> Result<()> {
+    if prefix.is_empty()
+        || prefix.starts_with('/')
+        || prefix.ends_with('/')
+        || prefix.contains('\\')
+        || prefix
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(ZeppelinError::Validation(
+            "encoder bundle prefix must be a canonical non-empty relative S3 prefix".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Immutable materialized FDE-transform descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdeTransformArtifactRef {
+    /// Exact namespace-owned content-addressed key.
+    pub key: String,
+    /// SHA-256 over the existing `ZFT1` bytes.
+    pub checksum: ArtifactChecksum,
+    /// Exact artifact size.
+    pub size_bytes: u64,
+    /// Existing `ZFT1` artifact format version.
+    pub format_version: u32,
+    /// Section-local physical-origin index, or the section owner when absent.
+    #[serde(default)]
+    pub artifact_origin: Option<ArtifactOriginIndex>,
+}
+
+/// One immutable fixed-dimensional generation recipe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdeRecipe {
+    /// SHA-256 over the canonical recipe fields below.
+    pub generation: FdeGenerationId,
+    /// Semantic epoch whose matrices this generation consumes.
+    pub semantic_epoch: MultiVectorEpochId,
+    /// Production FDE construction parameters.
+    pub params: FdeParams,
+    /// Existing materialized `ZFT1` transform artifact.
+    pub transform_artifact: FdeTransformArtifactRef,
+    /// Candidate-only row transform selected by the lab.
+    pub candidate_vector_transform: VectorTransformRecipe,
+    /// Candidate-only document-row pooling selected by the lab.
+    pub candidate_document_pooling: CandidateDocumentPooling,
+}
+
+impl FdeRecipe {
+    /// Derive the canonical generation ID, excluding the stored generation.
+    pub fn canonical_generation(&self) -> Result<FdeGenerationId> {
+        #[derive(Serialize)]
+        struct CanonicalRecipe {
+            semantic_epoch: MultiVectorEpochId,
+            params: FdeParams,
+            transform_artifact: FdeTransformArtifactRef,
+            candidate_vector_transform: VectorTransformRecipe,
+            candidate_document_pooling: CandidateDocumentPooling,
+        }
+
+        let mut transform_artifact = self.transform_artifact.clone();
+        transform_artifact.artifact_origin = None;
+        let mut candidate_vector_transform = self.candidate_vector_transform.clone();
+        if let Some(mean) = candidate_vector_transform.mean_mut() {
+            mean.artifact_origin = None;
+        }
+        canonical_sha256(
+            b"zeppelin-fde-generation-v1",
+            &CanonicalRecipe {
+                semantic_epoch: self.semantic_epoch,
+                params: self.params,
+                transform_artifact,
+                candidate_vector_transform,
+                candidate_document_pooling: self.candidate_document_pooling,
+            },
+        )
+        .map(FdeGenerationId::new)
+    }
+
+    /// Validate canonical identity and compatibility with one semantic epoch.
+    pub fn validate(&self, epoch: &MultiVectorEpoch) -> Result<()> {
+        if self.semantic_epoch != epoch.id {
+            return Err(ZeppelinError::Validation(
+                "FDE recipe semantic epoch does not match its profile epoch".to_string(),
+            ));
+        }
+        if self.params.input_dimension != epoch.vector_dimension {
+            return Err(ZeppelinError::DimensionMismatch {
+                expected: epoch.vector_dimension as usize,
+                actual: self.params.input_dimension as usize,
+            });
+        }
+        if self.transform_artifact.size_bytes == 0 || self.transform_artifact.format_version == 0 {
+            return Err(ZeppelinError::Validation(
+                "FDE transform artifact size and format version must be positive".to_string(),
+            ));
+        }
+        if let Some(mean) = self.candidate_vector_transform.mean() {
+            validate_mean_shape(mean, epoch.vector_dimension)?;
+        }
+        self.candidate_document_pooling.validate()?;
+        let expected = self.canonical_generation()?;
+        if self.generation != expected {
+            return Err(ZeppelinError::Validation(format!(
+                "FDE generation ID mismatch: expected {}, got {}",
+                expected.to_hex(),
+                self.generation.to_hex()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Manifest-section selection of one semantic epoch and FDE generation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingProfileRef {
+    /// Stable operator-facing registration identity.
+    pub profile: EmbeddingProfileId,
+    /// Complete semantic epoch recipe.
+    pub epoch: MultiVectorEpoch,
+    /// Complete FDE generation recipe.
+    pub fde: FdeRecipe,
+    /// Production-writer/decoder qualification required only for INT8.
+    #[serde(default)]
+    pub int8_qualification: Option<Int8QualificationStamp>,
+}
+
+impl EmbeddingProfileRef {
+    /// Validate recipe identities and matrix qualification.
+    pub fn validate(&self) -> Result<()> {
+        if self.profile.as_str().is_empty() {
+            return Err(ZeppelinError::Validation(
+                "embedding profile ID must be non-empty".to_string(),
+            ));
+        }
+        self.epoch.validate()?;
+        self.fde.validate(&self.epoch)?;
+        match (self.epoch.matrix_dtype, self.int8_qualification.as_ref()) {
+            (MatrixDtype::F16, None) => {}
+            (MatrixDtype::F16, Some(_)) => {
+                return Err(ZeppelinError::Validation(
+                    "f16 profiles must not carry an int8 qualification stamp".to_string(),
+                ))
+            }
+            (MatrixDtype::Int8SymV1 { .. }, None) => {
+                return Err(ZeppelinError::Validation(
+                    "int8_sym_v1 profile activation requires a qualification stamp".to_string(),
+                ))
+            }
+            (MatrixDtype::Int8SymV1 { .. }, Some(stamp)) => {
+                stamp.validate_for(&self.epoch)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate recipe identities and namespace modality compatibility.
+    pub fn validate_for_modalities(&self, accepted: &[InputModality]) -> Result<()> {
+        self.validate()?;
+        let supported = self
+            .epoch
+            .encoder
+            .supported_modalities
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if let Some(modality) = accepted
+            .iter()
+            .copied()
+            .find(|modality| !supported.contains(modality))
+        {
+            return Err(ZeppelinError::UnsupportedInputModality {
+                modality: modality.as_str(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Exact physical identity of one typed input-WAL fragment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhysicalInputFragmentIdentity {
+    /// Exact immutable input-WAL key.
+    pub key: String,
+    /// Input-fragment ULID.
+    pub id: Ulid,
+    /// Existing canonical input-fragment checksum.
+    pub checksum: u64,
+    /// Exact artifact size.
+    pub size_bytes: u64,
+    /// Section-local physical-origin index, or the section owner when absent.
+    #[serde(default)]
+    pub artifact_origin: Option<ArtifactOriginIndex>,
+}
+
+/// Immutable full-matrix fragment selected by one overlay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MultiVectorEmbeddingFragmentRef {
+    /// Exact namespace-owned matrix-fragment key.
+    pub key: String,
+    /// SHA-256 over the complete immutable artifact.
+    pub checksum: ArtifactChecksum,
+    /// Checksum of the input fragment from which this artifact was derived.
+    pub source_fragment_checksum: u64,
+    /// Semantic epoch used to encode every row.
+    pub semantic_epoch: MultiVectorEpochId,
+    /// Number of retrieval-unit rows.
+    pub row_count: u32,
+    /// Total multi-vector rows across retrieval units.
+    pub total_vectors: u64,
+    /// Coordinates per multi-vector row.
+    pub vector_dimension: u32,
+    /// Persisted matrix scalar representation copied from the artifact header.
+    pub dtype: MatrixDtype,
+    /// Artifact format version reserved for the coordinator codec.
+    pub format_version: u32,
+    /// Exact artifact size.
+    pub size_bytes: u64,
+    /// Section-local physical-origin index, or the section owner when absent.
+    #[serde(default)]
+    pub artifact_origin: Option<ArtifactOriginIndex>,
+}
+
+/// Immutable FDE fragment selected by one overlay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdeFragmentRef {
+    /// Exact namespace-owned FDE-fragment key.
+    pub key: String,
+    /// SHA-256 over the complete immutable artifact.
+    pub checksum: ArtifactChecksum,
+    /// Matrix-fragment checksum from which these vectors were derived.
+    pub embedding_fragment_checksum: ArtifactChecksum,
+    /// FDE generation used for every row.
+    pub generation: FdeGenerationId,
+    /// Number of retrieval-unit rows.
+    pub row_count: u32,
+    /// Coordinates per FDE vector.
+    pub fde_dimension: u32,
+    /// Artifact format version reserved for the coordinator codec.
+    pub format_version: u32,
+    /// Exact artifact size.
+    pub size_bytes: u64,
+    /// Section-local physical-origin index, or the section owner when absent.
+    #[serde(default)]
+    pub artifact_origin: Option<ArtifactOriginIndex>,
+}
+
+/// Exact source row/version identity covered by derived artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecordVersionRef {
+    /// Physical row ordinal inside the immutable input fragment.
+    pub row_ordinal: u32,
+    /// Caller record identity.
+    pub record_id: VectorId,
+    /// Canonical typed-content hash.
+    pub content_hash: ContentHash,
+    /// Namespace-local mutation sequence.
+    pub sequence: u64,
+}
+
+/// Exact immutable source versions covered by one overlay.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecordVersionCoverage {
+    /// Covered row/version identities in deterministic source-row order.
+    pub records: Vec<RecordVersionRef>,
+}
+
+/// One published matrix-plus-FDE derivation unit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SemanticOverlayRef {
+    /// Physical input fragment from which this overlay was derived.
+    pub source_fragment: PhysicalInputFragmentIdentity,
+    /// Semantic epoch used for full matrices.
+    pub semantic_epoch: MultiVectorEpochId,
+    /// FDE generation used for candidate vectors.
+    pub fde_generation: FdeGenerationId,
+    /// Full exact-scoring matrices.
+    pub embeddings: MultiVectorEmbeddingFragmentRef,
+    /// Fixed-dimensional candidate vectors.
+    pub fde_vectors: FdeFragmentRef,
+    /// Exact source versions satisfied by this overlay.
+    pub covered_versions: RecordVersionCoverage,
+    /// Root-manifest generation at which publication succeeded.
+    pub published_at_generation: u64,
+}
+
+fn validate_mean_shape(mean: &MeanVectorRef, expected_dimension: u32) -> Result<()> {
+    if mean.vector_dimension != expected_dimension {
+        return Err(ZeppelinError::DimensionMismatch {
+            expected: expected_dimension as usize,
+            actual: mean.vector_dimension as usize,
+        });
+    }
+    let payload_size = u64::from(expected_dimension) * 4;
+    if mean.format_version == 0 || mean.size_bytes <= payload_size {
+        return Err(ZeppelinError::Validation(
+            "centering mean must be one versioned little-endian f32 vector".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_sha256<T: Serialize>(domain: &[u8], value: &T) -> Result<[u8; 32]> {
+    let payload = rmp_serde::to_vec(value).map_err(|error| {
+        ZeppelinError::Serialization(format!("canonical recipe serialization failed: {error}"))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update([0]);
+    hasher.update(payload);
+    Ok(hasher.finalize().into())
 }
 
 /// Aggregate state of contiguous semantic coverage.
@@ -353,7 +1052,20 @@ pub struct SemanticCoverageState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactChecksum, EncoderInputRef, ImageObjectRef, TextContentRef};
+    use std::collections::BTreeMap;
+
+    use crate::index::late_interaction::{
+        FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection, InnerProjection,
+    };
+    use crate::namespace::branching::ArtifactOriginIndex;
+
+    use super::{
+        ArtifactChecksum, CandidateDocumentPooling, EmbeddingProfileId, EmbeddingProfileRef,
+        EncoderExecutionRef, EncoderInputRef, ExactScorerVersion, FdeRecipe,
+        FdeTransformArtifactRef, ImageObjectRef, InputModality, Int8QualificationStamp,
+        MatrixDtype, MeanVectorRef, MultiVectorEpoch, MultiVectorEpochId, NormalizationRecipe,
+        TextContentRef, VectorTransformRecipe, INT8_QUALIFICATION_STAMP_VERSION,
+    };
 
     fn image() -> ImageObjectRef {
         ImageObjectRef {
@@ -385,5 +1097,209 @@ mod tests {
             first.content_hash().unwrap(),
             image_text.content_hash().unwrap()
         );
+    }
+
+    fn config_e_epoch(artifact_digests: BTreeMap<String, ArtifactChecksum>) -> MultiVectorEpoch {
+        let mut epoch = MultiVectorEpoch {
+            id: MultiVectorEpochId::new([0; 32]),
+            encoder: EncoderExecutionRef {
+                implementation: "colpali-python-worker".to_string(),
+                version: "v1".to_string(),
+                bundle_prefix: Some("models/colpali/v1".to_string()),
+                artifact_digests,
+                supported_modalities: vec![
+                    InputModality::ImageText,
+                    InputModality::Text,
+                    InputModality::Image,
+                ],
+            },
+            preprocessing_digest: ArtifactChecksum::new([3; 32]),
+            vector_dimension: 128,
+            max_query_vectors: 64,
+            max_document_vectors: 1_024,
+            output_normalization: NormalizationRecipe::L2,
+            exact_scoring_transform: VectorTransformRecipe::Identity,
+            matrix_dtype: MatrixDtype::F16,
+            exact_scorer: ExactScorerVersion::MaxSimV1,
+        };
+        epoch.id = epoch
+            .canonical_id()
+            .expect("fixture epoch must canonicalize");
+        epoch
+    }
+
+    fn config_e_recipe(epoch: &MultiVectorEpoch) -> FdeRecipe {
+        let params = FdeParams {
+            algorithm: FdeAlgorithmVersion::PaperV1,
+            repetitions: 40,
+            simhash_bits: 4,
+            input_dimension: 128,
+            inner: InnerProjection::Rademacher { d_proj: 16 },
+            final_projection: FinalProjection::None,
+        };
+        let transform = FdeTransform::generate(&params, 7)
+            .expect("config E transform must generate")
+            .to_bytes();
+        let transform_checksum = ArtifactChecksum::digest(&transform);
+        let mut recipe = FdeRecipe {
+            generation: super::FdeGenerationId::new([0; 32]),
+            semantic_epoch: epoch.id,
+            params,
+            transform_artifact: FdeTransformArtifactRef {
+                key: format!("catalog/late/transforms/{}", transform_checksum.to_hex()),
+                checksum: transform_checksum,
+                size_bytes: transform.len() as u64,
+                format_version: 1,
+                artifact_origin: None,
+            },
+            candidate_vector_transform: VectorTransformRecipe::SubtractMean {
+                mean: MeanVectorRef {
+                    key: format!(
+                        "catalog/late/centering/{}",
+                        ArtifactChecksum::new([9; 32]).to_hex()
+                    ),
+                    checksum: ArtifactChecksum::new([9; 32]),
+                    size_bytes: 10 + 128 * 4,
+                    vector_dimension: 128,
+                    format_version: 1,
+                    artifact_origin: None,
+                },
+                renormalize: false,
+            },
+            candidate_document_pooling: CandidateDocumentPooling::Identity,
+        };
+        recipe.generation = recipe
+            .canonical_generation()
+            .expect("fixture recipe must canonicalize");
+        recipe
+    }
+
+    #[test]
+    fn canonical_epoch_and_generation_ids_are_order_and_origin_stable() {
+        let forward = BTreeMap::from([
+            ("model".to_string(), ArtifactChecksum::new([1; 32])),
+            ("processor".to_string(), ArtifactChecksum::new([2; 32])),
+        ]);
+        let reverse = [
+            ("processor".to_string(), ArtifactChecksum::new([2; 32])),
+            ("model".to_string(), ArtifactChecksum::new([1; 32])),
+        ]
+        .into_iter()
+        .collect();
+        let first = config_e_epoch(forward);
+        let mut reordered = config_e_epoch(reverse);
+        reordered.encoder.supported_modalities.reverse();
+        assert_eq!(
+            first.canonical_id().unwrap(),
+            reordered.canonical_id().unwrap()
+        );
+
+        let recipe = config_e_recipe(&first);
+        assert_eq!(
+            FdeTransform::generate(&recipe.params, 7)
+                .unwrap()
+                .output_dimension(),
+            10_240
+        );
+        let mut rebased = recipe.clone();
+        rebased.transform_artifact.artifact_origin = Some(ArtifactOriginIndex::new(2));
+        rebased
+            .candidate_vector_transform
+            .mean_mut()
+            .unwrap()
+            .artifact_origin = Some(ArtifactOriginIndex::new(1));
+        assert_eq!(
+            recipe.canonical_generation().unwrap(),
+            rebased.canonical_generation().unwrap()
+        );
+        recipe.validate(&first).unwrap();
+    }
+
+    #[test]
+    fn candidate_document_pooling_is_canonical_and_rejects_unapproved_factors() {
+        let epoch = config_e_epoch(BTreeMap::from([(
+            "model".to_string(),
+            ArtifactChecksum::new([1; 32]),
+        )]));
+        let identity = config_e_recipe(&epoch);
+        let mut pooled = identity.clone();
+        pooled.candidate_document_pooling = CandidateDocumentPooling::ContiguousMean { factor: 2 };
+        pooled.generation = pooled.canonical_generation().unwrap();
+
+        assert_ne!(identity.generation, pooled.generation);
+        pooled.validate(&epoch).unwrap();
+
+        let mut diagnostic_only = pooled;
+        diagnostic_only.candidate_document_pooling =
+            CandidateDocumentPooling::ContiguousMean { factor: 4 };
+        diagnostic_only.generation = diagnostic_only.canonical_generation().unwrap();
+        let error = diagnostic_only.validate(&epoch).unwrap_err();
+        assert!(error.to_string().contains("approved 2x contiguous mean"));
+    }
+
+    #[test]
+    fn bundle_prefix_is_canonical_epoch_identity() {
+        let artifacts = BTreeMap::from([("model".to_string(), ArtifactChecksum::new([1; 32]))]);
+        let first = config_e_epoch(artifacts.clone());
+        let mut second = config_e_epoch(artifacts);
+        second.encoder.bundle_prefix = Some("models/colpali/v2".to_string());
+        second.id = second.canonical_id().expect("second canonical epoch");
+        assert_ne!(first.id, second.id);
+
+        second.encoder.bundle_prefix = Some("../mutable".to_string());
+        second.id = second.canonical_id().expect("unsafe prefix still hashes");
+        assert!(second
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("canonical non-empty relative"));
+
+        let mut missing = first;
+        missing.encoder.bundle_prefix = None;
+        missing.id = missing.canonical_id().expect("missing prefix hashes");
+        assert!(missing
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must bind an S3 bundle prefix"));
+    }
+
+    #[test]
+    fn int8_profile_requires_a_matching_qualification_stamp() {
+        let mut epoch = config_e_epoch(BTreeMap::from([(
+            "model".to_string(),
+            ArtifactChecksum::new([1; 32]),
+        )]));
+        epoch.matrix_dtype = MatrixDtype::Int8SymV1 { group_size: 32 };
+        epoch.id = epoch.canonical_id().expect("int8 epoch canonicalizes");
+        let recipe = config_e_recipe(&epoch);
+        let mut profile = EmbeddingProfileRef {
+            profile: EmbeddingProfileId::new("int8-qualified"),
+            epoch: epoch.clone(),
+            fde: recipe,
+            int8_qualification: None,
+        };
+
+        let error = profile
+            .validate_for_modalities(&[InputModality::Text])
+            .expect_err("unstamped int8 profile");
+        assert!(error.to_string().contains("qualification stamp"));
+
+        profile.int8_qualification = Some(Int8QualificationStamp {
+            semantic_epoch: epoch.id,
+            dtype: epoch.matrix_dtype,
+            evidence_digest: ArtifactChecksum::digest(b"production-ranking-evidence"),
+            evidence_version: INT8_QUALIFICATION_STAMP_VERSION,
+        });
+        profile
+            .validate_for_modalities(&[InputModality::Text])
+            .expect("matching qualification stamp");
+
+        profile.int8_qualification.as_mut().unwrap().dtype =
+            MatrixDtype::Int8SymV1 { group_size: 16 };
+        let error = profile
+            .validate_for_modalities(&[InputModality::Text])
+            .expect_err("mismatched int8 stamp");
+        assert!(error.to_string().contains("does not match"));
     }
 }

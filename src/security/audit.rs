@@ -386,6 +386,17 @@ pub enum AuditParams {
         /// Complete settings after the patch.
         new: IndexConfigValues,
     },
+    /// A late namespace filled its immutable single-profile activation slot.
+    EmbeddingProfileActivation {
+        /// Namespace whose late-state section selected the profile.
+        namespace: NamespaceId,
+        /// Operator-facing profile identity.
+        profile: String,
+        /// Canonical semantic epoch SHA-256.
+        epoch: String,
+        /// Canonical FDE generation SHA-256.
+        fde_generation: String,
+    },
     /// Manual compaction was requested for a namespace.
     CompactionTrigger {
         /// Namespace offered to the compactor.

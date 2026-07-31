@@ -120,6 +120,7 @@ use crate::compaction::background::{
 };
 use crate::compaction::Compactor;
 use crate::config::{Config, CpuBudget, SecurityMode, StorageBackend};
+use crate::embedding::{ConfiguredEncoderProvider, MultiVectorEncoderProvider};
 use crate::error::{Result as ZeppelinResult, ZeppelinError};
 use crate::fts::wal_cache::WalFtsCache;
 use crate::namespace::{BranchReadinessObserver, NamespaceManager};
@@ -664,6 +665,8 @@ async fn build_app_with_entitlement_resolver(
         security.clone(),
         branch_readiness.clone(),
     );
+    let encoder_provider: Arc<dyn MultiVectorEncoderProvider> =
+        Arc::new(ConfiguredEncoderProvider::new(store.clone(), &config.mmli));
 
     // Spawn background compaction on a dedicated runtime (CPU isolation from queries)
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -675,10 +678,12 @@ async fn build_app_with_entitlement_resolver(
         lease_manager.clone(),
         cache.clone(),
         deletion_worker,
+        encoder_provider,
         compaction_lifecycle.clone(),
         CompactionThreadOptions {
             compaction_workers: cpu_budget.compaction_workers,
             gc_config: config.gc.clone(),
+            mmli: config.mmli.clone(),
         },
     );
 
