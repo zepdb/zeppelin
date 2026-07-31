@@ -418,7 +418,7 @@ impl Default for MmliSegmentConfig {
             kmeans_convergence_epsilon: 1e-4,
             max_matrix_object_bytes: 64 * 1024 * 1024,
             max_cluster_object_bytes: 8 * 1024 * 1024,
-            max_resident_bootstrap_bytes: 16 * 1024 * 1024,
+            max_resident_bootstrap_bytes: 128 * 1024 * 1024,
             read_gap_budget_bytes: 64 * 1024,
             read_max_request_bytes: 8 * 1024 * 1024,
             read_max_concurrency: 8,
@@ -1140,7 +1140,7 @@ mod tests {
         assert_eq!(defaults.segment.max_cluster_object_bytes, 8 * 1024 * 1024);
         assert_eq!(
             defaults.segment.max_resident_bootstrap_bytes,
-            16 * 1024 * 1024
+            128 * 1024 * 1024
         );
         assert_eq!(defaults.segment.read_gap_budget_bytes, 64 * 1024);
         assert_eq!(defaults.segment.read_max_request_bytes, 8 * 1024 * 1024);
@@ -3550,8 +3550,8 @@ impl Config {
         } else if self.mmli.segment.probe_budget > self.mmli.segment.nlist {
             violations.push("mmli.segment.probe_budget must not exceed nlist".to_string());
         }
-        if self.mmli.segment.candidate_k == 0 || self.mmli.segment.candidate_k > 700 {
-            violations.push("mmli.segment.candidate_k must be in 1..=700".to_string());
+        if self.mmli.segment.candidate_k == 0 || self.mmli.segment.candidate_k > 1500 {
+            violations.push("mmli.segment.candidate_k must be in 1..=1500".to_string());
         }
         if self.mmli.segment.kmeans_max_iterations == 0 {
             violations
