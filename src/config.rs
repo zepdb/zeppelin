@@ -114,6 +114,19 @@ const MMLI_MAX_RETRY_ATTEMPTS_ENV: &str = "ZEPPELIN_MMLI_MAX_RETRY_ATTEMPTS";
 const MMLI_SHUTDOWN_TIMEOUT_SECS_ENV: &str = "ZEPPELIN_MMLI_SHUTDOWN_TIMEOUT_SECS";
 const MMLI_SEMANTIC_WAIT_MS_ENV: &str = "ZEPPELIN_MMLI_SEMANTIC_WAIT_MS";
 const MMLI_MAX_OVERLAY_BYTES_PER_QUERY_ENV: &str = "ZEPPELIN_MMLI_MAX_OVERLAY_BYTES_PER_QUERY";
+const MMLI_SEGMENT_NLIST_ENV: &str = "ZEPPELIN_MMLI_SEGMENT_NLIST";
+const MMLI_SEGMENT_PROBE_BUDGET_ENV: &str = "ZEPPELIN_MMLI_SEGMENT_PROBE_BUDGET";
+const MMLI_SEGMENT_CANDIDATE_K_ENV: &str = "ZEPPELIN_MMLI_SEGMENT_CANDIDATE_K";
+const MMLI_SEGMENT_MAX_MATRIX_OBJECT_BYTES_ENV: &str =
+    "ZEPPELIN_MMLI_SEGMENT_MAX_MATRIX_OBJECT_BYTES";
+const MMLI_SEGMENT_MAX_CLUSTER_OBJECT_BYTES_ENV: &str =
+    "ZEPPELIN_MMLI_SEGMENT_MAX_CLUSTER_OBJECT_BYTES";
+const MMLI_SEGMENT_MAX_RESIDENT_BOOTSTRAP_BYTES_ENV: &str =
+    "ZEPPELIN_MMLI_SEGMENT_MAX_RESIDENT_BOOTSTRAP_BYTES";
+const MMLI_SEGMENT_READ_GAP_BUDGET_BYTES_ENV: &str = "ZEPPELIN_MMLI_SEGMENT_READ_GAP_BUDGET_BYTES";
+const MMLI_SEGMENT_READ_MAX_REQUEST_BYTES_ENV: &str =
+    "ZEPPELIN_MMLI_SEGMENT_READ_MAX_REQUEST_BYTES";
+const MMLI_SEGMENT_READ_MAX_CONCURRENCY_ENV: &str = "ZEPPELIN_MMLI_SEGMENT_READ_MAX_CONCURRENCY";
 /// Environment key for the pinned worker virtual environment.
 const MMLI_WORKER_VENV_DIR_ENV: &str = "ZEPPELIN_MMLI_WORKER_VENV_DIR";
 /// Environment key for the pinned worker Python executable.
@@ -267,12 +280,39 @@ pub struct MmliConfig {
     /// Maximum encoded overlay bytes read by one query. Default: `536_870_912`.
     #[serde(default = "default_mmli_max_overlay_bytes_per_query")]
     pub max_overlay_bytes_per_query: u64,
+    /// Persisted late-segment build and two-wave query bounds.
+    #[serde(default)]
+    pub segment: MmliSegmentConfig,
     /// Production worker execution paths and bounds.
     ///
     /// This stays absent for development-only deployments. Selecting a pinned
     /// profile without it fails when the provider resolves that profile.
     #[serde(default)]
     pub worker: Option<MmliWorkerConfig>,
+}
+
+/// Late-segment candidate-index, truth-block, and ranged-read settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MmliSegmentConfig {
+    /// Candidate IVF centroid count. Phase-2 routing point: `256`.
+    pub nlist: usize,
+    /// Candidate IVF clusters read per query. Phase-2 routing point: `16`.
+    pub probe_budget: usize,
+    /// Approximate rows retained before exact MaxSim. Text default: `537`.
+    pub candidate_k: usize,
+    /// Maximum complete record-major matrix-block object size.
+    pub max_matrix_object_bytes: usize,
+    /// Maximum complete wave-one cluster-shard object size.
+    pub max_cluster_object_bytes: usize,
+    /// Maximum resident centroid/bootstrap bytes admitted at activation.
+    pub max_resident_bootstrap_bytes: usize,
+    /// Maximum cumulative coalesced gap bytes per ranged request.
+    pub read_gap_budget_bytes: usize,
+    /// Maximum bytes in one physical ranged request.
+    pub read_max_request_bytes: usize,
+    /// Maximum physical ranged reads in flight per wave.
+    pub read_max_concurrency: usize,
 }
 
 /// Local execution and resource configuration for a pinned encoder worker.
@@ -361,6 +401,22 @@ const fn default_mmli_max_overlay_bytes_per_query() -> u64 {
     512 * 1024 * 1024
 }
 
+impl Default for MmliSegmentConfig {
+    fn default() -> Self {
+        Self {
+            nlist: 256,
+            probe_budget: 16,
+            candidate_k: 537,
+            max_matrix_object_bytes: 64 * 1024 * 1024,
+            max_cluster_object_bytes: 8 * 1024 * 1024,
+            max_resident_bootstrap_bytes: 16 * 1024 * 1024,
+            read_gap_budget_bytes: 64 * 1024,
+            read_max_request_bytes: 8 * 1024 * 1024,
+            read_max_concurrency: 8,
+        }
+    }
+}
+
 impl Default for MmliConfig {
     fn default() -> Self {
         Self {
@@ -372,6 +428,7 @@ impl Default for MmliConfig {
             shutdown_timeout_secs: default_mmli_shutdown_timeout_secs(),
             semantic_wait_ms: default_mmli_semantic_wait_ms(),
             max_overlay_bytes_per_query: default_mmli_max_overlay_bytes_per_query(),
+            segment: MmliSegmentConfig::default(),
             worker: None,
         }
     }
@@ -799,6 +856,15 @@ mod tests {
                 MMLI_SHUTDOWN_TIMEOUT_SECS_ENV,
                 MMLI_SEMANTIC_WAIT_MS_ENV,
                 MMLI_MAX_OVERLAY_BYTES_PER_QUERY_ENV,
+                MMLI_SEGMENT_NLIST_ENV,
+                MMLI_SEGMENT_PROBE_BUDGET_ENV,
+                MMLI_SEGMENT_CANDIDATE_K_ENV,
+                MMLI_SEGMENT_MAX_MATRIX_OBJECT_BYTES_ENV,
+                MMLI_SEGMENT_MAX_CLUSTER_OBJECT_BYTES_ENV,
+                MMLI_SEGMENT_MAX_RESIDENT_BOOTSTRAP_BYTES_ENV,
+                MMLI_SEGMENT_READ_GAP_BUDGET_BYTES_ENV,
+                MMLI_SEGMENT_READ_MAX_REQUEST_BYTES_ENV,
+                MMLI_SEGMENT_READ_MAX_CONCURRENCY_ENV,
                 MMLI_WORKER_VENV_DIR_ENV,
                 MMLI_WORKER_PYTHON_BINARY_ENV,
                 MMLI_WORKER_SCRIPT_ENV,
@@ -1054,6 +1120,18 @@ mod tests {
         assert_eq!(defaults.shutdown_timeout_secs, 30);
         assert_eq!(defaults.semantic_wait_ms, 5_000);
         assert_eq!(defaults.max_overlay_bytes_per_query, 512 * 1024 * 1024);
+        assert_eq!(defaults.segment.nlist, 256);
+        assert_eq!(defaults.segment.probe_budget, 16);
+        assert_eq!(defaults.segment.candidate_k, 537);
+        assert_eq!(defaults.segment.max_matrix_object_bytes, 64 * 1024 * 1024);
+        assert_eq!(defaults.segment.max_cluster_object_bytes, 8 * 1024 * 1024);
+        assert_eq!(
+            defaults.segment.max_resident_bootstrap_bytes,
+            16 * 1024 * 1024
+        );
+        assert_eq!(defaults.segment.read_gap_budget_bytes, 64 * 1024);
+        assert_eq!(defaults.segment.read_max_request_bytes, 8 * 1024 * 1024);
+        assert_eq!(defaults.segment.read_max_concurrency, 8);
         assert!(defaults.worker.is_none());
 
         let source = r#"
@@ -1066,6 +1144,17 @@ mod tests {
             shutdown_timeout_secs = 5
             semantic_wait_ms = 6
             max_overlay_bytes_per_query = 2048
+
+            [mmli.segment]
+            nlist = 32
+            probe_budget = 7
+            candidate_k = 91
+            max_matrix_object_bytes = 4096
+            max_cluster_object_bytes = 1024
+            max_resident_bootstrap_bytes = 8192
+            read_gap_budget_bytes = 64
+            read_max_request_bytes = 1024
+            read_max_concurrency = 3
         "#;
         let configured = load_toml(source).unwrap().mmli;
         assert!(!configured.allow_dev_encoder);
@@ -1076,6 +1165,15 @@ mod tests {
         assert_eq!(configured.shutdown_timeout_secs, 5);
         assert_eq!(configured.semantic_wait_ms, 6);
         assert_eq!(configured.max_overlay_bytes_per_query, 2048);
+        assert_eq!(configured.segment.nlist, 32);
+        assert_eq!(configured.segment.probe_budget, 7);
+        assert_eq!(configured.segment.candidate_k, 91);
+        assert_eq!(configured.segment.max_matrix_object_bytes, 4096);
+        assert_eq!(configured.segment.max_cluster_object_bytes, 1024);
+        assert_eq!(configured.segment.max_resident_bootstrap_bytes, 8192);
+        assert_eq!(configured.segment.read_gap_budget_bytes, 64);
+        assert_eq!(configured.segment.read_max_request_bytes, 1024);
+        assert_eq!(configured.segment.read_max_concurrency, 3);
 
         std::env::set_var(MMLI_ALLOW_DEV_ENCODER_ENV, "true");
         std::env::set_var(MMLI_ENRICHMENT_QUEUE_CAPACITY_ENV, "17");
@@ -1161,6 +1259,15 @@ mod tests {
         config.mmli.shutdown_timeout_secs = 0;
         config.mmli.semantic_wait_ms = 0;
         config.mmli.max_overlay_bytes_per_query = 0;
+        config.mmli.segment.nlist = 0;
+        config.mmli.segment.probe_budget = 0;
+        config.mmli.segment.candidate_k = 0;
+        config.mmli.segment.max_matrix_object_bytes = 0;
+        config.mmli.segment.max_cluster_object_bytes = 0;
+        config.mmli.segment.max_resident_bootstrap_bytes = 0;
+        config.mmli.segment.read_gap_budget_bytes = 0;
+        config.mmli.segment.read_max_request_bytes = 0;
+        config.mmli.segment.read_max_concurrency = 0;
 
         let error = config.validate().unwrap_err().to_string();
         for field in [
@@ -1171,6 +1278,15 @@ mod tests {
             "mmli.shutdown_timeout_secs",
             "mmli.semantic_wait_ms",
             "mmli.max_overlay_bytes_per_query",
+            "mmli.segment.nlist",
+            "mmli.segment.probe_budget",
+            "mmli.segment.candidate_k",
+            "mmli.segment.max_matrix_object_bytes",
+            "mmli.segment.max_cluster_object_bytes",
+            "mmli.segment.max_resident_bootstrap_bytes",
+            "mmli.segment.read_gap_budget_bytes",
+            "mmli.segment.read_max_request_bytes",
+            "mmli.segment.read_max_concurrency",
         ] {
             assert!(
                 error.contains(field),
@@ -3401,6 +3517,59 @@ impl Config {
             violations
                 .push("mmli.max_overlay_bytes_per_query must be greater than zero".to_string());
         }
+        if self.mmli.segment.nlist == 0 {
+            violations.push("mmli.segment.nlist must be greater than zero".to_string());
+        }
+        if self.mmli.segment.probe_budget == 0 {
+            violations.push("mmli.segment.probe_budget must be greater than zero".to_string());
+        } else if self.mmli.segment.probe_budget > self.mmli.segment.nlist {
+            violations.push("mmli.segment.probe_budget must not exceed nlist".to_string());
+        }
+        if self.mmli.segment.candidate_k == 0 || self.mmli.segment.candidate_k > 700 {
+            violations.push("mmli.segment.candidate_k must be in 1..=700".to_string());
+        }
+        for (field, value) in [
+            (
+                "max_matrix_object_bytes",
+                self.mmli.segment.max_matrix_object_bytes,
+            ),
+            (
+                "max_cluster_object_bytes",
+                self.mmli.segment.max_cluster_object_bytes,
+            ),
+            (
+                "max_resident_bootstrap_bytes",
+                self.mmli.segment.max_resident_bootstrap_bytes,
+            ),
+            (
+                "read_gap_budget_bytes",
+                self.mmli.segment.read_gap_budget_bytes,
+            ),
+            (
+                "read_max_request_bytes",
+                self.mmli.segment.read_max_request_bytes,
+            ),
+            (
+                "read_max_concurrency",
+                self.mmli.segment.read_max_concurrency,
+            ),
+        ] {
+            if value == 0 {
+                violations.push(format!("mmli.segment.{field} must be greater than zero"));
+            }
+        }
+        if self.mmli.segment.read_gap_budget_bytes >= self.mmli.segment.read_max_request_bytes {
+            violations.push(
+                "mmli.segment.read_gap_budget_bytes must be less than read_max_request_bytes"
+                    .to_string(),
+            );
+        }
+        if self.mmli.segment.max_cluster_object_bytes > self.mmli.segment.read_max_request_bytes {
+            violations.push(
+                "mmli.segment.max_cluster_object_bytes must not exceed read_max_request_bytes"
+                    .to_string(),
+            );
+        }
         if let Some(worker) = &self.mmli.worker {
             for (field, path) in [
                 ("venv_dir", &worker.venv_dir),
@@ -4022,6 +4191,33 @@ impl Config {
         }
         if let Some(v) = env_override(MMLI_MAX_OVERLAY_BYTES_PER_QUERY_ENV)? {
             self.mmli.max_overlay_bytes_per_query = v;
+        }
+        if let Some(v) = env_override(MMLI_SEGMENT_NLIST_ENV)? {
+            self.mmli.segment.nlist = v;
+        }
+        if let Some(v) = env_override(MMLI_SEGMENT_PROBE_BUDGET_ENV)? {
+            self.mmli.segment.probe_budget = v;
+        }
+        if let Some(v) = env_override(MMLI_SEGMENT_CANDIDATE_K_ENV)? {
+            self.mmli.segment.candidate_k = v;
+        }
+        if let Some(v) = env_override(MMLI_SEGMENT_MAX_MATRIX_OBJECT_BYTES_ENV)? {
+            self.mmli.segment.max_matrix_object_bytes = v;
+        }
+        if let Some(v) = env_override(MMLI_SEGMENT_MAX_CLUSTER_OBJECT_BYTES_ENV)? {
+            self.mmli.segment.max_cluster_object_bytes = v;
+        }
+        if let Some(v) = env_override(MMLI_SEGMENT_MAX_RESIDENT_BOOTSTRAP_BYTES_ENV)? {
+            self.mmli.segment.max_resident_bootstrap_bytes = v;
+        }
+        if let Some(v) = env_override(MMLI_SEGMENT_READ_GAP_BUDGET_BYTES_ENV)? {
+            self.mmli.segment.read_gap_budget_bytes = v;
+        }
+        if let Some(v) = env_override(MMLI_SEGMENT_READ_MAX_REQUEST_BYTES_ENV)? {
+            self.mmli.segment.read_max_request_bytes = v;
+        }
+        if let Some(v) = env_override(MMLI_SEGMENT_READ_MAX_CONCURRENCY_ENV)? {
+            self.mmli.segment.read_max_concurrency = v;
         }
         let worker_venv_dir = env_override::<PathBuf>(MMLI_WORKER_VENV_DIR_ENV)?;
         let worker_python_binary = env_override::<PathBuf>(MMLI_WORKER_PYTHON_BINARY_ENV)?;

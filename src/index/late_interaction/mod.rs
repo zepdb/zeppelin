@@ -4,12 +4,20 @@
 //! MUVERA fixed-dimensional encodings, provides the scalar MaxSim truth scorer,
 //! and owns exhaustive exact search over one immutable root-plus-section pair.
 
+mod attribute_artifact;
+mod candidate;
 mod fde;
 mod matrix;
 mod matrix_artifact;
 mod maxsim;
 mod search;
+mod segment_build;
 
+pub use attribute_artifact::AttributeBlockRef;
+pub use candidate::{
+    LateCandidateBootstrapRef, LateCandidateClusterRef, LateCandidateIndexRef, LateCandidateRecipe,
+    LateRoutingMetric,
+};
 pub use fde::{FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection, InnerProjection};
 pub use matrix::MultiVectorMatrixRef;
 pub use matrix_artifact::{MatrixBlockLocator, MatrixBlockRef};

@@ -2,8 +2,8 @@
 //!
 //! The root manifest remains the only visibility point. A section object may
 //! exist before publication, but readers discover it only through
-//! [`ManifestSectionRef`]. Version 3 adds active profile and semantic-overlay
-//! state while retaining version-1 and version-2 decoders.
+//! [`ManifestSectionRef`]. Version 4 adds immutable late-interaction segment
+//! state while retaining version-1 through version-3 decoders.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,11 +12,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::embedding::{
-    ArtifactChecksum, CenteringArtifact, ContentHash, EmbeddingProfileRef, FdeGenerationId,
-    MultiVectorEpochId, PhysicalInputFragmentIdentity, RecordVersionCoverage, SemanticOverlayRef,
+    ArtifactChecksum, CenteringArtifact, ContentHash, EmbeddingProfileId, EmbeddingProfileRef,
+    FdeGenerationId, MatrixDtype, MultiVectorEpochId, PhysicalInputFragmentIdentity,
+    RecordVersionCoverage, SemanticOverlayRef,
 };
 use crate::error::{Result, ZeppelinError};
-use crate::index::late_interaction::FdeTransform;
+use crate::index::late_interaction::{
+    AttributeBlockRef, FdeTransform, LateCandidateIndexRef, MatrixBlockRef,
+};
 use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
 use crate::storage::{CreateOnlyOutcome, NamespaceObjectFamily, NamespaceObjectKey, ZeppelinStore};
 
@@ -24,14 +27,15 @@ const LATE_STATE_MAGIC: &[u8; 4] = b"ZLS1";
 const LATE_STATE_VERSION_V1: u8 = 1;
 const LATE_STATE_VERSION_V2: u8 = 2;
 const LATE_STATE_VERSION_V3: u8 = 3;
+const LATE_STATE_VERSION_V4: u8 = 4;
 
 /// Persisted section format version carried by root-manifest references.
-pub const LATE_STATE_FORMAT_VERSION: u32 = 3;
+pub const LATE_STATE_FORMAT_VERSION: u32 = 4;
 
 /// Whether a root reference names a section version this binary can decode.
 #[must_use]
 pub const fn is_supported_late_state_format_version(version: u32) -> bool {
-    version == 1 || version == 2 || version == LATE_STATE_FORMAT_VERSION
+    version == 1 || version == 2 || version == 3 || version == LATE_STATE_FORMAT_VERSION
 }
 
 /// Root-manifest reference to one immutable late-state section object.
@@ -90,6 +94,57 @@ pub struct QuarantineEvidenceRef {
     pub artifact_origin: Option<ArtifactOriginIndex>,
 }
 
+/// One immutable attribute or full-text sidecar owned by a late segment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LateSegmentObjectRef {
+    /// Exact immutable object key.
+    pub key: String,
+    /// SHA-256 over the complete object.
+    pub checksum: ArtifactChecksum,
+    /// Complete object size.
+    pub size_bytes: u64,
+    /// Persisted codec version.
+    pub format_version: u32,
+}
+
+/// Manifest-visible descriptor for one immutable late-interaction segment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LateInteractionSegmentRef {
+    /// Stable immutable segment identity.
+    pub id: String,
+    /// Semantic profile represented by every row.
+    pub profile: EmbeddingProfileId,
+    /// Exact-scoring semantic epoch represented by every matrix.
+    pub semantic_epoch: MultiVectorEpochId,
+    /// Fixed-dimensional encoding generation used by the candidate index.
+    pub fde_generation: FdeGenerationId,
+    /// Epoch-uniform exact-matrix scalar representation.
+    pub matrix_dtype: MatrixDtype,
+    /// Number of live retrieval-unit rows in the segment.
+    pub record_count: u64,
+    /// Total exact vectors across all retrieval-unit rows.
+    pub total_vector_count: u64,
+    /// Coordinates per exact vector.
+    pub vector_dimension: u32,
+    /// Coordinates per fixed-dimensional candidate vector.
+    pub fde_dimension: u32,
+    /// Highest source mutation sequence proven into this full rebuild.
+    pub coverage_sequence: u64,
+    /// Immutable candidate bootstrap and cluster objects.
+    pub candidate_index: LateCandidateIndexRef,
+    /// Bounded record-major exact-matrix objects.
+    pub matrix_objects: Vec<MatrixBlockRef>,
+    /// Exact attribute sidecars used by wave-two result construction.
+    pub attribute_objects: Vec<AttributeBlockRef>,
+    /// Immutable full-text sidecars for the same retrieval-unit rows.
+    pub fts_objects: Vec<LateSegmentObjectRef>,
+    /// Section-local physical owner shared by every segment artifact.
+    #[serde(default)]
+    pub artifact_origin: Option<ArtifactOriginIndex>,
+}
+
 impl SourceInventoryRef {
     /// Build the checksum-addressed local source key.
     #[must_use]
@@ -119,7 +174,25 @@ struct NestedArtifactRef<'a> {
     content_checksum: Option<ArtifactChecksum>,
 }
 
-/// Version-3 late-interaction manifest state.
+fn insert_unique_segment_key<'a>(
+    keys: &mut BTreeSet<&'a str>,
+    key: &'a str,
+    kind: &str,
+) -> Result<()> {
+    if key.is_empty() {
+        return Err(ZeppelinError::Serialization(format!(
+            "late segment {kind} key must be non-empty"
+        )));
+    }
+    if !keys.insert(key) {
+        return Err(ZeppelinError::Serialization(format!(
+            "late-state segments contain duplicate artifact key {key}"
+        )));
+    }
+    Ok(())
+}
+
+/// Version-4 late-interaction manifest state.
 ///
 /// The origin table is section-local so its indices remain stable inside the
 /// immutable content-addressed bytes even when the root manifest later
@@ -141,10 +214,16 @@ pub struct LateStateSection {
     /// Deterministic failures that block the contiguous semantic watermark.
     #[serde(default)]
     pub quarantine_evidence: Vec<QuarantineEvidenceRef>,
+    /// Immutable late-interaction segments reachable through this section.
+    #[serde(default)]
+    pub late_interaction_segments: Vec<LateInteractionSegmentRef>,
+    /// Segment selected as the single-profile query baseline.
+    #[serde(default)]
+    pub active_late_segment: Option<String>,
 }
 
 impl LateStateSection {
-    /// Construct an empty version-3 section.
+    /// Construct an empty version-4 section.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -153,10 +232,12 @@ impl LateStateSection {
             active_profile: None,
             semantic_overlays: Vec::new(),
             quarantine_evidence: Vec::new(),
+            late_interaction_segments: Vec::new(),
+            active_late_segment: None,
         }
     }
 
-    /// Serialize canonical version-3 bytes.
+    /// Serialize canonical version-4 bytes.
     pub fn to_bytes(&self) -> Result<Bytes> {
         self.validate_structural()?;
         let payload = rmp_serde::to_vec(self).map_err(|error| {
@@ -166,12 +247,12 @@ impl LateStateSection {
         })?;
         let mut bytes = Vec::with_capacity(LATE_STATE_MAGIC.len() + 1 + payload.len());
         bytes.extend_from_slice(LATE_STATE_MAGIC);
-        bytes.push(LATE_STATE_VERSION_V3);
+        bytes.push(LATE_STATE_VERSION_V4);
         bytes.extend_from_slice(&payload);
         Ok(Bytes::from(bytes))
     }
 
-    /// Decode and validate version 1, version 2, or version 3 section bytes.
+    /// Decode and validate version 1 through version 4 section bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < LATE_STATE_MAGIC.len() + 1 {
             return Err(ZeppelinError::Serialization(
@@ -187,6 +268,7 @@ impl LateStateSection {
         if version != LATE_STATE_VERSION_V1
             && version != LATE_STATE_VERSION_V2
             && version != LATE_STATE_VERSION_V3
+            && version != LATE_STATE_VERSION_V4
         {
             return Err(ZeppelinError::Serialization(format!(
                 "unsupported late-state section version {version}"
@@ -298,6 +380,51 @@ impl LateStateSection {
                 content_checksum: Some(overlay.fde_vectors.checksum),
             })?;
         }
+        for segment in &self.late_interaction_segments {
+            visitor(NestedArtifactRef {
+                kind: "late candidate bootstrap",
+                key: &segment.candidate_index.bootstrap.key,
+                family: NamespaceObjectFamily::LateSegment,
+                artifact_origin: segment.artifact_origin,
+                content_checksum: Some(segment.candidate_index.bootstrap.checksum),
+            })?;
+            for cluster in &segment.candidate_index.clusters {
+                visitor(NestedArtifactRef {
+                    kind: "late candidate cluster",
+                    key: &cluster.key,
+                    family: NamespaceObjectFamily::LateSegment,
+                    artifact_origin: segment.artifact_origin,
+                    content_checksum: Some(cluster.checksum),
+                })?;
+            }
+            for matrix in &segment.matrix_objects {
+                visitor(NestedArtifactRef {
+                    kind: "late matrix block",
+                    key: &matrix.key,
+                    family: NamespaceObjectFamily::LateSegment,
+                    artifact_origin: segment.artifact_origin,
+                    content_checksum: Some(matrix.checksum),
+                })?;
+            }
+            for attributes in &segment.attribute_objects {
+                visitor(NestedArtifactRef {
+                    kind: "late attribute object",
+                    key: &attributes.key,
+                    family: NamespaceObjectFamily::LateSegment,
+                    artifact_origin: segment.artifact_origin,
+                    content_checksum: Some(attributes.checksum),
+                })?;
+            }
+            for fts in &segment.fts_objects {
+                visitor(NestedArtifactRef {
+                    kind: "late FTS object",
+                    key: &fts.key,
+                    family: NamespaceObjectFamily::LateSegment,
+                    artifact_origin: segment.artifact_origin,
+                    content_checksum: Some(fts.checksum),
+                })?;
+            }
+        }
         for evidence in &self.quarantine_evidence {
             visitor(NestedArtifactRef {
                 kind: "quarantine input fragment",
@@ -377,6 +504,46 @@ impl LateStateSection {
                 NamespaceObjectFamily::FdeFragment,
                 &mut overlay.fde_vectors.artifact_origin,
             )?;
+        }
+        for segment in &mut self.late_interaction_segments {
+            visitor(
+                "late candidate bootstrap",
+                &segment.candidate_index.bootstrap.key,
+                NamespaceObjectFamily::LateSegment,
+                &mut segment.artifact_origin,
+            )?;
+            for cluster in &segment.candidate_index.clusters {
+                visitor(
+                    "late candidate cluster",
+                    &cluster.key,
+                    NamespaceObjectFamily::LateSegment,
+                    &mut segment.artifact_origin,
+                )?;
+            }
+            for matrix in &segment.matrix_objects {
+                visitor(
+                    "late matrix block",
+                    &matrix.key,
+                    NamespaceObjectFamily::LateSegment,
+                    &mut segment.artifact_origin,
+                )?;
+            }
+            for attributes in &segment.attribute_objects {
+                visitor(
+                    "late attribute object",
+                    &attributes.key,
+                    NamespaceObjectFamily::LateSegment,
+                    &mut segment.artifact_origin,
+                )?;
+            }
+            for fts in &segment.fts_objects {
+                visitor(
+                    "late FTS object",
+                    &fts.key,
+                    NamespaceObjectFamily::LateSegment,
+                    &mut segment.artifact_origin,
+                )?;
+            }
         }
         for evidence in &mut self.quarantine_evidence {
             visitor(
@@ -468,13 +635,15 @@ impl LateStateSection {
                 )));
             }
             if let Some(checksum) = artifact.content_checksum {
-                let expected =
-                    Self::artifact_s3_key(origin.namespace.as_str(), artifact.family, checksum);
-                if artifact.key != expected {
-                    return Err(ZeppelinError::Validation(format!(
-                        "{} key must equal its content-addressed key {expected}",
-                        artifact.kind
-                    )));
+                if artifact.family != NamespaceObjectFamily::LateSegment {
+                    let expected =
+                        Self::artifact_s3_key(origin.namespace.as_str(), artifact.family, checksum);
+                    if artifact.key != expected {
+                        return Err(ZeppelinError::Validation(format!(
+                            "{} key must equal its content-addressed key {expected}",
+                            artifact.kind
+                        )));
+                    }
                 }
             }
             Ok(())
@@ -828,11 +997,15 @@ impl LateStateSection {
         }
         if let Some(profile) = self.active_profile.as_ref() {
             profile.validate()?;
-        } else if !self.semantic_overlays.is_empty() || !self.quarantine_evidence.is_empty() {
+        } else if !self.semantic_overlays.is_empty()
+            || !self.quarantine_evidence.is_empty()
+            || !self.late_interaction_segments.is_empty()
+        {
             return Err(ZeppelinError::Serialization(
                 "late-state semantic state requires an active profile".to_string(),
             ));
         }
+        self.validate_late_segments()?;
         let mut settled_rows = BTreeSet::new();
         for overlay in &self.semantic_overlays {
             let profile = self.active_profile.as_ref().ok_or_else(|| {
@@ -959,6 +1132,219 @@ impl LateStateSection {
         Ok(())
     }
 
+    fn validate_late_segments(&self) -> Result<()> {
+        let mut segment_ids = BTreeSet::new();
+        let mut artifact_keys = BTreeSet::new();
+        let profile = self.active_profile.as_ref();
+
+        for segment in &self.late_interaction_segments {
+            if segment.id.is_empty() || segment.id.contains('/') {
+                return Err(ZeppelinError::Serialization(
+                    "late segment id must be one non-empty path component".to_string(),
+                ));
+            }
+            if !segment_ids.insert(segment.id.as_str()) {
+                return Err(ZeppelinError::Serialization(format!(
+                    "late-state section contains duplicate segment id {}",
+                    segment.id
+                )));
+            }
+            let profile = profile.ok_or_else(|| {
+                ZeppelinError::Serialization(
+                    "late-state segment lost its active profile".to_string(),
+                )
+            })?;
+            if segment.profile != profile.profile
+                || segment.semantic_epoch != profile.epoch.id
+                || segment.fde_generation != profile.fde.generation
+                || segment.matrix_dtype != profile.epoch.matrix_dtype
+                || segment.vector_dimension != profile.epoch.vector_dimension
+            {
+                return Err(ZeppelinError::Serialization(
+                    "late segment does not match the active semantic profile".to_string(),
+                ));
+            }
+            if segment.record_count == 0
+                || segment.total_vector_count == 0
+                || segment.vector_dimension == 0
+                || segment.fde_dimension == 0
+                || segment.coverage_sequence == 0
+            {
+                return Err(ZeppelinError::Serialization(
+                    "late segment counts, dimensions, and coverage sequence must be positive"
+                        .to_string(),
+                ));
+            }
+            segment
+                .matrix_dtype
+                .validate_for_dimension(segment.vector_dimension)?;
+
+            let candidate = &segment.candidate_index;
+            let bootstrap = &candidate.bootstrap;
+            if bootstrap.size_bytes == 0
+                || bootstrap.format_version == 0
+                || bootstrap.row_count == 0
+                || bootstrap.recipe.fde_dimension == 0
+                || bootstrap.recipe.nlist == 0
+                || bootstrap.recipe.probe_budget == 0
+                || bootstrap.recipe.candidate_k == 0
+                || bootstrap.recipe.probe_budget > bootstrap.recipe.nlist
+            {
+                return Err(ZeppelinError::Serialization(
+                    "late candidate bootstrap metadata must be positive and internally bounded"
+                        .to_string(),
+                ));
+            }
+            if bootstrap.row_count != segment.record_count
+                || bootstrap.recipe.fde_generation != segment.fde_generation
+                || bootstrap.recipe.fde_dimension != segment.fde_dimension
+            {
+                return Err(ZeppelinError::Serialization(
+                    "late candidate bootstrap does not match its segment".to_string(),
+                ));
+            }
+            insert_unique_segment_key(
+                &mut artifact_keys,
+                bootstrap.key.as_str(),
+                "candidate bootstrap",
+            )?;
+
+            let mut cluster_rows = 0_u64;
+            let mut cluster_shards = BTreeSet::new();
+            let mut cluster_ids = BTreeSet::new();
+            for cluster in &candidate.clusters {
+                if cluster.size_bytes == 0
+                    || cluster.format_version == 0
+                    || cluster.row_count == 0
+                    || cluster.cluster_id >= bootstrap.recipe.nlist
+                {
+                    return Err(ZeppelinError::Serialization(
+                        "late candidate cluster metadata is invalid".to_string(),
+                    ));
+                }
+                if !cluster_shards.insert((cluster.cluster_id, cluster.shard_id)) {
+                    return Err(ZeppelinError::Serialization(
+                        "late candidate index contains a duplicate cluster shard".to_string(),
+                    ));
+                }
+                cluster_ids.insert(cluster.cluster_id);
+                cluster_rows = cluster_rows
+                    .checked_add(u64::from(cluster.row_count))
+                    .ok_or_else(|| {
+                        ZeppelinError::Serialization(
+                            "late candidate cluster row count overflows".to_string(),
+                        )
+                    })?;
+                insert_unique_segment_key(
+                    &mut artifact_keys,
+                    cluster.key.as_str(),
+                    "candidate cluster",
+                )?;
+            }
+            if cluster_rows != segment.record_count
+                || cluster_ids.len() != bootstrap.recipe.nlist as usize
+            {
+                return Err(ZeppelinError::Serialization(
+                    "late candidate clusters do not cover the segment exactly".to_string(),
+                ));
+            }
+
+            let mut matrix_rows = 0_u64;
+            let mut matrix_vectors = 0_u64;
+            for matrix in &segment.matrix_objects {
+                if matrix.size_bytes == 0
+                    || matrix.format_version == 0
+                    || matrix.row_count == 0
+                    || matrix.total_vectors == 0
+                    || matrix.vector_dimension == 0
+                {
+                    return Err(ZeppelinError::Serialization(
+                        "late matrix block metadata must be positive".to_string(),
+                    ));
+                }
+                if matrix.dtype != segment.matrix_dtype
+                    || matrix.semantic_epoch != segment.semantic_epoch
+                    || matrix.fde_generation != segment.fde_generation
+                    || matrix.vector_dimension != segment.vector_dimension
+                {
+                    return Err(ZeppelinError::Serialization(
+                        "late matrix block does not match its segment".to_string(),
+                    ));
+                }
+                matrix_rows = matrix_rows
+                    .checked_add(u64::from(matrix.row_count))
+                    .ok_or_else(|| {
+                        ZeppelinError::Serialization(
+                            "late matrix block row count overflows".to_string(),
+                        )
+                    })?;
+                matrix_vectors = matrix_vectors
+                    .checked_add(matrix.total_vectors)
+                    .ok_or_else(|| {
+                        ZeppelinError::Serialization(
+                            "late matrix block vector count overflows".to_string(),
+                        )
+                    })?;
+                insert_unique_segment_key(&mut artifact_keys, matrix.key.as_str(), "matrix block")?;
+            }
+            if matrix_rows != segment.record_count || matrix_vectors != segment.total_vector_count {
+                return Err(ZeppelinError::Serialization(
+                    "late matrix blocks do not cover the segment exactly".to_string(),
+                ));
+            }
+
+            let mut attribute_rows = 0_u64;
+            for object in &segment.attribute_objects {
+                if object.size_bytes == 0 || object.format_version == 0 || object.row_count == 0 {
+                    return Err(ZeppelinError::Serialization(
+                        "late attribute block metadata must be positive".to_string(),
+                    ));
+                }
+                attribute_rows = attribute_rows
+                    .checked_add(u64::from(object.row_count))
+                    .ok_or_else(|| {
+                        ZeppelinError::Serialization(
+                            "late attribute block row count overflows".to_string(),
+                        )
+                    })?;
+                insert_unique_segment_key(
+                    &mut artifact_keys,
+                    object.key.as_str(),
+                    "attribute object",
+                )?;
+            }
+            if attribute_rows != segment.record_count {
+                return Err(ZeppelinError::Serialization(
+                    "late attribute blocks do not cover the segment exactly".to_string(),
+                ));
+            }
+
+            for object in &segment.fts_objects {
+                if object.size_bytes == 0 || object.format_version == 0 {
+                    return Err(ZeppelinError::Serialization(
+                        "late segment FTS object size and format version must be positive"
+                            .to_string(),
+                    ));
+                }
+                insert_unique_segment_key(&mut artifact_keys, object.key.as_str(), "FTS object")?;
+            }
+        }
+
+        if !self.late_interaction_segments.is_empty() && self.active_late_segment.is_none() {
+            return Err(ZeppelinError::Serialization(
+                "late-state segments require an active late segment".to_string(),
+            ));
+        }
+        if let Some(active_id) = self.active_late_segment.as_deref() {
+            if !segment_ids.contains(active_id) {
+                return Err(ZeppelinError::Serialization(format!(
+                    "active late segment {active_id} is not present in the section"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_origin_indices(&self, require_canonical: bool) -> Result<()> {
         let mut previous = None;
         let mut unique = BTreeSet::new();
@@ -1052,31 +1438,33 @@ mod tests {
         VectorTransformRecipe,
     };
     use crate::index::late_interaction::{
-        FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection, InnerProjection,
+        AttributeBlockRef, FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection,
+        InnerProjection, LateCandidateBootstrapRef, LateCandidateClusterRef, LateCandidateIndexRef,
+        LateCandidateRecipe, LateRoutingMetric, MatrixBlockRef,
     };
     use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
-    use crate::storage::ZeppelinStore;
+    use crate::storage::{NamespaceObjectFamily, ZeppelinStore};
 
     use super::{
-        LateStateSection, SourceInventoryRef, LATE_STATE_FORMAT_VERSION, LATE_STATE_MAGIC,
+        LateInteractionSegmentRef, LateSegmentObjectRef, LateStateSection, SourceInventoryRef,
+        LATE_STATE_FORMAT_VERSION, LATE_STATE_MAGIC,
     };
 
     #[test]
-    fn empty_v1_section_decodes_with_v2_defaults() {
+    fn legacy_empty_sections_decode_with_v4_defaults() {
         const EMPTY_V1_FIXTURE: &[u8] = b"ZLS1\x01\x90";
         const EMPTY_V2_FIXTURE: &[u8] = b"ZLS1\x02\x92\x90\x90";
-        assert_eq!(
-            LateStateSection::from_bytes(EMPTY_V1_FIXTURE).expect("fixture must decode"),
-            LateStateSection::new()
-        );
-        assert_eq!(
-            LateStateSection::from_bytes(EMPTY_V2_FIXTURE).expect("fixture must decode"),
-            LateStateSection::new()
-        );
+        const EMPTY_V3_FIXTURE: &[u8] = b"ZLS1\x03\x95\x90\x90\xc0\x90\x90";
+        for fixture in [EMPTY_V1_FIXTURE, EMPTY_V2_FIXTURE, EMPTY_V3_FIXTURE] {
+            assert_eq!(
+                LateStateSection::from_bytes(fixture).expect("fixture must decode"),
+                LateStateSection::new()
+            );
+        }
     }
 
     #[test]
-    fn v3_source_inventory_round_trips_with_section_local_origins() {
+    fn v4_source_inventory_round_trips_with_section_local_origins() {
         let source = serde_json::from_value::<ArtifactOrigin>(serde_json::json!({
             "namespace": "source",
             "incarnation": "00000000-0000-0000-0000-000000000001"
@@ -1097,10 +1485,10 @@ mod tests {
             .canonicalize_artifact_origins()
             .expect("section origins must canonicalize");
 
-        let bytes = section.to_bytes().expect("v3 section must serialize");
+        let bytes = section.to_bytes().expect("v4 section must serialize");
         assert_eq!(&bytes[..4], LATE_STATE_MAGIC);
         assert_eq!(bytes[4], LATE_STATE_FORMAT_VERSION as u8);
-        let decoded = LateStateSection::from_bytes(&bytes).expect("v3 fixture must decode");
+        let decoded = LateStateSection::from_bytes(&bytes).expect("v4 fixture must decode");
         assert_eq!(decoded, section);
         assert_eq!(
             decoded
@@ -1180,8 +1568,158 @@ mod tests {
         }
     }
 
+    fn segment_fixture(
+        profile: &EmbeddingProfileRef,
+        owner_namespace: &str,
+    ) -> LateInteractionSegmentRef {
+        let segment_prefix = format!("{owner_namespace}/late/segments/segment-v1");
+        LateInteractionSegmentRef {
+            id: "segment-v1".to_string(),
+            profile: profile.profile.clone(),
+            semantic_epoch: profile.epoch.id,
+            fde_generation: profile.fde.generation,
+            matrix_dtype: profile.epoch.matrix_dtype,
+            record_count: 1,
+            total_vector_count: 2,
+            vector_dimension: profile.epoch.vector_dimension,
+            fde_dimension: 2,
+            coverage_sequence: 7,
+            candidate_index: LateCandidateIndexRef {
+                bootstrap: LateCandidateBootstrapRef {
+                    key: format!("{segment_prefix}/candidate-bootstrap.bin"),
+                    checksum: ArtifactChecksum::new([10; 32]),
+                    size_bytes: 128,
+                    recipe: LateCandidateRecipe {
+                        fde_generation: profile.fde.generation,
+                        fde_dimension: 2,
+                        nlist: 1,
+                        probe_budget: 1,
+                        candidate_k: 1,
+                        routing_metric: LateRoutingMetric::NegativeL2,
+                    },
+                    row_count: 1,
+                    format_version: 1,
+                },
+                clusters: vec![LateCandidateClusterRef {
+                    key: format!("{segment_prefix}/candidate-cluster-0.bin"),
+                    checksum: ArtifactChecksum::new([11; 32]),
+                    size_bytes: 256,
+                    cluster_id: 0,
+                    shard_id: 0,
+                    row_count: 1,
+                    format_version: 1,
+                }],
+            },
+            matrix_objects: vec![MatrixBlockRef {
+                key: format!("{segment_prefix}/matrix-0.bin"),
+                checksum: ArtifactChecksum::new([12; 32]),
+                size_bytes: 64,
+                dtype: profile.epoch.matrix_dtype,
+                semantic_epoch: profile.epoch.id,
+                fde_generation: profile.fde.generation,
+                vector_dimension: profile.epoch.vector_dimension,
+                row_count: 1,
+                total_vectors: 2,
+                format_version: 1,
+            }],
+            attribute_objects: vec![AttributeBlockRef {
+                key: format!("{segment_prefix}/attributes-0.bin"),
+                checksum: ArtifactChecksum::new([13; 32]),
+                size_bytes: 32,
+                row_count: 1,
+                format_version: 1,
+            }],
+            fts_objects: vec![LateSegmentObjectRef {
+                key: format!("{segment_prefix}/fts-0.bin"),
+                checksum: ArtifactChecksum::new([14; 32]),
+                size_bytes: 48,
+                format_version: 1,
+            }],
+            artifact_origin: None,
+        }
+    }
+
     #[test]
-    fn v3_profile_and_overlay_round_trip() {
+    fn v4_segment_round_trips_and_walks_every_owned_object() {
+        let profile = profile_fixture();
+        let foreign = serde_json::from_value::<ArtifactOrigin>(serde_json::json!({
+            "namespace": "source",
+            "incarnation": "00000000-0000-0000-0000-000000000002"
+        }))
+        .expect("foreign origin fixture");
+        let mut segment = segment_fixture(&profile, "source");
+        segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        let mut section = LateStateSection {
+            active_profile: Some(profile),
+            artifact_origins: vec![foreign.clone()],
+            late_interaction_segments: vec![segment.clone()],
+            active_late_segment: Some(segment.id.clone()),
+            ..LateStateSection::new()
+        };
+        section
+            .canonicalize_artifact_origins()
+            .expect("segment origin must canonicalize");
+
+        let bytes = section
+            .to_bytes()
+            .expect("v4 segment section must serialize");
+        assert_eq!(bytes[4], LATE_STATE_FORMAT_VERSION as u8);
+        let decoded = LateStateSection::from_bytes(&bytes).expect("v4 section must decode");
+        assert_eq!(decoded, section);
+
+        let local = serde_json::from_value::<ArtifactOrigin>(serde_json::json!({
+            "namespace": "catalog",
+            "incarnation": "00000000-0000-0000-0000-000000000001"
+        }))
+        .expect("origin fixture");
+        decoded
+            .validate_for_origin(&local)
+            .expect("all segment objects must belong to the registered family");
+        let resolved = decoded
+            .resolved_artifacts(&local)
+            .expect("segment ownership must resolve");
+        let segment_objects = resolved
+            .iter()
+            .filter(|artifact| artifact.family == NamespaceObjectFamily::LateSegment)
+            .collect::<Vec<_>>();
+        assert_eq!(segment_objects.len(), 5);
+        assert!(segment_objects
+            .iter()
+            .all(|artifact| artifact.origin == foreign));
+    }
+
+    #[test]
+    fn v4_segment_validation_rejects_invalid_selection_and_duplicate_keys() {
+        let profile = profile_fixture();
+        let segment = segment_fixture(&profile, "catalog");
+        let unselected = LateStateSection {
+            active_profile: Some(profile.clone()),
+            late_interaction_segments: vec![segment.clone()],
+            ..LateStateSection::new()
+        };
+        assert!(unselected.to_bytes().is_err());
+
+        let missing = LateStateSection {
+            active_profile: Some(profile.clone()),
+            late_interaction_segments: vec![segment.clone()],
+            active_late_segment: Some("missing".to_string()),
+            ..LateStateSection::new()
+        };
+        assert!(missing.to_bytes().is_err());
+
+        let mut duplicate = segment;
+        duplicate.attribute_objects[0].key = duplicate.matrix_objects[0].key.clone();
+        let duplicate = LateStateSection {
+            active_profile: Some(profile),
+            late_interaction_segments: vec![duplicate],
+            active_late_segment: Some("segment-v1".to_string()),
+            ..LateStateSection::new()
+        };
+        assert!(duplicate.to_bytes().is_err());
+    }
+
+    #[test]
+    fn v4_profile_and_overlay_round_trip() {
         let profile = profile_fixture();
         let input_id = Ulid::from(1_u128);
         let embedding_checksum = ArtifactChecksum::new([5; 32]);
@@ -1240,10 +1778,10 @@ mod tests {
             ..LateStateSection::new()
         };
 
-        let bytes = section.to_bytes().expect("v3 section must serialize");
+        let bytes = section.to_bytes().expect("v4 section must serialize");
         assert_eq!(bytes[4], LATE_STATE_FORMAT_VERSION as u8);
         assert_eq!(
-            LateStateSection::from_bytes(&bytes).expect("v3 section must decode"),
+            LateStateSection::from_bytes(&bytes).expect("v4 section must decode"),
             section
         );
     }

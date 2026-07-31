@@ -212,7 +212,7 @@ use rand::Rng;
 use tracing::{debug, error, info, instrument, warn};
 use ulid::Ulid;
 
-use crate::config::{CompactionConfig, IndexingConfig};
+use crate::config::{CompactionConfig, IndexingConfig, MmliConfig};
 use crate::error::{Result, ZeppelinError};
 use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
 use crate::fts::FtsFieldConfig;
@@ -233,7 +233,7 @@ use crate::namespace::NamespaceIncarnationId;
 use crate::security::{NamespaceId, PreservationService};
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
-use crate::types::VectorEntry;
+use crate::types::{IndexType, VectorEntry};
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{
     BootstrapRef, ClusterDataObjectRef, ClusterRowLayoutRef, CoarsePayloadEncoding,
@@ -624,6 +624,8 @@ pub struct Compactor {
     config: CompactionConfig,
     /// Process defaults overlaid by namespace-specific indexing metadata.
     indexing_config: IndexingConfig,
+    /// Late-segment build and two-wave query defaults.
+    mmli_config: MmliConfig,
     /// Maximum artifact-upload age allowed before publication.
     ///
     /// This is derived from GC configuration so in-flight objects cannot age
@@ -1185,6 +1187,7 @@ impl Compactor {
             wal_reader,
             config,
             indexing_config,
+            mmli_config: MmliConfig::default(),
             upload_window,
             clock,
             preservation: None,
@@ -1199,6 +1202,13 @@ impl Compactor {
         preservation: Option<Arc<PreservationService>>,
     ) -> Self {
         self.preservation = preservation;
+        self
+    }
+
+    /// Attach the process-wide late-interaction build and query configuration.
+    #[must_use]
+    pub fn with_mmli_config(mut self, config: MmliConfig) -> Self {
+        self.mmli_config = config;
         self
     }
 
@@ -1406,6 +1416,48 @@ impl Compactor {
         manifest: &Manifest,
         metadata: &NamespaceMetadata,
     ) -> Result<bool> {
+        if metadata.index_type == IndexType::LateInteractionFde {
+            let _ = resolve_indexing_config(namespace, metadata, &self.indexing_config)?;
+            if metadata.late_interaction.is_none() {
+                return Err(ZeppelinError::Validation(
+                    "late-interaction namespace is missing admission config".to_string(),
+                ));
+            }
+            let fragments = &manifest.input_fragments;
+            if fragments.is_empty() {
+                debug!("no typed input fragments, late compaction not needed");
+                return Ok(false);
+            }
+            let count = fragments.len();
+            let total_bytes = fragments.iter().try_fold(0_u64, |total, fragment| {
+                total.checked_add(fragment.size_bytes).ok_or_else(|| {
+                    ZeppelinError::Index("typed input fragment byte count overflows u64".into())
+                })
+            })?;
+            let now = self.clock.now();
+            let now_ms = u64::try_from(now.timestamp_millis()).map_err(|_| {
+                ZeppelinError::Index(format!("compactor clock before Unix epoch: {now}"))
+            })?;
+            let oldest_age_secs = fragments
+                .iter()
+                .map(|fragment| fragment_age_secs(&fragment.id, now_ms))
+                .max()
+                .unwrap_or(0);
+            let count_exceeded = count >= self.config.max_wal_fragments_before_compact;
+            let age_exceeded = oldest_age_secs >= self.config.max_wal_age_before_compact_secs;
+            let bytes_exceeded = total_bytes >= self.config.max_wal_bytes_before_compact;
+            if count_exceeded || age_exceeded || bytes_exceeded {
+                info!(
+                    fragment_count = count,
+                    total_input_bytes = total_bytes,
+                    oldest_fragment_age_secs = oldest_age_secs,
+                    "late compaction triggered"
+                );
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
         let fragments = if manifest.namespace_incarnation().is_some() {
             let local_origin = manifest.local_origin()?;
             let resolver = manifest.artifact_origin_resolver(&local_origin)?;
@@ -4966,12 +5018,13 @@ mod tests {
 
     use super::*;
     use crate::config::{Config, GcConfig, SecurityMode};
+    use crate::embedding::{InputModality, LateInteractionNamespaceConfig, ModalityCounts};
     use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
     use crate::namespace::manager::{CompactionHealth, NamespaceIndexConfig};
     use crate::namespace::{NamespaceId, NamespaceIncarnationId};
     use crate::time::TimeSource;
     use crate::types::{DistanceMetric, IndexType};
-    use crate::wal::manifest::FragmentRef;
+    use crate::wal::manifest::{FragmentRef, InputFragmentRef};
 
     #[derive(Debug)]
     struct AdjustableTimeSource {
@@ -5313,6 +5366,38 @@ mod tests {
         assert!(!compactor
             .should_compact("ns-pure-trigger", &manifest, &metadata)
             .unwrap());
+    }
+
+    #[test]
+    fn late_trigger_counts_typed_input_fragments_not_dense_wal() {
+        let compactor = mem_compactor(CompactionConfig {
+            max_wal_fragments_before_compact: 1,
+            ..CompactionConfig::default()
+        });
+        let mut manifest = Manifest::new();
+        manifest.input_fragments.push(InputFragmentRef {
+            id: Ulid::from_parts(now_ms(), 7),
+            upsert_count: 1,
+            delete_count: 0,
+            sequence_number: 1,
+            size_bytes: 512,
+            referenced_content_bytes: 32,
+            modality_counts: ModalityCounts {
+                text: 1,
+                ..ModalityCounts::default()
+            },
+            artifact_origin: None,
+        });
+        let mut metadata = active_metadata("late-trigger");
+        metadata.dimensions = 0;
+        metadata.index_type = IndexType::LateInteractionFde;
+        metadata.late_interaction = Some(LateInteractionNamespaceConfig {
+            accepted_modalities: vec![InputModality::Text],
+        });
+
+        assert!(compactor
+            .should_compact("late-trigger", &manifest, &metadata)
+            .expect("late trigger"));
     }
 
     #[test]

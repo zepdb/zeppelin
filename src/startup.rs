@@ -640,6 +640,7 @@ async fn build_app_with_entitlement_resolver(
             Duration::from_secs(config.gc.compaction_upload_window_secs),
             clock.clone(),
         )
+        .with_mmli_config(config.mmli.clone())
         .with_preservation_service(security.preservation_service().cloned()),
     );
 

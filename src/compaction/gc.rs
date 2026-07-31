@@ -5081,11 +5081,10 @@ fn parse_gc_artifact_key(namespace: &str, key: &str) -> Option<ParsedGcArtifact>
         NamespaceObjectFamily::LateSegment => {
             let prefix = NamespaceObjectFamily::LateSegment.namespace_prefix(namespace);
             let (segment_id, artifact) = key.strip_prefix(&prefix)?.split_once('/')?;
-            let matrix_index = artifact.strip_prefix("matrix_")?.strip_suffix(".bin")?;
             (!segment_id.is_empty()
                 && !segment_id.contains('/')
-                && !matrix_index.is_empty()
-                && matrix_index.bytes().all(|byte| byte.is_ascii_digit()))
+                && !artifact.contains('/')
+                && is_known_late_segment_artifact_name(artifact))
             .then_some(ParsedGcArtifact::LateArtifact)
         }
         NamespaceObjectFamily::MatrixFragment
@@ -5161,6 +5160,48 @@ fn is_known_scoped_artifact_path(path: &str) -> bool {
 
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_lower_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn is_known_late_segment_artifact_name(file_name: &str) -> bool {
+    if numbered_bin(file_name, "matrix_") || numbered_bin(file_name, "attrs_") {
+        return true;
+    }
+    if let Some(checksum) = file_name
+        .strip_prefix("candidate-bootstrap-")
+        .and_then(|rest| rest.strip_suffix(".bin"))
+    {
+        return is_lower_sha256_hex(checksum);
+    }
+    if let Some(checksum) = file_name
+        .strip_prefix("fts_")
+        .and_then(|rest| rest.strip_suffix(".bin"))
+    {
+        return is_lower_sha256_hex(checksum);
+    }
+    let Some(body) = file_name
+        .strip_prefix("candidate-cluster-")
+        .and_then(|rest| rest.strip_suffix(".bin"))
+    else {
+        return false;
+    };
+    let Some((cluster_and_shard, checksum)) = body.rsplit_once('-') else {
+        return false;
+    };
+    let Some((cluster, shard)) = cluster_and_shard.split_once("-shard-") else {
+        return false;
+    };
+    !cluster.is_empty()
+        && cluster.bytes().all(|byte| byte.is_ascii_digit())
+        && !shard.is_empty()
+        && shard.bytes().all(|byte| byte.is_ascii_digit())
+        && is_lower_sha256_hex(checksum)
 }
 
 fn is_known_tree_node_name(file_name: &str) -> bool {
@@ -6803,6 +6844,40 @@ mod tests {
         );
         assert!(parse_gc_artifact_key(NS, &uppercase_checksum).is_none());
         assert!(parse_gc_artifact_key(NS, &format!("{key}/extra")).is_none());
+    }
+
+    #[test]
+    fn late_segment_gc_grammar_accepts_only_registered_artifacts() {
+        let checksum = "ab".repeat(32);
+        for key in [
+            format!("{NS}/late/segments/seg_1/matrix_0.bin"),
+            format!("{NS}/late/segments/seg_1/attrs_0.bin"),
+            format!("{NS}/late/segments/seg_1/candidate-bootstrap-{checksum}.bin"),
+            format!("{NS}/late/segments/seg_1/candidate-cluster-7-shard-2-{checksum}.bin"),
+            format!("{NS}/late/segments/seg_1/fts_{checksum}.bin"),
+        ] {
+            assert_eq!(
+                parse_gc_artifact_key(NS, &key),
+                Some(ParsedGcArtifact::LateArtifact),
+                "registered late artifact must enter the GC grammar: {key}"
+            );
+        }
+
+        for key in [
+            format!("{NS}/late/segments/seg_1/notes.txt"),
+            format!("{NS}/late/segments/seg_1/matrix_x.bin"),
+            format!(
+                "{NS}/late/segments/seg_1/candidate-bootstrap-{}.bin",
+                "AB".repeat(32)
+            ),
+            format!("{NS}/late/segments/seg_1/candidate-cluster-7-shard-x-{checksum}.bin"),
+            format!("{NS}/late/segments/seg_1/nested/matrix_0.bin"),
+        ] {
+            assert!(
+                parse_gc_artifact_key(NS, &key).is_none(),
+                "unknown late artifact must remain fail-closed: {key}"
+            );
+        }
     }
 
     #[test]
