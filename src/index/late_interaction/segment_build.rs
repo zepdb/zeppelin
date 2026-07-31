@@ -17,13 +17,35 @@ use crate::error::{Result, ZeppelinError};
 use crate::namespace::branching::ArtifactOriginIndex;
 use crate::storage::{NamespaceObjectFamily, NamespaceObjectKey};
 use crate::types::{AttributeValue, VectorId};
-use crate::wal::{LateInteractionSegmentRef, LateSegmentObjectRef};
+use crate::wal::{LateCandidateKind, LateInteractionSegmentRef, LateSegmentObjectRef};
 
 use super::attribute_artifact::{build_attribute_blocks, AttributeBlockInputRow};
 use super::candidate::{
     build_late_candidate_index, LateCandidateBuildConfig, LateCandidateInputRow,
 };
+use super::flat_candidate::{build_flat_candidate_artifact, LateFlatCandidateBuildConfig};
 use super::matrix_artifact::{build_matrix_blocks, MatrixBlockInputRow};
+
+/// Candidate-kind build selection for one full segment rebuild.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LateCandidateBuild {
+    /// Routed IVF clusters (retained for the future scale phase).
+    Ivf(LateCandidateBuildConfig),
+    /// Resident exhaustive flat-SQ8 artifact (production for this regime).
+    // dead_code allow is transitional: the query-path slice flips compaction
+    // to this variant next; the allow is removed there.
+    #[allow(dead_code)]
+    FlatSq8(LateFlatCandidateBuildConfig),
+}
+
+impl LateCandidateBuild {
+    const fn fde_dimension(&self) -> usize {
+        match self {
+            Self::Ivf(config) => config.fde_dimension,
+            Self::FlatSq8(config) => config.fde_dimension,
+        }
+    }
+}
 
 /// One normalized live retrieval unit entering a full segment rebuild.
 #[derive(Clone, Debug)]
@@ -81,7 +103,7 @@ pub(crate) struct LateSegmentBuildConfig {
     /// Hard maximum exact-attribute block bytes.
     pub(crate) max_attribute_object_bytes: usize,
     /// Candidate build and query operating point.
-    pub(crate) candidate: LateCandidateBuildConfig,
+    pub(crate) candidate: LateCandidateBuild,
     /// Physical owner index copied into the section descriptor.
     pub(crate) artifact_origin: Option<ArtifactOriginIndex>,
     /// Already-built full-text artifacts for the same row set.
@@ -188,13 +210,56 @@ pub(crate) fn build_late_interaction_segment(
             },
         )
         .collect();
-    let candidate = build_late_candidate_index(
-        &config.namespace,
-        &config.segment_id,
-        config.fde_generation,
-        config.candidate,
-        candidate_rows,
-    )?;
+    let (candidate_kind, candidate_index, flat_candidate, mut candidate_artifacts) =
+        match config.candidate {
+            LateCandidateBuild::Ivf(candidate_config) => {
+                let candidate = build_late_candidate_index(
+                    &config.namespace,
+                    &config.segment_id,
+                    config.fde_generation,
+                    candidate_config,
+                    candidate_rows,
+                )?;
+                let mut artifacts = vec![BuiltLateSegmentArtifact {
+                    key: candidate.index_ref.bootstrap.key.clone(),
+                    checksum: candidate.index_ref.bootstrap.checksum,
+                    bytes: candidate.bootstrap_bytes,
+                }];
+                for cluster in candidate.clusters {
+                    artifacts.push(BuiltLateSegmentArtifact {
+                        key: cluster.reference.key,
+                        checksum: cluster.reference.checksum,
+                        bytes: cluster.bytes,
+                    });
+                }
+                (
+                    LateCandidateKind::Ivf,
+                    Some(candidate.index_ref),
+                    None,
+                    artifacts,
+                )
+            }
+            LateCandidateBuild::FlatSq8(flat_config) => {
+                let flat = build_flat_candidate_artifact(
+                    &config.namespace,
+                    &config.segment_id,
+                    config.fde_generation,
+                    flat_config,
+                    candidate_rows,
+                )?;
+                let artifacts = vec![BuiltLateSegmentArtifact {
+                    key: flat.reference.key.clone(),
+                    checksum: flat.reference.checksum,
+                    bytes: flat.bytes,
+                }];
+                (
+                    LateCandidateKind::FlatSq8,
+                    None,
+                    Some(flat.reference),
+                    artifacts,
+                )
+            }
+        };
 
     let record_count = u64::try_from(rows.len())
         .map_err(|_| segment_error("late segment row count exceeds u64"))?;
@@ -232,11 +297,13 @@ pub(crate) fn build_late_interaction_segment(
         fde_dimension: u32::try_from(config.fde_dimension)
             .map_err(|_| segment_error("late segment FDE dimension exceeds u32"))?,
         coverage_sequence: config.coverage_sequence,
-        candidate_index: candidate.index_ref.clone(),
+        candidate_index,
         matrix_objects,
         attribute_objects,
         fts_objects,
         artifact_origin: config.artifact_origin,
+        candidate_kind,
+        flat_candidate,
     };
     validate_segment_descriptor(&reference)?;
 
@@ -255,18 +322,7 @@ pub(crate) fn build_late_interaction_segment(
             bytes: block.bytes,
         });
     }
-    artifacts.push(BuiltLateSegmentArtifact {
-        key: candidate.index_ref.bootstrap.key.clone(),
-        checksum: candidate.index_ref.bootstrap.checksum,
-        bytes: candidate.bootstrap_bytes,
-    });
-    for cluster in candidate.clusters {
-        artifacts.push(BuiltLateSegmentArtifact {
-            key: cluster.reference.key,
-            checksum: cluster.reference.checksum,
-            bytes: cluster.bytes,
-        });
-    }
+    artifacts.append(&mut candidate_artifacts);
     for artifact in config.fts_artifacts {
         artifacts.push(BuiltLateSegmentArtifact {
             key: artifact.reference.key,
@@ -301,7 +357,7 @@ fn validate_config(config: &LateSegmentBuildConfig) -> Result<()> {
     config
         .matrix_dtype
         .validate_for_dimension(vector_dimension)?;
-    if config.candidate.fde_dimension != config.fde_dimension {
+    if config.candidate.fde_dimension() != config.fde_dimension {
         return Err(segment_error(
             "candidate and segment FDE dimensions disagree",
         ));
@@ -378,14 +434,18 @@ fn validate_complete_artifacts(
     artifacts: &[BuiltLateSegmentArtifact],
 ) -> Result<()> {
     let mut rooted = BTreeSet::new();
-    rooted.insert(reference.candidate_index.bootstrap.key.as_str());
-    rooted.extend(
-        reference
-            .candidate_index
-            .clusters
-            .iter()
-            .map(|cluster| cluster.key.as_str()),
-    );
+    if let Some(candidate_index) = reference.candidate_index.as_ref() {
+        rooted.insert(candidate_index.bootstrap.key.as_str());
+        rooted.extend(
+            candidate_index
+                .clusters
+                .iter()
+                .map(|cluster| cluster.key.as_str()),
+        );
+    }
+    if let Some(flat) = reference.flat_candidate.as_ref() {
+        rooted.insert(flat.key.as_str());
+    }
     rooted.extend(
         reference
             .matrix_objects
@@ -431,13 +491,36 @@ fn validate_segment_descriptor(reference: &LateInteractionSegmentRef) -> Result<
         || reference.total_vector_count == 0
         || reference.vector_dimension == 0
         || reference.fde_dimension == 0
-        || reference.candidate_index.bootstrap.recipe.fde_generation != reference.fde_generation
-        || reference.candidate_index.bootstrap.recipe.fde_dimension != reference.fde_dimension
-        || reference.candidate_index.bootstrap.row_count != reference.record_count
     {
         return Err(segment_error(
             "late segment descriptor identities or counts disagree",
         ));
+    }
+    match reference.candidate_kind {
+        LateCandidateKind::Ivf => {
+            let candidate_index = reference.ivf_candidate_index()?;
+            if reference.flat_candidate.is_some()
+                || candidate_index.bootstrap.recipe.fde_generation != reference.fde_generation
+                || candidate_index.bootstrap.recipe.fde_dimension != reference.fde_dimension
+                || candidate_index.bootstrap.row_count != reference.record_count
+            {
+                return Err(segment_error(
+                    "late segment descriptor identities or counts disagree",
+                ));
+            }
+        }
+        LateCandidateKind::FlatSq8 => {
+            let flat = reference.flat_candidate_ref()?;
+            if reference.candidate_index.is_some()
+                || flat.recipe.fde_generation != reference.fde_generation
+                || flat.recipe.fde_dimension != reference.fde_dimension
+                || flat.row_count != reference.record_count
+            {
+                return Err(segment_error(
+                    "late segment descriptor identities or counts disagree",
+                ));
+            }
+        }
     }
     reference
         .matrix_dtype
@@ -475,16 +558,19 @@ fn validate_segment_descriptor(reference: &LateInteractionSegmentRef) -> Result<
                 .checked_add(u64::from(object.row_count))
                 .ok_or_else(|| segment_error("late segment attribute row count overflows"))
         })?;
-    let candidate_rows =
-        reference
-            .candidate_index
-            .clusters
-            .iter()
-            .try_fold(0_u64, |total, object| {
-                total
-                    .checked_add(u64::from(object.row_count))
-                    .ok_or_else(|| segment_error("late segment candidate row count overflows"))
-            })?;
+    let candidate_rows = match reference.candidate_index.as_ref() {
+        Some(candidate_index) => {
+            candidate_index
+                .clusters
+                .iter()
+                .try_fold(0_u64, |total, object| {
+                    total
+                        .checked_add(u64::from(object.row_count))
+                        .ok_or_else(|| segment_error("late segment candidate row count overflows"))
+                })?
+        }
+        None => reference.flat_candidate_ref()?.row_count,
+    };
     if matrix_rows != reference.record_count
         || attribute_rows != reference.record_count
         || candidate_rows != reference.record_count
@@ -524,9 +610,14 @@ mod tests {
     use crate::types::AttributeValue;
     use crate::wal::LateSegmentObjectRef;
 
+    use crate::index::late_interaction::flat_candidate::{
+        LateFlatCandidateBuildConfig, ResidentFlatCandidateIndex,
+    };
+    use crate::wal::LateCandidateKind;
+
     use super::{
-        build_late_interaction_segment, LateSegmentBuildConfig, LateSegmentBuildRow,
-        PrebuiltLateFtsArtifact,
+        build_late_interaction_segment, LateCandidateBuild, LateSegmentBuildConfig,
+        LateSegmentBuildRow, PrebuiltLateFtsArtifact,
     };
 
     fn row(id: &str, sequence: u64, base: f32) -> LateSegmentBuildRow {
@@ -564,7 +655,7 @@ mod tests {
             coverage_sequence: 10,
             max_matrix_object_bytes: 2 * 1024,
             max_attribute_object_bytes: 512,
-            candidate: LateCandidateBuildConfig {
+            candidate: LateCandidateBuild::Ivf(LateCandidateBuildConfig {
                 fde_dimension: 2,
                 nlist: 2,
                 probe_budget: 2,
@@ -574,7 +665,7 @@ mod tests {
                 kmeans_epsilon: 1e-6,
                 max_cluster_bytes: 2 * 1024,
                 max_bootstrap_bytes: 64 * 1024,
-            },
+            }),
             artifact_origin: None,
             fts_artifacts: fts,
         }
@@ -612,9 +703,11 @@ mod tests {
             .iter()
             .map(|artifact| (artifact.key.as_str(), artifact.bytes.as_ref()))
             .collect::<BTreeMap<_, _>>();
-        let cluster_payloads = built
+        let candidate_index = built
             .reference
-            .candidate_index
+            .ivf_candidate_index()
+            .expect("IVF build must root a candidate index");
+        let cluster_payloads = candidate_index
             .clusters
             .iter()
             .map(|reference| FetchedLateCandidateCluster {
@@ -623,8 +716,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let candidates = decode_all_candidate_rows(
-            &built.reference.candidate_index,
-            artifact_by_key[built.reference.candidate_index.bootstrap.key.as_str()],
+            candidate_index,
+            artifact_by_key[candidate_index.bootstrap.key.as_str()],
             &cluster_payloads,
             64 * 1024,
             2 * 1024,
@@ -667,11 +760,9 @@ mod tests {
             assert_eq!(candidate.source_sequence, original.source_sequence);
         }
 
-        let rooted = std::iter::once(built.reference.candidate_index.bootstrap.key.as_str())
+        let rooted = std::iter::once(candidate_index.bootstrap.key.as_str())
             .chain(
-                built
-                    .reference
-                    .candidate_index
+                candidate_index
                     .clusters
                     .iter()
                     .map(|reference| reference.key.as_str()),
@@ -706,6 +797,88 @@ mod tests {
                 .map(|artifact| artifact.key.as_str())
                 .collect()
         );
+    }
+
+    fn flat_config() -> LateSegmentBuildConfig {
+        let mut config = config(Vec::new());
+        config.candidate = LateCandidateBuild::FlatSq8(LateFlatCandidateBuildConfig {
+            fde_dimension: 2,
+            candidate_k: 3,
+            max_artifact_bytes: 64 * 1024,
+        });
+        config
+    }
+
+    #[test]
+    fn flat_rebuild_roots_one_candidate_artifact_and_aligns_locators() {
+        let original_rows = vec![
+            row("charlie", 3, 3.0),
+            row("alpha", 1, 1.0),
+            row("bravo", 2, 2.0),
+        ];
+        let reversed = original_rows.iter().cloned().rev().collect::<Vec<_>>();
+        let built = build_late_interaction_segment(flat_config(), original_rows.clone())
+            .expect("flat segment build");
+        let again =
+            build_late_interaction_segment(flat_config(), reversed).expect("reversed flat build");
+        assert_eq!(built, again);
+        assert_eq!(built.reference.candidate_kind, LateCandidateKind::FlatSq8);
+        assert!(built.reference.candidate_index.is_none());
+
+        let flat = built
+            .reference
+            .flat_candidate_ref()
+            .expect("flat build must root its candidate artifact");
+        assert_eq!(flat.row_count, 3);
+        assert_eq!(flat.recipe.candidate_k, 3);
+        let artifact_by_key = built
+            .artifacts
+            .iter()
+            .map(|artifact| (artifact.key.as_str(), artifact.bytes.as_ref()))
+            .collect::<BTreeMap<_, _>>();
+        assert!(artifact_by_key.contains_key(flat.key.as_str()));
+        let resident = ResidentFlatCandidateIndex::from_bytes(
+            artifact_by_key[flat.key.as_str()],
+            flat,
+            64 * 1024,
+        )
+        .expect("flat artifact must hydrate");
+        let original_by_id = original_rows
+            .iter()
+            .map(|row| (row.id.as_str(), row))
+            .collect::<BTreeMap<_, _>>();
+        for decoded in resident.rows() {
+            let original = original_by_id[decoded.id.as_str()];
+            let matrix_start =
+                usize::try_from(decoded.matrix_locator.byte_offset).expect("matrix offset");
+            let matrix_end = matrix_start
+                + usize::try_from(decoded.matrix_locator.byte_length).expect("matrix length");
+            let matrix_object = artifact_by_key[decoded.matrix_locator.object_key.as_str()];
+            let matrix = decode_matrix_row(
+                &matrix_object[matrix_start..matrix_end],
+                &decoded.matrix_locator,
+                MatrixDtype::F16,
+                3,
+                4,
+            )
+            .expect("flat matrix locator");
+            assert_eq!(matrix, original.exact_matrix);
+
+            let attr_start =
+                usize::try_from(decoded.attr_locator.byte_offset).expect("attribute offset");
+            let attr_end = attr_start
+                + usize::try_from(decoded.attr_locator.byte_length).expect("attribute length");
+            let attr_object = artifact_by_key[decoded.attr_locator.object_key.as_str()];
+            let attributes = decode_attribute_row(
+                &attr_object[attr_start..attr_end],
+                &decoded.attr_locator,
+                1024,
+            )
+            .expect("flat attribute locator");
+            assert_eq!(attributes, original.attributes);
+            assert_eq!(decoded.content_hash, original.content_hash);
+            assert_eq!(decoded.source_sequence, original.source_sequence);
+        }
     }
 
     #[test]

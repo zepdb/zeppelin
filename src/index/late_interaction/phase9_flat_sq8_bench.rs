@@ -519,7 +519,7 @@ async fn run_benchmark() -> BenchResult<()> {
         vector_dimension: DIMENSION as u32,
         fde_dimension: FDE_DIMENSION as u32,
         coverage_sequence: 1,
-        candidate_index: placeholder_candidate_index(generation, &namespace),
+        candidate_index: Some(placeholder_candidate_index(generation, &namespace)),
         matrix_objects: matrix_blocks
             .into_iter()
             .map(|block| block.reference)
@@ -530,6 +530,8 @@ async fn run_benchmark() -> BenchResult<()> {
             .collect(),
         fts_objects: Vec::new(),
         artifact_origin: None,
+        candidate_kind: crate::wal::LateCandidateKind::Ivf,
+        flat_candidate: None,
     };
 
     eprintln!("flat-bench: measuring cold hydration");

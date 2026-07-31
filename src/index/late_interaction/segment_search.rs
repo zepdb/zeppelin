@@ -137,7 +137,8 @@ pub(crate) async fn search_segment(
     }
     validate_query_shape(request.segment, &request.exact_query)?;
 
-    let bootstrap = &request.segment.candidate_index.bootstrap;
+    let candidate_index = request.segment.ivf_candidate_index()?;
+    let bootstrap = &candidate_index.bootstrap;
     let bootstrap_size = usize::try_from(bootstrap.size_bytes)
         .map_err(|_| segment_error("candidate bootstrap size exceeds usize"))?;
     if bootstrap_size > request.bounds.max_resident_bytes {
@@ -155,7 +156,7 @@ pub(crate) async fn search_segment(
     };
     let resident = ResidentLateCandidateIndex::from_index_ref(
         &bootstrap_bytes,
-        &request.segment.candidate_index,
+        candidate_index,
         request.bounds.max_resident_bytes,
     )?;
 
@@ -230,7 +231,19 @@ fn validate_query_shape(
             actual: query.vector_dimension(),
         });
     }
-    if segment.fde_dimension != segment.candidate_index.bootstrap.recipe.fde_dimension {
+    let candidate_fde_dimension = match segment.candidate_kind {
+        crate::wal::LateCandidateKind::Ivf => {
+            segment
+                .ivf_candidate_index()?
+                .bootstrap
+                .recipe
+                .fde_dimension
+        }
+        crate::wal::LateCandidateKind::FlatSq8 => {
+            segment.flat_candidate_ref()?.recipe.fde_dimension
+        }
+    };
+    if segment.fde_dimension != candidate_fde_dimension {
         return Err(segment_error(
             "segment and candidate FDE dimensions disagree",
         ));
@@ -582,7 +595,7 @@ mod tests {
             vector_dimension: 2,
             fde_dimension: 2,
             coverage_sequence: 2,
-            candidate_index: candidate.index_ref,
+            candidate_index: Some(candidate.index_ref),
             matrix_objects: matrix_blocks
                 .into_iter()
                 .map(|block| block.reference)
@@ -593,6 +606,8 @@ mod tests {
                 .collect(),
             fts_objects: Vec::new(),
             artifact_origin: None,
+            candidate_kind: crate::wal::LateCandidateKind::Ivf,
+            flat_candidate: None,
         };
         Fixture { store, segment }
     }

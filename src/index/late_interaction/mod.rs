@@ -44,8 +44,8 @@ pub(crate) use candidate::{
 };
 pub(crate) use matrix_artifact::decode_matrix_block;
 pub(crate) use segment_build::{
-    build_late_interaction_segment, LateSegmentBuildConfig, LateSegmentBuildRow,
-    PrebuiltLateFtsArtifact,
+    build_late_interaction_segment, LateCandidateBuild, LateSegmentBuildConfig,
+    LateSegmentBuildRow, PrebuiltLateFtsArtifact,
 };
 
 use thiserror::Error;

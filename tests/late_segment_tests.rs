@@ -182,6 +182,7 @@ fn test_epoch(
     epoch
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn setup_profile_with_recipe(
     store: &ZeppelinStore,
     namespace: &str,

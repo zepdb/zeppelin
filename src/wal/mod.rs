@@ -87,8 +87,8 @@ pub use fragment_cache::WalFragmentCache;
 pub use input_fragment::EncoderInputWalFragment;
 /// Re-exports late-state section, root reference, and retained-source reference.
 pub use late_section::{
-    LateInteractionSegmentRef, LateSegmentObjectRef, LateStateSection, ManifestSectionRef,
-    QuarantineEvidenceRef, SourceInventoryRef,
+    LateCandidateKind, LateInteractionSegmentRef, LateSegmentObjectRef, LateStateSection,
+    ManifestSectionRef, QuarantineEvidenceRef, SourceInventoryRef,
 };
 /// Re-exports namespace lease snapshots and their object-store manager.
 pub use lease::{Lease, LeaseManager};

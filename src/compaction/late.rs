@@ -24,9 +24,9 @@ use crate::fts::inverted_index::InvertedIndex;
 use crate::fts::FtsFieldConfig;
 use crate::index::late_interaction::{
     build_late_interaction_segment, decode_all_candidate_rows, decode_attribute_block,
-    decode_matrix_block, FdeTransform, FetchedLateCandidateCluster, LateCandidateBuildConfig,
-    LateInteractionError, LateRoutingMetric, LateSegmentBuildConfig, LateSegmentBuildRow,
-    PrebuiltLateFtsArtifact,
+    decode_matrix_block, FdeTransform, FetchedLateCandidateCluster, LateCandidateBuild,
+    LateCandidateBuildConfig, LateInteractionError, LateRoutingMetric, LateSegmentBuildConfig,
+    LateSegmentBuildRow, PrebuiltLateFtsArtifact,
 };
 use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
 use crate::storage::{CreateOnlyOutcome, NamespaceObjectFamily, NamespaceObjectKey, ZeppelinStore};
@@ -145,7 +145,7 @@ impl Compactor {
                     coverage_sequence: snapshot.coverage_sequence,
                     max_matrix_object_bytes: self.mmli_config.segment.max_matrix_object_bytes,
                     max_attribute_object_bytes: self.mmli_config.segment.max_matrix_object_bytes,
-                    candidate: LateCandidateBuildConfig {
+                    candidate: LateCandidateBuild::Ivf(LateCandidateBuildConfig {
                         fde_dimension,
                         nlist,
                         probe_budget,
@@ -157,7 +157,7 @@ impl Compactor {
                         ),
                         max_cluster_bytes: self.mmli_config.segment.max_cluster_object_bytes,
                         max_bootstrap_bytes: self.mmli_config.segment.max_resident_bootstrap_bytes,
-                    },
+                    }),
                     artifact_origin: None,
                     fts_artifacts,
                 },
@@ -555,13 +555,13 @@ async fn load_old_segment_rows(
     max_cluster_bytes: usize,
     max_object_bytes: usize,
 ) -> Result<Vec<LateSegmentBuildRow>> {
-    let bootstrap_bytes = store.get(&segment.candidate_index.bootstrap.key).await?;
-    let mut cluster_bytes = Vec::with_capacity(segment.candidate_index.clusters.len());
-    for reference in &segment.candidate_index.clusters {
+    let candidate_index = segment.ivf_candidate_index()?;
+    let bootstrap_bytes = store.get(&candidate_index.bootstrap.key).await?;
+    let mut cluster_bytes = Vec::with_capacity(candidate_index.clusters.len());
+    for reference in &candidate_index.clusters {
         cluster_bytes.push(store.get(&reference.key).await?);
     }
-    let fetched = segment
-        .candidate_index
+    let fetched = candidate_index
         .clusters
         .iter()
         .zip(&cluster_bytes)
@@ -571,7 +571,7 @@ async fn load_old_segment_rows(
         })
         .collect::<Vec<_>>();
     let candidates = decode_all_candidate_rows(
-        &segment.candidate_index,
+        candidate_index,
         &bootstrap_bytes,
         &fetched,
         max_resident_bytes,
