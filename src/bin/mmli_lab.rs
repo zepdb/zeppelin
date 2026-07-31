@@ -119,9 +119,14 @@ struct Job {
     lane: Lane,
     documents: TensorInput,
     queries: TensorInput,
-    official_scores: PathBuf,
+    #[serde(default)]
+    official_scores: Option<PathBuf>,
     #[serde(default)]
     int8_probe: bool,
+    #[serde(default)]
+    precision_ranking_audit: bool,
+    #[serde(default)]
+    precision_ranking_candidates: Option<Vec<PrecisionRankingCandidate>>,
     #[serde(default)]
     chosen_algorithm: Option<Algorithm>,
     #[serde(default)]
@@ -184,6 +189,16 @@ struct ResultDocument {
     precision_retention: Option<PrecisionRetentionReport>,
     int8_probe: Option<Int8ProbeReport>,
     exact_frontier_gaps: Option<Vec<ExactFrontierGap>>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrecisionRankingAuditResultDocument {
+    schema_version: u32,
+    lane: Lane,
+    seed: u64,
+    corpus_stats: TensorSummary,
+    query_stats: TensorSummary,
+    precision_ranking_audit: PrecisionRankingAuditReport,
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,6 +364,84 @@ struct PrecisionRetentionReport {
     f32_top_1_same_rank_fraction: f64,
     f32_top_1_in_f16_top_10_fraction: f64,
     f32_top_10_recall_in_f16_top_10: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct PrecisionRankingAuditReport {
+    reference: &'static str,
+    query_count: usize,
+    gold_count: usize,
+    candidates: Vec<PrecisionRankingCandidateReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrecisionRankingCandidateReport {
+    candidate: PrecisionRankingCandidate,
+    top_10_set_exactly_equal_query_fraction: f64,
+    f32_top_10_recovered_in_candidate_top_10: f64,
+    ordered_top_10_exactly_equal_query_fraction: f64,
+    per_rank_same_document_fractions: Vec<RankSameDocumentFraction>,
+    f32_top_1_same_document_fraction: f64,
+    f32_top_1_in_candidate_top_10_fraction: f64,
+    coordinate_bytes_total: usize,
+    metadata_bytes_per_row: usize,
+    mean_payload_bytes_per_unit: f64,
+    saving_fraction_vs_f16: f64,
+    retrieval_decode_cost: RetrievalDecodeCost,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct RetrievalDecodeCost {
+    basis: &'static str,
+    scope: &'static str,
+    coordinate_conversions_total: usize,
+    scale_values_read_total: usize,
+    offset_values_read_total: usize,
+    dequantize_multiplications_total: usize,
+    dequantize_additions_total: usize,
+    renormalized_rows_total: usize,
+    norm_accumulations_total: usize,
+    square_roots_total: usize,
+    normalization_divisions_total: usize,
+    maxsim_scoring_included: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+enum PrecisionRankingCandidate {
+    F16,
+    Int8GlobalScale,
+    Int8PerRowCalibrated,
+    Int8PerRowCalibratedRenormalized,
+    Int8SymmetricPerRowRenormalized,
+    #[serde(rename = "int8_groupwise_32_symmetric_renormalized")]
+    Int8Groupwise32SymmetricRenormalized,
+    #[serde(rename = "int8_groupwise_16_symmetric_renormalized")]
+    Int8Groupwise16SymmetricRenormalized,
+}
+
+const ALL_PRECISION_RANKING_CANDIDATES: [PrecisionRankingCandidate; 7] = [
+    PrecisionRankingCandidate::F16,
+    PrecisionRankingCandidate::Int8GlobalScale,
+    PrecisionRankingCandidate::Int8PerRowCalibrated,
+    PrecisionRankingCandidate::Int8PerRowCalibratedRenormalized,
+    PrecisionRankingCandidate::Int8SymmetricPerRowRenormalized,
+    PrecisionRankingCandidate::Int8Groupwise32SymmetricRenormalized,
+    PrecisionRankingCandidate::Int8Groupwise16SymmetricRenormalized,
+];
+
+#[derive(Debug, Serialize)]
+struct RankSameDocumentFraction {
+    rank: usize,
+    fraction: f64,
+}
+
+#[derive(Clone, Copy)]
+struct CandidatePayload {
+    coordinate_bytes_total: usize,
+    metadata_bytes_per_row: usize,
+    mean_payload_bytes_per_unit: f64,
+    saving_fraction_vs_f16: f64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -553,7 +646,36 @@ fn run() -> Result<()> {
         .as_ref()
         .map(|(_, f32_truth)| compare_precision_truth(f32_truth, &identity_truth));
 
-    let official_path = resolve_path(base, &job.official_scores);
+    if job.precision_ranking_audit {
+        let (_, f32_truth) = full_precision.as_ref().ok_or_else(|| {
+            LabError::Invalid(
+                "precision_ranking_audit requires paired f32 document and query references"
+                    .to_string(),
+            )
+        })?;
+        return write_stdout_json(&PrecisionRankingAuditResultDocument {
+            schema_version: 2,
+            lane: job.lane,
+            seed: FDE_SEED,
+            corpus_stats: summarize(&documents),
+            query_stats: summarize(&queries),
+            precision_ranking_audit: evaluate_precision_ranking_audit(
+                &documents,
+                &queries,
+                f32_truth,
+                &identity_truth,
+                job.precision_ranking_candidates
+                    .as_deref()
+                    .unwrap_or(&ALL_PRECISION_RANKING_CANDIDATES),
+            )?,
+        });
+    }
+
+    let official_scores = job
+        .official_scores
+        .as_ref()
+        .ok_or_else(|| LabError::Invalid("non-audit jobs require official_scores".to_string()))?;
+    let official_path = resolve_path(base, official_scores);
     let official_scores: Vec<OfficialScore> = read_json(&official_path)?;
     let parity = evaluate_parity(&documents, &queries, &official_scores)?;
     let evaluation = evaluate_fixed_grid(
@@ -615,9 +737,13 @@ fn run() -> Result<()> {
         exact_frontier_gaps: evaluation.exact_frontier_gaps,
     };
 
+    write_stdout_json(&result)
+}
+
+fn write_stdout_json(result: &impl Serialize) -> Result<()> {
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
-    serde_json::to_writer_pretty(&mut writer, &result).map_err(|source| LabError::Json {
+    serde_json::to_writer_pretty(&mut writer, result).map_err(|source| LabError::Json {
         path: PathBuf::from("<stdout>"),
         source,
     })?;
@@ -651,19 +777,51 @@ fn parse_cli() -> Result<PathBuf> {
 }
 
 fn validate_lane_contract(job: &Job) -> Result<()> {
-    match job.lane {
-        Lane::Text => {
-            if job.chosen_algorithm.is_some() || job.chosen_centering.is_some() {
-                return Err(LabError::Invalid(
-                    "text jobs must not provide visual-only settings".to_string(),
-                ));
+    if !job.precision_ranking_audit && job.official_scores.is_none() {
+        return Err(LabError::Invalid(
+            "non-audit jobs require official_scores".to_string(),
+        ));
+    }
+    if !job.precision_ranking_audit {
+        match job.lane {
+            Lane::Text => {
+                if job.chosen_algorithm.is_some() || job.chosen_centering.is_some() {
+                    return Err(LabError::Invalid(
+                        "text jobs must not provide visual-only settings".to_string(),
+                    ));
+                }
+            }
+            Lane::Visual => {
+                if job.chosen_algorithm.is_none() || job.chosen_centering.is_none() {
+                    return Err(LabError::Invalid(
+                        "visual jobs require chosen_algorithm and chosen_centering".to_string(),
+                    ));
+                }
             }
         }
-        Lane::Visual => {
-            if job.chosen_algorithm.is_none() || job.chosen_centering.is_none() {
-                return Err(LabError::Invalid(
-                    "visual jobs require chosen_algorithm and chosen_centering".to_string(),
-                ));
+    }
+    if job.precision_ranking_audit && job.int8_probe {
+        return Err(LabError::Invalid(
+            "precision_ranking_audit cannot run with int8_probe".to_string(),
+        ));
+    }
+    if let Some(candidates) = &job.precision_ranking_candidates {
+        if !job.precision_ranking_audit {
+            return Err(LabError::Invalid(
+                "precision_ranking_candidates requires precision_ranking_audit".to_string(),
+            ));
+        }
+        if candidates.is_empty() {
+            return Err(LabError::Invalid(
+                "precision_ranking_candidates must not be empty".to_string(),
+            ));
+        }
+        let mut seen = HashSet::with_capacity(candidates.len());
+        for candidate in candidates {
+            if !seen.insert(*candidate) {
+                return Err(LabError::Invalid(format!(
+                    "precision_ranking_candidates repeats {candidate:?}"
+                )));
             }
         }
     }
@@ -672,6 +830,13 @@ fn validate_lane_contract(job: &Job) -> Result<()> {
     {
         return Err(LabError::Invalid(
             "int8_probe requires paired f32 document and query references".to_string(),
+        ));
+    }
+    if job.precision_ranking_audit
+        && (job.full_precision_documents.is_none() || job.full_precision_queries.is_none())
+    {
+        return Err(LabError::Invalid(
+            "precision_ranking_audit requires paired f32 document and query references".to_string(),
         ));
     }
     Ok(())
@@ -1183,6 +1348,281 @@ fn compare_precision_truth(
     }
 }
 
+fn evaluate_precision_ranking_audit(
+    documents: &TensorSet,
+    queries: &TensorSet,
+    f32_truth: &[ExactTruth],
+    f16_truth: &[ExactTruth],
+    requested_candidates: &[PrecisionRankingCandidate],
+) -> Result<PrecisionRankingAuditReport> {
+    let mut candidates = Vec::with_capacity(requested_candidates.len());
+    for &candidate in requested_candidates {
+        candidates.push(evaluate_precision_ranking_candidate(
+            documents, queries, f32_truth, f16_truth, candidate,
+        )?);
+    }
+
+    Ok(PrecisionRankingAuditReport {
+        reference: "f32_documents_f32_queries",
+        query_count: f32_truth.len(),
+        gold_count: f32_truth.len() * TRUTH_K,
+        candidates,
+    })
+}
+
+fn evaluate_precision_ranking_candidate(
+    documents: &TensorSet,
+    queries: &TensorSet,
+    f32_truth: &[ExactTruth],
+    f16_truth: &[ExactTruth],
+    candidate: PrecisionRankingCandidate,
+) -> Result<PrecisionRankingCandidateReport> {
+    let payload = precision_ranking_candidate_payload(documents, candidate)?;
+    let retrieval_decode_cost = precision_ranking_candidate_decode_cost(documents, candidate)?;
+    if candidate == PrecisionRankingCandidate::F16 {
+        return Ok(compare_precision_ranking_candidate(
+            candidate,
+            f32_truth,
+            f16_truth,
+            payload,
+            retrieval_decode_cost,
+        ));
+    }
+
+    let mut candidate_documents = match candidate {
+        PrecisionRankingCandidate::F16 => unreachable!("f16 returned above"),
+        PrecisionRankingCandidate::Int8GlobalScale => {
+            quantize_documents(documents, Int8Variant::GlobalScale)?
+        }
+        PrecisionRankingCandidate::Int8PerRowCalibrated
+        | PrecisionRankingCandidate::Int8PerRowCalibratedRenormalized => {
+            quantize_documents(documents, Int8Variant::PerRowCalibrated)?
+        }
+        PrecisionRankingCandidate::Int8SymmetricPerRowRenormalized => {
+            quantize_symmetric_renormalized(documents, documents.sidecar.dim)?
+        }
+        PrecisionRankingCandidate::Int8Groupwise32SymmetricRenormalized => {
+            quantize_symmetric_renormalized(documents, 32)?
+        }
+        PrecisionRankingCandidate::Int8Groupwise16SymmetricRenormalized => {
+            quantize_symmetric_renormalized(documents, 16)?
+        }
+    };
+    if candidate == PrecisionRankingCandidate::Int8PerRowCalibratedRenormalized {
+        renormalize_rows(&mut candidate_documents, documents.sidecar.dim)?;
+    }
+    let prepared = PreparedValues {
+        documents: Cow::Borrowed(&candidate_documents),
+        queries: Cow::Borrowed(&queries.values),
+    };
+    let candidate_truth = exhaustive_truth(documents, queries, &prepared)?;
+    Ok(compare_precision_ranking_candidate(
+        candidate,
+        f32_truth,
+        &candidate_truth,
+        payload,
+        retrieval_decode_cost,
+    ))
+}
+
+fn precision_ranking_candidate_payload(
+    documents: &TensorSet,
+    candidate: PrecisionRankingCandidate,
+) -> Result<CandidatePayload> {
+    let (coordinate_width, metadata_bytes_per_row) = match candidate {
+        PrecisionRankingCandidate::F16 => (DType::F16.byte_width(), 0),
+        PrecisionRankingCandidate::Int8GlobalScale => (1, 0),
+        PrecisionRankingCandidate::Int8PerRowCalibrated
+        | PrecisionRankingCandidate::Int8PerRowCalibratedRenormalized => (1, 8),
+        PrecisionRankingCandidate::Int8SymmetricPerRowRenormalized => (1, 2),
+        PrecisionRankingCandidate::Int8Groupwise32SymmetricRenormalized => (
+            1,
+            documents
+                .sidecar
+                .dim
+                .div_ceil(32)
+                .checked_mul(DType::F16.byte_width())
+                .ok_or_else(|| {
+                    LabError::Invalid("groupwise-32 metadata size overflows".to_string())
+                })?,
+        ),
+        PrecisionRankingCandidate::Int8Groupwise16SymmetricRenormalized => (
+            1,
+            documents
+                .sidecar
+                .dim
+                .div_ceil(16)
+                .checked_mul(DType::F16.byte_width())
+                .ok_or_else(|| {
+                    LabError::Invalid("groupwise-16 metadata size overflows".to_string())
+                })?,
+        ),
+    };
+    candidate_payload(documents, coordinate_width, metadata_bytes_per_row)
+}
+
+fn precision_ranking_candidate_decode_cost(
+    documents: &TensorSet,
+    candidate: PrecisionRankingCandidate,
+) -> Result<RetrievalDecodeCost> {
+    let scalar_count = documents.values.len();
+    let row_count = documents.total_rows;
+    let renormalized = matches!(
+        candidate,
+        PrecisionRankingCandidate::Int8PerRowCalibratedRenormalized
+            | PrecisionRankingCandidate::Int8SymmetricPerRowRenormalized
+            | PrecisionRankingCandidate::Int8Groupwise32SymmetricRenormalized
+            | PrecisionRankingCandidate::Int8Groupwise16SymmetricRenormalized
+    );
+    let (scale_reads, offset_reads, dequant_multiplications, dequant_additions) = match candidate {
+        PrecisionRankingCandidate::F16 => (0, 0, 0, 0),
+        PrecisionRankingCandidate::Int8GlobalScale => (0, 0, scalar_count, 0),
+        PrecisionRankingCandidate::Int8PerRowCalibrated
+        | PrecisionRankingCandidate::Int8PerRowCalibratedRenormalized => {
+            (row_count, row_count, scalar_count, scalar_count)
+        }
+        PrecisionRankingCandidate::Int8SymmetricPerRowRenormalized => {
+            (row_count, 0, scalar_count, 0)
+        }
+        PrecisionRankingCandidate::Int8Groupwise32SymmetricRenormalized => (
+            row_count
+                .checked_mul(documents.sidecar.dim.div_ceil(32))
+                .ok_or_else(|| {
+                    LabError::Invalid("groupwise-32 scale-read count overflows".to_string())
+                })?,
+            0,
+            scalar_count,
+            0,
+        ),
+        PrecisionRankingCandidate::Int8Groupwise16SymmetricRenormalized => (
+            row_count
+                .checked_mul(documents.sidecar.dim.div_ceil(16))
+                .ok_or_else(|| {
+                    LabError::Invalid("groupwise-16 scale-read count overflows".to_string())
+                })?,
+            0,
+            scalar_count,
+            0,
+        ),
+    };
+    Ok(RetrievalDecodeCost {
+        basis: "analytic_exact_counts",
+        scope: "payload_to_f32_before_maxsim",
+        coordinate_conversions_total: scalar_count,
+        scale_values_read_total: scale_reads,
+        offset_values_read_total: offset_reads,
+        dequantize_multiplications_total: dequant_multiplications,
+        dequantize_additions_total: dequant_additions,
+        renormalized_rows_total: if renormalized { row_count } else { 0 },
+        norm_accumulations_total: if renormalized { scalar_count } else { 0 },
+        square_roots_total: if renormalized { row_count } else { 0 },
+        normalization_divisions_total: if renormalized { scalar_count } else { 0 },
+        maxsim_scoring_included: false,
+    })
+}
+
+fn compare_precision_ranking_candidate(
+    candidate: PrecisionRankingCandidate,
+    reference: &[ExactTruth],
+    candidate_truth: &[ExactTruth],
+    payload: CandidatePayload,
+    retrieval_decode_cost: RetrievalDecodeCost,
+) -> PrecisionRankingCandidateReport {
+    assert_eq!(reference.len(), candidate_truth.len());
+    let mut top_10_set_exactly_equal_queries = 0usize;
+    let mut top_10_recovered = 0usize;
+    let mut ordered_top_10_exactly_equal_queries = 0usize;
+    let mut per_rank_same_document = [0usize; TRUTH_K];
+    let mut top_1_same_document = 0usize;
+    let mut top_1_in_candidate_top_10 = 0usize;
+
+    for (reference_query, candidate_query) in reference.iter().zip(candidate_truth) {
+        top_10_set_exactly_equal_queries += usize::from(
+            reference_query
+                .top_documents
+                .iter()
+                .all(|document| candidate_query.top_documents.contains(document)),
+        );
+        top_10_recovered += reference_query
+            .top_documents
+            .iter()
+            .filter(|document| candidate_query.top_documents.contains(document))
+            .count();
+        ordered_top_10_exactly_equal_queries +=
+            usize::from(reference_query.top_documents == candidate_query.top_documents);
+        for (rank, (reference_document, candidate_document)) in reference_query
+            .top_documents
+            .iter()
+            .zip(&candidate_query.top_documents)
+            .enumerate()
+        {
+            per_rank_same_document[rank] += usize::from(reference_document == candidate_document);
+        }
+        let reference_top_1 = reference_query.top_documents[0];
+        top_1_same_document += usize::from(reference_top_1 == candidate_query.top_documents[0]);
+        top_1_in_candidate_top_10 +=
+            usize::from(candidate_query.top_documents.contains(&reference_top_1));
+    }
+
+    let query_count = reference.len();
+    PrecisionRankingCandidateReport {
+        candidate,
+        top_10_set_exactly_equal_query_fraction: top_10_set_exactly_equal_queries as f64
+            / query_count as f64,
+        f32_top_10_recovered_in_candidate_top_10: top_10_recovered as f64
+            / (query_count * TRUTH_K) as f64,
+        ordered_top_10_exactly_equal_query_fraction: ordered_top_10_exactly_equal_queries as f64
+            / query_count as f64,
+        per_rank_same_document_fractions: per_rank_same_document
+            .into_iter()
+            .enumerate()
+            .map(|(rank, count)| RankSameDocumentFraction {
+                rank: rank + 1,
+                fraction: count as f64 / query_count as f64,
+            })
+            .collect(),
+        f32_top_1_same_document_fraction: top_1_same_document as f64 / query_count as f64,
+        f32_top_1_in_candidate_top_10_fraction: top_1_in_candidate_top_10 as f64
+            / query_count as f64,
+        coordinate_bytes_total: payload.coordinate_bytes_total,
+        metadata_bytes_per_row: payload.metadata_bytes_per_row,
+        mean_payload_bytes_per_unit: payload.mean_payload_bytes_per_unit,
+        saving_fraction_vs_f16: payload.saving_fraction_vs_f16,
+        retrieval_decode_cost,
+    }
+}
+
+fn candidate_payload(
+    documents: &TensorSet,
+    coordinate_width: usize,
+    metadata_bytes_per_row: usize,
+) -> Result<CandidatePayload> {
+    let coordinate_bytes_total = documents
+        .values
+        .len()
+        .checked_mul(coordinate_width)
+        .ok_or_else(|| LabError::Invalid("coordinate payload size overflows".to_string()))?;
+    let metadata_bytes_total = documents
+        .total_rows
+        .checked_mul(metadata_bytes_per_row)
+        .ok_or_else(|| LabError::Invalid("metadata payload size overflows".to_string()))?;
+    let payload_bytes_total = coordinate_bytes_total
+        .checked_add(metadata_bytes_total)
+        .ok_or_else(|| LabError::Invalid("combined payload size overflows".to_string()))?;
+    let f16_bytes_total = documents
+        .values
+        .len()
+        .checked_mul(DType::F16.byte_width())
+        .ok_or_else(|| LabError::Invalid("f16 payload size overflows".to_string()))?;
+    Ok(CandidatePayload {
+        coordinate_bytes_total,
+        metadata_bytes_per_row,
+        mean_payload_bytes_per_unit: payload_bytes_total as f64
+            / documents.sidecar.ids.len() as f64,
+        saving_fraction_vs_f16: 1.0 - payload_bytes_total as f64 / f16_bytes_total as f64,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_int8_probe(
     lane: Lane,
@@ -1359,6 +1799,142 @@ fn quantize_documents(documents: &TensorSet, variant: Int8Variant) -> Result<Vec
         }
     }
     Ok(dequantized)
+}
+
+fn quantize_symmetric_renormalized(documents: &TensorSet, group_size: usize) -> Result<Vec<f32>> {
+    if documents.sidecar.dtype != DType::F16 {
+        return Err(LabError::Invalid(
+            "symmetric int8 audit requires f16 primary documents".to_string(),
+        ));
+    }
+    if group_size == 0 {
+        return Err(LabError::Invalid(
+            "symmetric int8 group size must be nonzero".to_string(),
+        ));
+    }
+    let mut dequantized = Vec::with_capacity(documents.values.len());
+    for (row_index, row) in documents
+        .values
+        .chunks_exact(documents.sidecar.dim)
+        .enumerate()
+    {
+        for (group_index, group) in row.chunks(group_size).enumerate() {
+            let maximum_absolute_value = group.iter().copied().map(f32::abs).fold(0.0, f32::max);
+            if !maximum_absolute_value.is_finite() || maximum_absolute_value == 0.0 {
+                return Err(LabError::Invalid(format!(
+                    "symmetric int8 row {row_index} group {group_index} has zero or non-finite \
+                     range"
+                )));
+            }
+            let scale = round_f32_through_f16(maximum_absolute_value / 127.0);
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(LabError::Invalid(format!(
+                    "symmetric int8 row {row_index} group {group_index} has invalid f16 scale"
+                )));
+            }
+            for &value in group {
+                let quantized = quantize_ties_away_from_zero(value, scale)?;
+                let reconstructed = f32::from(quantized) * scale;
+                if !reconstructed.is_finite() {
+                    return Err(LabError::Invalid(format!(
+                        "symmetric int8 row {row_index} group {group_index} reconstructed a \
+                         non-finite coordinate"
+                    )));
+                }
+                dequantized.push(reconstructed);
+            }
+        }
+    }
+    renormalize_rows(&mut dequantized, documents.sidecar.dim)?;
+    Ok(dequantized)
+}
+
+fn quantize_ties_away_from_zero(value: f32, scale: f32) -> Result<i8> {
+    if !value.is_finite() || !scale.is_finite() || scale <= 0.0 {
+        return Err(LabError::Invalid(
+            "symmetric int8 quantization received zero or non-finite input".to_string(),
+        ));
+    }
+    Ok((value / scale).round().clamp(-127.0, 127.0) as i8)
+}
+
+fn renormalize_rows(values: &mut [f32], dim: usize) -> Result<()> {
+    if dim == 0 || values.len() % dim != 0 {
+        return Err(LabError::Invalid(
+            "row renormalization received an invalid tensor shape".to_string(),
+        ));
+    }
+    for (row_index, row) in values.chunks_exact_mut(dim).enumerate() {
+        let squared_norm = row.iter().try_fold(0.0_f64, |sum, value| {
+            if value.is_finite() {
+                Ok(sum + f64::from(*value) * f64::from(*value))
+            } else {
+                Err(LabError::Invalid(format!(
+                    "row renormalization found non-finite coordinate in row {row_index}"
+                )))
+            }
+        })?;
+        let norm = squared_norm.sqrt();
+        if !norm.is_finite() || norm == 0.0 {
+            return Err(LabError::Invalid(format!(
+                "row renormalization produced zero or non-finite norm for row {row_index}"
+            )));
+        }
+        for value in row {
+            *value = (f64::from(*value) / norm) as f32;
+            if !value.is_finite() {
+                return Err(LabError::Invalid(format!(
+                    "row renormalization produced non-finite coordinate in row {row_index}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn round_f32_through_f16(value: f32) -> f32 {
+    f16_to_f32(f32_to_f16_bits(value))
+}
+
+fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let fraction = bits & 0x007f_ffff;
+    if exponent == 0xff {
+        let half_fraction = if fraction == 0 {
+            0
+        } else {
+            (fraction >> 13).max(1)
+        };
+        return (sign | 0x7c00 | half_fraction) as u16;
+    }
+
+    let half_exponent = exponent - 127 + 15;
+    if half_exponent >= 0x1f {
+        return (sign | 0x7c00) as u16;
+    }
+    if half_exponent <= 0 {
+        if half_exponent < -10 {
+            return sign as u16;
+        }
+        let significand = fraction | 0x0080_0000;
+        let shift = (14 - half_exponent) as u32;
+        let mut half_fraction = significand >> shift;
+        let remainder = significand & ((1_u32 << shift) - 1);
+        let halfway = 1_u32 << (shift - 1);
+        if remainder > halfway || (remainder == halfway && half_fraction & 1 == 1) {
+            half_fraction += 1;
+        }
+        return (sign | half_fraction) as u16;
+    }
+
+    let mut half = sign | ((half_exponent as u32) << 10) | (fraction >> 13);
+    let remainder = fraction & 0x1fff;
+    if remainder > 0x1000 || (remainder == 0x1000 && half & 1 == 1) {
+        half += 1;
+    }
+    half as u16
 }
 
 fn compare_int8_truth(reference: &[ExactTruth], int8: &[ExactTruth]) -> (f64, f64) {
@@ -2559,4 +3135,234 @@ where
             })?
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn precision_ranking_comparison_separates_set_order_rank_and_recovery() {
+        let reference = [
+            truth([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            truth([10, 11, 12, 13, 14, 15, 16, 17, 18, 19]),
+            truth([20, 21, 22, 23, 24, 25, 26, 27, 28, 29]),
+        ];
+        let candidate = [
+            truth([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            truth([11, 10, 12, 13, 14, 15, 16, 17, 18, 19]),
+            truth([20, 21, 22, 23, 24, 25, 26, 27, 28, 99]),
+        ];
+
+        let report = compare_precision_ranking_candidate(
+            PrecisionRankingCandidate::F16,
+            &reference,
+            &candidate,
+            CandidatePayload {
+                coordinate_bytes_total: 0,
+                metadata_bytes_per_row: 0,
+                mean_payload_bytes_per_unit: 0.0,
+                saving_fraction_vs_f16: 0.0,
+            },
+            RetrievalDecodeCost {
+                basis: "analytic_exact_counts",
+                scope: "payload_to_f32_before_maxsim",
+                coordinate_conversions_total: 0,
+                scale_values_read_total: 0,
+                offset_values_read_total: 0,
+                dequantize_multiplications_total: 0,
+                dequantize_additions_total: 0,
+                renormalized_rows_total: 0,
+                norm_accumulations_total: 0,
+                square_roots_total: 0,
+                normalization_divisions_total: 0,
+                maxsim_scoring_included: false,
+            },
+        );
+        assert_eq!(report.top_10_set_exactly_equal_query_fraction, 2.0 / 3.0);
+        assert_eq!(report.f32_top_10_recovered_in_candidate_top_10, 29.0 / 30.0);
+        assert_eq!(
+            report.ordered_top_10_exactly_equal_query_fraction,
+            1.0 / 3.0
+        );
+        assert_eq!(
+            report
+                .per_rank_same_document_fractions
+                .iter()
+                .map(|rank| (rank.rank, rank.fraction))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 2.0 / 3.0),
+                (2, 2.0 / 3.0),
+                (3, 1.0),
+                (4, 1.0),
+                (5, 1.0),
+                (6, 1.0),
+                (7, 1.0),
+                (8, 1.0),
+                (9, 1.0),
+                (10, 2.0 / 3.0),
+            ]
+        );
+        assert_eq!(report.f32_top_1_same_document_fraction, 2.0 / 3.0);
+        assert_eq!(report.f32_top_1_in_candidate_top_10_fraction, 1.0);
+    }
+
+    #[test]
+    fn symmetric_quantization_is_deterministic_renormalized_and_rounds_scales_to_f16() {
+        let documents = tensor_set(
+            vec![1.0, 0.5, -0.25, -0.75, 0.2, -0.4, 0.8, -1.0],
+            vec![1, 1],
+            4,
+        );
+        let first = quantize_symmetric_renormalized(&documents, 2).expect("quantize");
+        let second = quantize_symmetric_renormalized(&documents, 2).expect("quantize");
+        assert_eq!(first, second);
+        for row in first.chunks_exact(4) {
+            let norm = row
+                .iter()
+                .map(|value| f64::from(*value) * f64::from(*value))
+                .sum::<f64>()
+                .sqrt();
+            assert!((norm - 1.0).abs() < 1.0e-6);
+        }
+        assert_eq!(round_f32_through_f16(0.1), f16_to_f32(0x2e66));
+        assert_eq!(
+            quantize_ties_away_from_zero(0.5, 1.0).expect("positive tie"),
+            1
+        );
+        assert_eq!(
+            quantize_ties_away_from_zero(-0.5, 1.0).expect("negative tie"),
+            -1
+        );
+    }
+
+    #[test]
+    fn audit_quantizers_fail_loud_on_zero_and_non_finite_rows() {
+        let zero_group = tensor_set(vec![0.0, 0.0, 1.0, -1.0], vec![1], 4);
+        assert!(matches!(
+            quantize_symmetric_renormalized(&zero_group, 2),
+            Err(LabError::Invalid(_))
+        ));
+        let non_finite = tensor_set(vec![f32::NAN, 1.0], vec![1], 2);
+        assert!(matches!(
+            quantize_symmetric_renormalized(&non_finite, 2),
+            Err(LabError::Invalid(_))
+        ));
+
+        let mut zero_row = [0.0_f32, 0.0];
+        assert!(matches!(
+            renormalize_rows(&mut zero_row, 2),
+            Err(LabError::Invalid(_))
+        ));
+        let mut non_finite_row = [f32::INFINITY, 1.0];
+        assert!(matches!(
+            renormalize_rows(&mut non_finite_row, 2),
+            Err(LabError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn payload_accounting_includes_exact_coordinate_and_row_metadata_bytes() {
+        let documents = tensor_set(vec![1.0; 8], vec![1, 1], 4);
+        let f16 = candidate_payload(&documents, 2, 0).expect("f16 payload");
+        assert_eq!(f16.coordinate_bytes_total, 16);
+        assert_eq!(f16.metadata_bytes_per_row, 0);
+        assert_eq!(f16.mean_payload_bytes_per_unit, 8.0);
+        assert_eq!(f16.saving_fraction_vs_f16, 0.0);
+
+        let int8_with_f16_scale = candidate_payload(&documents, 1, 2).expect("int8 payload");
+        assert_eq!(int8_with_f16_scale.coordinate_bytes_total, 8);
+        assert_eq!(int8_with_f16_scale.metadata_bytes_per_row, 2);
+        assert_eq!(int8_with_f16_scale.mean_payload_bytes_per_unit, 6.0);
+        assert_eq!(int8_with_f16_scale.saving_fraction_vs_f16, 0.25);
+    }
+
+    #[test]
+    fn retrieval_decode_costs_are_exact_analytic_counts() {
+        let documents = tensor_set(vec![1.0; 128], vec![1, 1], 64);
+        let f16 =
+            precision_ranking_candidate_decode_cost(&documents, PrecisionRankingCandidate::F16)
+                .expect("f16 cost");
+        assert_eq!(f16.coordinate_conversions_total, 128);
+        assert_eq!(f16.dequantize_multiplications_total, 0);
+        assert!(!f16.maxsim_scoring_included);
+
+        let affine = precision_ranking_candidate_decode_cost(
+            &documents,
+            PrecisionRankingCandidate::Int8PerRowCalibratedRenormalized,
+        )
+        .expect("affine cost");
+        assert_eq!(affine.scale_values_read_total, 2);
+        assert_eq!(affine.offset_values_read_total, 2);
+        assert_eq!(affine.dequantize_multiplications_total, 128);
+        assert_eq!(affine.dequantize_additions_total, 128);
+        assert_eq!(affine.renormalized_rows_total, 2);
+        assert_eq!(affine.norm_accumulations_total, 128);
+        assert_eq!(affine.square_roots_total, 2);
+        assert_eq!(affine.normalization_divisions_total, 128);
+
+        let groupwise_32 = precision_ranking_candidate_decode_cost(
+            &documents,
+            PrecisionRankingCandidate::Int8Groupwise32SymmetricRenormalized,
+        )
+        .expect("groupwise-32 cost");
+        assert_eq!(groupwise_32.scale_values_read_total, 4);
+        let groupwise_16 = precision_ranking_candidate_decode_cost(
+            &documents,
+            PrecisionRankingCandidate::Int8Groupwise16SymmetricRenormalized,
+        )
+        .expect("groupwise-16 cost");
+        assert_eq!(groupwise_16.scale_values_read_total, 8);
+    }
+
+    #[test]
+    fn groupwise_candidate_names_include_group_size_separator() {
+        for (name, expected) in [
+            (
+                "int8_groupwise_32_symmetric_renormalized",
+                PrecisionRankingCandidate::Int8Groupwise32SymmetricRenormalized,
+            ),
+            (
+                "int8_groupwise_16_symmetric_renormalized",
+                PrecisionRankingCandidate::Int8Groupwise16SymmetricRenormalized,
+            ),
+        ] {
+            let parsed: PrecisionRankingCandidate =
+                serde_json::from_str(&format!("\"{name}\"")).expect("deserialize candidate");
+            assert_eq!(parsed, expected);
+            assert_eq!(
+                serde_json::to_string(&parsed).expect("serialize candidate"),
+                format!("\"{name}\"")
+            );
+        }
+    }
+
+    fn truth(top_documents: [usize; TRUTH_K]) -> ExactTruth {
+        ExactTruth {
+            rank_10: (top_documents[TRUTH_K - 1], 0.0),
+            rank_100: (top_documents[TRUTH_K - 1], 0.0),
+            top_documents: top_documents.to_vec(),
+        }
+    }
+
+    fn tensor_set(values: Vec<f32>, rows: Vec<usize>, dim: usize) -> TensorSet {
+        let mut scalar_offsets = Vec::with_capacity(rows.len());
+        let mut offset = 0usize;
+        for &row_count in &rows {
+            scalar_offsets.push(offset);
+            offset += row_count * dim;
+        }
+        TensorSet {
+            sidecar: TensorSidecar {
+                ids: (0..rows.len()).map(|index| index.to_string()).collect(),
+                rows: rows.clone(),
+                dim,
+                dtype: DType::F16,
+            },
+            values,
+            scalar_offsets,
+            total_rows: rows.into_iter().sum(),
+        }
+    }
 }

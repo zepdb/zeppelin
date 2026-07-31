@@ -529,6 +529,41 @@ One seed and one repeat were used. Model and dataset files were downloaded at ex
 - Decision: reject int8 document matrix payloads; retain f16 for Phase 6.
 - The binding candidate gate remains measured against f32 exact truth. These probe readouts keep the FDE ranking unchanged and use each int8 variant's exact top-10 as the diagnostic truth.
 
+## int8 product-ranking follow-up
+
+This operator-authorized follow-up explicitly rebaselines the format decision
+to product-visible ranking rather than raw MaxSim numerical parity. The
+earlier frozen thresholds remain recorded measurements and still fail. Full
+per-rank results and exact decode-operation counts are in
+`results/int8-ranking.md` and `results/int8-ranking.json`.
+
+| Lane | Representation | Exact top-10 set/query | Exact order/query | f32 top-10 recovered | Same top-1 | Missed memberships | Saving vs f16 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Text | f16 | 0.990983 | 0.958521 | 0.999098 | 0.999098 | 10/11090 | — |
+| Text | affine per-row | 0.808837 | 0.409378 | 0.980613 | 0.988278 | 215/11090 | 0.468750 |
+| Text | affine per-row + renorm | 0.935077 | 0.712353 | 0.993508 | 0.997295 | 72/11090 | 0.468750 |
+| Text | groupwise-32 + renorm | 0.936880 | 0.738503 | 0.993688 | 0.998197 | 70/11090 | 0.468750 |
+| Text | groupwise-16 + renorm | 0.941389 | 0.744815 | 0.994139 | 0.998197 | 65/11090 | 0.437500 |
+| Visual | f16 | 1.000000 | 0.988743 | 1.000000 | 0.996248 | 0/5330 | — |
+| Visual | affine per-row | 0.958724 | 0.780488 | 0.995872 | 0.992495 | 22/5330 | 0.468750 |
+| Visual | groupwise-32 + renorm | 0.973734 | 0.806754 | 0.997373 | 0.988743 | 14/5330 | 0.468750 |
+| Visual | groupwise-16 + renorm | 0.973734 | 0.829268 | 0.997373 | 0.986867 | 14/5330 | 0.437500 |
+
+- Whole-row renormalization is the dominant improvement: affine text misses
+  fall from 215 to 72 at identical payload size.
+- Groupwise-32 is the balanced single-format recommendation: it preserves
+  affine's 46.875% saving, improves top-10 membership and complete-order
+  agreement in both lanes, and avoids groupwise-16's extra scale metadata.
+- Groupwise-16 is the measured quality ceiling among the fixed cells: five
+  fewer text membership misses and 12 more exactly ordered visual queries
+  than groupwise-32, at 43.750% saving and one extra visual top-1 flip.
+- The decided product shape is dual-format: f16 remains the default and
+  `int8_sym_v1 { group_size }` stays fail-closed until the production writer
+  and decoder earn a qualification stamp.
+- The current draft stamp requires same-top-1 ≥ 99.5%. Neither visual
+  groupwise lab cell meets it (G32 98.874%, G16 98.687%), so final per-lane
+  thresholds remain unsigned and INT8 activation remains refused.
+
 ## Named decisions and resolved lateon unknowns
 
 - Candidate algorithm: `paper_v1`.

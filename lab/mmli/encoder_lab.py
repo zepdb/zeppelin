@@ -63,6 +63,21 @@ PAIR_COUNT = 50
 VISUAL_TASK_CAP = 1_000
 PUNCTUATION = list('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~')
 DIAGNOSTIC_CANDIDATE_KS = (50, 100, 300, 500, 600, 700, 1_000, 2_000)
+PRECISION_RANKING_BASELINES = (
+    "f16",
+    "int8_global_scale",
+    "int8_per_row_calibrated",
+)
+PRECISION_RANKING_NEW_CANDIDATES = (
+    "int8_per_row_calibrated_renormalized",
+    "int8_symmetric_per_row_renormalized",
+    "int8_groupwise_32_symmetric_renormalized",
+    "int8_groupwise_16_symmetric_renormalized",
+)
+PRECISION_RANKING_ALL_CANDIDATES = (
+    *PRECISION_RANKING_BASELINES,
+    *PRECISION_RANKING_NEW_CANDIDATES,
+)
 
 
 @dataclass
@@ -312,13 +327,14 @@ def text_encoding_once(
     texts: list[str],
     ids: list[str],
     is_query: bool,
+    progress_label: str = "int8 f32",
 ) -> EncodingResult:
     matrices: list[np.ndarray] = []
     for ordinal, batch in enumerate(batches(texts, BATCH_SIZE), start=1):
         matrices.extend(encoder.encode_batch(batch, is_query))
         if ordinal % 25 == 0:
             print(
-                f"int8 f32 text "
+                f"{progress_label} text "
                 f"{'queries' if is_query else 'documents'}: "
                 f"{len(matrices)}/{len(texts)}",
                 flush=True,
@@ -423,13 +439,14 @@ def visual_encoding_once(
     values: list[Image.Image | str],
     ids: list[str],
     is_query: bool,
+    progress_label: str = "int8 f32",
 ) -> EncodingResult:
     matrices: list[np.ndarray] = []
     for ordinal, batch in enumerate(batches(values, BATCH_SIZE), start=1):
         matrices.extend(visual_batch(model, processor, batch, is_query))
         if ordinal % 10 == 0:
             print(
-                f"int8 f32 visual "
+                f"{progress_label} visual "
                 f"{'queries' if is_query else 'pages'}: "
                 f"{len(matrices)}/{len(values)}",
                 flush=True,
@@ -521,6 +538,208 @@ def validate_precision_reference(
             raise RuntimeError(
                 f"{lane} {role} tensor at index {index} has invalid shape "
                 f"{primary_matrix.shape}"
+            )
+
+
+def require_count(value, label: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError(f"{label} must be a non-negative integer")
+
+
+def require_fraction(value, label: str) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not 0.0 <= float(value) <= 1.0
+    ):
+        raise RuntimeError(f"{label} must be a finite fraction")
+
+
+def resolve_precision_ranking_candidates(
+    lane: str,
+    selected: list[str] | None,
+) -> tuple[list[str], bool]:
+    if lane == "text":
+        if selected:
+            raise RuntimeError(
+                "text ranking-retention always runs all seven candidates"
+            )
+        return list(PRECISION_RANKING_ALL_CANDIDATES), False
+    if not selected:
+        raise RuntimeError(
+            "visual ranking-retention requires one or two --candidate "
+            "selections"
+        )
+    if len(selected) != len(set(selected)):
+        raise RuntimeError("ranking-retention candidates must be unique")
+    if len(selected) > 2:
+        raise RuntimeError(
+            "visual ranking-retention accepts at most two --candidate "
+            "selections"
+        )
+    return [*PRECISION_RANKING_BASELINES, *selected], True
+
+
+def validate_precision_ranking_audit(
+    result: dict,
+    lane: str,
+    queries: EncodingResult,
+    expected_candidates: Sequence[str],
+) -> None:
+    if not isinstance(result, dict) or result.get("lane") != lane:
+        raise RuntimeError("Rust precision-ranking result has the wrong lane")
+    audit = result.get("precision_ranking_audit")
+    if not isinstance(audit, dict):
+        raise RuntimeError("Rust result omitted precision_ranking_audit")
+    if audit.get("reference") != "f32_documents_f32_queries":
+        raise RuntimeError("precision-ranking audit has an unknown reference")
+    for field in ("query_count", "gold_count"):
+        require_count(audit.get(field), f"precision_ranking_audit.{field}")
+    if (
+        audit["query_count"] != len(queries.ids)
+        or audit["gold_count"] != len(queries.ids) * 10
+    ):
+        raise RuntimeError("precision-ranking audit count is incomplete")
+    candidates = audit.get("candidates")
+    if not isinstance(candidates, list):
+        raise RuntimeError("precision_ranking_audit.candidates must be a list")
+    actual_candidates = [
+        candidate.get("candidate")
+        for candidate in candidates
+        if isinstance(candidate, dict)
+    ]
+    if actual_candidates != list(expected_candidates):
+        raise RuntimeError(
+            "precision-ranking audit candidate set or order differs: "
+            f"expected {list(expected_candidates)}, got {actual_candidates}"
+        )
+    fraction_fields = {
+        "top_10_set_exactly_equal_query_fraction",
+        "f32_top_10_recovered_in_candidate_top_10",
+        "ordered_top_10_exactly_equal_query_fraction",
+        "f32_top_1_same_document_fraction",
+        "f32_top_1_in_candidate_top_10_fraction",
+        "saving_fraction_vs_f16",
+    }
+    for candidate in candidates:
+        label = f"precision_ranking_audit.{candidate['candidate']}"
+        for field in fraction_fields:
+            require_fraction(candidate.get(field), f"{label}.{field}")
+        for field in ("coordinate_bytes_total", "metadata_bytes_per_row"):
+            require_count(candidate.get(field), f"{label}.{field}")
+        if (
+            isinstance(candidate.get("mean_payload_bytes_per_unit"), bool)
+            or not isinstance(
+                candidate.get("mean_payload_bytes_per_unit"),
+                (int, float),
+            )
+            or not math.isfinite(
+                float(candidate["mean_payload_bytes_per_unit"])
+            )
+            or candidate["mean_payload_bytes_per_unit"] < 0
+        ):
+            raise RuntimeError(
+                f"{label}.mean_payload_bytes_per_unit must be non-negative"
+            )
+        ranks = candidate.get("per_rank_same_document_fractions")
+        if not isinstance(ranks, list) or len(ranks) != 10:
+            raise RuntimeError(f"{label} must report ranks 1 through 10")
+        for expected_rank, rank in enumerate(ranks, start=1):
+            if not isinstance(rank, dict) or rank.get("rank") != expected_rank:
+                raise RuntimeError(f"{label} rank sequence is incomplete")
+            require_fraction(
+                rank.get("fraction"),
+                f"{label}.per_rank[{expected_rank}].fraction",
+            )
+
+
+def analytic_retrieval_decode_cost(
+    corpus_stats: dict,
+    candidate: str,
+) -> dict:
+    if not isinstance(corpus_stats, dict):
+        raise RuntimeError("ranking lane omitted corpus_stats")
+    scalar_count = corpus_stats.get("scalar_count")
+    row_count = corpus_stats.get("total_rows")
+    dimension = corpus_stats.get("dim")
+    for value, label in (
+        (scalar_count, "corpus_stats.scalar_count"),
+        (row_count, "corpus_stats.total_rows"),
+        (dimension, "corpus_stats.dim"),
+    ):
+        require_count(value, label)
+    if dimension == 0 or scalar_count != row_count * dimension:
+        raise RuntimeError("ranking corpus stats have inconsistent dimensions")
+
+    cost = {
+        "basis": "analytic_exact_counts",
+        "scope": "payload_to_f32_before_maxsim",
+        "coordinate_conversions_total": scalar_count,
+        "scale_values_read_total": 0,
+        "offset_values_read_total": 0,
+        "dequantize_multiplications_total": 0,
+        "dequantize_additions_total": 0,
+        "renormalized_rows_total": 0,
+        "norm_accumulations_total": 0,
+        "square_roots_total": 0,
+        "normalization_divisions_total": 0,
+        "maxsim_scoring_included": False,
+    }
+    if candidate == "f16":
+        return cost
+    cost["dequantize_multiplications_total"] = scalar_count
+    if candidate == "int8_global_scale":
+        return cost
+    if candidate in {
+        "int8_per_row_calibrated",
+        "int8_per_row_calibrated_renormalized",
+    }:
+        cost["scale_values_read_total"] = row_count
+        cost["offset_values_read_total"] = row_count
+        cost["dequantize_additions_total"] = scalar_count
+    elif candidate == "int8_symmetric_per_row_renormalized":
+        cost["scale_values_read_total"] = row_count
+    elif candidate in {
+        "int8_groupwise_32_symmetric_renormalized",
+        "int8_groupwise_16_symmetric_renormalized",
+    }:
+        group_size = 32 if "groupwise_32" in candidate else 16
+        cost["scale_values_read_total"] = (
+            row_count * ((dimension + group_size - 1) // group_size)
+        )
+    else:
+        raise RuntimeError(f"unknown ranking candidate: {candidate}")
+
+    if candidate != "int8_per_row_calibrated":
+        cost["renormalized_rows_total"] = row_count
+        cost["norm_accumulations_total"] = scalar_count
+        cost["square_roots_total"] = row_count
+        cost["normalization_divisions_total"] = scalar_count
+    return cost
+
+
+def backfill_retrieval_decode_cost(lane_result: dict) -> None:
+    if not isinstance(lane_result, dict):
+        raise RuntimeError("ranking lane result must be an object")
+    audit = lane_result.get("precision_ranking_audit")
+    candidates = audit.get("candidates") if isinstance(audit, dict) else None
+    if not isinstance(candidates, list):
+        raise RuntimeError("ranking lane omitted candidate results")
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise RuntimeError("ranking candidate result must be an object")
+        expected = analytic_retrieval_decode_cost(
+            lane_result.get("corpus_stats"),
+            candidate.get("candidate"),
+        )
+        existing = candidate.get("retrieval_decode_cost")
+        if existing is None:
+            candidate["retrieval_decode_cost"] = expected
+        elif existing != expected:
+            raise RuntimeError(
+                f"{candidate.get('candidate')} retrieval_decode_cost "
+                "differs from the analytic contract"
             )
 
 
@@ -2330,6 +2549,273 @@ def visual_lane(
     return result, encoding_metadata(documents, visual_queries)
 
 
+def encode_text_precision_ranking(
+    hf_home: Path,
+) -> tuple[EncodingResult, EncodingResult]:
+    model_path = snapshot_path(hf_home, TEXT_REPO, TEXT_REVISION, "model")
+    dataset_path = snapshot_path(
+        hf_home, SCIFACT_REPO, SCIFACT_REVISION, "dataset"
+    )
+    corpus = load_parquet_directory(dataset_path / "corpus")
+    queries = load_parquet_directory(dataset_path / "queries")
+    document_ids = [str(value) for value in corpus["_id"]]
+    document_texts = [
+        f"{title} {text}".strip()
+        for title, text in zip(corpus["title"], corpus["text"])
+    ]
+    query_ids = [str(value) for value in queries["_id"]]
+    query_texts = [
+        f"{title} {text}".strip()
+        for title, text in zip(queries["title"], queries["text"])
+    ]
+    encoder = TextEncoder(model_path)
+    documents = text_encoding_once(
+        encoder,
+        document_texts,
+        document_ids,
+        is_query=False,
+        progress_label="ranking f32",
+    )
+    encoded_queries = text_encoding_once(
+        encoder,
+        query_texts,
+        query_ids,
+        is_query=True,
+        progress_label="ranking f32",
+    )
+    del encoder
+    return documents, encoded_queries
+
+
+def encode_visual_precision_ranking(
+    hf_home: Path,
+    work_dir: Path,
+) -> tuple[EncodingResult, EncodingResult]:
+    base_path = snapshot_path(
+        hf_home, VISUAL_BASE_REPO, VISUAL_BASE_REVISION, "model"
+    )
+    adapter_path = snapshot_path(
+        hf_home, VISUAL_ADAPTER_REPO, VISUAL_ADAPTER_REVISION, "model"
+    )
+    images: list[Image.Image] = []
+    document_ids: list[str] = []
+    query_texts: list[str] = []
+    query_ids: list[str] = []
+    for label, repo, revision in VIDORE:
+        dataset_path = snapshot_path(hf_home, repo, revision, "dataset")
+        corpus = load_parquet_directory(dataset_path / "corpus")
+        ordered = sorted(corpus, key=lambda row: int(row["corpus_id"]))[
+            :VISUAL_TASK_CAP
+        ]
+        if len(ordered) != VISUAL_TASK_CAP:
+            raise RuntimeError(
+                f"{label} has only {len(ordered)} corpus rows after "
+                "deterministic cap"
+            )
+        images.extend(row["image"] for row in ordered)
+        document_ids.extend(
+            f"{label}:{int(row['corpus_id'])}" for row in ordered
+        )
+        queries = load_parquet_directory(dataset_path / "queries")
+        english = sorted(
+            (row for row in queries if row["language"] == "english"),
+            key=lambda row: int(row["query_id"]),
+        )
+        query_texts.extend(str(row["query"]) for row in english)
+        query_ids.extend(
+            f"{label}:{int(row['query_id'])}" for row in english
+        )
+    with tempfile.TemporaryDirectory(dir=work_dir) as temporary:
+        model, processor = load_visual_model(
+            base_path,
+            adapter_path,
+            Path(temporary),
+        )
+        documents = visual_encoding_once(
+            model,
+            processor,
+            images,
+            document_ids,
+            is_query=False,
+            progress_label="ranking f32",
+        )
+        encoded_queries = visual_encoding_once(
+            model,
+            processor,
+            query_texts,
+            query_ids,
+            is_query=True,
+            progress_label="ranking f32",
+        )
+        del model, processor
+    return documents, encoded_queries
+
+
+def run_precision_ranking_job(
+    binary: Path,
+    work_dir: Path,
+    lane: str,
+    documents: EncodingResult,
+    queries: EncodingResult,
+    expected_candidates: Sequence[str],
+    send_candidate_selection: bool,
+) -> tuple[dict, tuple[Path, ...]]:
+    prefix = f"ranking-{lane}"
+    doc_raw, doc_sidecar = write_tensor(
+        work_dir / f"{prefix}-documents",
+        documents,
+        "f16",
+    )
+    query_raw, query_sidecar = write_tensor(
+        work_dir / f"{prefix}-queries",
+        queries,
+        "f16",
+    )
+    f32_doc_raw, f32_doc_sidecar = write_tensor(
+        work_dir / f"{prefix}-documents-f32",
+        documents,
+        "f32",
+    )
+    f32_query_raw, f32_query_sidecar = write_tensor(
+        work_dir / f"{prefix}-queries-f32",
+        queries,
+        "f32",
+    )
+    job = {
+        "lane": lane,
+        "documents": {"raw": str(doc_raw), "sidecar": str(doc_sidecar)},
+        "queries": {"raw": str(query_raw), "sidecar": str(query_sidecar)},
+        "precision_ranking_audit": True,
+        "full_precision_documents": {
+            "raw": str(f32_doc_raw),
+            "sidecar": str(f32_doc_sidecar),
+        },
+        "full_precision_queries": {
+            "raw": str(f32_query_raw),
+            "sidecar": str(f32_query_sidecar),
+        },
+    }
+    if send_candidate_selection:
+        job["precision_ranking_candidates"] = list(expected_candidates)
+    job_path = work_dir / f"{prefix}-job.json"
+    job_path.write_text(json.dumps(job, indent=2) + "\n")
+    completed = subprocess.run(
+        [binary, job_path],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    result = json.loads(completed.stdout)
+    validate_precision_ranking_audit(
+        result,
+        lane,
+        queries,
+        expected_candidates,
+    )
+    return result, (
+        doc_raw,
+        doc_sidecar,
+        query_raw,
+        query_sidecar,
+        f32_doc_raw,
+        f32_doc_sidecar,
+        f32_query_raw,
+        f32_query_sidecar,
+        job_path,
+    )
+
+
+def write_precision_ranking_probe(
+    path: Path,
+    lane: str,
+    result: dict,
+) -> None:
+    if path.is_file():
+        payload = json.loads(path.read_text())
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 1
+            or not isinstance(payload.get("lanes"), dict)
+        ):
+            raise RuntimeError(
+                f"existing ranking probe has an incompatible schema: {path}"
+            )
+    else:
+        payload = {"schema_version": 1, "lanes": {}}
+    payload["lanes"] = {**payload["lanes"], lane: result}
+    for lane_result in payload["lanes"].values():
+        backfill_retrieval_decode_cost(lane_result)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temporary_path = Path(output.name)
+            json.dump(payload, output, indent=2, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def run_precision_ranking_audit(args) -> None:
+    require_offline()
+    expected_candidates, send_candidate_selection = (
+        resolve_precision_ranking_candidates(args.lane, args.candidates)
+    )
+    hf_home = args.hf_home.resolve()
+    work_dir = args.work_dir.resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    probe_output = args.probe_output.resolve()
+    if probe_output.suffix.lower() != ".json":
+        raise RuntimeError("--probe-output must name a dedicated JSON file")
+    prefix = f"ranking-{args.lane}"
+    reserved_outputs = {
+        (work_dir / f"{prefix}-{suffix}").resolve()
+        for suffix in (
+            "documents.json",
+            "queries.json",
+            "documents-f32.json",
+            "queries-f32.json",
+            "job.json",
+        )
+    }
+    if probe_output in reserved_outputs:
+        raise RuntimeError(
+            "--probe-output must not overwrite a ranking-audit sidecar"
+        )
+    probe_output.parent.mkdir(parents=True, exist_ok=True)
+    if args.lane == "text":
+        documents, queries = encode_text_precision_ranking(hf_home)
+    else:
+        documents, queries = encode_visual_precision_ranking(
+            hf_home,
+            work_dir,
+        )
+    result, ranking_artifacts = run_precision_ranking_job(
+        args.binary.resolve(),
+        work_dir,
+        args.lane,
+        documents,
+        queries,
+        expected_candidates,
+        send_candidate_selection,
+    )
+    write_precision_ranking_probe(probe_output, args.lane, result)
+    if not args.retain_tensors:
+        for path in ranking_artifacts:
+            path.unlink()
+    print(f"wrote {args.lane} ranking retention: {probe_output}", flush=True)
+
+
 def run(args) -> None:
     require_offline()
     hf_home = args.hf_home.resolve()
@@ -2433,6 +2919,24 @@ def parse_args():
     execute.add_argument("--report", type=Path, required=True)
     execute.add_argument("--retain-tensors", action="store_true")
     execute.add_argument("--int8-probe", action="store_true")
+    ranking = subparsers.add_parser("ranking-retention")
+    ranking.add_argument("--lane", choices=("text", "visual"), required=True)
+    ranking.add_argument(
+        "--candidate",
+        dest="candidates",
+        action="append",
+        choices=PRECISION_RANKING_NEW_CANDIDATES,
+        help=(
+            "add one new INT8 candidate after the automatic f16/global/"
+            "per-row baselines; omit for text to run all seven, or repeat "
+            "once or twice for visual in the requested order"
+        ),
+    )
+    ranking.add_argument("--hf-home", type=Path, required=True)
+    ranking.add_argument("--work-dir", type=Path, required=True)
+    ranking.add_argument("--binary", type=Path, required=True)
+    ranking.add_argument("--probe-output", type=Path, required=True)
+    ranking.add_argument("--retain-tensors", action="store_true")
     return parser.parse_args()
 
 
@@ -2440,6 +2944,8 @@ def main() -> None:
     args = parse_args()
     if args.command == "download":
         download_pins(args.hf_home.resolve())
+    elif args.command == "ranking-retention":
+        run_precision_ranking_audit(args)
     else:
         run(args)
 
