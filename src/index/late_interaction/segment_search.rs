@@ -250,7 +250,10 @@ fn complete_object_request(key: &str, size_bytes: u64, label: &str) -> Result<Re
     })
 }
 
-fn build_truth_requests(
+// `pub(crate)` on the four functions below exists solely for the ignored
+// Phase 9 flat-candidate benchmark module; nothing outside this crate can see
+// them and no production caller changes.
+pub(crate) fn build_truth_requests(
     segment: &LateInteractionSegmentRef,
     candidates: &[LateCandidate],
 ) -> Result<Vec<ReadRequest>> {
@@ -335,7 +338,7 @@ fn locator_request(key: &str, offset: u64, length: u64, label: &str) -> Result<R
     })
 }
 
-fn score_truth_wave(
+pub(crate) fn score_truth_wave(
     request: &SegmentSearchRequest<'_>,
     candidates: Vec<LateCandidate>,
     truth_bytes: &[bytes::Bytes],
@@ -413,14 +416,14 @@ fn trace_for(requests: &[ReadRequest], plan: &ReadPlan) -> SegmentWaveTrace {
     }
 }
 
-fn compare_scored_rows(left: &SegmentScoredRow, right: &SegmentScoredRow) -> Ordering {
+pub(crate) fn compare_scored_rows(left: &SegmentScoredRow, right: &SegmentScoredRow) -> Ordering {
     right
         .score
         .total_cmp(&left.score)
         .then_with(|| left.id.cmp(&right.id))
 }
 
-fn filter_matches(
+pub(crate) fn filter_matches(
     filter: Option<&Filter>,
     attributes: Option<&HashMap<String, AttributeValue>>,
 ) -> bool {
