@@ -7,6 +7,10 @@
 mod attribute_artifact;
 mod candidate;
 mod fde;
+// dead_code allow is transitional: the build/section/query slices that consume
+// this codec land next; the allow is removed when the query path wires it in.
+#[allow(dead_code)]
+mod flat_candidate;
 mod matrix;
 mod matrix_artifact;
 mod maxsim;
@@ -24,6 +28,7 @@ pub use candidate::{
     LateRoutingMetric,
 };
 pub use fde::{FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection, InnerProjection};
+pub use flat_candidate::{LateFlatCandidateRecipe, LateFlatCandidateRef};
 pub use matrix::MultiVectorMatrixRef;
 pub use matrix_artifact::{MatrixBlockLocator, MatrixBlockRef};
 pub use maxsim::max_sim;

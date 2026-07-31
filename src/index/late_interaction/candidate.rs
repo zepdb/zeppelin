@@ -1080,7 +1080,7 @@ fn validate_recipe(recipe: &LateCandidateRecipe) -> Result<()> {
     Ok(())
 }
 
-fn validate_input_row(row: &LateCandidateInputRow, dimension: usize) -> Result<()> {
+pub(super) fn validate_input_row(row: &LateCandidateInputRow, dimension: usize) -> Result<()> {
     if row.id.is_empty() {
         return Err(candidate_error("candidate input id cannot be empty"));
     }
@@ -1127,7 +1127,7 @@ fn validate_vector(vector: &[f32], dimension: usize, label: &str) -> Result<()> 
     Ok(())
 }
 
-fn validate_matrix_locator(locator: &MatrixBlockLocator) -> Result<()> {
+pub(super) fn validate_matrix_locator(locator: &MatrixBlockLocator) -> Result<()> {
     validate_locator_range(
         &locator.object_key,
         locator.byte_offset,
@@ -1140,7 +1140,7 @@ fn validate_matrix_locator(locator: &MatrixBlockLocator) -> Result<()> {
     Ok(())
 }
 
-fn validate_attribute_locator(locator: &AttributeLocator) -> Result<()> {
+pub(super) fn validate_attribute_locator(locator: &AttributeLocator) -> Result<()> {
     validate_locator_range(
         &locator.object_key,
         locator.byte_offset,
@@ -1158,7 +1158,9 @@ fn validate_locator_range(key: &str, offset: u64, length: u64, label: &str) -> R
     Ok(())
 }
 
-fn validate_filter_attributes(attributes: Option<&BTreeMap<String, AttributeValue>>) -> Result<()> {
+pub(super) fn validate_filter_attributes(
+    attributes: Option<&BTreeMap<String, AttributeValue>>,
+) -> Result<()> {
     let Some(attributes) = attributes else {
         return Ok(());
     };
@@ -1255,7 +1257,11 @@ fn filter_matches(
         .unwrap_or(true)
 }
 
-fn late_segment_key(namespace: &str, segment_id: &str, file_name: &str) -> Result<String> {
+pub(super) fn late_segment_key(
+    namespace: &str,
+    segment_id: &str,
+    file_name: &str,
+) -> Result<String> {
     let key = format!(
         "{}{segment_id}/{file_name}",
         NamespaceObjectFamily::LateSegment.namespace_prefix(namespace)
