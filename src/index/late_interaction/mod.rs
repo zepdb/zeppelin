@@ -10,6 +10,8 @@ mod fde;
 mod matrix;
 mod matrix_artifact;
 mod maxsim;
+#[cfg(test)]
+mod phase9_routing_diagnostic;
 mod search;
 mod segment_build;
 mod segment_search;
