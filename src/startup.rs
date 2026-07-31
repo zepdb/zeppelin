@@ -678,7 +678,7 @@ async fn build_app_with_entitlement_resolver(
         lease_manager.clone(),
         cache.clone(),
         deletion_worker,
-        encoder_provider,
+        Arc::clone(&encoder_provider),
         compaction_lifecycle.clone(),
         CompactionThreadOptions {
             compaction_workers: cpu_budget.compaction_workers,
@@ -755,6 +755,7 @@ async fn build_app_with_entitlement_resolver(
         branch_readiness: branch_readiness.snapshot,
         wal_writer,
         wal_reader,
+        encoder_provider,
         compactor,
         lease_manager,
         compaction_lifecycle: compaction_lifecycle.clone(),

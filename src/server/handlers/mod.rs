@@ -280,6 +280,20 @@ pub fn error_response(err: &ZeppelinError) -> Response {
             body["has_additional_children"] = json!(has_additional_children);
         }
     }
+    if let ZeppelinError::LateInteraction(
+        crate::index::late_interaction::LateInteractionError::SemanticIndexLag {
+            requested_generation,
+            covered_sequence,
+            pending_records,
+            failed_records,
+        },
+    ) = err
+    {
+        body["requested_generation"] = json!(requested_generation);
+        body["covered_sequence"] = json!(covered_sequence);
+        body["pending_records"] = json!(pending_records);
+        body["failed_records"] = json!(failed_records);
+    }
 
     let mut response = (status_code, axum::Json(body)).into_response();
     response

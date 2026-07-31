@@ -12,8 +12,10 @@ pub mod coordinator;
 pub mod dev;
 /// Encoder-neutral validated values and asynchronous adapter contract.
 pub mod encoder;
+mod priority;
 /// Lazy configuration-backed encoder session ownership.
 pub mod provider;
+pub(crate) mod transform;
 /// Durable retrieval-unit and semantic-coverage types.
 pub mod types;
 /// Digest-pinned external encoder-worker adapter.

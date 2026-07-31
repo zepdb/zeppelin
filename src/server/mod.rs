@@ -108,6 +108,7 @@ use crate::cache::DiskCache;
 use crate::compaction::background::CompactionLifecycle;
 use crate::compaction::Compactor;
 use crate::config::Config;
+use crate::embedding::MultiVectorEncoderProvider;
 use crate::error::ZeppelinError;
 use crate::fts::wal_cache::WalFtsCache;
 use crate::metrics::{HTTP_REQUESTS_TOTAL, RATE_LIMITED_TOTAL};
@@ -306,6 +307,8 @@ pub struct AppState {
     pub wal_writer: Arc<WalWriter>,
     /// Service that discovers visible WAL fragments through the manifest.
     pub wal_reader: Arc<WalReader>,
+    /// Shared epoch-pinned encoder sessions used by enrichment and late queries.
+    pub encoder_provider: Arc<dyn MultiVectorEncoderProvider>,
     /// Lease-protected compactor shared by background and manual admin paths.
     pub compactor: Arc<Compactor>,
     /// Per-namespace compaction lease manager.

@@ -337,6 +337,36 @@ pub enum ZeppelinError {
     #[error("validation error: {0}")]
     Validation(String),
 
+    /// A late-interaction query omitted meaningful text.
+    #[error("late-interaction query text cannot be empty")]
+    LateInteractionQueryEmpty,
+
+    /// A late-interaction query text payload exceeded the configured byte cap.
+    #[error(
+        "late-interaction query text size {actual_bytes} exceeds maximum of {max_bytes} bytes"
+    )]
+    LateInteractionQueryTooLarge {
+        /// Submitted UTF-8 byte count.
+        actual_bytes: usize,
+        /// Configured maximum UTF-8 byte count.
+        max_bytes: usize,
+    },
+
+    /// A late-interaction source targeted a namespace in another index family.
+    #[error(
+        "namespace {namespace} uses {actual:?}, but late-interaction query requires LateInteractionFde"
+    )]
+    LateInteractionNamespaceRequired {
+        /// Namespace whose immutable family does not match the source.
+        namespace: String,
+        /// Actual namespace index family.
+        actual: crate::types::IndexType,
+    },
+
+    /// Weighted score fusion cannot combine an uncalibrated MaxSim source.
+    #[error("weighted fusion does not support late-interaction sources")]
+    LateInteractionWeightedFusionUnsupported,
+
     /// A logical request payload exceeded a configured limit.
     #[error("{resource} size {actual} exceeds maximum of {limit}")]
     PayloadTooLarge {
@@ -599,11 +629,14 @@ impl ZeppelinError {
 
             ZeppelinError::DimensionMismatch { .. }
             | ZeppelinError::Validation(_)
+            | ZeppelinError::LateInteractionQueryEmpty
+            | ZeppelinError::LateInteractionNamespaceRequired { .. }
+            | ZeppelinError::LateInteractionWeightedFusionUnsupported
             | ZeppelinError::FtsFieldNotConfigured { .. } => 400,
 
-            ZeppelinError::PayloadTooLarge { .. } | ZeppelinError::RetrievalUnitTooLarge { .. } => {
-                413
-            }
+            ZeppelinError::PayloadTooLarge { .. }
+            | ZeppelinError::RetrievalUnitTooLarge { .. }
+            | ZeppelinError::LateInteractionQueryTooLarge { .. } => 413,
 
             ZeppelinError::RetrievalUnitEmpty
             | ZeppelinError::UnsupportedInputModality { .. }
@@ -626,6 +659,18 @@ impl ZeppelinError {
             }
 
             ZeppelinError::IndexUnavailable(_) | ZeppelinError::QueryConcurrencyExhausted => 503,
+
+            ZeppelinError::LateInteraction(
+                crate::index::late_interaction::LateInteractionError::MissingLateState
+                | crate::index::late_interaction::LateInteractionError::MissingActiveProfile,
+            ) => 409,
+
+            ZeppelinError::LateInteraction(
+                crate::index::late_interaction::LateInteractionError::SemanticIndexLag { .. }
+                | crate::index::late_interaction::LateInteractionError::OverlayPayloadBudgetExceeded {
+                    ..
+                },
+            ) => 503,
 
             ZeppelinError::RateLimitExceeded { .. } => 429,
 
@@ -699,11 +744,33 @@ impl ZeppelinError {
             ZeppelinError::Rabitq(_) => "INTERNAL_ERROR",
             ZeppelinError::Rq(_) => "INTERNAL_ERROR",
             ZeppelinError::Membership(_) => "INTERNAL_ERROR",
-            ZeppelinError::LateInteraction(_) => "INTERNAL_ERROR",
+            ZeppelinError::LateInteraction(error) => match error {
+                crate::index::late_interaction::LateInteractionError::MissingLateState
+                | crate::index::late_interaction::LateInteractionError::MissingActiveProfile => {
+                    "EMBEDDING_PROFILE_NOT_ACTIVE"
+                }
+                crate::index::late_interaction::LateInteractionError::SemanticIndexLag {
+                    ..
+                } => "SEMANTIC_INDEX_LAG",
+                crate::index::late_interaction::LateInteractionError::OverlayPayloadBudgetExceeded {
+                    ..
+                } => "SEMANTIC_OVERLAY_BUDGET_EXCEEDED",
+                _ => "INTERNAL_ERROR",
+            },
             ZeppelinError::KMeansConvergence { .. } => "INTERNAL_ERROR",
             ZeppelinError::DimensionMismatch { .. } => "DIMENSION_MISMATCH",
             ZeppelinError::VectorNotFound { .. } => "VECTOR_NOT_FOUND",
             ZeppelinError::Validation(_) => "VALIDATION_ERROR",
+            ZeppelinError::LateInteractionQueryEmpty => "LATE_INTERACTION_QUERY_EMPTY",
+            ZeppelinError::LateInteractionQueryTooLarge { .. } => {
+                "LATE_INTERACTION_QUERY_TOO_LARGE"
+            }
+            ZeppelinError::LateInteractionNamespaceRequired { .. } => {
+                "LATE_INTERACTION_NAMESPACE_REQUIRED"
+            }
+            ZeppelinError::LateInteractionWeightedFusionUnsupported => {
+                "LATE_INTERACTION_WEIGHTED_FUSION_UNSUPPORTED"
+            }
             ZeppelinError::PayloadTooLarge { .. } => "PAYLOAD_TOO_LARGE",
             ZeppelinError::RetrievalUnitTooLarge { .. } => "RETRIEVAL_UNIT_TOO_LARGE",
             ZeppelinError::RetrievalUnitEmpty => "RETRIEVAL_UNIT_EMPTY",
@@ -779,6 +846,15 @@ impl ZeppelinError {
                         | crate::security::SecurityError::PreservationStateUnavailable
                 )
                 | ZeppelinError::Storage(_)
+                | ZeppelinError::LateInteraction(
+                    crate::index::late_interaction::LateInteractionError::SemanticIndexLag {
+                        failed_records: 0,
+                        ..
+                    }
+                        | crate::index::late_interaction::LateInteractionError::OverlayPayloadBudgetExceeded {
+                            ..
+                        }
+                )
         )
     }
 
@@ -806,6 +882,15 @@ impl ZeppelinError {
             | ZeppelinError::LeaseHeld { .. }
             | ZeppelinError::LeaseExpired { .. }
             | ZeppelinError::FencingTokenStale { .. }
+            | ZeppelinError::LateInteraction(
+                crate::index::late_interaction::LateInteractionError::SemanticIndexLag {
+                    failed_records: 0,
+                    ..
+                }
+                | crate::index::late_interaction::LateInteractionError::OverlayPayloadBudgetExceeded {
+                    ..
+                },
+            )
             | ZeppelinError::Security(
                 crate::security::SecurityError::PolicyConflict
                 | crate::security::SecurityError::PreservationConflict
@@ -859,6 +944,18 @@ impl ZeppelinError {
                  configuration error"
                     .to_string()
             }
+            ZeppelinError::LateInteraction(
+                crate::index::late_interaction::LateInteractionError::MissingLateState
+                | crate::index::late_interaction::LateInteractionError::MissingActiveProfile,
+            ) => "late-interaction namespace has no active embedding profile".to_string(),
+            ZeppelinError::LateInteraction(
+                error @ (crate::index::late_interaction::LateInteractionError::SemanticIndexLag {
+                    ..
+                }
+                | crate::index::late_interaction::LateInteractionError::OverlayPayloadBudgetExceeded {
+                    ..
+                }),
+            ) => error.to_string(),
             ZeppelinError::Branch(error)
                 if matches!(
                     error.as_ref(),
@@ -940,6 +1037,10 @@ impl ZeppelinError {
             | ZeppelinError::DimensionMismatch { .. }
             | ZeppelinError::VectorNotFound { .. }
             | ZeppelinError::Validation(_)
+            | ZeppelinError::LateInteractionQueryEmpty
+            | ZeppelinError::LateInteractionQueryTooLarge { .. }
+            | ZeppelinError::LateInteractionNamespaceRequired { .. }
+            | ZeppelinError::LateInteractionWeightedFusionUnsupported
             | ZeppelinError::PayloadTooLarge { .. }
             | ZeppelinError::RetrievalUnitTooLarge { .. }
             | ZeppelinError::RetrievalUnitEmpty

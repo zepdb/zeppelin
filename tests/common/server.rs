@@ -28,6 +28,7 @@ use zeppelin::compaction::background::{
 };
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{ApiKeyConfig, Config, SecurityMode};
+use zeppelin::embedding::{ConfiguredEncoderProvider, MultiVectorEncoderProvider};
 use zeppelin::fts::wal_cache::WalFtsCache;
 use zeppelin::namespace::{
     BranchGraphReadinessSnapshot, BranchReadinessObserver, NamespaceManager,
@@ -114,6 +115,15 @@ fn test_fragment_cache(config: &Config) -> Arc<WalFragmentCache> {
         .checked_mul(1024 * 1024)
         .expect("test WAL fragment cache capacity overflow");
     Arc::new(WalFragmentCache::new(max_bytes))
+}
+
+/// Build the same lazy, epoch-pinned encoder provider used by production.
+#[must_use]
+pub fn test_encoder_provider(
+    config: &Config,
+    store: &ZeppelinStore,
+) -> Arc<dyn MultiVectorEncoderProvider> {
+    Arc::new(ConfiguredEncoderProvider::new(store.clone(), &config.mmli))
 }
 
 fn test_decoded_artifact_cache(config: &Config) -> Arc<DecodedArtifactCache> {
@@ -736,6 +746,7 @@ async fn start_test_server_with_config_inner(
         branch_readiness: BranchGraphReadinessSnapshot::new(),
         wal_writer: Arc::new(WalWriter::with_clock(harness.store.clone(), clock)),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
+        encoder_provider: test_encoder_provider(&config, &harness.store),
         compactor,
         lease_manager,
         compaction_lifecycle: compaction_lifecycle.clone(),
@@ -878,6 +889,7 @@ pub async fn start_test_server_on_store_with_readiness(
         branch_readiness: readiness.snapshot,
         wal_writer: Arc::new(WalWriter::with_clock(store.clone(), clock)),
         wal_reader: Arc::new(WalReader::new(store.clone())),
+        encoder_provider: test_encoder_provider(&config, &store),
         compactor,
         lease_manager,
         compaction_lifecycle: compaction_lifecycle.clone(),
@@ -961,6 +973,7 @@ pub async fn start_test_server_with_compactor(
         branch_readiness: BranchGraphReadinessSnapshot::new(),
         wal_writer: Arc::new(WalWriter::with_clock(harness.store.clone(), clock)),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
+        encoder_provider: test_encoder_provider(&config, &harness.store),
         compactor: compactor.clone(),
         lease_manager,
         compaction_lifecycle: compaction_lifecycle.clone(),
@@ -1088,6 +1101,7 @@ pub async fn start_test_server_with_compaction(
         branch_readiness: branch_readiness.snapshot,
         wal_writer: Arc::new(WalWriter::with_clock(harness.store.clone(), clock)),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
+        encoder_provider: test_encoder_provider(&config, &harness.store),
         compactor,
         lease_manager,
         compaction_lifecycle: compaction_lifecycle.clone(),
@@ -1842,6 +1856,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         branch_readiness: branch_readiness.snapshot,
         wal_writer: wal_writer.clone(),
         wal_reader: Arc::new(WalReader::new(store.clone())),
+        encoder_provider: test_encoder_provider(&config, &store),
         compactor: compactor.clone(),
         lease_manager: lease_manager.clone(),
         compaction_lifecycle: compaction_lifecycle.clone(),

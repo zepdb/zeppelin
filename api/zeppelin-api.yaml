@@ -1428,8 +1428,9 @@ paths:
         Run vector similarity search, BM25 full-text search, or typed
         retrieval-algebra search. Legacy requests provide exactly one of
         `vector` or `rank_by`; retrieval-algebra requests provide typed
-        `sources`, with multi-source `ann` + `bm25` fusion supported by RRF
-        or weighted normalized score. A server-owned mandatory filter is always
+        `sources`. ANN, BM25, and exhaustive late-interaction sources can
+        participate in rank-only RRF fusion; weighted normalized-score fusion
+        supports ANN and BM25 only. A server-owned mandatory filter is always
         ANDed with the caller filter for live and `as_of` reads. Policy-masked
         attributes are omitted from results. Masked fields cannot be referenced
         by caller filters or ranking expressions and cannot be selected as
@@ -1463,10 +1464,41 @@ paths:
                 $ref: "#/components/schemas/QueryResponse"
         "400":
           $ref: "#/components/responses/ValidationError"
+        "409":
+          description: |
+            The namespace has no active late-interaction embedding profile
+            (`EMBEDDING_PROFILE_NOT_ACTIVE`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           $ref: "#/components/responses/NotFoundError"
         "410":
           $ref: "#/components/responses/GoneError"
+        "413":
+          description: |
+            Late-interaction query text exceeds the configured UTF-8 byte limit
+            (`LATE_INTERACTION_QUERY_TOO_LARGE`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: |
+            Strong semantic coverage did not complete before its wait budget
+            (`SEMANTIC_INDEX_LAG`), or the exact live-overlay payload exceeded
+            its configured cap (`SEMANTIC_OVERLAY_BUDGET_EXCEEDED`).
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                minimum: 1
+              description: Seconds to wait when the returned error is retryable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "501":
           $ref: "#/components/responses/NotImplemented"
 
@@ -1478,13 +1510,15 @@ paths:
       operationId: batchQueryNamespace
       summary: Batch query vectors
       description: |
-        Run multiple vector similarity or BM25 full-text searches in one
-        request. Each entry uses the same body shape as `POST
+        Run multiple vector similarity, BM25 full-text, or late-interaction
+        searches in one request. Each entry uses the same body shape as `POST
         /v1/namespaces/{ns}/query`.
 
         Results are returned positionally. A failure in one entry is reported
         in that entry's error envelope and does not fail the whole batch.
-        Entries share one manifest freshness check and segment metadata load.
+        Entries share one fixed manifest selected before execution; a
+        late-interaction wait cannot advance one entry beyond that batch
+        snapshot. Entries also share one segment metadata load.
       tags: [Query]
       requestBody:
         required: true
@@ -1882,6 +1916,13 @@ components:
             - INDEX_UNAVAILABLE
             - REQUEST_TIMEOUT
             - PAYLOAD_TOO_LARGE
+            - LATE_INTERACTION_QUERY_EMPTY
+            - LATE_INTERACTION_QUERY_TOO_LARGE
+            - LATE_INTERACTION_NAMESPACE_REQUIRED
+            - LATE_INTERACTION_WEIGHTED_FUSION_UNSUPPORTED
+            - EMBEDDING_PROFILE_NOT_ACTIVE
+            - SEMANTIC_INDEX_LAG
+            - SEMANTIC_OVERLAY_BUDGET_EXCEEDED
             - NOT_IMPLEMENTED
             - NOT_FOUND
             - METHOD_NOT_ALLOWED
@@ -1911,6 +1952,22 @@ components:
             Echo of the request's `x-request-id` (or a server-generated UUID).
             Present on routes that carry request-id middleware, including the
             lightweight query hot path. Use it to correlate with server logs.
+        requested_generation:
+          type: integer
+          minimum: 0
+          description: Present only for `SEMANTIC_INDEX_LAG`.
+        covered_sequence:
+          type: integer
+          minimum: 0
+          description: Present only for `SEMANTIC_INDEX_LAG`.
+        pending_records:
+          type: integer
+          minimum: 0
+          description: Present only for `SEMANTIC_INDEX_LAG`.
+        failed_records:
+          type: integer
+          minimum: 0
+          description: Present only for `SEMANTIC_INDEX_LAG`.
       example:
         code: NAMESPACE_NOT_FOUND
         error: "namespace not found: test"
@@ -3863,6 +3920,7 @@ components:
         - legacy `rank_by`
         - single-source `ann` with either raw `vector` or stored seed `id`
         - single-source `bm25`
+        - single-source exhaustive `late_interaction` MaxSim
         - multi-source RRF fusion (`fusion` omitted defaults to RRF k=60)
         - multi-source weighted normalized score fusion
         - explicit vector and BM25 rerank over the candidate frontier
@@ -3871,6 +3929,9 @@ components:
         - lightweight facet counts over the filtered candidate frontier
         - plan and full query explain output
         - `projection.include_attributes`
+
+        Late-interaction sources support RRF but reject weighted fusion until
+        MaxSim calibration is explicitly qualified.
 
         Reserved today (returns code `NOT_IMPLEMENTED`):
         - field/vector projection
@@ -3967,9 +4028,11 @@ components:
         mapping:
           ann: "#/components/schemas/AnnCandidateSource"
           bm25: "#/components/schemas/Bm25CandidateSource"
+          late_interaction: "#/components/schemas/LateInteractionCandidateSource"
       oneOf:
         - $ref: "#/components/schemas/AnnCandidateSource"
         - $ref: "#/components/schemas/Bm25CandidateSource"
+        - $ref: "#/components/schemas/LateInteractionCandidateSource"
 
     AnnCandidateSource:
       type: object
@@ -4013,6 +4076,37 @@ components:
           type: boolean
           default: false
           description: Treat the last token of each BM25 query as a prefix.
+
+    LateInteractionCandidateSource:
+      type: object
+      required: [type, text]
+      additionalProperties: false
+      description: |
+        Exhaustive exact MaxSim over live semantic overlays. Strong consistency
+        waits for complete semantic coverage; eventual consistency explicitly
+        returns partial coverage when pending live versions are omitted.
+      properties:
+        type:
+          type: string
+          const: late_interaction
+        text:
+          type: string
+          minLength: 1
+          pattern: '.*\S.*'
+          description: |
+            Non-whitespace text encoded by the manifest-selected active
+            profile. Its UTF-8 byte length is capped by
+            `server.max_retrieval_text_bytes`.
+        top_k:
+          type: integer
+          minimum: 1
+          description: |
+            Optional source-local candidate width, capped by the server's
+            configured maximum top-k.
+        semantic_wait_ms:
+          type: integer
+          minimum: 0
+          description: Optional strong semantic-coverage wait budget.
 
     FusionSpec:
       description: |
@@ -4304,6 +4398,14 @@ components:
           $ref: "#/components/schemas/QueryFacets"
         explain:
           $ref: "#/components/schemas/QueryExplain"
+        semantic_coverage:
+          type: string
+          enum: [complete, partial]
+          description: |
+            Present when the query contains a late-interaction source.
+            `complete` means every live version was covered. `partial` means an
+            eventual query omitted one or more pending or failed live versions
+            while still honoring tombstones and newer-version suppression.
     QueryResultGroup:
       type: object
       required: [key, results]
@@ -4413,25 +4515,56 @@ components:
 
     QueryExplainSource:
       type: object
-      required: [index, type, nprobe, candidate_k]
+      required: [index, type, nprobe, candidate_k, score_direction]
       properties:
         index:
           type: integer
           minimum: 0
         type:
           type: string
-          enum: [ann, bm25]
+          enum: [ann, bm25, late_interaction]
         nprobe:
           type: integer
           nullable: true
           minimum: 1
           description: |
             Effective IVF probe count for unconstrained ANN sources. Null for
-            BM25 and for mandatory-filter callers, because a manifest-derived
-            value would reveal shared namespace topology outside their row slice.
+            BM25, late interaction, and mandatory-filter callers, because a
+            manifest-derived value would reveal shared namespace topology
+            outside their row slice.
         candidate_k:
           type: integer
           minimum: 1
+        score_direction:
+          type: string
+          enum: [lower_is_better, higher_is_better]
+        profile:
+          type: string
+          description: Active profile id for a late-interaction source.
+        epoch:
+          type: array
+          minItems: 32
+          maxItems: 32
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+          description: Active semantic epoch digest bytes for a late-interaction source.
+        fde_generation:
+          type: array
+          minItems: 32
+          maxItems: 32
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+          description: Active FDE generation digest bytes for a late-interaction source.
+        manifest_generation:
+          type: integer
+          minimum: 0
+          description: Root generation used by a late-interaction source.
+        consistency_actual:
+          $ref: "#/components/schemas/ConsistencyLevel"
 
     QueryExplainFusion:
       oneOf:
@@ -4549,7 +4682,7 @@ components:
           minimum: 0
         type:
           type: string
-          enum: [ann, bm25]
+          enum: [ann, bm25, late_interaction]
         raw_score:
           type: number
           format: float

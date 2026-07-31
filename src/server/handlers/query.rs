@@ -144,6 +144,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Duration;
 use std::time::Instant;
 
 use axum::extract::{Extension, Path, Query, State};
@@ -162,6 +163,10 @@ use crate::fts::rank_by::RankBy;
 use crate::fts::tokenizer::tokenize_text;
 use crate::fts::FtsFieldConfig;
 use crate::index::distance::compute_distance;
+use crate::index::late_interaction::{
+    LateInteractionCoverage, LateInteractionProvenance, LateInteractionSearchRequest,
+    ManifestRefresh,
+};
 use crate::namespace::manager::NamespaceMetadata;
 use crate::query;
 use crate::query::{
@@ -176,7 +181,9 @@ use crate::security::{
     PolicyVersion, SecurityError,
 };
 use crate::server::{AppState, AuditRequest, RateLimitClass, RateLimitIdentity};
-use crate::types::{AttributeValue, ConsistencyLevel, Filter, SearchResult};
+use crate::types::{
+    AttributeValue, ConsistencyLevel, Filter, IndexType, ScoreDirection, SearchResult,
+};
 use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
 
@@ -292,7 +299,7 @@ fn validate_query_security_constraints(
                 .flatten()
                 .filter_map(|source| match source {
                     CandidateSource::Bm25 { rank_by, .. } => Some(rank_by),
-                    CandidateSource::Ann { .. } => None,
+                    CandidateSource::Ann { .. } | CandidateSource::LateInteraction { .. } => None,
                 }),
         )
         .chain(req.rerank.iter().filter_map(|rerank| match rerank {
@@ -355,6 +362,17 @@ pub enum CandidateSource {
         /// Source-local prefix choice, falling back to the top-level option when absent.
         #[serde(default)]
         last_as_prefix: Option<bool>,
+    },
+    /// Token-level late-interaction source where higher MaxSim is better.
+    LateInteraction {
+        /// UTF-8 text encoded by the manifest-selected active profile.
+        text: String,
+        /// Source-local candidate width, falling back to the request frontier.
+        #[serde(default)]
+        top_k: Option<usize>,
+        /// Strong-mode semantic coverage wait budget in milliseconds.
+        #[serde(default)]
+        semantic_wait_ms: Option<u64>,
     },
 }
 
@@ -613,6 +631,11 @@ enum ValidatedSource {
         /// Zero-based position in [`QueryRequest::sources`].
         index: usize,
     },
+    /// One algebra late-interaction source at the given request position.
+    AlgebraLateInteraction {
+        /// Zero-based position in [`QueryRequest::sources`].
+        index: usize,
+    },
     /// Multiple algebra sources that require fusion.
     AlgebraHybrid {
         /// Cardinality checked again before source iteration.
@@ -630,6 +653,18 @@ enum QuerySourceKind {
     Ann,
     /// Lexical relevance, where higher is better.
     Bm25,
+    /// Token-level MaxSim relevance, where higher is better.
+    LateInteraction,
+}
+
+impl QuerySourceKind {
+    /// Return the source's native score ordering.
+    const fn direction(self) -> ScoreDirection {
+        match self {
+            Self::Ann => ScoreDirection::LowerIsBetter,
+            Self::Bm25 | Self::LateInteraction => ScoreDirection::HigherIsBetter,
+        }
+    }
 }
 
 /// Provides one source's executable inputs as borrowed or owned views.
@@ -659,14 +694,43 @@ enum QuerySourceRef<'a> {
         /// Whether each field query's last token matches prefixes.
         last_as_prefix: bool,
     },
+    /// Text input and source-local controls for exact late-interaction search.
+    LateInteraction {
+        /// Caller text; never copied into logs or errors.
+        text: &'a str,
+        /// Optional source-local result width.
+        top_k: Option<usize>,
+        /// Optional strong semantic wait override.
+        semantic_wait_ms: Option<u64>,
+    },
 }
 
 /// Couples a source response with the information needed to interpret scores.
 struct SourceQueryResponse {
-    /// Native score direction used by normalization and explain output.
+    /// Source identity used by explain output.
     kind: QuerySourceKind,
+    /// Native score direction used by normalization and pagination.
+    direction: ScoreDirection,
     /// Domain response, including source work counters and optional diagnostics.
     response: QueryResponse,
+    /// Manifest actually used by this source after any strong semantic wait.
+    manifest: Option<Manifest>,
+    /// Late-only recipe and snapshot provenance.
+    late_provenance: Option<LateInteractionProvenance>,
+}
+
+impl SourceQueryResponse {
+    /// Attach execution-selected direction and late provenance to explain metadata.
+    fn annotate_explain_source(&self, source: &mut QueryExplainSource) {
+        source.score_direction = self.direction;
+        if let Some(provenance) = self.late_provenance.as_ref() {
+            source.profile = Some(provenance.profile.clone());
+            source.epoch = Some(provenance.epoch);
+            source.fde_generation = Some(provenance.fde_generation);
+            source.manifest_generation = Some(provenance.manifest_generation);
+            source.consistency_actual = Some(provenance.consistency);
+        }
+    }
 }
 
 /// Default reciprocal-rank-fusion offset when the request omits `k`.
@@ -685,6 +749,8 @@ struct QueryExecutionOptions {
     manifest: Option<Manifest>,
     /// Whether a live active segment should contribute to hydrator heat.
     notify_hydration: bool,
+    /// Whether late strong wait may advance to a newer live manifest.
+    manifest_refresh: ManifestRefresh,
 }
 
 /// Complete borrowed and frozen state for one validated query execution.
@@ -776,6 +842,18 @@ pub struct BatchQueryError {
     pub status: u16,
     /// Whether retrying unchanged may succeed according to the domain error.
     pub retryable: bool,
+    /// Manifest generation required by a semantic-lag failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_generation: Option<u64>,
+    /// Highest contiguous source sequence represented by semantic artifacts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covered_sequence: Option<u64>,
+    /// Live records still awaiting applicable semantic artifacts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_records: Option<u64>,
+    /// Live records blocked by deterministic enrichment failures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_records: Option<u64>,
 }
 
 impl BatchQueryError {
@@ -795,11 +873,31 @@ impl BatchQueryError {
     /// A dimension mismatch becomes a non-retryable 400-class entry while an
     /// internal storage failure retains its server-error classification.
     fn from_error(err: &ZeppelinError) -> Self {
+        let lag = match err {
+            ZeppelinError::LateInteraction(
+                crate::index::late_interaction::LateInteractionError::SemanticIndexLag {
+                    requested_generation,
+                    covered_sequence,
+                    pending_records,
+                    failed_records,
+                },
+            ) => Some((
+                *requested_generation,
+                *covered_sequence,
+                *pending_records,
+                *failed_records,
+            )),
+            _ => None,
+        };
         Self {
             code: err.error_code(),
             error: err.client_message(),
             status: err.status_code(),
             retryable: err.retryable(),
+            requested_generation: lag.map(|values| values.0),
+            covered_sequence: lag.map(|values| values.1),
+            pending_records: lag.map(|values| values.2),
+            failed_records: lag.map(|values| values.3),
         }
     }
 }
@@ -934,6 +1032,11 @@ pub async fn query_namespace(
         validated.cursor_fingerprint = cursor_fingerprint;
     }
     let notify_hydration = as_of_manifest.is_none();
+    let manifest_refresh = if as_of_manifest.is_none() {
+        ManifestRefresh::Live
+    } else {
+        ManifestRefresh::Fixed
+    };
     let result = execute_validated_query(ValidatedQueryExecution {
         state: &state,
         ns: &ns,
@@ -945,6 +1048,7 @@ pub async fn query_namespace(
         options: QueryExecutionOptions {
             manifest: as_of_manifest,
             notify_hydration,
+            manifest_refresh,
         },
     })
     .await
@@ -1166,6 +1270,7 @@ pub async fn batch_query_namespace(
                     options: QueryExecutionOptions {
                         manifest: manifest.clone(),
                         notify_hydration: false,
+                        manifest_refresh: ManifestRefresh::Fixed,
                     },
                 })
                 .await
@@ -1242,8 +1347,12 @@ fn validate_query_shape(
     cursor_fingerprint: Option<u64>,
 ) -> Result<ValidatedQuery, ZeppelinError> {
     let top_k = req.top_k.unwrap_or(knobs.default_top_k);
-    let (source, source_nprobe) =
-        validate_query_source(req, state.config.server.max_vector_id_length)?;
+    let (source, source_nprobe) = validate_query_source(
+        req,
+        state.config.server.max_vector_id_length,
+        state.config.server.max_retrieval_text_bytes,
+        state.config.server.max_top_k,
+    )?;
     validate_retrieval_algebra_options(req)?;
     let include_attributes = validate_projection(req)?;
     let candidate_k = validate_candidate_k(req, top_k)?;
@@ -1301,6 +1410,8 @@ fn validate_query_shape(
 fn validate_query_source(
     req: &QueryRequest,
     max_vector_id_length: usize,
+    max_retrieval_text_bytes: usize,
+    max_top_k: usize,
 ) -> Result<(ValidatedSource, Option<usize>), ZeppelinError> {
     if let Some(sources) = req.sources.as_ref() {
         if req.vector.is_some() || req.rank_by.is_some() {
@@ -1314,7 +1425,12 @@ fn validate_query_source(
             ));
         }
         for source in sources {
-            validate_candidate_source_shape(source, max_vector_id_length)?;
+            validate_candidate_source_shape(
+                source,
+                max_vector_id_length,
+                max_retrieval_text_bytes,
+                max_top_k,
+            )?;
         }
         if sources.len() > 1 {
             return validate_multi_source_request(req, sources);
@@ -1329,6 +1445,9 @@ fn validate_query_source(
                 Ok((ValidatedSource::AlgebraAnn { index: 0 }, *nprobe))
             }
             CandidateSource::Bm25 { .. } => Ok((ValidatedSource::AlgebraBm25 { index: 0 }, None)),
+            CandidateSource::LateInteraction { .. } => {
+                Ok((ValidatedSource::AlgebraLateInteraction { index: 0 }, None))
+            }
         };
     }
 
@@ -1385,6 +1504,8 @@ fn validate_query_source(
 fn validate_candidate_source_shape(
     source: &CandidateSource,
     max_vector_id_length: usize,
+    max_retrieval_text_bytes: usize,
+    max_top_k: usize,
 ) -> Result<(), ZeppelinError> {
     match source {
         CandidateSource::Ann { vector, id, .. } => match (vector.is_some(), id.as_ref()) {
@@ -1397,6 +1518,29 @@ fn validate_candidate_source_shape(
             )),
         },
         CandidateSource::Bm25 { .. } => Ok(()),
+        CandidateSource::LateInteraction { text, top_k, .. } => {
+            if text.trim().is_empty() {
+                return Err(ZeppelinError::LateInteractionQueryEmpty);
+            }
+            let actual_bytes = text.len();
+            if actual_bytes > max_retrieval_text_bytes {
+                return Err(ZeppelinError::LateInteractionQueryTooLarge {
+                    actual_bytes,
+                    max_bytes: max_retrieval_text_bytes,
+                });
+            }
+            if matches!(top_k, Some(0)) {
+                return Err(ZeppelinError::Validation(
+                    "late-interaction source top_k must be >= 1".into(),
+                ));
+            }
+            if top_k.is_some_and(|top_k| top_k > max_top_k) {
+                return Err(ZeppelinError::Validation(format!(
+                    "late-interaction source top_k exceeds maximum of {max_top_k}"
+                )));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1441,6 +1585,14 @@ fn validate_multi_source_request(
         return Err(ZeppelinError::Validation(
             "cannot provide both top-level 'nprobe' and source 'nprobe'".into(),
         ));
+    }
+
+    if matches!(req.fusion, Some(FusionSpec::Weighted { .. }))
+        && sources
+            .iter()
+            .any(|source| matches!(source, CandidateSource::LateInteraction { .. }))
+    {
+        return Err(ZeppelinError::LateInteractionWeightedFusionUnsupported);
     }
 
     match req.fusion.as_ref() {
@@ -1778,6 +1930,7 @@ async fn execute_validated_query(
         options,
     } = execution;
 
+    let manifest_refresh = options.manifest_refresh;
     let manifest =
         read_manifest_for_execution(state, ns, req.consistency, options, meta.artifact_origin()?)
             .await?;
@@ -1793,7 +1946,7 @@ async fn execute_validated_query(
     .await?;
     validate_query_source_metadata(ns, meta, &source_ref)?;
     let emit_debug = req.debug.unwrap_or(false);
-    let first_stage_top_k = first_stage_top_k(req, validated);
+    let first_stage_top_k = source_top_k_for_ref(&source_ref, first_stage_top_k(req, validated));
     let rerank_limit = rerank_output_k(req, validated, first_stage_top_k);
     let first_stage_include_attributes =
         first_stage_include_attributes(req, validated.include_attributes);
@@ -1828,10 +1981,16 @@ async fn execute_validated_query(
         first_stage_include_attributes,
         knobs,
         manifest.clone(),
+        manifest_refresh,
         emit_debug,
     )
     .await?;
+    let source_direction = source.direction;
+    let execution_manifest = source.manifest.clone().unwrap_or(manifest);
     if let Some(explain) = explain.as_mut() {
+        if let Some(explain_source) = explain.plan.sources.first_mut() {
+            source.annotate_explain_source(explain_source);
+        }
         explain.capture_single_source(0, source.kind, &source.response.results);
     }
     apply_rerank_if_requested(
@@ -1848,7 +2007,8 @@ async fn execute_validated_query(
             policy_version: security.policy_version,
             cursor_binding_key: security.cursor_binding_key,
             cursor_fingerprint: validated.cursor_fingerprint,
-            manifest,
+            manifest: execution_manifest,
+            source_direction,
         },
         source.response,
         explain,
@@ -1858,11 +2018,11 @@ async fn execute_validated_query(
 
 /// Executes every source in a validated hybrid request and fuses their results.
 ///
-/// Sources run sequentially in request order against clones of one manifest.
-/// Stored-vector seed IDs are fetched from that snapshot, excluded from all
-/// source responses, and compensated for by requesting extra candidates before
-/// truncation. The fused frontier then enters the same rerank/presentation path
-/// as a single source.
+/// If present, the first late-interaction source runs first so a live strong
+/// wait can select the qualifying manifest. Every remaining source then runs
+/// against that exact root, while response and explain slots preserve request
+/// order. Stored-vector seed IDs are excluded from all source responses and
+/// compensated for by requesting extra candidates before truncation.
 ///
 /// # Parameters
 ///
@@ -1883,8 +2043,9 @@ async fn execute_validated_query(
 ///
 /// # Consistency
 ///
-/// Every ANN/BM25 source and by-ID seed lookup receives the same manifest
-/// snapshot. This avoids fusing candidates from different visibility versions.
+/// Every source and by-ID seed lookup receives the manifest selected by the
+/// first late source, or the caller's original manifest when no late source is
+/// present. Historical and batch roots are fixed and cannot advance.
 ///
 /// # Performance
 ///
@@ -1921,48 +2082,59 @@ async fn execute_hybrid_query(
         ));
     }
 
+    let manifest_refresh = options.manifest_refresh;
     let manifest =
         read_manifest_for_execution(state, ns, req.consistency, options, meta.artifact_origin()?)
             .await?;
-    let mut source_responses = Vec::with_capacity(source_count);
+    let mut source_responses: Vec<Option<SourceQueryResponse>> =
+        std::iter::repeat_with(|| None).take(source_count).collect();
     let emit_debug = req.debug.unwrap_or(false);
     let first_stage_top_k = first_stage_top_k(req, validated);
     let rerank_limit = rerank_output_k(req, validated, first_stage_top_k);
     let first_stage_include_attributes =
         first_stage_include_attributes(req, validated.include_attributes);
     let excluded_seed_ids = algebra_seed_exclusion_ids(req);
-    let source_candidate_k = validated
-        .candidate_k
-        .saturating_add(excluded_seed_ids.len());
-    let mut explain_sources = Vec::with_capacity(source_count);
+    let mut explain_sources: Vec<Option<QueryExplainSource>> =
+        std::iter::repeat_with(|| None).take(source_count).collect();
     let effective_filter =
         query::compile_effective_filter(security.mandatory_filter.as_ref(), req.filter.as_ref());
-    for index in 0..source_count {
+    let first_late_index = sources
+        .iter()
+        .position(|source| matches!(source, CandidateSource::LateInteraction { .. }));
+    let execution_order: Vec<usize> = first_late_index
+        .into_iter()
+        .chain((0..source_count).filter(|index| Some(*index) != first_late_index))
+        .collect();
+    let mut execution_manifest = manifest;
+    for index in execution_order {
         let source_ref = resolve_algebra_source_ref(
             state,
             ns,
             req,
             index,
-            manifest.clone(),
+            execution_manifest.clone(),
             security.mandatory_filter.as_ref(),
             meta.artifact_origin()?,
         )
         .await?;
         validate_query_source_metadata(ns, meta, &source_ref)?;
+        let source_output_k = source_top_k_for_ref(&source_ref, validated.candidate_k);
+        let source_candidate_k = source_output_k.saturating_add(excluded_seed_ids.len());
         let requested_nprobe = nprobe_for_algebra_source(req, index)?;
         let nprobe = resolve_source_nprobe(
             &source_ref,
-            &manifest,
+            &execution_manifest,
             requested_nprobe,
             &state.config.indexing,
             knobs.default_nprobe,
         )?;
-        explain_sources.push(explain_source_for_request_source(
-            req,
-            index,
-            nprobe,
-            source_candidate_k,
-        )?);
+        let mut explain_source =
+            explain_source_for_request_source(req, index, nprobe, source_candidate_k)?;
+        let source_manifest_refresh = if Some(index) == first_late_index {
+            manifest_refresh
+        } else {
+            ManifestRefresh::Fixed
+        };
         let mut source_response = execute_query_source_with_manifest(
             state,
             ns,
@@ -1975,17 +2147,43 @@ async fn execute_hybrid_query(
             nprobe,
             first_stage_include_attributes,
             knobs,
-            manifest.clone(),
+            execution_manifest.clone(),
+            source_manifest_refresh,
             emit_debug,
         )
         .await?;
         exclude_seed_ids_from_response(
             &mut source_response.response,
             &excluded_seed_ids,
-            validated.candidate_k,
+            source_output_k,
         );
-        source_responses.push(source_response);
+        source_response.annotate_explain_source(&mut explain_source);
+        if source_response.kind == QuerySourceKind::LateInteraction {
+            execution_manifest = source_response.manifest.clone().ok_or_else(|| {
+                ZeppelinError::Index("late-interaction source omitted its selected manifest".into())
+            })?;
+        }
+        explain_sources[index] = Some(explain_source);
+        source_responses[index] = Some(source_response);
     }
+    let explain_sources = explain_sources
+        .into_iter()
+        .enumerate()
+        .map(|(index, source)| {
+            source.ok_or_else(|| {
+                ZeppelinError::Index(format!("hybrid explain source {index} was not executed"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let source_responses = source_responses
+        .into_iter()
+        .enumerate()
+        .map(|(index, source)| {
+            source.ok_or_else(|| {
+                ZeppelinError::Index(format!("hybrid source {index} was not executed"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut explain = build_explain_accumulator(
         req,
@@ -2019,7 +2217,8 @@ async fn execute_hybrid_query(
             policy_version: security.policy_version,
             cursor_binding_key: security.cursor_binding_key,
             cursor_fingerprint: validated.cursor_fingerprint,
-            manifest,
+            manifest: execution_manifest,
+            source_direction: ScoreDirection::HigherIsBetter,
         },
         response,
         explain,
@@ -2058,6 +2257,18 @@ fn first_stage_top_k(req: &QueryRequest, validated: ValidatedQuery) -> usize {
         }
     } else {
         validated.top_k
+    }
+}
+
+/// Applies a late-interaction source-local width without changing other sources.
+fn source_top_k_for_ref(source: &QuerySourceRef<'_>, fallback: usize) -> usize {
+    match source {
+        QuerySourceRef::LateInteraction {
+            top_k: Some(top_k), ..
+        } => *top_k,
+        QuerySourceRef::Ann { .. }
+        | QuerySourceRef::Bm25 { .. }
+        | QuerySourceRef::LateInteraction { top_k: None, .. } => fallback,
     }
 }
 
@@ -2198,7 +2409,9 @@ fn algebra_seed_exclusion_ids(req: &QueryRequest) -> HashSet<String> {
         .iter()
         .filter_map(|source| match source {
             CandidateSource::Ann { id: Some(id), .. } => Some(id.clone()),
-            _ => None,
+            CandidateSource::Ann { id: None, .. }
+            | CandidateSource::Bm25 { .. }
+            | CandidateSource::LateInteraction { .. } => None,
         })
         .collect()
 }
@@ -2434,7 +2647,7 @@ impl ExplainAccumulator {
                     ));
                 }
                 let normalized =
-                    normalize_source_score(source.kind, result.score, min_score, max_score);
+                    normalize_source_score(source.direction, result.score, min_score, max_score);
                 self.record_source_score(
                     &result.id,
                     source_index,
@@ -2737,12 +2950,36 @@ fn explain_source_for_ref(
             kind: QueryExplainSourceKind::Ann,
             nprobe: Some(nprobe),
             candidate_k,
+            score_direction: ScoreDirection::LowerIsBetter,
+            profile: None,
+            epoch: None,
+            fde_generation: None,
+            manifest_generation: None,
+            consistency_actual: None,
         },
         QuerySourceRef::Bm25 { .. } => QueryExplainSource {
             index,
             kind: QueryExplainSourceKind::Bm25,
             nprobe: None,
             candidate_k,
+            score_direction: ScoreDirection::HigherIsBetter,
+            profile: None,
+            epoch: None,
+            fde_generation: None,
+            manifest_generation: None,
+            consistency_actual: None,
+        },
+        QuerySourceRef::LateInteraction { .. } => QueryExplainSource {
+            index,
+            kind: QueryExplainSourceKind::LateInteraction,
+            nprobe: None,
+            candidate_k,
+            score_direction: ScoreDirection::HigherIsBetter,
+            profile: None,
+            epoch: None,
+            fde_generation: None,
+            manifest_generation: None,
+            consistency_actual: None,
         },
     }
 }
@@ -2769,12 +3006,36 @@ fn explain_source_for_request_source(
             kind: QueryExplainSourceKind::Ann,
             nprobe: Some(nprobe),
             candidate_k,
+            score_direction: ScoreDirection::LowerIsBetter,
+            profile: None,
+            epoch: None,
+            fde_generation: None,
+            manifest_generation: None,
+            consistency_actual: None,
         }),
         Some(CandidateSource::Bm25 { .. }) => Ok(QueryExplainSource {
             index,
             kind: QueryExplainSourceKind::Bm25,
             nprobe: None,
             candidate_k,
+            score_direction: ScoreDirection::HigherIsBetter,
+            profile: None,
+            epoch: None,
+            fde_generation: None,
+            manifest_generation: None,
+            consistency_actual: None,
+        }),
+        Some(CandidateSource::LateInteraction { .. }) => Ok(QueryExplainSource {
+            index,
+            kind: QueryExplainSourceKind::LateInteraction,
+            nprobe: None,
+            candidate_k,
+            score_direction: ScoreDirection::HigherIsBetter,
+            profile: None,
+            epoch: None,
+            fde_generation: None,
+            manifest_generation: None,
+            consistency_actual: None,
         }),
         None => Err(ZeppelinError::Validation(
             "validated algebra source is missing".into(),
@@ -2787,6 +3048,7 @@ fn explain_source_kind(kind: QuerySourceKind) -> QueryExplainSourceKind {
     match kind {
         QuerySourceKind::Ann => QueryExplainSourceKind::Ann,
         QuerySourceKind::Bm25 => QueryExplainSourceKind::Bm25,
+        QuerySourceKind::LateInteraction => QueryExplainSourceKind::LateInteraction,
     }
 }
 
@@ -2795,9 +3057,9 @@ fn explain_path(source: ValidatedSource) -> QueryExplainPath {
     match source {
         ValidatedSource::LegacyVector => QueryExplainPath::LegacyVector,
         ValidatedSource::LegacyBm25 => QueryExplainPath::LegacyBm25,
-        ValidatedSource::AlgebraAnn { .. } | ValidatedSource::AlgebraBm25 { .. } => {
-            QueryExplainPath::AlgebraSingle
-        }
+        ValidatedSource::AlgebraAnn { .. }
+        | ValidatedSource::AlgebraBm25 { .. }
+        | ValidatedSource::AlgebraLateInteraction { .. } => QueryExplainPath::AlgebraSingle,
         ValidatedSource::AlgebraHybrid { .. } => QueryExplainPath::AlgebraHybrid,
     }
 }
@@ -2834,6 +3096,8 @@ struct RerankExecutionContext<'a> {
     cursor_fingerprint: Option<u64>,
     /// Owned visibility snapshot reused by vector-value fetches.
     manifest: Manifest,
+    /// Native direction of the source or fused frontier entering reranking.
+    source_direction: ScoreDirection,
 }
 
 /// Applies facets, optional reranking, grouping/cursoring, projection, and explain.
@@ -2892,16 +3156,22 @@ async fn apply_rerank_if_requested(
 ) -> Result<QueryResponse, ZeppelinError> {
     let facets = compute_facets_if_requested(ctx.req, &response.results)?;
     let keep_attrs_after_rerank = ctx.include_attributes || grouping_requested(ctx.req);
-    let response = match ctx.req.rerank.as_ref() {
-        Some(RerankSpec::Vector { vector }) => apply_vector_rerank(&ctx, response, vector).await?,
-        Some(RerankSpec::Bm25 { rank_by }) => apply_bm25_rerank(
-            ctx.meta,
-            response,
-            ctx.rerank_limit,
-            keep_attrs_after_rerank,
-            rank_by,
-        )?,
-        _ => response,
+    let (response, final_direction) = match ctx.req.rerank.as_ref() {
+        Some(RerankSpec::Vector { vector }) => (
+            apply_vector_rerank(&ctx, response, vector).await?,
+            ScoreDirection::LowerIsBetter,
+        ),
+        Some(RerankSpec::Bm25 { rank_by }) => (
+            apply_bm25_rerank(
+                ctx.meta,
+                response,
+                ctx.rerank_limit,
+                keep_attrs_after_rerank,
+                rank_by,
+            )?,
+            ScoreDirection::HigherIsBetter,
+        ),
+        _ => (response, ctx.source_direction),
     };
     if ctx.req.rerank.as_ref().is_some_and(RerankSpec::is_explicit) {
         if let Some(explain) = explain.as_mut() {
@@ -2914,6 +3184,7 @@ async fn apply_rerank_if_requested(
         ctx.req,
         response,
         ctx.top_k,
+        final_direction,
         ctx.policy_version,
         ctx.cursor_binding_key,
         ctx.cursor_fingerprint,
@@ -3449,6 +3720,7 @@ fn apply_cursor_if_requested(
     req: &QueryRequest,
     mut response: QueryResponse,
     top_k: usize,
+    score_direction: ScoreDirection,
     policy_version: PolicyVersion,
     cursor_binding_key: CursorBindingKey,
     fingerprint: Option<u64>,
@@ -3458,7 +3730,7 @@ fn apply_cursor_if_requested(
         return Ok(response);
     };
 
-    let cursor_cmp = cursor_result_cmp(req);
+    let cursor_cmp = cursor_result_cmp(score_direction);
     response.results.sort_by(cursor_cmp);
     let fingerprint = fingerprint.ok_or_else(|| {
         ZeppelinError::Index(
@@ -3520,33 +3792,13 @@ fn apply_cursor_if_requested(
 /// A plain function pointer that sorts ascending distance or descending
 /// fused/relevance score, always with ascending ID ties. A function pointer has
 /// no captured state and can be reused by sorting and marker filtering.
-fn cursor_result_cmp(req: &QueryRequest) -> fn(&SearchResult, &SearchResult) -> Ordering {
-    if cursor_lower_score_is_better(req) {
-        distance_result_cmp
-    } else {
-        fused_result_cmp
+fn cursor_result_cmp(
+    score_direction: ScoreDirection,
+) -> fn(&SearchResult, &SearchResult) -> Ordering {
+    match score_direction {
+        ScoreDirection::LowerIsBetter => distance_result_cmp,
+        ScoreDirection::HigherIsBetter => fused_result_cmp,
     }
-}
-
-/// Determines whether the final cursor score treats smaller values as better.
-///
-/// Explicit vector rerank and a single algebra ANN source use distance order.
-/// BM25 rerank, BM25 sources, and hybrid fused scores use descending order.
-///
-/// # Examples
-///
-/// A hybrid ANN+BM25 query followed by vector rerank returns `true` because the
-/// reranker replaces fused scores with distances.
-fn cursor_lower_score_is_better(req: &QueryRequest) -> bool {
-    match req.rerank.as_ref() {
-        Some(RerankSpec::Vector { .. }) => return true,
-        Some(RerankSpec::Bm25 { .. }) => return false,
-        Some(RerankSpec::Default | RerankSpec::None) | None => {}
-    }
-    let Some(sources) = req.sources.as_ref() else {
-        return false;
-    };
-    matches!(sources.as_slice(), [CandidateSource::Ann { .. }])
 }
 
 /// Orders distance results from nearest to farthest with stable ID ties.
@@ -4195,6 +4447,15 @@ fn validate_query_source_metadata(
             }
             Ok(())
         }
+        QuerySourceRef::LateInteraction { .. } => {
+            if meta.index_type != IndexType::LateInteractionFde {
+                return Err(ZeppelinError::LateInteractionNamespaceRequired {
+                    namespace: ns.to_string(),
+                    actual: meta.index_type,
+                });
+            }
+            Ok(())
+        }
     }
 }
 
@@ -4322,9 +4583,11 @@ async fn execute_query_source_with_manifest(
     include_attributes: bool,
     knobs: &QueryKnobs,
     manifest: Manifest,
+    manifest_refresh: ManifestRefresh,
     emit_debug: bool,
 ) -> Result<SourceQueryResponse, ZeppelinError> {
     let authoritative_origin = meta.artifact_origin()?;
+    let supplied_manifest = manifest.clone();
     match source_ref {
         QuerySourceRef::Bm25 {
             rank_by,
@@ -4392,7 +4655,10 @@ async fn execute_query_source_with_manifest(
             };
             response.map(|response| SourceQueryResponse {
                 kind: QuerySourceKind::Bm25,
+                direction: QuerySourceKind::Bm25.direction(),
                 response,
+                manifest: Some(supplied_manifest),
+                late_provenance: None,
             })
         }
         QuerySourceRef::Ann {
@@ -4469,10 +4735,96 @@ async fn execute_query_source_with_manifest(
             }
             Ok(SourceQueryResponse {
                 kind: QuerySourceKind::Ann,
+                direction: QuerySourceKind::Ann.direction(),
                 response,
+                manifest: Some(supplied_manifest),
+                late_provenance: None,
             })
         }
+        QuerySourceRef::LateInteraction {
+            text,
+            top_k: _,
+            semantic_wait_ms,
+        } => {
+            execute_late_interaction_source_with_manifest(
+                state,
+                ns,
+                req,
+                text,
+                semantic_wait_ms,
+                top_k,
+                effective_filter,
+                manifest,
+                manifest_refresh,
+            )
+            .await
+        }
     }
+}
+
+/// Adapts one validated HTTP source to snapshot-bound exhaustive MaxSim search.
+///
+/// The returned manifest may be newer than the supplied root only when live
+/// strong-wait refresh was explicitly allowed. Callers must use that returned
+/// root for every later source and rerank in the same query.
+#[allow(clippy::too_many_arguments)]
+async fn execute_late_interaction_source_with_manifest(
+    state: &AppState,
+    ns: &str,
+    req: &QueryRequest,
+    text: &str,
+    semantic_wait_ms: Option<u64>,
+    top_k: usize,
+    filter: Option<&Filter>,
+    manifest: Manifest,
+    manifest_refresh: ManifestRefresh,
+) -> Result<SourceQueryResponse, ZeppelinError> {
+    let output = crate::index::late_interaction::search(LateInteractionSearchRequest {
+        store: &state.store,
+        encoder_provider: state.encoder_provider.as_ref(),
+        namespace: ns,
+        manifest,
+        text,
+        top_k,
+        effective_filter: filter,
+        consistency: req.consistency,
+        semantic_wait: Duration::from_millis(
+            semantic_wait_ms.unwrap_or(state.config.mmli.semantic_wait_ms),
+        ),
+        max_overlay_bytes: state.config.mmli.max_overlay_bytes_per_query,
+        manifest_refresh,
+    })
+    .await?;
+    let semantic_coverage = match output.semantic_coverage {
+        LateInteractionCoverage::Complete => query::SemanticCoverage::Complete,
+        LateInteractionCoverage::Partial => query::SemanticCoverage::Partial,
+    };
+    let response = QueryResponse {
+        results: output
+            .results
+            .into_iter()
+            .map(|result| SearchResult {
+                id: result.id,
+                score: result.score,
+                attributes: result.attributes,
+            })
+            .collect(),
+        scanned_fragments: 0,
+        scanned_segments: 0,
+        debug: None,
+        next_cursor: None,
+        groups: None,
+        facets: None,
+        explain: None,
+        semantic_coverage: Some(semantic_coverage),
+    };
+    Ok(SourceQueryResponse {
+        kind: QuerySourceKind::LateInteraction,
+        direction: QuerySourceKind::LateInteraction.direction(),
+        response,
+        manifest: Some(output.manifest),
+        late_provenance: Some(output.provenance),
+    })
 }
 
 /// Combines multiple source responses and aggregates their observable work.
@@ -4527,6 +4879,16 @@ fn fuse_source_responses(
     } else {
         Vec::new()
     };
+    let semantic_coverage = sources
+        .iter()
+        .filter_map(|source| source.response.semantic_coverage)
+        .fold(None, |coverage, source_coverage| {
+            Some(match (coverage, source_coverage) {
+                (Some(query::SemanticCoverage::Partial), _)
+                | (_, query::SemanticCoverage::Partial) => query::SemanticCoverage::Partial,
+                _ => query::SemanticCoverage::Complete,
+            })
+        });
     let results = match fusion {
         Some(FusionSpec::None) => {
             return Err(ZeppelinError::Validation(
@@ -4557,6 +4919,7 @@ fn fuse_source_responses(
         groups: None,
         facets: None,
         explain: None,
+        semantic_coverage,
     })
 }
 
@@ -4586,11 +4949,17 @@ pub(crate) fn fuse_ann_bm25_for_test_support(
         vec![
             SourceQueryResponse {
                 kind: QuerySourceKind::Ann,
+                direction: QuerySourceKind::Ann.direction(),
                 response: ann,
+                manifest: None,
+                late_provenance: None,
             },
             SourceQueryResponse {
                 kind: QuerySourceKind::Bm25,
+                direction: QuerySourceKind::Bm25.direction(),
                 response: bm25,
+                manifest: None,
+                late_provenance: None,
             },
         ],
         top_k,
@@ -4750,7 +5119,7 @@ fn fuse_weighted_results(
                 ));
             }
             let normalized =
-                normalize_source_score(source.kind, result.score, min_score, max_score);
+                normalize_source_score(source.direction, result.score, min_score, max_score);
             add_fused_candidate(&mut fused, result, weight * normalized);
         }
     }
@@ -4776,7 +5145,7 @@ fn fuse_weighted_results(
 /// ANN distances from `0.1` to `0.5` map `0.1` to one and `0.5` to zero; BM25
 /// relevance does the opposite mapping for the same numeric endpoints.
 fn normalize_source_score(
-    kind: QuerySourceKind,
+    direction: ScoreDirection,
     score: f32,
     min_score: f32,
     max_score: f32,
@@ -4785,9 +5154,9 @@ fn normalize_source_score(
         return 1.0;
     }
 
-    match kind {
-        QuerySourceKind::Ann => (max_score - score) / (max_score - min_score),
-        QuerySourceKind::Bm25 => (score - min_score) / (max_score - min_score),
+    match direction {
+        ScoreDirection::LowerIsBetter => (max_score - score) / (max_score - min_score),
+        ScoreDirection::HigherIsBetter => (score - min_score) / (max_score - min_score),
     }
 }
 
@@ -4910,6 +5279,18 @@ async fn resolve_query_source_ref<'a>(
             )
             .await
         }
+        ValidatedSource::AlgebraLateInteraction { index } => {
+            resolve_algebra_source_ref(
+                state,
+                ns,
+                req,
+                index,
+                manifest,
+                mandatory_filter,
+                authoritative_origin,
+            )
+            .await
+        }
         ValidatedSource::AlgebraHybrid { .. } => Err(ZeppelinError::Validation(
             "hybrid query must execute through all algebra sources".into(),
         )),
@@ -4998,6 +5379,15 @@ async fn resolve_algebra_source_ref<'a>(
             rank_by,
             last_as_prefix: last_as_prefix.or(req.last_as_prefix).unwrap_or(false),
         }),
+        Some(CandidateSource::LateInteraction {
+            text,
+            top_k,
+            semantic_wait_ms,
+        }) => Ok(QuerySourceRef::LateInteraction {
+            text,
+            top_k: *top_k,
+            semantic_wait_ms: *semantic_wait_ms,
+        }),
         None => Err(ZeppelinError::Validation(
             "validated algebra source is missing".into(),
         )),
@@ -5030,6 +5420,7 @@ fn nprobe_for_algebra_source(
     match sources.get(index) {
         Some(CandidateSource::Ann { nprobe, .. }) => Ok(nprobe.or(req.nprobe)),
         Some(CandidateSource::Bm25 { .. }) => Ok(None),
+        Some(CandidateSource::LateInteraction { .. }) => Ok(None),
         None => Err(ZeppelinError::Validation(
             "validated algebra source is missing".into(),
         )),
@@ -5055,6 +5446,7 @@ fn resolve_source_nprobe(
             )
         }
         QuerySourceRef::Bm25 { .. } => Ok(default_nprobe_floor),
+        QuerySourceRef::LateInteraction { .. } => Ok(default_nprobe_floor),
     }
 }
 

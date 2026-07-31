@@ -1,16 +1,21 @@
-//! Pure late-interaction primitives.
+//! Late-interaction kernels and exact manifest-selected overlay search.
 //!
 //! The module validates ragged multi-vector matrices, builds deterministic
-//! MUVERA fixed-dimensional encodings, and provides the scalar MaxSim truth
-//! scorer. It owns no storage, manifest, configuration, or query orchestration.
+//! MUVERA fixed-dimensional encodings, provides the scalar MaxSim truth scorer,
+//! and owns exhaustive exact search over one immutable root-plus-section pair.
 
 mod fde;
 mod matrix;
 mod maxsim;
+mod search;
 
 pub use fde::{FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection, InnerProjection};
 pub use matrix::MultiVectorMatrixRef;
 pub use maxsim::max_sim;
+pub use search::{
+    search, LateInteractionCoverage, LateInteractionProvenance, LateInteractionRankedResult,
+    LateInteractionSearchOutput, LateInteractionSearchRequest, ManifestRefresh,
+};
 
 use thiserror::Error;
 
@@ -94,5 +99,62 @@ pub enum LateInteractionError {
     InvalidFdeTransform {
         /// Decode or integrity diagnostic.
         reason: String,
+    },
+
+    /// The selected root did not reference late-interaction state.
+    #[error("late-interaction search requires a manifest-selected late-state section")]
+    MissingLateState,
+
+    /// The selected late-state section had no active semantic profile.
+    #[error("late-interaction search requires an active embedding profile")]
+    MissingActiveProfile,
+
+    /// Root coverage metadata did not describe the root-plus-section snapshot.
+    #[error("semantic coverage metadata disagrees with the selected snapshot")]
+    CoverageMetadataMismatch,
+
+    /// One source version was published more than once for the active recipe.
+    #[error("semantic coverage contains duplicate output for one source version")]
+    DuplicateVersionCoverage,
+
+    /// An exact matrix artifact disagreed with its overlay coverage descriptor.
+    #[error("semantic overlay matrix metadata disagrees with covered versions")]
+    MatrixCoverageMismatch,
+
+    /// Checked addition overflowed while sizing selected matrix objects.
+    #[error("semantic overlay payload byte count overflows u64")]
+    OverlayPayloadSizeOverflow,
+
+    /// Coverage replay exceeded a persisted integer bound.
+    #[error("semantic coverage replay arithmetic overflow")]
+    CoverageArithmeticOverflow,
+
+    /// The resolved query encoder disagreed with the active profile.
+    #[error("late-interaction query encoder identity or dimension mismatch")]
+    EncoderIdentityMismatch,
+
+    /// Loading selected exact matrices would exceed the configured query cap.
+    #[error("semantic overlay payload is {requested_bytes} bytes, maximum is {max_bytes}")]
+    OverlayPayloadBudgetExceeded {
+        /// Aggregate immutable matrix bytes selected by this query.
+        requested_bytes: u64,
+        /// Configured maximum overlay bytes per query.
+        max_bytes: u64,
+    },
+
+    /// Strong semantics could not find a fully covered snapshot in time.
+    #[error(
+        "semantic index lag at requested generation {requested_generation}: covered through \
+         sequence {covered_sequence}, {pending_records} pending, {failed_records} failed"
+    )]
+    SemanticIndexLag {
+        /// Root generation selected when the query began.
+        requested_generation: u64,
+        /// Highest contiguous mutation sequence represented by derived state.
+        covered_sequence: u64,
+        /// Live source versions without applicable output.
+        pending_records: u64,
+        /// Live source versions with deterministic enrichment failure.
+        failed_records: u64,
     },
 }

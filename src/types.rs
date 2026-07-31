@@ -385,6 +385,20 @@ pub enum ConsistencyLevel {
     Eventual,
 }
 
+/// Declares whether smaller or larger native source scores rank first.
+///
+/// ANN distances are lower-is-better. BM25 relevance and late-interaction
+/// MaxSim remain higher-is-better. Carrying this explicitly prevents fusion,
+/// pagination, and provenance code from guessing from request shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoreDirection {
+    /// Smaller native scores rank ahead of larger scores.
+    LowerIsBetter,
+    /// Larger native scores rank ahead of smaller scores.
+    HigherIsBetter,
+}
+
 /// Selects the vector-index family and compression strategy for a namespace.
 ///
 /// All variants use approximate nearest-neighbor search and trade storage,

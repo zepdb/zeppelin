@@ -108,6 +108,7 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
         branch_readiness: zeppelin::namespace::BranchGraphReadinessSnapshot::new(),
         wal_writer: Arc::new(WalWriter::new(store.clone())),
         wal_reader: Arc::new(WalReader::new(store.clone())),
+        encoder_provider: common::server::test_encoder_provider(&config, &store),
         compactor: compactor.clone(),
         lease_manager,
         compaction_lifecycle: compaction_lifecycle.clone(),

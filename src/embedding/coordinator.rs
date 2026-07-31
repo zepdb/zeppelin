@@ -9,14 +9,14 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
+use crate::embedding::transform::{apply_vector_transform, load_vector_transform_mean};
 use crate::embedding::{
-    ArtifactChecksum, CandidateDocumentPooling, CenteringArtifact, EmbeddingProfileRef,
-    EncoderDocumentInput, EncoderInputRef, FdeArtifact, FdeArtifactRow, FdeFragmentRef,
-    ImmutableArtifactBytes, MatrixArtifact, MatrixArtifactRow, MultiVectorEmbedding,
-    MultiVectorEmbeddingBatch, MultiVectorEmbeddingFragmentRef, MultiVectorEncoder,
-    MultiVectorEpochId, PhysicalInputFragmentIdentity, RecordVersionCoverage, RecordVersionRef,
-    RetrievalUnitRecord, SemanticOverlayRef, VectorTransformRecipe, FDE_ARTIFACT_FORMAT_VERSION,
-    MATRIX_ARTIFACT_FORMAT_VERSION,
+    ArtifactChecksum, CandidateDocumentPooling, EmbeddingProfileRef, EncoderDocumentInput,
+    EncoderInputRef, FdeArtifact, FdeArtifactRow, FdeFragmentRef, ImmutableArtifactBytes,
+    MatrixArtifact, MatrixArtifactRow, MultiVectorEmbedding, MultiVectorEmbeddingBatch,
+    MultiVectorEmbeddingFragmentRef, MultiVectorEncoder, MultiVectorEpochId,
+    PhysicalInputFragmentIdentity, RecordVersionCoverage, RecordVersionRef, RetrievalUnitRecord,
+    SemanticOverlayRef, FDE_ARTIFACT_FORMAT_VERSION, MATRIX_ARTIFACT_FORMAT_VERSION,
 };
 use crate::error::{Result, ZeppelinError};
 use crate::index::late_interaction::FdeTransform;
@@ -26,6 +26,8 @@ use crate::wal::{
     EncoderInputWalFragment, InputFragmentRef, LateStateSection, LeaseManager, Manifest,
     QuarantineEvidenceRef,
 };
+
+use super::priority::QueryPriorityEncoder;
 
 /// Deterministic identity of one complete enrichment unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -120,6 +122,7 @@ impl MultiVectorEncoderRegistry {
     /// Register one encoder under the exact epoch it reports.
     pub fn register(&self, encoder: Arc<dyn MultiVectorEncoder>) -> Result<()> {
         let epoch = encoder.epoch();
+        let encoder = QueryPriorityEncoder::wrap(encoder);
         let mut encoders = self
             .encoders
             .write()
@@ -694,13 +697,13 @@ async fn load_work_inputs_once(
         &work.source_versions,
     )
     .await?;
-    let exact_mean = load_transform_mean(
+    let exact_mean = load_vector_transform_mean(
         store,
         &work.profile.epoch.exact_scoring_transform,
         work.profile.epoch.vector_dimension as usize,
     )
     .await?;
-    let candidate_mean = load_transform_mean(
+    let candidate_mean = load_vector_transform_mean(
         store,
         &work.profile.fde.candidate_vector_transform,
         work.profile.epoch.vector_dimension as usize,
@@ -1399,76 +1402,6 @@ fn terminal_post_encode_error(error: ZeppelinError) -> ZeppelinError {
     ZeppelinError::Validation(format!(
         "semantic enrichment failed after encoder completion: {error}"
     ))
-}
-
-async fn load_transform_mean(
-    store: &ZeppelinStore,
-    recipe: &VectorTransformRecipe,
-    dimension: usize,
-) -> Result<Option<Vec<f32>>> {
-    let Some(reference) = recipe.mean() else {
-        return Ok(None);
-    };
-    let bytes = store.get(&reference.key).await?;
-    if u64::try_from(bytes.len()).ok() != Some(reference.size_bytes) {
-        return Err(ZeppelinError::Serialization(
-            "centering artifact size mismatch".to_string(),
-        ));
-    }
-    CenteringArtifact::from_bytes(&bytes, reference.checksum, dimension)
-        .map(|artifact| Some(artifact.values().to_vec()))
-}
-
-fn apply_vector_transform(
-    embedding: &MultiVectorEmbedding,
-    recipe: &VectorTransformRecipe,
-    mean: Option<&[f32]>,
-    max_vectors: usize,
-) -> Result<MultiVectorEmbedding> {
-    let mut values = embedding.values().to_vec();
-    match recipe {
-        VectorTransformRecipe::Identity => {}
-        VectorTransformRecipe::SubtractMean { renormalize, .. } => {
-            let mean = mean.ok_or_else(|| {
-                ZeppelinError::Validation(
-                    "centering transform is missing its loaded mean".to_string(),
-                )
-            })?;
-            if mean.len() != embedding.vector_dimension() {
-                return Err(ZeppelinError::DimensionMismatch {
-                    expected: embedding.vector_dimension(),
-                    actual: mean.len(),
-                });
-            }
-            for row in values.chunks_exact_mut(embedding.vector_dimension()) {
-                for (value, center) in row.iter_mut().zip(mean) {
-                    *value -= center;
-                }
-                if *renormalize {
-                    let norm = row
-                        .iter()
-                        .map(|value| f64::from(*value) * f64::from(*value))
-                        .sum::<f64>()
-                        .sqrt();
-                    if !norm.is_finite() || norm == 0.0 {
-                        return Err(ZeppelinError::Validation(
-                            "centering produced a zero or non-finite row".to_string(),
-                        ));
-                    }
-                    let inverse = norm.recip() as f32;
-                    for value in row {
-                        *value *= inverse;
-                    }
-                }
-            }
-        }
-    }
-    MultiVectorEmbedding::new(
-        values,
-        embedding.vector_count(),
-        embedding.vector_dimension(),
-        max_vectors,
-    )
 }
 
 fn apply_candidate_document_pooling(

@@ -71,6 +71,34 @@ curl -s http://localhost:8080/v1/namespaces/<ns>/query \
   }' | jq
 ```
 
+For a `late_interaction_fde` namespace with an active embedding profile, send
+query text through the retrieval algebra:
+
+```bash
+curl -s http://localhost:8080/v1/namespaces/<ns>/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sources": [{
+      "type": "late_interaction",
+      "text": "find the section about storage ownership",
+      "top_k": 100,
+      "semantic_wait_ms": 5000
+    }],
+    "consistency": "strong",
+    "top_k": 10
+  }' | jq
+```
+
+Strong queries wait for every visible live record to have an exact semantic
+overlay. If the budget expires, Zeppelin returns `SEMANTIC_INDEX_LAG` with
+`requested_generation`, `covered_sequence`, `pending_records`, and
+`failed_records`. Eventual queries score only covered live versions and
+suppress newer pending versions and tombstones. Their response reports
+`"semantic_coverage": "complete"` when every live version was covered and
+`"semantic_coverage": "partial"` when any live version was omitted.
+Late-interaction sources can participate in RRF fusion; weighted fusion is
+rejected because raw MaxSim is not calibrated against dense or BM25 scores.
+
 ### Delete vectors
 
 ```bash

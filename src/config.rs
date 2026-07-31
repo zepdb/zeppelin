@@ -112,6 +112,8 @@ const MMLI_MAX_BYTES_PER_TICK_ENV: &str = "ZEPPELIN_MMLI_MAX_BYTES_PER_TICK";
 const MMLI_MAX_RETRY_ATTEMPTS_ENV: &str = "ZEPPELIN_MMLI_MAX_RETRY_ATTEMPTS";
 /// Environment key for the enrichment-plane shutdown deadline.
 const MMLI_SHUTDOWN_TIMEOUT_SECS_ENV: &str = "ZEPPELIN_MMLI_SHUTDOWN_TIMEOUT_SECS";
+const MMLI_SEMANTIC_WAIT_MS_ENV: &str = "ZEPPELIN_MMLI_SEMANTIC_WAIT_MS";
+const MMLI_MAX_OVERLAY_BYTES_PER_QUERY_ENV: &str = "ZEPPELIN_MMLI_MAX_OVERLAY_BYTES_PER_QUERY";
 /// Environment key for the pinned worker virtual environment.
 const MMLI_WORKER_VENV_DIR_ENV: &str = "ZEPPELIN_MMLI_WORKER_VENV_DIR";
 /// Environment key for the pinned worker Python executable.
@@ -259,6 +261,12 @@ pub struct MmliConfig {
     /// Maximum time to join enrichment workers during shutdown. Default: `30`.
     #[serde(default = "default_mmli_shutdown_timeout_secs")]
     pub shutdown_timeout_secs: u64,
+    /// Default strong-query wait budget for semantic coverage. Default: `5_000`.
+    #[serde(default = "default_mmli_semantic_wait_ms")]
+    pub semantic_wait_ms: u64,
+    /// Maximum encoded overlay bytes read by one query. Default: `536_870_912`.
+    #[serde(default = "default_mmli_max_overlay_bytes_per_query")]
+    pub max_overlay_bytes_per_query: u64,
     /// Production worker execution paths and bounds.
     ///
     /// This stays absent for development-only deployments. Selecting a pinned
@@ -345,6 +353,14 @@ const fn default_mmli_shutdown_timeout_secs() -> u64 {
     30
 }
 
+const fn default_mmli_semantic_wait_ms() -> u64 {
+    5_000
+}
+
+const fn default_mmli_max_overlay_bytes_per_query() -> u64 {
+    512 * 1024 * 1024
+}
+
 impl Default for MmliConfig {
     fn default() -> Self {
         Self {
@@ -354,6 +370,8 @@ impl Default for MmliConfig {
             max_bytes_per_tick: default_mmli_max_bytes_per_tick(),
             max_retry_attempts: default_mmli_max_retry_attempts(),
             shutdown_timeout_secs: default_mmli_shutdown_timeout_secs(),
+            semantic_wait_ms: default_mmli_semantic_wait_ms(),
+            max_overlay_bytes_per_query: default_mmli_max_overlay_bytes_per_query(),
             worker: None,
         }
     }
@@ -779,6 +797,8 @@ mod tests {
                 MMLI_MAX_BYTES_PER_TICK_ENV,
                 MMLI_MAX_RETRY_ATTEMPTS_ENV,
                 MMLI_SHUTDOWN_TIMEOUT_SECS_ENV,
+                MMLI_SEMANTIC_WAIT_MS_ENV,
+                MMLI_MAX_OVERLAY_BYTES_PER_QUERY_ENV,
                 MMLI_WORKER_VENV_DIR_ENV,
                 MMLI_WORKER_PYTHON_BINARY_ENV,
                 MMLI_WORKER_SCRIPT_ENV,
@@ -1032,6 +1052,8 @@ mod tests {
         assert_eq!(defaults.max_bytes_per_tick, 64 * 1024 * 1024);
         assert_eq!(defaults.max_retry_attempts, 3);
         assert_eq!(defaults.shutdown_timeout_secs, 30);
+        assert_eq!(defaults.semantic_wait_ms, 5_000);
+        assert_eq!(defaults.max_overlay_bytes_per_query, 512 * 1024 * 1024);
         assert!(defaults.worker.is_none());
 
         let source = r#"
@@ -1042,6 +1064,8 @@ mod tests {
             max_bytes_per_tick = 1024
             max_retry_attempts = 4
             shutdown_timeout_secs = 5
+            semantic_wait_ms = 6
+            max_overlay_bytes_per_query = 2048
         "#;
         let configured = load_toml(source).unwrap().mmli;
         assert!(!configured.allow_dev_encoder);
@@ -1050,6 +1074,8 @@ mod tests {
         assert_eq!(configured.max_bytes_per_tick, 1024);
         assert_eq!(configured.max_retry_attempts, 4);
         assert_eq!(configured.shutdown_timeout_secs, 5);
+        assert_eq!(configured.semantic_wait_ms, 6);
+        assert_eq!(configured.max_overlay_bytes_per_query, 2048);
 
         std::env::set_var(MMLI_ALLOW_DEV_ENCODER_ENV, "true");
         std::env::set_var(MMLI_ENRICHMENT_QUEUE_CAPACITY_ENV, "17");
@@ -1057,6 +1083,8 @@ mod tests {
         std::env::set_var(MMLI_MAX_BYTES_PER_TICK_ENV, "4096");
         std::env::set_var(MMLI_MAX_RETRY_ATTEMPTS_ENV, "7");
         std::env::set_var(MMLI_SHUTDOWN_TIMEOUT_SECS_ENV, "11");
+        std::env::set_var(MMLI_SEMANTIC_WAIT_MS_ENV, "13");
+        std::env::set_var(MMLI_MAX_OVERLAY_BYTES_PER_QUERY_ENV, "8192");
 
         let overridden = load_toml(source).unwrap().mmli;
         assert!(overridden.allow_dev_encoder);
@@ -1065,6 +1093,8 @@ mod tests {
         assert_eq!(overridden.max_bytes_per_tick, 4096);
         assert_eq!(overridden.max_retry_attempts, 7);
         assert_eq!(overridden.shutdown_timeout_secs, 11);
+        assert_eq!(overridden.semantic_wait_ms, 13);
+        assert_eq!(overridden.max_overlay_bytes_per_query, 8192);
     }
 
     /// Pinned-worker configuration is optional, strict, and environment-overridable.
@@ -1129,6 +1159,8 @@ mod tests {
         config.mmli.max_bytes_per_tick = 0;
         config.mmli.max_retry_attempts = 0;
         config.mmli.shutdown_timeout_secs = 0;
+        config.mmli.semantic_wait_ms = 0;
+        config.mmli.max_overlay_bytes_per_query = 0;
 
         let error = config.validate().unwrap_err().to_string();
         for field in [
@@ -1137,6 +1169,8 @@ mod tests {
             "mmli.max_bytes_per_tick",
             "mmli.max_retry_attempts",
             "mmli.shutdown_timeout_secs",
+            "mmli.semantic_wait_ms",
+            "mmli.max_overlay_bytes_per_query",
         ] {
             assert!(
                 error.contains(field),
@@ -3360,6 +3394,13 @@ impl Config {
         if self.mmli.shutdown_timeout_secs == 0 {
             violations.push("mmli.shutdown_timeout_secs must be greater than zero".to_string());
         }
+        if self.mmli.semantic_wait_ms == 0 {
+            violations.push("mmli.semantic_wait_ms must be greater than zero".to_string());
+        }
+        if self.mmli.max_overlay_bytes_per_query == 0 {
+            violations
+                .push("mmli.max_overlay_bytes_per_query must be greater than zero".to_string());
+        }
         if let Some(worker) = &self.mmli.worker {
             for (field, path) in [
                 ("venv_dir", &worker.venv_dir),
@@ -3975,6 +4016,12 @@ impl Config {
         }
         if let Some(v) = env_override(MMLI_SHUTDOWN_TIMEOUT_SECS_ENV)? {
             self.mmli.shutdown_timeout_secs = v;
+        }
+        if let Some(v) = env_override(MMLI_SEMANTIC_WAIT_MS_ENV)? {
+            self.mmli.semantic_wait_ms = v;
+        }
+        if let Some(v) = env_override(MMLI_MAX_OVERLAY_BYTES_PER_QUERY_ENV)? {
+            self.mmli.max_overlay_bytes_per_query = v;
         }
         let worker_venv_dir = env_override::<PathBuf>(MMLI_WORKER_VENV_DIR_ENV)?;
         let worker_python_binary = env_override::<PathBuf>(MMLI_WORKER_PYTHON_BINARY_ENV)?;

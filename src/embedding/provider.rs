@@ -7,6 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use super::priority::QueryPriorityEncoder;
 use super::{
     DeterministicDev, EmbeddingProfileRef, MultiVectorEncoder, MultiVectorEncoderProvider,
     MultiVectorEpoch, MultiVectorEpochId, PinnedWorker, PinnedWorkerConfig,
@@ -38,6 +39,7 @@ struct ProviderState {
 struct CachedEncoder {
     epoch: MultiVectorEpoch,
     session: OwnedEncoder,
+    encoder: Arc<dyn MultiVectorEncoder>,
 }
 
 enum OwnedEncoder {
@@ -128,26 +130,28 @@ impl MultiVectorEncoderProvider for ConfiguredEncoderProvider {
                     "cached encoder epoch identity collision".to_string(),
                 ));
             }
-            return Ok(cached.session.as_encoder());
+            return Ok(Arc::clone(&cached.encoder));
         }
 
         // Hold the construction lock so concurrent first use cannot spawn two
         // subprocesses for the same exact epoch.
         let session = self.spawn(&profile.epoch).await?;
-        let encoder = session.as_encoder();
-        if encoder.epoch() != profile.epoch.id
-            || encoder.output_dimension() != profile.epoch.vector_dimension as usize
+        let raw_encoder = session.as_encoder();
+        if raw_encoder.epoch() != profile.epoch.id
+            || raw_encoder.output_dimension() != profile.epoch.vector_dimension as usize
         {
             session.shutdown().await?;
             return Err(ZeppelinError::Validation(
                 "configured encoder identity or dimension mismatch".to_string(),
             ));
         }
+        let encoder = QueryPriorityEncoder::wrap(raw_encoder);
         state.sessions.insert(
             profile.epoch.id,
             CachedEncoder {
                 epoch: profile.epoch.clone(),
                 session,
+                encoder: Arc::clone(&encoder),
             },
         );
         Ok(encoder)

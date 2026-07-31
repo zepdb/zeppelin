@@ -137,6 +137,7 @@ use crate::cache::decoded_cache::DecodedArtifactCache;
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::{with_cache_diagnostics, CacheDiagnostics, DiskCache};
 use crate::config::IndexingConfig;
+use crate::embedding::types::{EmbeddingProfileId, FdeGenerationId, MultiVectorEpochId};
 use crate::error::Result;
 use crate::fts::bm25::Bm25Params;
 use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
@@ -156,7 +157,9 @@ use crate::retrieval_scope::{
     ScopedFtsIndex, ScopedSegmentCorpus,
 };
 use crate::storage::ZeppelinStore;
-use crate::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult};
+use crate::types::{
+    AttributeValue, ConsistencyLevel, DistanceMetric, Filter, ScoreDirection, SearchResult,
+};
 use crate::wal::manifest::{
     CoarsePayloadEncoding, LocatedFragmentRef, LocatedInputFragmentRef, LocatedSegmentRef,
     SegmentRef,
@@ -229,6 +232,22 @@ pub struct QueryResponse {
     /// Query execution explain output, returned only when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explain: Option<QueryExplain>,
+    /// Semantic completeness for a late-interaction source.
+    ///
+    /// Dense and BM25 responses omit this field. Late-interaction strong reads
+    /// report `complete`; explicit eventual reads may report `partial`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_coverage: Option<SemanticCoverage>,
+}
+
+/// Reports whether a late-interaction result set covered every visible live row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticCoverage {
+    /// Every live row in the selected manifest snapshot was semantically covered.
+    Complete,
+    /// The caller explicitly allowed semantically pending rows to be omitted.
+    Partial,
 }
 
 /// Groups ranked hits that share one response-level attribute value.
@@ -379,6 +398,23 @@ pub struct QueryExplainSource {
     pub nprobe: Option<usize>,
     /// Candidate count requested from this source.
     pub candidate_k: usize,
+    /// Native score ordering used by this source.
+    pub score_direction: ScoreDirection,
+    /// Active late-interaction profile, absent for ANN and BM25.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<EmbeddingProfileId>,
+    /// Active late-interaction semantic epoch, absent for ANN and BM25.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<MultiVectorEpochId>,
+    /// Active late-interaction FDE generation, absent for ANN and BM25.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fde_generation: Option<FdeGenerationId>,
+    /// Manifest generation that owned the late-interaction snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_generation: Option<u64>,
+    /// Consistency mode actually used by late-interaction execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consistency_actual: Option<ConsistencyLevel>,
 }
 
 /// Distinguishes vector-distance retrieval from lexical-relevance retrieval.
@@ -389,6 +425,8 @@ pub enum QueryExplainSourceKind {
     Ann,
     /// BM25 text source where a higher raw relevance score is better.
     Bm25,
+    /// Late-interaction MaxSim source where a higher raw score is better.
+    LateInteraction,
 }
 
 /// Describes how multiple source rankings were combined by the HTTP layer.
@@ -1560,6 +1598,7 @@ async fn execute_query_with_manifest_scoped(
         groups: None,
         facets: None,
         explain: None,
+        semantic_coverage: None,
     })
 }
 
@@ -2766,6 +2805,7 @@ async fn execute_bm25_query_with_manifest_scoped(
         groups: None,
         facets: None,
         explain: None,
+        semantic_coverage: None,
     })
 }
 
@@ -2921,6 +2961,7 @@ async fn execute_filtered_bm25_query_with_manifest(
         groups: None,
         facets: None,
         explain: None,
+        semantic_coverage: None,
     })
 }
 

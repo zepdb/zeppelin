@@ -2554,7 +2554,11 @@ impl Manifest {
         Ok(())
     }
 
-    async fn read_input_fragment_checked(
+    /// Read one manifest-selected typed-input fragment through its physical owner.
+    ///
+    /// The body checksum, object size, immutable ID, and operation counts must
+    /// all agree with the root-manifest descriptor.
+    pub(crate) async fn read_input_fragment_checked(
         store: &ZeppelinStore,
         reference: &InputFragmentRef,
         origin: &ArtifactOrigin,

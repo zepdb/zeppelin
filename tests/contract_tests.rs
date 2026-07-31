@@ -177,6 +177,77 @@ fn openapi_documents_exact_routed_surface() {
 }
 
 #[test]
+fn openapi_documents_late_interaction_query_contract() {
+    let api = include_str!("../api/zeppelin-api.yaml");
+
+    let source_union = component_schema_block(api, "CandidateSource");
+    assert!(source_union.contains("late_interaction:"));
+    assert!(source_union.contains("#/components/schemas/LateInteractionCandidateSource"));
+
+    let late_source = component_schema_block(api, "LateInteractionCandidateSource");
+    for contract in [
+        "required: [type, text]",
+        "const: late_interaction",
+        "pattern: '.*\\S.*'",
+        "server.max_retrieval_text_bytes",
+        "semantic_wait_ms:",
+    ] {
+        assert!(
+            late_source.contains(contract),
+            "late-interaction source schema missing {contract}"
+        );
+    }
+
+    let response = component_schema_block(api, "QueryResponse");
+    assert!(response.contains("semantic_coverage:"));
+    assert!(response.contains("enum: [complete, partial]"));
+
+    let explain_source = component_schema_block(api, "QueryExplainSource");
+    for contract in [
+        "score_direction",
+        "enum: [lower_is_better, higher_is_better]",
+        "profile:",
+        "epoch:",
+        "fde_generation:",
+        "manifest_generation:",
+        "consistency_actual:",
+        "minItems: 32",
+        "maxItems: 32",
+    ] {
+        assert!(
+            explain_source.contains(contract),
+            "late-interaction explain schema missing {contract}"
+        );
+    }
+    assert!(component_schema_block(api, "QueryExplainResultSource")
+        .contains("enum: [ann, bm25, late_interaction]"));
+
+    let errors = component_schema_block(api, "ErrorResponse");
+    for contract in [
+        "EMBEDDING_PROFILE_NOT_ACTIVE",
+        "SEMANTIC_INDEX_LAG",
+        "SEMANTIC_OVERLAY_BUDGET_EXCEEDED",
+        "requested_generation:",
+        "covered_sequence:",
+        "pending_records:",
+        "failed_records:",
+    ] {
+        assert!(
+            errors.contains(contract),
+            "late-interaction error schema missing {contract}"
+        );
+    }
+
+    let query = operation_block(api, "post", "/v1/namespaces/{ns}/query");
+    for status in ["\"409\":", "\"413\":", "\"503\":"] {
+        assert!(
+            query.contains(status),
+            "late-interaction query operation missing {status}"
+        );
+    }
+}
+
+#[test]
 fn branching_release_contract_is_gated_and_has_no_merge_surface() {
     let api = include_str!("../api/zeppelin-api.yaml");
     assert!(api.contains("/v1/namespaces/{ns}/branches:"));
