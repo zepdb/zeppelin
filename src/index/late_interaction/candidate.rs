@@ -1458,6 +1458,24 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["a", "b", "c", "d"])
         );
+
+        let persisted_frontier = resident
+            .candidates_from_fetched(
+                &[1.0, 1.0],
+                &BTreeSet::new(),
+                None,
+                None,
+                &payloads,
+                1024 * 1024,
+            )
+            .expect("full-probe persisted frontier");
+        assert_eq!(
+            persisted_frontier
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "d", "b"]
+        );
     }
 
     #[test]
