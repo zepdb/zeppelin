@@ -96,6 +96,7 @@ pub(crate) struct DecodedMatrixBlockRow {
     pub(crate) id: VectorId,
     pub(crate) ordinal: u32,
     pub(crate) content_hash: ContentHash,
+    #[cfg(test)]
     pub(crate) vector_offset: u64,
     pub(crate) locator: MatrixBlockLocator,
     pub(crate) embedding: MultiVectorEmbedding,
@@ -518,6 +519,7 @@ pub(crate) fn decode_matrix_block(
             id,
             ordinal,
             content_hash,
+            #[cfg(test)]
             vector_offset,
             locator,
             embedding,

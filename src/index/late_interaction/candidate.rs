@@ -238,6 +238,7 @@ pub(crate) trait FdeCandidateIndex {
     fn candidates_from_fetched(
         &self,
         query_fde: &[f32],
+        excluded_ids: &BTreeSet<VectorId>,
         mandatory_filter: Option<&Filter>,
         request_filter: Option<&Filter>,
         fetched: &[FetchedLateCandidateCluster<'_>],
@@ -651,11 +652,6 @@ impl ResidentLateCandidateIndex {
             clusters: wire.clusters,
         })
     }
-
-    /// Borrow the manifest-visible bootstrap reference.
-    pub(crate) const fn reference(&self) -> &LateCandidateBootstrapRef {
-        &self.reference
-    }
 }
 
 impl FdeCandidateIndex for ResidentLateCandidateIndex {
@@ -701,6 +697,7 @@ impl FdeCandidateIndex for ResidentLateCandidateIndex {
     fn candidates_from_fetched(
         &self,
         query_fde: &[f32],
+        excluded_ids: &BTreeSet<VectorId>,
         mandatory_filter: Option<&Filter>,
         request_filter: Option<&Filter>,
         fetched: &[FetchedLateCandidateCluster<'_>],
@@ -751,6 +748,9 @@ impl FdeCandidateIndex for ResidentLateCandidateIndex {
                     return Err(candidate_error(
                         "candidate wave contains a duplicate retrieval-unit id",
                     ));
+                }
+                if excluded_ids.contains(&row.id) {
+                    continue;
                 }
                 let attributes = row.filter_attributes.as_ref().map(|attributes| {
                     attributes
@@ -1422,7 +1422,7 @@ mod tests {
             1024 * 1024,
         )
         .expect("resident bootstrap");
-        assert_eq!(resident.reference(), &first.index_ref.bootstrap);
+        assert_eq!(&resident.reference, &first.index_ref.bootstrap);
         assert_eq!(resident.recipe().nlist, 2);
         assert_eq!(resident.route(&[0.0, 0.0]).expect("route").len(), 2);
 
@@ -1492,7 +1492,14 @@ mod tests {
             bytes: &cluster.bytes,
         };
         let candidates = resident
-            .candidates_from_fetched(&[1.0, 0.0], None, None, &[payload], 1024 * 1024)
+            .candidates_from_fetched(
+                &[1.0, 0.0],
+                &BTreeSet::new(),
+                None,
+                None,
+                &[payload],
+                1024 * 1024,
+            )
             .expect("routed candidates");
         assert_eq!(candidates[0].id, "near");
     }
@@ -1554,6 +1561,7 @@ mod tests {
         let candidates = resident
             .candidates_from_fetched(
                 &[1.0, 0.0],
+                &BTreeSet::new(),
                 Some(&mandatory_filter),
                 Some(&filter),
                 &payloads,
@@ -1565,6 +1573,13 @@ mod tests {
         assert_eq!(candidates[0].id, "allowed-low");
         assert_eq!(candidates[0].approx_fde_score, 1.0);
         assert_eq!(candidates[0].metadata.parent_id.as_deref(), Some("parent"));
+
+        let excluded = BTreeSet::from(["blocked-high".to_string()]);
+        let candidates = resident
+            .candidates_from_fetched(&[1.0, 0.0], &excluded, None, None, &payloads, 1024 * 1024)
+            .expect("excluded candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, "allowed-low");
     }
 
     #[test]
@@ -1593,7 +1608,14 @@ mod tests {
         };
 
         let error = resident
-            .candidates_from_fetched(&[1.0, 0.0], None, None, &[payload], 1024 * 1024)
+            .candidates_from_fetched(
+                &[1.0, 0.0],
+                &BTreeSet::new(),
+                None,
+                None,
+                &[payload],
+                1024 * 1024,
+            )
             .expect_err("corrupt cluster must fail");
         assert!(error.to_string().contains("checksum mismatch"));
     }

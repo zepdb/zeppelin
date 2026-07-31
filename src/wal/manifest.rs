@@ -2584,7 +2584,7 @@ impl Manifest {
         Ok(fragment)
     }
 
-    async fn compute_semantic_coverage(
+    pub(crate) async fn compute_semantic_coverage(
         &self,
         store: &ZeppelinStore,
         section: &LateStateSection,

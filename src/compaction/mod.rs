@@ -202,6 +202,7 @@ pub mod background;
 /// Compaction records retired keys in the manifest; this module deliberately
 /// leaves the physical DELETE operations to [`gc`][crate::compaction::gc].
 pub mod gc;
+mod late;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -1298,60 +1299,6 @@ impl Compactor {
         &self.clock
     }
 
-    /// Resolves process defaults with the namespace's current indexing overlay.
-    ///
-    /// # Parameters
-    ///
-    /// - `namespace`: Namespace whose metadata object should be read.
-    ///
-    /// # Returns
-    ///
-    /// An owned, validated [`IndexingConfig`]. If metadata has no index overlay,
-    /// the process defaults are cloned.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ZeppelinError::NamespaceNotFound`] when the authoritative
-    /// metadata object is absent and [`ZeppelinError::NamespaceDeleting`] when
-    /// metadata marks the namespace as deleting. Storage, decoding, and
-    /// per-dimension validation failures also propagate; no malformed overlay
-    /// is silently ignored.
-    ///
-    /// # Consistency
-    ///
-    /// Namespace metadata controls the desired layout, while the manifest
-    /// controls which already-built layout is visible. This read occurs near the
-    /// beginning of each run so a config transition can request a rewrite.
-    ///
-    /// # Performance
-    ///
-    /// Performs one complete metadata-object GET and clones a small config.
-    ///
-    /// # Examples
-    ///
-    /// If process defaults request unquantized flat IVF but namespace metadata
-    /// enables scalar quantization, the returned config requests SQ and
-    /// `should_compact` can trigger a segment rewrite even without new WAL.
-    ///
-    /// # Rust Notes for Java/C Engineers
-    ///
-    /// Exhaustive `match` converts a missing authoritative metadata object into
-    /// the namespace-domain error while preserving every other failure. No
-    /// process default can authorize a build after `meta.json` disappears.
-    async fn effective_indexing_config(&self, namespace: &str) -> Result<IndexingConfig> {
-        let key = NamespaceMetadata::s3_key(namespace);
-        match self.store.get(&key).await {
-            Ok(data) => {
-                let meta = NamespaceMetadata::from_bytes(&data)?;
-                resolve_indexing_config(namespace, &meta, &self.indexing_config)
-            }
-            Err(ZeppelinError::NotFound { .. }) => Err(ZeppelinError::NamespaceNotFound {
-                namespace: namespace.to_string(),
-            }),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Determines whether a namespace currently meets any compaction trigger.
     ///
     /// Four independent triggers:
@@ -1842,7 +1789,23 @@ impl Compactor {
                 },
                 error => error,
             })?;
-        let indexing_config = self.effective_indexing_config(namespace).await?;
+        let metadata_key = NamespaceMetadata::s3_key(namespace);
+        let namespace_metadata = match self.store.get(&metadata_key).await {
+            Ok(bytes) => NamespaceMetadata::from_bytes(&bytes)?,
+            Err(ZeppelinError::NotFound { .. }) => {
+                return Err(ZeppelinError::NamespaceNotFound {
+                    namespace: namespace.to_string(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        if namespace_metadata.index_type == IndexType::LateInteractionFde {
+            return self
+                .compact_late_with_signaled(namespace, fencing_token, lease_lost)
+                .await;
+        }
+        let indexing_config =
+            resolve_indexing_config(namespace, &namespace_metadata, &self.indexing_config)?;
         validate_two_bit_rotation_seed(namespace, &manifest, &indexing_config)?;
         let rewrite_for_index_config = manifest_needs_index_rewrite(&manifest, &indexing_config);
         let materialize_foreign = manifest.has_foreign_visible_artifacts()?;

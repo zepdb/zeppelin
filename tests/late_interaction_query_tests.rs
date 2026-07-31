@@ -278,6 +278,7 @@ async fn exhaustive_search_matches_stored_matrix_bruteforce_with_filter() {
     let started = Instant::now();
     let output = search(LateInteractionSearchRequest {
         store: &harness.store,
+        bootstrap_cache: None,
         encoder_provider: encoder_provider.as_ref(),
         namespace: &namespace,
         manifest: manifest.clone(),
@@ -287,6 +288,7 @@ async fn exhaustive_search_matches_stored_matrix_bruteforce_with_filter() {
         consistency: ConsistencyLevel::Strong,
         semantic_wait: Duration::from_millis(1),
         max_overlay_bytes: 64 * 1024 * 1024,
+        segment_config: Default::default(),
         manifest_refresh: ManifestRefresh::Fixed,
     })
     .await
@@ -406,6 +408,7 @@ async fn strong_waits_for_coverage_while_eventual_reports_partial() {
     let covered_manifest = read_manifest(&harness.store, &namespace, incarnation).await;
     let covered = search(LateInteractionSearchRequest {
         store: &harness.store,
+        bootstrap_cache: None,
         encoder_provider: encoder_provider.as_ref(),
         namespace: &namespace,
         manifest: covered_manifest,
@@ -415,6 +418,7 @@ async fn strong_waits_for_coverage_while_eventual_reports_partial() {
         consistency: ConsistencyLevel::Strong,
         semantic_wait: Duration::ZERO,
         max_overlay_bytes: 64 * 1024 * 1024,
+        segment_config: Default::default(),
         manifest_refresh: ManifestRefresh::Fixed,
     })
     .await
@@ -453,6 +457,7 @@ async fn strong_waits_for_coverage_while_eventual_reports_partial() {
         .clone();
     let error = search(LateInteractionSearchRequest {
         store: &harness.store,
+        bootstrap_cache: None,
         encoder_provider: encoder_provider.as_ref(),
         namespace: &namespace,
         manifest: pending_manifest.clone(),
@@ -462,6 +467,7 @@ async fn strong_waits_for_coverage_while_eventual_reports_partial() {
         consistency: ConsistencyLevel::Strong,
         semantic_wait: Duration::ZERO,
         max_overlay_bytes: 64 * 1024 * 1024,
+        segment_config: Default::default(),
         manifest_refresh: ManifestRefresh::Live,
     })
     .await
@@ -488,6 +494,7 @@ async fn strong_waits_for_coverage_while_eventual_reports_partial() {
 
     let eventual = search(LateInteractionSearchRequest {
         store: &harness.store,
+        bootstrap_cache: None,
         encoder_provider: encoder_provider.as_ref(),
         namespace: &namespace,
         manifest: pending_manifest.clone(),
@@ -497,6 +504,7 @@ async fn strong_waits_for_coverage_while_eventual_reports_partial() {
         consistency: ConsistencyLevel::Eventual,
         semantic_wait: Duration::ZERO,
         max_overlay_bytes: 64 * 1024 * 1024,
+        segment_config: Default::default(),
         manifest_refresh: ManifestRefresh::Fixed,
     })
     .await
@@ -520,6 +528,7 @@ async fn strong_waits_for_coverage_while_eventual_reports_partial() {
     let waiting_search = tokio::spawn(async move {
         search(LateInteractionSearchRequest {
             store: &task_store,
+            bootstrap_cache: None,
             encoder_provider: task_provider.as_ref(),
             namespace: &task_namespace,
             manifest: pending_manifest,
@@ -529,6 +538,7 @@ async fn strong_waits_for_coverage_while_eventual_reports_partial() {
             consistency: ConsistencyLevel::Strong,
             semantic_wait: Duration::from_secs(5),
             max_overlay_bytes: 64 * 1024 * 1024,
+            segment_config: Default::default(),
             manifest_refresh: ManifestRefresh::Live,
         })
         .await
@@ -609,6 +619,7 @@ async fn tombstones_and_newer_pending_versions_suppress_stale_overlays() {
 
     let initial = search(LateInteractionSearchRequest {
         store: &harness.store,
+        bootstrap_cache: None,
         encoder_provider: encoder_provider.as_ref(),
         namespace: &namespace,
         manifest: read_manifest(&harness.store, &namespace, incarnation).await,
@@ -618,6 +629,7 @@ async fn tombstones_and_newer_pending_versions_suppress_stale_overlays() {
         consistency: ConsistencyLevel::Strong,
         semantic_wait: Duration::ZERO,
         max_overlay_bytes: 64 * 1024 * 1024,
+        segment_config: Default::default(),
         manifest_refresh: ManifestRefresh::Fixed,
     })
     .await
@@ -642,6 +654,7 @@ async fn tombstones_and_newer_pending_versions_suppress_stale_overlays() {
         .expect("tombstone append must succeed");
     let after_delete = search(LateInteractionSearchRequest {
         store: &harness.store,
+        bootstrap_cache: None,
         encoder_provider: encoder_provider.as_ref(),
         namespace: &namespace,
         manifest: read_manifest(&harness.store, &namespace, incarnation).await,
@@ -651,6 +664,7 @@ async fn tombstones_and_newer_pending_versions_suppress_stale_overlays() {
         consistency: ConsistencyLevel::Strong,
         semantic_wait: Duration::ZERO,
         max_overlay_bytes: 64 * 1024 * 1024,
+        segment_config: Default::default(),
         manifest_refresh: ManifestRefresh::Fixed,
     })
     .await
@@ -687,6 +701,7 @@ async fn tombstones_and_newer_pending_versions_suppress_stale_overlays() {
     let pending_manifest = read_manifest(&harness.store, &namespace, incarnation).await;
     let strong_error = search(LateInteractionSearchRequest {
         store: &harness.store,
+        bootstrap_cache: None,
         encoder_provider: encoder_provider.as_ref(),
         namespace: &namespace,
         manifest: pending_manifest.clone(),
@@ -696,6 +711,7 @@ async fn tombstones_and_newer_pending_versions_suppress_stale_overlays() {
         consistency: ConsistencyLevel::Strong,
         semantic_wait: Duration::ZERO,
         max_overlay_bytes: 64 * 1024 * 1024,
+        segment_config: Default::default(),
         manifest_refresh: ManifestRefresh::Fixed,
     })
     .await
@@ -710,6 +726,7 @@ async fn tombstones_and_newer_pending_versions_suppress_stale_overlays() {
     ));
     let eventual = search(LateInteractionSearchRequest {
         store: &harness.store,
+        bootstrap_cache: None,
         encoder_provider: encoder_provider.as_ref(),
         namespace: &namespace,
         manifest: pending_manifest,
@@ -719,6 +736,7 @@ async fn tombstones_and_newer_pending_versions_suppress_stale_overlays() {
         consistency: ConsistencyLevel::Eventual,
         semantic_wait: Duration::ZERO,
         max_overlay_bytes: 64 * 1024 * 1024,
+        segment_config: Default::default(),
         manifest_refresh: ManifestRefresh::Fixed,
     })
     .await

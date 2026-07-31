@@ -12,6 +12,7 @@ mod matrix_artifact;
 mod maxsim;
 mod search;
 mod segment_build;
+mod segment_search;
 
 pub use attribute_artifact::AttributeBlockRef;
 pub use candidate::{
@@ -24,7 +25,18 @@ pub use matrix_artifact::{MatrixBlockLocator, MatrixBlockRef};
 pub use maxsim::max_sim;
 pub use search::{
     search, LateInteractionCoverage, LateInteractionProvenance, LateInteractionRankedResult,
-    LateInteractionSearchOutput, LateInteractionSearchRequest, ManifestRefresh,
+    LateInteractionReadTrace, LateInteractionSearchOutput, LateInteractionSearchRequest,
+    LateInteractionWaveTrace, ManifestRefresh,
+};
+
+pub(crate) use attribute_artifact::decode_attribute_block;
+pub(crate) use candidate::{
+    decode_all_candidate_rows, FetchedLateCandidateCluster, LateCandidateBuildConfig,
+};
+pub(crate) use matrix_artifact::decode_matrix_block;
+pub(crate) use segment_build::{
+    build_late_interaction_segment, LateSegmentBuildConfig, LateSegmentBuildRow,
+    PrebuiltLateFtsArtifact,
 };
 
 use thiserror::Error;

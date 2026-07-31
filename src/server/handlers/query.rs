@@ -4781,6 +4781,7 @@ async fn execute_late_interaction_source_with_manifest(
 ) -> Result<SourceQueryResponse, ZeppelinError> {
     let output = crate::index::late_interaction::search(LateInteractionSearchRequest {
         store: &state.store,
+        bootstrap_cache: Some(state.cache.as_ref()),
         encoder_provider: state.encoder_provider.as_ref(),
         namespace: ns,
         manifest,
@@ -4792,6 +4793,7 @@ async fn execute_late_interaction_source_with_manifest(
             semantic_wait_ms.unwrap_or(state.config.mmli.semantic_wait_ms),
         ),
         max_overlay_bytes: state.config.mmli.max_overlay_bytes_per_query,
+        segment_config: state.config.mmli.segment.clone(),
         manifest_refresh,
     })
     .await?;

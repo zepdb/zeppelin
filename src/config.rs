@@ -117,6 +117,9 @@ const MMLI_MAX_OVERLAY_BYTES_PER_QUERY_ENV: &str = "ZEPPELIN_MMLI_MAX_OVERLAY_BY
 const MMLI_SEGMENT_NLIST_ENV: &str = "ZEPPELIN_MMLI_SEGMENT_NLIST";
 const MMLI_SEGMENT_PROBE_BUDGET_ENV: &str = "ZEPPELIN_MMLI_SEGMENT_PROBE_BUDGET";
 const MMLI_SEGMENT_CANDIDATE_K_ENV: &str = "ZEPPELIN_MMLI_SEGMENT_CANDIDATE_K";
+const MMLI_SEGMENT_KMEANS_MAX_ITERATIONS_ENV: &str = "ZEPPELIN_MMLI_SEGMENT_KMEANS_MAX_ITERATIONS";
+const MMLI_SEGMENT_KMEANS_CONVERGENCE_EPSILON_ENV: &str =
+    "ZEPPELIN_MMLI_SEGMENT_KMEANS_CONVERGENCE_EPSILON";
 const MMLI_SEGMENT_MAX_MATRIX_OBJECT_BYTES_ENV: &str =
     "ZEPPELIN_MMLI_SEGMENT_MAX_MATRIX_OBJECT_BYTES";
 const MMLI_SEGMENT_MAX_CLUSTER_OBJECT_BYTES_ENV: &str =
@@ -301,6 +304,10 @@ pub struct MmliSegmentConfig {
     pub probe_budget: usize,
     /// Approximate rows retained before exact MaxSim. Text default: `537`.
     pub candidate_k: usize,
+    /// Maximum Lloyd iterations for late-candidate centroid training.
+    pub kmeans_max_iterations: usize,
+    /// Late-candidate centroid convergence threshold.
+    pub kmeans_convergence_epsilon: f32,
     /// Maximum complete record-major matrix-block object size.
     pub max_matrix_object_bytes: usize,
     /// Maximum complete wave-one cluster-shard object size.
@@ -407,6 +414,8 @@ impl Default for MmliSegmentConfig {
             nlist: 256,
             probe_budget: 16,
             candidate_k: 537,
+            kmeans_max_iterations: 100,
+            kmeans_convergence_epsilon: 1e-4,
             max_matrix_object_bytes: 64 * 1024 * 1024,
             max_cluster_object_bytes: 8 * 1024 * 1024,
             max_resident_bootstrap_bytes: 16 * 1024 * 1024,
@@ -859,6 +868,8 @@ mod tests {
                 MMLI_SEGMENT_NLIST_ENV,
                 MMLI_SEGMENT_PROBE_BUDGET_ENV,
                 MMLI_SEGMENT_CANDIDATE_K_ENV,
+                MMLI_SEGMENT_KMEANS_MAX_ITERATIONS_ENV,
+                MMLI_SEGMENT_KMEANS_CONVERGENCE_EPSILON_ENV,
                 MMLI_SEGMENT_MAX_MATRIX_OBJECT_BYTES_ENV,
                 MMLI_SEGMENT_MAX_CLUSTER_OBJECT_BYTES_ENV,
                 MMLI_SEGMENT_MAX_RESIDENT_BOOTSTRAP_BYTES_ENV,
@@ -1123,6 +1134,8 @@ mod tests {
         assert_eq!(defaults.segment.nlist, 256);
         assert_eq!(defaults.segment.probe_budget, 16);
         assert_eq!(defaults.segment.candidate_k, 537);
+        assert_eq!(defaults.segment.kmeans_max_iterations, 100);
+        assert_eq!(defaults.segment.kmeans_convergence_epsilon, 1e-4);
         assert_eq!(defaults.segment.max_matrix_object_bytes, 64 * 1024 * 1024);
         assert_eq!(defaults.segment.max_cluster_object_bytes, 8 * 1024 * 1024);
         assert_eq!(
@@ -1149,6 +1162,8 @@ mod tests {
             nlist = 32
             probe_budget = 7
             candidate_k = 91
+            kmeans_max_iterations = 12
+            kmeans_convergence_epsilon = 0.002
             max_matrix_object_bytes = 4096
             max_cluster_object_bytes = 1024
             max_resident_bootstrap_bytes = 8192
@@ -1168,6 +1183,8 @@ mod tests {
         assert_eq!(configured.segment.nlist, 32);
         assert_eq!(configured.segment.probe_budget, 7);
         assert_eq!(configured.segment.candidate_k, 91);
+        assert_eq!(configured.segment.kmeans_max_iterations, 12);
+        assert_eq!(configured.segment.kmeans_convergence_epsilon, 0.002);
         assert_eq!(configured.segment.max_matrix_object_bytes, 4096);
         assert_eq!(configured.segment.max_cluster_object_bytes, 1024);
         assert_eq!(configured.segment.max_resident_bootstrap_bytes, 8192);
@@ -1183,6 +1200,8 @@ mod tests {
         std::env::set_var(MMLI_SHUTDOWN_TIMEOUT_SECS_ENV, "11");
         std::env::set_var(MMLI_SEMANTIC_WAIT_MS_ENV, "13");
         std::env::set_var(MMLI_MAX_OVERLAY_BYTES_PER_QUERY_ENV, "8192");
+        std::env::set_var(MMLI_SEGMENT_KMEANS_MAX_ITERATIONS_ENV, "19");
+        std::env::set_var(MMLI_SEGMENT_KMEANS_CONVERGENCE_EPSILON_ENV, "0.003");
 
         let overridden = load_toml(source).unwrap().mmli;
         assert!(overridden.allow_dev_encoder);
@@ -1193,6 +1212,8 @@ mod tests {
         assert_eq!(overridden.shutdown_timeout_secs, 11);
         assert_eq!(overridden.semantic_wait_ms, 13);
         assert_eq!(overridden.max_overlay_bytes_per_query, 8192);
+        assert_eq!(overridden.segment.kmeans_max_iterations, 19);
+        assert_eq!(overridden.segment.kmeans_convergence_epsilon, 0.003);
     }
 
     /// Pinned-worker configuration is optional, strict, and environment-overridable.
@@ -1262,6 +1283,8 @@ mod tests {
         config.mmli.segment.nlist = 0;
         config.mmli.segment.probe_budget = 0;
         config.mmli.segment.candidate_k = 0;
+        config.mmli.segment.kmeans_max_iterations = 0;
+        config.mmli.segment.kmeans_convergence_epsilon = 0.0;
         config.mmli.segment.max_matrix_object_bytes = 0;
         config.mmli.segment.max_cluster_object_bytes = 0;
         config.mmli.segment.max_resident_bootstrap_bytes = 0;
@@ -1281,6 +1304,8 @@ mod tests {
             "mmli.segment.nlist",
             "mmli.segment.probe_budget",
             "mmli.segment.candidate_k",
+            "mmli.segment.kmeans_max_iterations",
+            "mmli.segment.kmeans_convergence_epsilon",
             "mmli.segment.max_matrix_object_bytes",
             "mmli.segment.max_cluster_object_bytes",
             "mmli.segment.max_resident_bootstrap_bytes",
@@ -3528,6 +3553,18 @@ impl Config {
         if self.mmli.segment.candidate_k == 0 || self.mmli.segment.candidate_k > 700 {
             violations.push("mmli.segment.candidate_k must be in 1..=700".to_string());
         }
+        if self.mmli.segment.kmeans_max_iterations == 0 {
+            violations
+                .push("mmli.segment.kmeans_max_iterations must be greater than zero".to_string());
+        }
+        if !self.mmli.segment.kmeans_convergence_epsilon.is_finite()
+            || self.mmli.segment.kmeans_convergence_epsilon <= 0.0
+        {
+            violations.push(
+                "mmli.segment.kmeans_convergence_epsilon must be finite and greater than zero"
+                    .to_string(),
+            );
+        }
         for (field, value) in [
             (
                 "max_matrix_object_bytes",
@@ -4200,6 +4237,12 @@ impl Config {
         }
         if let Some(v) = env_override(MMLI_SEGMENT_CANDIDATE_K_ENV)? {
             self.mmli.segment.candidate_k = v;
+        }
+        if let Some(v) = env_override(MMLI_SEGMENT_KMEANS_MAX_ITERATIONS_ENV)? {
+            self.mmli.segment.kmeans_max_iterations = v;
+        }
+        if let Some(v) = env_override(MMLI_SEGMENT_KMEANS_CONVERGENCE_EPSILON_ENV)? {
+            self.mmli.segment.kmeans_convergence_epsilon = v;
         }
         if let Some(v) = env_override(MMLI_SEGMENT_MAX_MATRIX_OBJECT_BYTES_ENV)? {
             self.mmli.segment.max_matrix_object_bytes = v;

@@ -8,21 +8,27 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
+use crate::cache::DiskCache;
+use crate::config::MmliSegmentConfig;
 use crate::embedding::transform::{apply_vector_transform, load_vector_transform_mean};
 use crate::embedding::{
-    ContentHash, EmbeddingProfileId, EmbeddingProfileRef, EncoderQueryInput, FdeGenerationId,
-    MatrixArtifact, MultiVectorEncoderProvider, MultiVectorEpochId, RetrievalUnitRecord,
-    SemanticCoverageState, SemanticState,
+    ArtifactChecksum, ContentHash, EmbeddingProfileId, EmbeddingProfileRef, EncoderQueryInput,
+    FdeGenerationId, MatrixArtifact, MultiVectorEncoderProvider, MultiVectorEpochId,
+    RetrievalUnitRecord, SemanticCoverageState, SemanticState,
 };
 use crate::error::{Result, ZeppelinError};
 use crate::index::filter::evaluate_filter_on_optional_attributes;
 use crate::index::topk::TopK;
 use crate::namespace::branching::ArtifactOrigin;
+use crate::storage::read_plan::ReadPlanConfig;
 use crate::storage::{NamespaceObjectFamily, ZeppelinStore};
 use crate::types::{AttributeValue, ConsistencyLevel, Filter, VectorId};
-use crate::wal::{EncoderInputWalFragment, LateStateSection, Manifest};
+use crate::wal::{EncoderInputWalFragment, LateInteractionSegmentRef, LateStateSection, Manifest};
 
-use super::{max_sim, LateInteractionError};
+use super::segment_search::{
+    search_segment, SegmentSearchBounds, SegmentSearchRequest, SegmentSearchTrace,
+};
+use super::{max_sim, FdeTransform, LateInteractionError};
 
 const SEMANTIC_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -93,12 +99,36 @@ pub struct LateInteractionSearchOutput {
     pub pending_records: u64,
     /// Live source versions omitted because enrichment failed.
     pub failed_records: u64,
+    /// Planned row-dependent reads when an immutable segment was searched.
+    pub read_trace: Option<LateInteractionReadTrace>,
+}
+
+/// Read-plan accounting for one candidate or truth wave.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LateInteractionWaveTrace {
+    /// Logical ranges submitted to the planner.
+    pub logical_ranges: usize,
+    /// Physical ranged requests emitted by the planner.
+    pub planned_requests: usize,
+    /// Physical bytes including coalesced gaps.
+    pub planned_bytes: u64,
+}
+
+/// Query-visible accounting for both immutable-segment read waves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LateInteractionReadTrace {
+    /// Candidate-cluster wave.
+    pub candidate_wave: LateInteractionWaveTrace,
+    /// Exact matrix-and-attribute wave.
+    pub truth_wave: LateInteractionWaveTrace,
 }
 
 /// Typed inputs to the exhaustive late-interaction search engine.
 pub struct LateInteractionSearchRequest<'a> {
     /// Object-storage source of truth.
     pub store: &'a ZeppelinStore,
+    /// Existing immutable-artifact cache used only for resident bootstrap bytes.
+    pub bootstrap_cache: Option<&'a DiskCache>,
     /// Active provider shared with document enrichment.
     pub encoder_provider: &'a dyn MultiVectorEncoderProvider,
     /// Logical namespace whose live root may be polled.
@@ -117,6 +147,8 @@ pub struct LateInteractionSearchRequest<'a> {
     pub semantic_wait: Duration,
     /// Maximum aggregate bytes of selected exact matrix objects.
     pub max_overlay_bytes: u64,
+    /// Late-segment build/query bounds selected by configuration and the lab.
+    pub segment_config: MmliSegmentConfig,
     /// Whether strong semantic wait may select a newer live root.
     pub manifest_refresh: ManifestRefresh,
 }
@@ -130,6 +162,7 @@ pub async fn search(
 ) -> Result<LateInteractionSearchOutput> {
     let LateInteractionSearchRequest {
         store,
+        bootstrap_cache,
         encoder_provider,
         namespace,
         manifest,
@@ -139,16 +172,19 @@ pub async fn search(
         consistency,
         semantic_wait,
         max_overlay_bytes,
+        segment_config,
         manifest_refresh,
     } = request;
     let execution = SearchExecution {
         store,
+        bootstrap_cache,
         encoder_provider,
         text,
         top_k,
         effective_filter,
         consistency,
         max_overlay_bytes,
+        segment_config,
     };
     if text.trim().is_empty() {
         return Err(ZeppelinError::LateInteractionQueryEmpty);
@@ -191,12 +227,14 @@ pub async fn search(
 
 struct SearchExecution<'a> {
     store: &'a ZeppelinStore,
+    bootstrap_cache: Option<&'a DiskCache>,
     encoder_provider: &'a dyn MultiVectorEncoderProvider,
     text: &'a str,
     top_k: usize,
     effective_filter: Option<&'a Filter>,
     consistency: ConsistencyLevel,
     max_overlay_bytes: u64,
+    segment_config: MmliSegmentConfig,
 }
 
 struct OwnedLateSnapshot {
@@ -239,6 +277,22 @@ impl OwnedLateSnapshot {
             consistency,
         }
     }
+
+    fn active_segment(&self) -> Result<Option<&LateInteractionSegmentRef>> {
+        let Some(active_id) = self.section.active_late_segment.as_deref() else {
+            return Ok(None);
+        };
+        self.section
+            .late_interaction_segments
+            .iter()
+            .find(|segment| segment.id == active_id)
+            .map(Some)
+            .ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "active late segment {active_id} is absent from its selected section"
+                ))
+            })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -273,6 +327,7 @@ struct CoveredLiveVersion {
 
 struct ReplayState {
     covered: Vec<CoveredLiveVersion>,
+    touched_ids: BTreeSet<VectorId>,
     covered_sequence: u64,
     pending_records: u64,
     failed_records: u64,
@@ -285,12 +340,14 @@ async fn replay_snapshot(
     let mut references = snapshot.manifest.input_fragments.iter().collect::<Vec<_>>();
     references.sort_by_key(|reference| reference.sequence_number);
     let mut live = BTreeMap::<VectorId, LiveVersion>::new();
+    let mut touched_ids = BTreeSet::new();
 
     for reference in references {
         let origin = snapshot.manifest.input_fragment_origin(reference)?;
         let fragment = Manifest::read_input_fragment_checked(store, reference, &origin).await?;
         let source_key = EncoderInputWalFragment::s3_key(origin.namespace.as_str(), &reference.id);
         for (row_index, record) in fragment.upserts.iter().enumerate() {
+            touched_ids.insert(record.id.clone());
             let row_ordinal = u32::try_from(row_index)
                 .map_err(|_| LateInteractionError::CoverageArithmeticOverflow)?;
             let identity = VersionIdentity {
@@ -313,16 +370,18 @@ async fn replay_snapshot(
             );
         }
         for deleted in &fragment.deletes {
+            touched_ids.insert(deleted.clone());
             live.remove(deleted);
         }
     }
 
-    classify_live_versions(snapshot, live)
+    classify_live_versions(snapshot, live, touched_ids)
 }
 
 fn classify_live_versions(
     snapshot: &OwnedLateSnapshot,
     live: BTreeMap<VectorId, LiveVersion>,
+    touched_ids: BTreeSet<VectorId>,
 ) -> Result<ReplayState> {
     let mut covered_locations = BTreeMap::<VersionIdentity, MatrixLocation>::new();
     for (overlay_index, overlay) in snapshot.section.semantic_overlays.iter().enumerate() {
@@ -442,6 +501,7 @@ fn classify_live_versions(
 
     Ok(ReplayState {
         covered,
+        touched_ids,
         covered_sequence,
         pending_records,
         failed_records,
@@ -460,7 +520,7 @@ async fn execute_snapshot(
         LateInteractionCoverage::Partial
     };
 
-    let filtered = replay
+    let filtered_overlays = replay
         .covered
         .into_iter()
         .filter(|candidate| {
@@ -469,8 +529,9 @@ async fn execute_snapshot(
             })
         })
         .collect::<Vec<_>>();
+    let active_segment = snapshot.active_segment()?;
 
-    if request.top_k == 0 || filtered.is_empty() {
+    if request.top_k == 0 || (filtered_overlays.is_empty() && active_segment.is_none()) {
         return Ok(LateInteractionSearchOutput {
             results: Vec::new(),
             manifest: snapshot.manifest,
@@ -479,6 +540,7 @@ async fn execute_snapshot(
             covered_sequence: replay.covered_sequence,
             pending_records: replay.pending_records,
             failed_records: replay.failed_records,
+            read_trace: None,
         });
     }
 
@@ -509,7 +571,67 @@ async fn execute_snapshot(
     )?;
     let query_matrix = query.matrix_ref()?;
 
-    let selected_overlays = filtered
+    let segment_output = if let Some(segment) = active_segment {
+        let candidate_mean = load_vector_transform_mean(
+            request.store,
+            &snapshot.profile.fde.candidate_vector_transform,
+            snapshot.profile.epoch.vector_dimension as usize,
+        )
+        .await?;
+        let candidate_query = apply_vector_transform(
+            &raw_query,
+            &snapshot.profile.fde.candidate_vector_transform,
+            candidate_mean.as_deref(),
+            snapshot.profile.epoch.max_query_vectors as usize,
+        )?;
+        let transform_ref = &snapshot.profile.fde.transform_artifact;
+        let transform_bytes = request.store.get(&transform_ref.key).await?;
+        if u64::try_from(transform_bytes.len()).ok() != Some(transform_ref.size_bytes)
+            || ArtifactChecksum::digest(&transform_bytes) != transform_ref.checksum
+        {
+            return Err(ZeppelinError::Serialization(
+                "candidate FDE transform size or checksum mismatch".to_string(),
+            ));
+        }
+        let fde_transform = FdeTransform::from_bytes(&transform_bytes)?;
+        if fde_transform.params() != snapshot.profile.fde.params
+            || fde_transform.output_dimension() != segment.fde_dimension as usize
+        {
+            return Err(ZeppelinError::Serialization(
+                "candidate FDE transform disagrees with the active segment".to_string(),
+            ));
+        }
+        let candidate_query_fde = fde_transform.encode_query(&candidate_query.matrix_ref()?)?;
+        let read_plan = ReadPlanConfig::new(
+            request.segment_config.read_gap_budget_bytes,
+            request.segment_config.read_max_request_bytes,
+            request.segment_config.read_max_concurrency,
+        )
+        .map_err(|error| ZeppelinError::Validation(error.to_string()))?;
+        search_segment(SegmentSearchRequest {
+            store: request.store,
+            bootstrap_cache: request.bootstrap_cache,
+            segment,
+            exact_query: query_matrix,
+            candidate_query_fde: &candidate_query_fde,
+            mandatory_filter: None,
+            request_filter: request.effective_filter,
+            excluded_ids: &replay.touched_ids,
+            top_k: request.top_k,
+            read_plan: &read_plan,
+            bounds: SegmentSearchBounds {
+                max_resident_bytes: request.segment_config.max_resident_bootstrap_bytes,
+                max_cluster_bytes: request.segment_config.max_cluster_object_bytes,
+                max_vectors_per_document: snapshot.profile.epoch.max_document_vectors as usize,
+                max_attribute_payload_bytes: request.segment_config.read_max_request_bytes,
+            },
+        })
+        .await?
+    } else {
+        Default::default()
+    };
+
+    let selected_overlays = filtered_overlays
         .iter()
         .map(|candidate| candidate.location.overlay_index)
         .collect::<BTreeSet<_>>();
@@ -522,17 +644,29 @@ async fn execute_snapshot(
     .await?;
 
     struct Scored {
-        record: RetrievalUnitRecord,
+        id: VectorId,
         score: f32,
+        parent_id: Option<String>,
+        unit_ordinal: Option<u32>,
+        attributes: Option<HashMap<String, AttributeValue>>,
     }
     fn compare_scored(left: &Scored, right: &Scored) -> Ordering {
         right
             .score
             .total_cmp(&left.score)
-            .then_with(|| left.record.id.cmp(&right.record.id))
+            .then_with(|| left.id.cmp(&right.id))
     }
     let mut top_k = TopK::new(request.top_k, compare_scored);
-    for candidate in filtered {
+    for row in segment_output.rows {
+        top_k.push(Scored {
+            id: row.id,
+            score: row.score,
+            parent_id: row.parent_id,
+            unit_ordinal: row.unit_ordinal,
+            attributes: row.attributes,
+        });
+    }
+    for candidate in filtered_overlays {
         let matrix = matrices
             .get(&candidate.location.overlay_index)
             .ok_or(LateInteractionError::MatrixCoverageMismatch)?;
@@ -546,8 +680,11 @@ async fn execute_snapshot(
         let document = row.embedding().matrix_ref()?;
         let score = max_sim(&query_matrix, &document)?;
         top_k.push(Scored {
-            record: candidate.record,
+            id: candidate.record.id,
             score,
+            parent_id: candidate.record.parent_id,
+            unit_ordinal: candidate.record.unit_ordinal,
+            attributes: candidate.record.attributes,
         });
     }
 
@@ -556,18 +693,20 @@ async fn execute_snapshot(
         .into_iter()
         .filter(|scored| {
             request.effective_filter.is_none_or(|filter| {
-                evaluate_filter_on_optional_attributes(filter, scored.record.attributes.as_ref())
+                evaluate_filter_on_optional_attributes(filter, scored.attributes.as_ref())
             })
         })
         .map(|scored| LateInteractionRankedResult {
-            id: scored.record.id,
+            id: scored.id,
             score: scored.score,
-            parent_id: scored.record.parent_id,
-            unit_ordinal: scored.record.unit_ordinal,
-            attributes: scored.record.attributes,
+            parent_id: scored.parent_id,
+            unit_ordinal: scored.unit_ordinal,
+            attributes: scored.attributes,
             provenance: provenance.clone(),
         })
         .collect();
+
+    let read_trace = active_segment.map(|_| map_segment_trace(segment_output.trace));
 
     Ok(LateInteractionSearchOutput {
         results,
@@ -577,7 +716,23 @@ async fn execute_snapshot(
         covered_sequence: replay.covered_sequence,
         pending_records: replay.pending_records,
         failed_records: replay.failed_records,
+        read_trace,
     })
+}
+
+fn map_segment_trace(trace: SegmentSearchTrace) -> LateInteractionReadTrace {
+    LateInteractionReadTrace {
+        candidate_wave: LateInteractionWaveTrace {
+            logical_ranges: trace.candidate_wave.logical_ranges,
+            planned_requests: trace.candidate_wave.planned_requests,
+            planned_bytes: trace.candidate_wave.planned_bytes,
+        },
+        truth_wave: LateInteractionWaveTrace {
+            logical_ranges: trace.truth_wave.logical_ranges,
+            planned_requests: trace.truth_wave.planned_requests,
+            planned_bytes: trace.truth_wave.planned_bytes,
+        },
+    }
 }
 
 async fn load_selected_matrices(
