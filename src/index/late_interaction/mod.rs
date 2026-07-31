@@ -6,11 +6,13 @@
 
 mod fde;
 mod matrix;
+mod matrix_artifact;
 mod maxsim;
 mod search;
 
 pub use fde::{FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection, InnerProjection};
 pub use matrix::MultiVectorMatrixRef;
+pub use matrix_artifact::{MatrixBlockLocator, MatrixBlockRef};
 pub use maxsim::max_sim;
 pub use search::{
     search, LateInteractionCoverage, LateInteractionProvenance, LateInteractionRankedResult,

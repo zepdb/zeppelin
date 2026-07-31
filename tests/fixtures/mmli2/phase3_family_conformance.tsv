@@ -13,6 +13,7 @@ FdeFragment	target/late/fde-fragments/0123456789abcdef0123456789abcdef0123456789
 FdeTransform	target/late/transforms/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef	Other
 Centering	target/late/centering/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef	Other
 Quarantine	target/late/quarantine/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef	Other
+LateSegment	target/late/segments/segment/matrix_0.bin	Other
 Staging	target/_staging/17.json	Other
 Gc	target/_gc/candidates.json	Other
 BranchVisibilityRemoved	target/_lifecycle/branch_visibility_removed/01ARZ3NDEKTSV4RRFFQ69G5FAV.1234567890abcdef1234567890abcdef.json	Other

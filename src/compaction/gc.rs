@@ -1030,7 +1030,8 @@ pub fn reachable_keys_with_staging(
             | NamespaceObjectFamily::FdeFragment
             | NamespaceObjectFamily::FdeTransform
             | NamespaceObjectFamily::Centering
-            | NamespaceObjectFamily::Quarantine => {
+            | NamespaceObjectFamily::Quarantine
+            | NamespaceObjectFamily::LateSegment => {
                 debug_assert!(family.participates_in_branch_locality());
                 // Section-resident refs are expanded only after the selected
                 // immutable section has been loaded and verified.
@@ -5076,6 +5077,16 @@ fn parse_gc_artifact_key(namespace: &str, key: &str) -> Option<ParsedGcArtifact>
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
             .then_some(ParsedGcArtifact::LateSection)
+        }
+        NamespaceObjectFamily::LateSegment => {
+            let prefix = NamespaceObjectFamily::LateSegment.namespace_prefix(namespace);
+            let (segment_id, artifact) = key.strip_prefix(&prefix)?.split_once('/')?;
+            let matrix_index = artifact.strip_prefix("matrix_")?.strip_suffix(".bin")?;
+            (!segment_id.is_empty()
+                && !segment_id.contains('/')
+                && !matrix_index.is_empty()
+                && matrix_index.bytes().all(|byte| byte.is_ascii_digit()))
+            .then_some(ParsedGcArtifact::LateArtifact)
         }
         NamespaceObjectFamily::MatrixFragment
         | NamespaceObjectFamily::FdeFragment

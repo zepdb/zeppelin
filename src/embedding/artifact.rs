@@ -256,28 +256,12 @@ impl MatrixArtifact {
                 })?)
                 .ok_or_else(|| artifact_error("matrix vector offset overflows".to_string()))?;
         }
-        match self.dtype {
-            MatrixDtype::F16 => {
-                for row in &self.rows {
-                    for value in row.embedding.values() {
-                        bytes.put_u16_le(f32_to_f16_bits(*value)?);
-                    }
-                }
-            }
-            MatrixDtype::Int8SymV1 { group_size } => {
-                let group_size = usize::from(group_size);
-                for row in &self.rows {
-                    for vector in row.embedding.values().chunks_exact(self.vector_dimension) {
-                        let encoded = encode_int8_sym_v1_vector(vector, group_size)?;
-                        for code in encoded.codes {
-                            bytes.put_i8(code);
-                        }
-                        for scale in encoded.folded_scale_bits {
-                            bytes.put_u16_le(scale);
-                        }
-                    }
-                }
-            }
+        for row in &self.rows {
+            bytes.extend_from_slice(&encode_matrix_payload(
+                self.dtype,
+                self.vector_dimension,
+                &row.embedding,
+            )?);
         }
         Ok(ImmutableArtifactBytes::new(bytes.freeze()))
     }
@@ -389,41 +373,17 @@ impl MatrixArtifact {
         rows.try_reserve_exact(row_count)
             .map_err(|error| artifact_error(format!("matrix row allocation failed: {error}")))?;
         for (content_hash, vector_count) in directory {
-            let row_scalar_count = vector_count
-                .checked_mul(vector_dimension)
-                .ok_or_else(|| artifact_error("matrix row scalar count overflows".to_string()))?;
-            let mut values = Vec::new();
-            values
-                .try_reserve_exact(row_scalar_count)
-                .map_err(|error| {
-                    artifact_error(format!("matrix scalar allocation failed: {error}"))
-                })?;
-            match dtype {
-                MatrixDtype::F16 => {
-                    for _ in 0..row_scalar_count {
-                        values.push(f16_bits_to_f32(reader.read_u16()?)?);
-                    }
-                }
-                MatrixDtype::Int8SymV1 { group_size } => {
-                    for _ in 0..vector_count {
-                        decode_int8_sym_v1_vector(
-                            &mut reader,
-                            vector_dimension,
-                            usize::from(group_size),
-                            &mut values,
-                        )?;
-                    }
-                }
-            }
-            rows.push(MatrixArtifactRow::new(
-                content_hash,
-                MultiVectorEmbedding::new(
-                    values,
-                    vector_count,
-                    vector_dimension,
-                    max_vectors_per_row,
-                )?,
-            ));
+            let row_bytes = vector_count
+                .checked_mul(matrix_bytes_per_vector(dtype, vector_dimension)?)
+                .ok_or_else(|| artifact_error("matrix row byte count overflows".to_string()))?;
+            let embedding = decode_matrix_payload(
+                reader.read_exact(row_bytes)?,
+                dtype,
+                vector_dimension,
+                vector_count,
+                max_vectors_per_row,
+            )?;
+            rows.push(MatrixArtifactRow::new(content_hash, embedding));
         }
         if reader.remaining() != 0 {
             return Err(artifact_error(
@@ -789,14 +749,14 @@ fn validate_matrix_rows(vector_dimension: usize, rows: &[MatrixArtifactRow]) -> 
     Ok(())
 }
 
-fn matrix_dtype_header(dtype: MatrixDtype) -> (u8, u16) {
+pub(crate) fn matrix_dtype_header(dtype: MatrixDtype) -> (u8, u16) {
     match dtype {
         MatrixDtype::F16 => (MATRIX_DTYPE_F16, 0),
         MatrixDtype::Int8SymV1 { group_size } => (MATRIX_DTYPE_INT8_SYM_V1, group_size),
     }
 }
 
-fn matrix_dtype_from_header(discriminant: u8, group_size: u16) -> Result<MatrixDtype> {
+pub(crate) fn matrix_dtype_from_header(discriminant: u8, group_size: u16) -> Result<MatrixDtype> {
     match discriminant {
         MATRIX_DTYPE_F16 if group_size == 0 => Ok(MatrixDtype::F16),
         MATRIX_DTYPE_F16 => Err(EmbeddingArtifactError::InvalidMatrixDtypeHeader {
@@ -816,7 +776,10 @@ fn matrix_dtype_from_header(discriminant: u8, group_size: u16) -> Result<MatrixD
     }
 }
 
-fn matrix_bytes_per_vector(dtype: MatrixDtype, vector_dimension: usize) -> Result<usize> {
+pub(crate) fn matrix_bytes_per_vector(
+    dtype: MatrixDtype,
+    vector_dimension: usize,
+) -> Result<usize> {
     dtype.validate_for_dimension(
         u32::try_from(vector_dimension)
             .map_err(|_| artifact_error("matrix dimension exceeds u32".to_string()))?,
@@ -834,6 +797,115 @@ fn matrix_bytes_per_vector(dtype: MatrixDtype, vector_dimension: usize) -> Resul
                 .ok_or_else(|| artifact_error("int8 matrix row byte count overflows".to_string()))
         }
     }
+}
+
+/// Encode one document matrix using the shared fragment/segment dtype codec.
+pub(crate) fn encode_matrix_payload(
+    dtype: MatrixDtype,
+    vector_dimension: usize,
+    embedding: &MultiVectorEmbedding,
+) -> Result<Bytes> {
+    dtype.validate_for_dimension(
+        u32::try_from(vector_dimension)
+            .map_err(|_| artifact_error("matrix dimension exceeds u32".to_string()))?,
+    )?;
+    if embedding.vector_dimension() != vector_dimension {
+        return Err(artifact_error(format!(
+            "matrix payload dimension mismatch: expected {vector_dimension}, got {}",
+            embedding.vector_dimension()
+        )));
+    }
+    embedding.matrix_ref()?;
+    let bytes_per_vector = matrix_bytes_per_vector(dtype, vector_dimension)?;
+    let payload_bytes = embedding
+        .vector_count()
+        .checked_mul(bytes_per_vector)
+        .ok_or_else(|| artifact_error("matrix payload byte count overflows".to_string()))?;
+    let mut bytes = BytesMut::with_capacity(payload_bytes);
+    match dtype {
+        MatrixDtype::F16 => {
+            for value in embedding.values() {
+                bytes.put_u16_le(f32_to_f16_bits(*value)?);
+            }
+        }
+        MatrixDtype::Int8SymV1 { group_size } => {
+            let group_size = usize::from(group_size);
+            for vector in embedding.values().chunks_exact(vector_dimension) {
+                let encoded = encode_int8_sym_v1_vector(vector, group_size)?;
+                for code in encoded.codes {
+                    bytes.put_i8(code);
+                }
+                for scale in encoded.folded_scale_bits {
+                    bytes.put_u16_le(scale);
+                }
+            }
+        }
+    }
+    if bytes.len() != payload_bytes {
+        return Err(artifact_error(
+            "matrix payload encoder produced an unexpected byte count".to_string(),
+        ));
+    }
+    Ok(bytes.freeze())
+}
+
+/// Decode one exact document matrix using the shared fragment/segment codec.
+pub(crate) fn decode_matrix_payload(
+    bytes: &[u8],
+    dtype: MatrixDtype,
+    vector_dimension: usize,
+    vector_count: usize,
+    max_vectors: usize,
+) -> Result<MultiVectorEmbedding> {
+    dtype.validate_for_dimension(
+        u32::try_from(vector_dimension)
+            .map_err(|_| artifact_error("matrix dimension exceeds u32".to_string()))?,
+    )?;
+    if vector_count == 0 || vector_count > max_vectors {
+        return Err(artifact_error(format!(
+            "matrix row vector count {vector_count} is outside 1..={max_vectors}"
+        )));
+    }
+    let expected_bytes = vector_count
+        .checked_mul(matrix_bytes_per_vector(dtype, vector_dimension)?)
+        .ok_or_else(|| artifact_error("matrix row byte count overflows".to_string()))?;
+    if bytes.len() != expected_bytes {
+        return Err(artifact_error(format!(
+            "matrix row payload length mismatch: expected {expected_bytes}, got {}",
+            bytes.len()
+        )));
+    }
+    let scalar_count = vector_count
+        .checked_mul(vector_dimension)
+        .ok_or_else(|| artifact_error("matrix row scalar count overflows".to_string()))?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(scalar_count)
+        .map_err(|error| artifact_error(format!("matrix scalar allocation failed: {error}")))?;
+    let mut reader = ArtifactReader::new(bytes, "matrix row");
+    match dtype {
+        MatrixDtype::F16 => {
+            for _ in 0..scalar_count {
+                values.push(f16_bits_to_f32(reader.read_u16()?)?);
+            }
+        }
+        MatrixDtype::Int8SymV1 { group_size } => {
+            for _ in 0..vector_count {
+                decode_int8_sym_v1_vector(
+                    &mut reader,
+                    vector_dimension,
+                    usize::from(group_size),
+                    &mut values,
+                )?;
+            }
+        }
+    }
+    if reader.remaining() != 0 {
+        return Err(artifact_error(
+            "matrix row payload contains trailing bytes".to_string(),
+        ));
+    }
+    MultiVectorEmbedding::new(values, vector_count, vector_dimension, max_vectors)
 }
 
 struct EncodedInt8Vector {

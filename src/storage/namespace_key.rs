@@ -41,6 +41,8 @@ pub(crate) enum NamespaceObjectFamily {
     Centering,
     /// `late/quarantine/`: immutable deterministic-failure evidence.
     Quarantine,
+    /// `late/segments/`: immutable candidate, truth, and filter segment artifacts.
+    LateSegment,
     /// `_staging/`: fenced staging roots, never deferred or branch-local.
     Staging,
     /// `_gc/`: GC-protocol state, never deferred, expanded, or branch-local.
@@ -62,7 +64,7 @@ pub(crate) enum GcOwnership {
 
 impl NamespaceObjectFamily {
     /// Every production namespace object family, in stable registry order.
-    pub(crate) const ALL: [Self; 18] = [
+    pub(crate) const ALL: [Self; 19] = [
         Self::Metadata,
         Self::Manifest,
         Self::Lease,
@@ -78,6 +80,7 @@ impl NamespaceObjectFamily {
         Self::FdeTransform,
         Self::Centering,
         Self::Quarantine,
+        Self::LateSegment,
         Self::Staging,
         Self::Gc,
         Self::BranchVisibilityRemoved,
@@ -101,6 +104,7 @@ impl NamespaceObjectFamily {
             | Self::FdeTransform
             | Self::Centering
             | Self::Quarantine => true,
+            Self::LateSegment => true,
             Self::Metadata
             | Self::Manifest
             | Self::Lease
@@ -126,6 +130,7 @@ impl NamespaceObjectFamily {
             | Self::FdeTransform
             | Self::Centering
             | Self::Quarantine => GcOwnership::ManifestReferenced,
+            Self::LateSegment => GcOwnership::ManifestReferenced,
             Self::Staging => GcOwnership::StagingProtocol,
             Self::Metadata
             | Self::Manifest
@@ -151,6 +156,7 @@ impl NamespaceObjectFamily {
             | Self::FdeTransform
             | Self::Centering
             | Self::Quarantine => true,
+            Self::LateSegment => true,
             Self::Metadata
             | Self::Manifest
             | Self::Lease
@@ -181,6 +187,7 @@ impl NamespaceObjectFamily {
             Self::FdeTransform => "late/transforms/",
             Self::Centering => "late/centering/",
             Self::Quarantine => "late/quarantine/",
+            Self::LateSegment => "late/segments/",
             Self::Staging => "_staging/",
             Self::Gc => "_gc/candidates.json",
             Self::BranchVisibilityRemoved => "_lifecycle/branch_visibility_removed/",
@@ -206,6 +213,7 @@ impl NamespaceObjectFamily {
             | Self::FdeTransform
             | Self::Centering
             | Self::Quarantine => "late/",
+            Self::LateSegment => "late/",
             Self::Staging => "_staging/",
             Self::Gc => "_gc/",
             Self::BranchVisibilityRemoved => "_lifecycle/",
@@ -237,6 +245,7 @@ impl NamespaceObjectFamily {
             | Self::FdeTransform
             | Self::Centering
             | Self::Quarantine
+            | Self::LateSegment
             | Self::Staging
             | Self::Gc
             | Self::BranchVisibilityRemoved => false,
@@ -374,6 +383,10 @@ fn classify_nested_family(key: &str, suffix: &str) -> Result<NamespaceObjectFami
         (
             NamespaceObjectFamily::Quarantine.relative_prefix(),
             NamespaceObjectFamily::Quarantine,
+        ),
+        (
+            NamespaceObjectFamily::LateSegment.relative_prefix(),
+            NamespaceObjectFamily::LateSegment,
         ),
     ] {
         if let Some(descendant) = suffix.strip_prefix(prefix) {
@@ -551,6 +564,7 @@ mod tests {
                 | NamespaceObjectFamily::Quarantine => {
                     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 }
+                NamespaceObjectFamily::LateSegment => "segment/matrix_0.bin",
                 NamespaceObjectFamily::Staging => "17.json",
                 NamespaceObjectFamily::BranchVisibilityRemoved => {
                     "01ARZ3NDEKTSV4RRFFQ69G5FAV.1234567890abcdef1234567890abcdef.json"
@@ -625,7 +639,8 @@ mod tests {
                 | NamespaceObjectFamily::FdeFragment
                 | NamespaceObjectFamily::FdeTransform
                 | NamespaceObjectFamily::Centering
-                | NamespaceObjectFamily::Quarantine => {
+                | NamespaceObjectFamily::Quarantine
+                | NamespaceObjectFamily::LateSegment => {
                     assert_eq!(family.gc_ownership(), GcOwnership::ManifestReferenced);
                     assert!(family.participates_in_branch_locality());
                 }
