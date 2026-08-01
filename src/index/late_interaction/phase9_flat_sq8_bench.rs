@@ -250,6 +250,7 @@ struct BenchReport {
     truth_score_ms: FloatSummary,
     truth_decode_ms: FloatSummary,
     truth_maxsim_ms: FloatSummary,
+    truth_score_workers: usize,
     truth_get_latency_ms: FloatSummary,
     truth_logical_ranges: IntegerSummary,
     truth_planned_requests: IntegerSummary,
@@ -642,6 +643,7 @@ async fn run_benchmark() -> BenchResult<()> {
     let mut score_ms = Vec::with_capacity(QUERY_COUNT);
     let mut decode_ms = Vec::with_capacity(QUERY_COUNT);
     let mut maxsim_ms = Vec::with_capacity(QUERY_COUNT);
+    let mut truth_score_workers = 0usize;
     let mut truth_logical = Vec::with_capacity(QUERY_COUNT);
     let mut truth_planned_requests = Vec::with_capacity(QUERY_COUNT);
     let mut truth_planned_bytes = Vec::with_capacity(QUERY_COUNT);
@@ -717,6 +719,14 @@ async fn run_benchmark() -> BenchResult<()> {
         let mut rows = score_truth_wave(&request, candidates, &truth_bytes, Some(&mut timing))
             .map_err(|error| error.to_string())?;
         let score_elapsed = score_started.elapsed();
+        if truth_score_workers == 0 {
+            truth_score_workers = timing.workers;
+        } else if truth_score_workers != timing.workers {
+            return Err(format!(
+                "truth score worker count changed from {truth_score_workers} to {}",
+                timing.workers
+            ));
+        }
         rows.sort_by(compare_scored_rows);
         rows.truncate(GOLD_PER_QUERY);
         let truth_elapsed = truth_started.elapsed();
@@ -874,6 +884,7 @@ async fn run_benchmark() -> BenchResult<()> {
         truth_score_ms: float_summary(&score_ms),
         truth_decode_ms: float_summary(&decode_ms),
         truth_maxsim_ms: float_summary(&maxsim_ms),
+        truth_score_workers,
         truth_get_latency_ms: float_summary(&truth_get_latency_ms),
         truth_logical_ranges: integer_summary(&truth_logical),
         truth_planned_requests: integer_summary(&truth_planned_requests),

@@ -10,6 +10,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
+use std::thread;
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
@@ -409,7 +410,28 @@ pub(crate) fn score_truth_wave(
     request: &SegmentSearchRequest<'_>,
     candidates: Vec<LateCandidate>,
     truth_bytes: &[bytes::Bytes],
-    #[cfg(test)] mut timing: Option<&mut TruthWaveTiming>,
+    #[cfg(test)] timing: Option<&mut TruthWaveTiming>,
+) -> Result<Vec<SegmentScoredRow>> {
+    let worker_count = thread::available_parallelism()
+        .map(usize::from)
+        .map_err(|error| segment_error(format!("cannot resolve truth scoring workers: {error}")))?
+        .min(candidates.len().max(1));
+    score_truth_wave_with_workers(
+        request,
+        candidates,
+        truth_bytes,
+        worker_count,
+        #[cfg(test)]
+        timing,
+    )
+}
+
+fn score_truth_wave_with_workers(
+    request: &SegmentSearchRequest<'_>,
+    candidates: Vec<LateCandidate>,
+    truth_bytes: &[bytes::Bytes],
+    worker_count: usize,
+    #[cfg(test)] timing: Option<&mut TruthWaveTiming>,
 ) -> Result<Vec<SegmentScoredRow>> {
     let expected = candidates
         .len()
@@ -422,8 +444,94 @@ pub(crate) fn score_truth_wave(
     }
     let vector_dimension = usize::try_from(request.segment.vector_dimension)
         .map_err(|_| segment_error("segment vector dimension exceeds usize"))?;
+    if worker_count == 0 {
+        return Err(segment_error("truth scoring worker count must be positive"));
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = worker_count.min(candidates.len());
+    let candidate_count = candidates.len();
+    let base_chunk_size = candidate_count / worker_count;
+    let larger_chunks = candidate_count % worker_count;
+    let mut candidate_iter = candidates.into_iter();
+    let mut start_index = 0usize;
+    let chunks = (0..worker_count)
+        .map(|worker_index| {
+            let chunk_size = base_chunk_size + usize::from(worker_index < larger_chunks);
+            let chunk = candidate_iter.by_ref().take(chunk_size).collect::<Vec<_>>();
+            let chunk_start = start_index;
+            start_index += chunk.len();
+            (chunk_start, chunk)
+        })
+        .collect::<Vec<_>>();
+    debug_assert_eq!(start_index, candidate_count);
+
+    let scored_chunks = thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(chunks.len());
+        for (start_index, candidates) in chunks {
+            workers.push(scope.spawn(move || {
+                score_truth_chunk(
+                    request,
+                    start_index,
+                    candidates,
+                    truth_bytes,
+                    vector_dimension,
+                )
+            }));
+        }
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| segment_error("truth scoring worker panicked"))?
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+
+    #[cfg(test)]
+    if let Some(timing) = timing {
+        timing.decode = scored_chunks
+            .iter()
+            .map(|chunk| chunk.timing.decode)
+            .max()
+            .unwrap_or_default();
+        timing.maxsim = scored_chunks
+            .iter()
+            .map(|chunk| chunk.timing.maxsim)
+            .max()
+            .unwrap_or_default();
+        timing.workers = scored_chunks.len();
+    }
+
+    Ok(scored_chunks
+        .into_iter()
+        .flat_map(|chunk| chunk.rows)
+        .collect())
+}
+
+struct ScoredTruthChunk {
+    rows: Vec<SegmentScoredRow>,
+    #[cfg(test)]
+    timing: TruthWaveTiming,
+}
+
+fn score_truth_chunk(
+    request: &SegmentSearchRequest<'_>,
+    start_index: usize,
+    candidates: Vec<LateCandidate>,
+    truth_bytes: &[bytes::Bytes],
+    vector_dimension: usize,
+) -> Result<ScoredTruthChunk> {
     let mut rows = Vec::with_capacity(candidates.len());
-    for (candidate_index, candidate) in candidates.into_iter().enumerate() {
+    #[cfg(test)]
+    let mut timing = TruthWaveTiming::default();
+    for (chunk_index, candidate) in candidates.into_iter().enumerate() {
+        let candidate_index = start_index
+            .checked_add(chunk_index)
+            .ok_or_else(|| segment_error("truth candidate index overflows"))?;
         #[cfg(test)]
         let decode_started = Instant::now();
         let matrix_index = candidate_index
@@ -462,14 +570,14 @@ pub(crate) fn score_truth_wave(
         }
         let document = embedding.matrix_ref()?;
         #[cfg(test)]
-        if let Some(timing) = timing.as_deref_mut() {
+        {
             timing.decode += decode_started.elapsed();
         }
         #[cfg(test)]
         let maxsim_started = Instant::now();
         let score = max_sim(&request.exact_query, &document)?;
         #[cfg(test)]
-        if let Some(timing) = timing.as_deref_mut() {
+        {
             timing.maxsim += maxsim_started.elapsed();
         }
         if !score.is_finite() {
@@ -485,15 +593,23 @@ pub(crate) fn score_truth_wave(
             attributes,
         });
     }
-    Ok(rows)
+    Ok(ScoredTruthChunk {
+        rows,
+        #[cfg(test)]
+        timing,
+    })
 }
 
-/// Test-only CPU timing split for exact truth-wave scoring.
+/// Test-only critical-worker timing split for exact truth-wave scoring.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TruthWaveTiming {
+    /// Maximum accumulated decode time reported by any one scoped worker.
     pub(crate) decode: Duration,
+    /// Maximum accumulated MaxSim time reported by any one scoped worker.
     pub(crate) maxsim: Duration,
+    /// Scoped workers used for this score wave.
+    pub(crate) workers: usize,
 }
 
 fn trace_for(requests: &[ReadRequest], plan: &ReadPlan) -> SegmentWaveTrace {
@@ -546,8 +662,8 @@ mod tests {
         build_attribute_blocks, AttributeBlockInputRow, BuiltAttributeBlock,
     };
     use crate::index::late_interaction::candidate::{
-        build_late_candidate_index, BuiltLateCandidateIndex, LateCandidateBuildConfig,
-        LateCandidateInputRow, LateRoutingMetric,
+        build_late_candidate_index, BuiltLateCandidateIndex, LateCandidate,
+        LateCandidateBuildConfig, LateCandidateInputRow, LateCandidateMetadata, LateRoutingMetric,
     };
     use crate::index::late_interaction::flat_candidate::{
         build_flat_candidate_artifact, LateFlatCandidateBuildConfig,
@@ -555,18 +671,22 @@ mod tests {
     use crate::index::late_interaction::matrix_artifact::{
         build_matrix_blocks, BuiltMatrixBlock, MatrixBlockInputRow,
     };
-    use crate::storage::read_plan::ReadPlanConfig;
+    use crate::storage::read_plan::{execute_read_plan, ReadPlan, ReadPlanConfig};
     use crate::storage::ZeppelinStore;
     use crate::types::{AttributeValue, Filter};
     use crate::wal::{LateCandidateKind, LateInteractionSegmentRef};
 
-    use super::{search_segment, SegmentSearchBounds, SegmentSearchRequest};
+    use super::{
+        build_truth_requests, score_truth_wave_with_workers, search_segment, SegmentSearchBounds,
+        SegmentSearchRequest,
+    };
 
     const MAX_BYTES: usize = 1024 * 1024;
 
     struct Fixture {
         store: ZeppelinStore,
         segment: LateInteractionSegmentRef,
+        candidates: Vec<LateCandidate>,
     }
 
     async fn fixture(candidate_k: usize, corrupt_matrix: bool) -> Fixture {
@@ -647,6 +767,22 @@ mod tests {
                     AttributeValue::String(color.to_string()),
                 )])),
             })
+            .collect::<Vec<_>>();
+        let scoring_candidates = candidate_rows
+            .iter()
+            .map(|row| LateCandidate {
+                id: row.id.clone(),
+                approx_fde_score: 0.0,
+                matrix_locator: row.matrix_locator.clone(),
+                attr_locator: row.attr_locator.clone(),
+                metadata: LateCandidateMetadata {
+                    content_hash: row.content_hash,
+                    source_sequence: row.source_sequence,
+                    parent_id: row.parent_id.clone(),
+                    unit_ordinal: row.unit_ordinal,
+                    attributes: row.filter_attributes.clone(),
+                },
+            })
             .collect();
         let (candidate_index, flat_candidate) = match kind {
             LateCandidateKind::Ivf => {
@@ -718,7 +854,11 @@ mod tests {
             candidate_kind: kind,
             flat_candidate,
         };
-        Fixture { store, segment }
+        Fixture {
+            store,
+            segment,
+            candidates: scoring_candidates,
+        }
     }
 
     fn content_hash(id: &str) -> ContentHash {
@@ -775,6 +915,61 @@ mod tests {
 
     fn plan() -> ReadPlanConfig {
         ReadPlanConfig::new(4096, MAX_BYTES, 2).expect("read plan")
+    }
+
+    #[tokio::test]
+    async fn parallel_truth_scoring_is_bit_identical_and_ordered() {
+        let fixture = fixture(2, false).await;
+        let read_plan = plan();
+        let truth_requests =
+            build_truth_requests(&fixture.segment, &fixture.candidates).expect("truth requests");
+        let truth_plan = ReadPlan::build(&truth_requests, &read_plan).expect("truth plan");
+        let truth_bytes = execute_read_plan(&fixture.store, &truth_plan)
+            .await
+            .expect("truth bytes");
+        let query = MultiVectorEmbedding::new(vec![1.0, 0.0], 1, 2, 4).expect("query");
+        let excluded_ids = BTreeSet::new();
+        let request = SegmentSearchRequest {
+            store: &fixture.store,
+            bootstrap_cache: None,
+            segment: &fixture.segment,
+            exact_query: query.matrix_ref().expect("query matrix"),
+            candidate_query_fde: &[1.0, 0.0],
+            mandatory_filter: None,
+            request_filter: None,
+            excluded_ids: &excluded_ids,
+            top_k: 2,
+            read_plan: &read_plan,
+            bounds: bounds(),
+        };
+
+        let sequential = score_truth_wave_with_workers(
+            &request,
+            fixture.candidates.clone(),
+            &truth_bytes,
+            1,
+            None,
+        )
+        .expect("sequential truth scores");
+        let parallel = score_truth_wave_with_workers(
+            &request,
+            fixture.candidates.clone(),
+            &truth_bytes,
+            2,
+            None,
+        )
+        .expect("parallel truth scores");
+
+        assert_eq!(parallel.len(), sequential.len());
+        for (parallel, sequential) in parallel.iter().zip(&sequential) {
+            assert_eq!(parallel.id, sequential.id);
+            assert_eq!(parallel.score.to_bits(), sequential.score.to_bits());
+            assert_eq!(parallel.content_hash, sequential.content_hash);
+            assert_eq!(parallel.source_sequence, sequential.source_sequence);
+            assert_eq!(parallel.parent_id, sequential.parent_id);
+            assert_eq!(parallel.unit_ordinal, sequential.unit_ordinal);
+            assert_eq!(parallel.attributes, sequential.attributes);
+        }
     }
 
     #[tokio::test]
