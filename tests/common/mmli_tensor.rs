@@ -11,7 +11,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::task;
 use zeppelin::embedding::{
-    ContentHash, EncoderDocumentInput, EncoderQueryInput, MatrixDtype, MultiVectorEmbedding,
+    ContentHash, EncoderDocumentInput, EncoderQueryInput, MultiVectorEmbedding,
     MultiVectorEmbeddingBatch, MultiVectorEncoder, MultiVectorEpoch, MultiVectorEpochId,
 };
 use zeppelin::error::ZeppelinError;
@@ -400,13 +400,15 @@ impl FileBackedMultiVectorEncoder {
         let dim = epoch.vector_dimension as usize;
         let max_query_rows = epoch.max_query_vectors as usize;
         let max_document_rows = epoch.max_document_vectors as usize;
-        if epoch.matrix_dtype != MatrixDtype::F16
-            || documents.0.dim != dim
+        // The encoder always emits f16 rows; the epoch's persisted matrix
+        // dtype (f16 or int8_sym_v1) is applied by Rust at enrichment and
+        // does not constrain the replay tensors.
+        if documents.0.dim != dim
             || queries.0.dim != dim
             || documents.max_rows() > max_document_rows
             || queries.max_rows() > max_query_rows
         {
-            return Err("replay tensors do not match epoch dtype/dimension/row limits".to_string());
+            return Err("replay tensors do not match epoch dimension/row limits".to_string());
         }
         if document_hashes.len() != documents.count() || query_texts.len() != queries.count() {
             return Err("replay lookup inputs do not match tensor counts".to_string());
