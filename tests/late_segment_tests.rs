@@ -408,7 +408,7 @@ async fn text_matrix_dtype_is_a_one_way_namespace_fence() {
 }
 
 fn provider(profile: &EmbeddingProfileRef) -> Arc<dyn MultiVectorEncoderProvider> {
-    let registry = Arc::new(MultiVectorEncoderRegistry::new());
+    let registry = Arc::new(MultiVectorEncoderRegistry::new(&MmliConfig::default()));
     registry
         .register(Arc::new(
             DeterministicDev::new(true, &profile.epoch).expect("dev encoder must construct"),
@@ -1335,6 +1335,7 @@ fn real_replay_query_texts(lane: RealReplayLane) -> Vec<String> {
 }
 
 fn real_replay_provider(
+    config: &MmliConfig,
     profile: &EmbeddingProfileRef,
     documents: FileBackedF16Tensor,
     queries: FileBackedF16Tensor,
@@ -1349,7 +1350,7 @@ fn real_replay_provider(
         query_texts,
     )
     .expect("verified replay tensors must bind to the replay epoch");
-    let registry = Arc::new(MultiVectorEncoderRegistry::new());
+    let registry = Arc::new(MultiVectorEncoderRegistry::new(config));
     registry
         .register(Arc::new(encoder))
         .expect("matrix replay encoder must register");
@@ -1564,7 +1565,18 @@ async fn late_segment_recall_matches_real_lab_matrices() {
     .await;
     let transform_checksum_matches =
         profile.fde.transform_artifact.checksum.to_hex() == REAL_REPLAY_TRANSFORM_SHA256;
+    let mut mmli = MmliConfig {
+        text_matrix_dtype: match matrix_dtype {
+            MatrixDtype::F16 => MmliMatrixDtype::F16,
+            MatrixDtype::Int8SymV1 { group_size: 32 } => MmliMatrixDtype::Int8G32,
+            MatrixDtype::Int8SymV1 { group_size } => {
+                panic!("unsupported real-replay INT8 group size {group_size}")
+            }
+        },
+        ..MmliConfig::default()
+    };
     let provider = real_replay_provider(
+        &mmli,
         &profile,
         documents.clone(),
         queries,
@@ -1586,7 +1598,6 @@ async fn late_segment_recall_matches_real_lab_matrices() {
     )
     .await;
 
-    let mut mmli = MmliConfig::default();
     mmli.segment.candidate_k = lane.candidate_k;
     let operating_point_is_default =
         mmli.segment.candidate_k == MmliSegmentConfig::default().candidate_k;
