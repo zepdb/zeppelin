@@ -7,7 +7,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
 use crate::embedding::artifact::{
-    decode_matrix_payload, matrix_bytes_per_vector, matrix_dtype_from_header, matrix_dtype_header,
+    decode_matrix_payload, decode_matrix_payload_into, matrix_bytes_per_vector,
+    matrix_dtype_from_header, matrix_dtype_header, MatrixDecodeScratch,
 };
 use crate::embedding::{
     ArtifactChecksum, ContentHash, FdeGenerationId, MatrixDtype, MultiVectorEmbedding,
@@ -16,6 +17,8 @@ use crate::embedding::{
 use crate::error::{Result, ZeppelinError};
 use crate::storage::{NamespaceObjectFamily, NamespaceObjectKey};
 use crate::types::VectorId;
+
+use super::matrix::MultiVectorMatrixRef;
 
 const MATRIX_BLOCK_MAGIC: &[u8; 4] = b"ZMB1";
 const MATRIX_BLOCK_VERSION: u8 = 1;
@@ -426,6 +429,33 @@ pub(crate) fn decode_matrix_row(
         usize::try_from(locator.vector_count)
             .map_err(|_| invalid_block("matrix row vector count exceeds usize"))?,
         max_vectors,
+    )
+}
+
+pub(crate) fn decode_matrix_row_into<'a>(
+    bytes: &[u8],
+    locator: &MatrixBlockLocator,
+    dtype: MatrixDtype,
+    vector_dimension: usize,
+    max_vectors: usize,
+    scratch: &'a mut MatrixDecodeScratch,
+) -> Result<MultiVectorMatrixRef<'a>> {
+    if u64::try_from(bytes.len()).ok() != Some(locator.byte_length) {
+        return Err(invalid_block(
+            "matrix row payload length disagrees with its locator",
+        ));
+    }
+    if ArtifactChecksum::digest(bytes) != locator.payload_checksum {
+        return Err(invalid_block("matrix row payload checksum mismatch"));
+    }
+    decode_matrix_payload_into(
+        bytes,
+        dtype,
+        vector_dimension,
+        usize::try_from(locator.vector_count)
+            .map_err(|_| invalid_block("matrix row vector count exceeds usize"))?,
+        max_vectors,
+        scratch,
     )
 }
 

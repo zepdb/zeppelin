@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::cache::DiskCache;
+use crate::embedding::artifact::MatrixDecodeScratch;
 use crate::embedding::{ArtifactChecksum, ContentHash};
 use crate::error::{Result, ZeppelinError};
 use crate::index::filter::evaluate_filter_on_optional_attributes;
@@ -30,7 +31,7 @@ use super::candidate::{
     FdeCandidateIndex, FetchedLateCandidateCluster, LateCandidate, ResidentLateCandidateIndex,
 };
 use super::flat_candidate::ResidentFlatCandidateIndex;
-use super::matrix_artifact::decode_matrix_row;
+use super::matrix_artifact::decode_matrix_row_into;
 use super::{max_sim, MultiVectorMatrixRef};
 
 /// Runtime byte and shape limits for one segment execution.
@@ -526,6 +527,7 @@ fn score_truth_chunk(
     vector_dimension: usize,
 ) -> Result<ScoredTruthChunk> {
     let mut rows = Vec::with_capacity(candidates.len());
+    let mut decode_scratch = MatrixDecodeScratch::default();
     #[cfg(test)]
     let mut timing = TruthWaveTiming::default();
     for (chunk_index, candidate) in candidates.into_iter().enumerate() {
@@ -540,7 +542,7 @@ fn score_truth_chunk(
         let attribute_index = matrix_index
             .checked_add(1)
             .ok_or_else(|| segment_error("truth attribute output index overflows"))?;
-        let embedding = decode_matrix_row(
+        let document = decode_matrix_row_into(
             truth_bytes
                 .get(matrix_index)
                 .ok_or_else(|| segment_error("truth wave omitted a matrix payload"))?,
@@ -548,6 +550,7 @@ fn score_truth_chunk(
             request.segment.matrix_dtype,
             vector_dimension,
             request.bounds.max_vectors_per_document,
+            &mut decode_scratch,
         )?;
         let attributes = decode_attribute_row(
             truth_bytes
@@ -568,7 +571,6 @@ fn score_truth_chunk(
                 "candidate failed the final exact attribute assertion",
             ));
         }
-        let document = embedding.matrix_ref()?;
         #[cfg(test)]
         {
             timing.decode += decode_started.elapsed();

@@ -7,9 +7,12 @@
 //! identity mismatches.
 
 use bytes::{BufMut, Bytes, BytesMut};
+use half::f16;
+use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
 use thiserror::Error;
 
 use crate::error::{Result, ZeppelinError};
+use crate::index::late_interaction::MultiVectorMatrixRef;
 
 use super::{
     ArtifactChecksum, ContentHash, FdeGenerationId, MatrixDtype, MultiVectorEmbedding,
@@ -903,6 +906,39 @@ pub(crate) fn decode_matrix_payload(
     vector_count: usize,
     max_vectors: usize,
 ) -> Result<MultiVectorEmbedding> {
+    let mut scratch = MatrixDecodeScratch::default();
+    decode_matrix_payload_into(
+        bytes,
+        dtype,
+        vector_dimension,
+        vector_count,
+        max_vectors,
+        &mut scratch,
+    )?;
+    MultiVectorEmbedding::from_decoder_validated(
+        scratch.values,
+        vector_count,
+        vector_dimension,
+        max_vectors,
+    )
+}
+
+/// Reusable buffers for decoding one exact matrix at a time.
+#[derive(Default)]
+pub(crate) struct MatrixDecodeScratch {
+    f16_bits: Vec<u16>,
+    values: Vec<f32>,
+}
+
+/// Decode one exact matrix into caller-owned reusable storage.
+pub(crate) fn decode_matrix_payload_into<'a>(
+    bytes: &[u8],
+    dtype: MatrixDtype,
+    vector_dimension: usize,
+    vector_count: usize,
+    max_vectors: usize,
+    scratch: &'a mut MatrixDecodeScratch,
+) -> Result<MultiVectorMatrixRef<'a>> {
     dtype.validate_for_dimension(
         u32::try_from(vector_dimension)
             .map_err(|_| artifact_error("matrix dimension exceeds u32".to_string()))?,
@@ -924,34 +960,71 @@ pub(crate) fn decode_matrix_payload(
     let scalar_count = vector_count
         .checked_mul(vector_dimension)
         .ok_or_else(|| artifact_error("matrix row scalar count overflows".to_string()))?;
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(scalar_count)
-        .map_err(|error| artifact_error(format!("matrix scalar allocation failed: {error}")))?;
-    let mut reader = ArtifactReader::new(bytes, "matrix row");
     match dtype {
         MatrixDtype::F16 => {
-            for _ in 0..scalar_count {
-                values.push(f16_bits_to_f32(reader.read_u16()?)?);
+            scratch.f16_bits.clear();
+            scratch
+                .f16_bits
+                .try_reserve_exact(scalar_count)
+                .map_err(|error| {
+                    artifact_error(format!("matrix f16 scratch allocation failed: {error}"))
+                })?;
+            scratch.f16_bits.extend(
+                bytes
+                    .chunks_exact(size_of::<u16>())
+                    .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]])),
+            );
+            debug_assert_eq!(scratch.f16_bits.len(), scalar_count);
+            if scratch.f16_bits.iter().any(|bits| bits & 0x7c00 == 0x7c00) {
+                return Err(artifact_error(
+                    "matrix artifact contains a non-finite f16 value".to_string(),
+                ));
             }
+
+            scratch.values.clear();
+            scratch
+                .values
+                .try_reserve_exact(scalar_count)
+                .map_err(|error| {
+                    artifact_error(format!("matrix scalar allocation failed: {error}"))
+                })?;
+            scratch.values.resize(scalar_count, 0.0);
+            scratch
+                .f16_bits
+                .as_slice()
+                .reinterpret_cast::<f16>()
+                .convert_to_f32_slice(&mut scratch.values);
         }
         MatrixDtype::Int8SymV1 { group_size } => {
+            scratch.values.clear();
+            scratch
+                .values
+                .try_reserve_exact(scalar_count)
+                .map_err(|error| {
+                    artifact_error(format!("matrix scalar allocation failed: {error}"))
+                })?;
+            let mut reader = ArtifactReader::new(bytes, "matrix row");
             for _ in 0..vector_count {
                 decode_int8_sym_v1_vector(
                     &mut reader,
                     vector_dimension,
                     usize::from(group_size),
-                    &mut values,
+                    &mut scratch.values,
                 )?;
+            }
+            if reader.remaining() != 0 {
+                return Err(artifact_error(
+                    "matrix row payload contains trailing bytes".to_string(),
+                ));
             }
         }
     }
-    if reader.remaining() != 0 {
-        return Err(artifact_error(
-            "matrix row payload contains trailing bytes".to_string(),
-        ));
-    }
-    MultiVectorEmbedding::new(values, vector_count, vector_dimension, max_vectors)
+    MultiVectorMatrixRef::from_decoder_validated(
+        &scratch.values,
+        vector_count,
+        vector_dimension,
+        max_vectors,
+    )
 }
 
 struct EncodedInt8Vector {
@@ -1293,14 +1366,42 @@ mod tests {
     use std::mem::size_of;
 
     use super::{
-        matrix_header_len, round_ties_away, CenteringArtifact, EmbeddingArtifactError, FdeArtifact,
-        FdeArtifactRow, MatrixArtifact, MatrixArtifactRow, MATRIX_MAGIC,
+        decode_matrix_payload_into, f16_bits_to_f32, matrix_header_len, round_ties_away,
+        CenteringArtifact, EmbeddingArtifactError, FdeArtifact, FdeArtifactRow, MatrixArtifact,
+        MatrixArtifactRow, MatrixDecodeScratch, MATRIX_MAGIC,
     };
     use crate::embedding::{
         ArtifactChecksum, ContentHash, FdeGenerationId, MatrixDtype, MultiVectorEmbedding,
         MultiVectorEpochId,
     };
     use crate::error::ZeppelinError;
+
+    #[test]
+    fn f16_slice_decode_is_bit_identical_to_scalar_path() {
+        let bits = [
+            0x0000_u16, 0x8000, 0x0001, 0x8001, 0x03ff, 0x83ff, 0x0400, 0x3555, 0x3c00, 0xbc00,
+            0x7bff, 0xfbff,
+        ];
+        let bytes = bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        let expected = bits
+            .iter()
+            .map(|bits| f16_bits_to_f32(*bits).expect("finite scalar f16").to_bits())
+            .collect::<Vec<_>>();
+        let mut scratch = MatrixDecodeScratch::default();
+
+        let decoded = decode_matrix_payload_into(&bytes, MatrixDtype::F16, 4, 3, 3, &mut scratch)
+            .expect("slice decode");
+        let actual = decoded
+            .values()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn f16_matrix_artifact_is_deterministic_and_round_trips() {
