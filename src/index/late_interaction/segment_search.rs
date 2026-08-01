@@ -558,20 +558,20 @@ mod tests {
         let ids = ["blocked-high", "allowed-low"];
         let colors = ["red", "blue"];
         let matrices = vec![
-            MatrixBlockInputRow {
-                id: ids[0].to_string(),
-                ordinal: 0,
-                content_hash: content_hash(ids[0]),
-                embedding: MultiVectorEmbedding::new(vec![2.0, 0.0], 1, 2, 4)
-                    .expect("blocked matrix"),
-            },
-            MatrixBlockInputRow {
-                id: ids[1].to_string(),
-                ordinal: 1,
-                content_hash: content_hash(ids[1]),
-                embedding: MultiVectorEmbedding::new(vec![1.0, 0.0], 1, 2, 4)
-                    .expect("allowed matrix"),
-            },
+            MatrixBlockInputRow::encoded(
+                ids[0].to_string(),
+                0,
+                content_hash(ids[0]),
+                MatrixDtype::F16,
+                MultiVectorEmbedding::new(vec![2.0, 0.0], 1, 2, 4).expect("blocked matrix"),
+            ),
+            MatrixBlockInputRow::encoded(
+                ids[1].to_string(),
+                1,
+                content_hash(ids[1]),
+                MatrixDtype::F16,
+                MultiVectorEmbedding::new(vec![1.0, 0.0], 1, 2, 4).expect("allowed matrix"),
+            ),
         ];
         let matrix_blocks = build_matrix_blocks(
             "test",

@@ -797,9 +797,32 @@ fn prepare_encoded_work(
         matrix_artifact.checksum(),
     );
 
+    // For `int8_sym_v1` epochs the raw worker rows are not durable — only the
+    // persisted matrix bytes are — so candidate/FDE derivation reads them back
+    // through the production decoder. The flat-segment rebuild reproduces the
+    // identical FDEs from the stored bytes alone (see
+    // tasks/MMLI-2/results/int8-flat-rebuild-design.md). F16 epochs keep the
+    // raw-row derivation, which is bit-identical for f16-representable output.
+    let decoded_stored_matrix = match work.profile.epoch.matrix_dtype {
+        crate::embedding::MatrixDtype::F16 => None,
+        crate::embedding::MatrixDtype::Int8SymV1 { .. } => Some(MatrixArtifact::from_bytes(
+            matrix_artifact.bytes(),
+            matrix_artifact.checksum(),
+            work.profile.epoch.matrix_dtype,
+            work.profile.epoch.id,
+            source.checksum,
+            work.profile.epoch.vector_dimension as usize,
+            healthy_records.len(),
+            work.profile.epoch.max_document_vectors as usize,
+        )?),
+    };
+    let candidate_sources: Vec<&MultiVectorEmbedding> = match decoded_stored_matrix.as_ref() {
+        None => raw_embeddings.iter().collect(),
+        Some(artifact) => artifact.rows().iter().map(|row| row.embedding()).collect(),
+    };
     let candidate_rows = healthy_records
         .iter()
-        .zip(&raw_embeddings)
+        .zip(&candidate_sources)
         .map(|(record, embedding)| {
             apply_vector_transform(
                 embedding,

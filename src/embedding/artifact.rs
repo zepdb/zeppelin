@@ -400,6 +400,52 @@ impl MatrixArtifact {
     }
 }
 
+/// Slice the exact stored per-row payload bytes out of verified matrix bytes.
+///
+/// The artifact must be the result of decoding `bytes` (or byte-identical to
+/// its encoding); offsets are recomputed from the validated shape. Carrying
+/// these bytes verbatim through compaction is what keeps truth payloads
+/// stable for dtypes whose decode→re-encode round trip is not byte-idempotent
+/// (`int8_sym_v1`).
+pub(crate) fn matrix_row_payloads(bytes: &Bytes, artifact: &MatrixArtifact) -> Result<Vec<Bytes>> {
+    let bytes_per_vector = matrix_bytes_per_vector(artifact.dtype(), artifact.vector_dimension())?;
+    let directory_bytes = artifact
+        .rows()
+        .len()
+        .checked_mul(32 + size_of::<u32>() + size_of::<u64>())
+        .ok_or_else(|| artifact_error("matrix directory byte count overflows".to_string()))?;
+    let mut offset = matrix_header_len()
+        .checked_add(directory_bytes)
+        .ok_or_else(|| artifact_error("matrix payload offset overflows".to_string()))?;
+    let mut payloads = Vec::new();
+    payloads
+        .try_reserve_exact(artifact.rows().len())
+        .map_err(|error| artifact_error(format!("matrix payload allocation failed: {error}")))?;
+    for row in artifact.rows() {
+        let row_bytes = row
+            .embedding()
+            .vector_count()
+            .checked_mul(bytes_per_vector)
+            .ok_or_else(|| artifact_error("matrix row byte count overflows".to_string()))?;
+        let end = offset
+            .checked_add(row_bytes)
+            .ok_or_else(|| artifact_error("matrix payload offset overflows".to_string()))?;
+        if end > bytes.len() {
+            return Err(artifact_error(
+                "matrix payload slice exceeds artifact bytes".to_string(),
+            ));
+        }
+        payloads.push(bytes.slice(offset..end));
+        offset = end;
+    }
+    if offset != bytes.len() {
+        return Err(artifact_error(
+            "matrix payload slices do not cover the artifact".to_string(),
+        ));
+    }
+    Ok(payloads)
+}
+
 /// One content-bound f32 FDE vector within an FDE artifact.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FdeArtifactRow {

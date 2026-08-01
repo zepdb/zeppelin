@@ -16,10 +16,11 @@ use zeppelin::embedding::{
     ArtifactChecksum, CandidateDocumentPooling, CenteringArtifact, DeterministicDev,
     EmbeddingProfileId, EmbeddingProfileRef, EncoderDocumentInput, EncoderExecutionRef,
     EncoderInputRef, ExactScorerVersion, FdeRecipe, FdeTransformArtifactRef, ImageObjectRef,
-    InputModality, MatrixDtype, MeanVectorRef, MultiVectorEncoder, MultiVectorEncoderProvider,
-    MultiVectorEncoderRegistry, MultiVectorEpoch, MultiVectorEpochId, NormalizationRecipe,
-    RetrievalUnitRecord, TextContentRef, VectorTransformRecipe, CENTERING_ARTIFACT_FORMAT_VERSION,
-    DETERMINISTIC_DEV_IMPLEMENTATION, DETERMINISTIC_DEV_VERSION,
+    InputModality, Int8QualificationStamp, MatrixDtype, MeanVectorRef, MultiVectorEncoder,
+    MultiVectorEncoderProvider, MultiVectorEncoderRegistry, MultiVectorEpoch, MultiVectorEpochId,
+    NormalizationRecipe, RetrievalUnitRecord, TextContentRef, VectorTransformRecipe,
+    CENTERING_ARTIFACT_FORMAT_VERSION, DETERMINISTIC_DEV_IMPLEMENTATION, DETERMINISTIC_DEV_VERSION,
+    INT8_QUALIFICATION_STAMP_VERSION,
 };
 use zeppelin::index::late_interaction::{
     search, FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection, InnerProjection,
@@ -204,6 +205,7 @@ async fn setup_profile_with_recipe(
         candidate_vector_transform,
         CandidateDocumentPooling::Identity,
         "phase-9-segment-test",
+        None,
     )
     .await
 }
@@ -218,6 +220,7 @@ async fn setup_profile_for_epoch(
     candidate_vector_transform: VectorTransformRecipe,
     candidate_document_pooling: CandidateDocumentPooling,
     profile_id: &str,
+    int8_qualification: Option<Int8QualificationStamp>,
 ) -> (EmbeddingProfileRef, Uuid) {
     let metadata = NamespaceManager::new(store.clone())
         .create_typed_with_fts_and_index_config(
@@ -274,7 +277,7 @@ async fn setup_profile_for_epoch(
         profile: EmbeddingProfileId::new(profile_id),
         epoch,
         fde,
-        int8_qualification: None,
+        int8_qualification,
     };
     profile.validate().expect("profile must validate");
     let (mut manifest, version) =
@@ -1012,6 +1015,19 @@ const REAL_REPLAY_TRANSFORM_SEED: u64 = 5_570_192_190_543_495_170;
 const REAL_REPLAY_TRANSFORM_SHA256: &str =
     "00ad4edb4292ddd64c6df00c84c2f8dfced3a092d9ddc307239d9e070deb2ad4";
 const REAL_REPLAY_FRAGMENT_MATRIX_BYTES: usize = 48 * 1024 * 1024;
+/// SHA-256 of the durable text-lane INT8 production qualification evidence
+/// (`tasks/MMLI-2/results/int8-production-qualification.json`), matching the
+/// operator-approved tuple in `embedding::types`.
+const INT8_TEXT_EVIDENCE_SHA256: &str =
+    "e91ef65c9c26a772a7a98e05985ceb7f310a094541d853559fc3aaee0a88794b";
+
+fn real_replay_dtype() -> MatrixDtype {
+    match std::env::var("MMLI_REAL_MATRIX_DTYPE").as_deref() {
+        Err(_) | Ok("f16") => MatrixDtype::F16,
+        Ok("int8_g32") => MatrixDtype::Int8SymV1 { group_size: 32 },
+        Ok(other) => panic!("MMLI_REAL_MATRIX_DTYPE must be f16 or int8_g32, got {other:?}"),
+    }
+}
 
 #[derive(Clone, Copy)]
 struct RealReplayLane {
@@ -1083,6 +1099,7 @@ fn real_replay_epoch(
     lane: RealReplayLane,
     documents: &FileBackedF16Tensor,
     queries: &FileBackedF16Tensor,
+    matrix_dtype: MatrixDtype,
 ) -> MultiVectorEpoch {
     let mut epoch = MultiVectorEpoch {
         id: MultiVectorEpochId::new([0; 32]),
@@ -1112,7 +1129,7 @@ fn real_replay_epoch(
             .expect("document row maximum must fit u32"),
         output_normalization: NormalizationRecipe::L2,
         exact_scoring_transform: VectorTransformRecipe::Identity,
-        matrix_dtype: MatrixDtype::F16,
+        matrix_dtype,
         exact_scorer: ExactScorerVersion::MaxSimV1,
     };
     epoch.id = epoch
@@ -1286,13 +1303,19 @@ async fn measure_real_replay(
 
 fn print_real_replay_measurement(
     lane: RealReplayLane,
+    matrix_dtype: MatrixDtype,
     mmli: &MmliConfig,
     measurement: &RealReplayMeasurement,
     compaction_millis: u128,
 ) {
+    let dtype_label = match matrix_dtype {
+        MatrixDtype::F16 => "f16".to_string(),
+        MatrixDtype::Int8SymV1 { group_size } => format!("int8_g{group_size}"),
+    };
     let recall = measurement.hits as f64 / measurement.gold_count as f64;
     println!(
-        "phase9_real_matrix_recall lane={} kind=flat_sq8 hits={}/{} recall={recall:.6} \
+        "phase9_real_matrix_recall lane={} kind=flat_sq8 dtype={dtype_label} hits={}/{} \
+         recall={recall:.6} \
          gate={:.6} passed={} candidate_k={} min_hits={} below_8={} below_5={} \
          mean_planned_bytes={} mean_planned_requests={} p50_ms={} p95_ms={} \
          compaction_ms={compaction_millis}",
@@ -1350,7 +1373,17 @@ async fn late_segment_recall_matches_real_lab_matrices() {
         .expect("config-E exact gold must match the pinned tensor sidecars");
     let query_texts = real_replay_query_texts(lane);
     let (fragments, document_hashes) = real_replay_documents(lane, &documents);
-    let epoch = real_replay_epoch(lane, &documents, &queries);
+    let matrix_dtype = real_replay_dtype();
+    let epoch = real_replay_epoch(lane, &documents, &queries, matrix_dtype);
+    let int8_qualification = match matrix_dtype {
+        MatrixDtype::F16 => None,
+        MatrixDtype::Int8SymV1 { .. } => Some(Int8QualificationStamp {
+            semantic_epoch: epoch.id,
+            dtype: matrix_dtype,
+            evidence_digest: checksum_from_hex(INT8_TEXT_EVIDENCE_SHA256),
+            evidence_version: INT8_QUALIFICATION_STAMP_VERSION,
+        }),
+    };
 
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace(&format!("real-matrix-{}", lane.name));
@@ -1379,6 +1412,7 @@ async fn late_segment_recall_matches_real_lab_matrices() {
         candidate_transform,
         lane.candidate_pooling,
         &format!("phase-9-real-matrix-{}", lane.name),
+        int8_qualification,
     )
     .await;
     let transform_checksum_matches =
@@ -1431,7 +1465,7 @@ async fn late_segment_recall_matches_real_lab_matrices() {
         &gold,
     )
     .await;
-    print_real_replay_measurement(lane, &mmli, &measurement, compaction_millis);
+    print_real_replay_measurement(lane, matrix_dtype, &mmli, &measurement, compaction_millis);
 
     harness.cleanup_artifact_origin_namespace(&namespace).await;
     let recall = measurement.hits as f64 / measurement.gold_count as f64;
@@ -1451,27 +1485,71 @@ async fn late_segment_recall_matches_real_lab_matrices() {
         lane.name,
         lane.recall_gate
     );
-    if let Some(expected_hits) = lane.expected_hits {
-        assert_eq!(
-            measurement.hits, expected_hits,
-            "{} parity tripwire: measured hits changed without a recorded \
-             encoder, transform, or quantizer revision (D9.5)",
-            lane.name
-        );
+    // The parity and tail tripwires are pinned for the f16 operating point;
+    // an INT8 confirm run reports its own numbers against the gate only.
+    if matrix_dtype == MatrixDtype::F16 {
+        if let Some(expected_hits) = lane.expected_hits {
+            assert_eq!(
+                measurement.hits, expected_hits,
+                "{} parity tripwire: measured hits changed without a recorded \
+                 encoder, transform, or quantizer revision (D9.5)",
+                lane.name
+            );
+        }
+        if let Some(max_below_8) = lane.max_queries_below_8 {
+            assert!(
+                measurement.queries_below(8) <= max_below_8,
+                "{} tail tripwire: {} queries below 8/10 exceeds pinned {} (D9.5)",
+                lane.name,
+                measurement.queries_below(8),
+                max_below_8
+            );
+            assert_eq!(
+                measurement.queries_below(5),
+                0,
+                "{} tail tripwire: no query may fall below 5/10 golds (D9.5)",
+                lane.name
+            );
+        }
     }
-    if let Some(max_below_8) = lane.max_queries_below_8 {
-        assert!(
-            measurement.queries_below(8) <= max_below_8,
-            "{} tail tripwire: {} queries below 8/10 exceeds pinned {} (D9.5)",
-            lane.name,
-            measurement.queries_below(8),
-            max_below_8
-        );
-        assert_eq!(
-            measurement.queries_below(5),
-            0,
-            "{} tail tripwire: no query may fall below 5/10 golds (D9.5)",
-            lane.name
-        );
-    }
+}
+
+/// One-time mint helper: prints the canonical INT8 g32 epoch identity for a
+/// replay lane so the operator-approved tuple in `embedding::types` can bind
+/// it. Requires only the pinned tensors, not MinIO.
+#[tokio::test]
+#[ignore = "mint helper; requires the pinned Phase 2 tensors"]
+async fn print_real_replay_int8_epoch_identity() {
+    let tensor_directory = PathBuf::from(
+        std::env::var_os("MMLI_REAL_MATRIX_DIR")
+            .expect("MMLI_REAL_MATRIX_DIR must name the pinned tensor directory"),
+    );
+    let lane = real_replay_lane(
+        &std::env::var("MMLI_REAL_MATRIX_LANE")
+            .expect("MMLI_REAL_MATRIX_LANE must be text or visual"),
+    );
+    let documents = FileBackedF16Tensor::load_verified(
+        tensor_directory.join(format!("{}-documents.f16", lane.name)),
+        tensor_directory.join(format!("{}-documents.json", lane.name)),
+        lane.documents_sha256,
+    )
+    .expect("pinned document tensor must validate");
+    let queries = FileBackedF16Tensor::load_verified(
+        tensor_directory.join(format!("{}-queries.f16", lane.name)),
+        tensor_directory.join(format!("{}-queries.json", lane.name)),
+        lane.queries_sha256,
+    )
+    .expect("pinned query tensor must validate");
+    let epoch = real_replay_epoch(
+        lane,
+        &documents,
+        &queries,
+        MatrixDtype::Int8SymV1 { group_size: 32 },
+    );
+    println!(
+        "int8_epoch_identity lane={} epoch_id={} evidence_sha256={}",
+        lane.name,
+        epoch.id.to_hex(),
+        INT8_TEXT_EVIDENCE_SHA256,
+    );
 }

@@ -14,7 +14,9 @@ use rand::Rng;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::embedding::artifact::{decode_matrix_payload, encode_matrix_payload};
+use crate::embedding::artifact::{
+    decode_matrix_payload, encode_matrix_payload, matrix_row_payloads,
+};
 use crate::embedding::coordinator::apply_candidate_document_pooling;
 use crate::embedding::transform::{apply_vector_transform, load_vector_transform_mean};
 use crate::embedding::{
@@ -69,11 +71,12 @@ struct VersionIdentity {
 #[derive(Clone)]
 struct DerivedRow {
     exact_matrix: crate::embedding::MultiVectorEmbedding,
+    exact_payload: Bytes,
     raw_fde: Vec<f32>,
 }
 
 enum LiveRow {
-    Baseline(LateSegmentBuildRow),
+    Baseline(Box<LateSegmentBuildRow>),
     Input {
         input_index: usize,
         row_ordinal: usize,
@@ -661,6 +664,7 @@ async fn load_old_segment_rows(
                     unit_ordinal: candidate.unit_ordinal,
                     attributes: attributes_row.attributes,
                     exact_matrix: matrix.embedding,
+                    exact_payload: matrix.payload,
                     raw_fde: candidate.fde,
                 });
             }
@@ -758,6 +762,7 @@ async fn load_old_segment_rows(
                     unit_ordinal: row.unit_ordinal,
                     attributes: attributes_row.attributes,
                     exact_matrix: matrix.embedding,
+                    exact_payload: matrix.payload,
                     raw_fde,
                 });
             }
@@ -861,11 +866,13 @@ async fn load_overlay_rows(
             overlay.covered_versions.records.len(),
         )?;
         validate_overlay_artifact_metadata(overlay, &matrix, &fde, &input.fragment)?;
-        for ((version, matrix_row), fde_row) in overlay
+        let matrix_payloads = matrix_row_payloads(&matrix_bytes, &matrix)?;
+        for (((version, matrix_row), matrix_payload), fde_row) in overlay
             .covered_versions
             .records
             .iter()
             .zip(matrix.rows())
+            .zip(matrix_payloads)
             .zip(fde.rows())
         {
             if matrix_row.content_hash() != version.content_hash
@@ -881,6 +888,7 @@ async fn load_overlay_rows(
                     identity,
                     DerivedRow {
                         exact_matrix: matrix_row.embedding().clone(),
+                        exact_payload: matrix_payload,
                         raw_fde: fde_row.values().to_vec(),
                     },
                 )
@@ -1086,7 +1094,7 @@ fn replay_late_rows(
 ) -> Result<Vec<LateSegmentBuildRow>> {
     let mut live = baseline
         .into_iter()
-        .map(|row| (row.id.clone(), LiveRow::Baseline(row)))
+        .map(|row| (row.id.clone(), LiveRow::Baseline(Box::new(row))))
         .collect::<BTreeMap<_, _>>();
     for (input_index, input) in inputs.iter().enumerate() {
         for (row_ordinal, record) in input.fragment.upserts.iter().enumerate() {
@@ -1106,7 +1114,7 @@ fn replay_late_rows(
     let mut rows = Vec::with_capacity(live.len());
     for (_, source) in live {
         match source {
-            LiveRow::Baseline(row) => rows.push(row),
+            LiveRow::Baseline(row) => rows.push(*row),
             LiveRow::Input {
                 input_index,
                 row_ordinal,
@@ -1134,6 +1142,7 @@ fn replay_late_rows(
                     unit_ordinal: record.unit_ordinal,
                     attributes: record.attributes.clone(),
                     exact_matrix: output.exact_matrix.clone(),
+                    exact_payload: output.exact_payload.clone(),
                     raw_fde: output.raw_fde.clone(),
                 });
             }
@@ -1318,9 +1327,9 @@ mod tests {
     use crate::namespace::{NamespaceId, NamespaceIncarnationId};
 
     use super::{
-        input_version_identity, replay_late_rows, resolve_section_origin, same_input_descriptor,
-        BTreeMap, BTreeSet, DerivedRow, EncoderInputWalFragment, InputFragmentRef,
-        LateSegmentBuildRow, LateStateSection, SnapshottedInput,
+        encode_matrix_payload, input_version_identity, replay_late_rows, resolve_section_origin,
+        same_input_descriptor, BTreeMap, BTreeSet, DerivedRow, EncoderInputWalFragment,
+        InputFragmentRef, LateSegmentBuildRow, LateStateSection, MatrixDtype, SnapshottedInput,
     };
 
     fn input_ref(sequence_number: u64) -> InputFragmentRef {
@@ -1405,6 +1414,8 @@ mod tests {
             identity,
             DerivedRow {
                 exact_matrix: exact_matrix.clone(),
+                exact_payload: encode_matrix_payload(MatrixDtype::F16, 2, &exact_matrix)
+                    .expect("test payload"),
                 raw_fde: vec![0.25, 0.5],
             },
         )]);
@@ -1482,6 +1493,7 @@ mod tests {
     }
 
     fn baseline_row(id: &str, sequence: u64) -> LateSegmentBuildRow {
+        let exact_matrix = matrix(sequence as f32);
         LateSegmentBuildRow {
             id: id.to_string(),
             content_hash: ContentHash::new([sequence as u8; 32]),
@@ -1489,7 +1501,9 @@ mod tests {
             parent_id: None,
             unit_ordinal: None,
             attributes: None,
-            exact_matrix: matrix(sequence as f32),
+            exact_payload: encode_matrix_payload(MatrixDtype::F16, 2, &exact_matrix)
+                .expect("test payload"),
+            exact_matrix,
             raw_fde: vec![sequence as f32, 0.0],
         }
     }

@@ -7,8 +7,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
 use crate::embedding::artifact::{
-    decode_matrix_payload, encode_matrix_payload, matrix_bytes_per_vector,
-    matrix_dtype_from_header, matrix_dtype_header,
+    decode_matrix_payload, matrix_bytes_per_vector, matrix_dtype_from_header, matrix_dtype_header,
 };
 use crate::embedding::{
     ArtifactChecksum, ContentHash, FdeGenerationId, MatrixDtype, MultiVectorEmbedding,
@@ -74,6 +73,37 @@ pub(crate) struct MatrixBlockInputRow {
     pub(crate) ordinal: u32,
     pub(crate) content_hash: ContentHash,
     pub(crate) embedding: MultiVectorEmbedding,
+    /// Stored payload bytes carried verbatim from the source artifact.
+    /// Truth payloads are encoded exactly once, at enrichment; re-encoding
+    /// decoded rows is not byte-idempotent for `int8_sym_v1`.
+    pub(crate) payload: Bytes,
+}
+
+#[cfg(test)]
+impl MatrixBlockInputRow {
+    /// Test-only constructor performing the one-time payload encode that
+    /// production performs at enrichment.
+    pub(crate) fn encoded(
+        id: VectorId,
+        ordinal: u32,
+        content_hash: ContentHash,
+        dtype: MatrixDtype,
+        embedding: MultiVectorEmbedding,
+    ) -> Self {
+        let payload = crate::embedding::artifact::encode_matrix_payload(
+            dtype,
+            embedding.vector_dimension(),
+            &embedding,
+        )
+        .expect("test matrix payload must encode");
+        Self {
+            id,
+            ordinal,
+            content_hash,
+            embedding,
+            payload,
+        }
+    }
 }
 
 pub(crate) struct BuiltMatrixBlock {
@@ -100,6 +130,8 @@ pub(crate) struct DecodedMatrixBlockRow {
     pub(crate) vector_offset: u64,
     pub(crate) locator: MatrixBlockLocator,
     pub(crate) embedding: MultiVectorEmbedding,
+    /// Exact stored payload bytes, carried verbatim into rebuilds.
+    pub(crate) payload: Bytes,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -157,7 +189,18 @@ pub(crate) fn build_matrix_blocks(
         }
         let vector_count = u32::try_from(row.embedding.vector_count())
             .map_err(|_| invalid_block("matrix row vector count exceeds u32"))?;
-        let payload = encode_matrix_payload(dtype, vector_dimension, &row.embedding)?;
+        let expected_payload_bytes = row
+            .embedding
+            .vector_count()
+            .checked_mul(matrix_bytes_per_vector(dtype, vector_dimension)?)
+            .ok_or_else(|| invalid_block("matrix row payload byte count overflows"))?;
+        if row.payload.len() != expected_payload_bytes {
+            return Err(invalid_block(format!(
+                "matrix row payload length {} disagrees with dtype and shape ({expected_payload_bytes} expected)",
+                row.payload.len()
+            )));
+        }
+        let payload = row.payload;
         prepared.push(PreparedRow {
             id: row.id,
             ordinal: row.ordinal,
@@ -523,6 +566,7 @@ pub(crate) fn decode_matrix_block(
             vector_offset,
             locator,
             embedding,
+            payload: Bytes::copy_from_slice(payload),
         });
         expected_vector_offset = expected_vector_offset
             .checked_add(u64::from(vector_count))
@@ -616,20 +660,21 @@ mod tests {
     #[test]
     fn record_major_matrix_block_round_trips_with_direct_locators() {
         let rows = vec![
-            MatrixBlockInputRow {
-                id: "first".to_string(),
-                ordinal: 4,
-                content_hash: ContentHash::new([1; 32]),
-                embedding: MultiVectorEmbedding::new(vec![0.5, -0.5, 1.0, 0.0], 2, 2, 4)
+            MatrixBlockInputRow::encoded(
+                "first".to_string(),
+                4,
+                ContentHash::new([1; 32]),
+                MatrixDtype::F16,
+                MultiVectorEmbedding::new(vec![0.5, -0.5, 1.0, 0.0], 2, 2, 4)
                     .expect("first matrix"),
-            },
-            MatrixBlockInputRow {
-                id: "second".to_string(),
-                ordinal: 9,
-                content_hash: ContentHash::new([2; 32]),
-                embedding: MultiVectorEmbedding::new(vec![0.25, 0.75], 1, 2, 4)
-                    .expect("second matrix"),
-            },
+            ),
+            MatrixBlockInputRow::encoded(
+                "second".to_string(),
+                9,
+                ContentHash::new([2; 32]),
+                MatrixDtype::F16,
+                MultiVectorEmbedding::new(vec![0.25, 0.75], 1, 2, 4).expect("second matrix"),
+            ),
         ];
         let blocks = build_matrix_blocks(
             "namespace",
@@ -675,5 +720,86 @@ mod tests {
             .expect("direct range decode");
             assert_eq!(ranged, row.embedding);
         }
+    }
+
+    #[test]
+    fn int8_matrix_blocks_rebuild_byte_identically_from_carried_payloads() {
+        let dtype = MatrixDtype::Int8SymV1 { group_size: 32 };
+        // Search a deterministic family of unit rows for one whose stored
+        // payload does NOT survive a decode→re-encode round trip: int8_sym_v1
+        // re-quantization is data-dependently non-idempotent, which is the
+        // reason builds carry payload bytes.
+        let make_row = |seed: u32| {
+            let raw: Vec<f32> = (0..128_usize)
+                .map(|index| {
+                    let angle = (index as f32).mul_add(0.7, seed as f32 * 1.3);
+                    let magnitude = 0.001 + 0.01 * (((index * 7 + seed as usize) % 13) as f32);
+                    angle.sin() * magnitude
+                })
+                .collect();
+            let norm = raw.iter().map(|value| value * value).sum::<f32>().sqrt();
+            let values: Vec<f32> = raw.into_iter().map(|value| value / norm).collect();
+            MultiVectorEmbedding::new(values, 1, 128, 4).expect("int8 matrix")
+        };
+        let mut chosen = None;
+        for seed in 0..512_u32 {
+            let embedding = make_row(seed);
+            let payload = crate::embedding::artifact::encode_matrix_payload(dtype, 128, &embedding)
+                .expect("int8 payload");
+            let decoded =
+                crate::embedding::artifact::decode_matrix_payload(&payload, dtype, 128, 1, 4)
+                    .expect("int8 decode");
+            let re_encoded =
+                crate::embedding::artifact::encode_matrix_payload(dtype, 128, &decoded)
+                    .expect("re-encoded payload");
+            if re_encoded != payload {
+                chosen = Some(embedding);
+                break;
+            }
+        }
+        let embedding =
+            chosen.expect("int8_sym_v1 re-quantization must diverge for some deterministic row");
+        let row = super::MatrixBlockInputRow::encoded(
+            "unit".to_string(),
+            0,
+            ContentHash::new([5; 32]),
+            dtype,
+            embedding,
+        );
+        let build = |rows: Vec<super::MatrixBlockInputRow>| {
+            build_matrix_blocks(
+                "namespace",
+                "segment",
+                dtype,
+                MultiVectorEpochId::new([3; 32]),
+                FdeGenerationId::new([4; 32]),
+                128,
+                64 * 1024,
+                rows,
+            )
+            .expect("int8 matrix blocks")
+        };
+        let first = build(vec![row.clone()]);
+        let decoded = decode_matrix_block(&first[0].bytes, &first[0].reference, 4, 4)
+            .expect("decoded int8 block");
+
+        // The decoded row's re-encoding differs from the stored payload —
+        // int8_sym_v1 re-quantization is not byte-idempotent, which is why
+        // builds must carry payload bytes instead of re-encoding.
+        let re_encoded =
+            crate::embedding::artifact::encode_matrix_payload(dtype, 128, &decoded[0].embedding)
+                .expect("re-encoded payload");
+        assert_ne!(re_encoded, decoded[0].payload);
+
+        // Rebuilding from the carried payload reproduces the block exactly.
+        let rebuilt = build(vec![super::MatrixBlockInputRow {
+            id: decoded[0].id.clone(),
+            ordinal: decoded[0].ordinal,
+            content_hash: decoded[0].content_hash,
+            embedding: decoded[0].embedding.clone(),
+            payload: decoded[0].payload.clone(),
+        }]);
+        assert_eq!(rebuilt[0].bytes, first[0].bytes);
+        assert_eq!(rebuilt[0].reference, first[0].reference);
     }
 }

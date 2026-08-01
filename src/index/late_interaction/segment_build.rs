@@ -64,6 +64,9 @@ pub(crate) struct LateSegmentBuildRow {
     pub(crate) attributes: Option<HashMap<String, AttributeValue>>,
     /// Exact multi-vector document matrix.
     pub(crate) exact_matrix: MultiVectorEmbedding,
+    /// Stored matrix payload bytes at the epoch dtype, carried verbatim.
+    /// Encoded exactly once at enrichment — never re-encoded by builds.
+    pub(crate) exact_payload: Bytes,
     /// Raw uncompressed document FDE.
     pub(crate) raw_fde: Vec<f32>,
 }
@@ -157,6 +160,7 @@ pub(crate) fn build_late_interaction_segment(
                 ordinal: block_ordinal(row.unit_ordinal),
                 content_hash: row.content_hash,
                 embedding: row.exact_matrix.clone(),
+                payload: row.exact_payload.clone(),
             })
             .collect(),
     )?;
@@ -631,6 +635,13 @@ mod tests {
                 "name".to_string(),
                 AttributeValue::String(id.to_string()),
             )])),
+            exact_payload: crate::embedding::artifact::encode_matrix_payload(
+                MatrixDtype::F16,
+                3,
+                &MultiVectorEmbedding::new(vec![base, 0.0, 0.0, base, base, base], 2, 3, 4)
+                    .expect("matrix"),
+            )
+            .expect("test payload"),
             exact_matrix: MultiVectorEmbedding::new(
                 vec![base, 0.0, 0.0, base, base, base],
                 2,

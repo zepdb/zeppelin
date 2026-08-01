@@ -407,18 +407,19 @@ async fn run_benchmark() -> BenchResult<()> {
     let matrix_rows = (0..DOCUMENT_COUNT)
         .map(|index| {
             let matrix = documents.matrix(index)?;
-            Ok(MatrixBlockInputRow {
-                id: production_document_id(index),
-                ordinal: index as u32,
-                content_hash: document_content_hash(index),
-                embedding: MultiVectorEmbedding::new(
+            Ok(MatrixBlockInputRow::encoded(
+                production_document_id(index),
+                index as u32,
+                document_content_hash(index),
+                MatrixDtype::F16,
+                MultiVectorEmbedding::new(
                     matrix.values().to_vec(),
                     matrix.vector_count(),
                     DIMENSION,
                     matrix.vector_count(),
                 )
                 .map_err(|error| error.to_string())?,
-            })
+            ))
         })
         .collect::<BenchResult<Vec<_>>>()?;
     let matrix_blocks = build_matrix_blocks(

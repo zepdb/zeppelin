@@ -431,9 +431,26 @@ pub const INT8_QUALIFICATION_STAMP_VERSION: u32 = 1;
 
 /// Exact INT8 qualification evidence approved for this release.
 ///
-/// Keep this empty until an operator accepts production writer/decoder
-/// evidence for a specific semantic epoch and matrix dtype.
-const APPROVED_INT8_QUALIFICATIONS: &[(MultiVectorEpochId, MatrixDtype, ArtifactChecksum)] = &[];
+/// One tuple per operator-signed lane. The sole approved tuple binds the
+/// TEXT-lane replay epoch at `int8_sym_v1 { group_size: 32 }` (Anup,
+/// 2026-07-31: text met the ≥99.5% production same-top-1 bar; visual stays
+/// held at 99.25%). The evidence digest is the SHA-256 of the durable
+/// production writer/decoder measurement,
+/// `tasks/MMLI-2/results/int8-production-qualification.json`.
+const APPROVED_INT8_QUALIFICATIONS: &[(MultiVectorEpochId, MatrixDtype, ArtifactChecksum)] = &[(
+    // Text replay epoch 04643f3cac3e8a07eab78b5b8496c79701613e0dcb3f3ad9470c97b8cbf08749
+    MultiVectorEpochId::new([
+        4, 100, 63, 60, 172, 62, 138, 7, 234, 183, 139, 91, 132, 150, 199, 151, 1, 97, 62, 13, 203,
+        63, 58, 217, 71, 12, 151, 184, 203, 240, 135, 73,
+    ]),
+    MatrixDtype::Int8SymV1 { group_size: 32 },
+    // sha256(int8-production-qualification.json) =
+    // e91ef65c9c26a772a7a98e05985ceb7f310a094541d853559fc3aaee0a88794b
+    ArtifactChecksum::new([
+        233, 30, 246, 92, 156, 38, 167, 114, 167, 169, 142, 5, 152, 92, 235, 127, 49, 10, 9, 69,
+        65, 216, 83, 85, 159, 195, 170, 238, 10, 136, 121, 75,
+    ]),
+)];
 
 /// Operator-minted evidence binding one qualified INT8 profile epoch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -702,12 +719,24 @@ impl MultiVectorEpoch {
         }
         self.matrix_dtype
             .validate_for_dimension(self.vector_dimension)?;
-        if matches!(self.matrix_dtype, MatrixDtype::Int8SymV1 { .. })
-            && self.output_normalization != NormalizationRecipe::L2
-        {
-            return Err(ZeppelinError::Validation(
-                "int8_sym_v1 requires encoder L2-normalized rows".to_string(),
-            ));
+        if matches!(self.matrix_dtype, MatrixDtype::Int8SymV1 { .. }) {
+            if self.output_normalization != NormalizationRecipe::L2 {
+                return Err(ZeppelinError::Validation(
+                    "int8_sym_v1 requires encoder L2-normalized rows".to_string(),
+                ));
+            }
+            // FDE derivation and flat-segment rebuilds read INT8 epochs back
+            // through the stored matrix bytes, which must therefore be the
+            // encoder output at the persisted boundary — no exact-side
+            // centering (tasks/MMLI-2/results/int8-flat-rebuild-design.md).
+            if !matches!(
+                self.exact_scoring_transform,
+                VectorTransformRecipe::Identity
+            ) {
+                return Err(ZeppelinError::Validation(
+                    "int8_sym_v1 requires the identity exact-scoring transform".to_string(),
+                ));
+            }
         }
         let expected = self.canonical_id()?;
         if self.id != expected {
@@ -1330,5 +1359,47 @@ mod tests {
             .validate_for_modalities(&[InputModality::Text])
             .expect_err("mismatched int8 stamp");
         assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn approved_int8_qualifications_pin_only_the_text_lane_g32_tuple() {
+        assert_eq!(super::APPROVED_INT8_QUALIFICATIONS.len(), 1);
+        let (epoch, dtype, evidence) = &super::APPROVED_INT8_QUALIFICATIONS[0];
+        assert_eq!(
+            epoch.to_hex(),
+            "04643f3cac3e8a07eab78b5b8496c79701613e0dcb3f3ad9470c97b8cbf08749"
+        );
+        assert_eq!(*dtype, MatrixDtype::Int8SymV1 { group_size: 32 });
+        assert_eq!(
+            evidence.to_hex(),
+            "e91ef65c9c26a772a7a98e05985ceb7f310a094541d853559fc3aaee0a88794b"
+        );
+    }
+
+    #[test]
+    fn int8_epoch_requires_the_identity_exact_scoring_transform() {
+        let mut epoch = config_e_epoch(BTreeMap::from([(
+            "model".to_string(),
+            ArtifactChecksum::new([1; 32]),
+        )]));
+        epoch.matrix_dtype = MatrixDtype::Int8SymV1 { group_size: 32 };
+        epoch.exact_scoring_transform = VectorTransformRecipe::SubtractMean {
+            mean: MeanVectorRef {
+                key: "ns/late/means/deadbeef".to_string(),
+                checksum: ArtifactChecksum::new([7; 32]),
+                size_bytes: 520,
+                vector_dimension: 128,
+                format_version: 1,
+                artifact_origin: None,
+            },
+            renormalize: false,
+        };
+        epoch.id = epoch.canonical_id().expect("centered int8 epoch hashes");
+        let error = epoch
+            .validate()
+            .expect_err("int8 epoch with exact-side centering");
+        assert!(error
+            .to_string()
+            .contains("identity exact-scoring transform"));
     }
 }
