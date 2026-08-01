@@ -12,6 +12,8 @@ mod matrix;
 mod matrix_artifact;
 mod maxsim;
 #[cfg(test)]
+mod phase10_flat_pq_bench;
+#[cfg(test)]
 mod phase9_flat_sq8_bench;
 #[cfg(test)]
 mod phase9_routing_diagnostic;

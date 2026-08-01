@@ -62,27 +62,30 @@ use super::{
     MatrixBlockLocator, MultiVectorMatrixRef,
 };
 
-const DOCUMENT_DIGEST: &str = "1960f7bc88a667beb76b6e15a750469e615aafe9a925928c23f7c546d12cfe22";
-const QUERY_DIGEST: &str = "cefbff5713a3944f4007676b243985f393f87a7a7579bb5cba6ca09899b0aa0c";
-const TRANSFORM_DIGEST: &str = "00ad4edb4292ddd64c6df00c84c2f8dfced3a092d9ddc307239d9e070deb2ad4";
-const PRODUCTION_DOCUMENT_FDE_DIGEST: &str =
+pub(super) const DOCUMENT_DIGEST: &str =
+    "1960f7bc88a667beb76b6e15a750469e615aafe9a925928c23f7c546d12cfe22";
+pub(super) const QUERY_DIGEST: &str =
+    "cefbff5713a3944f4007676b243985f393f87a7a7579bb5cba6ca09899b0aa0c";
+pub(super) const TRANSFORM_DIGEST: &str =
+    "00ad4edb4292ddd64c6df00c84c2f8dfced3a092d9ddc307239d9e070deb2ad4";
+pub(super) const PRODUCTION_DOCUMENT_FDE_DIGEST: &str =
     "399264618538eabd2fdbe0e979d92ed5d552768a2ad5235b4c934acbb1b3dad1";
-const PRODUCTION_QUERY_FDE_DIGEST: &str =
+pub(super) const PRODUCTION_QUERY_FDE_DIGEST: &str =
     "c63a2756f5d74cf0079383d512fa1d0b9171c006d5a5dfcd9939d5870e28ab8e";
 const SQ8_CODE_DIGEST: &str = "08d3e1d29684689b18330e838acc92f10872c5ecd2cb89ba57a8c7fe8f247d98";
 const SQ8_CALIBRATION_DIGEST: &str =
     "ba1b608200e4568711dfa0cf16e978990fb1064ab4901bc816d4c10b907144ae";
-const FDE_SEED: u64 = 0x4d4d_4c49_0000_0002;
-const DIMENSION: usize = 128;
-const FDE_DIMENSION: usize = 10_240;
-const GOLD_PER_QUERY: usize = 10;
+pub(super) const FDE_SEED: u64 = 0x4d4d_4c49_0000_0002;
+pub(super) const DIMENSION: usize = 128;
+pub(super) const FDE_DIMENSION: usize = 10_240;
+pub(super) const GOLD_PER_QUERY: usize = 10;
 const CENTERING_SAMPLE_ROWS: usize = 5_000;
-const DOCUMENT_COUNT: usize = 5_183;
-const QUERY_COUNT: usize = 1_109;
-const CANDIDATE_K: usize = 1_000;
+pub(super) const DOCUMENT_COUNT: usize = 5_183;
+pub(super) const QUERY_COUNT: usize = 1_109;
+pub(super) const CANDIDATE_K: usize = 1_000;
 // Expected exact hits from the pinned frontier JSON (sq8_exhaustive points).
 const EXPECTED_HITS_K700: usize = 10_708;
-const EXPECTED_HITS_K1000: usize = 10_869;
+pub(super) const EXPECTED_HITS_K1000: usize = 10_869;
 const EXPECTED_HITS_K1500: usize = 10_993;
 const SEGMENT_ID: &str = "flat-sq8-bench";
 const FLAT_MAGIC: &[u8; 4] = b"ZFQ1";
@@ -94,7 +97,7 @@ const FILTERED_QUERY_COUNT: usize = 20;
 const COLD_HYDRATIONS: usize = 3;
 
 type BenchResult<T> = Result<T, String>;
-type ProductionFdes = (Vec<Vec<f32>>, Vec<Vec<f32>>, f64);
+pub(super) type ProductionFdes = (Vec<Vec<f32>>, Vec<Vec<f32>>, f64);
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -105,15 +108,15 @@ enum TensorDtype {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TensorSidecar {
+pub(super) struct TensorSidecar {
     rows: Vec<usize>,
     dim: usize,
     dtype: TensorDtype,
-    ids: Vec<String>,
+    pub(super) ids: Vec<String>,
 }
 
-struct TensorSet {
-    sidecar: TensorSidecar,
+pub(super) struct TensorSet {
+    pub(super) sidecar: TensorSidecar,
     values: Vec<f32>,
     scalar_offsets: Vec<usize>,
     total_rows: usize,
@@ -136,8 +139,8 @@ impl TensorSet {
 }
 
 #[derive(Clone, Copy)]
-struct GoldDocument {
-    document_index: usize,
+pub(super) struct GoldDocument {
+    pub(super) document_index: usize,
 }
 
 #[derive(Deserialize)]
@@ -1026,7 +1029,7 @@ fn counting_minio_store() -> BenchResult<(ZeppelinStore, Arc<AtomicU64>, Arc<Ato
 /// mean, push documents through the f16 persistence boundary, then encode.
 /// Replicates the routing diagnostic's `production_*` variant bit-for-bit
 /// (verified by the pinned FDE checksums).
-fn build_production_fdes(
+pub(super) fn build_production_fdes(
     documents: &TensorSet,
     queries: &TensorSet,
     transform: &FdeTransform,
@@ -1109,13 +1112,17 @@ fn build_production_fdes(
     Ok((document_fdes, query_fdes, encode_ms_mean))
 }
 
-fn required_path(name: &str) -> BenchResult<PathBuf> {
+pub(super) fn required_path(name: &str) -> BenchResult<PathBuf> {
     env::var_os(name)
         .map(PathBuf::from)
         .ok_or_else(|| format!("{name} must be set"))
 }
 
-fn load_tensor(raw_path: &Path, sidecar_path: &Path, expected: &str) -> BenchResult<TensorSet> {
+pub(super) fn load_tensor(
+    raw_path: &Path,
+    sidecar_path: &Path,
+    expected: &str,
+) -> BenchResult<TensorSet> {
     let sidecar_bytes = fs::read(sidecar_path)
         .map_err(|error| format!("cannot read {}: {error}", sidecar_path.display()))?;
     let sidecar: TensorSidecar = serde_json::from_slice(&sidecar_bytes)
@@ -1209,7 +1216,7 @@ fn hash_frame(hasher: &mut Sha256, label: &[u8], bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-fn load_gold(
+pub(super) fn load_gold(
     path: &Path,
     documents: &TensorSet,
     queries: &TensorSet,
@@ -1268,7 +1275,7 @@ fn production_document_id(index: usize) -> String {
     format!("mmli-replay-d-{index:020}")
 }
 
-fn checksum_vectors(vectors: &[Vec<f32>], dimension: usize) -> String {
+pub(super) fn checksum_vectors(vectors: &[Vec<f32>], dimension: usize) -> String {
     let mut hasher = Sha256::new();
     hasher.update((vectors.len() as u64).to_le_bytes());
     hasher.update((dimension as u64).to_le_bytes());
@@ -1331,7 +1338,7 @@ fn integer_summary_f64(values: &[f64]) -> IntegerSummary {
     integer_summary(&as_u64)
 }
 
-fn parallel_indexed_map<T, F>(count: usize, operation: F) -> BenchResult<Vec<T>>
+pub(super) fn parallel_indexed_map<T, F>(count: usize, operation: F) -> BenchResult<Vec<T>>
 where
     T: Send,
     F: Fn(usize) -> BenchResult<T> + Sync,
@@ -1389,7 +1396,7 @@ fn f16_to_f32(bits: u16) -> f32 {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write as _;
