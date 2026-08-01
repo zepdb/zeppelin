@@ -55,8 +55,8 @@ use super::candidate::{
 };
 use super::matrix_artifact::{build_matrix_blocks, MatrixBlockInputRow};
 use super::segment_search::{
-    build_truth_requests, compare_scored_rows, filter_matches, score_truth_wave,
-    SegmentSearchBounds, SegmentSearchRequest, TruthWaveTiming,
+    build_truth_requests, compare_scored_rows, execute_truth_wave_pipelined, filter_matches,
+    score_truth_wave, SegmentSearchBounds, SegmentSearchRequest, TruthWaveTiming,
 };
 use super::{
     FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection, InnerProjection,
@@ -228,6 +228,7 @@ struct BenchReport {
     read_gap_budget_bytes: usize,
     read_max_request_bytes: usize,
     read_max_concurrency: usize,
+    pipeline_enabled: bool,
     document_count: usize,
     query_count: usize,
     gold_memberships: usize,
@@ -237,6 +238,7 @@ struct BenchReport {
     recall_k1000: f64,
     per_query_hits_k1000: IntegerSummary,
     per_query_hits_k1000_values: Vec<u64>,
+    per_query_top10_ids: Vec<Vec<String>>,
     queries_below_8_of_10: usize,
     queries_below_5_of_10: usize,
     flat_artifact_bytes: u64,
@@ -397,6 +399,7 @@ async fn run_benchmark() -> BenchResult<()> {
     let tensor_dir = required_path("MMLI_REAL_MATRIX_DIR")?;
     let output = required_path("MMLI_FLAT_BENCH_OUTPUT")?;
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let pipeline_enabled = optional_one_flag("MMLI_FLAT_BENCH_PIPELINE")?;
     let query_count = optional_usize("MMLI_FLAT_BENCH_QUERY_LIMIT", QUERY_COUNT)?;
     if !(1..=QUERY_COUNT).contains(&query_count) {
         return Err(format!(
@@ -652,7 +655,7 @@ async fn run_benchmark() -> BenchResult<()> {
     eprintln!(
         "flat-bench: running {query_count} warm queries at K={CANDIDATE_K}, \
          gap_budget={read_gap_budget_bytes}, max_request={read_max_request_bytes}, \
-         concurrency={read_max_concurrency}"
+         concurrency={read_max_concurrency}, pipeline={pipeline_enabled}"
     );
     let bounds = SegmentSearchBounds {
         max_resident_bytes: 64 * 1024 * 1024,
@@ -669,6 +672,7 @@ async fn run_benchmark() -> BenchResult<()> {
     let mut hits_k1000 = 0usize;
     let mut hits_k1500 = 0usize;
     let mut per_query_hits = Vec::with_capacity(query_count);
+    let mut per_query_top10_ids = Vec::with_capacity(query_count);
     let mut warm_ms = Vec::with_capacity(query_count);
     let mut scan_ms = Vec::with_capacity(query_count);
     let mut truth_ms = Vec::with_capacity(query_count);
@@ -724,16 +728,53 @@ async fn run_benchmark() -> BenchResult<()> {
             .map_err(|error| error.to_string())?;
         let planned_request_count = plan.planned_request_count() as u64;
         let observed_before = get_requests.load(AtomicOrdering::Relaxed);
-        let fetch_started = Instant::now();
-        let truth_bytes = execute_read_plan(&store, &plan)
-            .await
-            .map_err(|error| error.to_string())?;
-        let fetch_elapsed = fetch_started.elapsed();
-        let logical_bytes = truth_bytes.iter().try_fold(0_u64, |total, bytes| {
-            total
-                .checked_add(bytes.len() as u64)
-                .ok_or_else(|| "truth logical byte count overflowed u64".to_string())
-        })?;
+        let request = SegmentSearchRequest {
+            store: &store,
+            bootstrap_cache: None,
+            segment: &segment,
+            exact_query: queries.matrix(query_index)?,
+            candidate_query_fde: &query_fdes[query_index],
+            mandatory_filter: None,
+            request_filter: None,
+            excluded_ids: &excluded_ids,
+            top_k: GOLD_PER_QUERY,
+            read_plan: &read_plan_config,
+            bounds,
+        };
+        let (mut rows, logical_bytes, fetch_elapsed, score_elapsed, timing) = if pipeline_enabled {
+            let piped = execute_truth_wave_pipelined(&request, candidates, &plan)
+                .await
+                .map_err(|error| error.to_string())?;
+            (
+                piped.rows,
+                piped.logical_bytes,
+                piped.fetch_elapsed,
+                piped.score_elapsed,
+                piped.timing,
+            )
+        } else {
+            let fetch_started = Instant::now();
+            let truth_bytes = execute_read_plan(&store, &plan)
+                .await
+                .map_err(|error| error.to_string())?;
+            let fetch_elapsed = fetch_started.elapsed();
+            let logical_bytes = truth_bytes.iter().try_fold(0_u64, |total, bytes| {
+                total
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| "truth logical byte count overflowed u64".to_string())
+            })?;
+            let mut timing = TruthWaveTiming::default();
+            let score_started = Instant::now();
+            let rows = score_truth_wave(&request, candidates, &truth_bytes, Some(&mut timing))
+                .map_err(|error| error.to_string())?;
+            (
+                rows,
+                logical_bytes,
+                fetch_elapsed,
+                score_started.elapsed(),
+                timing,
+            )
+        };
         // The flat frontier contains unique documents, so its matrix and
         // attribute ranges do not overlap and physical excess is gap waste.
         let gap_waste_bytes = plan
@@ -751,24 +792,6 @@ async fn run_benchmark() -> BenchResult<()> {
                 "query {query_index}: observed {observed_delta} GETs, planned {planned_request_count}"
             ));
         }
-        let request = SegmentSearchRequest {
-            store: &store,
-            bootstrap_cache: None,
-            segment: &segment,
-            exact_query: queries.matrix(query_index)?,
-            candidate_query_fde: &query_fdes[query_index],
-            mandatory_filter: None,
-            request_filter: None,
-            excluded_ids: &excluded_ids,
-            top_k: GOLD_PER_QUERY,
-            read_plan: &read_plan_config,
-            bounds,
-        };
-        let mut timing = TruthWaveTiming::default();
-        let score_started = Instant::now();
-        let mut rows = score_truth_wave(&request, candidates, &truth_bytes, Some(&mut timing))
-            .map_err(|error| error.to_string())?;
-        let score_elapsed = score_started.elapsed();
         rows.sort_by(compare_scored_rows);
         rows.truncate(GOLD_PER_QUERY);
         let truth_elapsed = truth_started.elapsed();
@@ -790,6 +813,7 @@ async fn run_benchmark() -> BenchResult<()> {
         }
         hits_k1000 += final_hits;
         per_query_hits.push(final_hits as u64);
+        per_query_top10_ids.push(rows.iter().map(|row| row.id.clone()).collect());
         warm_ms.push(query_elapsed.as_secs_f64() * 1_000.0);
         scan_ms.push(scan_elapsed.as_secs_f64() * 1_000.0);
         truth_ms.push(truth_elapsed.as_secs_f64() * 1_000.0);
@@ -861,15 +885,6 @@ async fn run_benchmark() -> BenchResult<()> {
             .map_err(|error| error.to_string())?;
         filtered_planned.push(plan.planned_request_count() as u64);
         let observed_before = get_requests.load(AtomicOrdering::Relaxed);
-        let truth_bytes = execute_read_plan(&store, &plan)
-            .await
-            .map_err(|error| error.to_string())?;
-        let observed_delta = get_requests.load(AtomicOrdering::Relaxed) - observed_before;
-        if observed_delta != plan.planned_request_count() as u64 {
-            return Err(format!(
-                "filtered query {query_index}: observed GETs diverge from the plan"
-            ));
-        }
         let request = SegmentSearchRequest {
             store: &store,
             bootstrap_cache: None,
@@ -883,8 +898,24 @@ async fn run_benchmark() -> BenchResult<()> {
             read_plan: &read_plan_config,
             bounds,
         };
-        let mut rows = score_truth_wave(&request, candidates, &truth_bytes, None)
-            .map_err(|error| error.to_string())?;
+        let mut rows = if pipeline_enabled {
+            execute_truth_wave_pipelined(&request, candidates, &plan)
+                .await
+                .map_err(|error| error.to_string())?
+                .rows
+        } else {
+            let truth_bytes = execute_read_plan(&store, &plan)
+                .await
+                .map_err(|error| error.to_string())?;
+            score_truth_wave(&request, candidates, &truth_bytes, None)
+                .map_err(|error| error.to_string())?
+        };
+        let observed_delta = get_requests.load(AtomicOrdering::Relaxed) - observed_before;
+        if observed_delta != plan.planned_request_count() as u64 {
+            return Err(format!(
+                "filtered query {query_index}: observed GETs diverge from the plan"
+            ));
+        }
         rows.sort_by(compare_scored_rows);
         rows.truncate(GOLD_PER_QUERY);
         for row in &rows {
@@ -902,12 +933,13 @@ async fn run_benchmark() -> BenchResult<()> {
     }
 
     let report = BenchReport {
-        schema_version: 2,
+        schema_version: 3,
         source_revision: "518aa23+flat-bench".to_string(),
         candidate_k: CANDIDATE_K,
         read_gap_budget_bytes,
         read_max_request_bytes,
         read_max_concurrency,
+        pipeline_enabled,
         document_count: DOCUMENT_COUNT,
         query_count,
         gold_memberships: query_count * GOLD_PER_QUERY,
@@ -917,6 +949,7 @@ async fn run_benchmark() -> BenchResult<()> {
         recall_k1000: hits_k1000 as f64 / (query_count * GOLD_PER_QUERY) as f64,
         per_query_hits_k1000: integer_summary(&per_query_hits),
         per_query_hits_k1000_values: per_query_hits.clone(),
+        per_query_top10_ids,
         queries_below_8_of_10: per_query_hits.iter().filter(|&&hits| hits < 8).count(),
         queries_below_5_of_10: per_query_hits.iter().filter(|&&hits| hits < 5).count(),
         flat_artifact_bytes,
@@ -1277,6 +1310,15 @@ fn optional_usize(name: &str, default: usize) -> BenchResult<usize> {
             .parse::<usize>()
             .map_err(|error| format!("invalid {name}={value:?}: {error}")),
         Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(format!("cannot read {name}: {error}")),
+    }
+}
+
+fn optional_one_flag(name: &str) -> BenchResult<bool> {
+    match env::var(name) {
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) => Err(format!("{name} must be 1 when set, got {value:?}")),
+        Err(env::VarError::NotPresent) => Ok(false),
         Err(error) => Err(format!("cannot read {name}: {error}")),
     }
 }

@@ -13,10 +13,15 @@ use std::ops::Range;
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use futures::StreamExt;
+
 use crate::cache::DiskCache;
-use crate::embedding::{ArtifactChecksum, ContentHash};
+use crate::embedding::{ArtifactChecksum, ContentHash, MatrixDtype};
 use crate::error::{Result, ZeppelinError};
 use crate::index::filter::evaluate_filter_on_optional_attributes;
+#[cfg(test)]
+use crate::storage::read_plan::execute_read_plan_streamed;
 use crate::storage::read_plan::{
     execute_read_plan, ReadPlan, ReadPlanConfig, ReadPlanError, ReadRequest,
 };
@@ -424,68 +429,270 @@ pub(crate) fn score_truth_wave(
         .map_err(|_| segment_error("segment vector dimension exceeds usize"))?;
     let mut rows = Vec::with_capacity(candidates.len());
     for (candidate_index, candidate) in candidates.into_iter().enumerate() {
-        #[cfg(test)]
-        let decode_started = Instant::now();
         let matrix_index = candidate_index
             .checked_mul(2)
             .ok_or_else(|| segment_error("truth matrix output index overflows"))?;
         let attribute_index = matrix_index
             .checked_add(1)
             .ok_or_else(|| segment_error("truth attribute output index overflows"))?;
-        let embedding = decode_matrix_row(
-            truth_bytes
-                .get(matrix_index)
-                .ok_or_else(|| segment_error("truth wave omitted a matrix payload"))?,
-            &candidate.matrix_locator,
+        let matrix_bytes = truth_bytes
+            .get(matrix_index)
+            .ok_or_else(|| segment_error("truth wave omitted a matrix payload"))?;
+        let attribute_bytes = truth_bytes
+            .get(attribute_index)
+            .ok_or_else(|| segment_error("truth wave omitted an attribute payload"))?;
+        #[cfg(not(test))]
+        let row = score_truth_candidate(
+            &request.exact_query,
             request.segment.matrix_dtype,
             vector_dimension,
-            request.bounds.max_vectors_per_document,
+            request.bounds,
+            request.mandatory_filter,
+            request.request_filter,
+            candidate,
+            matrix_bytes,
+            attribute_bytes,
         )?;
-        let attributes = decode_attribute_row(
-            truth_bytes
-                .get(attribute_index)
-                .ok_or_else(|| segment_error("truth wave omitted an attribute payload"))?,
-            &candidate.attr_locator,
-            request.bounds.max_attribute_payload_bytes,
+        #[cfg(test)]
+        let row = score_truth_candidate(
+            &request.exact_query,
+            request.segment.matrix_dtype,
+            vector_dimension,
+            request.bounds,
+            request.mandatory_filter,
+            request.request_filter,
+            candidate,
+            matrix_bytes,
+            attribute_bytes,
+            timing.as_deref_mut(),
         )?;
-        if attributes != candidate.metadata.attributes {
-            return Err(segment_error(
-                "wave-one filter attributes disagree with exact attributes",
-            ));
-        }
-        if !filter_matches(request.mandatory_filter, attributes.as_ref())
-            || !filter_matches(request.request_filter, attributes.as_ref())
-        {
-            return Err(segment_error(
-                "candidate failed the final exact attribute assertion",
-            ));
-        }
-        let document = embedding.matrix_ref()?;
-        #[cfg(test)]
-        if let Some(timing) = timing.as_deref_mut() {
-            timing.decode += decode_started.elapsed();
-        }
-        #[cfg(test)]
-        let maxsim_started = Instant::now();
-        let score = max_sim(&request.exact_query, &document)?;
-        #[cfg(test)]
-        if let Some(timing) = timing.as_deref_mut() {
-            timing.maxsim += maxsim_started.elapsed();
-        }
-        if !score.is_finite() {
-            return Err(segment_error("exact MaxSim score is not finite"));
-        }
-        rows.push(SegmentScoredRow {
-            id: candidate.id,
-            score,
-            content_hash: candidate.metadata.content_hash,
-            source_sequence: candidate.metadata.source_sequence,
-            parent_id: candidate.metadata.parent_id,
-            unit_ordinal: candidate.metadata.unit_ordinal,
-            attributes,
-        });
+        rows.push(row);
     }
     Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_truth_candidate(
+    exact_query: &MultiVectorMatrixRef<'_>,
+    matrix_dtype: MatrixDtype,
+    vector_dimension: usize,
+    bounds: SegmentSearchBounds,
+    mandatory_filter: Option<&Filter>,
+    request_filter: Option<&Filter>,
+    candidate: LateCandidate,
+    matrix_bytes: &bytes::Bytes,
+    attribute_bytes: &bytes::Bytes,
+    #[cfg(test)] timing: Option<&mut TruthWaveTiming>,
+) -> Result<SegmentScoredRow> {
+    #[cfg(test)]
+    let decode_started = Instant::now();
+    let embedding = decode_matrix_row(
+        matrix_bytes,
+        &candidate.matrix_locator,
+        matrix_dtype,
+        vector_dimension,
+        bounds.max_vectors_per_document,
+    )?;
+    let attributes = decode_attribute_row(
+        attribute_bytes,
+        &candidate.attr_locator,
+        bounds.max_attribute_payload_bytes,
+    )?;
+    if attributes != candidate.metadata.attributes {
+        return Err(segment_error(
+            "wave-one filter attributes disagree with exact attributes",
+        ));
+    }
+    if !filter_matches(mandatory_filter, attributes.as_ref())
+        || !filter_matches(request_filter, attributes.as_ref())
+    {
+        return Err(segment_error(
+            "candidate failed the final exact attribute assertion",
+        ));
+    }
+    let document = embedding.matrix_ref()?;
+    #[cfg(test)]
+    let mut timing = timing;
+    #[cfg(test)]
+    if let Some(timing) = timing.as_mut() {
+        timing.decode += decode_started.elapsed();
+    }
+    #[cfg(test)]
+    let maxsim_started = Instant::now();
+    let score = max_sim(exact_query, &document)?;
+    #[cfg(test)]
+    if let Some(timing) = timing.as_mut() {
+        timing.maxsim += maxsim_started.elapsed();
+    }
+    if !score.is_finite() {
+        return Err(segment_error("exact MaxSim score is not finite"));
+    }
+    Ok(SegmentScoredRow {
+        id: candidate.id,
+        score,
+        content_hash: candidate.metadata.content_hash,
+        source_sequence: candidate.metadata.source_sequence,
+        parent_id: candidate.metadata.parent_id,
+        unit_ordinal: candidate.metadata.unit_ordinal,
+        attributes,
+    })
+}
+
+#[cfg(test)]
+struct ReadyTruthCandidate {
+    candidate: LateCandidate,
+    matrix_bytes: bytes::Bytes,
+    attribute_bytes: bytes::Bytes,
+}
+
+/// Bench-only output from overlapping physical reads with one blocking scorer.
+#[cfg(test)]
+pub(crate) struct PipelinedTruthWave {
+    pub(crate) rows: Vec<SegmentScoredRow>,
+    pub(crate) logical_bytes: u64,
+    pub(crate) fetch_elapsed: Duration,
+    pub(crate) score_elapsed: Duration,
+    pub(crate) timing: TruthWaveTiming,
+}
+
+/// Bench-only truth driver that keeps fetching while one CPU worker scores.
+#[cfg(test)]
+pub(crate) async fn execute_truth_wave_pipelined(
+    request: &SegmentSearchRequest<'_>,
+    candidates: Vec<LateCandidate>,
+    plan: &ReadPlan,
+) -> Result<PipelinedTruthWave> {
+    let candidate_count = candidates.len();
+    let expected_logical = candidate_count
+        .checked_mul(2)
+        .ok_or_else(|| segment_error("truth output count overflows"))?;
+    if plan.logical_request_count() != expected_logical {
+        return Err(segment_error(
+            "truth read plan does not match the candidate payload count",
+        ));
+    }
+    let vector_dimension = usize::try_from(request.segment.vector_dimension)
+        .map_err(|_| segment_error("segment vector dimension exceeds usize"))?;
+    let query_values = request.exact_query.values().to_vec();
+    let query_vector_count = request.exact_query.vector_count();
+    let query_vector_dimension = request.exact_query.vector_dimension();
+    let matrix_dtype = request.segment.matrix_dtype;
+    let bounds = request.bounds;
+    let mandatory_filter = request.mandatory_filter.cloned();
+    let request_filter = request.request_filter.cloned();
+
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<ReadyTruthCandidate>();
+    let scoring_worker = tokio::task::spawn_blocking(move || {
+        let exact_query = MultiVectorMatrixRef::new(
+            &query_values,
+            query_vector_count,
+            query_vector_dimension,
+            query_vector_count,
+        )?;
+        let mut rows = Vec::with_capacity(candidate_count);
+        let mut score_elapsed = Duration::ZERO;
+        let mut timing = TruthWaveTiming::default();
+        let mut first_error = None;
+        while let Some(ready) = receiver.blocking_recv() {
+            if first_error.is_some() {
+                continue;
+            }
+            let score_started = Instant::now();
+            match score_truth_candidate(
+                &exact_query,
+                matrix_dtype,
+                vector_dimension,
+                bounds,
+                mandatory_filter.as_ref(),
+                request_filter.as_ref(),
+                ready.candidate,
+                &ready.matrix_bytes,
+                &ready.attribute_bytes,
+                Some(&mut timing),
+            ) {
+                Ok(row) => rows.push(row),
+                Err(error) => first_error = Some(error),
+            }
+            score_elapsed += score_started.elapsed();
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok((rows, score_elapsed, timing))
+    });
+
+    let mut candidates = candidates.into_iter().map(Some).collect::<Vec<_>>();
+    let mut payloads = (0..candidate_count)
+        .map(|_| [None, None])
+        .collect::<Vec<[Option<bytes::Bytes>; 2]>>();
+    let mut remaining = vec![2_u8; candidate_count];
+    let mut logical_bytes = 0_u64;
+    let fetch_started = Instant::now();
+    let completions = execute_read_plan_streamed(request.store, plan);
+    futures::pin_mut!(completions);
+    while let Some(completion) = completions.next().await {
+        let (planned_index, bytes) = completion.map_err(map_read_plan_error)?;
+        let logical = plan
+            .logical_slices_for(planned_index, &bytes)
+            .map_err(map_read_plan_error)?;
+        for (logical_index, bytes) in logical {
+            logical_bytes = logical_bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| segment_error("truth logical byte count overflows"))?;
+            let candidate_index = logical_index / 2;
+            let payload_index = logical_index % 2;
+            let candidate_payloads = payloads
+                .get_mut(candidate_index)
+                .ok_or_else(|| segment_error("truth logical index exceeds candidates"))?;
+            if candidate_payloads[payload_index].replace(bytes).is_some() {
+                return Err(segment_error("truth pipeline delivered a payload twice"));
+            }
+            let candidate_remaining = remaining
+                .get_mut(candidate_index)
+                .ok_or_else(|| segment_error("truth logical index exceeds candidates"))?;
+            *candidate_remaining = candidate_remaining
+                .checked_sub(1)
+                .ok_or_else(|| segment_error("truth candidate range count underflowed"))?;
+            if *candidate_remaining == 0 {
+                let matrix_bytes = candidate_payloads[0]
+                    .take()
+                    .ok_or_else(|| segment_error("truth pipeline omitted a matrix payload"))?;
+                let attribute_bytes = candidate_payloads[1]
+                    .take()
+                    .ok_or_else(|| segment_error("truth pipeline omitted an attribute payload"))?;
+                let candidate = candidates[candidate_index]
+                    .take()
+                    .ok_or_else(|| segment_error("truth pipeline scored a candidate twice"))?;
+                sender
+                    .send(ReadyTruthCandidate {
+                        candidate,
+                        matrix_bytes,
+                        attribute_bytes,
+                    })
+                    .map_err(|_| segment_error("truth scoring worker stopped early"))?;
+            }
+        }
+    }
+    let fetch_elapsed = fetch_started.elapsed();
+    if remaining.iter().any(|remaining| *remaining != 0) {
+        return Err(segment_error("truth pipeline omitted candidate payloads"));
+    }
+    drop(sender);
+    let (rows, score_elapsed, timing) = scoring_worker
+        .await
+        .map_err(|error| segment_error(format!("truth scoring worker failed: {error}")))??;
+    if rows.len() != candidate_count {
+        return Err(segment_error(
+            "truth scoring worker returned the wrong row count",
+        ));
+    }
+    Ok(PipelinedTruthWave {
+        rows,
+        logical_bytes,
+        fetch_elapsed,
+        score_elapsed,
+        timing,
+    })
 }
 
 /// Test-only CPU timing split for exact truth-wave scoring.
