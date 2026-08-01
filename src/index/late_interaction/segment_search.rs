@@ -10,6 +10,8 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
+#[cfg(test)]
+use std::time::{Duration, Instant};
 
 use crate::cache::DiskCache;
 use crate::embedding::{ArtifactChecksum, ContentHash};
@@ -237,7 +239,10 @@ pub(crate) async fn search_segment(
     let truth_bytes = execute_read_plan(request.store, &truth_plan)
         .await
         .map_err(map_read_plan_error)?;
+    #[cfg(not(test))]
     let mut rows = score_truth_wave(&request, candidates, &truth_bytes)?;
+    #[cfg(test)]
+    let mut rows = score_truth_wave(&request, candidates, &truth_bytes, None)?;
     rows.sort_by(compare_scored_rows);
     rows.truncate(request.top_k);
     Ok(SegmentSearchOutput {
@@ -404,6 +409,7 @@ pub(crate) fn score_truth_wave(
     request: &SegmentSearchRequest<'_>,
     candidates: Vec<LateCandidate>,
     truth_bytes: &[bytes::Bytes],
+    #[cfg(test)] mut timing: Option<&mut TruthWaveTiming>,
 ) -> Result<Vec<SegmentScoredRow>> {
     let expected = candidates
         .len()
@@ -418,6 +424,8 @@ pub(crate) fn score_truth_wave(
         .map_err(|_| segment_error("segment vector dimension exceeds usize"))?;
     let mut rows = Vec::with_capacity(candidates.len());
     for (candidate_index, candidate) in candidates.into_iter().enumerate() {
+        #[cfg(test)]
+        let decode_started = Instant::now();
         let matrix_index = candidate_index
             .checked_mul(2)
             .ok_or_else(|| segment_error("truth matrix output index overflows"))?;
@@ -453,7 +461,17 @@ pub(crate) fn score_truth_wave(
             ));
         }
         let document = embedding.matrix_ref()?;
+        #[cfg(test)]
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.decode += decode_started.elapsed();
+        }
+        #[cfg(test)]
+        let maxsim_started = Instant::now();
         let score = max_sim(&request.exact_query, &document)?;
+        #[cfg(test)]
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.maxsim += maxsim_started.elapsed();
+        }
         if !score.is_finite() {
             return Err(segment_error("exact MaxSim score is not finite"));
         }
@@ -468,6 +486,14 @@ pub(crate) fn score_truth_wave(
         });
     }
     Ok(rows)
+}
+
+/// Test-only CPU timing split for exact truth-wave scoring.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TruthWaveTiming {
+    pub(crate) decode: Duration,
+    pub(crate) maxsim: Duration,
 }
 
 fn trace_for(requests: &[ReadRequest], plan: &ReadPlan) -> SegmentWaveTrace {

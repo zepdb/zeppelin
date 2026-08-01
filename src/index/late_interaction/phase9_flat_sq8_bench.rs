@@ -20,6 +20,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
@@ -55,7 +56,7 @@ use super::candidate::{
 use super::matrix_artifact::{build_matrix_blocks, MatrixBlockInputRow};
 use super::segment_search::{
     build_truth_requests, compare_scored_rows, filter_matches, score_truth_wave,
-    SegmentSearchBounds, SegmentSearchRequest,
+    SegmentSearchBounds, SegmentSearchRequest, TruthWaveTiming,
 };
 use super::{
     FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection, InnerProjection,
@@ -202,6 +203,17 @@ struct IntegerSummary {
 }
 
 #[derive(Serialize)]
+struct FloatSummary {
+    min: f64,
+    p5: f64,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    max: f64,
+    mean: f64,
+}
+
+#[derive(Serialize)]
 struct ColdHydration {
     fetch_ms: f64,
     decode_ms: f64,
@@ -234,9 +246,17 @@ struct BenchReport {
     warm_query_ms: IntegerSummary,
     sq8_scan_ms: IntegerSummary,
     truth_wave_ms: IntegerSummary,
+    truth_fetch_ms: FloatSummary,
+    truth_score_ms: FloatSummary,
+    truth_decode_ms: FloatSummary,
+    truth_maxsim_ms: FloatSummary,
+    truth_get_latency_ms: FloatSummary,
     truth_logical_ranges: IntegerSummary,
     truth_planned_requests: IntegerSummary,
     truth_planned_bytes: IntegerSummary,
+    truth_request_waves: IntegerSummary,
+    truth_total_get_requests: u64,
+    truth_total_request_waves: u64,
     observed_get_requests_equal_planned: bool,
     query_fde_encode_ms_mean: f64,
     filtered_queries: usize,
@@ -250,14 +270,31 @@ struct BenchReport {
 
 /// Counts physical object-store operations issued beneath `ZeppelinStore`.
 ///
-/// Every read path in `object_store` 0.11 funnels through `get_opts`
-/// (`get`, `get_range`, and `get_ranges` are default methods over it), so one
-/// counter observes exactly the physical GET requests the planner executes.
+/// The planner's singleton `get_ranges` calls `get_range`, while whole-object
+/// reads call `get_opts`; overriding both observes every physical GET once.
 #[derive(Debug)]
 struct CountingStore {
     inner: Arc<dyn ObjectStore>,
     get_requests: Arc<AtomicU64>,
     put_requests: Arc<AtomicU64>,
+    get_latency_ms: Arc<Mutex<Vec<f64>>>,
+}
+
+type CountingStoreSetup = (
+    ZeppelinStore,
+    Arc<AtomicU64>,
+    Arc<AtomicU64>,
+    Arc<Mutex<Vec<f64>>>,
+);
+
+impl CountingStore {
+    fn record_get(&self, elapsed_ms: f64) {
+        self.get_requests.fetch_add(1, AtomicOrdering::Relaxed);
+        self.get_latency_ms
+            .lock()
+            .expect("GET latency lock")
+            .push(elapsed_ms);
+    }
 }
 
 impl std::fmt::Display for CountingStore {
@@ -292,8 +329,21 @@ impl ObjectStore for CountingStore {
         location: &ObjectPath,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        self.get_requests.fetch_add(1, AtomicOrdering::Relaxed);
-        self.inner.get_opts(location, options).await
+        let started = Instant::now();
+        let result = self.inner.get_opts(location, options).await;
+        self.record_get(started.elapsed().as_secs_f64() * 1_000.0);
+        result
+    }
+
+    async fn get_range(
+        &self,
+        location: &ObjectPath,
+        range: Range<usize>,
+    ) -> object_store::Result<Bytes> {
+        let started = Instant::now();
+        let result = self.inner.get_range(location, range).await;
+        self.record_get(started.elapsed().as_secs_f64() * 1_000.0);
+        result
     }
 
     async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
@@ -483,7 +533,7 @@ async fn run_benchmark() -> BenchResult<()> {
     drop(codes);
 
     eprintln!("flat-bench: uploading artifacts to MinIO");
-    let (store, get_requests, put_requests) = counting_minio_store()?;
+    let (store, get_requests, put_requests, get_latency_ms) = counting_minio_store()?;
     let mut uploaded_objects = 0usize;
     let mut uploaded_bytes = 0u64;
     for block in &matrix_blocks {
@@ -588,10 +638,20 @@ async fn run_benchmark() -> BenchResult<()> {
     let mut warm_ms = Vec::with_capacity(QUERY_COUNT);
     let mut scan_ms = Vec::with_capacity(QUERY_COUNT);
     let mut truth_ms = Vec::with_capacity(QUERY_COUNT);
+    let mut fetch_ms = Vec::with_capacity(QUERY_COUNT);
+    let mut score_ms = Vec::with_capacity(QUERY_COUNT);
+    let mut decode_ms = Vec::with_capacity(QUERY_COUNT);
+    let mut maxsim_ms = Vec::with_capacity(QUERY_COUNT);
     let mut truth_logical = Vec::with_capacity(QUERY_COUNT);
     let mut truth_planned_requests = Vec::with_capacity(QUERY_COUNT);
     let mut truth_planned_bytes = Vec::with_capacity(QUERY_COUNT);
+    let mut truth_request_waves = Vec::with_capacity(QUERY_COUNT);
     let observed_equals_planned = true;
+    {
+        let mut latencies = get_latency_ms.lock().expect("GET latency lock");
+        latencies.clear();
+        latencies.reserve(QUERY_COUNT * CANDIDATE_K);
+    }
 
     for query_index in 0..QUERY_COUNT {
         let query_started = Instant::now();
@@ -628,9 +688,11 @@ async fn run_benchmark() -> BenchResult<()> {
             .map_err(|error| error.to_string())?;
         let planned_request_count = plan.planned_request_count() as u64;
         let observed_before = get_requests.load(AtomicOrdering::Relaxed);
+        let fetch_started = Instant::now();
         let truth_bytes = execute_read_plan(&store, &plan)
             .await
             .map_err(|error| error.to_string())?;
+        let fetch_elapsed = fetch_started.elapsed();
         let observed_delta = get_requests.load(AtomicOrdering::Relaxed) - observed_before;
         if observed_delta != planned_request_count {
             return Err(format!(
@@ -650,8 +712,11 @@ async fn run_benchmark() -> BenchResult<()> {
             read_plan: &read_plan_config,
             bounds,
         };
-        let mut rows = score_truth_wave(&request, candidates, &truth_bytes)
+        let mut timing = TruthWaveTiming::default();
+        let score_started = Instant::now();
+        let mut rows = score_truth_wave(&request, candidates, &truth_bytes, Some(&mut timing))
             .map_err(|error| error.to_string())?;
+        let score_elapsed = score_started.elapsed();
         rows.sort_by(compare_scored_rows);
         rows.truncate(GOLD_PER_QUERY);
         let truth_elapsed = truth_started.elapsed();
@@ -676,9 +741,15 @@ async fn run_benchmark() -> BenchResult<()> {
         warm_ms.push(query_elapsed.as_secs_f64() * 1_000.0);
         scan_ms.push(scan_elapsed.as_secs_f64() * 1_000.0);
         truth_ms.push(truth_elapsed.as_secs_f64() * 1_000.0);
+        fetch_ms.push(fetch_elapsed.as_secs_f64() * 1_000.0);
+        score_ms.push(score_elapsed.as_secs_f64() * 1_000.0);
+        decode_ms.push(timing.decode.as_secs_f64() * 1_000.0);
+        maxsim_ms.push(timing.maxsim.as_secs_f64() * 1_000.0);
         truth_logical.push(truth_requests.len() as u64);
         truth_planned_requests.push(planned_request_count);
         truth_planned_bytes.push(plan.planned_bytes());
+        truth_request_waves
+            .push(planned_request_count.div_ceil(read_plan_config.max_concurrent_requests as u64));
         if (query_index + 1) % 200 == 0 {
             eprintln!(
                 "flat-bench: {} queries done, running recall {:.6}",
@@ -698,6 +769,15 @@ async fn run_benchmark() -> BenchResult<()> {
              K1500 {hits_k1500}/{EXPECTED_HITS_K1500}"
         ));
     }
+    let truth_get_latency_ms = get_latency_ms.lock().expect("GET latency lock").clone();
+    let truth_total_get_requests = truth_planned_requests.iter().sum::<u64>();
+    if truth_get_latency_ms.len() as u64 != truth_total_get_requests {
+        return Err(format!(
+            "recorded {} truth GET latencies for {truth_total_get_requests} requests",
+            truth_get_latency_ms.len()
+        ));
+    }
+    let truth_total_request_waves = truth_request_waves.iter().sum::<u64>();
 
     eprintln!("flat-bench: running {FILTERED_QUERY_COUNT} filtered queries");
     let filter = Filter::Eq {
@@ -747,7 +827,7 @@ async fn run_benchmark() -> BenchResult<()> {
             read_plan: &read_plan_config,
             bounds,
         };
-        let mut rows = score_truth_wave(&request, candidates, &truth_bytes)
+        let mut rows = score_truth_wave(&request, candidates, &truth_bytes, None)
             .map_err(|error| error.to_string())?;
         rows.sort_by(compare_scored_rows);
         rows.truncate(GOLD_PER_QUERY);
@@ -790,9 +870,17 @@ async fn run_benchmark() -> BenchResult<()> {
         warm_query_ms: integer_summary_f64(&warm_ms),
         sq8_scan_ms: integer_summary_f64(&scan_ms),
         truth_wave_ms: integer_summary_f64(&truth_ms),
+        truth_fetch_ms: float_summary(&fetch_ms),
+        truth_score_ms: float_summary(&score_ms),
+        truth_decode_ms: float_summary(&decode_ms),
+        truth_maxsim_ms: float_summary(&maxsim_ms),
+        truth_get_latency_ms: float_summary(&truth_get_latency_ms),
         truth_logical_ranges: integer_summary(&truth_logical),
         truth_planned_requests: integer_summary(&truth_planned_requests),
         truth_planned_bytes: integer_summary(&truth_planned_bytes),
+        truth_request_waves: integer_summary(&truth_request_waves),
+        truth_total_get_requests,
+        truth_total_request_waves,
         observed_get_requests_equal_planned: observed_equals_planned,
         query_fde_encode_ms_mean,
         filtered_queries: FILTERED_QUERY_COUNT,
@@ -987,7 +1075,7 @@ fn decode_flat_artifact(bytes: &[u8]) -> BenchResult<ResidentFlatIndex> {
     })
 }
 
-fn counting_minio_store() -> BenchResult<(ZeppelinStore, Arc<AtomicU64>, Arc<AtomicU64>)> {
+fn counting_minio_store() -> BenchResult<CountingStoreSetup> {
     use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
     use object_store::ClientOptions;
 
@@ -1013,15 +1101,18 @@ fn counting_minio_store() -> BenchResult<(ZeppelinStore, Arc<AtomicU64>, Arc<Ato
         .map_err(|error| format!("cannot build MinIO store: {error}"))?;
     let get_requests = Arc::new(AtomicU64::new(0));
     let put_requests = Arc::new(AtomicU64::new(0));
+    let get_latency_ms = Arc::new(Mutex::new(Vec::new()));
     let counting = CountingStore {
         inner: Arc::new(inner),
         get_requests: Arc::clone(&get_requests),
         put_requests: Arc::clone(&put_requests),
+        get_latency_ms: Arc::clone(&get_latency_ms),
     };
     Ok((
         ZeppelinStore::new(Arc::new(counting)),
         get_requests,
         put_requests,
+        get_latency_ms,
     ))
 }
 
@@ -1336,6 +1427,31 @@ fn integer_summary(values: &[u64]) -> IntegerSummary {
 fn integer_summary_f64(values: &[f64]) -> IntegerSummary {
     let as_u64: Vec<u64> = values.iter().map(|&value| value.round() as u64).collect();
     integer_summary(&as_u64)
+}
+
+fn float_summary(values: &[f64]) -> FloatSummary {
+    let mut ordered = values.to_vec();
+    ordered.sort_by(f64::total_cmp);
+    let percentile = |percent: usize| -> f64 {
+        if ordered.is_empty() {
+            return 0.0;
+        }
+        let rank = (percent * ordered.len()).div_ceil(100).max(1);
+        ordered[rank - 1]
+    };
+    FloatSummary {
+        min: ordered.first().copied().unwrap_or(0.0),
+        p5: percentile(5),
+        p50: percentile(50),
+        p95: percentile(95),
+        p99: percentile(99),
+        max: ordered.last().copied().unwrap_or(0.0),
+        mean: if ordered.is_empty() {
+            0.0
+        } else {
+            ordered.iter().sum::<f64>() / ordered.len() as f64
+        },
+    }
 }
 
 pub(super) fn parallel_indexed_map<T, F>(count: usize, operation: F) -> BenchResult<Vec<T>>
