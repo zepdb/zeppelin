@@ -12,7 +12,7 @@ use zeppelin::embedding::{
     ArtifactChecksum, DeterministicDev, EmbeddingProfileId, EmbeddingProfileRef,
     EncoderDocumentInput, EncoderExecutionRef, EncoderInputRef, EncoderQueryInput,
     EnrichmentCheckpoint, EnrichmentCoordinator, EnrichmentCoordinatorOptions, ExactScorerVersion,
-    FdeArtifact, FdeRecipe, FdeTransformArtifactRef, MatrixArtifact, MatrixDtype,
+    FdeArtifact, FdeRecipe, FdeTransformArtifactRef, InputModality, MatrixArtifact, MatrixDtype,
     MultiVectorEmbedding, MultiVectorEmbeddingBatch, MultiVectorEncoder,
     MultiVectorEncoderProvider, MultiVectorEncoderRegistry, MultiVectorEpoch, MultiVectorEpochId,
     NormalizationRecipe, RetrievalUnitRecord, SemanticState, TextContentRef, VectorTransformRecipe,
@@ -32,6 +32,8 @@ use common::fault_injection::{
     pause_first_cas_matching, pause_first_create_matching, toggle_cas_precondition_failure_matching,
 };
 use common::harness::TestHarness;
+
+const TEXT_MODALITIES: &[InputModality] = &[InputModality::Text];
 
 fn text_record(id: &str, text: &str) -> RetrievalUnitRecord {
     let input = EncoderInputRef::Text {
@@ -216,13 +218,13 @@ async fn enrichment_publishes_decodable_artifacts_and_exact_fde() {
 
     let coordinator = coordinator(&harness.store, &profile, None);
     let bounded = coordinator
-        .discover_and_admit(&namespace, incarnation, 2, 0)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 2, 0)
         .await
         .expect("zero-byte discovery must succeed");
     assert_eq!(bounded.admitted_fragments, 0);
     assert_eq!(bounded.admitted_bytes, 0);
     let report = coordinator
-        .discover_and_admit(&namespace, incarnation, 2, 1_000_000)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 2, 1_000_000)
         .await
         .expect("discovery must succeed");
     assert_eq!(report.admitted_fragments, 1);
@@ -313,7 +315,7 @@ async fn enrichment_restarts_at_each_checkpoint_and_rejects_collisions() {
         Some(EnrichmentCheckpoint::AfterMatrixPut),
     );
     first
-        .discover_and_admit(&namespace, incarnation, 1, 1_000_000)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 1, 1_000_000)
         .await
         .expect("first discovery must succeed");
     assert!(first.wait_for_idle().await.is_err());
@@ -337,7 +339,7 @@ async fn enrichment_restarts_at_each_checkpoint_and_rejects_collisions() {
         .expect("test corruption must write");
     let collision = coordinator(&harness.store, &profile, None);
     collision
-        .discover_and_admit(&namespace, incarnation, 1, 1_000_000)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 1, 1_000_000)
         .await
         .expect("collision discovery must succeed");
     assert!(collision.wait_for_idle().await.is_err());
@@ -371,7 +373,7 @@ async fn enrichment_restarts_at_each_checkpoint_and_rejects_collisions() {
     ] {
         let crashed = coordinator(&harness.store, &profile, Some(checkpoint));
         crashed
-            .discover_and_admit(&namespace, incarnation, 1, 1_000_000)
+            .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 1, 1_000_000)
             .await
             .expect("restart discovery must succeed");
         assert!(crashed.wait_for_idle().await.is_err());
@@ -418,7 +420,7 @@ async fn enrichment_restarts_at_each_checkpoint_and_rejects_collisions() {
 
     let final_run = coordinator(&harness.store, &profile, None);
     final_run
-        .discover_and_admit(&namespace, incarnation, 1, 1_000_000)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 1, 1_000_000)
         .await
         .expect("final discovery must succeed");
     final_run
@@ -619,7 +621,7 @@ async fn deterministic_poison_is_durable_and_does_not_stop_later_work() {
     let metric_before = metric.get();
 
     let report = coordinator
-        .discover_and_admit(&namespace, incarnation, 2, 1_000_000)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 2, 1_000_000)
         .await
         .expect("poison and later work must admit");
     assert_eq!(report.admitted_fragments, 1);
@@ -665,7 +667,7 @@ async fn deterministic_poison_is_durable_and_does_not_stop_later_work() {
     assert_eq!(metric.get() - metric_before, 1);
 
     let rediscovery = coordinator
-        .discover_and_admit(&namespace, incarnation, 2, 1_000_000)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 2, 1_000_000)
         .await
         .expect("durable poison rediscovery must succeed");
     assert_eq!(rediscovery.admitted_fragments, 0);
@@ -726,7 +728,7 @@ async fn stale_output_keeps_a_hole_and_encoding_holds_no_lease() {
         },
     );
     coordinator
-        .discover_and_admit(&namespace, incarnation, 1, 1_000_000)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 1, 1_000_000)
         .await
         .expect("old work must admit");
     entered.wait().await;
@@ -778,7 +780,7 @@ async fn stale_output_keeps_a_hole_and_encoding_holds_no_lease() {
     assert_eq!(coverage.pending_record_count, 1);
 
     coordinator
-        .discover_and_admit(&namespace, incarnation, 2, 1_000_000)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 2, 1_000_000)
         .await
         .expect("new work must admit past the covered prefix");
     coordinator
@@ -856,7 +858,7 @@ async fn bounded_discovery_skips_settled_history_without_input_wal_gets() {
             .expect("historical append must succeed");
         settled_keys.push(EncoderInputWalFragment::s3_key(&namespace, &fragment.id));
         let report = historical_coordinator
-            .discover_and_admit(&namespace, incarnation, 1, 1_000_000)
+            .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 1, 1_000_000)
             .await
             .expect("historical discovery must succeed");
         assert_eq!(report.admitted_fragments, 1);
@@ -909,7 +911,7 @@ async fn bounded_discovery_skips_settled_history_without_input_wal_gets() {
     );
 
     let zero_fragment_bound = coordinator
-        .discover_and_admit(&namespace, incarnation, 0, u64::MAX)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 0, u64::MAX)
         .await
         .expect("zero-fragment discovery must succeed");
     assert_eq!(zero_fragment_bound.admitted_fragments, 0);
@@ -917,7 +919,7 @@ async fn bounded_discovery_skips_settled_history_without_input_wal_gets() {
 
     counter.reset();
     let zero_byte_bound = coordinator
-        .discover_and_admit(&namespace, incarnation, 1, 0)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 1, 0)
         .await
         .expect("zero-byte discovery must succeed");
     assert_eq!(zero_byte_bound.admitted_fragments, 0);
@@ -925,7 +927,7 @@ async fn bounded_discovery_skips_settled_history_without_input_wal_gets() {
 
     counter.reset();
     let admitted = coordinator
-        .discover_and_admit(&namespace, incarnation, 1, 1_000_000)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 1, 1_000_000)
         .await
         .expect("tail discovery must succeed");
     assert_eq!(admitted.admitted_fragments, 1);
@@ -936,7 +938,7 @@ async fn bounded_discovery_skips_settled_history_without_input_wal_gets() {
     );
     entered.wait().await;
     let already_inflight = coordinator
-        .discover_and_admit(&namespace, incarnation, 1, 1_000_000)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 1, 1_000_000)
         .await
         .expect("inflight rediscovery must stay bounded");
     assert_eq!(already_inflight.admitted_fragments, 0);
@@ -945,6 +947,11 @@ async fn bounded_discovery_skips_settled_history_without_input_wal_gets() {
         tail.referenced_content_bytes()
             .expect("tail referenced bytes must fit"),
         "inspected bytes must be charged even when the work is already inflight"
+    );
+    assert_eq!(
+        counter.gets_matching(&format!("{namespace}/meta.json")),
+        0,
+        "repeated admission must not GET immutable namespace modalities"
     );
     for settled_key in settled_keys {
         assert_eq!(
@@ -1010,7 +1017,7 @@ async fn exhausted_publication_cas_does_not_reencode_terminal_source_recipe() {
     );
 
     let first = coordinator
-        .discover_and_admit(&namespace, incarnation, 1, 1_000_000)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 1, 1_000_000)
         .await
         .expect("first work must admit");
     assert_eq!(first.admitted_fragments, 1);
@@ -1045,7 +1052,7 @@ async fn exhausted_publication_cas_does_not_reencode_terminal_source_recipe() {
 
     cas_failures.disable();
     let suppressed = coordinator
-        .discover_and_admit(&namespace, incarnation, 1, 1_000_000)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 1, 1_000_000)
         .await
         .expect("terminal-source rediscovery must succeed");
     assert_eq!(suppressed.admitted_fragments, 0);
@@ -1065,7 +1072,7 @@ async fn exhausted_publication_cas_does_not_reencode_terminal_source_recipe() {
         .await
         .expect("new physical source append must succeed");
     let next = coordinator
-        .discover_and_admit(&namespace, incarnation, 2, 1_000_000)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 2, 1_000_000)
         .await
         .expect("new physical source discovery must succeed");
     assert_eq!(

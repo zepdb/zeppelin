@@ -504,6 +504,16 @@ async fn enrich_all_with_provider(
     encoder_provider: Arc<dyn MultiVectorEncoderProvider>,
     queue_capacity: usize,
 ) {
+    let metadata = NamespaceManager::new(store.clone())
+        .get(namespace)
+        .await
+        .expect("late namespace metadata must load");
+    let accepted_modalities = metadata
+        .late_interaction
+        .as_ref()
+        .expect("late namespace admission config must exist")
+        .accepted_modalities
+        .as_slice();
     let coordinator = zeppelin::embedding::EnrichmentCoordinator::start(
         store.clone(),
         Arc::new(LeaseManager::new(
@@ -519,7 +529,13 @@ async fn enrich_all_with_provider(
         },
     );
     let report = coordinator
-        .discover_and_admit(namespace, incarnation, usize::MAX, u64::MAX)
+        .discover_and_admit(
+            namespace,
+            incarnation,
+            Some(accepted_modalities),
+            usize::MAX,
+            u64::MAX,
+        )
         .await
         .expect("enrichment discovery must succeed");
     assert!(report.admitted_fragments > 0);
