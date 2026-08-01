@@ -8,9 +8,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use chrono::Duration as ChronoDuration;
 use uuid::Uuid;
 use zeppelin::cache::DiskCache;
+use zeppelin::compaction::gc::{GcNamespaceIncarnation, GcRunner};
 use zeppelin::compaction::Compactor;
+use zeppelin::config::GcConfig;
 use zeppelin::config::{Config, MmliConfig, MmliSegmentConfig};
 use zeppelin::embedding::{
     ArtifactChecksum, CandidateDocumentPooling, CenteringArtifact, DeterministicDev,
@@ -1815,6 +1818,359 @@ async fn late_segment_incremental_compaction_matches_full_rebuild() {
     );
 
     for (namespace, _, _, _) in &outputs {
+        harness.cleanup_artifact_origin_namespace(namespace).await;
+    }
+}
+
+/// W10.3 gate (b): exact-key GC over the late segment families after an
+/// incremental compaction — carried old-generation blocks survive because the
+/// new segment roots them, superseded old objects and a crash orphan under
+/// the late-segment prefix collect, and live objects stay untouched.
+#[tokio::test]
+async fn late_segment_gc_keeps_carried_blocks_and_collects_superseded() {
+    require_minio();
+    let harness = TestHarness::new().await;
+    let namespace = harness.artifact_origin_namespace("w103-gc");
+    let (profile, incarnation) = setup_profile_for_epoch(
+        &harness.store,
+        &namespace,
+        test_epoch(8, 16, b"w103-gc-v1"),
+        FdeParams {
+            algorithm: FdeAlgorithmVersion::PaperV1,
+            repetitions: 2,
+            simhash_bits: 1,
+            input_dimension: 8,
+            inner: InnerProjection::Rademacher { d_proj: 4 },
+            final_projection: FinalProjection::None,
+        },
+        17,
+        VectorTransformRecipe::Identity,
+        CandidateDocumentPooling::Identity,
+        "w103-gc",
+        None,
+    )
+    .await;
+    let provider = provider(&profile);
+    let mut mmli = mmli_config();
+    mmli.segment.max_matrix_object_bytes = 2048;
+
+    let base: Vec<RetrievalUnitRecord> = (0..40)
+        .map(|index| {
+            text_record(
+                &format!("gc-{index:04}"),
+                &format!("gc corpus document {index} token {}", index * 3),
+                ["red", "blue"][index % 2],
+            )
+        })
+        .collect();
+    WalWriter::new(harness.store.clone())
+        .append_retrieval_units(&namespace, base, Vec::new(), Vec::new())
+        .await
+        .expect("base append must succeed");
+    enrich_all_with_provider(&harness.store, &namespace, incarnation, provider.clone(), 8).await;
+    compactor(&harness.store, &mmli)
+        .compact(&namespace)
+        .await
+        .expect("initial compaction must succeed");
+    let manifest = read_manifest(&harness.store, &namespace, incarnation).await;
+    let section = manifest
+        .load_late_state(&harness.store)
+        .await
+        .expect("section must load")
+        .expect("section must exist");
+    let first_segment = section
+        .late_interaction_segments
+        .first()
+        .expect("initial segment")
+        .clone();
+    let mut first_keys = BTreeSet::new();
+    first_keys.insert(first_segment.flat_candidate.as_ref().unwrap().key.clone());
+    first_keys.extend(first_segment.matrix_objects.iter().map(|b| b.key.clone()));
+    first_keys.extend(
+        first_segment
+            .attribute_objects
+            .iter()
+            .map(|b| b.key.clone()),
+    );
+
+    // Churn one row so exactly one block is touched and the rest carry.
+    WalWriter::new(harness.store.clone())
+        .append_retrieval_units(
+            &namespace,
+            vec![text_record(
+                "gc-0001",
+                "gc corpus document 1 REVISED",
+                "red",
+            )],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("churn append must succeed");
+    enrich_all_with_provider(&harness.store, &namespace, incarnation, provider.clone(), 8).await;
+    compactor(&harness.store, &mmli)
+        .compact(&namespace)
+        .await
+        .expect("incremental compaction must succeed");
+    let manifest = read_manifest(&harness.store, &namespace, incarnation).await;
+    let section = manifest
+        .load_late_state(&harness.store)
+        .await
+        .expect("section must load")
+        .expect("section must exist");
+    let second_id = section
+        .active_late_segment
+        .clone()
+        .expect("second segment id");
+    assert_ne!(second_id, first_segment.id);
+    let second_segment = section
+        .late_interaction_segments
+        .iter()
+        .find(|segment| segment.id == second_id)
+        .expect("second segment descriptor")
+        .clone();
+    let mut second_keys = BTreeSet::new();
+    second_keys.insert(second_segment.flat_candidate.as_ref().unwrap().key.clone());
+    second_keys.extend(second_segment.matrix_objects.iter().map(|b| b.key.clone()));
+    second_keys.extend(
+        second_segment
+            .attribute_objects
+            .iter()
+            .map(|b| b.key.clone()),
+    );
+    let carried: Vec<String> = first_keys.intersection(&second_keys).cloned().collect();
+    let superseded: Vec<String> = first_keys.difference(&second_keys).cloned().collect();
+    assert!(
+        !carried.is_empty(),
+        "incremental compaction must carry old blocks"
+    );
+    assert!(
+        !superseded.is_empty(),
+        "incremental compaction must supersede some old objects"
+    );
+
+    // A crash orphan with a known artifact shape must collect; an unknown
+    // shape must be skipped fail-closed (never deleted).
+    let orphan_key = format!(
+        "{namespace}/late/segments/{second_id}/flat-sq8-{}.bin",
+        "ab".repeat(32)
+    );
+    harness
+        .store
+        .put(&orphan_key, Bytes::from_static(b"crash orphan"))
+        .await
+        .expect("orphan upload must succeed");
+    let unknown_shape_key = format!("{namespace}/late/segments/{second_id}/mystery.bin");
+    harness
+        .store
+        .put(&unknown_shape_key, Bytes::from_static(b"unknown shape"))
+        .await
+        .expect("unknown-shape upload must succeed");
+
+    let latest_modified = harness
+        .store
+        .list_prefix_meta(&format!("{namespace}/"))
+        .await
+        .expect("namespace LIST must succeed")
+        .into_iter()
+        .map(|object| object.last_modified)
+        .max()
+        .expect("namespace must contain objects");
+    let now = latest_modified + ChronoDuration::seconds(5);
+    let gc = GcConfig {
+        horizon_secs: 1,
+        compaction_upload_window_secs: 1,
+        skew_slop_secs: 0,
+        allow_unsafe_short_horizon: true,
+        manifest_history_keep_count: 1,
+        pitr_retention_secs: 0,
+    };
+    let metadata = NamespaceManager::new(harness.store.clone())
+        .get(&namespace)
+        .await
+        .expect("metadata must load");
+    let gc_incarnation = GcNamespaceIncarnation::from_metadata(&metadata);
+    let mut runner = GcRunner::new(harness.store.clone(), gc);
+    for offset in 0..4 {
+        runner
+            .run_cycle_at(
+                gc_incarnation.clone(),
+                now + ChronoDuration::seconds(offset),
+            )
+            .await
+            .expect("GC cycle must succeed");
+    }
+
+    for key in &carried {
+        assert!(
+            harness.store.exists(key).await.expect("existence check"),
+            "carried block {key} must survive GC"
+        );
+    }
+    for key in second_keys.iter() {
+        assert!(
+            harness.store.exists(key).await.expect("existence check"),
+            "live second-generation object {key} must survive GC"
+        );
+    }
+    for key in &superseded {
+        assert!(
+            !harness.store.exists(key).await.expect("existence check"),
+            "superseded object {key} must collect"
+        );
+    }
+    assert!(
+        !harness
+            .store
+            .exists(&orphan_key)
+            .await
+            .expect("existence check"),
+        "late-segment crash orphan must collect"
+    );
+    assert!(
+        harness
+            .store
+            .exists(&unknown_shape_key)
+            .await
+            .expect("existence check"),
+        "an unknown-shaped key must be skipped fail-closed, never deleted"
+    );
+
+    // The surviving segment must still answer queries after GC.
+    let manifest = read_manifest(&harness.store, &namespace, incarnation).await;
+    let output = run_query_with_text(
+        &harness.store,
+        None,
+        &namespace,
+        manifest,
+        provider.as_ref(),
+        &mmli,
+        None,
+        "gc corpus document 1 REVISED",
+        10,
+    )
+    .await;
+    assert!(!output.results.is_empty());
+
+    harness.cleanup_artifact_origin_namespace(&namespace).await;
+}
+
+/// W10.3 gate (c): the flat bootstrap cache keys artifacts by content
+/// digest alone, so distinct artifacts coexist in one shared cache with no
+/// collision or cross-pollution, and a re-query of the same artifact stays
+/// warm (zero physical reads).
+#[tokio::test]
+async fn late_flat_bootstrap_cache_isolates_artifacts_by_content_digest() {
+    require_minio();
+    let harness = TestHarness::new().await;
+    let mmli = mmli_config();
+    let cache_dir = tempfile::tempdir().expect("cache dir");
+    let shared_cache =
+        DiskCache::new_with_max_bytes(cache_dir.path().join("cache"), 64 * 1024 * 1024)
+            .expect("shared cache");
+
+    let mut states = Vec::new();
+    for label in ["cache-a", "cache-b"] {
+        let namespace = harness.artifact_origin_namespace(&format!("w103-{label}"));
+        let (profile, incarnation) = setup_profile_for_epoch(
+            &harness.store,
+            &namespace,
+            test_epoch(8, 16, b"w103-cache-v1"),
+            FdeParams {
+                algorithm: FdeAlgorithmVersion::PaperV1,
+                repetitions: 2,
+                simhash_bits: 1,
+                input_dimension: 8,
+                inner: InnerProjection::Rademacher { d_proj: 4 },
+                final_projection: FinalProjection::None,
+            },
+            17,
+            VectorTransformRecipe::Identity,
+            CandidateDocumentPooling::Identity,
+            &format!("w103-{label}"),
+            None,
+        )
+        .await;
+        let provider = provider(&profile);
+        let records: Vec<RetrievalUnitRecord> = (0..12)
+            .map(|index| {
+                text_record(
+                    &format!("{label}-{index:03}"),
+                    &format!("{label} corpus document {index}"),
+                    "red",
+                )
+            })
+            .collect();
+        WalWriter::new(harness.store.clone())
+            .append_retrieval_units(&namespace, records, Vec::new(), Vec::new())
+            .await
+            .expect("append must succeed");
+        enrich_all_with_provider(&harness.store, &namespace, incarnation, provider.clone(), 8)
+            .await;
+        compactor(&harness.store, &mmli)
+            .compact(&namespace)
+            .await
+            .expect("compaction must succeed");
+        states.push((namespace, incarnation, provider));
+    }
+
+    let (counted_store, counter) = counting_store(&harness.store);
+    let mut outputs = Vec::new();
+    for (round, (namespace, incarnation, provider)) in states.iter().enumerate() {
+        let manifest = read_manifest(&harness.store, namespace, *incarnation).await;
+        counter.reset();
+        let output = run_query_with_text(
+            &counted_store,
+            Some(&shared_cache),
+            namespace,
+            manifest.clone(),
+            provider.as_ref(),
+            &mmli,
+            None,
+            "corpus document 5",
+            12,
+        )
+        .await;
+        assert_eq!(
+            counter.gets_matching("flat-sq8-"),
+            1,
+            "round {round}: a distinct artifact must hydrate exactly once"
+        );
+        counter.reset();
+        let warm = run_query_with_text(
+            &counted_store,
+            Some(&shared_cache),
+            namespace,
+            manifest,
+            provider.as_ref(),
+            &mmli,
+            None,
+            "corpus document 5",
+            12,
+        )
+        .await;
+        assert_eq!(
+            counter.gets_matching("flat-sq8-"),
+            0,
+            "round {round}: the same artifact must stay warm in the shared cache"
+        );
+        assert!(ranked_results_are_identical(&output.results, &warm.results));
+        outputs.push(output);
+    }
+    // Distinct artifacts share the cache without cross-pollution: each
+    // namespace's results only contain its own ids.
+    for (index, (_, _, _)) in states.iter().enumerate() {
+        let prefix = if index == 0 { "cache-a-" } else { "cache-b-" };
+        assert!(
+            outputs[index]
+                .results
+                .iter()
+                .all(|result| result.id.starts_with(prefix)),
+            "shared cache must never leak rows across artifacts"
+        );
+    }
+
+    for (namespace, _, _) in &states {
         harness.cleanup_artifact_origin_namespace(namespace).await;
     }
 }

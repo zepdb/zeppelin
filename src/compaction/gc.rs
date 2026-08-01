@@ -5185,6 +5185,13 @@ fn is_known_late_segment_artifact_name(file_name: &str) -> bool {
     {
         return is_lower_sha256_hex(checksum);
     }
+    // Flat-SQ8 candidate artifacts (`ZFQ1`), content-addressed per segment.
+    if let Some(checksum) = file_name
+        .strip_prefix("flat-sq8-")
+        .and_then(|rest| rest.strip_suffix(".bin"))
+    {
+        return is_lower_sha256_hex(checksum);
+    }
     let Some(body) = file_name
         .strip_prefix("candidate-cluster-")
         .and_then(|rest| rest.strip_suffix(".bin"))
