@@ -72,6 +72,7 @@
 //! parse any type implementing [`std::str::FromStr`] and still return the crate's single
 //! [`crate::error::Result`] error channel.
 
+use crate::embedding::{EmbeddingProfileRef, InputModality, MatrixDtype};
 use crate::error::{Result, ZeppelinError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -259,6 +260,24 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MmliConfig {
+    /// Exact matrix dtype for text-only namespaces. Default: `f16`.
+    ///
+    /// Pinned text replay at K=1000: `f16` recall@10 `0.980072`
+    /// (gate `>=0.975`, PASS), `58.35 MB`/query, `730` requests,
+    /// p50 `596 ms`; `int8_g32` recall@10 `0.974211`
+    /// (gate `>=0.975`, MISS), `35.95 MB`/query, `622` requests,
+    /// p50 `530 ms`.
+    #[serde(default)]
+    pub text_matrix_dtype: MmliMatrixDtype,
+    /// Exact matrix dtype for namespaces accepting image or image-text. Default: `f16`.
+    ///
+    /// Pinned visual replay at K=300: `f16` recall@10 `0.903752`
+    /// (gate `>=0.90`, PASS), `75.77 MB`/query, `154` requests,
+    /// p50 `694 ms`; `int8_g32` is UNQUALIFIED (`99.25% < 99.5%`
+    /// draft fidelity; rejected), with `~46 MB`/query estimated and
+    /// requests/p50 unmeasured.
+    #[serde(default)]
+    pub visual_matrix_dtype: MmliMatrixDtype,
     /// Permit the deterministic development encoder. Default: `false`.
     #[serde(default)]
     pub allow_dev_encoder: bool,
@@ -292,6 +311,38 @@ pub struct MmliConfig {
     /// profile without it fails when the provider resolves that profile.
     #[serde(default)]
     pub worker: Option<MmliWorkerConfig>,
+}
+
+/// Operator-selected exact matrix representation for one MMLI lane.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MmliMatrixDtype {
+    /// Persist exact matrices as IEEE-754 binary16 values.
+    #[default]
+    #[serde(rename = "f16")]
+    F16,
+    /// Persist exact matrices as qualified symmetric groupwise INT8, group size 32.
+    #[serde(rename = "int8_g32")]
+    Int8G32,
+}
+
+impl MmliMatrixDtype {
+    /// Stable operator-facing spelling used in configuration and diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Int8G32 => "int8_g32",
+        }
+    }
+
+    /// Convert the constrained configuration choice into the persisted epoch dtype.
+    #[must_use]
+    pub const fn epoch_dtype(self) -> MatrixDtype {
+        match self {
+            Self::F16 => MatrixDtype::F16,
+            Self::Int8G32 => MatrixDtype::Int8SymV1 { group_size: 32 },
+        }
+    }
 }
 
 /// Late-segment candidate-index, truth-block, and ranged-read settings.
@@ -439,6 +490,8 @@ impl Default for MmliSegmentConfig {
 impl Default for MmliConfig {
     fn default() -> Self {
         Self {
+            text_matrix_dtype: MmliMatrixDtype::F16,
+            visual_matrix_dtype: MmliMatrixDtype::F16,
             allow_dev_encoder: false,
             enrichment_queue_capacity: default_mmli_enrichment_queue_capacity(),
             max_fragments_per_tick: default_mmli_max_fragments_per_tick(),
@@ -450,6 +503,69 @@ impl Default for MmliConfig {
             segment: MmliSegmentConfig::default(),
             worker: None,
         }
+    }
+}
+
+impl MmliConfig {
+    /// Resolve the exact matrix dtype for a namespace's accepted modalities.
+    ///
+    /// Image and image-text admission select the visual lane; only a nonempty
+    /// text-only admission selects the text lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Validation`] when the namespace admits no
+    /// modalities instead of silently treating an invalid namespace as text.
+    pub fn matrix_dtype_for_modalities(
+        &self,
+        accepted_modalities: &[InputModality],
+    ) -> Result<MmliMatrixDtype> {
+        if accepted_modalities.is_empty() {
+            return Err(ZeppelinError::Validation(
+                "cannot resolve an MMLI matrix dtype for empty accepted modalities".to_string(),
+            ));
+        }
+        if accepted_modalities
+            .iter()
+            .any(|modality| matches!(modality, InputModality::Image | InputModality::ImageText))
+        {
+            Ok(self.visual_matrix_dtype)
+        } else {
+            Ok(self.text_matrix_dtype)
+        }
+    }
+
+    /// Validate a persisted profile against one namespace's immutable lane choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns the profile's existing validation error, a modality mismatch,
+    /// or [`ZeppelinError::Validation`] naming the namespace and both dtypes
+    /// when process configuration disagrees with the persisted epoch.
+    pub fn validate_profile_for_namespace(
+        &self,
+        namespace: &str,
+        accepted_modalities: &[InputModality],
+        profile: &EmbeddingProfileRef,
+    ) -> Result<()> {
+        profile.validate_for_modalities(accepted_modalities)?;
+        let configured = self.matrix_dtype_for_modalities(accepted_modalities)?;
+        let persisted = profile.epoch.matrix_dtype;
+        if persisted != configured.epoch_dtype() {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {namespace} persisted epoch matrix dtype {} disagrees with configured lane matrix dtype {}; matrix dtype is one-way",
+                matrix_dtype_label(persisted),
+                configured.as_str()
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn matrix_dtype_label(dtype: MatrixDtype) -> String {
+    match dtype {
+        MatrixDtype::F16 => "f16".to_string(),
+        MatrixDtype::Int8SymV1 { group_size } => format!("int8_g{group_size}"),
     }
 }
 
@@ -1133,6 +1249,8 @@ mod tests {
         let _env = EnvGuard::clear();
 
         let defaults = load_toml("").unwrap().mmli;
+        assert_eq!(defaults.text_matrix_dtype, MmliMatrixDtype::F16);
+        assert_eq!(defaults.visual_matrix_dtype, MmliMatrixDtype::F16);
         assert!(!defaults.allow_dev_encoder);
         assert_eq!(defaults.enrichment_queue_capacity, 64);
         assert_eq!(defaults.max_fragments_per_tick, 8);
@@ -1224,6 +1342,37 @@ mod tests {
         assert_eq!(overridden.max_overlay_bytes_per_query, 8192);
         assert_eq!(overridden.segment.kmeans_max_iterations, 19);
         assert_eq!(overridden.segment.kmeans_convergence_epsilon, 0.003);
+    }
+
+    /// Pins the operator-facing dtype strings and the visual qualification gate.
+    #[test]
+    fn mmli_matrix_dtype_defaults_and_qualification_gate() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        let defaults = load_toml("").expect("default f16 lanes must validate");
+        assert_eq!(defaults.mmli.text_matrix_dtype, MmliMatrixDtype::F16);
+        assert_eq!(defaults.mmli.visual_matrix_dtype, MmliMatrixDtype::F16);
+
+        let text_int8 = load_toml(
+            r#"
+            [mmli]
+            text_matrix_dtype = "int8_g32"
+            "#,
+        )
+        .expect("qualified text int8 must validate");
+        assert_eq!(text_int8.mmli.text_matrix_dtype, MmliMatrixDtype::Int8G32);
+        assert_eq!(text_int8.mmli.visual_matrix_dtype, MmliMatrixDtype::F16);
+
+        assert_config_error_contains(
+            load_toml(
+                r#"
+                [mmli]
+                visual_matrix_dtype = "int8_g32"
+                "#,
+            ),
+            &["mmli.visual_matrix_dtype", "99.25%", "99.5%"],
+        );
     }
 
     /// Pinned-worker configuration is optional, strict, and environment-overridable.
@@ -3553,6 +3702,12 @@ impl Config {
         if self.mmli.max_overlay_bytes_per_query == 0 {
             violations
                 .push("mmli.max_overlay_bytes_per_query must be greater than zero".to_string());
+        }
+        if self.mmli.visual_matrix_dtype == MmliMatrixDtype::Int8G32 {
+            violations.push(
+                "mmli.visual_matrix_dtype int8_g32 is unqualified: visual same-top-1 fidelity measured 99.25%, below the 99.5% qualification bar"
+                    .to_string(),
+            );
         }
         if self.mmli.segment.nlist == 0 {
             violations.push("mmli.segment.nlist must be greater than zero".to_string());

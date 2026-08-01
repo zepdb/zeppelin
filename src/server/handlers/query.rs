@@ -4749,6 +4749,7 @@ async fn execute_query_source_with_manifest(
             execute_late_interaction_source_with_manifest(
                 state,
                 ns,
+                meta,
                 req,
                 text,
                 semantic_wait_ms,
@@ -4771,6 +4772,7 @@ async fn execute_query_source_with_manifest(
 async fn execute_late_interaction_source_with_manifest(
     state: &AppState,
     ns: &str,
+    meta: &NamespaceMetadata,
     req: &QueryRequest,
     text: &str,
     semantic_wait_ms: Option<u64>,
@@ -4779,11 +4781,21 @@ async fn execute_late_interaction_source_with_manifest(
     manifest: Manifest,
     manifest_refresh: ManifestRefresh,
 ) -> Result<SourceQueryResponse, ZeppelinError> {
+    let accepted_modalities = &meta
+        .late_interaction
+        .as_ref()
+        .ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "late-interaction namespace {ns} is missing admission config"
+            ))
+        })?
+        .accepted_modalities;
     let output = crate::index::late_interaction::search(LateInteractionSearchRequest {
         store: &state.store,
         bootstrap_cache: Some(state.cache.as_ref()),
         encoder_provider: state.encoder_provider.as_ref(),
         namespace: ns,
+        accepted_modalities: accepted_modalities.clone(),
         manifest,
         text,
         top_k,

@@ -14,17 +14,18 @@ use zeppelin::cache::DiskCache;
 use zeppelin::compaction::gc::{GcNamespaceIncarnation, GcRunner};
 use zeppelin::compaction::Compactor;
 use zeppelin::config::GcConfig;
-use zeppelin::config::{Config, MmliConfig, MmliSegmentConfig};
+use zeppelin::config::{Config, MmliConfig, MmliMatrixDtype, MmliSegmentConfig};
 use zeppelin::embedding::{
-    ArtifactChecksum, CandidateDocumentPooling, CenteringArtifact, DeterministicDev,
-    EmbeddingProfileId, EmbeddingProfileRef, EncoderDocumentInput, EncoderExecutionRef,
-    EncoderInputRef, ExactScorerVersion, FdeRecipe, FdeTransformArtifactRef, ImageObjectRef,
-    InputModality, Int8QualificationStamp, MatrixDtype, MeanVectorRef, MultiVectorEncoder,
-    MultiVectorEncoderProvider, MultiVectorEncoderRegistry, MultiVectorEpoch, MultiVectorEpochId,
-    NormalizationRecipe, RetrievalUnitRecord, TextContentRef, VectorTransformRecipe,
-    CENTERING_ARTIFACT_FORMAT_VERSION, DETERMINISTIC_DEV_IMPLEMENTATION, DETERMINISTIC_DEV_VERSION,
-    INT8_QUALIFICATION_STAMP_VERSION,
+    ArtifactChecksum, CandidateDocumentPooling, CenteringArtifact, ConfiguredEncoderProvider,
+    DeterministicDev, EmbeddingProfileId, EmbeddingProfileRef, EncoderDocumentInput,
+    EncoderExecutionRef, EncoderInputRef, ExactScorerVersion, FdeRecipe, FdeTransformArtifactRef,
+    ImageObjectRef, InputModality, Int8QualificationStamp, MatrixDtype, MeanVectorRef,
+    MultiVectorEncoder, MultiVectorEncoderProvider, MultiVectorEncoderRegistry, MultiVectorEpoch,
+    MultiVectorEpochId, NormalizationRecipe, RetrievalUnitRecord, TextContentRef,
+    VectorTransformRecipe, CENTERING_ARTIFACT_FORMAT_VERSION, DETERMINISTIC_DEV_IMPLEMENTATION,
+    DETERMINISTIC_DEV_VERSION, INT8_QUALIFICATION_STAMP_VERSION,
 };
+use zeppelin::error::ZeppelinError;
 use zeppelin::index::late_interaction::{
     search, FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection, InnerProjection,
     LateInteractionCoverage, LateInteractionRankedResult, LateInteractionSearchOutput,
@@ -37,8 +38,6 @@ use zeppelin::wal::{LeaseManager, Manifest, SourceInventoryRef, WalReader, WalWr
 
 #[cfg(feature = "branching-test-support")]
 use zeppelin::config::{BranchingConfig, IndexingConfig};
-#[cfg(feature = "branching-test-support")]
-use zeppelin::error::ZeppelinError;
 #[cfg(feature = "branching-test-support")]
 use zeppelin::namespace::branching::test_support::{
     activate_fork_for_test, branch_control_snapshot, delete_namespace_for_test,
@@ -333,6 +332,81 @@ async fn setup_profile_for_epoch(
     (profile, incarnation)
 }
 
+#[tokio::test]
+async fn text_matrix_dtype_is_a_one_way_namespace_fence() {
+    require_minio();
+    let harness = TestHarness::new().await;
+    let namespace = harness.artifact_origin_namespace("matrix-dtype-fence");
+    let mut epoch = test_epoch(8, 16, b"matrix-dtype-fence-v1");
+    epoch.encoder.supported_modalities = vec![InputModality::Text];
+    epoch.id = epoch.canonical_id().expect("text epoch must canonicalize");
+
+    let (_, incarnation) = setup_profile_for_epoch(
+        &harness.store,
+        &namespace,
+        epoch,
+        FdeParams {
+            algorithm: FdeAlgorithmVersion::PaperV1,
+            repetitions: 2,
+            simhash_bits: 1,
+            input_dimension: 8,
+            inner: InnerProjection::Rademacher { d_proj: 4 },
+            final_projection: FinalProjection::None,
+        },
+        17,
+        VectorTransformRecipe::Identity,
+        CandidateDocumentPooling::Identity,
+        "matrix-dtype-fence",
+        None,
+    )
+    .await;
+    let manifest = read_manifest(&harness.store, &namespace, incarnation).await;
+    let persisted = manifest
+        .load_late_state(&harness.store)
+        .await
+        .expect("late state must load")
+        .expect("late state must exist")
+        .active_profile
+        .expect("profile must be persisted");
+    let accepted_modalities = [InputModality::Text];
+
+    let unchanged = MmliConfig {
+        allow_dev_encoder: true,
+        ..MmliConfig::default()
+    };
+    unchanged
+        .validate_profile_for_namespace(&namespace, &accepted_modalities, &persisted)
+        .expect("unchanged text=f16 config must resolve");
+    let provider = ConfiguredEncoderProvider::new(harness.store.clone(), &unchanged);
+    provider
+        .encoder_for(&namespace, &accepted_modalities, &persisted)
+        .await
+        .expect("unchanged provider resolution must succeed");
+    provider.shutdown().await.expect("provider must shut down");
+
+    let changed = MmliConfig {
+        text_matrix_dtype: MmliMatrixDtype::Int8G32,
+        allow_dev_encoder: true,
+        ..MmliConfig::default()
+    };
+    let provider = ConfiguredEncoderProvider::new(harness.store.clone(), &changed);
+    let error = provider
+        .encoder_for(&namespace, &accepted_modalities, &persisted)
+        .await
+        .err()
+        .expect("changed text dtype must fail hard");
+    assert!(matches!(error, ZeppelinError::Validation(_)));
+    let message = error.to_string();
+    for expected in [&namespace, "f16", "int8_g32"] {
+        assert!(
+            message.contains(expected),
+            "expected {expected:?} in dtype fence error: {message}"
+        );
+    }
+
+    harness.cleanup_artifact_origin_namespace(&namespace).await;
+}
+
 fn provider(profile: &EmbeddingProfileRef) -> Arc<dyn MultiVectorEncoderProvider> {
     let registry = Arc::new(MultiVectorEncoderRegistry::new());
     registry
@@ -542,11 +616,20 @@ async fn run_query_with_text(
     text: &str,
     top_k: usize,
 ) -> LateInteractionSearchOutput {
+    let metadata = NamespaceManager::new(store.clone())
+        .get(namespace)
+        .await
+        .expect("late namespace metadata must load");
+    let accepted_modalities = metadata
+        .late_interaction
+        .expect("late namespace admission must exist")
+        .accepted_modalities;
     search(LateInteractionSearchRequest {
         store,
         bootstrap_cache,
         encoder_provider: provider,
         namespace,
+        accepted_modalities,
         manifest,
         text,
         top_k,

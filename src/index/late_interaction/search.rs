@@ -13,7 +13,7 @@ use crate::config::MmliSegmentConfig;
 use crate::embedding::transform::{apply_vector_transform, load_vector_transform_mean};
 use crate::embedding::{
     ArtifactChecksum, ContentHash, EmbeddingProfileId, EmbeddingProfileRef, EncoderQueryInput,
-    FdeGenerationId, MatrixArtifact, MultiVectorEncoderProvider, MultiVectorEpochId,
+    FdeGenerationId, InputModality, MatrixArtifact, MultiVectorEncoderProvider, MultiVectorEpochId,
     RetrievalUnitRecord, SemanticCoverageState, SemanticState,
 };
 use crate::error::{Result, ZeppelinError};
@@ -133,6 +133,8 @@ pub struct LateInteractionSearchRequest<'a> {
     pub encoder_provider: &'a dyn MultiVectorEncoderProvider,
     /// Logical namespace whose live root may be polled.
     pub namespace: &'a str,
+    /// Immutable namespace admission used to resolve the configured dtype lane.
+    pub accepted_modalities: Vec<InputModality>,
     /// Owned initial root selected by the caller's consistency/snapshot policy.
     pub manifest: Manifest,
     /// Non-empty text passed only to the active profile's query adapter.
@@ -165,6 +167,7 @@ pub async fn search(
         bootstrap_cache,
         encoder_provider,
         namespace,
+        accepted_modalities,
         manifest,
         text,
         top_k,
@@ -179,6 +182,8 @@ pub async fn search(
         store,
         bootstrap_cache,
         encoder_provider,
+        namespace,
+        accepted_modalities,
         text,
         top_k,
         effective_filter,
@@ -229,6 +234,8 @@ struct SearchExecution<'a> {
     store: &'a ZeppelinStore,
     bootstrap_cache: Option<&'a DiskCache>,
     encoder_provider: &'a dyn MultiVectorEncoderProvider,
+    namespace: &'a str,
+    accepted_modalities: Vec<InputModality>,
     text: &'a str,
     top_k: usize,
     effective_filter: Option<&'a Filter>,
@@ -546,7 +553,11 @@ async fn execute_snapshot(
 
     let encoder = request
         .encoder_provider
-        .encoder_for(&snapshot.profile)
+        .encoder_for(
+            request.namespace,
+            &request.accepted_modalities,
+            &snapshot.profile,
+        )
         .await?;
     let raw_query = encoder
         .encode_query(EncoderQueryInput::new(request.text)?)

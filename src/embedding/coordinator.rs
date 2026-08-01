@@ -13,14 +13,16 @@ use crate::embedding::transform::{apply_vector_transform, load_vector_transform_
 use crate::embedding::{
     ArtifactChecksum, CandidateDocumentPooling, EmbeddingProfileRef, EncoderDocumentInput,
     EncoderInputRef, FdeArtifact, FdeArtifactRow, FdeFragmentRef, ImmutableArtifactBytes,
-    MatrixArtifact, MatrixArtifactRow, MultiVectorEmbedding, MultiVectorEmbeddingBatch,
-    MultiVectorEmbeddingFragmentRef, MultiVectorEncoder, MultiVectorEpochId,
-    PhysicalInputFragmentIdentity, RecordVersionCoverage, RecordVersionRef, RetrievalUnitRecord,
-    SemanticOverlayRef, FDE_ARTIFACT_FORMAT_VERSION, MATRIX_ARTIFACT_FORMAT_VERSION,
+    InputModality, MatrixArtifact, MatrixArtifactRow, MultiVectorEmbedding,
+    MultiVectorEmbeddingBatch, MultiVectorEmbeddingFragmentRef, MultiVectorEncoder,
+    MultiVectorEpochId, PhysicalInputFragmentIdentity, RecordVersionCoverage, RecordVersionRef,
+    RetrievalUnitRecord, SemanticOverlayRef, FDE_ARTIFACT_FORMAT_VERSION,
+    MATRIX_ARTIFACT_FORMAT_VERSION,
 };
 use crate::error::{Result, ZeppelinError};
 use crate::index::late_interaction::FdeTransform;
 use crate::namespace::branching::ArtifactOrigin;
+use crate::namespace::NamespaceManager;
 use crate::storage::{CreateOnlyOutcome, NamespaceObjectFamily, ZeppelinStore};
 use crate::wal::{
     EncoderInputWalFragment, InputFragmentRef, LateStateSection, LeaseManager, Manifest,
@@ -94,9 +96,11 @@ pub struct EnrichmentAdmissionReport {
 /// Resolves one exact epoch to its owned encoder session.
 #[async_trait]
 pub trait MultiVectorEncoderProvider: Send + Sync {
-    /// Resolve the encoder selected by this exact validated profile.
+    /// Resolve the encoder selected by this namespace's exact validated profile.
     async fn encoder_for(
         &self,
+        namespace: &str,
+        accepted_modalities: &[InputModality],
         profile: &EmbeddingProfileRef,
     ) -> Result<Arc<dyn MultiVectorEncoder>>;
 
@@ -141,8 +145,11 @@ impl MultiVectorEncoderRegistry {
 impl MultiVectorEncoderProvider for MultiVectorEncoderRegistry {
     async fn encoder_for(
         &self,
+        _namespace: &str,
+        accepted_modalities: &[InputModality],
         profile: &EmbeddingProfileRef,
     ) -> Result<Arc<dyn MultiVectorEncoder>> {
+        profile.validate_for_modalities(accepted_modalities)?;
         let encoder = self
             .encoders
             .read()
@@ -171,6 +178,7 @@ struct EnrichmentWork {
     id: EnrichmentWorkId,
     source_id: EnrichmentSourceId,
     namespace: String,
+    accepted_modalities: Vec<InputModality>,
     incarnation: uuid::Uuid,
     source_ref: InputFragmentRef,
     source_origin: ArtifactOrigin,
@@ -373,6 +381,20 @@ impl EnrichmentCoordinator {
         let Some(profile) = section.active_profile.as_ref() else {
             return Ok(EnrichmentAdmissionReport::default());
         };
+        let metadata = NamespaceManager::new(self.store.clone())
+            .get(namespace)
+            .await?;
+        let accepted_modalities = metadata
+            .late_interaction
+            .as_ref()
+            .ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "late-interaction namespace {namespace} is missing admission config"
+                ))
+            })?
+            .accepted_modalities
+            .clone();
+        profile.validate_for_modalities(&accepted_modalities)?;
         let mut report = EnrichmentAdmissionReport::default();
         let mut inspected_bytes = 0_u64;
         for source_ref in &manifest.input_fragments {
@@ -451,6 +473,7 @@ impl EnrichmentCoordinator {
                 id: work_id,
                 source_id,
                 namespace: namespace.to_string(),
+                accepted_modalities: accepted_modalities.clone(),
                 incarnation,
                 source_ref: source_ref.clone(),
                 source_origin,
@@ -602,7 +625,9 @@ async fn execute_work(
     max_retry_attempts: usize,
     work: &EnrichmentWork,
 ) -> Result<()> {
-    let encoder = encoder_provider.encoder_for(&work.profile).await?;
+    let encoder = encoder_provider
+        .encoder_for(&work.namespace, &work.accepted_modalities, &work.profile)
+        .await?;
     if encoder.epoch() != work.profile.epoch.id
         || encoder.output_dimension() != work.profile.epoch.vector_dimension as usize
     {

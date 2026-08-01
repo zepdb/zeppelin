@@ -145,7 +145,10 @@ use uuid::Uuid;
 
 use crate::cache::hydration::HydrationTarget;
 use crate::compaction::background::run_compaction_with_reserved_lease;
-use crate::embedding::{EmbeddingProfileRef, EncoderInputRef, LateInteractionNamespaceConfig};
+use crate::config::MmliMatrixDtype;
+use crate::embedding::{
+    EmbeddingProfileRef, EncoderInputRef, InputModality, LateInteractionNamespaceConfig,
+};
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
@@ -2988,9 +2991,20 @@ pub async fn activate_embedding_profile(
             "late-interaction namespace is missing admission config".to_string(),
         ))
     })?;
-    req.profile
-        .validate_for_modalities(&admission.accepted_modalities)
+    state
+        .config
+        .mmli
+        .validate_profile_for_namespace(&ns, &admission.accepted_modalities, &req.profile)
         .map_err(ApiError::from)?;
+    let configured_dtype = state
+        .config
+        .mmli
+        .matrix_dtype_for_modalities(&admission.accepted_modalities)
+        .map_err(ApiError::from)?;
+    let text_lane = !admission
+        .accepted_modalities
+        .iter()
+        .any(|modality| matches!(modality, InputModality::Image | InputModality::ImageText));
     LateStateSection::validate_local_profile_artifacts(&state.store, &ns, &req.profile)
         .await
         .map_err(ApiError::from)?;
@@ -3018,6 +3032,18 @@ pub async fn activate_embedding_profile(
         .activate_embedding_profile(&state.store, &ns, &version, &req.profile)
         .await
         .map_err(ApiError::from)?;
+    if text_lane && configured_dtype == MmliMatrixDtype::Int8G32 {
+        warn!(
+            namespace = %ns,
+            lane = "text",
+            matrix_dtype = "int8_g32",
+            candidate_k = 1000_u64,
+            measured_recall_at_10 = 0.974211_f64,
+            required_recall_at_10 = 0.975_f64,
+            recall_gap = 0.000789_f64,
+            "registered text INT8 matrix dtype below the pinned recall gate"
+        );
+    }
     state.manifest_cache.insert(&ns, manifest.clone());
 
     Ok(Json(ActivateEmbeddingProfileResponse {

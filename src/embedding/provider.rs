@@ -9,9 +9,9 @@ use tokio::sync::Mutex;
 
 use super::priority::QueryPriorityEncoder;
 use super::{
-    DeterministicDev, EmbeddingProfileRef, MultiVectorEncoder, MultiVectorEncoderProvider,
-    MultiVectorEpoch, MultiVectorEpochId, PinnedWorker, PinnedWorkerConfig,
-    DETERMINISTIC_DEV_IMPLEMENTATION,
+    DeterministicDev, EmbeddingProfileRef, InputModality, MultiVectorEncoder,
+    MultiVectorEncoderProvider, MultiVectorEpoch, MultiVectorEpochId, PinnedWorker,
+    PinnedWorkerConfig, DETERMINISTIC_DEV_IMPLEMENTATION,
 };
 use crate::config::{MmliConfig, MmliWorkerConfig};
 use crate::error::{Result, ZeppelinError};
@@ -25,8 +25,7 @@ use crate::storage::ZeppelinStore;
 /// paths and resource bounds.
 pub struct ConfiguredEncoderProvider {
     store: ZeppelinStore,
-    allow_dev_encoder: bool,
-    worker: Option<MmliWorkerConfig>,
+    config: MmliConfig,
     state: Mutex<ProviderState>,
 }
 
@@ -75,20 +74,19 @@ impl ConfiguredEncoderProvider {
     pub fn new(store: ZeppelinStore, config: &MmliConfig) -> Self {
         Self {
             store,
-            allow_dev_encoder: config.allow_dev_encoder,
-            worker: config.worker.clone(),
+            config: config.clone(),
             state: Mutex::new(ProviderState::default()),
         }
     }
 
     async fn spawn(&self, epoch: &MultiVectorEpoch) -> Result<OwnedEncoder> {
         if epoch.encoder.implementation == DETERMINISTIC_DEV_IMPLEMENTATION {
-            return DeterministicDev::new(self.allow_dev_encoder, epoch)
+            return DeterministicDev::new(self.config.allow_dev_encoder, epoch)
                 .map(Arc::new)
                 .map(OwnedEncoder::Dev);
         }
 
-        let runtime = self.worker.as_ref().ok_or_else(|| {
+        let runtime = self.config.worker.as_ref().ok_or_else(|| {
             ZeppelinError::Config(format!(
                 "pinned encoder {} selected but [mmli.worker] is absent",
                 epoch.id.to_hex()
@@ -115,9 +113,12 @@ impl ConfiguredEncoderProvider {
 impl MultiVectorEncoderProvider for ConfiguredEncoderProvider {
     async fn encoder_for(
         &self,
+        namespace: &str,
+        accepted_modalities: &[InputModality],
         profile: &EmbeddingProfileRef,
     ) -> Result<Arc<dyn MultiVectorEncoder>> {
-        profile.validate()?;
+        self.config
+            .validate_profile_for_namespace(namespace, accepted_modalities, profile)?;
         let mut state = self.state.lock().await;
         if state.closed {
             return Err(ZeppelinError::Validation(
@@ -291,16 +292,19 @@ mod tests {
         let provider = ConfiguredEncoderProvider::new(store(), &config);
         let profile = profile(DETERMINISTIC_DEV_IMPLEMENTATION, None);
 
-        let first = provider.encoder_for(&profile).await.expect("first resolve");
+        let first = provider
+            .encoder_for("provider-test", &[InputModality::Text], &profile)
+            .await
+            .expect("first resolve");
         let second = provider
-            .encoder_for(&profile)
+            .encoder_for("provider-test", &[InputModality::Text], &profile)
             .await
             .expect("cached resolve");
         assert!(Arc::ptr_eq(&first, &second));
 
         provider.shutdown().await.expect("provider shutdown");
         let error = provider
-            .encoder_for(&profile)
+            .encoder_for("provider-test", &[InputModality::Text], &profile)
             .await
             .err()
             .expect("closed provider must reject");
@@ -311,14 +315,22 @@ mod tests {
     async fn missing_dev_gate_or_pinned_runtime_fails_loudly() {
         let provider = ConfiguredEncoderProvider::new(store(), &MmliConfig::default());
         let dev_error = provider
-            .encoder_for(&profile(DETERMINISTIC_DEV_IMPLEMENTATION, None))
+            .encoder_for(
+                "provider-test",
+                &[InputModality::Text],
+                &profile(DETERMINISTIC_DEV_IMPLEMENTATION, None),
+            )
             .await
             .err()
             .expect("disabled dev encoder must reject");
         assert!(dev_error.to_string().contains("disabled by configuration"));
 
         let pinned_error = provider
-            .encoder_for(&profile("pinned-test-worker", Some("models/pinned/v1")))
+            .encoder_for(
+                "provider-test",
+                &[InputModality::Text],
+                &profile("pinned-test-worker", Some("models/pinned/v1")),
+            )
             .await
             .err()
             .expect("missing worker config must reject");

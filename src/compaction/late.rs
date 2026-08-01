@@ -444,7 +444,11 @@ impl Compactor {
                 "validated late namespace lost its admission config".to_string(),
             )
         })?;
-        profile.validate_for_modalities(&late_config.accepted_modalities)?;
+        self.mmli_config.validate_profile_for_namespace(
+            namespace,
+            &late_config.accepted_modalities,
+            &profile,
+        )?;
 
         let coverage = manifest
             .compute_semantic_coverage(&self.store, &section, &profile)
