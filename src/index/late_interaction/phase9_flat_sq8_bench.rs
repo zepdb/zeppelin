@@ -225,6 +225,8 @@ struct BenchReport {
     schema_version: u32,
     source_revision: String,
     candidate_k: usize,
+    read_gap_budget_bytes: usize,
+    read_max_request_bytes: usize,
     read_max_concurrency: usize,
     document_count: usize,
     query_count: usize,
@@ -254,8 +256,10 @@ struct BenchReport {
     truth_maxsim_ms: FloatSummary,
     truth_get_latency_ms: FloatSummary,
     truth_logical_ranges: IntegerSummary,
+    truth_logical_bytes: IntegerSummary,
     truth_planned_requests: IntegerSummary,
     truth_planned_bytes: IntegerSummary,
+    truth_gap_waste_bytes: IntegerSummary,
     truth_request_waves: IntegerSummary,
     truth_total_get_requests: u64,
     truth_total_request_waves: u64,
@@ -400,13 +404,21 @@ async fn run_benchmark() -> BenchResult<()> {
         ));
     }
     let default_read_plan_config = ReadPlanConfig::default();
+    let read_gap_budget_bytes = optional_usize(
+        "MMLI_FLAT_BENCH_GAP_BUDGET",
+        default_read_plan_config.gap_budget_bytes,
+    )?;
+    let read_max_request_bytes = optional_usize(
+        "MMLI_FLAT_BENCH_MAX_REQUEST",
+        default_read_plan_config.max_request_bytes,
+    )?;
     let read_max_concurrency = optional_usize(
         "MMLI_FLAT_BENCH_CONCURRENCY",
         default_read_plan_config.max_concurrent_requests,
     )?;
     let read_plan_config = ReadPlanConfig::new(
-        default_read_plan_config.gap_budget_bytes,
-        default_read_plan_config.max_request_bytes,
+        read_gap_budget_bytes,
+        read_max_request_bytes,
         read_max_concurrency,
     )
     .map_err(|error| error.to_string())?;
@@ -638,7 +650,9 @@ async fn run_benchmark() -> BenchResult<()> {
         + flat_metadata_bytes;
 
     eprintln!(
-        "flat-bench: running {query_count} warm queries at K={CANDIDATE_K}, concurrency={read_max_concurrency}"
+        "flat-bench: running {query_count} warm queries at K={CANDIDATE_K}, \
+         gap_budget={read_gap_budget_bytes}, max_request={read_max_request_bytes}, \
+         concurrency={read_max_concurrency}"
     );
     let bounds = SegmentSearchBounds {
         max_resident_bytes: 64 * 1024 * 1024,
@@ -663,8 +677,10 @@ async fn run_benchmark() -> BenchResult<()> {
     let mut decode_ms = Vec::with_capacity(query_count);
     let mut maxsim_ms = Vec::with_capacity(query_count);
     let mut truth_logical = Vec::with_capacity(query_count);
+    let mut truth_logical_bytes = Vec::with_capacity(query_count);
     let mut truth_planned_requests = Vec::with_capacity(query_count);
     let mut truth_planned_bytes = Vec::with_capacity(query_count);
+    let mut truth_gap_waste_bytes = Vec::with_capacity(query_count);
     let mut truth_request_waves = Vec::with_capacity(query_count);
     let observed_equals_planned = true;
     {
@@ -713,6 +729,22 @@ async fn run_benchmark() -> BenchResult<()> {
             .await
             .map_err(|error| error.to_string())?;
         let fetch_elapsed = fetch_started.elapsed();
+        let logical_bytes = truth_bytes.iter().try_fold(0_u64, |total, bytes| {
+            total
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| "truth logical byte count overflowed u64".to_string())
+        })?;
+        // The flat frontier contains unique documents, so its matrix and
+        // attribute ranges do not overlap and physical excess is gap waste.
+        let gap_waste_bytes = plan
+            .planned_bytes()
+            .checked_sub(logical_bytes)
+            .ok_or_else(|| {
+                format!(
+                "query {query_index}: planned {} bytes but delivered {logical_bytes} logical bytes",
+                plan.planned_bytes()
+            )
+            })?;
         let observed_delta = get_requests.load(AtomicOrdering::Relaxed) - observed_before;
         if observed_delta != planned_request_count {
             return Err(format!(
@@ -766,8 +798,10 @@ async fn run_benchmark() -> BenchResult<()> {
         decode_ms.push(timing.decode.as_secs_f64() * 1_000.0);
         maxsim_ms.push(timing.maxsim.as_secs_f64() * 1_000.0);
         truth_logical.push(truth_requests.len() as u64);
+        truth_logical_bytes.push(logical_bytes);
         truth_planned_requests.push(planned_request_count);
         truth_planned_bytes.push(plan.planned_bytes());
+        truth_gap_waste_bytes.push(gap_waste_bytes);
         truth_request_waves
             .push(planned_request_count.div_ceil(read_plan_config.max_concurrent_requests as u64));
         if (query_index + 1) % 200 == 0 {
@@ -868,9 +902,11 @@ async fn run_benchmark() -> BenchResult<()> {
     }
 
     let report = BenchReport {
-        schema_version: 1,
+        schema_version: 2,
         source_revision: "518aa23+flat-bench".to_string(),
         candidate_k: CANDIDATE_K,
+        read_gap_budget_bytes,
+        read_max_request_bytes,
         read_max_concurrency,
         document_count: DOCUMENT_COUNT,
         query_count,
@@ -900,8 +936,10 @@ async fn run_benchmark() -> BenchResult<()> {
         truth_maxsim_ms: float_summary(&maxsim_ms),
         truth_get_latency_ms: float_summary(&truth_get_latency_ms),
         truth_logical_ranges: integer_summary(&truth_logical),
+        truth_logical_bytes: integer_summary(&truth_logical_bytes),
         truth_planned_requests: integer_summary(&truth_planned_requests),
         truth_planned_bytes: integer_summary(&truth_planned_bytes),
+        truth_gap_waste_bytes: integer_summary(&truth_gap_waste_bytes),
         truth_request_waves: integer_summary(&truth_request_waves),
         truth_total_get_requests,
         truth_total_request_waves,
