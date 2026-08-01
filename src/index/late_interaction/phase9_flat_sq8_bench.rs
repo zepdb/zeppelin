@@ -55,8 +55,8 @@ use super::candidate::{
 };
 use super::matrix_artifact::{build_matrix_blocks, MatrixBlockInputRow};
 use super::segment_search::{
-    build_truth_requests, compare_scored_rows, filter_matches, score_truth_wave,
-    SegmentSearchBounds, SegmentSearchRequest, TruthWaveTiming,
+    build_truth_requests, compare_scored_rows, execute_truth_wave_pipelined, filter_matches,
+    score_truth_wave, SegmentSearchBounds, SegmentSearchRequest, TruthWaveTiming,
 };
 use super::{
     FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection, InnerProjection,
@@ -225,6 +225,10 @@ struct BenchReport {
     schema_version: u32,
     source_revision: String,
     candidate_k: usize,
+    read_gap_budget_bytes: usize,
+    read_max_request_bytes: usize,
+    read_max_concurrency: usize,
+    pipeline_enabled: bool,
     document_count: usize,
     query_count: usize,
     gold_memberships: usize,
@@ -233,6 +237,8 @@ struct BenchReport {
     hits_k1500: usize,
     recall_k1000: f64,
     per_query_hits_k1000: IntegerSummary,
+    per_query_hits_k1000_values: Vec<u64>,
+    per_query_top10_ids: Vec<Vec<String>>,
     queries_below_8_of_10: usize,
     queries_below_5_of_10: usize,
     flat_artifact_bytes: u64,
@@ -253,8 +259,10 @@ struct BenchReport {
     truth_score_workers: usize,
     truth_get_latency_ms: FloatSummary,
     truth_logical_ranges: IntegerSummary,
+    truth_logical_bytes: IntegerSummary,
     truth_planned_requests: IntegerSummary,
     truth_planned_bytes: IntegerSummary,
+    truth_gap_waste_bytes: IntegerSummary,
     truth_request_waves: IntegerSummary,
     truth_total_get_requests: u64,
     truth_total_request_waves: u64,
@@ -392,6 +400,32 @@ async fn run_benchmark() -> BenchResult<()> {
     let tensor_dir = required_path("MMLI_REAL_MATRIX_DIR")?;
     let output = required_path("MMLI_FLAT_BENCH_OUTPUT")?;
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let pipeline_enabled = optional_one_flag("MMLI_FLAT_BENCH_PIPELINE")?;
+    let query_count = optional_usize("MMLI_FLAT_BENCH_QUERY_LIMIT", QUERY_COUNT)?;
+    if !(1..=QUERY_COUNT).contains(&query_count) {
+        return Err(format!(
+            "MMLI_FLAT_BENCH_QUERY_LIMIT must be between 1 and {QUERY_COUNT}"
+        ));
+    }
+    let default_read_plan_config = ReadPlanConfig::default();
+    let read_gap_budget_bytes = optional_usize(
+        "MMLI_FLAT_BENCH_GAP_BUDGET",
+        default_read_plan_config.gap_budget_bytes,
+    )?;
+    let read_max_request_bytes = optional_usize(
+        "MMLI_FLAT_BENCH_MAX_REQUEST",
+        default_read_plan_config.max_request_bytes,
+    )?;
+    let read_max_concurrency = optional_usize(
+        "MMLI_FLAT_BENCH_CONCURRENCY",
+        default_read_plan_config.max_concurrent_requests,
+    )?;
+    let read_plan_config = ReadPlanConfig::new(
+        read_gap_budget_bytes,
+        read_max_request_bytes,
+        read_max_concurrency,
+    )
+    .map_err(|error| error.to_string())?;
 
     eprintln!("flat-bench: loading and verifying pinned tensors");
     let documents = load_tensor(
@@ -619,8 +653,11 @@ async fn run_benchmark() -> BenchResult<()> {
         + resident.rows.len() * std::mem::size_of::<FlatRowMeta>()) as u64
         + flat_metadata_bytes;
 
-    eprintln!("flat-bench: running {QUERY_COUNT} warm queries at K={CANDIDATE_K}");
-    let read_plan_config = ReadPlanConfig::default();
+    eprintln!(
+        "flat-bench: running {query_count} warm queries at K={CANDIDATE_K}, \
+         gap_budget={read_gap_budget_bytes}, max_request={read_max_request_bytes}, \
+         concurrency={read_max_concurrency}, pipeline={pipeline_enabled}"
+    );
     let bounds = SegmentSearchBounds {
         max_resident_bytes: 64 * 1024 * 1024,
         max_cluster_bytes: 64 * 1024 * 1024,
@@ -635,27 +672,30 @@ async fn run_benchmark() -> BenchResult<()> {
     let mut hits_k700 = 0usize;
     let mut hits_k1000 = 0usize;
     let mut hits_k1500 = 0usize;
-    let mut per_query_hits = Vec::with_capacity(QUERY_COUNT);
-    let mut warm_ms = Vec::with_capacity(QUERY_COUNT);
-    let mut scan_ms = Vec::with_capacity(QUERY_COUNT);
-    let mut truth_ms = Vec::with_capacity(QUERY_COUNT);
-    let mut fetch_ms = Vec::with_capacity(QUERY_COUNT);
-    let mut score_ms = Vec::with_capacity(QUERY_COUNT);
-    let mut decode_ms = Vec::with_capacity(QUERY_COUNT);
-    let mut maxsim_ms = Vec::with_capacity(QUERY_COUNT);
+    let mut per_query_hits = Vec::with_capacity(query_count);
+    let mut per_query_top10_ids = Vec::with_capacity(query_count);
+    let mut warm_ms = Vec::with_capacity(query_count);
+    let mut scan_ms = Vec::with_capacity(query_count);
+    let mut truth_ms = Vec::with_capacity(query_count);
+    let mut fetch_ms = Vec::with_capacity(query_count);
+    let mut score_ms = Vec::with_capacity(query_count);
+    let mut decode_ms = Vec::with_capacity(query_count);
+    let mut maxsim_ms = Vec::with_capacity(query_count);
     let mut truth_score_workers = 0usize;
-    let mut truth_logical = Vec::with_capacity(QUERY_COUNT);
-    let mut truth_planned_requests = Vec::with_capacity(QUERY_COUNT);
-    let mut truth_planned_bytes = Vec::with_capacity(QUERY_COUNT);
-    let mut truth_request_waves = Vec::with_capacity(QUERY_COUNT);
+    let mut truth_logical = Vec::with_capacity(query_count);
+    let mut truth_logical_bytes = Vec::with_capacity(query_count);
+    let mut truth_planned_requests = Vec::with_capacity(query_count);
+    let mut truth_planned_bytes = Vec::with_capacity(query_count);
+    let mut truth_gap_waste_bytes = Vec::with_capacity(query_count);
+    let mut truth_request_waves = Vec::with_capacity(query_count);
     let observed_equals_planned = true;
     {
         let mut latencies = get_latency_ms.lock().expect("GET latency lock");
         latencies.clear();
-        latencies.reserve(QUERY_COUNT * CANDIDATE_K);
+        latencies.reserve(query_count * CANDIDATE_K);
     }
 
-    for query_index in 0..QUERY_COUNT {
+    for query_index in 0..query_count {
         let query_started = Instant::now();
         let scan_started = Instant::now();
         let order = flat_selection_order(&resident, &query_fdes[query_index]);
@@ -690,17 +730,6 @@ async fn run_benchmark() -> BenchResult<()> {
             .map_err(|error| error.to_string())?;
         let planned_request_count = plan.planned_request_count() as u64;
         let observed_before = get_requests.load(AtomicOrdering::Relaxed);
-        let fetch_started = Instant::now();
-        let truth_bytes = execute_read_plan(&store, &plan)
-            .await
-            .map_err(|error| error.to_string())?;
-        let fetch_elapsed = fetch_started.elapsed();
-        let observed_delta = get_requests.load(AtomicOrdering::Relaxed) - observed_before;
-        if observed_delta != planned_request_count {
-            return Err(format!(
-                "query {query_index}: observed {observed_delta} GETs, planned {planned_request_count}"
-            ));
-        }
         let request = SegmentSearchRequest {
             store: &store,
             bootstrap_cache: None,
@@ -714,17 +743,63 @@ async fn run_benchmark() -> BenchResult<()> {
             read_plan: &read_plan_config,
             bounds,
         };
-        let mut timing = TruthWaveTiming::default();
-        let score_started = Instant::now();
-        let mut rows = score_truth_wave(&request, candidates, &truth_bytes, Some(&mut timing))
-            .map_err(|error| error.to_string())?;
-        let score_elapsed = score_started.elapsed();
+        let (mut rows, logical_bytes, fetch_elapsed, score_elapsed, timing) = if pipeline_enabled {
+            let piped = execute_truth_wave_pipelined(&request, candidates, &plan)
+                .await
+                .map_err(|error| error.to_string())?;
+            (
+                piped.rows,
+                piped.logical_bytes,
+                piped.fetch_elapsed,
+                piped.score_elapsed,
+                piped.timing,
+            )
+        } else {
+            let fetch_started = Instant::now();
+            let truth_bytes = execute_read_plan(&store, &plan)
+                .await
+                .map_err(|error| error.to_string())?;
+            let fetch_elapsed = fetch_started.elapsed();
+            let logical_bytes = truth_bytes.iter().try_fold(0_u64, |total, bytes| {
+                total
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| "truth logical byte count overflowed u64".to_string())
+            })?;
+            let mut timing = TruthWaveTiming::default();
+            let score_started = Instant::now();
+            let rows = score_truth_wave(&request, candidates, &truth_bytes, Some(&mut timing))
+                .map_err(|error| error.to_string())?;
+            (
+                rows,
+                logical_bytes,
+                fetch_elapsed,
+                score_started.elapsed(),
+                timing,
+            )
+        };
         if truth_score_workers == 0 {
             truth_score_workers = timing.workers;
         } else if truth_score_workers != timing.workers {
             return Err(format!(
                 "truth score worker count changed from {truth_score_workers} to {}",
                 timing.workers
+            ));
+        }
+        // The flat frontier contains unique documents, so its matrix and
+        // attribute ranges do not overlap and physical excess is gap waste.
+        let gap_waste_bytes = plan
+            .planned_bytes()
+            .checked_sub(logical_bytes)
+            .ok_or_else(|| {
+                format!(
+                "query {query_index}: planned {} bytes but delivered {logical_bytes} logical bytes",
+                plan.planned_bytes()
+            )
+            })?;
+        let observed_delta = get_requests.load(AtomicOrdering::Relaxed) - observed_before;
+        if observed_delta != planned_request_count {
+            return Err(format!(
+                "query {query_index}: observed {observed_delta} GETs, planned {planned_request_count}"
             ));
         }
         rows.sort_by(compare_scored_rows);
@@ -748,6 +823,7 @@ async fn run_benchmark() -> BenchResult<()> {
         }
         hits_k1000 += final_hits;
         per_query_hits.push(final_hits as u64);
+        per_query_top10_ids.push(rows.iter().map(|row| row.id.clone()).collect());
         warm_ms.push(query_elapsed.as_secs_f64() * 1_000.0);
         scan_ms.push(scan_elapsed.as_secs_f64() * 1_000.0);
         truth_ms.push(truth_elapsed.as_secs_f64() * 1_000.0);
@@ -756,8 +832,10 @@ async fn run_benchmark() -> BenchResult<()> {
         decode_ms.push(timing.decode.as_secs_f64() * 1_000.0);
         maxsim_ms.push(timing.maxsim.as_secs_f64() * 1_000.0);
         truth_logical.push(truth_requests.len() as u64);
+        truth_logical_bytes.push(logical_bytes);
         truth_planned_requests.push(planned_request_count);
         truth_planned_bytes.push(plan.planned_bytes());
+        truth_gap_waste_bytes.push(gap_waste_bytes);
         truth_request_waves
             .push(planned_request_count.div_ceil(read_plan_config.max_concurrent_requests as u64));
         if (query_index + 1) % 200 == 0 {
@@ -769,9 +847,10 @@ async fn run_benchmark() -> BenchResult<()> {
         }
     }
 
-    if hits_k700 != EXPECTED_HITS_K700
-        || hits_k1000 != EXPECTED_HITS_K1000
-        || hits_k1500 != EXPECTED_HITS_K1500
+    if query_count == QUERY_COUNT
+        && (hits_k700 != EXPECTED_HITS_K700
+            || hits_k1000 != EXPECTED_HITS_K1000
+            || hits_k1500 != EXPECTED_HITS_K1500)
     {
         return Err(format!(
             "recall parity failed: K700 {hits_k700}/{EXPECTED_HITS_K700}, \
@@ -789,14 +868,15 @@ async fn run_benchmark() -> BenchResult<()> {
     }
     let truth_total_request_waves = truth_request_waves.iter().sum::<u64>();
 
-    eprintln!("flat-bench: running {FILTERED_QUERY_COUNT} filtered queries");
+    let filtered_query_count = FILTERED_QUERY_COUNT.min(query_count);
+    eprintln!("flat-bench: running {filtered_query_count} filtered queries");
     let filter = Filter::Eq {
         field: "color".to_string(),
         value: AttributeValue::String(FILTER_COLORS[0].to_string()),
     };
-    let mut filtered_planned = Vec::with_capacity(FILTERED_QUERY_COUNT);
+    let mut filtered_planned = Vec::with_capacity(filtered_query_count);
     let mut filtered_all_results_match = true;
-    for (query_index, query_fde) in query_fdes.iter().enumerate().take(FILTERED_QUERY_COUNT) {
+    for (query_index, query_fde) in query_fdes.iter().enumerate().take(filtered_query_count) {
         let order = flat_selection_order(&resident, query_fde);
         let candidates = order
             .iter()
@@ -815,15 +895,6 @@ async fn run_benchmark() -> BenchResult<()> {
             .map_err(|error| error.to_string())?;
         filtered_planned.push(plan.planned_request_count() as u64);
         let observed_before = get_requests.load(AtomicOrdering::Relaxed);
-        let truth_bytes = execute_read_plan(&store, &plan)
-            .await
-            .map_err(|error| error.to_string())?;
-        let observed_delta = get_requests.load(AtomicOrdering::Relaxed) - observed_before;
-        if observed_delta != plan.planned_request_count() as u64 {
-            return Err(format!(
-                "filtered query {query_index}: observed GETs diverge from the plan"
-            ));
-        }
         let request = SegmentSearchRequest {
             store: &store,
             bootstrap_cache: None,
@@ -837,8 +908,24 @@ async fn run_benchmark() -> BenchResult<()> {
             read_plan: &read_plan_config,
             bounds,
         };
-        let mut rows = score_truth_wave(&request, candidates, &truth_bytes, None)
-            .map_err(|error| error.to_string())?;
+        let mut rows = if pipeline_enabled {
+            execute_truth_wave_pipelined(&request, candidates, &plan)
+                .await
+                .map_err(|error| error.to_string())?
+                .rows
+        } else {
+            let truth_bytes = execute_read_plan(&store, &plan)
+                .await
+                .map_err(|error| error.to_string())?;
+            score_truth_wave(&request, candidates, &truth_bytes, None)
+                .map_err(|error| error.to_string())?
+        };
+        let observed_delta = get_requests.load(AtomicOrdering::Relaxed) - observed_before;
+        if observed_delta != plan.planned_request_count() as u64 {
+            return Err(format!(
+                "filtered query {query_index}: observed GETs diverge from the plan"
+            ));
+        }
         rows.sort_by(compare_scored_rows);
         rows.truncate(GOLD_PER_QUERY);
         for row in &rows {
@@ -856,17 +943,23 @@ async fn run_benchmark() -> BenchResult<()> {
     }
 
     let report = BenchReport {
-        schema_version: 1,
+        schema_version: 4,
         source_revision: "518aa23+flat-bench".to_string(),
         candidate_k: CANDIDATE_K,
+        read_gap_budget_bytes,
+        read_max_request_bytes,
+        read_max_concurrency,
+        pipeline_enabled,
         document_count: DOCUMENT_COUNT,
-        query_count: QUERY_COUNT,
-        gold_memberships: QUERY_COUNT * GOLD_PER_QUERY,
+        query_count,
+        gold_memberships: query_count * GOLD_PER_QUERY,
         hits_k700,
         hits_k1000,
         hits_k1500,
-        recall_k1000: hits_k1000 as f64 / (QUERY_COUNT * GOLD_PER_QUERY) as f64,
+        recall_k1000: hits_k1000 as f64 / (query_count * GOLD_PER_QUERY) as f64,
         per_query_hits_k1000: integer_summary(&per_query_hits),
+        per_query_hits_k1000_values: per_query_hits.clone(),
+        per_query_top10_ids,
         queries_below_8_of_10: per_query_hits.iter().filter(|&&hits| hits < 8).count(),
         queries_below_5_of_10: per_query_hits.iter().filter(|&&hits| hits < 5).count(),
         flat_artifact_bytes,
@@ -887,14 +980,16 @@ async fn run_benchmark() -> BenchResult<()> {
         truth_score_workers,
         truth_get_latency_ms: float_summary(&truth_get_latency_ms),
         truth_logical_ranges: integer_summary(&truth_logical),
+        truth_logical_bytes: integer_summary(&truth_logical_bytes),
         truth_planned_requests: integer_summary(&truth_planned_requests),
         truth_planned_bytes: integer_summary(&truth_planned_bytes),
+        truth_gap_waste_bytes: integer_summary(&truth_gap_waste_bytes),
         truth_request_waves: integer_summary(&truth_request_waves),
         truth_total_get_requests,
         truth_total_request_waves,
         observed_get_requests_equal_planned: observed_equals_planned,
         query_fde_encode_ms_mean,
-        filtered_queries: FILTERED_QUERY_COUNT,
+        filtered_queries: filtered_query_count,
         filtered_all_results_match,
         filtered_planned_requests: integer_summary(&filtered_planned),
         flat_artifact_sha256,
@@ -910,7 +1005,7 @@ async fn run_benchmark() -> BenchResult<()> {
         "phase9_flat_sq8 lane=text candidate_k={CANDIDATE_K} hits={hits_k1000}/{} \
          recall={:.6} warm_p50_ms={:.1} warm_p95_ms={:.1} \
          planned_bytes_p50={} artifact_bytes={flat_artifact_bytes} elapsed_ms={}",
-        QUERY_COUNT * GOLD_PER_QUERY,
+        query_count * GOLD_PER_QUERY,
         report.recall_k1000,
         report.warm_query_ms.p50,
         report.warm_query_ms.p95,
@@ -1218,6 +1313,25 @@ pub(super) fn required_path(name: &str) -> BenchResult<PathBuf> {
     env::var_os(name)
         .map(PathBuf::from)
         .ok_or_else(|| format!("{name} must be set"))
+}
+
+fn optional_usize(name: &str, default: usize) -> BenchResult<usize> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .map_err(|error| format!("invalid {name}={value:?}: {error}")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(format!("cannot read {name}: {error}")),
+    }
+}
+
+fn optional_one_flag(name: &str) -> BenchResult<bool> {
+    match env::var(name) {
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) => Err(format!("{name} must be 1 when set, got {value:?}")),
+        Err(env::VarError::NotPresent) => Ok(false),
+        Err(error) => Err(format!("cannot read {name}: {error}")),
+    }
 }
 
 pub(super) fn load_tensor(
