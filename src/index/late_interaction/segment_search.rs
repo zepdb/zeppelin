@@ -657,7 +657,8 @@ struct ReadyTruthCandidate {
 #[cfg(test)]
 struct ScoredReadyTruthChunk {
     rows: Vec<(usize, SegmentScoredRow)>,
-    score_elapsed: Duration,
+    first_score_started: Option<Instant>,
+    last_score_finished: Option<Instant>,
     timing: TruthWaveTiming,
 }
 
@@ -721,7 +722,8 @@ pub(crate) async fn execute_truth_wave_pipelined(
                     )?;
                     let mut rows = Vec::with_capacity(candidate_count.div_ceil(worker_count));
                     let mut decode_scratch = MatrixDecodeScratch::default();
-                    let mut score_elapsed = Duration::ZERO;
+                    let mut first_score_started = None;
+                    let mut last_score_finished = None;
                     let mut timing = TruthWaveTiming::default();
                     let mut first_error = None;
                     while let Some(ready) = receiver.blocking_recv() {
@@ -729,6 +731,7 @@ pub(crate) async fn execute_truth_wave_pipelined(
                             continue;
                         }
                         let score_started = Instant::now();
+                        first_score_started.get_or_insert(score_started);
                         match score_truth_candidate(
                             &exact_query,
                             matrix_dtype,
@@ -745,14 +748,15 @@ pub(crate) async fn execute_truth_wave_pipelined(
                             Ok(row) => rows.push((ready.candidate_index, row)),
                             Err(error) => first_error = Some(error),
                         }
-                        score_elapsed += score_started.elapsed();
+                        last_score_finished = Some(Instant::now());
                     }
                     if let Some(error) = first_error {
                         return Err(error);
                     }
                     Ok(ScoredReadyTruthChunk {
                         rows,
-                        score_elapsed,
+                        first_score_started,
+                        last_score_finished,
                         timing,
                     })
                 }));
@@ -829,11 +833,19 @@ pub(crate) async fn execute_truth_wave_pipelined(
     let scored_chunks = scoring_workers
         .await
         .map_err(|error| segment_error(format!("truth scoring worker failed: {error}")))??;
-    let score_elapsed = scored_chunks
+    let first_score_started = scored_chunks
         .iter()
-        .map(|chunk| chunk.score_elapsed)
-        .max()
-        .unwrap_or_default();
+        .filter_map(|chunk| chunk.first_score_started)
+        .min();
+    let last_score_finished = scored_chunks
+        .iter()
+        .filter_map(|chunk| chunk.last_score_finished)
+        .max();
+    let score_elapsed = match (first_score_started, last_score_finished) {
+        (Some(started), Some(finished)) => finished.duration_since(started),
+        (None, None) => Duration::ZERO,
+        _ => return Err(segment_error("truth scoring timing is incomplete")),
+    };
     let timing = TruthWaveTiming {
         decode: scored_chunks
             .iter()
