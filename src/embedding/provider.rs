@@ -7,11 +7,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use super::coordinator::MultiVectorEncoderResolver;
 use super::priority::QueryPriorityEncoder;
 use super::{
-    DeterministicDev, EmbeddingProfileRef, InputModality, MultiVectorEncoder,
-    MultiVectorEncoderProvider, MultiVectorEpoch, MultiVectorEpochId, PinnedWorker,
-    PinnedWorkerConfig, DETERMINISTIC_DEV_IMPLEMENTATION,
+    DeterministicDev, EmbeddingProfileRef, MultiVectorEncoder, MultiVectorEpoch,
+    MultiVectorEpochId, PinnedWorker, PinnedWorkerConfig, DETERMINISTIC_DEV_IMPLEMENTATION,
 };
 use crate::config::{MmliConfig, MmliWorkerConfig};
 use crate::error::{Result, ZeppelinError};
@@ -110,15 +110,15 @@ impl ConfiguredEncoderProvider {
 }
 
 #[async_trait]
-impl MultiVectorEncoderProvider for ConfiguredEncoderProvider {
-    async fn encoder_for(
+impl MultiVectorEncoderResolver for ConfiguredEncoderProvider {
+    fn mmli_config(&self) -> &MmliConfig {
+        &self.config
+    }
+
+    async fn resolve_encoder(
         &self,
-        namespace: &str,
-        accepted_modalities: &[InputModality],
         profile: &EmbeddingProfileRef,
     ) -> Result<Arc<dyn MultiVectorEncoder>> {
-        self.config
-            .validate_profile_for_namespace(namespace, accepted_modalities, profile)?;
         let mut state = self.state.lock().await;
         if state.closed {
             return Err(ZeppelinError::Validation(
@@ -158,7 +158,7 @@ impl MultiVectorEncoderProvider for ConfiguredEncoderProvider {
         Ok(encoder)
     }
 
-    async fn shutdown(&self) -> Result<()> {
+    async fn shutdown_inner(&self) -> Result<()> {
         let sessions = {
             let mut state = self.state.lock().await;
             state.closed = true;
@@ -209,13 +209,13 @@ mod tests {
     use object_store::memory::InMemory;
 
     use super::ConfiguredEncoderProvider;
-    use crate::config::MmliConfig;
+    use crate::config::{MmliConfig, MmliMatrixDtype};
     use crate::embedding::{
         ArtifactChecksum, EmbeddingProfileId, EmbeddingProfileRef, EncoderExecutionRef,
         ExactScorerVersion, FdeGenerationId, FdeRecipe, FdeTransformArtifactRef, InputModality,
-        MatrixDtype, MultiVectorEncoderProvider, MultiVectorEpoch, MultiVectorEpochId,
-        NormalizationRecipe, VectorTransformRecipe, DETERMINISTIC_DEV_IMPLEMENTATION,
-        DETERMINISTIC_DEV_VERSION,
+        MatrixDtype, MultiVectorEncoderProvider, MultiVectorEncoderRegistry, MultiVectorEpoch,
+        MultiVectorEpochId, NormalizationRecipe, VectorTransformRecipe,
+        DETERMINISTIC_DEV_IMPLEMENTATION, DETERMINISTIC_DEV_VERSION,
     };
     use crate::index::late_interaction::{
         FdeAlgorithmVersion, FdeParams, FinalProjection, InnerProjection,
@@ -335,5 +335,36 @@ mod tests {
             .err()
             .expect("missing worker config must reject");
         assert!(pinned_error.to_string().contains("[mmli.worker] is absent"));
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_namespace_matrix_dtype_mismatch() {
+        let config = MmliConfig {
+            text_matrix_dtype: MmliMatrixDtype::Int8G32,
+            ..MmliConfig::default()
+        };
+        let profile = profile(DETERMINISTIC_DEV_IMPLEMENTATION, None);
+        let registry = MultiVectorEncoderRegistry::new(&config);
+        registry
+            .register(Arc::new(
+                crate::embedding::DeterministicDev::new(true, &profile.epoch)
+                    .expect("dev encoder must construct"),
+            ))
+            .expect("dev encoder must register");
+
+        let error = registry
+            .encoder_for("registry-dtype-fence", &[InputModality::Text], &profile)
+            .await
+            .err()
+            .expect("registry resolution must enforce the namespace dtype fence");
+
+        assert!(matches!(error, crate::error::ZeppelinError::Validation(_)));
+        let message = error.to_string();
+        for expected in ["registry-dtype-fence", "f16", "int8_g32"] {
+            assert!(
+                message.contains(expected),
+                "expected {expected:?} in dtype fence error: {message}"
+            );
+        }
     }
 }

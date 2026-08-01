@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
-use zeppelin::config::Config;
+use zeppelin::config::{Config, MmliConfig};
 use zeppelin::embedding::{
     ArtifactChecksum, DeterministicDev, EmbeddingProfileId, EmbeddingProfileRef,
     EncoderExecutionRef, EncoderInputRef, EncoderQueryInput, EnrichmentCoordinator,
@@ -174,7 +174,7 @@ fn provider(
 ) -> (Arc<dyn MultiVectorEncoderProvider>, Arc<DeterministicDev>) {
     let dev =
         Arc::new(DeterministicDev::new(true, &profile.epoch).expect("dev encoder must construct"));
-    let registry = Arc::new(MultiVectorEncoderRegistry::new());
+    let registry = Arc::new(MultiVectorEncoderRegistry::new(&MmliConfig::default()));
     registry
         .register(dev.clone())
         .expect("dev encoder must register");

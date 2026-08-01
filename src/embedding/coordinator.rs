@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
+use crate::config::MmliConfig;
 use crate::embedding::transform::{apply_vector_transform, load_vector_transform_mean};
 use crate::embedding::{
     ArtifactChecksum, CandidateDocumentPooling, EmbeddingProfileRef, EncoderDocumentInput,
@@ -92,9 +93,32 @@ pub struct EnrichmentAdmissionReport {
     pub queue_full: bool,
 }
 
-/// Resolves one exact epoch to its owned encoder session.
 #[async_trait]
-pub trait MultiVectorEncoderProvider: Send + Sync {
+pub(super) trait MultiVectorEncoderResolver: Send + Sync {
+    fn mmli_config(&self) -> &MmliConfig;
+
+    async fn resolve_encoder(
+        &self,
+        profile: &EmbeddingProfileRef,
+    ) -> Result<Arc<dyn MultiVectorEncoder>>;
+
+    async fn shutdown_inner(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+mod private {
+    pub trait Sealed {}
+
+    impl<T> Sealed for T where T: super::MultiVectorEncoderResolver {}
+}
+
+/// Resolves one exact epoch to its owned encoder session.
+///
+/// Every adapter crosses the namespace matrix-dtype fence before its private
+/// resolver hook runs.
+#[async_trait]
+pub trait MultiVectorEncoderProvider: private::Sealed + Send + Sync {
     /// Resolve the encoder selected by this namespace's exact validated profile.
     async fn encoder_for(
         &self,
@@ -104,22 +128,47 @@ pub trait MultiVectorEncoderProvider: Send + Sync {
     ) -> Result<Arc<dyn MultiVectorEncoder>>;
 
     /// Stop owned sessions after the coordinator executor has drained.
+    async fn shutdown(&self) -> Result<()>;
+}
+
+#[async_trait]
+impl<T> MultiVectorEncoderProvider for T
+where
+    T: MultiVectorEncoderResolver,
+{
+    async fn encoder_for(
+        &self,
+        namespace: &str,
+        accepted_modalities: &[InputModality],
+        profile: &EmbeddingProfileRef,
+    ) -> Result<Arc<dyn MultiVectorEncoder>> {
+        self.mmli_config().validate_profile_for_namespace(
+            namespace,
+            accepted_modalities,
+            profile,
+        )?;
+        self.resolve_encoder(profile).await
+    }
+
     async fn shutdown(&self) -> Result<()> {
-        Ok(())
+        self.shutdown_inner().await
     }
 }
 
 /// Explicit epoch-keyed registry used by tests and fixed local deployments.
-#[derive(Default)]
 pub struct MultiVectorEncoderRegistry {
+    config: MmliConfig,
     encoders: RwLock<HashMap<MultiVectorEpochId, Arc<dyn MultiVectorEncoder>>>,
 }
 
 impl MultiVectorEncoderRegistry {
     /// Construct an empty fail-loud registry.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(config: &MmliConfig) -> Self {
+        Self {
+            config: config.clone(),
+            encoders: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Register one encoder under the exact epoch it reports.
@@ -141,14 +190,15 @@ impl MultiVectorEncoderRegistry {
 }
 
 #[async_trait]
-impl MultiVectorEncoderProvider for MultiVectorEncoderRegistry {
-    async fn encoder_for(
+impl MultiVectorEncoderResolver for MultiVectorEncoderRegistry {
+    fn mmli_config(&self) -> &MmliConfig {
+        &self.config
+    }
+
+    async fn resolve_encoder(
         &self,
-        _namespace: &str,
-        accepted_modalities: &[InputModality],
         profile: &EmbeddingProfileRef,
     ) -> Result<Arc<dyn MultiVectorEncoder>> {
-        profile.validate_for_modalities(accepted_modalities)?;
         let encoder = self
             .encoders
             .read()

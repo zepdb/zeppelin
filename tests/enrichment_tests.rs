@@ -8,6 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::Barrier;
 use uuid::Uuid;
+use zeppelin::config::MmliConfig;
 use zeppelin::embedding::{
     ArtifactChecksum, DeterministicDev, EmbeddingProfileId, EmbeddingProfileRef,
     EncoderDocumentInput, EncoderExecutionRef, EncoderInputRef, EncoderQueryInput,
@@ -159,7 +160,7 @@ async fn setup_profile(
 }
 
 fn provider(profile: &EmbeddingProfileRef) -> Arc<dyn MultiVectorEncoderProvider> {
-    let registry = Arc::new(MultiVectorEncoderRegistry::new());
+    let registry = Arc::new(MultiVectorEncoderRegistry::new(&MmliConfig::default()));
     registry
         .register(Arc::new(
             DeterministicDev::new(true, &profile.epoch).expect("dev encoder must construct"),
@@ -596,7 +597,7 @@ async fn deterministic_poison_is_durable_and_does_not_stop_later_work() {
         .await
         .expect("mixed poison fixture append must succeed");
 
-    let registry = Arc::new(MultiVectorEncoderRegistry::new());
+    let registry = Arc::new(MultiVectorEncoderRegistry::new(&MmliConfig::default()));
     registry
         .register(Arc::new(RecoverablePoisonEncoder {
             inner: DeterministicDev::new(true, &profile.epoch).expect("dev encoder must construct"),
@@ -702,7 +703,7 @@ async fn stale_output_keeps_a_hole_and_encoding_holds_no_lease() {
     let entered = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
     let encode_calls = Arc::new(AtomicUsize::new(0));
-    let registry = Arc::new(MultiVectorEncoderRegistry::new());
+    let registry = Arc::new(MultiVectorEncoderRegistry::new(&MmliConfig::default()));
     registry
         .register(Arc::new(FirstCallGateEncoder {
             inner: DeterministicDev::new(true, &profile.epoch).expect("dev encoder must construct"),
@@ -885,7 +886,7 @@ async fn bounded_discovery_skips_settled_history_without_input_wal_gets() {
     let (counted_store, counter) = counting_store(&harness.store);
     let entered = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
-    let registry = Arc::new(MultiVectorEncoderRegistry::new());
+    let registry = Arc::new(MultiVectorEncoderRegistry::new(&MmliConfig::default()));
     registry
         .register(Arc::new(FirstCallGateEncoder {
             inner: DeterministicDev::new(true, &profile.epoch).expect("dev encoder must construct"),
@@ -994,7 +995,7 @@ async fn exhausted_publication_cas_does_not_reencode_terminal_source_recipe() {
         toggle_cas_precondition_failure_matching(&harness.store, "/manifest.json");
     cas_failures.enable();
     let encode_calls = Arc::new(AtomicUsize::new(0));
-    let registry = Arc::new(MultiVectorEncoderRegistry::new());
+    let registry = Arc::new(MultiVectorEncoderRegistry::new(&MmliConfig::default()));
     registry
         .register(Arc::new(CountingEncoder {
             inner: DeterministicDev::new(true, &profile.epoch).expect("dev encoder must construct"),
