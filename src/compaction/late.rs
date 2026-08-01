@@ -132,6 +132,9 @@ impl Compactor {
                     namespace,
                     "late compaction materializes a foreign-backed branch view"
                 );
+                crate::metrics::LATE_COMPACTION_MODE_TOTAL
+                    .with_label_values(&[namespace, "materialize"])
+                    .inc();
             } else {
                 return Ok(CompactionResult {
                     segment_id: None,
@@ -492,6 +495,9 @@ impl Compactor {
                             carried_blocks = carried.len(),
                             "late compaction reuses untouched matrix blocks and codes"
                         );
+                        crate::metrics::LATE_COMPACTION_MODE_TOTAL
+                            .with_label_values(&[namespace, "incremental"])
+                            .inc();
                         (baseline, carried, calibration)
                     }
                     IncrementalDecision::Full { reason } => {
@@ -501,6 +507,9 @@ impl Compactor {
                             reason,
                             "late compaction performs a full rebuild"
                         );
+                        crate::metrics::LATE_COMPACTION_MODE_TOTAL
+                            .with_label_values(&[namespace, "full"])
+                            .inc();
                         let baseline = load_old_segment_rows(
                             &self.store,
                             segment,

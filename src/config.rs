@@ -324,7 +324,10 @@ pub struct MmliSegmentConfig {
     /// Maximum changed-row fraction (changed ids over the previous segment's
     /// rows) for incremental flat compaction; larger churn or `0.0` forces a
     /// full rebuild with SQ8 recalibration. Mirrors the dense
-    /// `retrain_imbalance_threshold` shape with its own value.
+    /// `retrain_imbalance_threshold` shape with its own value. Default `0.2`
+    /// per the W10.2 equivalence gate (`tasks/MMLI-2/results/hardening.md`):
+    /// carried codes stay bit-identical to a full rebuild, so the bound
+    /// limits calibration drift, not correctness.
     pub incremental_max_changed_fraction: f32,
 }
 
@@ -1298,6 +1301,7 @@ mod tests {
         config.mmli.segment.read_gap_budget_bytes = 0;
         config.mmli.segment.read_max_request_bytes = 0;
         config.mmli.segment.read_max_concurrency = 0;
+        config.mmli.segment.incremental_max_changed_fraction = 1.0;
 
         let error = config.validate().unwrap_err().to_string();
         for field in [
@@ -1319,6 +1323,7 @@ mod tests {
             "mmli.segment.read_gap_budget_bytes",
             "mmli.segment.read_max_request_bytes",
             "mmli.segment.read_max_concurrency",
+            "mmli.segment.incremental_max_changed_fraction",
         ] {
             assert!(
                 error.contains(field),
@@ -3611,6 +3616,19 @@ impl Config {
         if self.mmli.segment.max_cluster_object_bytes > self.mmli.segment.read_max_request_bytes {
             violations.push(
                 "mmli.segment.max_cluster_object_bytes must not exceed read_max_request_bytes"
+                    .to_string(),
+            );
+        }
+        if !self
+            .mmli
+            .segment
+            .incremental_max_changed_fraction
+            .is_finite()
+            || self.mmli.segment.incremental_max_changed_fraction < 0.0
+            || self.mmli.segment.incremental_max_changed_fraction >= 1.0
+        {
+            violations.push(
+                "mmli.segment.incremental_max_changed_fraction must be finite and in [0.0, 1.0)"
                     .to_string(),
             );
         }

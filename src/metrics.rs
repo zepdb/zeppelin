@@ -74,6 +74,14 @@ mod inner {
             "Records durably quarantined after deterministic semantic-enrichment rejection",
             &["namespace"]
         ).unwrap();
+        /// Late compaction build decisions: `incremental` (carried blocks and
+        /// frozen calibration), `full` (recalibrating rebuild), or
+        /// `materialize` (foreign-backed branch view rebuilt target-owned).
+        pub static ref LATE_COMPACTION_MODE_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_late_compaction_mode_total",
+            "Late-interaction compaction build decisions by mode",
+            &["namespace", "mode"]
+        ).unwrap();
         /// Cache lookups partitioned by the resulting hit or miss classification.
         pub static ref CACHE_HITS_TOTAL: IntCounterVec = register_int_counter_vec!(
             "zeppelin_cache_hits_total", "Cache hits", &["result"]
