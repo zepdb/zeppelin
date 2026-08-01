@@ -29,12 +29,12 @@ use super::matrix_artifact::{build_matrix_blocks, MatrixBlockInputRow};
 /// Candidate-kind build selection for one full segment rebuild.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum LateCandidateBuild {
-    /// Routed IVF clusters (retained for the future scale phase).
+    /// Routed IVF clusters, retained for the future scale phase. No
+    /// production caller constructs this variant in the flat-SQ8 regime;
+    /// tests keep the build arm exercised.
+    #[allow(dead_code)]
     Ivf(LateCandidateBuildConfig),
     /// Resident exhaustive flat-SQ8 artifact (production for this regime).
-    // dead_code allow is transitional: the query-path slice flips compaction
-    // to this variant next; the allow is removed there.
-    #[allow(dead_code)]
     FlatSq8(LateFlatCandidateBuildConfig),
 }
 

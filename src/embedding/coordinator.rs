@@ -1404,7 +1404,11 @@ fn terminal_post_encode_error(error: ZeppelinError) -> ZeppelinError {
     ))
 }
 
-fn apply_candidate_document_pooling(
+/// Apply the profile-pinned candidate pooling exactly as enrichment does.
+///
+/// Shared with late compaction's flat-segment baseline rebuild so recomputed
+/// candidate FDEs follow the identical pooling seam.
+pub(crate) fn apply_candidate_document_pooling(
     embedding: &MultiVectorEmbedding,
     recipe: CandidateDocumentPooling,
 ) -> Result<MultiVectorEmbedding> {

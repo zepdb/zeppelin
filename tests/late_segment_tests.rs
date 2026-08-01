@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use uuid::Uuid;
+use zeppelin::cache::DiskCache;
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{Config, MmliConfig, MmliSegmentConfig};
 use zeppelin::embedding::{
@@ -457,8 +458,22 @@ async fn run_query(
     mmli: &MmliConfig,
     filter: Option<&Filter>,
 ) -> LateInteractionSearchOutput {
+    run_query_cached(store, None, namespace, manifest, provider, mmli, filter).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_query_cached(
+    store: &ZeppelinStore,
+    bootstrap_cache: Option<&DiskCache>,
+    namespace: &str,
+    manifest: Manifest,
+    provider: &dyn MultiVectorEncoderProvider,
+    mmli: &MmliConfig,
+    filter: Option<&Filter>,
+) -> LateInteractionSearchOutput {
     run_query_with_text(
         store,
+        bootstrap_cache,
         namespace,
         manifest,
         provider,
@@ -473,6 +488,7 @@ async fn run_query(
 #[allow(clippy::too_many_arguments)]
 async fn run_query_with_text(
     store: &ZeppelinStore,
+    bootstrap_cache: Option<&DiskCache>,
     namespace: &str,
     manifest: Manifest,
     provider: &dyn MultiVectorEncoderProvider,
@@ -483,7 +499,7 @@ async fn run_query_with_text(
 ) -> LateInteractionSearchOutput {
     search(LateInteractionSearchRequest {
         store,
-        bootstrap_cache: None,
+        bootstrap_cache,
         encoder_provider: provider,
         namespace,
         manifest,
@@ -515,6 +531,7 @@ async fn measure_segment_recall(
     for (query, expected) in queries.iter().zip(gold) {
         let output = run_query_with_text(
             store,
+            None,
             namespace,
             manifest.clone(),
             provider,
@@ -650,10 +667,15 @@ async fn late_segment_full_rebuild_lifecycle_matches_oracle_and_traces_two_waves
         .iter()
         .any(|source| source.key == source_key));
 
+    let cache_dir = tempfile::tempdir().expect("bootstrap cache dir");
+    let bootstrap_cache =
+        DiskCache::new_with_max_bytes(cache_dir.path().join("cache"), 64 * 1024 * 1024)
+            .expect("bootstrap cache");
     let (counted_store, counter) = counting_store(&harness.store);
     counter.reset();
-    let first_segment_query = run_query(
+    let first_segment_query = run_query_cached(
         &counted_store,
+        Some(&bootstrap_cache),
         &namespace,
         after_first.clone(),
         provider.as_ref(),
@@ -665,20 +687,19 @@ async fn late_segment_full_rebuild_lifecycle_matches_oracle_and_traces_two_waves
     let first_trace = first_segment_query
         .read_trace
         .expect("segment query must expose its two-wave trace");
-    assert!(first_trace.candidate_wave.logical_ranges > 0);
-    assert!(first_trace.candidate_wave.planned_requests > 0);
+    assert_eq!(first_trace.candidate_wave.logical_ranges, 0);
+    assert_eq!(first_trace.candidate_wave.planned_requests, 0);
+    assert_eq!(first_trace.candidate_wave.planned_bytes, 0);
     assert!(first_trace.truth_wave.logical_ranges > 0);
     assert!(first_trace.truth_wave.planned_requests > 0);
-    assert!(
-        first_trace.candidate_wave.planned_requests <= first_trace.candidate_wave.logical_ranges
-    );
     assert!(first_trace.truth_wave.planned_requests <= first_trace.truth_wave.logical_ranges);
-    let observed_candidate_gets = counter.gets_matching("candidate-cluster-");
-    let observed_truth_gets = counter.gets_matching("/matrix_") + counter.gets_matching("/attrs_");
     assert_eq!(
-        observed_candidate_gets,
-        first_trace.candidate_wave.planned_requests as u64
+        counter.gets_matching("flat-sq8-"),
+        1,
+        "cold wave one must hydrate the flat artifact exactly once"
     );
+    assert_eq!(counter.gets_matching("candidate-cluster-"), 0);
+    let observed_truth_gets = counter.gets_matching("/matrix_") + counter.gets_matching("/attrs_");
     assert_eq!(
         observed_truth_gets,
         first_trace.truth_wave.planned_requests as u64
@@ -697,8 +718,9 @@ async fn late_segment_full_rebuild_lifecycle_matches_oracle_and_traces_two_waves
         value: AttributeValue::String("blue".to_string()),
     };
     counter.reset();
-    let filtered = run_query(
+    let filtered = run_query_cached(
         &counted_store,
+        Some(&bootstrap_cache),
         &namespace,
         after_first.clone(),
         provider.as_ref(),
@@ -716,15 +738,13 @@ async fn late_segment_full_rebuild_lifecycle_matches_oracle_and_traces_two_waves
     let filtered_trace = filtered
         .read_trace
         .expect("filtered segment query must retain the two-wave trace");
-    assert_eq!(
-        filtered_trace.candidate_wave.planned_requests,
-        first_trace.candidate_wave.planned_requests
-    );
+    assert_eq!(filtered_trace.candidate_wave.planned_requests, 0);
     assert!(filtered_trace.truth_wave.planned_requests > 0);
     assert!(filtered_trace.truth_wave.planned_requests <= first_trace.truth_wave.planned_requests);
     assert_eq!(
-        counter.gets_matching("candidate-cluster-"),
-        filtered_trace.candidate_wave.planned_requests as u64
+        counter.gets_matching("flat-sq8-"),
+        0,
+        "warm wave one must perform zero candidate reads"
     );
     assert_eq!(
         counter.gets_matching("/matrix_") + counter.gets_matching("/attrs_"),
@@ -822,7 +842,10 @@ async fn late_segment_dev_recall_tripwire_and_full_probe_converge() {
     const LAB_TRANSFORM_SEED: u64 = 5_570_192_190_543_495_170;
     const PREPROCESSING_DIGEST: &[u8] = b"phase-9-dev-recall-v2";
     const DOCUMENT_COUNT: usize = 5_000;
-    const PINNED_TRIPWIRE_HITS: usize = 163;
+    // Re-pinned 2026-07-31 on the flat-SQ8 candidate path at the production
+    // defaults (exhaustive SQ8, candidate_k 1000). The prior IVF-routed pin
+    // (nlist 256 / nprobe 16 / K 537) was 163.
+    const PINNED_TRIPWIRE_HITS: usize = 260;
 
     let harness = TestHarness::new().await;
     let namespace = harness.artifact_origin_namespace("late-segment-recall");
@@ -865,12 +888,13 @@ async fn late_segment_dev_recall_tripwire_and_full_probe_converge() {
     };
     assert_eq!(routed_mmli.segment.nlist, 256);
     assert_eq!(routed_mmli.segment.probe_budget, 16);
-    assert_eq!(routed_mmli.segment.candidate_k, 537);
+    assert_eq!(routed_mmli.segment.candidate_k, 1000);
     let overlay_manifest = read_manifest(&harness.store, &namespace, incarnation).await;
     let mut gold = Vec::with_capacity(queries.len());
     for query in &queries {
         let output = run_query_with_text(
             &harness.store,
+            None,
             &namespace,
             overlay_manifest.clone(),
             provider.as_ref(),
@@ -938,6 +962,7 @@ async fn late_segment_dev_recall_tripwire_and_full_probe_converge() {
     for (query, expected) in queries.iter().zip(&gold) {
         let output = run_query_with_text(
             &harness.store,
+            None,
             &namespace,
             convergence_manifest.clone(),
             provider.as_ref(),
@@ -998,6 +1023,14 @@ struct RealReplayLane {
     diagnostics_file: &'static str,
     candidate_k: usize,
     recall_gate: f64,
+    /// D9.5 parity tripwire: the exact measured hit count at the lane's
+    /// operating point. Any change requires a recorded cause (encoder,
+    /// transform, or quantizer revision). `None` until first passing run.
+    expected_hits: Option<usize>,
+    /// D9.5 tail tripwire: maximum queries below 8/10 golds (`None` until a
+    /// first passing run pins the lane's tails). Queries below 5/10 must
+    /// always be zero once pinned.
+    max_queries_below_8: Option<usize>,
     candidate_pooling: CandidateDocumentPooling,
     center_candidates: bool,
 }
@@ -1011,8 +1044,10 @@ fn real_replay_lane(value: &str) -> RealReplayLane {
             documents_sha256: "1960f7bc88a667beb76b6e15a750469e615aafe9a925928c23f7c546d12cfe22",
             queries_sha256: "cefbff5713a3944f4007676b243985f393f87a7a7579bb5cba6ca09899b0aa0c",
             diagnostics_file: "lab-diagnostics.json",
-            candidate_k: 537,
-            recall_gate: 0.95,
+            candidate_k: 1_000,
+            recall_gate: 0.975,
+            expected_hits: Some(10_869),
+            max_queries_below_8: Some(12),
             candidate_pooling: CandidateDocumentPooling::Identity,
             center_candidates: true,
         },
@@ -1025,6 +1060,8 @@ fn real_replay_lane(value: &str) -> RealReplayLane {
             diagnostics_file: "lab-visual-diagnostics.json",
             candidate_k: 300,
             recall_gate: 0.90,
+            expected_hits: None,
+            max_queries_below_8: None,
             candidate_pooling: CandidateDocumentPooling::ContiguousMean { factor: 2 },
             center_candidates: false,
         },
@@ -1158,16 +1195,26 @@ fn real_replay_provider(
 struct RealReplayMeasurement {
     hits: usize,
     gold_count: usize,
+    per_query_hits: Vec<usize>,
     mean_planned_bytes: u64,
     mean_planned_requests: u64,
     p50_millis: u128,
     p95_millis: u128,
-    frontiers: Vec<BTreeSet<String>>,
-    final_top_tens: Vec<BTreeSet<String>>,
 }
 
+impl RealReplayMeasurement {
+    fn queries_below(&self, threshold: usize) -> usize {
+        self.per_query_hits
+            .iter()
+            .filter(|&&hits| hits < threshold)
+            .count()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn measure_real_replay(
     store: &ZeppelinStore,
+    bootstrap_cache: &DiskCache,
     namespace: &str,
     manifest: &Manifest,
     provider: &dyn MultiVectorEncoderProvider,
@@ -1176,53 +1223,50 @@ async fn measure_real_replay(
     gold: &[Vec<String>],
 ) -> RealReplayMeasurement {
     let mut hits = 0_usize;
+    let mut per_query_hits = Vec::with_capacity(queries.len());
     let mut planned_bytes = 0_u64;
     let mut planned_requests = 0_u64;
     let mut latencies = Vec::with_capacity(queries.len());
-    let mut frontiers = Vec::with_capacity(queries.len());
-    let mut final_top_tens = Vec::with_capacity(queries.len());
     for (query, expected) in queries.iter().zip(gold) {
         let started = Instant::now();
         let output = run_query_with_text(
             store,
+            Some(bootstrap_cache),
             namespace,
             manifest.clone(),
             provider,
             mmli,
             None,
             query,
-            mmli.segment.candidate_k,
+            10,
         )
         .await;
         latencies.push(started.elapsed().as_millis());
         let trace = output
             .read_trace
-            .expect("real matrix replay must use both planned waves");
+            .expect("real matrix replay must trace its planned waves");
+        assert_eq!(
+            trace.candidate_wave.planned_requests, 0,
+            "flat wave one must plan zero per-query candidate reads"
+        );
         planned_bytes = planned_bytes
-            .checked_add(trace.candidate_wave.planned_bytes)
-            .and_then(|bytes| bytes.checked_add(trace.truth_wave.planned_bytes))
+            .checked_add(trace.truth_wave.planned_bytes)
             .expect("planned replay bytes must not overflow");
         planned_requests = planned_requests
-            .checked_add(trace.candidate_wave.planned_requests as u64)
-            .and_then(|requests| requests.checked_add(trace.truth_wave.planned_requests as u64))
+            .checked_add(trace.truth_wave.planned_requests as u64)
             .expect("planned replay requests must not overflow");
-        let frontier = output
-            .results
-            .iter()
-            .map(|result| result.id.clone())
-            .collect::<BTreeSet<_>>();
         let final_top_ten = output
             .results
             .iter()
             .take(10)
             .map(|result| result.id.clone())
             .collect::<BTreeSet<_>>();
-        hits += expected
+        let query_hits = expected
             .iter()
             .filter(|id| final_top_ten.contains(id.as_str()))
             .count();
-        frontiers.push(frontier);
-        final_top_tens.push(final_top_ten);
+        hits += query_hits;
+        per_query_hits.push(query_hits);
     }
     latencies.sort_unstable();
     let percentile = |percent: usize| {
@@ -1232,38 +1276,24 @@ async fn measure_real_replay(
     RealReplayMeasurement {
         hits,
         gold_count: gold.iter().map(Vec::len).sum(),
+        per_query_hits,
         mean_planned_bytes: planned_bytes / queries.len() as u64,
         mean_planned_requests: planned_requests / queries.len() as u64,
         p50_millis: percentile(50),
         p95_millis: percentile(95),
-        frontiers,
-        final_top_tens,
     }
-}
-
-async fn trigger_real_replay_rebuild(store: &ZeppelinStore, namespace: &str, label: &str) {
-    WalWriter::new(store.clone())
-        .append_retrieval_units(
-            namespace,
-            Vec::new(),
-            vec![format!("phase9-real-replay-rebuild-{label}")],
-            Vec::new(),
-        )
-        .await
-        .expect("real replay rebuild trigger must append");
 }
 
 fn print_real_replay_measurement(
     lane: RealReplayLane,
-    arm: &str,
     mmli: &MmliConfig,
     measurement: &RealReplayMeasurement,
     compaction_millis: u128,
 ) {
     let recall = measurement.hits as f64 / measurement.gold_count as f64;
     println!(
-        "phase9_real_matrix_recall lane={} arm={arm} hits={}/{} recall={recall:.6} \
-         gate={:.6} passed={} nlist={} nprobe={} candidate_k={} \
+        "phase9_real_matrix_recall lane={} kind=flat_sq8 hits={}/{} recall={recall:.6} \
+         gate={:.6} passed={} candidate_k={} min_hits={} below_8={} below_5={} \
          mean_planned_bytes={} mean_planned_requests={} p50_ms={} p95_ms={} \
          compaction_ms={compaction_millis}",
         lane.name,
@@ -1271,9 +1301,15 @@ fn print_real_replay_measurement(
         measurement.gold_count,
         lane.recall_gate,
         recall >= lane.recall_gate,
-        mmli.segment.nlist,
-        mmli.segment.probe_budget,
         mmli.segment.candidate_k,
+        measurement
+            .per_query_hits
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or(0),
+        measurement.queries_below(8),
+        measurement.queries_below(5),
         measurement.mean_planned_bytes,
         measurement.mean_planned_requests,
         measurement.p50_millis,
@@ -1369,147 +1405,73 @@ async fn late_segment_recall_matches_real_lab_matrices() {
     )
     .await;
 
-    let mut full_probe = MmliConfig::default();
-    full_probe.segment.nlist = 256;
-    full_probe.segment.probe_budget = full_probe.segment.nlist;
-    full_probe.segment.candidate_k = lane.candidate_k;
+    let mut mmli = MmliConfig::default();
+    mmli.segment.candidate_k = lane.candidate_k;
+    let operating_point_is_default =
+        mmli.segment.candidate_k == MmliSegmentConfig::default().candidate_k;
     let started = Instant::now();
-    compactor(&harness.store, &full_probe)
+    compactor(&harness.store, &mmli)
         .compact(&namespace)
         .await
-        .expect("full-probe real matrix compaction must succeed");
-    let full_probe_compaction_millis = started.elapsed().as_millis();
+        .expect("flat real matrix compaction must succeed");
+    let compaction_millis = started.elapsed().as_millis();
     let manifest = read_manifest(&harness.store, &namespace, incarnation).await;
-    let full_probe_measurement = measure_real_replay(
+    let cache_dir = tempfile::tempdir().expect("replay bootstrap cache dir");
+    let bootstrap_cache =
+        DiskCache::new_with_max_bytes(cache_dir.path().join("cache"), 256 * 1024 * 1024)
+            .expect("replay bootstrap cache");
+    let measurement = measure_real_replay(
         &harness.store,
+        &bootstrap_cache,
         &namespace,
         &manifest,
         provider.as_ref(),
-        &full_probe,
+        &mmli,
         &query_texts,
         &gold,
     )
     .await;
-    print_real_replay_measurement(
-        lane,
-        "full_probe",
-        &full_probe,
-        &full_probe_measurement,
-        full_probe_compaction_millis,
-    );
-
-    trigger_real_replay_rebuild(&harness.store, &namespace, "routed-operating-point").await;
-    let mut routed = full_probe.clone();
-    routed.segment.probe_budget = 16;
-    let routed_operating_point_is_pinned = routed.segment.nlist == 256
-        && routed.segment.probe_budget == 16
-        && routed.segment.candidate_k == lane.candidate_k;
-    let started = Instant::now();
-    compactor(&harness.store, &routed)
-        .compact(&namespace)
-        .await
-        .expect("routed real matrix compaction must succeed");
-    let routed_compaction_millis = started.elapsed().as_millis();
-    let manifest = read_manifest(&harness.store, &namespace, incarnation).await;
-    let routed_measurement = measure_real_replay(
-        &harness.store,
-        &namespace,
-        &manifest,
-        provider.as_ref(),
-        &routed,
-        &query_texts,
-        &gold,
-    )
-    .await;
-    print_real_replay_measurement(
-        lane,
-        "routed",
-        &routed,
-        &routed_measurement,
-        routed_compaction_millis,
-    );
-
-    trigger_real_replay_rebuild(&harness.store, &namespace, "routing-containment").await;
-    let mut containment = routed.clone();
-    containment.segment.candidate_k = lane.document_count;
-    let started = Instant::now();
-    compactor(&harness.store, &containment)
-        .compact(&namespace)
-        .await
-        .expect("routing-containment compaction must succeed");
-    let containment_compaction_millis = started.elapsed().as_millis();
-    let manifest = read_manifest(&harness.store, &namespace, incarnation).await;
-    let containment_measurement = measure_real_replay(
-        &harness.store,
-        &namespace,
-        &manifest,
-        provider.as_ref(),
-        &containment,
-        &query_texts,
-        &gold,
-    )
-    .await;
-    print_real_replay_measurement(
-        lane,
-        "routing_containment",
-        &containment,
-        &containment_measurement,
-        containment_compaction_millis,
-    );
-
-    let mut routing_losses = 0_usize;
-    let mut frontier_losses = 0_usize;
-    let mut rerank_losses = 0_usize;
-    let mut recovered = 0_usize;
-    for (((expected, routed_frontier), routed_top_ten), containment_frontier) in gold
-        .iter()
-        .zip(&routed_measurement.frontiers)
-        .zip(&routed_measurement.final_top_tens)
-        .zip(&containment_measurement.frontiers)
-    {
-        for id in expected {
-            if !containment_frontier.contains(id) {
-                routing_losses += 1;
-            } else if !routed_frontier.contains(id) {
-                frontier_losses += 1;
-            } else if !routed_top_ten.contains(id) {
-                rerank_losses += 1;
-            } else {
-                recovered += 1;
-            }
-        }
-    }
-    let attributed = routing_losses + frontier_losses + rerank_losses + recovered;
-    println!(
-        "phase9_real_matrix_loss_attribution lane={} golds={attributed} routing={} \
-         frontier={} rerank={} recovered={recovered}",
-        lane.name, routing_losses, frontier_losses, rerank_losses,
-    );
+    print_real_replay_measurement(lane, &mmli, &measurement, compaction_millis);
 
     harness.cleanup_artifact_origin_namespace(&namespace).await;
-    let full_probe_recall =
-        full_probe_measurement.hits as f64 / full_probe_measurement.gold_count as f64;
-    let routed_recall = routed_measurement.hits as f64 / routed_measurement.gold_count as f64;
+    let recall = measurement.hits as f64 / measurement.gold_count as f64;
     assert!(
         transform_checksum_matches,
         "real replay FDE transform checksum differed from Phase 2"
     );
+    if lane.name == "text" {
+        assert!(
+            operating_point_is_default,
+            "text lane must measure the production default candidate_k"
+        );
+    }
     assert!(
-        routed_operating_point_is_pinned,
-        "real replay routed arm did not use the frozen operating point"
-    );
-    assert_eq!(attributed, routed_measurement.gold_count);
-    assert_eq!(rerank_losses, 0, "exact rerank dropped an admitted gold");
-    assert!(
-        full_probe_recall >= lane.recall_gate,
-        "{} full-probe recall {full_probe_recall:.6} missed gate {:.6}",
+        recall >= lane.recall_gate,
+        "{} flat recall {recall:.6} missed gate {:.6}",
         lane.name,
         lane.recall_gate
     );
-    assert!(
-        routed_recall >= lane.recall_gate,
-        "{} routed recall {routed_recall:.6} missed gate {:.6}",
-        lane.name,
-        lane.recall_gate
-    );
+    if let Some(expected_hits) = lane.expected_hits {
+        assert_eq!(
+            measurement.hits, expected_hits,
+            "{} parity tripwire: measured hits changed without a recorded \
+             encoder, transform, or quantizer revision (D9.5)",
+            lane.name
+        );
+    }
+    if let Some(max_below_8) = lane.max_queries_below_8 {
+        assert!(
+            measurement.queries_below(8) <= max_below_8,
+            "{} tail tripwire: {} queries below 8/10 exceeds pinned {} (D9.5)",
+            lane.name,
+            measurement.queries_below(8),
+            max_below_8
+        );
+        assert_eq!(
+            measurement.queries_below(5),
+            0,
+            "{} tail tripwire: no query may fall below 5/10 golds (D9.5)",
+            lane.name
+        );
+    }
 }

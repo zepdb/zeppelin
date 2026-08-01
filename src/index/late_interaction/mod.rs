@@ -7,9 +7,6 @@
 mod attribute_artifact;
 mod candidate;
 mod fde;
-// dead_code allow is transitional: the build/section/query slices that consume
-// this codec land next; the allow is removed when the query path wires it in.
-#[allow(dead_code)]
 mod flat_candidate;
 mod matrix;
 mod matrix_artifact;
@@ -39,9 +36,8 @@ pub use search::{
 };
 
 pub(crate) use attribute_artifact::decode_attribute_block;
-pub(crate) use candidate::{
-    decode_all_candidate_rows, FetchedLateCandidateCluster, LateCandidateBuildConfig,
-};
+pub(crate) use candidate::{decode_all_candidate_rows, FetchedLateCandidateCluster};
+pub(crate) use flat_candidate::{LateFlatCandidateBuildConfig, ResidentFlatCandidateIndex};
 pub(crate) use matrix_artifact::decode_matrix_block;
 pub(crate) use segment_build::{
     build_late_interaction_segment, LateCandidateBuild, LateSegmentBuildConfig,

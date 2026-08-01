@@ -1,16 +1,18 @@
 //! Two-wave exact search over one immutable late-interaction segment.
 //!
-//! The resident candidate bootstrap is validated before either wave. Routed
-//! cluster objects form one cross-object read plan, and every retained exact
-//! matrix plus attribute payload forms one second plan. No row-dependent read
-//! occurs outside those two executions.
+//! Wave one depends on the segment's candidate kind. The production flat-SQ8
+//! kind hydrates one resident `ZFQ1` artifact through the bootstrap cache and
+//! selects candidates without any per-query planned read; the retained IVF
+//! kind routes resident centroids and fetches routed clusters as one
+//! cross-object read plan. Every retained exact matrix plus attribute payload
+//! forms one second (truth) plan; no row-dependent read occurs outside it.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 
 use crate::cache::DiskCache;
-use crate::embedding::ContentHash;
+use crate::embedding::{ArtifactChecksum, ContentHash};
 use crate::error::{Result, ZeppelinError};
 use crate::index::filter::evaluate_filter_on_optional_attributes;
 use crate::storage::read_plan::{
@@ -18,12 +20,13 @@ use crate::storage::read_plan::{
 };
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, Filter, VectorId};
-use crate::wal::LateInteractionSegmentRef;
+use crate::wal::{LateCandidateKind, LateInteractionSegmentRef};
 
 use super::attribute_artifact::decode_attribute_row;
 use super::candidate::{
     FdeCandidateIndex, FetchedLateCandidateCluster, LateCandidate, ResidentLateCandidateIndex,
 };
+use super::flat_candidate::ResidentFlatCandidateIndex;
 use super::matrix_artifact::decode_matrix_row;
 use super::{max_sim, MultiVectorMatrixRef};
 
@@ -137,61 +140,86 @@ pub(crate) async fn search_segment(
     }
     validate_query_shape(request.segment, &request.exact_query)?;
 
-    let candidate_index = request.segment.ivf_candidate_index()?;
-    let bootstrap = &candidate_index.bootstrap;
-    let bootstrap_size = usize::try_from(bootstrap.size_bytes)
-        .map_err(|_| segment_error("candidate bootstrap size exceeds usize"))?;
-    if bootstrap_size > request.bounds.max_resident_bytes {
-        return Err(segment_error(
-            "candidate bootstrap exceeds the resident byte budget",
-        ));
-    }
-    let bootstrap_bytes = if let Some(cache) = request.bootstrap_cache {
-        let cache_key = format!("{}@sha256-{}", bootstrap.key, bootstrap.checksum.to_hex());
-        cache
-            .get_or_fetch(&cache_key, || request.store.get(&bootstrap.key))
-            .await?
-    } else {
-        request.store.get(&bootstrap.key).await?
-    };
-    let resident = ResidentLateCandidateIndex::from_index_ref(
-        &bootstrap_bytes,
-        candidate_index,
-        request.bounds.max_resident_bytes,
-    )?;
+    let (candidates, candidate_trace) = match request.segment.candidate_kind {
+        LateCandidateKind::FlatSq8 => {
+            let flat = request.segment.flat_candidate_ref()?;
+            let flat_size = usize::try_from(flat.size_bytes)
+                .map_err(|_| segment_error("flat candidate artifact size exceeds usize"))?;
+            if flat_size > request.bounds.max_resident_bytes {
+                return Err(segment_error(
+                    "flat candidate artifact exceeds the resident byte budget",
+                ));
+            }
+            let flat_bytes = fetch_resident_artifact(&request, &flat.key, &flat.checksum).await?;
+            let resident = ResidentFlatCandidateIndex::from_bytes(
+                &flat_bytes,
+                flat,
+                request.bounds.max_resident_bytes,
+            )?;
+            let candidates = resident.select_candidates(
+                request.candidate_query_fde,
+                request.excluded_ids,
+                request.mandatory_filter,
+                request.request_filter,
+            )?;
+            // Wave one performs no per-query planned read for the flat kind:
+            // the artifact hydrates once per segment generation through the
+            // bootstrap cache, so its trace is empty by construction.
+            (candidates, SegmentWaveTrace::default())
+        }
+        LateCandidateKind::Ivf => {
+            let candidate_index = request.segment.ivf_candidate_index()?;
+            let bootstrap = &candidate_index.bootstrap;
+            let bootstrap_size = usize::try_from(bootstrap.size_bytes)
+                .map_err(|_| segment_error("candidate bootstrap size exceeds usize"))?;
+            if bootstrap_size > request.bounds.max_resident_bytes {
+                return Err(segment_error(
+                    "candidate bootstrap exceeds the resident byte budget",
+                ));
+            }
+            let bootstrap_bytes =
+                fetch_resident_artifact(&request, &bootstrap.key, &bootstrap.checksum).await?;
+            let resident = ResidentLateCandidateIndex::from_index_ref(
+                &bootstrap_bytes,
+                candidate_index,
+                request.bounds.max_resident_bytes,
+            )?;
 
-    let routed = resident.route(request.candidate_query_fde)?;
-    if routed.is_empty() {
-        return Ok(SegmentSearchOutput::default());
-    }
-    let candidate_requests = routed
-        .iter()
-        .map(|cluster| {
-            complete_object_request(&cluster.key, cluster.size_bytes, "candidate cluster")
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let candidate_plan =
-        ReadPlan::build(&candidate_requests, request.read_plan).map_err(map_read_plan_error)?;
-    let candidate_trace = trace_for(&candidate_requests, &candidate_plan);
-    let candidate_bytes = execute_read_plan(request.store, &candidate_plan)
-        .await
-        .map_err(map_read_plan_error)?;
-    let fetched = routed
-        .iter()
-        .zip(&candidate_bytes)
-        .map(|(reference, bytes)| FetchedLateCandidateCluster {
-            reference,
-            bytes: bytes.as_ref(),
-        })
-        .collect::<Vec<_>>();
-    let candidates = resident.candidates_from_fetched(
-        request.candidate_query_fde,
-        request.excluded_ids,
-        request.mandatory_filter,
-        request.request_filter,
-        &fetched,
-        request.bounds.max_cluster_bytes,
-    )?;
+            let routed = resident.route(request.candidate_query_fde)?;
+            if routed.is_empty() {
+                return Ok(SegmentSearchOutput::default());
+            }
+            let candidate_requests = routed
+                .iter()
+                .map(|cluster| {
+                    complete_object_request(&cluster.key, cluster.size_bytes, "candidate cluster")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let candidate_plan = ReadPlan::build(&candidate_requests, request.read_plan)
+                .map_err(map_read_plan_error)?;
+            let candidate_trace = trace_for(&candidate_requests, &candidate_plan);
+            let candidate_bytes = execute_read_plan(request.store, &candidate_plan)
+                .await
+                .map_err(map_read_plan_error)?;
+            let fetched = routed
+                .iter()
+                .zip(&candidate_bytes)
+                .map(|(reference, bytes)| FetchedLateCandidateCluster {
+                    reference,
+                    bytes: bytes.as_ref(),
+                })
+                .collect::<Vec<_>>();
+            let candidates = resident.candidates_from_fetched(
+                request.candidate_query_fde,
+                request.excluded_ids,
+                request.mandatory_filter,
+                request.request_filter,
+                &fetched,
+                request.bounds.max_cluster_bytes,
+            )?;
+            (candidates, candidate_trace)
+        }
+    };
     if candidates.is_empty() {
         return Ok(SegmentSearchOutput {
             rows: Vec::new(),
@@ -249,6 +277,27 @@ fn validate_query_shape(
         ));
     }
     Ok(())
+}
+
+/// Fetch one resident candidate artifact through the bootstrap-cache authority.
+///
+/// The cache key is the artifact's SHA-256 alone: every candidate artifact is
+/// content-addressed and validated against its manifest checksum after
+/// hydration, and the full object key exceeds the disk cache's one-component
+/// filename limit on common filesystems.
+async fn fetch_resident_artifact(
+    request: &SegmentSearchRequest<'_>,
+    key: &str,
+    checksum: &ArtifactChecksum,
+) -> Result<bytes::Bytes> {
+    if let Some(cache) = request.bootstrap_cache {
+        let cache_key = format!("late-candidate-sha256-{}", checksum.to_hex());
+        cache
+            .get_or_fetch(&cache_key, || request.store.get(key))
+            .await
+    } else {
+        request.store.get(key).await
+    }
 }
 
 fn complete_object_request(key: &str, size_bytes: u64, label: &str) -> Result<ReadRequest> {
@@ -474,13 +523,16 @@ mod tests {
         build_late_candidate_index, BuiltLateCandidateIndex, LateCandidateBuildConfig,
         LateCandidateInputRow, LateRoutingMetric,
     };
+    use crate::index::late_interaction::flat_candidate::{
+        build_flat_candidate_artifact, LateFlatCandidateBuildConfig,
+    };
     use crate::index::late_interaction::matrix_artifact::{
         build_matrix_blocks, BuiltMatrixBlock, MatrixBlockInputRow,
     };
     use crate::storage::read_plan::ReadPlanConfig;
     use crate::storage::ZeppelinStore;
     use crate::types::{AttributeValue, Filter};
-    use crate::wal::LateInteractionSegmentRef;
+    use crate::wal::{LateCandidateKind, LateInteractionSegmentRef};
 
     use super::{search_segment, SegmentSearchBounds, SegmentSearchRequest};
 
@@ -492,6 +544,14 @@ mod tests {
     }
 
     async fn fixture(candidate_k: usize, corrupt_matrix: bool) -> Fixture {
+        fixture_of_kind(candidate_k, corrupt_matrix, LateCandidateKind::FlatSq8).await
+    }
+
+    async fn fixture_of_kind(
+        candidate_k: usize,
+        corrupt_matrix: bool,
+        kind: LateCandidateKind,
+    ) -> Fixture {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         let epoch = MultiVectorEpochId::new([3; 32]);
         let generation = FdeGenerationId::new([4; 32]);
@@ -562,26 +622,49 @@ mod tests {
                 )])),
             })
             .collect();
-        let candidate = build_late_candidate_index(
-            "test",
-            "segment",
-            generation,
-            LateCandidateBuildConfig {
-                fde_dimension: 2,
-                nlist: 1,
-                probe_budget: 1,
-                candidate_k,
-                routing_metric: LateRoutingMetric::NegativeL2,
-                kmeans_max_iters: 20,
-                kmeans_epsilon: 1e-6,
-                max_cluster_bytes: MAX_BYTES,
-                max_bootstrap_bytes: MAX_BYTES,
-            },
-            candidate_rows,
-        )
-        .expect("candidate index");
-
-        upload_candidate(&store, &candidate).await;
+        let (candidate_index, flat_candidate) = match kind {
+            LateCandidateKind::Ivf => {
+                let candidate = build_late_candidate_index(
+                    "test",
+                    "segment",
+                    generation,
+                    LateCandidateBuildConfig {
+                        fde_dimension: 2,
+                        nlist: 1,
+                        probe_budget: 1,
+                        candidate_k,
+                        routing_metric: LateRoutingMetric::NegativeL2,
+                        kmeans_max_iters: 20,
+                        kmeans_epsilon: 1e-6,
+                        max_cluster_bytes: MAX_BYTES,
+                        max_bootstrap_bytes: MAX_BYTES,
+                    },
+                    candidate_rows,
+                )
+                .expect("candidate index");
+                upload_candidate(&store, &candidate).await;
+                (Some(candidate.index_ref), None)
+            }
+            LateCandidateKind::FlatSq8 => {
+                let flat = build_flat_candidate_artifact(
+                    "test",
+                    "segment",
+                    generation,
+                    LateFlatCandidateBuildConfig {
+                        fde_dimension: 2,
+                        candidate_k,
+                        max_artifact_bytes: MAX_BYTES,
+                    },
+                    candidate_rows,
+                )
+                .expect("flat candidate artifact");
+                store
+                    .put_create(&flat.reference.key, flat.bytes.clone())
+                    .await
+                    .expect("flat upload");
+                (None, Some(flat.reference))
+            }
+        };
         upload_attributes(&store, &attribute_blocks).await;
         upload_matrices(&store, &matrix_blocks, corrupt_matrix).await;
         let segment = LateInteractionSegmentRef {
@@ -595,7 +678,7 @@ mod tests {
             vector_dimension: 2,
             fde_dimension: 2,
             coverage_sequence: 2,
-            candidate_index: Some(candidate.index_ref),
+            candidate_index,
             matrix_objects: matrix_blocks
                 .into_iter()
                 .map(|block| block.reference)
@@ -606,8 +689,8 @@ mod tests {
                 .collect(),
             fts_objects: Vec::new(),
             artifact_origin: None,
-            candidate_kind: crate::wal::LateCandidateKind::Ivf,
-            flat_candidate: None,
+            candidate_kind: kind,
+            flat_candidate,
         };
         Fixture { store, segment }
     }
@@ -669,8 +752,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truth_wave_coalesces_multiple_rows_per_object() {
+    async fn flat_selection_reads_only_one_truth_wave() {
         let fixture = fixture(2, false).await;
+        let query = MultiVectorEmbedding::new(vec![1.0, 0.0], 1, 2, 4).expect("query");
+        let output = search_segment(SegmentSearchRequest {
+            store: &fixture.store,
+            bootstrap_cache: None,
+            segment: &fixture.segment,
+            exact_query: query.matrix_ref().expect("query matrix"),
+            candidate_query_fde: &[1.0, 0.0],
+            mandatory_filter: None,
+            request_filter: None,
+            excluded_ids: &BTreeSet::new(),
+            top_k: 2,
+            read_plan: &plan(),
+            bounds: bounds(),
+        })
+        .await
+        .expect("segment search");
+
+        assert_eq!(output.rows.len(), 2);
+        assert_eq!(output.trace.candidate_wave.logical_ranges, 0);
+        assert_eq!(output.trace.candidate_wave.planned_requests, 0);
+        assert_eq!(output.trace.candidate_wave.planned_bytes, 0);
+        assert_eq!(output.trace.truth_wave.logical_ranges, 4);
+        assert_eq!(output.trace.truth_wave.planned_requests, 2);
+    }
+
+    #[tokio::test]
+    async fn ivf_kind_still_plans_a_candidate_wave() {
+        let fixture = fixture_of_kind(2, false, LateCandidateKind::Ivf).await;
         let query = MultiVectorEmbedding::new(vec![1.0, 0.0], 1, 2, 4).expect("query");
         let output = search_segment(SegmentSearchRequest {
             store: &fixture.store,

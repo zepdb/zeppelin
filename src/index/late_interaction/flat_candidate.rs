@@ -335,11 +335,6 @@ impl ResidentFlatCandidateIndex {
         })
     }
 
-    /// Borrow the persisted operating point.
-    pub(crate) fn recipe(&self) -> &LateFlatCandidateRecipe {
-        &self.recipe
-    }
-
     /// Borrow every decoded baseline row in canonical id order.
     pub(crate) fn rows(&self) -> &[FlatCandidateRow] {
         &self.rows
@@ -535,7 +530,6 @@ mod tests {
         let resident =
             ResidentFlatCandidateIndex::from_bytes(&first.bytes, &first.reference, 1024 * 1024)
                 .expect("resident flat index");
-        assert_eq!(resident.recipe(), &first.reference.recipe);
         assert_eq!(
             resident
                 .rows()

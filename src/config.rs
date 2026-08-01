@@ -302,7 +302,8 @@ pub struct MmliSegmentConfig {
     pub nlist: usize,
     /// Candidate IVF clusters read per query. Phase-2 routing point: `16`.
     pub probe_budget: usize,
-    /// Approximate rows retained before exact MaxSim. Text default: `537`.
+    /// Approximate rows retained before exact MaxSim. Flat-SQ8 text
+    /// operating point (measured 2026-07-31): `1000`.
     pub candidate_k: usize,
     /// Maximum Lloyd iterations for late-candidate centroid training.
     pub kmeans_max_iterations: usize,
@@ -413,7 +414,7 @@ impl Default for MmliSegmentConfig {
         Self {
             nlist: 256,
             probe_budget: 16,
-            candidate_k: 537,
+            candidate_k: 1000,
             kmeans_max_iterations: 100,
             kmeans_convergence_epsilon: 1e-4,
             max_matrix_object_bytes: 64 * 1024 * 1024,
@@ -1133,7 +1134,7 @@ mod tests {
         assert_eq!(defaults.max_overlay_bytes_per_query, 512 * 1024 * 1024);
         assert_eq!(defaults.segment.nlist, 256);
         assert_eq!(defaults.segment.probe_budget, 16);
-        assert_eq!(defaults.segment.candidate_k, 537);
+        assert_eq!(defaults.segment.candidate_k, 1000);
         assert_eq!(defaults.segment.kmeans_max_iterations, 100);
         assert_eq!(defaults.segment.kmeans_convergence_epsilon, 1e-4);
         assert_eq!(defaults.segment.max_matrix_object_bytes, 64 * 1024 * 1024);

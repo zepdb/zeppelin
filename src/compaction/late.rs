@@ -14,26 +14,30 @@ use rand::Rng;
 use tracing::{info, warn};
 use ulid::Ulid;
 
+use crate::embedding::artifact::{decode_matrix_payload, encode_matrix_payload};
+use crate::embedding::coordinator::apply_candidate_document_pooling;
+use crate::embedding::transform::{apply_vector_transform, load_vector_transform_mean};
 use crate::embedding::{
     ArtifactChecksum, ContentHash, EmbeddingProfileRef, FdeArtifact, MatrixArtifact,
     PhysicalInputFragmentIdentity, RecordVersionRef, RetrievalUnitRecord, SemanticOverlayRef,
     SemanticState,
 };
+use crate::embedding::{MatrixDtype, VectorTransformRecipe};
 use crate::error::{Result, ZeppelinError};
 use crate::fts::inverted_index::InvertedIndex;
 use crate::fts::FtsFieldConfig;
 use crate::index::late_interaction::{
     build_late_interaction_segment, decode_all_candidate_rows, decode_attribute_block,
     decode_matrix_block, FdeTransform, FetchedLateCandidateCluster, LateCandidateBuild,
-    LateCandidateBuildConfig, LateInteractionError, LateRoutingMetric, LateSegmentBuildConfig,
-    LateSegmentBuildRow, PrebuiltLateFtsArtifact,
+    LateFlatCandidateBuildConfig, LateInteractionError, LateSegmentBuildConfig,
+    LateSegmentBuildRow, PrebuiltLateFtsArtifact, ResidentFlatCandidateIndex,
 };
 use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
 use crate::storage::{CreateOnlyOutcome, NamespaceObjectFamily, NamespaceObjectKey, ZeppelinStore};
 use crate::types::{IndexType, VectorId};
 use crate::wal::{
-    EncoderInputWalFragment, InputFragmentRef, LateInteractionSegmentRef, LateSegmentObjectRef,
-    LateStateSection, Manifest,
+    EncoderInputWalFragment, InputFragmentRef, LateCandidateKind, LateInteractionSegmentRef,
+    LateSegmentObjectRef, LateStateSection, Manifest,
 };
 
 use super::{
@@ -130,8 +134,6 @@ impl Compactor {
                         "late segment build lost its non-empty row set".to_string(),
                     )
                 })?;
-            let nlist = self.mmli_config.segment.nlist.min(snapshot.rows.len());
-            let probe_budget = self.mmli_config.segment.probe_budget.min(nlist);
             Some(build_late_interaction_segment(
                 LateSegmentBuildConfig {
                     namespace: namespace.to_string(),
@@ -145,18 +147,13 @@ impl Compactor {
                     coverage_sequence: snapshot.coverage_sequence,
                     max_matrix_object_bytes: self.mmli_config.segment.max_matrix_object_bytes,
                     max_attribute_object_bytes: self.mmli_config.segment.max_matrix_object_bytes,
-                    candidate: LateCandidateBuild::Ivf(LateCandidateBuildConfig {
+                    // Flat SQ8 is the adopted candidate design for this corpus
+                    // regime; nlist/probe_budget remain configured but unused
+                    // by this kind (retained for the future IVF scale phase).
+                    candidate: LateCandidateBuild::FlatSq8(LateFlatCandidateBuildConfig {
                         fde_dimension,
-                        nlist,
-                        probe_budget,
                         candidate_k: self.mmli_config.segment.candidate_k,
-                        routing_metric: LateRoutingMetric::NegativeL2,
-                        kmeans_max_iters: self.mmli_config.segment.kmeans_max_iterations,
-                        kmeans_epsilon: f64::from(
-                            self.mmli_config.segment.kmeans_convergence_epsilon,
-                        ),
-                        max_cluster_bytes: self.mmli_config.segment.max_cluster_object_bytes,
-                        max_bootstrap_bytes: self.mmli_config.segment.max_resident_bootstrap_bytes,
+                        max_artifact_bytes: self.mmli_config.segment.max_resident_bootstrap_bytes,
                     }),
                     artifact_origin: None,
                     fts_artifacts,
@@ -555,29 +552,6 @@ async fn load_old_segment_rows(
     max_cluster_bytes: usize,
     max_object_bytes: usize,
 ) -> Result<Vec<LateSegmentBuildRow>> {
-    let candidate_index = segment.ivf_candidate_index()?;
-    let bootstrap_bytes = store.get(&candidate_index.bootstrap.key).await?;
-    let mut cluster_bytes = Vec::with_capacity(candidate_index.clusters.len());
-    for reference in &candidate_index.clusters {
-        cluster_bytes.push(store.get(&reference.key).await?);
-    }
-    let fetched = candidate_index
-        .clusters
-        .iter()
-        .zip(&cluster_bytes)
-        .map(|(reference, bytes)| FetchedLateCandidateCluster {
-            reference,
-            bytes: bytes.as_ref(),
-        })
-        .collect::<Vec<_>>();
-    let candidates = decode_all_candidate_rows(
-        candidate_index,
-        &bootstrap_bytes,
-        &fetched,
-        max_resident_bytes,
-        max_cluster_bytes,
-    )?;
-
     let row_limit = usize::try_from(segment.record_count).map_err(|_| {
         ZeppelinError::Validation("late segment row count exceeds usize".to_string())
     })?;
@@ -627,43 +601,167 @@ async fn load_old_segment_rows(
         }
     }
 
-    let mut rows = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let matrix = matrices.remove(&candidate.id).ok_or_else(|| {
-            ZeppelinError::Serialization(format!(
-                "candidate {} has no exact matrix row",
-                candidate.id
-            ))
-        })?;
-        let attributes_row = attributes.remove(&candidate.id).ok_or_else(|| {
-            ZeppelinError::Serialization(format!(
-                "candidate {} has no exact attribute row",
-                candidate.id
-            ))
-        })?;
-        let ordinal = candidate.unit_ordinal.unwrap_or(0);
-        if matrix.ordinal != ordinal
-            || attributes_row.ordinal != ordinal
-            || matrix.content_hash != candidate.content_hash
-            || matrix.locator != candidate.matrix_locator
-            || attributes_row.locator != candidate.attr_locator
-            || attributes_row.attributes != candidate.filter_attributes
-        {
-            return Err(ZeppelinError::Serialization(format!(
-                "candidate {} disagrees with its exact matrix or attribute row",
-                candidate.id
-            )));
+    let mut rows = Vec::new();
+    match segment.candidate_kind {
+        LateCandidateKind::Ivf => {
+            let candidate_index = segment.ivf_candidate_index()?;
+            let bootstrap_bytes = store.get(&candidate_index.bootstrap.key).await?;
+            let mut cluster_bytes = Vec::with_capacity(candidate_index.clusters.len());
+            for reference in &candidate_index.clusters {
+                cluster_bytes.push(store.get(&reference.key).await?);
+            }
+            let fetched = candidate_index
+                .clusters
+                .iter()
+                .zip(&cluster_bytes)
+                .map(|(reference, bytes)| FetchedLateCandidateCluster {
+                    reference,
+                    bytes: bytes.as_ref(),
+                })
+                .collect::<Vec<_>>();
+            let candidates = decode_all_candidate_rows(
+                candidate_index,
+                &bootstrap_bytes,
+                &fetched,
+                max_resident_bytes,
+                max_cluster_bytes,
+            )?;
+            rows.reserve(candidates.len());
+            for candidate in candidates {
+                let matrix = matrices.remove(&candidate.id).ok_or_else(|| {
+                    ZeppelinError::Serialization(format!(
+                        "candidate {} has no exact matrix row",
+                        candidate.id
+                    ))
+                })?;
+                let attributes_row = attributes.remove(&candidate.id).ok_or_else(|| {
+                    ZeppelinError::Serialization(format!(
+                        "candidate {} has no exact attribute row",
+                        candidate.id
+                    ))
+                })?;
+                let ordinal = candidate.unit_ordinal.unwrap_or(0);
+                if matrix.ordinal != ordinal
+                    || attributes_row.ordinal != ordinal
+                    || matrix.content_hash != candidate.content_hash
+                    || matrix.locator != candidate.matrix_locator
+                    || attributes_row.locator != candidate.attr_locator
+                    || attributes_row.attributes != candidate.filter_attributes
+                {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "candidate {} disagrees with its exact matrix or attribute row",
+                        candidate.id
+                    )));
+                }
+                rows.push(LateSegmentBuildRow {
+                    id: candidate.id,
+                    content_hash: candidate.content_hash,
+                    source_sequence: candidate.source_sequence,
+                    parent_id: candidate.parent_id,
+                    unit_ordinal: candidate.unit_ordinal,
+                    attributes: attributes_row.attributes,
+                    exact_matrix: matrix.embedding,
+                    raw_fde: candidate.fde,
+                });
+            }
         }
-        rows.push(LateSegmentBuildRow {
-            id: candidate.id,
-            content_hash: candidate.content_hash,
-            source_sequence: candidate.source_sequence,
-            parent_id: candidate.parent_id,
-            unit_ordinal: candidate.unit_ordinal,
-            attributes: attributes_row.attributes,
-            exact_matrix: matrix.embedding,
-            raw_fde: candidate.fde,
-        });
+        LateCandidateKind::FlatSq8 => {
+            // The flat artifact stores SQ8 codes, not raw FDEs, so baseline
+            // FDEs are recomputed from the stored exact matrices through the
+            // exact enrichment seam (candidate transform, f16 persistence
+            // boundary, pooling, FDE encode). This requires the identity
+            // exact-scoring transform so the stored matrix equals the encoder
+            // output at the persisted dtype.
+            if !matches!(
+                profile.epoch.exact_scoring_transform,
+                VectorTransformRecipe::Identity
+            ) {
+                return Err(ZeppelinError::Validation(
+                    "flat late segment rebuild requires an identity exact-scoring transform"
+                        .to_string(),
+                ));
+            }
+            let flat = segment.flat_candidate_ref()?;
+            let flat_bytes = store.get(&flat.key).await?;
+            let resident =
+                ResidentFlatCandidateIndex::from_bytes(&flat_bytes, flat, max_resident_bytes)?;
+            let transform = load_profile_fde_transform(store, profile).await?;
+            if transform.output_dimension()
+                != usize::try_from(flat.recipe.fde_dimension).map_err(|_| {
+                    ZeppelinError::Validation("flat FDE dimension exceeds usize".to_string())
+                })?
+            {
+                return Err(ZeppelinError::Validation(
+                    "flat late segment FDE dimension disagrees with the profile transform"
+                        .to_string(),
+                ));
+            }
+            let dimension = profile.epoch.vector_dimension as usize;
+            let max_vectors = profile.epoch.max_document_vectors as usize;
+            let candidate_mean = load_vector_transform_mean(
+                store,
+                &profile.fde.candidate_vector_transform,
+                dimension,
+            )
+            .await?;
+            rows.reserve(resident.rows().len());
+            for row in resident.rows() {
+                let matrix = matrices.remove(&row.id).ok_or_else(|| {
+                    ZeppelinError::Serialization(format!(
+                        "flat candidate {} has no exact matrix row",
+                        row.id
+                    ))
+                })?;
+                let attributes_row = attributes.remove(&row.id).ok_or_else(|| {
+                    ZeppelinError::Serialization(format!(
+                        "flat candidate {} has no exact attribute row",
+                        row.id
+                    ))
+                })?;
+                let ordinal = row.unit_ordinal.unwrap_or(0);
+                if matrix.ordinal != ordinal
+                    || attributes_row.ordinal != ordinal
+                    || matrix.content_hash != row.content_hash
+                    || matrix.locator != row.matrix_locator
+                    || attributes_row.locator != row.attr_locator
+                    || attributes_row.attributes != row.filter_attributes
+                {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "flat candidate {} disagrees with its exact matrix or attribute row",
+                        row.id
+                    )));
+                }
+                let centered = apply_vector_transform(
+                    &matrix.embedding,
+                    &profile.fde.candidate_vector_transform,
+                    candidate_mean.as_deref(),
+                    max_vectors,
+                )?;
+                let encoded = encode_matrix_payload(MatrixDtype::F16, dimension, &centered)?;
+                let decoded = decode_matrix_payload(
+                    &encoded,
+                    MatrixDtype::F16,
+                    dimension,
+                    centered.vector_count(),
+                    max_vectors,
+                )?;
+                let pooled = apply_candidate_document_pooling(
+                    &decoded,
+                    profile.fde.candidate_document_pooling,
+                )?;
+                let raw_fde = transform.encode_document(&pooled.matrix_ref()?)?;
+                rows.push(LateSegmentBuildRow {
+                    id: row.id.clone(),
+                    content_hash: row.content_hash,
+                    source_sequence: row.source_sequence,
+                    parent_id: row.parent_id.clone(),
+                    unit_ordinal: row.unit_ordinal,
+                    attributes: attributes_row.attributes,
+                    exact_matrix: matrix.embedding,
+                    raw_fde,
+                });
+            }
+        }
     }
     if !matrices.is_empty()
         || !attributes.is_empty()
@@ -674,6 +772,29 @@ async fn load_old_segment_rows(
         ));
     }
     Ok(rows)
+}
+
+/// Load and verify the profile's immutable FDE transform artifact.
+async fn load_profile_fde_transform(
+    store: &ZeppelinStore,
+    profile: &EmbeddingProfileRef,
+) -> Result<FdeTransform> {
+    let transform_ref = &profile.fde.transform_artifact;
+    let transform_bytes = store.get(&transform_ref.key).await?;
+    if u64::try_from(transform_bytes.len()).ok() != Some(transform_ref.size_bytes)
+        || ArtifactChecksum::digest(&transform_bytes) != transform_ref.checksum
+    {
+        return Err(ZeppelinError::Serialization(
+            "late compaction FDE transform metadata mismatch".to_string(),
+        ));
+    }
+    let transform = FdeTransform::from_bytes(&transform_bytes)?;
+    if transform.params() != profile.fde.params {
+        return Err(ZeppelinError::Validation(
+            "late compaction FDE transform recipe mismatch".to_string(),
+        ));
+    }
+    Ok(transform)
 }
 
 async fn load_overlay_rows(
@@ -692,21 +813,7 @@ async fn load_overlay_rows(
         .enumerate()
         .map(|(index, input)| (input.key.as_str(), index))
         .collect::<BTreeMap<_, _>>();
-    let transform_ref = &profile.fde.transform_artifact;
-    let transform_bytes = store.get(&transform_ref.key).await?;
-    if u64::try_from(transform_bytes.len()).ok() != Some(transform_ref.size_bytes)
-        || ArtifactChecksum::digest(&transform_bytes) != transform_ref.checksum
-    {
-        return Err(ZeppelinError::Serialization(
-            "late compaction FDE transform metadata mismatch".to_string(),
-        ));
-    }
-    let transform = FdeTransform::from_bytes(&transform_bytes)?;
-    if transform.params() != profile.fde.params {
-        return Err(ZeppelinError::Validation(
-            "late compaction FDE transform recipe mismatch".to_string(),
-        ));
-    }
+    let transform = load_profile_fde_transform(store, profile).await?;
 
     let mut derived = BTreeMap::new();
     let mut consumed = Vec::new();
