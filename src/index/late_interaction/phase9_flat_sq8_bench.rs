@@ -225,6 +225,7 @@ struct BenchReport {
     schema_version: u32,
     source_revision: String,
     candidate_k: usize,
+    read_max_concurrency: usize,
     document_count: usize,
     query_count: usize,
     gold_memberships: usize,
@@ -233,6 +234,7 @@ struct BenchReport {
     hits_k1500: usize,
     recall_k1000: f64,
     per_query_hits_k1000: IntegerSummary,
+    per_query_hits_k1000_values: Vec<u64>,
     queries_below_8_of_10: usize,
     queries_below_5_of_10: usize,
     flat_artifact_bytes: u64,
@@ -391,6 +393,23 @@ async fn run_benchmark() -> BenchResult<()> {
     let tensor_dir = required_path("MMLI_REAL_MATRIX_DIR")?;
     let output = required_path("MMLI_FLAT_BENCH_OUTPUT")?;
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let query_count = optional_usize("MMLI_FLAT_BENCH_QUERY_LIMIT", QUERY_COUNT)?;
+    if !(1..=QUERY_COUNT).contains(&query_count) {
+        return Err(format!(
+            "MMLI_FLAT_BENCH_QUERY_LIMIT must be between 1 and {QUERY_COUNT}"
+        ));
+    }
+    let default_read_plan_config = ReadPlanConfig::default();
+    let read_max_concurrency = optional_usize(
+        "MMLI_FLAT_BENCH_CONCURRENCY",
+        default_read_plan_config.max_concurrent_requests,
+    )?;
+    let read_plan_config = ReadPlanConfig::new(
+        default_read_plan_config.gap_budget_bytes,
+        default_read_plan_config.max_request_bytes,
+        read_max_concurrency,
+    )
+    .map_err(|error| error.to_string())?;
 
     eprintln!("flat-bench: loading and verifying pinned tensors");
     let documents = load_tensor(
@@ -618,8 +637,9 @@ async fn run_benchmark() -> BenchResult<()> {
         + resident.rows.len() * std::mem::size_of::<FlatRowMeta>()) as u64
         + flat_metadata_bytes;
 
-    eprintln!("flat-bench: running {QUERY_COUNT} warm queries at K={CANDIDATE_K}");
-    let read_plan_config = ReadPlanConfig::default();
+    eprintln!(
+        "flat-bench: running {query_count} warm queries at K={CANDIDATE_K}, concurrency={read_max_concurrency}"
+    );
     let bounds = SegmentSearchBounds {
         max_resident_bytes: 64 * 1024 * 1024,
         max_cluster_bytes: 64 * 1024 * 1024,
@@ -634,26 +654,26 @@ async fn run_benchmark() -> BenchResult<()> {
     let mut hits_k700 = 0usize;
     let mut hits_k1000 = 0usize;
     let mut hits_k1500 = 0usize;
-    let mut per_query_hits = Vec::with_capacity(QUERY_COUNT);
-    let mut warm_ms = Vec::with_capacity(QUERY_COUNT);
-    let mut scan_ms = Vec::with_capacity(QUERY_COUNT);
-    let mut truth_ms = Vec::with_capacity(QUERY_COUNT);
-    let mut fetch_ms = Vec::with_capacity(QUERY_COUNT);
-    let mut score_ms = Vec::with_capacity(QUERY_COUNT);
-    let mut decode_ms = Vec::with_capacity(QUERY_COUNT);
-    let mut maxsim_ms = Vec::with_capacity(QUERY_COUNT);
-    let mut truth_logical = Vec::with_capacity(QUERY_COUNT);
-    let mut truth_planned_requests = Vec::with_capacity(QUERY_COUNT);
-    let mut truth_planned_bytes = Vec::with_capacity(QUERY_COUNT);
-    let mut truth_request_waves = Vec::with_capacity(QUERY_COUNT);
+    let mut per_query_hits = Vec::with_capacity(query_count);
+    let mut warm_ms = Vec::with_capacity(query_count);
+    let mut scan_ms = Vec::with_capacity(query_count);
+    let mut truth_ms = Vec::with_capacity(query_count);
+    let mut fetch_ms = Vec::with_capacity(query_count);
+    let mut score_ms = Vec::with_capacity(query_count);
+    let mut decode_ms = Vec::with_capacity(query_count);
+    let mut maxsim_ms = Vec::with_capacity(query_count);
+    let mut truth_logical = Vec::with_capacity(query_count);
+    let mut truth_planned_requests = Vec::with_capacity(query_count);
+    let mut truth_planned_bytes = Vec::with_capacity(query_count);
+    let mut truth_request_waves = Vec::with_capacity(query_count);
     let observed_equals_planned = true;
     {
         let mut latencies = get_latency_ms.lock().expect("GET latency lock");
         latencies.clear();
-        latencies.reserve(QUERY_COUNT * CANDIDATE_K);
+        latencies.reserve(query_count * CANDIDATE_K);
     }
 
-    for query_index in 0..QUERY_COUNT {
+    for query_index in 0..query_count {
         let query_started = Instant::now();
         let scan_started = Instant::now();
         let order = flat_selection_order(&resident, &query_fdes[query_index]);
@@ -759,9 +779,10 @@ async fn run_benchmark() -> BenchResult<()> {
         }
     }
 
-    if hits_k700 != EXPECTED_HITS_K700
-        || hits_k1000 != EXPECTED_HITS_K1000
-        || hits_k1500 != EXPECTED_HITS_K1500
+    if query_count == QUERY_COUNT
+        && (hits_k700 != EXPECTED_HITS_K700
+            || hits_k1000 != EXPECTED_HITS_K1000
+            || hits_k1500 != EXPECTED_HITS_K1500)
     {
         return Err(format!(
             "recall parity failed: K700 {hits_k700}/{EXPECTED_HITS_K700}, \
@@ -779,14 +800,15 @@ async fn run_benchmark() -> BenchResult<()> {
     }
     let truth_total_request_waves = truth_request_waves.iter().sum::<u64>();
 
-    eprintln!("flat-bench: running {FILTERED_QUERY_COUNT} filtered queries");
+    let filtered_query_count = FILTERED_QUERY_COUNT.min(query_count);
+    eprintln!("flat-bench: running {filtered_query_count} filtered queries");
     let filter = Filter::Eq {
         field: "color".to_string(),
         value: AttributeValue::String(FILTER_COLORS[0].to_string()),
     };
-    let mut filtered_planned = Vec::with_capacity(FILTERED_QUERY_COUNT);
+    let mut filtered_planned = Vec::with_capacity(filtered_query_count);
     let mut filtered_all_results_match = true;
-    for (query_index, query_fde) in query_fdes.iter().enumerate().take(FILTERED_QUERY_COUNT) {
+    for (query_index, query_fde) in query_fdes.iter().enumerate().take(filtered_query_count) {
         let order = flat_selection_order(&resident, query_fde);
         let candidates = order
             .iter()
@@ -849,14 +871,16 @@ async fn run_benchmark() -> BenchResult<()> {
         schema_version: 1,
         source_revision: "518aa23+flat-bench".to_string(),
         candidate_k: CANDIDATE_K,
+        read_max_concurrency,
         document_count: DOCUMENT_COUNT,
-        query_count: QUERY_COUNT,
-        gold_memberships: QUERY_COUNT * GOLD_PER_QUERY,
+        query_count,
+        gold_memberships: query_count * GOLD_PER_QUERY,
         hits_k700,
         hits_k1000,
         hits_k1500,
-        recall_k1000: hits_k1000 as f64 / (QUERY_COUNT * GOLD_PER_QUERY) as f64,
+        recall_k1000: hits_k1000 as f64 / (query_count * GOLD_PER_QUERY) as f64,
         per_query_hits_k1000: integer_summary(&per_query_hits),
+        per_query_hits_k1000_values: per_query_hits.clone(),
         queries_below_8_of_10: per_query_hits.iter().filter(|&&hits| hits < 8).count(),
         queries_below_5_of_10: per_query_hits.iter().filter(|&&hits| hits < 5).count(),
         flat_artifact_bytes,
@@ -883,7 +907,7 @@ async fn run_benchmark() -> BenchResult<()> {
         truth_total_request_waves,
         observed_get_requests_equal_planned: observed_equals_planned,
         query_fde_encode_ms_mean,
-        filtered_queries: FILTERED_QUERY_COUNT,
+        filtered_queries: filtered_query_count,
         filtered_all_results_match,
         filtered_planned_requests: integer_summary(&filtered_planned),
         flat_artifact_sha256,
@@ -899,7 +923,7 @@ async fn run_benchmark() -> BenchResult<()> {
         "phase9_flat_sq8 lane=text candidate_k={CANDIDATE_K} hits={hits_k1000}/{} \
          recall={:.6} warm_p50_ms={:.1} warm_p95_ms={:.1} \
          planned_bytes_p50={} artifact_bytes={flat_artifact_bytes} elapsed_ms={}",
-        QUERY_COUNT * GOLD_PER_QUERY,
+        query_count * GOLD_PER_QUERY,
         report.recall_k1000,
         report.warm_query_ms.p50,
         report.warm_query_ms.p95,
@@ -1207,6 +1231,16 @@ pub(super) fn required_path(name: &str) -> BenchResult<PathBuf> {
     env::var_os(name)
         .map(PathBuf::from)
         .ok_or_else(|| format!("{name} must be set"))
+}
+
+fn optional_usize(name: &str, default: usize) -> BenchResult<usize> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .map_err(|error| format!("invalid {name}={value:?}: {error}")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(format!("cannot read {name}: {error}")),
+    }
 }
 
 pub(super) fn load_tensor(
