@@ -1947,6 +1947,9 @@ async fn compaction_loop_with_lifecycle_inner(
                             .discover_and_admit(
                                 &ns.name,
                                 incarnation.as_uuid(),
+                                ns.late_interaction
+                                    .as_ref()
+                                    .map(|admission| admission.accepted_modalities.as_slice()),
                                 enrichment_fragments_remaining,
                                 enrichment_bytes_remaining,
                             )

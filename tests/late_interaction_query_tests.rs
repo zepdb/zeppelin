@@ -32,6 +32,8 @@ use common::fault_injection::pause_first_get_matching;
 use common::harness::TestHarness;
 use common::server::{client_with_bearer, start_test_server_on_store_with_config};
 
+const TEXT_MODALITIES: &[InputModality] = &[InputModality::Text];
+
 fn require_minio() {
     assert_eq!(
         std::env::var("TEST_BACKEND").as_deref(),
@@ -214,7 +216,13 @@ async fn enrich_all(
 ) {
     let coordinator = coordinator(store, encoder_provider);
     let report = coordinator
-        .discover_and_admit(namespace, incarnation, usize::MAX, u64::MAX)
+        .discover_and_admit(
+            namespace,
+            incarnation,
+            Some(TEXT_MODALITIES),
+            usize::MAX,
+            u64::MAX,
+        )
         .await
         .expect("enrichment discovery must succeed");
     assert!(
@@ -552,7 +560,7 @@ async fn strong_waits_for_coverage_while_eventual_reports_partial() {
 
     let coordinator = coordinator(&harness.store, Arc::clone(&encoder_provider));
     let report = coordinator
-        .discover_and_admit(&namespace, incarnation, 10, u64::MAX)
+        .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 10, u64::MAX)
         .await
         .expect("pending discovery must succeed");
     assert_eq!(report.admitted_fragments, 1);

@@ -22,7 +22,6 @@ use crate::embedding::{
 use crate::error::{Result, ZeppelinError};
 use crate::index::late_interaction::FdeTransform;
 use crate::namespace::branching::ArtifactOrigin;
-use crate::namespace::NamespaceManager;
 use crate::storage::{CreateOnlyOutcome, NamespaceObjectFamily, ZeppelinStore};
 use crate::wal::{
     EncoderInputWalFragment, InputFragmentRef, LateStateSection, LeaseManager, Manifest,
@@ -362,10 +361,15 @@ impl EnrichmentCoordinator {
     }
 
     /// Discover and `try_send` bounded work without awaiting encoder execution.
+    ///
+    /// `accepted_modalities` must come from the namespace metadata snapshot
+    /// paired with `incarnation`. `None` preserves fail-loud handling for a
+    /// late-interaction namespace whose admission config is missing.
     pub async fn discover_and_admit(
         &self,
         namespace: &str,
         incarnation: uuid::Uuid,
+        accepted_modalities: Option<&[InputModality]>,
         max_fragments: usize,
         max_bytes: u64,
     ) -> Result<EnrichmentAdmissionReport> {
@@ -381,20 +385,12 @@ impl EnrichmentCoordinator {
         let Some(profile) = section.active_profile.as_ref() else {
             return Ok(EnrichmentAdmissionReport::default());
         };
-        let metadata = NamespaceManager::new(self.store.clone())
-            .get(namespace)
-            .await?;
-        let accepted_modalities = metadata
-            .late_interaction
-            .as_ref()
-            .ok_or_else(|| {
-                ZeppelinError::Validation(format!(
-                    "late-interaction namespace {namespace} is missing admission config"
-                ))
-            })?
-            .accepted_modalities
-            .clone();
-        profile.validate_for_modalities(&accepted_modalities)?;
+        let accepted_modalities = accepted_modalities.ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "late-interaction namespace {namespace} is missing admission config"
+            ))
+        })?;
+        profile.validate_for_modalities(accepted_modalities)?;
         let mut report = EnrichmentAdmissionReport::default();
         let mut inspected_bytes = 0_u64;
         for source_ref in &manifest.input_fragments {
@@ -473,7 +469,7 @@ impl EnrichmentCoordinator {
                 id: work_id,
                 source_id,
                 namespace: namespace.to_string(),
-                accepted_modalities: accepted_modalities.clone(),
+                accepted_modalities: accepted_modalities.to_vec(),
                 incarnation,
                 source_ref: source_ref.clone(),
                 source_origin,
