@@ -1372,6 +1372,12 @@ impl Compactor {
             }
             let fragments = &manifest.input_fragments;
             if fragments.is_empty() {
+                if manifest.namespace_incarnation().is_some()
+                    && manifest.has_foreign_visible_artifacts()?
+                {
+                    info!("late compaction triggered by foreign branch materialization");
+                    return Ok(true);
+                }
                 debug!("no typed input fragments, late compaction not needed");
                 return Ok(false);
             }

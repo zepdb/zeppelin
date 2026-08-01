@@ -98,6 +98,10 @@ struct LateBuildSnapshot {
     carried_matrix_blocks: Vec<MatrixBlockRef>,
     /// Flat-SQ8 calibration authority for this build.
     flat_calibration: FlatCalibrationSource,
+    /// True when a visible ref is still foreign-owned: compaction must run
+    /// even with no pending inputs so the branch fully materializes and the
+    /// source root can eventually release.
+    requires_foreign_materialization: bool,
 }
 
 /// Reuse decision for one late compaction over an existing flat segment.
@@ -123,12 +127,19 @@ impl Compactor {
         check_lease_lost(namespace, lease_lost.as_deref())?;
         let snapshot = self.snapshot_late_build(namespace).await?;
         if snapshot.inputs.is_empty() {
-            return Ok(CompactionResult {
-                segment_id: None,
-                vectors_compacted: 0,
-                fragments_removed: 0,
-                old_segment_removed: None,
-            });
+            if snapshot.requires_foreign_materialization {
+                info!(
+                    namespace,
+                    "late compaction materializes a foreign-backed branch view"
+                );
+            } else {
+                return Ok(CompactionResult {
+                    segment_id: None,
+                    vectors_compacted: 0,
+                    fragments_removed: 0,
+                    old_segment_removed: None,
+                });
+            }
         }
 
         let fragments_removed = snapshot.inputs.len();
@@ -282,6 +293,21 @@ impl Compactor {
                 built.as_ref().map(|candidate| candidate.reference.clone()),
                 namespace,
             )?;
+            if snapshot.requires_foreign_materialization {
+                let copies =
+                    rebind_foreign_section_residents(&mut section, namespace, &fresh_local)?;
+                for (source_key, target_key) in &copies {
+                    let bytes = self.store.get(source_key).await?;
+                    put_create_verified(&self.store, target_key, bytes).await?;
+                }
+                if !copies.is_empty() {
+                    info!(
+                        namespace,
+                        copied = copies.len(),
+                        "materialization copied foreign section residents"
+                    );
+                }
+            }
             section.canonicalize_artifact_origins()?;
             section.validate_for_origin(&fresh_local)?;
             let new_section_ref = section.put_create(&self.store, namespace).await?;
@@ -400,6 +426,8 @@ impl Compactor {
                     "late-interaction namespace has no loadable late-state section".to_string(),
                 )
             })?;
+        let requires_foreign_materialization =
+            !manifest.visible_refs_are_local_with_late_state(Some(&section))?;
         section.rebase_nested_artifact_origins(&section_origin, &local_origin)?;
         section.canonicalize_artifact_origins()?;
         section.validate_for_origin(&local_origin)?;
@@ -509,8 +537,85 @@ impl Compactor {
             fts_configs: metadata.full_text_search,
             carried_matrix_blocks,
             flat_calibration,
+            requires_foreign_materialization,
         })
     }
+}
+
+/// Rebind every section-resident foreign artifact to a target-owned key.
+///
+/// Branch materialization rebuilds the active segment target-owned, but the
+/// small immutable residents — the profile's FDE transform, centering means,
+/// typed sources, and quarantine evidence — still reference the source
+/// namespace and would keep the locality projection foreign forever,
+/// permanently blocking source-root release. Each foreign ref is rewritten
+/// to `{namespace}/{suffix}` (the suffixes are content-addressed, so the
+/// checksummed identity is unchanged) and the returned `(source, target)`
+/// pairs tell the caller which object bytes to copy before publication.
+fn rebind_foreign_section_residents(
+    section: &mut LateStateSection,
+    namespace: &str,
+    local: &ArtifactOrigin,
+) -> Result<Vec<(String, String)>> {
+    let origins = section.artifact_origins.clone();
+    let mut copies: Vec<(String, String)> = Vec::new();
+    let mut rebind =
+        |key: &mut String, origin_slot: &mut Option<ArtifactOriginIndex>| -> Result<()> {
+            let Some(index) = origin_slot.as_ref() else {
+                return Ok(());
+            };
+            let table_index = usize::try_from(index.get()).map_err(|_| {
+                ZeppelinError::Serialization(format!(
+                    "section origin index {} does not fit this platform",
+                    index.get()
+                ))
+            })?;
+            let origin = origins.get(table_index).ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "section origin index {table_index} is out of bounds for table length {}",
+                    origins.len()
+                ))
+            })?;
+            if origin == local {
+                *origin_slot = None;
+                return Ok(());
+            }
+            let prefix = format!("{}/", origin.namespace.as_str());
+            let suffix = key.strip_prefix(&prefix).ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "foreign section artifact {key} is not under its origin namespace {}",
+                    origin.namespace.as_str()
+                ))
+            })?;
+            let target_key = format!("{namespace}/{suffix}");
+            copies.push((key.clone(), target_key.clone()));
+            *key = target_key;
+            *origin_slot = None;
+            Ok(())
+        };
+    for source in &mut section.source_inventory {
+        rebind(&mut source.key, &mut source.artifact_origin)?;
+    }
+    if let Some(profile) = section.active_profile.as_mut() {
+        if let Some(mean) = profile.epoch.exact_scoring_transform.mean_mut() {
+            rebind(&mut mean.key, &mut mean.artifact_origin)?;
+        }
+        rebind(
+            &mut profile.fde.transform_artifact.key,
+            &mut profile.fde.transform_artifact.artifact_origin,
+        )?;
+        if let Some(mean) = profile.fde.candidate_vector_transform.mean_mut() {
+            rebind(&mut mean.key, &mut mean.artifact_origin)?;
+        }
+    }
+    for evidence in &mut section.quarantine_evidence {
+        rebind(
+            &mut evidence.source_fragment.key,
+            &mut evidence.source_fragment.artifact_origin,
+        )?;
+        rebind(&mut evidence.key, &mut evidence.artifact_origin)?;
+    }
+    Ok(copies)
 }
 
 /// Decide whether the old flat segment can be reused incrementally.

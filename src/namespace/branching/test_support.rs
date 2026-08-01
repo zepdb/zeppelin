@@ -500,6 +500,36 @@ pub async fn delete_namespace_for_test(
         .await
 }
 
+/// Exercise graph-owned deletion with an exact validated config and clock.
+///
+/// This keeps grace-boundary deletion sequences (delete → grace wait →
+/// clock jump → resume → dependent deletes) inside one clock domain, so
+/// lease expiries observed by later steps stay consistent without sleeping
+/// on wall time.
+pub async fn delete_namespace_with_config_and_clock_for_test(
+    store: ZeppelinStore,
+    namespace: NamespaceId,
+    config: &Config,
+    clock: Clock,
+) -> Result<NamespaceDeleteOutcome> {
+    let decision_id = DecisionId::new();
+    graph_for_test_with_config_and_clock(store, config, clock)?
+        .delete(AuthorizedNamespaceDelete {
+            namespace,
+            decision: DeletionDecision {
+                actor: PrincipalId::new("test-delete-actor")
+                    .unwrap_or_else(|_| panic!("test delete actor must be a valid principal")),
+                approver: None,
+                decision_id,
+                policy_version: PolicyVersion::BOOT,
+                decision_evidence_ref: deletion_decision_evidence_key(decision_id),
+            },
+            governance: Arc::new(TestDeletionGovernance),
+            activation_recovery: Arc::new(TestBranchActivationRecovery),
+        })
+        .await
+}
+
 /// Resume an ordinary deleting namespace through the graph retry seam.
 pub async fn resume_delete_for_test(
     store: ZeppelinStore,

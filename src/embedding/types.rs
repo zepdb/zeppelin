@@ -649,7 +649,12 @@ impl MultiVectorEpoch {
         supported_modalities.dedup();
         let mut exact_scoring_transform = self.exact_scoring_transform.clone();
         if let Some(mean) = exact_scoring_transform.mean_mut() {
+            // Epoch identity is location-independent: the mean participates
+            // by content checksum and shape, never by where it is stored, so
+            // branch materialization can rehome the artifact without minting
+            // a new epoch.
             mean.artifact_origin = None;
+            mean.key = String::new();
         }
         let canonical = CanonicalEpoch {
             encoder: CanonicalEncoder {
@@ -811,11 +816,16 @@ impl FdeRecipe {
             candidate_document_pooling: CandidateDocumentPooling,
         }
 
+        // Generation identity is location-independent: artifacts participate
+        // by content checksum and shape, never by their stored key, so branch
+        // materialization can rehome them without minting a new generation.
         let mut transform_artifact = self.transform_artifact.clone();
         transform_artifact.artifact_origin = None;
+        transform_artifact.key = String::new();
         let mut candidate_vector_transform = self.candidate_vector_transform.clone();
         if let Some(mean) = candidate_vector_transform.mean_mut() {
             mean.artifact_origin = None;
+            mean.key = String::new();
         }
         canonical_sha256(
             b"zeppelin-fde-generation-v1",
