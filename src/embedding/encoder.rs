@@ -140,6 +140,26 @@ impl MultiVectorEmbedding {
         })
     }
 
+    /// Take ownership of values already validated by an artifact decoder.
+    pub(crate) fn from_decoder_validated(
+        values: Vec<f32>,
+        vector_count: usize,
+        vector_dimension: usize,
+        max_vectors: usize,
+    ) -> Result<Self> {
+        MultiVectorMatrixRef::from_decoder_validated(
+            &values,
+            vector_count,
+            vector_dimension,
+            max_vectors,
+        )?;
+        Ok(Self {
+            values,
+            vector_count,
+            vector_dimension,
+        })
+    }
+
     /// Borrow the complete row-major scalar payload.
     #[must_use]
     pub fn values(&self) -> &[f32] {

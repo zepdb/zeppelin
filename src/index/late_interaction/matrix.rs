@@ -23,6 +23,37 @@ impl<'a> MultiVectorMatrixRef<'a> {
         vector_dimension: usize,
         max_vectors: usize,
     ) -> Result<Self> {
+        let matrix =
+            Self::from_validated_parts(values, vector_count, vector_dimension, max_vectors)?;
+        if let Some(index) = values.iter().position(|value| !value.is_finite()) {
+            return Err(LateInteractionError::NonFiniteValue { index }.into());
+        }
+        Ok(matrix)
+    }
+
+    /// Construct a matrix view after an artifact decoder validated finiteness.
+    ///
+    /// Shape and caller bounds remain checked here. The debug assertion catches
+    /// decoder-contract regressions without rescanning every value in release
+    /// scoring builds.
+    pub(crate) fn from_decoder_validated(
+        values: &'a [f32],
+        vector_count: usize,
+        vector_dimension: usize,
+        max_vectors: usize,
+    ) -> Result<Self> {
+        let matrix =
+            Self::from_validated_parts(values, vector_count, vector_dimension, max_vectors)?;
+        debug_assert!(values.iter().all(|value| value.is_finite()));
+        Ok(matrix)
+    }
+
+    fn from_validated_parts(
+        values: &'a [f32],
+        vector_count: usize,
+        vector_dimension: usize,
+        max_vectors: usize,
+    ) -> Result<Self> {
         if vector_count == 0 {
             return Err(LateInteractionError::EmptyMatrix.into());
         }
@@ -50,9 +81,6 @@ impl<'a> MultiVectorMatrixRef<'a> {
                 actual: values.len(),
             }
             .into());
-        }
-        if let Some(index) = values.iter().position(|value| !value.is_finite()) {
-            return Err(LateInteractionError::NonFiniteValue { index }.into());
         }
         Ok(Self {
             values,

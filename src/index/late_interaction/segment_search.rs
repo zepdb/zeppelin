@@ -10,11 +10,20 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
+use std::thread;
+#[cfg(test)]
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use futures::StreamExt;
 
 use crate::cache::DiskCache;
-use crate::embedding::{ArtifactChecksum, ContentHash};
+use crate::embedding::artifact::MatrixDecodeScratch;
+use crate::embedding::{ArtifactChecksum, ContentHash, MatrixDtype};
 use crate::error::{Result, ZeppelinError};
 use crate::index::filter::evaluate_filter_on_optional_attributes;
+#[cfg(test)]
+use crate::storage::read_plan::execute_read_plan_streamed;
 use crate::storage::read_plan::{
     execute_read_plan, ReadPlan, ReadPlanConfig, ReadPlanError, ReadRequest,
 };
@@ -27,7 +36,7 @@ use super::candidate::{
     FdeCandidateIndex, FetchedLateCandidateCluster, LateCandidate, ResidentLateCandidateIndex,
 };
 use super::flat_candidate::ResidentFlatCandidateIndex;
-use super::matrix_artifact::decode_matrix_row;
+use super::matrix_artifact::decode_matrix_row_into;
 use super::{max_sim, MultiVectorMatrixRef};
 
 /// Runtime byte and shape limits for one segment execution.
@@ -237,7 +246,10 @@ pub(crate) async fn search_segment(
     let truth_bytes = execute_read_plan(request.store, &truth_plan)
         .await
         .map_err(map_read_plan_error)?;
+    #[cfg(not(test))]
     let mut rows = score_truth_wave(&request, candidates, &truth_bytes)?;
+    #[cfg(test)]
+    let mut rows = score_truth_wave(&request, candidates, &truth_bytes, None)?;
     rows.sort_by(compare_scored_rows);
     rows.truncate(request.top_k);
     Ok(SegmentSearchOutput {
@@ -404,6 +416,32 @@ pub(crate) fn score_truth_wave(
     request: &SegmentSearchRequest<'_>,
     candidates: Vec<LateCandidate>,
     truth_bytes: &[bytes::Bytes],
+    #[cfg(test)] timing: Option<&mut TruthWaveTiming>,
+) -> Result<Vec<SegmentScoredRow>> {
+    let worker_count = truth_score_worker_count(candidates.len())?;
+    score_truth_wave_with_workers(
+        request,
+        candidates,
+        truth_bytes,
+        worker_count,
+        #[cfg(test)]
+        timing,
+    )
+}
+
+fn truth_score_worker_count(candidate_count: usize) -> Result<usize> {
+    thread::available_parallelism()
+        .map(usize::from)
+        .map_err(|error| segment_error(format!("cannot resolve truth scoring workers: {error}")))
+        .map(|workers| workers.min(candidate_count.max(1)))
+}
+
+fn score_truth_wave_with_workers(
+    request: &SegmentSearchRequest<'_>,
+    candidates: Vec<LateCandidate>,
+    truth_bytes: &[bytes::Bytes],
+    worker_count: usize,
+    #[cfg(test)] timing: Option<&mut TruthWaveTiming>,
 ) -> Result<Vec<SegmentScoredRow>> {
     let expected = candidates
         .len()
@@ -416,58 +454,444 @@ pub(crate) fn score_truth_wave(
     }
     let vector_dimension = usize::try_from(request.segment.vector_dimension)
         .map_err(|_| segment_error("segment vector dimension exceeds usize"))?;
+    if worker_count == 0 {
+        return Err(segment_error("truth scoring worker count must be positive"));
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = worker_count.min(candidates.len());
+    let candidate_count = candidates.len();
+    let base_chunk_size = candidate_count / worker_count;
+    let larger_chunks = candidate_count % worker_count;
+    let mut candidate_iter = candidates.into_iter();
+    let mut start_index = 0usize;
+    let chunks = (0..worker_count)
+        .map(|worker_index| {
+            let chunk_size = base_chunk_size + usize::from(worker_index < larger_chunks);
+            let chunk = candidate_iter.by_ref().take(chunk_size).collect::<Vec<_>>();
+            let chunk_start = start_index;
+            start_index += chunk.len();
+            (chunk_start, chunk)
+        })
+        .collect::<Vec<_>>();
+    debug_assert_eq!(start_index, candidate_count);
+
+    let scored_chunks = thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(chunks.len());
+        for (start_index, candidates) in chunks {
+            workers.push(scope.spawn(move || {
+                score_truth_chunk(
+                    request,
+                    start_index,
+                    candidates,
+                    truth_bytes,
+                    vector_dimension,
+                )
+            }));
+        }
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| segment_error("truth scoring worker panicked"))?
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+
+    #[cfg(test)]
+    if let Some(timing) = timing {
+        timing.decode = scored_chunks
+            .iter()
+            .map(|chunk| chunk.timing.decode)
+            .max()
+            .unwrap_or_default();
+        timing.maxsim = scored_chunks
+            .iter()
+            .map(|chunk| chunk.timing.maxsim)
+            .max()
+            .unwrap_or_default();
+        timing.workers = scored_chunks.len();
+    }
+
+    Ok(scored_chunks
+        .into_iter()
+        .flat_map(|chunk| chunk.rows)
+        .collect())
+}
+
+struct ScoredTruthChunk {
+    rows: Vec<SegmentScoredRow>,
+    #[cfg(test)]
+    timing: TruthWaveTiming,
+}
+
+fn score_truth_chunk(
+    request: &SegmentSearchRequest<'_>,
+    start_index: usize,
+    candidates: Vec<LateCandidate>,
+    truth_bytes: &[bytes::Bytes],
+    vector_dimension: usize,
+) -> Result<ScoredTruthChunk> {
     let mut rows = Vec::with_capacity(candidates.len());
-    for (candidate_index, candidate) in candidates.into_iter().enumerate() {
+    let mut decode_scratch = MatrixDecodeScratch::default();
+    #[cfg(test)]
+    let mut timing = TruthWaveTiming::default();
+    for (chunk_index, candidate) in candidates.into_iter().enumerate() {
+        let candidate_index = start_index
+            .checked_add(chunk_index)
+            .ok_or_else(|| segment_error("truth candidate index overflows"))?;
         let matrix_index = candidate_index
             .checked_mul(2)
             .ok_or_else(|| segment_error("truth matrix output index overflows"))?;
         let attribute_index = matrix_index
             .checked_add(1)
             .ok_or_else(|| segment_error("truth attribute output index overflows"))?;
-        let embedding = decode_matrix_row(
-            truth_bytes
-                .get(matrix_index)
-                .ok_or_else(|| segment_error("truth wave omitted a matrix payload"))?,
-            &candidate.matrix_locator,
+        let matrix_bytes = truth_bytes
+            .get(matrix_index)
+            .ok_or_else(|| segment_error("truth wave omitted a matrix payload"))?;
+        let attribute_bytes = truth_bytes
+            .get(attribute_index)
+            .ok_or_else(|| segment_error("truth wave omitted an attribute payload"))?;
+        let row = score_truth_candidate(
+            &request.exact_query,
             request.segment.matrix_dtype,
             vector_dimension,
-            request.bounds.max_vectors_per_document,
+            request.bounds,
+            request.mandatory_filter,
+            request.request_filter,
+            candidate,
+            matrix_bytes,
+            attribute_bytes,
+            &mut decode_scratch,
+            #[cfg(test)]
+            Some(&mut timing),
         )?;
-        let attributes = decode_attribute_row(
-            truth_bytes
-                .get(attribute_index)
-                .ok_or_else(|| segment_error("truth wave omitted an attribute payload"))?,
-            &candidate.attr_locator,
-            request.bounds.max_attribute_payload_bytes,
-        )?;
-        if attributes != candidate.metadata.attributes {
-            return Err(segment_error(
-                "wave-one filter attributes disagree with exact attributes",
-            ));
-        }
-        if !filter_matches(request.mandatory_filter, attributes.as_ref())
-            || !filter_matches(request.request_filter, attributes.as_ref())
-        {
-            return Err(segment_error(
-                "candidate failed the final exact attribute assertion",
-            ));
-        }
-        let document = embedding.matrix_ref()?;
-        let score = max_sim(&request.exact_query, &document)?;
-        if !score.is_finite() {
-            return Err(segment_error("exact MaxSim score is not finite"));
-        }
-        rows.push(SegmentScoredRow {
-            id: candidate.id,
-            score,
-            content_hash: candidate.metadata.content_hash,
-            source_sequence: candidate.metadata.source_sequence,
-            parent_id: candidate.metadata.parent_id,
-            unit_ordinal: candidate.metadata.unit_ordinal,
-            attributes,
-        });
+        rows.push(row);
     }
-    Ok(rows)
+    Ok(ScoredTruthChunk {
+        rows,
+        #[cfg(test)]
+        timing,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_truth_candidate(
+    exact_query: &MultiVectorMatrixRef<'_>,
+    matrix_dtype: MatrixDtype,
+    vector_dimension: usize,
+    bounds: SegmentSearchBounds,
+    mandatory_filter: Option<&Filter>,
+    request_filter: Option<&Filter>,
+    candidate: LateCandidate,
+    matrix_bytes: &bytes::Bytes,
+    attribute_bytes: &bytes::Bytes,
+    decode_scratch: &mut MatrixDecodeScratch,
+    #[cfg(test)] timing: Option<&mut TruthWaveTiming>,
+) -> Result<SegmentScoredRow> {
+    #[cfg(test)]
+    let decode_started = Instant::now();
+    let document = decode_matrix_row_into(
+        matrix_bytes,
+        &candidate.matrix_locator,
+        matrix_dtype,
+        vector_dimension,
+        bounds.max_vectors_per_document,
+        decode_scratch,
+    )?;
+    let attributes = decode_attribute_row(
+        attribute_bytes,
+        &candidate.attr_locator,
+        bounds.max_attribute_payload_bytes,
+    )?;
+    if attributes != candidate.metadata.attributes {
+        return Err(segment_error(
+            "wave-one filter attributes disagree with exact attributes",
+        ));
+    }
+    if !filter_matches(mandatory_filter, attributes.as_ref())
+        || !filter_matches(request_filter, attributes.as_ref())
+    {
+        return Err(segment_error(
+            "candidate failed the final exact attribute assertion",
+        ));
+    }
+    #[cfg(test)]
+    let mut timing = timing;
+    #[cfg(test)]
+    if let Some(timing) = timing.as_mut() {
+        timing.decode += decode_started.elapsed();
+    }
+    #[cfg(test)]
+    let maxsim_started = Instant::now();
+    let score = max_sim(exact_query, &document)?;
+    #[cfg(test)]
+    if let Some(timing) = timing.as_mut() {
+        timing.maxsim += maxsim_started.elapsed();
+    }
+    if !score.is_finite() {
+        return Err(segment_error("exact MaxSim score is not finite"));
+    }
+    Ok(SegmentScoredRow {
+        id: candidate.id,
+        score,
+        content_hash: candidate.metadata.content_hash,
+        source_sequence: candidate.metadata.source_sequence,
+        parent_id: candidate.metadata.parent_id,
+        unit_ordinal: candidate.metadata.unit_ordinal,
+        attributes,
+    })
+}
+
+#[cfg(test)]
+struct ReadyTruthCandidate {
+    candidate_index: usize,
+    candidate: LateCandidate,
+    matrix_bytes: bytes::Bytes,
+    attribute_bytes: bytes::Bytes,
+}
+
+#[cfg(test)]
+struct ScoredReadyTruthChunk {
+    rows: Vec<(usize, SegmentScoredRow)>,
+    first_score_started: Option<Instant>,
+    last_score_finished: Option<Instant>,
+    timing: TruthWaveTiming,
+}
+
+/// Bench-only output from overlapping physical reads with parallel scoring.
+#[cfg(test)]
+pub(crate) struct PipelinedTruthWave {
+    pub(crate) rows: Vec<SegmentScoredRow>,
+    pub(crate) logical_bytes: u64,
+    pub(crate) fetch_elapsed: Duration,
+    pub(crate) score_elapsed: Duration,
+    pub(crate) timing: TruthWaveTiming,
+}
+
+/// Bench-only truth driver that keeps fetching while scoped CPU workers score.
+#[cfg(test)]
+pub(crate) async fn execute_truth_wave_pipelined(
+    request: &SegmentSearchRequest<'_>,
+    candidates: Vec<LateCandidate>,
+    plan: &ReadPlan,
+) -> Result<PipelinedTruthWave> {
+    let candidate_count = candidates.len();
+    let expected_logical = candidate_count
+        .checked_mul(2)
+        .ok_or_else(|| segment_error("truth output count overflows"))?;
+    if plan.logical_request_count() != expected_logical {
+        return Err(segment_error(
+            "truth read plan does not match the candidate payload count",
+        ));
+    }
+    let vector_dimension = usize::try_from(request.segment.vector_dimension)
+        .map_err(|_| segment_error("segment vector dimension exceeds usize"))?;
+    let query_values = request.exact_query.values().to_vec();
+    let query_vector_count = request.exact_query.vector_count();
+    let query_vector_dimension = request.exact_query.vector_dimension();
+    let matrix_dtype = request.segment.matrix_dtype;
+    let bounds = request.bounds;
+    let mandatory_filter = request.mandatory_filter.cloned();
+    let request_filter = request.request_filter.cloned();
+    let worker_count = truth_score_worker_count(candidate_count)?;
+
+    let mut senders = Vec::with_capacity(worker_count);
+    let mut receivers = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<ReadyTruthCandidate>();
+        senders.push(sender);
+        receivers.push(receiver);
+    }
+    let scoring_workers = tokio::task::spawn_blocking(move || {
+        thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(worker_count);
+            for mut receiver in receivers {
+                let query_values = &query_values;
+                let mandatory_filter = &mandatory_filter;
+                let request_filter = &request_filter;
+                workers.push(scope.spawn(move || -> Result<ScoredReadyTruthChunk> {
+                    let exact_query = MultiVectorMatrixRef::new(
+                        query_values,
+                        query_vector_count,
+                        query_vector_dimension,
+                        query_vector_count,
+                    )?;
+                    let mut rows = Vec::with_capacity(candidate_count.div_ceil(worker_count));
+                    let mut decode_scratch = MatrixDecodeScratch::default();
+                    let mut first_score_started = None;
+                    let mut last_score_finished = None;
+                    let mut timing = TruthWaveTiming::default();
+                    let mut first_error = None;
+                    while let Some(ready) = receiver.blocking_recv() {
+                        if first_error.is_some() {
+                            continue;
+                        }
+                        let score_started = Instant::now();
+                        first_score_started.get_or_insert(score_started);
+                        match score_truth_candidate(
+                            &exact_query,
+                            matrix_dtype,
+                            vector_dimension,
+                            bounds,
+                            mandatory_filter.as_ref(),
+                            request_filter.as_ref(),
+                            ready.candidate,
+                            &ready.matrix_bytes,
+                            &ready.attribute_bytes,
+                            &mut decode_scratch,
+                            Some(&mut timing),
+                        ) {
+                            Ok(row) => rows.push((ready.candidate_index, row)),
+                            Err(error) => first_error = Some(error),
+                        }
+                        last_score_finished = Some(Instant::now());
+                    }
+                    if let Some(error) = first_error {
+                        return Err(error);
+                    }
+                    Ok(ScoredReadyTruthChunk {
+                        rows,
+                        first_score_started,
+                        last_score_finished,
+                        timing,
+                    })
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .map_err(|_| segment_error("truth scoring worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+    });
+
+    let mut candidates = candidates.into_iter().map(Some).collect::<Vec<_>>();
+    let mut payloads = (0..candidate_count)
+        .map(|_| [None, None])
+        .collect::<Vec<[Option<bytes::Bytes>; 2]>>();
+    let mut remaining = vec![2_u8; candidate_count];
+    let mut logical_bytes = 0_u64;
+    let fetch_started = Instant::now();
+    let completions = execute_read_plan_streamed(request.store, plan);
+    futures::pin_mut!(completions);
+    while let Some(completion) = completions.next().await {
+        let (planned_index, bytes) = completion.map_err(map_read_plan_error)?;
+        let logical = plan
+            .logical_slices_for(planned_index, &bytes)
+            .map_err(map_read_plan_error)?;
+        for (logical_index, bytes) in logical {
+            logical_bytes = logical_bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| segment_error("truth logical byte count overflows"))?;
+            let candidate_index = logical_index / 2;
+            let payload_index = logical_index % 2;
+            let candidate_payloads = payloads
+                .get_mut(candidate_index)
+                .ok_or_else(|| segment_error("truth logical index exceeds candidates"))?;
+            if candidate_payloads[payload_index].replace(bytes).is_some() {
+                return Err(segment_error("truth pipeline delivered a payload twice"));
+            }
+            let candidate_remaining = remaining
+                .get_mut(candidate_index)
+                .ok_or_else(|| segment_error("truth logical index exceeds candidates"))?;
+            *candidate_remaining = candidate_remaining
+                .checked_sub(1)
+                .ok_or_else(|| segment_error("truth candidate range count underflowed"))?;
+            if *candidate_remaining == 0 {
+                let matrix_bytes = candidate_payloads[0]
+                    .take()
+                    .ok_or_else(|| segment_error("truth pipeline omitted a matrix payload"))?;
+                let attribute_bytes = candidate_payloads[1]
+                    .take()
+                    .ok_or_else(|| segment_error("truth pipeline omitted an attribute payload"))?;
+                let candidate = candidates[candidate_index]
+                    .take()
+                    .ok_or_else(|| segment_error("truth pipeline scored a candidate twice"))?;
+                senders[candidate_index % worker_count]
+                    .send(ReadyTruthCandidate {
+                        candidate_index,
+                        candidate,
+                        matrix_bytes,
+                        attribute_bytes,
+                    })
+                    .map_err(|_| segment_error("truth scoring worker stopped early"))?;
+            }
+        }
+    }
+    let fetch_elapsed = fetch_started.elapsed();
+    if remaining.iter().any(|remaining| *remaining != 0) {
+        return Err(segment_error("truth pipeline omitted candidate payloads"));
+    }
+    drop(senders);
+    let scored_chunks = scoring_workers
+        .await
+        .map_err(|error| segment_error(format!("truth scoring worker failed: {error}")))??;
+    let first_score_started = scored_chunks
+        .iter()
+        .filter_map(|chunk| chunk.first_score_started)
+        .min();
+    let last_score_finished = scored_chunks
+        .iter()
+        .filter_map(|chunk| chunk.last_score_finished)
+        .max();
+    let score_elapsed = match (first_score_started, last_score_finished) {
+        (Some(started), Some(finished)) => finished.duration_since(started),
+        (None, None) => Duration::ZERO,
+        _ => return Err(segment_error("truth scoring timing is incomplete")),
+    };
+    let timing = TruthWaveTiming {
+        decode: scored_chunks
+            .iter()
+            .map(|chunk| chunk.timing.decode)
+            .max()
+            .unwrap_or_default(),
+        maxsim: scored_chunks
+            .iter()
+            .map(|chunk| chunk.timing.maxsim)
+            .max()
+            .unwrap_or_default(),
+        workers: scored_chunks.len(),
+    };
+    let mut indexed_rows = scored_chunks
+        .into_iter()
+        .flat_map(|chunk| chunk.rows)
+        .collect::<Vec<_>>();
+    indexed_rows.sort_by_key(|(candidate_index, _)| *candidate_index);
+    let rows = indexed_rows
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect::<Vec<_>>();
+    if rows.len() != candidate_count {
+        return Err(segment_error(
+            "truth scoring worker returned the wrong row count",
+        ));
+    }
+    Ok(PipelinedTruthWave {
+        rows,
+        logical_bytes,
+        fetch_elapsed,
+        score_elapsed,
+        timing,
+    })
+}
+
+/// Test-only critical-worker timing split for exact truth-wave scoring.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TruthWaveTiming {
+    /// Maximum accumulated decode time reported by any one scoped worker.
+    pub(crate) decode: Duration,
+    /// Maximum accumulated MaxSim time reported by any one scoped worker.
+    pub(crate) maxsim: Duration,
+    /// Scoped workers used for this score wave.
+    pub(crate) workers: usize,
 }
 
 fn trace_for(requests: &[ReadRequest], plan: &ReadPlan) -> SegmentWaveTrace {
@@ -520,8 +944,8 @@ mod tests {
         build_attribute_blocks, AttributeBlockInputRow, BuiltAttributeBlock,
     };
     use crate::index::late_interaction::candidate::{
-        build_late_candidate_index, BuiltLateCandidateIndex, LateCandidateBuildConfig,
-        LateCandidateInputRow, LateRoutingMetric,
+        build_late_candidate_index, BuiltLateCandidateIndex, LateCandidate,
+        LateCandidateBuildConfig, LateCandidateInputRow, LateCandidateMetadata, LateRoutingMetric,
     };
     use crate::index::late_interaction::flat_candidate::{
         build_flat_candidate_artifact, LateFlatCandidateBuildConfig,
@@ -529,18 +953,22 @@ mod tests {
     use crate::index::late_interaction::matrix_artifact::{
         build_matrix_blocks, BuiltMatrixBlock, MatrixBlockInputRow,
     };
-    use crate::storage::read_plan::ReadPlanConfig;
+    use crate::storage::read_plan::{execute_read_plan, ReadPlan, ReadPlanConfig};
     use crate::storage::ZeppelinStore;
     use crate::types::{AttributeValue, Filter};
     use crate::wal::{LateCandidateKind, LateInteractionSegmentRef};
 
-    use super::{search_segment, SegmentSearchBounds, SegmentSearchRequest};
+    use super::{
+        build_truth_requests, execute_truth_wave_pipelined, score_truth_wave_with_workers,
+        search_segment, SegmentSearchBounds, SegmentSearchRequest,
+    };
 
     const MAX_BYTES: usize = 1024 * 1024;
 
     struct Fixture {
         store: ZeppelinStore,
         segment: LateInteractionSegmentRef,
+        candidates: Vec<LateCandidate>,
     }
 
     async fn fixture(candidate_k: usize, corrupt_matrix: bool) -> Fixture {
@@ -621,6 +1049,22 @@ mod tests {
                     AttributeValue::String(color.to_string()),
                 )])),
             })
+            .collect::<Vec<_>>();
+        let scoring_candidates = candidate_rows
+            .iter()
+            .map(|row| LateCandidate {
+                id: row.id.clone(),
+                approx_fde_score: 0.0,
+                matrix_locator: row.matrix_locator.clone(),
+                attr_locator: row.attr_locator.clone(),
+                metadata: LateCandidateMetadata {
+                    content_hash: row.content_hash,
+                    source_sequence: row.source_sequence,
+                    parent_id: row.parent_id.clone(),
+                    unit_ordinal: row.unit_ordinal,
+                    attributes: row.filter_attributes.clone(),
+                },
+            })
             .collect();
         let (candidate_index, flat_candidate) = match kind {
             LateCandidateKind::Ivf => {
@@ -692,7 +1136,11 @@ mod tests {
             candidate_kind: kind,
             flat_candidate,
         };
-        Fixture { store, segment }
+        Fixture {
+            store,
+            segment,
+            candidates: scoring_candidates,
+        }
     }
 
     fn content_hash(id: &str) -> ContentHash {
@@ -749,6 +1197,76 @@ mod tests {
 
     fn plan() -> ReadPlanConfig {
         ReadPlanConfig::new(4096, MAX_BYTES, 2).expect("read plan")
+    }
+
+    #[tokio::test]
+    async fn parallel_truth_scoring_is_bit_identical_and_ordered() {
+        let fixture = fixture(2, false).await;
+        let read_plan = plan();
+        let truth_requests =
+            build_truth_requests(&fixture.segment, &fixture.candidates).expect("truth requests");
+        let truth_plan = ReadPlan::build(&truth_requests, &read_plan).expect("truth plan");
+        let truth_bytes = execute_read_plan(&fixture.store, &truth_plan)
+            .await
+            .expect("truth bytes");
+        let query = MultiVectorEmbedding::new(vec![1.0, 0.0], 1, 2, 4).expect("query");
+        let excluded_ids = BTreeSet::new();
+        let request = SegmentSearchRequest {
+            store: &fixture.store,
+            bootstrap_cache: None,
+            segment: &fixture.segment,
+            exact_query: query.matrix_ref().expect("query matrix"),
+            candidate_query_fde: &[1.0, 0.0],
+            mandatory_filter: None,
+            request_filter: None,
+            excluded_ids: &excluded_ids,
+            top_k: 2,
+            read_plan: &read_plan,
+            bounds: bounds(),
+        };
+
+        let sequential = score_truth_wave_with_workers(
+            &request,
+            fixture.candidates.clone(),
+            &truth_bytes,
+            1,
+            None,
+        )
+        .expect("sequential truth scores");
+        let parallel = score_truth_wave_with_workers(
+            &request,
+            fixture.candidates.clone(),
+            &truth_bytes,
+            2,
+            None,
+        )
+        .expect("parallel truth scores");
+        let pipelined =
+            execute_truth_wave_pipelined(&request, fixture.candidates.clone(), &truth_plan)
+                .await
+                .expect("pipelined truth scores");
+
+        assert_eq!(parallel.len(), sequential.len());
+        for (parallel, sequential) in parallel.iter().zip(&sequential) {
+            assert_eq!(parallel.id, sequential.id);
+            assert_eq!(parallel.score.to_bits(), sequential.score.to_bits());
+            assert_eq!(parallel.content_hash, sequential.content_hash);
+            assert_eq!(parallel.source_sequence, sequential.source_sequence);
+            assert_eq!(parallel.parent_id, sequential.parent_id);
+            assert_eq!(parallel.unit_ordinal, sequential.unit_ordinal);
+            assert_eq!(parallel.attributes, sequential.attributes);
+        }
+        assert_eq!(pipelined.timing.workers, 2);
+        assert_eq!(pipelined.rows.len(), sequential.len());
+        for (pipelined, sequential) in pipelined.rows.iter().zip(&sequential) {
+            assert_eq!(pipelined.id, sequential.id);
+            assert_eq!(pipelined.score.to_bits(), sequential.score.to_bits());
+            assert_eq!(pipelined.content_hash, sequential.content_hash);
+            assert_eq!(pipelined.source_sequence, sequential.source_sequence);
+            assert_eq!(pipelined.parent_id, sequential.parent_id);
+            assert_eq!(pipelined.unit_ordinal, sequential.unit_ordinal);
+            assert_eq!(pipelined.attributes, sequential.attributes);
+        }
     }
 
     #[tokio::test]
