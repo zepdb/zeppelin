@@ -2,8 +2,8 @@
 //!
 //! The planner groups logical ranges by immutable object, coalesces useful
 //! spans, caps each physical request, and preserves a back-map to caller order.
-//! It owns no cache or retry policy and has no production caller until the
-//! late-interaction two-wave query adopts it.
+//! It owns no cache or retry policy. Late-interaction queries use its collect
+//! executor for candidate reads and its completion stream for truth reads.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -198,7 +198,6 @@ struct BackMapEntry {
 pub struct ReadPlan {
     planned: Vec<PlannedRead>,
     back_map: Vec<BackMapEntry>,
-    #[cfg(test)]
     logical_by_planned: Vec<Vec<(usize, Range<usize>)>>,
     planned_bytes: u64,
     max_concurrent_requests: usize,
@@ -378,23 +377,19 @@ impl ReadPlan {
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .ok_or(ReadPlanError::InvalidBackMap)?;
-        #[cfg(test)]
         let mut logical_by_planned = vec![Vec::new(); planned.len()];
-        #[cfg(test)]
         for (logical_index, mapping) in back_map.iter().enumerate() {
             logical_by_planned
                 .get_mut(mapping.planned_index)
                 .ok_or(ReadPlanError::InvalidBackMap)?
                 .push((logical_index, mapping.slice.clone()));
         }
-        #[cfg(test)]
         if logical_by_planned.iter().any(Vec::is_empty) {
             return Err(ReadPlanError::InvalidBackMap);
         }
         Ok(Self {
             planned,
             back_map,
-            #[cfg(test)]
             logical_by_planned,
             planned_bytes,
             max_concurrent_requests: config.max_concurrent_requests,
@@ -408,7 +403,6 @@ impl ReadPlan {
     }
 
     /// Return the number of caller-ordered logical ranges.
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn logical_request_count(&self) -> usize {
         self.back_map.len()
@@ -421,7 +415,6 @@ impl ReadPlan {
     }
 
     /// Restore the caller-ordered logical slices carried by one physical read.
-    #[cfg(test)]
     pub(crate) fn logical_slices_for(
         &self,
         planned_index: usize,

@@ -14,7 +14,6 @@ use std::thread;
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
 use futures::StreamExt;
 
 use crate::cache::DiskCache;
@@ -22,10 +21,9 @@ use crate::embedding::artifact::MatrixDecodeScratch;
 use crate::embedding::{ArtifactChecksum, ContentHash, MatrixDtype};
 use crate::error::{Result, ZeppelinError};
 use crate::index::filter::evaluate_filter_on_optional_attributes;
-#[cfg(test)]
-use crate::storage::read_plan::execute_read_plan_streamed;
 use crate::storage::read_plan::{
-    execute_read_plan, ReadPlan, ReadPlanConfig, ReadPlanError, ReadRequest,
+    execute_read_plan, execute_read_plan_streamed, ReadPlan, ReadPlanConfig, ReadPlanError,
+    ReadRequest,
 };
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, Filter, VectorId};
@@ -243,13 +241,9 @@ pub(crate) async fn search_segment(
     let truth_plan =
         ReadPlan::build(&truth_requests, request.read_plan).map_err(map_read_plan_error)?;
     let truth_trace = trace_for(&truth_requests, &truth_plan);
-    let truth_bytes = execute_read_plan(request.store, &truth_plan)
-        .await
-        .map_err(map_read_plan_error)?;
-    #[cfg(not(test))]
-    let mut rows = score_truth_wave(&request, candidates, &truth_bytes)?;
-    #[cfg(test)]
-    let mut rows = score_truth_wave(&request, candidates, &truth_bytes, None)?;
+    let mut rows = execute_truth_wave_pipelined(&request, candidates, &truth_plan)
+        .await?
+        .rows;
     rows.sort_by(compare_scored_rows);
     rows.truncate(request.top_k);
     Ok(SegmentSearchOutput {
@@ -324,9 +318,9 @@ fn complete_object_request(key: &str, size_bytes: u64, label: &str) -> Result<Re
     })
 }
 
-// `pub(crate)` on the four functions below exists solely for the ignored
-// Phase 9 flat-candidate benchmark module; nothing outside this crate can see
-// them and no production caller changes.
+// `pub(crate)` on the benchmark-facing helpers below lets the ignored Phase 9
+// flat-candidate benchmark invoke the same code as production. The streamed
+// truth driver also backs `search_segment`; nothing outside this crate sees it.
 pub(crate) fn build_truth_requests(
     segment: &LateInteractionSegmentRef,
     candidates: &[LateCandidate],
@@ -412,23 +406,6 @@ fn locator_request(key: &str, offset: u64, length: u64, label: &str) -> Result<R
     })
 }
 
-pub(crate) fn score_truth_wave(
-    request: &SegmentSearchRequest<'_>,
-    candidates: Vec<LateCandidate>,
-    truth_bytes: &[bytes::Bytes],
-    #[cfg(test)] timing: Option<&mut TruthWaveTiming>,
-) -> Result<Vec<SegmentScoredRow>> {
-    let worker_count = truth_score_worker_count(candidates.len())?;
-    score_truth_wave_with_workers(
-        request,
-        candidates,
-        truth_bytes,
-        worker_count,
-        #[cfg(test)]
-        timing,
-    )
-}
-
 fn truth_score_worker_count(candidate_count: usize) -> Result<usize> {
     thread::available_parallelism()
         .map(usize::from)
@@ -436,6 +413,7 @@ fn truth_score_worker_count(candidate_count: usize) -> Result<usize> {
         .map(|workers| workers.min(candidate_count.max(1)))
 }
 
+#[cfg(test)]
 fn score_truth_wave_with_workers(
     request: &SegmentSearchRequest<'_>,
     candidates: Vec<LateCandidate>,
@@ -522,12 +500,14 @@ fn score_truth_wave_with_workers(
         .collect())
 }
 
+#[cfg(test)]
 struct ScoredTruthChunk {
     rows: Vec<SegmentScoredRow>,
     #[cfg(test)]
     timing: TruthWaveTiming,
 }
 
+#[cfg(test)]
 fn score_truth_chunk(
     request: &SegmentSearchRequest<'_>,
     start_index: usize,
@@ -646,7 +626,6 @@ fn score_truth_candidate(
     })
 }
 
-#[cfg(test)]
 struct ReadyTruthCandidate {
     candidate_index: usize,
     candidate: LateCandidate,
@@ -654,26 +633,30 @@ struct ReadyTruthCandidate {
     attribute_bytes: bytes::Bytes,
 }
 
-#[cfg(test)]
 struct ScoredReadyTruthChunk {
     rows: Vec<(usize, SegmentScoredRow)>,
+    #[cfg(test)]
     first_score_started: Option<Instant>,
+    #[cfg(test)]
     last_score_finished: Option<Instant>,
+    #[cfg(test)]
     timing: TruthWaveTiming,
 }
 
-/// Bench-only output from overlapping physical reads with parallel scoring.
-#[cfg(test)]
+/// Output from overlapping physical reads with parallel scoring.
 pub(crate) struct PipelinedTruthWave {
     pub(crate) rows: Vec<SegmentScoredRow>,
+    #[cfg(test)]
     pub(crate) logical_bytes: u64,
+    #[cfg(test)]
     pub(crate) fetch_elapsed: Duration,
+    #[cfg(test)]
     pub(crate) score_elapsed: Duration,
+    #[cfg(test)]
     pub(crate) timing: TruthWaveTiming,
 }
 
-/// Bench-only truth driver that keeps fetching while scoped CPU workers score.
-#[cfg(test)]
+/// Truth driver that keeps fetching while scoped CPU workers score.
 pub(crate) async fn execute_truth_wave_pipelined(
     request: &SegmentSearchRequest<'_>,
     candidates: Vec<LateCandidate>,
@@ -722,16 +705,22 @@ pub(crate) async fn execute_truth_wave_pipelined(
                     )?;
                     let mut rows = Vec::with_capacity(candidate_count.div_ceil(worker_count));
                     let mut decode_scratch = MatrixDecodeScratch::default();
+                    #[cfg(test)]
                     let mut first_score_started = None;
+                    #[cfg(test)]
                     let mut last_score_finished = None;
+                    #[cfg(test)]
                     let mut timing = TruthWaveTiming::default();
                     let mut first_error = None;
                     while let Some(ready) = receiver.blocking_recv() {
                         if first_error.is_some() {
                             continue;
                         }
-                        let score_started = Instant::now();
-                        first_score_started.get_or_insert(score_started);
+                        #[cfg(test)]
+                        {
+                            let score_started = Instant::now();
+                            first_score_started.get_or_insert(score_started);
+                        }
                         match score_truth_candidate(
                             &exact_query,
                             matrix_dtype,
@@ -743,20 +732,27 @@ pub(crate) async fn execute_truth_wave_pipelined(
                             &ready.matrix_bytes,
                             &ready.attribute_bytes,
                             &mut decode_scratch,
+                            #[cfg(test)]
                             Some(&mut timing),
                         ) {
                             Ok(row) => rows.push((ready.candidate_index, row)),
                             Err(error) => first_error = Some(error),
                         }
-                        last_score_finished = Some(Instant::now());
+                        #[cfg(test)]
+                        {
+                            last_score_finished = Some(Instant::now());
+                        }
                     }
                     if let Some(error) = first_error {
                         return Err(error);
                     }
                     Ok(ScoredReadyTruthChunk {
                         rows,
+                        #[cfg(test)]
                         first_score_started,
+                        #[cfg(test)]
                         last_score_finished,
+                        #[cfg(test)]
                         timing,
                     })
                 }));
@@ -777,7 +773,9 @@ pub(crate) async fn execute_truth_wave_pipelined(
         .map(|_| [None, None])
         .collect::<Vec<[Option<bytes::Bytes>; 2]>>();
     let mut remaining = vec![2_u8; candidate_count];
+    #[cfg(test)]
     let mut logical_bytes = 0_u64;
+    #[cfg(test)]
     let fetch_started = Instant::now();
     let completions = execute_read_plan_streamed(request.store, plan);
     futures::pin_mut!(completions);
@@ -787,9 +785,12 @@ pub(crate) async fn execute_truth_wave_pipelined(
             .logical_slices_for(planned_index, &bytes)
             .map_err(map_read_plan_error)?;
         for (logical_index, bytes) in logical {
-            logical_bytes = logical_bytes
-                .checked_add(bytes.len() as u64)
-                .ok_or_else(|| segment_error("truth logical byte count overflows"))?;
+            #[cfg(test)]
+            {
+                logical_bytes = logical_bytes
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| segment_error("truth logical byte count overflows"))?;
+            }
             let candidate_index = logical_index / 2;
             let payload_index = logical_index % 2;
             let candidate_payloads = payloads
@@ -825,6 +826,7 @@ pub(crate) async fn execute_truth_wave_pipelined(
             }
         }
     }
+    #[cfg(test)]
     let fetch_elapsed = fetch_started.elapsed();
     if remaining.iter().any(|remaining| *remaining != 0) {
         return Err(segment_error("truth pipeline omitted candidate payloads"));
@@ -833,19 +835,23 @@ pub(crate) async fn execute_truth_wave_pipelined(
     let scored_chunks = scoring_workers
         .await
         .map_err(|error| segment_error(format!("truth scoring worker failed: {error}")))??;
+    #[cfg(test)]
     let first_score_started = scored_chunks
         .iter()
         .filter_map(|chunk| chunk.first_score_started)
         .min();
+    #[cfg(test)]
     let last_score_finished = scored_chunks
         .iter()
         .filter_map(|chunk| chunk.last_score_finished)
         .max();
+    #[cfg(test)]
     let score_elapsed = match (first_score_started, last_score_finished) {
         (Some(started), Some(finished)) => finished.duration_since(started),
         (None, None) => Duration::ZERO,
         _ => return Err(segment_error("truth scoring timing is incomplete")),
     };
+    #[cfg(test)]
     let timing = TruthWaveTiming {
         decode: scored_chunks
             .iter()
@@ -875,9 +881,13 @@ pub(crate) async fn execute_truth_wave_pipelined(
     }
     Ok(PipelinedTruthWave {
         rows,
+        #[cfg(test)]
         logical_bytes,
+        #[cfg(test)]
         fetch_elapsed,
+        #[cfg(test)]
         score_elapsed,
+        #[cfg(test)]
         timing,
     })
 }
