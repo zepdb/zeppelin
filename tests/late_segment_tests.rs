@@ -1553,3 +1553,268 @@ async fn print_real_replay_int8_epoch_identity() {
         INT8_TEXT_EVIDENCE_SHA256,
     );
 }
+
+/// W10.2 equivalence gate: appends + updates + deletes compacted
+/// incrementally must return byte-equivalent query results to a from-scratch
+/// full rebuild of the same logical state, while carrying untouched matrix
+/// blocks by reference and keeping their objects retained.
+#[tokio::test]
+async fn late_segment_incremental_compaction_matches_full_rebuild() {
+    require_minio();
+    const BASE_DOCUMENTS: usize = 50;
+    let harness = TestHarness::new().await;
+
+    let base_fragments: Vec<Vec<RetrievalUnitRecord>> = (0..3)
+        .map(|fragment| {
+            let start = fragment * 17;
+            let end = (start + 17).min(BASE_DOCUMENTS);
+            (start..end)
+                .map(|index| {
+                    text_record(
+                        &format!("inc-{index:04}"),
+                        &format!("incremental corpus document {index} token {}", index * 7),
+                        ["red", "blue", "green"][index % 3],
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let churn_upserts = vec![
+        text_record("inc-0003", "incremental corpus document 3 REVISED", "red"),
+        text_record("inc-0021", "incremental corpus document 21 REVISED", "blue"),
+        text_record("inc-9001", "incremental appended document 9001", "green"),
+        text_record("inc-9002", "incremental appended document 9002", "red"),
+        text_record("inc-9003", "incremental appended document 9003", "blue"),
+    ];
+    let churn_deletes = vec!["inc-0007".to_string(), "inc-0033".to_string()];
+
+    // Small matrix objects force multiple blocks so untouched blocks exist.
+    let mut incremental_mmli = mmli_config();
+    incremental_mmli.segment.max_matrix_object_bytes = 2048;
+    incremental_mmli.segment.candidate_k = 64;
+    let mut full_mmli = incremental_mmli.clone();
+    full_mmli.segment.incremental_max_changed_fraction = 0.0;
+
+    let mut outputs: Vec<(
+        String,
+        Uuid,
+        Arc<dyn MultiVectorEncoderProvider>,
+        MmliConfig,
+    )> = Vec::new();
+    for (label, mmli) in [
+        ("inc", incremental_mmli.clone()),
+        ("full", full_mmli.clone()),
+    ] {
+        let namespace = harness.artifact_origin_namespace(&format!("w102-{label}"));
+        let (profile, incarnation) = setup_profile_for_epoch(
+            &harness.store,
+            &namespace,
+            test_epoch(8, 16, b"w102-equivalence-v1"),
+            FdeParams {
+                algorithm: FdeAlgorithmVersion::PaperV1,
+                repetitions: 2,
+                simhash_bits: 1,
+                input_dimension: 8,
+                inner: InnerProjection::Rademacher { d_proj: 4 },
+                final_projection: FinalProjection::None,
+            },
+            17,
+            VectorTransformRecipe::Identity,
+            CandidateDocumentPooling::Identity,
+            &format!("w102-{label}"),
+            None,
+        )
+        .await;
+        let provider = provider(&profile);
+        for fragment in &base_fragments {
+            WalWriter::new(harness.store.clone())
+                .append_retrieval_units(&namespace, fragment.clone(), Vec::new(), Vec::new())
+                .await
+                .expect("base fragment must append");
+        }
+        enrich_all_with_provider(&harness.store, &namespace, incarnation, provider.clone(), 8)
+            .await;
+        compactor(&harness.store, &mmli)
+            .compact(&namespace)
+            .await
+            .expect("initial full compaction must succeed");
+        outputs.push((namespace, incarnation, provider, mmli));
+    }
+
+    // Record the first-generation segment ids before churn.
+    let mut first_segment_ids = Vec::new();
+    for (namespace, incarnation, _, _) in &outputs {
+        let manifest = read_manifest(&harness.store, namespace, *incarnation).await;
+        let section = manifest
+            .load_late_state(&harness.store)
+            .await
+            .expect("section must load")
+            .expect("section must exist");
+        let segment_id = section
+            .active_late_segment
+            .clone()
+            .expect("active segment after initial compaction");
+        first_segment_ids.push(segment_id);
+    }
+
+    // Churn: updates + deletes + appends, then compact both namespaces.
+    for (namespace, incarnation, provider, mmli) in &outputs {
+        WalWriter::new(harness.store.clone())
+            .append_retrieval_units(
+                namespace,
+                churn_upserts.clone(),
+                churn_deletes.clone(),
+                Vec::new(),
+            )
+            .await
+            .expect("churn fragment must append");
+        enrich_all_with_provider(&harness.store, namespace, *incarnation, provider.clone(), 8)
+            .await;
+        compactor(&harness.store, mmli)
+            .compact(namespace)
+            .await
+            .expect("churn compaction must succeed");
+    }
+
+    // The incremental namespace must carry old-generation matrix blocks; the
+    // forced-full namespace must not.
+    let mut carried_keys = Vec::new();
+    for (index, (namespace, incarnation, _, _)) in outputs.iter().enumerate() {
+        let manifest = read_manifest(&harness.store, namespace, *incarnation).await;
+        assert!(
+            manifest.input_fragments.is_empty(),
+            "compaction must consume every input fragment"
+        );
+        let section = manifest
+            .load_late_state(&harness.store)
+            .await
+            .expect("section must load")
+            .expect("section must exist");
+        let active_id = section
+            .active_late_segment
+            .clone()
+            .expect("active segment after churn compaction");
+        assert_ne!(active_id, first_segment_ids[index]);
+        let segment = section
+            .late_interaction_segments
+            .iter()
+            .find(|segment| segment.id == active_id)
+            .expect("active segment descriptor");
+        let old_marker = format!("/{}/", first_segment_ids[index]);
+        let new_marker = format!("/{active_id}/");
+        let carried: Vec<String> = segment
+            .matrix_objects
+            .iter()
+            .filter(|block| block.key.contains(&old_marker))
+            .map(|block| block.key.clone())
+            .collect();
+        let fresh = segment
+            .matrix_objects
+            .iter()
+            .filter(|block| block.key.contains(&new_marker))
+            .count();
+        if index == 0 {
+            assert!(
+                !carried.is_empty(),
+                "incremental compaction must carry untouched matrix blocks"
+            );
+            assert!(fresh > 0, "incremental compaction must write fresh blocks");
+            carried_keys = carried;
+        } else {
+            assert!(
+                carried.is_empty(),
+                "forced-full compaction must not carry old blocks"
+            );
+        }
+    }
+    for key in &carried_keys {
+        harness
+            .store
+            .get(key)
+            .await
+            .expect("carried matrix block must remain retained");
+    }
+
+    // Byte-equivalent query results across both namespaces at a full frontier.
+    for query_text in [
+        "incremental corpus document 3 REVISED",
+        "incremental appended document 9002",
+        "incremental corpus document 40 token 280",
+        "phase ten equivalence probe",
+    ] {
+        let mut results = Vec::new();
+        for (namespace, incarnation, provider, mmli) in &outputs {
+            let manifest = read_manifest(&harness.store, namespace, *incarnation).await;
+            let output = run_query_with_text(
+                &harness.store,
+                None,
+                namespace,
+                manifest,
+                provider.as_ref(),
+                mmli,
+                None,
+                query_text,
+                64,
+            )
+            .await;
+            results.push(output);
+        }
+        assert!(
+            ranked_results_are_identical(&results[0].results, &results[1].results),
+            "incremental and full rebuilds must return identical results for {query_text:?}"
+        );
+        assert!(!results[0].results.is_empty());
+    }
+
+    // A later full rebuild over the incremental segment must hold the strict
+    // row closure across carried blocks, and results must stay equivalent.
+    let tail_upserts = vec![text_record(
+        "inc-9004",
+        "incremental appended document 9004",
+        "green",
+    )];
+    for (index, (namespace, incarnation, provider, _)) in outputs.iter().enumerate() {
+        WalWriter::new(harness.store.clone())
+            .append_retrieval_units(namespace, tail_upserts.clone(), Vec::new(), Vec::new())
+            .await
+            .expect("tail fragment must append");
+        enrich_all_with_provider(&harness.store, namespace, *incarnation, provider.clone(), 8)
+            .await;
+        let mmli = if index == 0 {
+            // Force the incremental namespace through a full rebuild that must
+            // read carried blocks back through the strict closure.
+            full_mmli.clone()
+        } else {
+            full_mmli.clone()
+        };
+        compactor(&harness.store, &mmli)
+            .compact(namespace)
+            .await
+            .expect("tail compaction must succeed");
+    }
+    let mut tails = Vec::new();
+    for (namespace, incarnation, provider, mmli) in &outputs {
+        let manifest = read_manifest(&harness.store, namespace, *incarnation).await;
+        let output = run_query_with_text(
+            &harness.store,
+            None,
+            namespace,
+            manifest,
+            provider.as_ref(),
+            mmli,
+            None,
+            "incremental appended document 9004",
+            64,
+        )
+        .await;
+        tails.push(output);
+    }
+    assert!(
+        ranked_results_are_identical(&tails[0].results, &tails[1].results),
+        "post-full-rebuild results must stay identical"
+    );
+
+    for (namespace, _, _, _) in &outputs {
+        harness.cleanup_artifact_origin_namespace(namespace).await;
+    }
+}

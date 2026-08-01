@@ -21,8 +21,8 @@ use crate::types::{AttributeValue, Filter, VectorId};
 
 use super::candidate::{
     late_segment_key, validate_attribute_locator, validate_filter_attributes, validate_input_row,
-    validate_matrix_locator, AttributeLocator, LateCandidate, LateCandidateInputRow,
-    LateCandidateMetadata,
+    validate_matrix_locator, AttributeLocator, CandidateFdeSource, LateCandidate,
+    LateCandidateInputRow, LateCandidateMetadata,
 };
 use super::matrix_artifact::MatrixBlockLocator;
 use super::segment_search::filter_matches;
@@ -138,12 +138,42 @@ pub(crate) struct ResidentFlatCandidateIndex {
     codes: Vec<u8>,
 }
 
-/// Build one deterministic flat-SQ8 candidate artifact.
+/// Calibration authority for one flat-SQ8 build.
+#[derive(Clone, Debug)]
+pub(crate) enum FlatCalibrationSource {
+    /// Recalibrate over the complete row set; every row must supply a raw FDE.
+    Recalibrate,
+    /// Reuse the previous artifact's calibration; `Sq8` rows carry their codes
+    /// verbatim and raw rows are encoded under the frozen calibration.
+    Frozen(SqCalibration),
+}
+
+/// Build one deterministic flat-SQ8 candidate artifact (recalibrating).
+#[cfg(test)]
 pub(crate) fn build_flat_candidate_artifact(
     namespace: &str,
     segment_id: &str,
     fde_generation: FdeGenerationId,
     config: LateFlatCandidateBuildConfig,
+    rows: Vec<LateCandidateInputRow>,
+) -> Result<BuiltLateFlatCandidate> {
+    build_flat_candidate_artifact_with_calibration(
+        namespace,
+        segment_id,
+        fde_generation,
+        config,
+        FlatCalibrationSource::Recalibrate,
+        rows,
+    )
+}
+
+/// Build one flat-SQ8 artifact under an explicit calibration authority.
+pub(crate) fn build_flat_candidate_artifact_with_calibration(
+    namespace: &str,
+    segment_id: &str,
+    fde_generation: FdeGenerationId,
+    config: LateFlatCandidateBuildConfig,
+    calibration_source: FlatCalibrationSource,
     mut rows: Vec<LateCandidateInputRow>,
 ) -> Result<BuiltLateFlatCandidate> {
     if config.fde_dimension == 0
@@ -166,17 +196,35 @@ pub(crate) fn build_flat_candidate_artifact(
         }
     }
 
-    let fde_refs: Vec<&[f32]> = rows.iter().map(|row| row.fde.as_slice()).collect();
-    let calibration = SqCalibration::calibrate(&fde_refs, config.fde_dimension);
-    let mut codes = Vec::with_capacity(rows.len() * config.fde_dimension);
-    for fde in &fde_refs {
-        let code = calibration.encode(fde);
-        if code.len() != config.fde_dimension {
-            return Err(flat_error("flat SQ8 code width disagrees with dimension"));
+    let calibration = match &calibration_source {
+        FlatCalibrationSource::Recalibrate => {
+            let fde_refs: Vec<&[f32]> = rows
+                .iter()
+                .map(|row| row.fde.raw())
+                .collect::<Result<Vec<_>>>()
+                .map_err(|_| flat_error("flat recalibration requires a raw FDE for every row"))?;
+            SqCalibration::calibrate(&fde_refs, config.fde_dimension)
         }
-        codes.extend_from_slice(&code);
+        FlatCalibrationSource::Frozen(calibration) => calibration.clone(),
+    };
+    let mut codes = Vec::with_capacity(rows.len() * config.fde_dimension);
+    for row in &rows {
+        match &row.fde {
+            CandidateFdeSource::Raw(fde) => {
+                let code = calibration.encode(fde);
+                if code.len() != config.fde_dimension {
+                    return Err(flat_error("flat SQ8 code width disagrees with dimension"));
+                }
+                codes.extend_from_slice(&code);
+            }
+            CandidateFdeSource::Sq8(code) => {
+                if matches!(calibration_source, FlatCalibrationSource::Recalibrate) {
+                    return Err(flat_error("carried SQ8 codes require a frozen calibration"));
+                }
+                codes.extend_from_slice(code);
+            }
+        }
     }
-    drop(fde_refs);
 
     let recipe = LateFlatCandidateRecipe {
         fde_generation,
@@ -340,6 +388,26 @@ impl ResidentFlatCandidateIndex {
         &self.rows
     }
 
+    /// Borrow the persisted calibration for frozen incremental reuse.
+    pub(crate) fn calibration(&self) -> &SqCalibration {
+        &self.calibration
+    }
+
+    /// Borrow one row's SQ8 code by its position in [`Self::rows`].
+    pub(crate) fn row_code(&self, index: usize) -> Result<&[u8]> {
+        let dimension = usize::try_from(self.recipe.fde_dimension)
+            .map_err(|_| flat_error("flat FDE dimension exceeds usize"))?;
+        let start = index
+            .checked_mul(dimension)
+            .ok_or_else(|| flat_error("flat code offset overflows"))?;
+        let end = start
+            .checked_add(dimension)
+            .ok_or_else(|| flat_error("flat code end overflows"))?;
+        self.codes
+            .get(start..end)
+            .ok_or_else(|| flat_error("flat code index is out of bounds"))
+    }
+
     /// Exhaustively score, filter, and truncate the resident candidate frontier.
     ///
     /// Filters and overlay exclusions are applied BEFORE truncation to the
@@ -474,7 +542,7 @@ mod tests {
     fn row(id: &str, fde: [f32; 2], color: &str) -> LateCandidateInputRow {
         LateCandidateInputRow {
             id: id.to_string(),
-            fde: fde.to_vec(),
+            fde: super::CandidateFdeSource::Raw(fde.to_vec()),
             content_hash: ContentHash::new(
                 ArtifactChecksum::digest(id.as_bytes())
                     .as_bytes()

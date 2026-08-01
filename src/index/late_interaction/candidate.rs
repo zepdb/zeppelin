@@ -177,13 +177,47 @@ pub(crate) struct LateCandidateBuildConfig {
     pub(crate) max_bootstrap_bytes: usize,
 }
 
+/// Candidate representation of one row's document FDE.
+///
+/// Full rebuilds always supply `Raw`. `Sq8` exists only for the flat
+/// incremental path: a code carried verbatim from the previous flat artifact
+/// under its frozen calibration, so unchanged rows are never re-read or
+/// re-encoded.
+#[derive(Clone, Debug)]
+pub(crate) enum CandidateFdeSource {
+    /// Raw uncompressed document FDE.
+    Raw(Vec<f32>),
+    /// SQ8 code pre-encoded under the frozen carried calibration.
+    Sq8(Vec<u8>),
+}
+
+impl CandidateFdeSource {
+    pub(crate) fn raw(&self) -> Result<&[f32]> {
+        match self {
+            Self::Raw(fde) => Ok(fde),
+            Self::Sq8(_) => Err(ZeppelinError::Index(
+                "candidate build requires a raw FDE for this row".to_string(),
+            )),
+        }
+    }
+
+    /// FDE dimension represented by this row (codes are one byte per
+    /// coordinate, so both variants have the FDE's length).
+    pub(crate) fn dimension(&self) -> usize {
+        match self {
+            Self::Raw(fde) => fde.len(),
+            Self::Sq8(code) => code.len(),
+        }
+    }
+}
+
 /// One live retrieval unit supplied by late segment compaction.
 #[derive(Clone, Debug)]
 pub(crate) struct LateCandidateInputRow {
     /// Retrieval-unit identity.
     pub(crate) id: VectorId,
-    /// Raw uncompressed document FDE.
-    pub(crate) fde: Vec<f32>,
+    /// Document FDE representation for candidate selection.
+    pub(crate) fde: CandidateFdeSource,
     /// Source content identity represented by this row.
     pub(crate) content_hash: ContentHash,
     /// Authoritative source mutation sequence.
@@ -325,7 +359,10 @@ pub(crate) fn build_late_candidate_index(
         }
     }
 
-    let vector_refs: Vec<&[f32]> = rows.iter().map(|row| row.fde.as_slice()).collect();
+    let vector_refs: Vec<&[f32]> = rows
+        .iter()
+        .map(|row| row.fde.raw())
+        .collect::<Result<Vec<_>>>()?;
     let centroids = train_kmeans(
         &vector_refs,
         config.fde_dimension,
@@ -342,7 +379,7 @@ pub(crate) fn build_late_candidate_index(
 
     let mut assignments = vec![Vec::new(); config.nlist];
     for row in rows {
-        let cluster_id = nearest_centroid(&row.fde, &centroids)?;
+        let cluster_id = nearest_centroid(row.fde.raw()?, &centroids)?;
         assignments[cluster_id].push(row);
     }
     if assignments.iter().any(Vec::is_empty) {
@@ -529,7 +566,7 @@ pub(crate) fn decode_all_candidate_rows(
             }
             rows.push(LateCandidateInputRow {
                 id: row.id,
-                fde: row.fde,
+                fde: CandidateFdeSource::Raw(row.fde),
                 content_hash: row.content_hash,
                 source_sequence: row.source_sequence,
                 parent_id: row.parent_id,
@@ -807,9 +844,10 @@ fn cluster_row_wire(row: LateCandidateInputRow) -> Result<ClusterRowWire> {
             .into_iter()
             .collect::<BTreeMap<String, AttributeValue>>()
     });
+    let fde = row.fde.raw()?.to_vec();
     Ok(ClusterRowWire {
         id: row.id,
-        fde: row.fde,
+        fde,
         content_hash: row.content_hash,
         source_sequence: row.source_sequence,
         parent_id: row.parent_id,
@@ -1084,7 +1122,16 @@ pub(super) fn validate_input_row(row: &LateCandidateInputRow, dimension: usize) 
     if row.id.is_empty() {
         return Err(candidate_error("candidate input id cannot be empty"));
     }
-    validate_vector(&row.fde, dimension, "candidate input FDE")?;
+    match &row.fde {
+        CandidateFdeSource::Raw(fde) => validate_vector(fde, dimension, "candidate input FDE")?,
+        CandidateFdeSource::Sq8(code) => {
+            if code.len() != dimension {
+                return Err(candidate_error(
+                    "candidate input SQ8 code width disagrees with dimension",
+                ));
+            }
+        }
+    }
     validate_matrix_locator(&row.matrix_locator)?;
     validate_attribute_locator(&row.attr_locator)?;
     let ordered = row.filter_attributes.as_ref().map(|attributes| {
@@ -1362,7 +1409,7 @@ mod tests {
     fn row(id: &str, fde: [f32; 2], color: &str) -> LateCandidateInputRow {
         LateCandidateInputRow {
             id: id.to_string(),
-            fde: fde.to_vec(),
+            fde: super::CandidateFdeSource::Raw(fde.to_vec()),
             content_hash: crate::embedding::ContentHash::new(
                 ArtifactChecksum::digest(id.as_bytes())
                     .as_bytes()

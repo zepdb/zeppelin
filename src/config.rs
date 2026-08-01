@@ -321,6 +321,11 @@ pub struct MmliSegmentConfig {
     pub read_max_request_bytes: usize,
     /// Maximum physical ranged reads in flight per wave.
     pub read_max_concurrency: usize,
+    /// Maximum changed-row fraction (changed ids over the previous segment's
+    /// rows) for incremental flat compaction; larger churn or `0.0` forces a
+    /// full rebuild with SQ8 recalibration. Mirrors the dense
+    /// `retrain_imbalance_threshold` shape with its own value.
+    pub incremental_max_changed_fraction: f32,
 }
 
 /// Local execution and resource configuration for a pinned encoder worker.
@@ -423,6 +428,7 @@ impl Default for MmliSegmentConfig {
             read_gap_budget_bytes: 64 * 1024,
             read_max_request_bytes: 8 * 1024 * 1024,
             read_max_concurrency: 8,
+            incremental_max_changed_fraction: 0.2,
         }
     }
 }

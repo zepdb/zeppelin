@@ -20,11 +20,16 @@ use crate::types::{AttributeValue, VectorId};
 use crate::wal::{LateCandidateKind, LateInteractionSegmentRef, LateSegmentObjectRef};
 
 use super::attribute_artifact::{build_attribute_blocks, AttributeBlockInputRow};
+use super::candidate::CandidateFdeSource;
 use super::candidate::{
     build_late_candidate_index, LateCandidateBuildConfig, LateCandidateInputRow,
 };
-use super::flat_candidate::{build_flat_candidate_artifact, LateFlatCandidateBuildConfig};
-use super::matrix_artifact::{build_matrix_blocks, MatrixBlockInputRow};
+use super::flat_candidate::{
+    build_flat_candidate_artifact_with_calibration, FlatCalibrationSource,
+    LateFlatCandidateBuildConfig,
+};
+use super::matrix_artifact::{build_matrix_blocks, MatrixBlockInputRow, MatrixBlockRef};
+use super::MatrixBlockLocator;
 
 /// Candidate-kind build selection for one full segment rebuild.
 #[derive(Clone, Copy, Debug)]
@@ -47,6 +52,39 @@ impl LateCandidateBuild {
     }
 }
 
+/// Matrix representation of one row entering a segment build.
+///
+/// `Fresh` rows are written into new matrix blocks (payload bytes carried
+/// verbatim from their source artifact — never re-encoded). `Carried` rows
+/// stay in a fully-untouched block of the previous segment referenced by
+/// `LateSegmentBuildConfig::carried_matrix_blocks`; their bytes are never
+/// read or rewritten.
+#[derive(Clone, Debug)]
+pub(crate) enum LateRowMatrixSource {
+    /// Row written into a new matrix block by this build.
+    Fresh {
+        /// Exact multi-vector document matrix.
+        exact_matrix: MultiVectorEmbedding,
+        /// Stored matrix payload bytes at the epoch dtype, carried verbatim.
+        exact_payload: Bytes,
+    },
+    /// Row remaining in a carried immutable block of the previous segment.
+    Carried {
+        /// Direct ranged-read locator into the carried block.
+        locator: MatrixBlockLocator,
+    },
+}
+
+impl LateRowMatrixSource {
+    pub(crate) fn vector_count(&self) -> Result<usize> {
+        match self {
+            Self::Fresh { exact_matrix, .. } => Ok(exact_matrix.vector_count()),
+            Self::Carried { locator } => usize::try_from(locator.vector_count)
+                .map_err(|_| segment_error("carried matrix vector count exceeds usize")),
+        }
+    }
+}
+
 /// One normalized live retrieval unit entering a full segment rebuild.
 #[derive(Clone, Debug)]
 pub(crate) struct LateSegmentBuildRow {
@@ -62,13 +100,10 @@ pub(crate) struct LateSegmentBuildRow {
     pub(crate) unit_ordinal: Option<u32>,
     /// Exact attributes used by filtering and result construction.
     pub(crate) attributes: Option<HashMap<String, AttributeValue>>,
-    /// Exact multi-vector document matrix.
-    pub(crate) exact_matrix: MultiVectorEmbedding,
-    /// Stored matrix payload bytes at the epoch dtype, carried verbatim.
-    /// Encoded exactly once at enrichment — never re-encoded by builds.
-    pub(crate) exact_payload: Bytes,
-    /// Raw uncompressed document FDE.
-    pub(crate) raw_fde: Vec<f32>,
+    /// Exact matrix source (fresh bytes or a carried-block locator).
+    pub(crate) matrix: LateRowMatrixSource,
+    /// Document FDE representation for candidate selection.
+    pub(crate) fde: CandidateFdeSource,
 }
 
 /// One already-built full-text artifact supplied by the FTS builder.
@@ -111,6 +146,11 @@ pub(crate) struct LateSegmentBuildConfig {
     pub(crate) artifact_origin: Option<ArtifactOriginIndex>,
     /// Already-built full-text artifacts for the same row set.
     pub(crate) fts_artifacts: Vec<PrebuiltLateFtsArtifact>,
+    /// Fully-untouched matrix blocks carried from the previous segment.
+    /// Empty for full rebuilds. Carried rows reference exactly these keys.
+    pub(crate) carried_matrix_blocks: Vec<MatrixBlockRef>,
+    /// Calibration authority for the flat-SQ8 candidate artifact.
+    pub(crate) flat_calibration: FlatCalibrationSource,
 }
 
 /// One immutable key and complete bytes ready for create-only upload.
@@ -146,33 +186,60 @@ pub(crate) fn build_late_interaction_segment(
         .sort_by(|left, right| left.reference.key.cmp(&right.reference.key));
     validate_fts_artifacts(&config)?;
 
-    let matrix_blocks = build_matrix_blocks(
-        &config.namespace,
-        &config.segment_id,
-        config.matrix_dtype,
-        config.semantic_epoch,
-        config.fde_generation,
-        config.vector_dimension,
-        config.max_matrix_object_bytes,
-        rows.iter()
-            .map(|row| MatrixBlockInputRow {
+    validate_carried_blocks(&config, &rows)?;
+    let carried_key_list: Vec<String> = config
+        .carried_matrix_blocks
+        .iter()
+        .map(|block| block.key.clone())
+        .collect();
+    let fresh_inputs: Vec<MatrixBlockInputRow> = rows
+        .iter()
+        .filter_map(|row| match &row.matrix {
+            LateRowMatrixSource::Fresh {
+                exact_matrix,
+                exact_payload,
+            } => Some(MatrixBlockInputRow {
                 id: row.id.clone(),
                 ordinal: block_ordinal(row.unit_ordinal),
                 content_hash: row.content_hash,
-                embedding: row.exact_matrix.clone(),
-                payload: row.exact_payload.clone(),
-            })
-            .collect(),
-    )?;
-    let matrix_locators = matrix_blocks
+                embedding: exact_matrix.clone(),
+                payload: exact_payload.clone(),
+            }),
+            LateRowMatrixSource::Carried { .. } => None,
+        })
+        .collect();
+    let matrix_blocks = if fresh_inputs.is_empty() {
+        Vec::new()
+    } else {
+        build_matrix_blocks(
+            &config.namespace,
+            &config.segment_id,
+            config.matrix_dtype,
+            config.semantic_epoch,
+            config.fde_generation,
+            config.vector_dimension,
+            config.max_matrix_object_bytes,
+            fresh_inputs,
+        )?
+    };
+    let mut fresh_locators = matrix_blocks
         .iter()
-        .flat_map(|block| block.locators.iter().cloned())
-        .collect::<Vec<_>>();
-    if matrix_locators.len() != rows.len() {
+        .flat_map(|block| block.locators.iter().cloned());
+    let matrix_locators = rows
+        .iter()
+        .map(|row| match &row.matrix {
+            LateRowMatrixSource::Fresh { .. } => fresh_locators
+                .next()
+                .ok_or_else(|| segment_error("fresh matrix locators ran out of rows")),
+            LateRowMatrixSource::Carried { locator } => Ok(locator.clone()),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if fresh_locators.next().is_some() {
         return Err(segment_error(
             "matrix block locators disagree with normalized row count",
         ));
     }
+    drop(fresh_locators);
 
     let attribute_blocks = build_attribute_blocks(
         &config.namespace,
@@ -203,7 +270,7 @@ pub(crate) fn build_late_interaction_segment(
         .map(
             |((row, matrix_locator), attr_locator)| LateCandidateInputRow {
                 id: row.id.clone(),
-                fde: row.raw_fde.clone(),
+                fde: row.fde.clone(),
                 content_hash: row.content_hash,
                 source_sequence: row.source_sequence,
                 parent_id: row.parent_id.clone(),
@@ -244,11 +311,12 @@ pub(crate) fn build_late_interaction_segment(
                 )
             }
             LateCandidateBuild::FlatSq8(flat_config) => {
-                let flat = build_flat_candidate_artifact(
+                let flat = build_flat_candidate_artifact_with_calibration(
                     &config.namespace,
                     &config.segment_id,
                     config.fde_generation,
                     flat_config,
+                    config.flat_calibration.clone(),
                     candidate_rows,
                 )?;
                 let artifacts = vec![BuiltLateSegmentArtifact {
@@ -270,15 +338,14 @@ pub(crate) fn build_late_interaction_segment(
     let total_vector_count = rows.iter().try_fold(0_u64, |total, row| {
         total
             .checked_add(
-                u64::try_from(row.exact_matrix.vector_count())
+                u64::try_from(row.matrix.vector_count()?)
                     .map_err(|_| segment_error("matrix vector count exceeds u64"))?,
             )
             .ok_or_else(|| segment_error("late segment total vector count overflows"))
     })?;
-    let matrix_objects = matrix_blocks
-        .iter()
-        .map(|block| block.reference.clone())
-        .collect::<Vec<_>>();
+    let mut matrix_objects = config.carried_matrix_blocks.clone();
+    matrix_objects.extend(matrix_blocks.iter().map(|block| block.reference.clone()));
+    matrix_objects.sort_by(|left, right| left.key.cmp(&right.key));
     let attribute_objects = attribute_blocks
         .iter()
         .map(|block| block.reference.clone())
@@ -335,7 +402,7 @@ pub(crate) fn build_late_interaction_segment(
         });
     }
     artifacts.sort_by(|left, right| left.key.cmp(&right.key));
-    validate_complete_artifacts(&reference, &artifacts)?;
+    validate_complete_artifacts(&reference, &artifacts, &carried_key_list)?;
 
     Ok(BuiltLateInteractionSegment {
         reference,
@@ -387,23 +454,90 @@ fn validate_rows(rows: &[LateSegmentBuildRow], config: &LateSegmentBuildConfig) 
                 "late segment row sequence exceeds declared coverage",
             ));
         }
-        if row.exact_matrix.vector_dimension() != config.vector_dimension {
-            return Err(ZeppelinError::DimensionMismatch {
-                expected: config.vector_dimension,
-                actual: row.exact_matrix.vector_dimension(),
-            });
+        match &row.matrix {
+            LateRowMatrixSource::Fresh { exact_matrix, .. } => {
+                if exact_matrix.vector_dimension() != config.vector_dimension {
+                    return Err(ZeppelinError::DimensionMismatch {
+                        expected: config.vector_dimension,
+                        actual: exact_matrix.vector_dimension(),
+                    });
+                }
+            }
+            LateRowMatrixSource::Carried { .. } => {
+                if matches!(config.candidate, LateCandidateBuild::Ivf(_)) {
+                    return Err(segment_error(
+                        "carried matrix rows require the flat candidate kind",
+                    ));
+                }
+            }
         }
-        if row.raw_fde.len() != config.fde_dimension {
-            return Err(ZeppelinError::DimensionMismatch {
-                expected: config.fde_dimension,
-                actual: row.raw_fde.len(),
-            });
+        match &row.fde {
+            CandidateFdeSource::Raw(fde) => {
+                if fde.len() != config.fde_dimension {
+                    return Err(ZeppelinError::DimensionMismatch {
+                        expected: config.fde_dimension,
+                        actual: fde.len(),
+                    });
+                }
+                if fde.iter().any(|value| !value.is_finite()) {
+                    return Err(segment_error(
+                        "late segment FDE contains a non-finite value",
+                    ));
+                }
+            }
+            CandidateFdeSource::Sq8(code) => {
+                if code.len() != config.fde_dimension {
+                    return Err(ZeppelinError::DimensionMismatch {
+                        expected: config.fde_dimension,
+                        actual: code.len(),
+                    });
+                }
+            }
         }
-        if row.raw_fde.iter().any(|value| !value.is_finite()) {
+    }
+    Ok(())
+}
+
+/// Validate carried blocks against the config identities and row locators.
+///
+/// Every carried block must share the segment's dtype/epoch/generation, every
+/// carried row's locator must point into a declared carried block, and every
+/// declared carried block must be referenced by at least one carried row so a
+/// dead block can never stay rooted.
+fn validate_carried_blocks(
+    config: &LateSegmentBuildConfig,
+    rows: &[LateSegmentBuildRow],
+) -> Result<()> {
+    let mut carried_keys = BTreeSet::new();
+    for block in &config.carried_matrix_blocks {
+        if block.dtype != config.matrix_dtype
+            || block.semantic_epoch != config.semantic_epoch
+            || block.fde_generation != config.fde_generation
+            || u32::try_from(config.vector_dimension).ok() != Some(block.vector_dimension)
+        {
             return Err(segment_error(
-                "late segment FDE contains a non-finite value",
+                "carried matrix block identity disagrees with the segment build",
             ));
         }
+        if !carried_keys.insert(block.key.as_str()) {
+            return Err(segment_error("carried matrix blocks repeat a key"));
+        }
+    }
+    let mut referenced = BTreeSet::new();
+    for row in rows {
+        if let LateRowMatrixSource::Carried { locator } = &row.matrix {
+            if !carried_keys.contains(locator.object_key.as_str()) {
+                return Err(segment_error(
+                    "carried row locator points outside the declared carried blocks",
+                ));
+            }
+            referenced.insert(locator.object_key.as_str());
+        }
+    }
+    if referenced.len() != carried_keys.len() {
+        return Err(segment_error(
+            "declared carried matrix block has no remaining live row",
+        ));
     }
     Ok(())
 }
@@ -436,6 +570,7 @@ fn validate_fts_artifacts(config: &LateSegmentBuildConfig) -> Result<()> {
 fn validate_complete_artifacts(
     reference: &LateInteractionSegmentRef,
     artifacts: &[BuiltLateSegmentArtifact],
+    carried_keys: &[String],
 ) -> Result<()> {
     let mut rooted = BTreeSet::new();
     if let Some(candidate_index) = reference.candidate_index.as_ref() {
@@ -468,6 +603,13 @@ fn validate_complete_artifacts(
             .iter()
             .map(|object| object.key.as_str()),
     );
+    for carried in carried_keys {
+        if !rooted.remove(carried.as_str()) {
+            return Err(segment_error(
+                "carried matrix block is not rooted by the segment descriptor",
+            ));
+        }
+    }
     let returned = artifacts
         .iter()
         .map(|artifact| artifact.key.as_str())
@@ -635,26 +777,30 @@ mod tests {
                 "name".to_string(),
                 AttributeValue::String(id.to_string()),
             )])),
-            exact_payload: crate::embedding::artifact::encode_matrix_payload(
-                MatrixDtype::F16,
-                3,
-                &MultiVectorEmbedding::new(vec![base, 0.0, 0.0, base, base, base], 2, 3, 4)
-                    .expect("matrix"),
-            )
-            .expect("test payload"),
-            exact_matrix: MultiVectorEmbedding::new(
-                vec![base, 0.0, 0.0, base, base, base],
-                2,
-                3,
-                4,
-            )
-            .expect("matrix"),
-            raw_fde: vec![base, 0.0],
+            matrix: super::LateRowMatrixSource::Fresh {
+                exact_payload: crate::embedding::artifact::encode_matrix_payload(
+                    MatrixDtype::F16,
+                    3,
+                    &MultiVectorEmbedding::new(vec![base, 0.0, 0.0, base, base, base], 2, 3, 4)
+                        .expect("matrix"),
+                )
+                .expect("test payload"),
+                exact_matrix: MultiVectorEmbedding::new(
+                    vec![base, 0.0, 0.0, base, base, base],
+                    2,
+                    3,
+                    4,
+                )
+                .expect("matrix"),
+            },
+            fde: super::CandidateFdeSource::Raw(vec![base, 0.0]),
         }
     }
 
     fn config(fts: Vec<PrebuiltLateFtsArtifact>) -> LateSegmentBuildConfig {
         LateSegmentBuildConfig {
+            carried_matrix_blocks: Vec::new(),
+            flat_calibration: super::FlatCalibrationSource::Recalibrate,
             namespace: "target".to_string(),
             segment_id: "segment".to_string(),
             profile: EmbeddingProfileId::new("profile"),
@@ -753,7 +899,12 @@ mod tests {
                 4,
             )
             .expect("candidate matrix locator");
-            assert_eq!(matrix, original.exact_matrix);
+            match &original.matrix {
+                super::LateRowMatrixSource::Fresh { exact_matrix, .. } => {
+                    assert_eq!(matrix, *exact_matrix)
+                }
+                super::LateRowMatrixSource::Carried { .. } => panic!("row must be fresh"),
+            }
 
             let attr_start =
                 usize::try_from(candidate.attr_locator.byte_offset).expect("attribute offset");
@@ -873,7 +1024,12 @@ mod tests {
                 4,
             )
             .expect("flat matrix locator");
-            assert_eq!(matrix, original.exact_matrix);
+            match &original.matrix {
+                super::LateRowMatrixSource::Fresh { exact_matrix, .. } => {
+                    assert_eq!(matrix, *exact_matrix)
+                }
+                super::LateRowMatrixSource::Carried { .. } => panic!("row must be fresh"),
+            }
 
             let attr_start =
                 usize::try_from(decoded.attr_locator.byte_offset).expect("attribute offset");

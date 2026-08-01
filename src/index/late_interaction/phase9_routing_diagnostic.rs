@@ -1294,7 +1294,7 @@ fn diagnostic_candidate_row(
     let checksum = ArtifactChecksum::digest(id.as_bytes());
     LateCandidateInputRow {
         id: id.clone(),
-        fde,
+        fde: super::candidate::CandidateFdeSource::Raw(fde),
         content_hash: ContentHash::new(checksum.as_bytes().to_owned()),
         source_sequence: index as u64,
         parent_id: None,

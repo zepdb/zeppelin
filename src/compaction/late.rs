@@ -30,9 +30,10 @@ use crate::fts::inverted_index::InvertedIndex;
 use crate::fts::FtsFieldConfig;
 use crate::index::late_interaction::{
     build_late_interaction_segment, decode_all_candidate_rows, decode_attribute_block,
-    decode_matrix_block, FdeTransform, FetchedLateCandidateCluster, LateCandidateBuild,
-    LateFlatCandidateBuildConfig, LateInteractionError, LateSegmentBuildConfig,
-    LateSegmentBuildRow, PrebuiltLateFtsArtifact, ResidentFlatCandidateIndex,
+    decode_matrix_block, CandidateFdeSource, FdeTransform, FetchedLateCandidateCluster,
+    FlatCalibrationSource, LateCandidateBuild, LateFlatCandidateBuildConfig, LateInteractionError,
+    LateRowMatrixSource, LateSegmentBuildConfig, LateSegmentBuildRow, MatrixBlockRef,
+    PrebuiltLateFtsArtifact, ResidentFlatCandidateIndex,
 };
 use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
 use crate::storage::{CreateOnlyOutcome, NamespaceObjectFamily, NamespaceObjectKey, ZeppelinStore};
@@ -92,6 +93,22 @@ struct LateBuildSnapshot {
     rows: Vec<LateSegmentBuildRow>,
     coverage_sequence: u64,
     fts_configs: HashMap<String, FtsFieldConfig>,
+    /// Fully-untouched matrix blocks carried by reference from the old
+    /// segment; empty for full rebuilds.
+    carried_matrix_blocks: Vec<MatrixBlockRef>,
+    /// Flat-SQ8 calibration authority for this build.
+    flat_calibration: FlatCalibrationSource,
+}
+
+/// Reuse decision for one late compaction over an existing flat segment.
+enum IncrementalDecision {
+    /// Carry untouched blocks and codes; only changed rows are rewritten.
+    Incremental {
+        changed: BTreeSet<VectorId>,
+        changed_fraction: f64,
+    },
+    /// Rebuild everything from scratch (always correctness-preserving).
+    Full { reason: &'static str },
 }
 
 impl Compactor {
@@ -131,7 +148,7 @@ impl Compactor {
             let fde_dimension = snapshot
                 .rows
                 .first()
-                .map(|row| row.raw_fde.len())
+                .map(|row| row.fde.dimension())
                 .ok_or_else(|| {
                     ZeppelinError::Validation(
                         "late segment build lost its non-empty row set".to_string(),
@@ -160,6 +177,8 @@ impl Compactor {
                     }),
                     artifact_origin: None,
                     fts_artifacts,
+                    carried_matrix_blocks: snapshot.carried_matrix_blocks.clone(),
+                    flat_calibration: snapshot.flat_calibration.clone(),
                 },
                 snapshot.rows.clone(),
             )?)
@@ -414,19 +433,60 @@ impl Compactor {
         if let Some(old) = old_segment.as_ref() {
             validate_old_segment_recipe(old, &profile)?;
         }
-        let baseline = match old_segment.as_ref() {
+        let (baseline, carried_matrix_blocks, flat_calibration) = match old_segment.as_ref() {
             Some(segment) => {
-                load_old_segment_rows(
-                    &self.store,
+                let decision = plan_incremental_rebuild(
                     segment,
-                    &profile,
-                    self.mmli_config.segment.max_resident_bootstrap_bytes,
-                    self.mmli_config.segment.max_cluster_object_bytes,
-                    self.mmli_config.segment.max_matrix_object_bytes,
-                )
-                .await?
+                    &section,
+                    &local_origin,
+                    &inputs,
+                    self.mmli_config.segment.incremental_max_changed_fraction,
+                )?;
+                match decision {
+                    IncrementalDecision::Incremental {
+                        changed,
+                        changed_fraction,
+                    } => {
+                        let (baseline, carried, calibration) = assemble_incremental_baseline(
+                            &self.store,
+                            segment,
+                            &profile,
+                            &changed,
+                            self.mmli_config.segment.max_resident_bootstrap_bytes,
+                            self.mmli_config.segment.max_matrix_object_bytes,
+                        )
+                        .await?;
+                        info!(
+                            namespace,
+                            mode = "incremental",
+                            changed_rows = changed.len(),
+                            changed_fraction,
+                            carried_blocks = carried.len(),
+                            "late compaction reuses untouched matrix blocks and codes"
+                        );
+                        (baseline, carried, calibration)
+                    }
+                    IncrementalDecision::Full { reason } => {
+                        info!(
+                            namespace,
+                            mode = "full",
+                            reason,
+                            "late compaction performs a full rebuild"
+                        );
+                        let baseline = load_old_segment_rows(
+                            &self.store,
+                            segment,
+                            &profile,
+                            self.mmli_config.segment.max_resident_bootstrap_bytes,
+                            self.mmli_config.segment.max_cluster_object_bytes,
+                            self.mmli_config.segment.max_matrix_object_bytes,
+                        )
+                        .await?;
+                        (baseline, Vec::new(), FlatCalibrationSource::Recalibrate)
+                    }
+                }
             }
-            None => Vec::new(),
+            None => (Vec::new(), Vec::new(), FlatCalibrationSource::Recalibrate),
         };
         let (derived, failed, consumed_overlays) =
             load_overlay_rows(&self.store, &section, &local_origin, &profile, &inputs).await?;
@@ -447,8 +507,201 @@ impl Compactor {
             rows,
             coverage_sequence,
             fts_configs: metadata.full_text_search,
+            carried_matrix_blocks,
+            flat_calibration,
         })
     }
+}
+
+/// Decide whether the old flat segment can be reused incrementally.
+///
+/// Incremental reuse requires the flat candidate kind, a locally-owned old
+/// segment (branch materialization stays a full-corpus rebuild), and bounded
+/// churn: the fraction of ids touched by the new inputs over the previous
+/// row count must not exceed the configured threshold. A threshold of zero
+/// disables incremental reuse entirely.
+fn plan_incremental_rebuild(
+    segment: &LateInteractionSegmentRef,
+    section: &LateStateSection,
+    local_origin: &ArtifactOrigin,
+    inputs: &[SnapshottedInput],
+    max_changed_fraction: f32,
+) -> Result<IncrementalDecision> {
+    if !max_changed_fraction.is_finite() || max_changed_fraction <= 0.0 {
+        return Ok(IncrementalDecision::Full {
+            reason: "incremental reuse disabled by configuration",
+        });
+    }
+    if segment.candidate_kind != LateCandidateKind::FlatSq8 {
+        return Ok(IncrementalDecision::Full {
+            reason: "old segment does not use the flat candidate kind",
+        });
+    }
+    let segment_origin = resolve_section_origin(section, local_origin, segment.artifact_origin)?;
+    if segment_origin != local_origin {
+        return Ok(IncrementalDecision::Full {
+            reason: "old segment is foreign-owned; branch materialization",
+        });
+    }
+    let mut changed = BTreeSet::new();
+    for input in inputs {
+        for record in &input.fragment.upserts {
+            changed.insert(record.id.clone());
+        }
+        for deleted in &input.fragment.deletes {
+            changed.insert(deleted.clone());
+        }
+    }
+    if segment.record_count == 0 {
+        return Ok(IncrementalDecision::Full {
+            reason: "old segment has no rows",
+        });
+    }
+    let changed_fraction = changed.len() as f64 / segment.record_count as f64;
+    if changed_fraction > f64::from(max_changed_fraction) {
+        return Ok(IncrementalDecision::Full {
+            reason: "changed-row fraction exceeds the incremental threshold",
+        });
+    }
+    Ok(IncrementalDecision::Incremental {
+        changed,
+        changed_fraction,
+    })
+}
+
+/// Assemble the incremental baseline from the old flat segment.
+///
+/// Reads only the flat artifact plus matrix blocks containing changed rows.
+/// Untouched blocks are carried by reference with their rows' SQ8 codes
+/// reused verbatim under the frozen calibration; rows co-located with a
+/// change move into new blocks with their stored payload bytes carried
+/// verbatim (never re-encoded).
+async fn assemble_incremental_baseline(
+    store: &ZeppelinStore,
+    segment: &LateInteractionSegmentRef,
+    profile: &EmbeddingProfileRef,
+    changed: &BTreeSet<VectorId>,
+    max_resident_bytes: usize,
+    max_object_bytes: usize,
+) -> Result<(
+    Vec<LateSegmentBuildRow>,
+    Vec<MatrixBlockRef>,
+    FlatCalibrationSource,
+)> {
+    let flat = segment.flat_candidate_ref()?;
+    let flat_bytes = store.get(&flat.key).await?;
+    let resident = ResidentFlatCandidateIndex::from_bytes(&flat_bytes, flat, max_resident_bytes)?;
+
+    let known_blocks = segment
+        .matrix_objects
+        .iter()
+        .map(|block| block.key.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut touched_keys = BTreeSet::new();
+    for row in resident.rows() {
+        if !known_blocks.contains(row.matrix_locator.object_key.as_str()) {
+            return Err(ZeppelinError::Serialization(
+                "flat candidate row references an unknown matrix block".to_string(),
+            ));
+        }
+        if changed.contains(&row.id) {
+            touched_keys.insert(row.matrix_locator.object_key.clone());
+        }
+    }
+    let carried_blocks = segment
+        .matrix_objects
+        .iter()
+        .filter(|block| !touched_keys.contains(&block.key))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let row_limit = usize::try_from(segment.record_count).map_err(|_| {
+        ZeppelinError::Validation("late segment row count exceeds usize".to_string())
+    })?;
+    let mut displaced = BTreeMap::new();
+    for reference in &segment.matrix_objects {
+        if !touched_keys.contains(&reference.key) {
+            continue;
+        }
+        if usize::try_from(reference.size_bytes)
+            .ok()
+            .is_none_or(|size| size > max_object_bytes)
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "late matrix object {} exceeds configured bound",
+                reference.key
+            )));
+        }
+        let bytes = store.get(&reference.key).await?;
+        for row in decode_matrix_block(
+            &bytes,
+            reference,
+            row_limit,
+            profile.epoch.max_document_vectors as usize,
+        )? {
+            if displaced.insert(row.id.clone(), row).is_some() {
+                return Err(ZeppelinError::Serialization(
+                    "touched late segment blocks contain duplicate row IDs".to_string(),
+                ));
+            }
+        }
+    }
+
+    let mut baseline = Vec::with_capacity(resident.rows().len().saturating_sub(changed.len()));
+    for (index, row) in resident.rows().iter().enumerate() {
+        if changed.contains(&row.id) {
+            // The old version stays behind in its (touched, dropped) block.
+            displaced.remove(&row.id);
+            continue;
+        }
+        let code = resident.row_code(index)?.to_vec();
+        let matrix = if touched_keys.contains(&row.matrix_locator.object_key) {
+            let decoded = displaced.remove(&row.id).ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "surviving flat candidate {} has no decoded matrix row",
+                    row.id
+                ))
+            })?;
+            let ordinal = row.unit_ordinal.unwrap_or(0);
+            if decoded.ordinal != ordinal
+                || decoded.content_hash != row.content_hash
+                || decoded.locator != row.matrix_locator
+            {
+                return Err(ZeppelinError::Serialization(format!(
+                    "surviving flat candidate {} disagrees with its matrix row",
+                    row.id
+                )));
+            }
+            LateRowMatrixSource::Fresh {
+                exact_matrix: decoded.embedding,
+                exact_payload: decoded.payload,
+            }
+        } else {
+            LateRowMatrixSource::Carried {
+                locator: row.matrix_locator.clone(),
+            }
+        };
+        baseline.push(LateSegmentBuildRow {
+            id: row.id.clone(),
+            content_hash: row.content_hash,
+            source_sequence: row.source_sequence,
+            parent_id: row.parent_id.clone(),
+            unit_ordinal: row.unit_ordinal,
+            attributes: row.filter_attributes.clone(),
+            matrix,
+            fde: CandidateFdeSource::Sq8(code),
+        });
+    }
+    if !displaced.is_empty() {
+        return Err(ZeppelinError::Serialization(
+            "touched late segment blocks contain rows outside the flat index".to_string(),
+        ));
+    }
+    Ok((
+        baseline,
+        carried_blocks,
+        FlatCalibrationSource::Frozen(resident.calibration().clone()),
+    ))
 }
 
 fn validate_late_metadata(namespace: &str, metadata: &NamespaceMetadata) -> Result<()> {
@@ -663,9 +916,11 @@ async fn load_old_segment_rows(
                     parent_id: candidate.parent_id,
                     unit_ordinal: candidate.unit_ordinal,
                     attributes: attributes_row.attributes,
-                    exact_matrix: matrix.embedding,
-                    exact_payload: matrix.payload,
-                    raw_fde: candidate.fde,
+                    matrix: LateRowMatrixSource::Fresh {
+                        exact_matrix: matrix.embedding,
+                        exact_payload: matrix.payload,
+                    },
+                    fde: candidate.fde,
                 });
             }
         }
@@ -761,9 +1016,11 @@ async fn load_old_segment_rows(
                     parent_id: row.parent_id.clone(),
                     unit_ordinal: row.unit_ordinal,
                     attributes: attributes_row.attributes,
-                    exact_matrix: matrix.embedding,
-                    exact_payload: matrix.payload,
-                    raw_fde,
+                    matrix: LateRowMatrixSource::Fresh {
+                        exact_matrix: matrix.embedding,
+                        exact_payload: matrix.payload,
+                    },
+                    fde: CandidateFdeSource::Raw(raw_fde),
                 });
             }
         }
@@ -1141,9 +1398,11 @@ fn replay_late_rows(
                     parent_id: record.parent_id.clone(),
                     unit_ordinal: record.unit_ordinal,
                     attributes: record.attributes.clone(),
-                    exact_matrix: output.exact_matrix.clone(),
-                    exact_payload: output.exact_payload.clone(),
-                    raw_fde: output.raw_fde.clone(),
+                    matrix: LateRowMatrixSource::Fresh {
+                        exact_matrix: output.exact_matrix.clone(),
+                        exact_payload: output.exact_payload.clone(),
+                    },
+                    fde: CandidateFdeSource::Raw(output.raw_fde.clone()),
                 });
             }
         }
@@ -1328,8 +1587,9 @@ mod tests {
 
     use super::{
         encode_matrix_payload, input_version_identity, replay_late_rows, resolve_section_origin,
-        same_input_descriptor, BTreeMap, BTreeSet, DerivedRow, EncoderInputWalFragment,
-        InputFragmentRef, LateSegmentBuildRow, LateStateSection, MatrixDtype, SnapshottedInput,
+        same_input_descriptor, BTreeMap, BTreeSet, CandidateFdeSource, DerivedRow,
+        EncoderInputWalFragment, InputFragmentRef, LateRowMatrixSource, LateSegmentBuildRow,
+        LateStateSection, MatrixDtype, SnapshottedInput,
     };
 
     fn input_ref(sequence_number: u64) -> InputFragmentRef {
@@ -1427,8 +1687,17 @@ mod tests {
         assert_eq!(rows[0].id, "same");
         assert_eq!(rows[0].source_sequence, 9);
         assert_eq!(rows[0].content_hash, replacement.content_hash);
-        assert_eq!(rows[0].exact_matrix, exact_matrix);
-        assert_eq!(rows[0].raw_fde, vec![0.25, 0.5]);
+        match &rows[0].matrix {
+            LateRowMatrixSource::Fresh {
+                exact_matrix: fresh,
+                ..
+            } => assert_eq!(*fresh, exact_matrix),
+            LateRowMatrixSource::Carried { .. } => panic!("replayed row must be fresh"),
+        }
+        match &rows[0].fde {
+            CandidateFdeSource::Raw(fde) => assert_eq!(*fde, vec![0.25, 0.5]),
+            CandidateFdeSource::Sq8(_) => panic!("replayed row must carry a raw FDE"),
+        }
     }
 
     #[test]
@@ -1501,10 +1770,12 @@ mod tests {
             parent_id: None,
             unit_ordinal: None,
             attributes: None,
-            exact_payload: encode_matrix_payload(MatrixDtype::F16, 2, &exact_matrix)
-                .expect("test payload"),
-            exact_matrix,
-            raw_fde: vec![sequence as f32, 0.0],
+            matrix: LateRowMatrixSource::Fresh {
+                exact_payload: encode_matrix_payload(MatrixDtype::F16, 2, &exact_matrix)
+                    .expect("test payload"),
+                exact_matrix,
+            },
+            fde: CandidateFdeSource::Raw(vec![sequence as f32, 0.0]),
         }
     }
 }

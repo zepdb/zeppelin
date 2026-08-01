@@ -38,12 +38,16 @@ pub use search::{
 };
 
 pub(crate) use attribute_artifact::decode_attribute_block;
-pub(crate) use candidate::{decode_all_candidate_rows, FetchedLateCandidateCluster};
-pub(crate) use flat_candidate::{LateFlatCandidateBuildConfig, ResidentFlatCandidateIndex};
+pub(crate) use candidate::{
+    decode_all_candidate_rows, CandidateFdeSource, FetchedLateCandidateCluster,
+};
+pub(crate) use flat_candidate::{
+    FlatCalibrationSource, LateFlatCandidateBuildConfig, ResidentFlatCandidateIndex,
+};
 pub(crate) use matrix_artifact::decode_matrix_block;
 pub(crate) use segment_build::{
-    build_late_interaction_segment, LateCandidateBuild, LateSegmentBuildConfig,
-    LateSegmentBuildRow, PrebuiltLateFtsArtifact,
+    build_late_interaction_segment, LateCandidateBuild, LateRowMatrixSource,
+    LateSegmentBuildConfig, LateSegmentBuildRow, PrebuiltLateFtsArtifact,
 };
 
 use thiserror::Error;

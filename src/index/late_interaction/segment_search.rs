@@ -605,11 +605,11 @@ mod tests {
             .enumerate()
             .map(|(index, (id, color))| LateCandidateInputRow {
                 id: (*id).to_string(),
-                fde: if index == 0 {
+                fde: super::super::CandidateFdeSource::Raw(if index == 0 {
                     vec![2.0, 0.0]
                 } else {
                     vec![1.0, 0.0]
-                },
+                }),
                 content_hash: content_hash(id),
                 source_sequence: index as u64 + 1,
                 parent_id: Some("parent".to_string()),
