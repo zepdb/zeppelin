@@ -10,9 +10,11 @@ const REQUIRED_OP_KINDS: &[&str] = &[
     "create_namespace",
     "get_namespace",
     "upsert",
+    "late_upsert",
     "delete_vectors",
     "fetch_vectors",
     "query",
+    "late_query",
     "batch_query",
     "paginate_all",
     "invalid_probe",
@@ -46,6 +48,7 @@ const REQUIRED_TAGS: &[&str] = &[
     "sandwich",
     "delete-recreate",
     "sketch-adc-v4",
+    "late-interaction",
 ];
 
 const REQUIRED_SECURITY_OP_KINDS: &[&str] = &[

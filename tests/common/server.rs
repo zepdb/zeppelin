@@ -16,6 +16,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 
+use super::counting::GetCounter;
 use super::harness::{TestHarness, TestServerRuntime};
 
 use zeppelin::cache::decoded_cache::DecodedArtifactCache;
@@ -1323,6 +1324,8 @@ pub struct FullTestServer {
     pub audit_node_id: String,
     pub security: Arc<SecurityKernel>,
     pub namespace_manager: Arc<NamespaceManager>,
+    pub encoder_provider: Arc<dyn MultiVectorEncoderProvider>,
+    pub object_store_counter: Option<GetCounter>,
     pub workload_credentials: WorkloadCredentialRegistry,
     compaction_lifecycle: CompactionLifecycle,
     server_tasks: Arc<ServerTaskSupervisor>,
@@ -1591,6 +1594,8 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes(
         None,
         None,
         None,
+        None,
+        None,
         true,
     )
     .await
@@ -1620,6 +1625,70 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
         Some(admin_bearer),
         None,
         None,
+        None,
+        None,
+        true,
+    )
+    .await
+}
+
+/// Starts the full test server with an explicit multi-vector encoder provider.
+///
+/// The adversarial late-interaction profile uses this additive test seam to
+/// replay exact generated matrices through the production HTTP query path.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_test_server_full_with_disk_cache_max_bytes_and_encoder_provider(
+    store: ZeppelinStore,
+    namespace_name_prefix: Option<String>,
+    config: Config,
+    spawn_compaction_loop: bool,
+    clock: Option<Clock>,
+    disk_cache_max_bytes: u64,
+    encoder_provider: Arc<dyn MultiVectorEncoderProvider>,
+    object_store_counter: GetCounter,
+) -> FullTestServer {
+    start_test_server_full_with_disk_cache_max_bytes_inner(
+        store,
+        namespace_name_prefix,
+        config,
+        spawn_compaction_loop,
+        clock,
+        disk_cache_max_bytes,
+        None,
+        None,
+        None,
+        Some(encoder_provider),
+        Some(object_store_counter),
+        true,
+    )
+    .await
+}
+
+/// Starts the full test server with a reused administrator and explicit encoder.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer_and_encoder_provider(
+    store: ZeppelinStore,
+    namespace_name_prefix: Option<String>,
+    config: Config,
+    spawn_compaction_loop: bool,
+    clock: Option<Clock>,
+    disk_cache_max_bytes: u64,
+    admin_bearer: &str,
+    encoder_provider: Arc<dyn MultiVectorEncoderProvider>,
+    object_store_counter: GetCounter,
+) -> FullTestServer {
+    start_test_server_full_with_disk_cache_max_bytes_inner(
+        store,
+        namespace_name_prefix,
+        config,
+        spawn_compaction_loop,
+        clock,
+        disk_cache_max_bytes,
+        Some(admin_bearer),
+        None,
+        None,
+        Some(encoder_provider),
+        Some(object_store_counter),
         true,
     )
     .await
@@ -1642,6 +1711,8 @@ pub async fn start_test_server_full_with_credential_adapter(
         None,
         Some(credential_adapter),
         None,
+        None,
+        None,
         true,
     )
     .await
@@ -1660,6 +1731,8 @@ pub async fn start_test_server_full_without_rate_limit_override(
         false,
         None,
         100 * 1024 * 1024,
+        None,
+        None,
         None,
         None,
         None,
@@ -1683,6 +1756,8 @@ pub async fn start_test_server_full_without_rate_limit_override_and_admin_bearer
         None,
         100 * 1024 * 1024,
         Some(admin_bearer),
+        None,
+        None,
         None,
         None,
         false,
@@ -1709,6 +1784,8 @@ pub async fn start_test_server_full_with_entitlements(
         None,
         None,
         Some(entitlements),
+        None,
+        None,
         true,
     )
     .await
@@ -1725,6 +1802,8 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     existing_admin_bearer: Option<&str>,
     credential_adapter_override: Option<Arc<dyn CredentialAdapter>>,
     entitlements_override: Option<Entitlements>,
+    encoder_provider_override: Option<Arc<dyn MultiVectorEncoderProvider>>,
+    object_store_counter: Option<GetCounter>,
     override_rate_limits: bool,
 ) -> FullTestServer {
     zeppelin::metrics::init();
@@ -1833,6 +1912,8 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     let wal_writer = Arc::new(WalWriter::with_clock(store.clone(), clock.clone()));
     let fragment_cache = test_fragment_cache(&config);
     let decoded_artifact_cache = test_decoded_artifact_cache(&config);
+    let encoder_provider =
+        encoder_provider_override.unwrap_or_else(|| test_encoder_provider(&config, &store));
     let shutdown_timeout = Duration::from_secs(config.server.shutdown_timeout_secs);
     let (audit, audit_runtime, audit_node_id) = start_test_audit_with_entitlements(
         &config,
@@ -1857,7 +1938,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         branch_readiness: branch_readiness.snapshot,
         wal_writer: wal_writer.clone(),
         wal_reader: Arc::new(WalReader::new(store.clone())),
-        encoder_provider: test_encoder_provider(&config, &store),
+        encoder_provider: Arc::clone(&encoder_provider),
         compactor: compactor.clone(),
         lease_manager: lease_manager.clone(),
         compaction_lifecycle: compaction_lifecycle.clone(),
@@ -1908,6 +1989,8 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         audit_node_id,
         security,
         namespace_manager,
+        encoder_provider,
+        object_store_counter,
         workload_credentials,
         compaction_lifecycle,
         server_tasks,

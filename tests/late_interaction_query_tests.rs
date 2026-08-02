@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
-use zeppelin::config::{Config, MmliConfig};
+use zeppelin::compaction::Compactor;
+use zeppelin::config::{Config, MmliConfig, MmliSegmentConfig};
 use zeppelin::embedding::{
     ArtifactChecksum, DeterministicDev, EmbeddingProfileId, EmbeddingProfileRef,
     EncoderExecutionRef, EncoderInputRef, EncoderQueryInput, EnrichmentCoordinator,
@@ -26,7 +27,7 @@ use zeppelin::index::late_interaction::{
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, IndexType};
-use zeppelin::wal::{LeaseManager, Manifest, WalWriter};
+use zeppelin::wal::{LeaseManager, Manifest, WalReader, WalWriter};
 
 use common::fault_injection::pause_first_get_matching;
 use common::harness::TestHarness;
@@ -964,6 +965,147 @@ async fn http_rrf_uses_late_and_bm25_ranks_and_rejects_weighted_fusion() {
     );
     assert_eq!(weighted_body["status"], 400);
     assert_eq!(weighted_body["retryable"], false);
+
+    harness.cleanup_artifact_origin_namespace(&namespace).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn http_late_debug_is_opt_in_and_exposes_truth_planned_requests() {
+    require_minio();
+    let harness = TestHarness::new().await;
+    let namespace = harness.artifact_origin_namespace("late-query-debug");
+    let (profile, incarnation) = setup_profile(&harness.store, &namespace).await;
+    let (encoder_provider, _) = provider(&profile);
+    let records = (0..8)
+        .map(|ordinal| {
+            text_record(
+                format!("doc-{ordinal:02}"),
+                format!("debug trace document {ordinal}"),
+                HashMap::from([(
+                    "content".to_string(),
+                    AttributeValue::String(format!("debug trace document {ordinal}")),
+                )]),
+            )
+        })
+        .collect();
+    WalWriter::new(harness.store.clone())
+        .append_retrieval_units(&namespace, records, Vec::new(), Vec::new())
+        .await
+        .expect("debug fixture append must succeed");
+    enrich_all(&harness.store, &namespace, incarnation, encoder_provider).await;
+
+    let mmli = MmliConfig {
+        allow_dev_encoder: true,
+        segment: MmliSegmentConfig {
+            nlist: 2,
+            probe_budget: 2,
+            candidate_k: 8,
+            kmeans_max_iterations: 10,
+            max_matrix_object_bytes: 1024 * 1024,
+            max_cluster_object_bytes: 1024 * 1024,
+            max_resident_bootstrap_bytes: 1024 * 1024,
+            read_gap_budget_bytes: 16 * 1024,
+            read_max_request_bytes: 1024 * 1024,
+            read_max_concurrency: 2,
+            ..MmliSegmentConfig::default()
+        },
+        ..MmliConfig::default()
+    };
+    let compaction_config = Config::default();
+    let compaction = Compactor::new(
+        harness.store.clone(),
+        WalReader::new(harness.store.clone()),
+        compaction_config.compaction,
+        compaction_config.indexing,
+        common::default_gc_upload_window(),
+    )
+    .with_mmli_config(mmli.clone())
+    .compact(&namespace)
+    .await
+    .expect("debug fixture compaction must succeed");
+    assert!(
+        compaction.segment_id.is_some(),
+        "debug fixture must publish an immutable late segment"
+    );
+
+    let config = Config {
+        mmli,
+        ..Config::default()
+    };
+    let (base_url, _cache, _cache_dir, admin_bearer) = start_test_server_on_store_with_config(
+        &harness,
+        harness.store.clone(),
+        Some(harness.prefix.clone()),
+        config,
+    )
+    .await;
+    let client = client_with_bearer(&admin_bearer);
+    let endpoint = format!("{base_url}/v1/namespaces/{namespace}/query");
+    let mut request = json!({
+        "sources": [{
+            "type": "late_interaction",
+            "text": "debug trace query",
+            "top_k": 4,
+            "semantic_wait_ms": 1_000
+        }],
+        "top_k": 4,
+        "consistency": "strong",
+        "projection": {"include_attributes": false}
+    });
+
+    let without_debug = client
+        .post(&endpoint)
+        .json(&request)
+        .send()
+        .await
+        .expect("non-debug query must complete");
+    assert_eq!(without_debug.status().as_u16(), 200);
+    let without_debug_bytes = without_debug
+        .bytes()
+        .await
+        .expect("non-debug response bytes must load");
+    let mut explicit_off_request = request.clone();
+    explicit_off_request["debug"] = Value::Bool(false);
+    let explicit_off = client
+        .post(&endpoint)
+        .json(&explicit_off_request)
+        .send()
+        .await
+        .expect("explicit debug-off query must complete");
+    assert_eq!(explicit_off.status().as_u16(), 200);
+    let explicit_off_bytes = explicit_off
+        .bytes()
+        .await
+        .expect("explicit debug-off response bytes must load");
+    assert_eq!(
+        without_debug_bytes, explicit_off_bytes,
+        "debug=false must preserve the default response byte-for-byte"
+    );
+    let without_debug: Value =
+        serde_json::from_slice(&without_debug_bytes).expect("non-debug response must decode");
+    assert!(
+        without_debug.get("debug").is_none(),
+        "debug response field must remain absent unless explicitly requested"
+    );
+
+    request["debug"] = Value::Bool(true);
+    let with_debug = client
+        .post(endpoint)
+        .json(&request)
+        .send()
+        .await
+        .expect("debug query must complete");
+    assert_eq!(with_debug.status().as_u16(), 200);
+    let with_debug: Value = with_debug.json().await.expect("debug response must decode");
+    assert_eq!(without_debug["results"], with_debug["results"]);
+    assert_eq!(with_debug["debug"]["consistency_effective"], "strong");
+    assert!(
+        with_debug["debug"]["truth_planned_requests"]
+            .as_u64()
+            .is_some_and(|planned| planned > 0),
+        "debug response must expose the immutable segment truth-wave plan: {with_debug}"
+    );
 
     harness.cleanup_artifact_origin_namespace(&namespace).await;
     harness.cleanup().await;

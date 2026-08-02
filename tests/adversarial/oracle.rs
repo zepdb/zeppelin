@@ -52,6 +52,8 @@ pub enum ViolationId {
     I27ConstraintDrop,
     I28PreservationBypass,
     I30BranchingLifecycle,
+    I31LateExactEquivalence,
+    I32LateReadAccounting,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +106,7 @@ pub fn check_op(
         violations.extend(check_i12_structural_sanity(model, rec));
         if mode == RunMode::Deterministic {
             violations.extend(check_i1_strong_exact(model, rec, mode, mutation));
+            violations.extend(check_i31_late_exact(model, rec, mode, mutation));
             violations.extend(check_i8_as_of_exact(model, rec, mode, mutation));
             violations.extend(check_i3_membership(model, rec));
             violations.extend(check_i5_batch_equivalence(rec));
@@ -111,6 +114,177 @@ pub fn check_op(
             violations.extend(check_i13_probe_sandwich(rec));
         }
         violations.extend(check_i7_fts_membership(model, rec));
+    }
+    violations
+}
+
+/// I31 — exact late-interaction MaxSim equivalence.
+///
+/// Deterministic successful late queries must match the f16-canonical model
+/// exactly by ID and order, with only the shared score tolerance allowed.
+fn check_i31_late_exact(
+    model: &Model,
+    rec: &OpRecord,
+    mode: RunMode,
+    mutation: Option<OracleMutation>,
+) -> Vec<Violation> {
+    if mode != RunMode::Deterministic {
+        return Vec::new();
+    }
+    let Op::LateQuery {
+        ns,
+        query,
+        top_k,
+        filter,
+        ..
+    } = &rec.op
+    else {
+        return Vec::new();
+    };
+    let Some(ns_model) = model.namespaces.get(ns) else {
+        return vec![violation(
+            ViolationId::I31LateExactEquivalence,
+            rec,
+            ns,
+            "late query response for unknown namespace",
+            serde_json::json!({ "namespace": ns }),
+        )];
+    };
+    let Ok(results) = query_results(&rec.response) else {
+        return vec![violation(
+            ViolationId::I31LateExactEquivalence,
+            rec,
+            ns,
+            "late query response did not contain parseable results",
+            rec.response.clone(),
+        )];
+    };
+    let mut expected = ns_model.late_expected_results(query, *top_k, filter.as_ref());
+    if mutation == Some(OracleMutation::LateSkewScore) {
+        if let Some((_, score)) = expected.first_mut() {
+            *score += score_eps(*score) * 10.0;
+        }
+    }
+
+    let actual_ids = results
+        .iter()
+        .map(|result| result.id.as_str())
+        .collect::<Vec<_>>();
+    let expected_ids = expected
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    let mut violations = Vec::new();
+    if actual_ids != expected_ids {
+        violations.push(violation(
+            ViolationId::I31LateExactEquivalence,
+            rec,
+            ns,
+            "late query ids or order did not match exact MaxSim",
+            serde_json::json!({
+                "actual_ids": actual_ids,
+                "expected_ids": expected_ids,
+            }),
+        ));
+    }
+    for result in &results {
+        let Some((_, expected_score)) = expected.iter().find(|(id, _)| id == &result.id) else {
+            continue;
+        };
+        if !score_close(result.score, *expected_score) {
+            violations.push(violation(
+                ViolationId::I31LateExactEquivalence,
+                rec,
+                ns,
+                "late query score did not match exact MaxSim",
+                serde_json::json!({
+                    "id": result.id,
+                    "actual": result.score,
+                    "expected": expected_score,
+                }),
+            ));
+        }
+    }
+    violations
+}
+
+/// Object-store GETs observed around one late query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LateReadObservation {
+    /// GETs against per-cluster candidate artifacts.
+    pub candidate_gets: u64,
+    /// GETs against exact matrix and attribute artifacts.
+    pub truth_gets: u64,
+}
+
+/// I32 — late-interaction read-plan accounting.
+///
+/// The runner owns the counting store and passes the per-operation deltas;
+/// the oracle compares them with the opt-in trace carried by the response.
+#[must_use]
+pub fn check_i32_late_read_accounting(
+    rec: &OpRecord,
+    observation: LateReadObservation,
+    mutation: Option<OracleMutation>,
+) -> Vec<Violation> {
+    let Op::LateQuery { ns, .. } = &rec.op else {
+        return Vec::new();
+    };
+    if !(200..300).contains(&rec.status) {
+        return Vec::new();
+    }
+    let Some(planned) = rec
+        .response
+        .get("debug")
+        .and_then(|debug| debug.get("truth_planned_requests"))
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return vec![violation(
+            ViolationId::I32LateReadAccounting,
+            rec,
+            ns,
+            "late debug response omitted truth planned-request count",
+            serde_json::json!({
+                "debug": rec.response.get("debug"),
+                "observation": {
+                    "candidate_gets": observation.candidate_gets,
+                    "truth_gets": observation.truth_gets,
+                },
+            }),
+        )];
+    };
+    let compared_planned = if mutation == Some(OracleMutation::LateHiddenGet) {
+        planned.saturating_sub(1)
+    } else {
+        planned
+    };
+    let mut violations = Vec::new();
+    if observation.candidate_gets != 0 {
+        violations.push(violation(
+            ViolationId::I32LateReadAccounting,
+            rec,
+            ns,
+            "flat-SQ8 late query performed candidate-wave GETs",
+            serde_json::json!({
+                "candidate_gets": observation.candidate_gets,
+                "truth_gets": observation.truth_gets,
+                "truth_planned_requests": planned,
+            }),
+        ));
+    }
+    if observation.truth_gets != compared_planned {
+        violations.push(violation(
+            ViolationId::I32LateReadAccounting,
+            rec,
+            ns,
+            "observed truth-wave GETs did not match planned requests",
+            serde_json::json!({
+                "observed_truth_gets": observation.truth_gets,
+                "truth_planned_requests": planned,
+                "compared_planned_requests": compared_planned,
+                "mutation": mutation == Some(OracleMutation::LateHiddenGet),
+            }),
+        ));
     }
     violations
 }
@@ -1436,6 +1610,12 @@ fn check_i10_failed_validation_no_wal(rec: &OpRecord) -> Vec<Violation> {
 fn check_i12_structural_sanity(model: &Model, rec: &OpRecord) -> Vec<Violation> {
     match &rec.op {
         Op::Query { ns, q, .. } => check_query_structural(model, rec, ns, q, &rec.response),
+        Op::LateQuery {
+            ns,
+            top_k,
+            consistency,
+            ..
+        } => check_late_query_structural(rec, ns, *top_k, *consistency, &rec.response),
         Op::BatchQuery { ns, qs, .. } => rec.response["batch"]["results"]
             .as_array()
             .into_iter()
@@ -1506,7 +1686,66 @@ fn check_query_structural(
     violations.extend(check_groups_structural(rec, ns, q, response));
     violations.extend(check_facets_structural(model, rec, ns, response));
     violations.extend(check_explain_structural(rec, ns, q, response));
-    violations.extend(check_debug_structural(rec, ns, q, response));
+    violations.extend(check_debug_structural(
+        rec,
+        ns,
+        q.consistency().unwrap_or(ConsistencyLevel::Strong),
+        q.body.get("debug").and_then(serde_json::Value::as_bool) == Some(true),
+        false,
+        response,
+    ));
+    violations
+}
+
+fn check_late_query_structural(
+    rec: &OpRecord,
+    ns: &str,
+    top_k: usize,
+    consistency: ConsistencyLevel,
+    response: &serde_json::Value,
+) -> Vec<Violation> {
+    let Ok(results) = query_results(response) else {
+        return Vec::new();
+    };
+    let mut violations = Vec::new();
+    let mut seen = BTreeSet::new();
+    for result in &results {
+        if !result.score.is_finite() {
+            violations.push(violation(
+                ViolationId::I12StructuralSanity,
+                rec,
+                ns,
+                "late query returned non-finite score",
+                serde_json::json!({ "id": result.id, "score": result.score }),
+            ));
+        }
+        if !seen.insert(result.id.clone()) {
+            violations.push(violation(
+                ViolationId::I12StructuralSanity,
+                rec,
+                ns,
+                "late query returned duplicate id",
+                serde_json::json!({ "id": result.id }),
+            ));
+        }
+    }
+    if results.len() > top_k {
+        violations.push(violation(
+            ViolationId::I12StructuralSanity,
+            rec,
+            ns,
+            "late query returned more results than top_k",
+            serde_json::json!({ "top_k": top_k, "actual_len": results.len() }),
+        ));
+    }
+    violations.extend(check_debug_structural(
+        rec,
+        ns,
+        consistency,
+        true,
+        true,
+        response,
+    ));
     violations
 }
 
@@ -1697,10 +1936,12 @@ fn check_explain_structural(
 fn check_debug_structural(
     rec: &OpRecord,
     ns: &str,
-    q: &GeneratedQuery,
+    consistency: ConsistencyLevel,
+    debug_requested: bool,
+    require_late_trace: bool,
     response: &serde_json::Value,
 ) -> Vec<Violation> {
-    if q.body.get("debug").and_then(serde_json::Value::as_bool) != Some(true) {
+    if !debug_requested {
         return Vec::new();
     }
     let Some(debug) = response.get("debug").and_then(serde_json::Value::as_object) else {
@@ -1712,7 +1953,7 @@ fn check_debug_structural(
             response.clone(),
         )];
     };
-    let expected = consistency_str(q.consistency().unwrap_or(ConsistencyLevel::Strong));
+    let expected = consistency_str(consistency);
     if debug
         .get("consistency_effective")
         .and_then(serde_json::Value::as_str)
@@ -1727,6 +1968,20 @@ fn check_debug_structural(
                 "expected": expected,
                 "debug": debug,
             }),
+        )];
+    }
+    if require_late_trace
+        && debug
+            .get("truth_planned_requests")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+    {
+        return vec![violation(
+            ViolationId::I12StructuralSanity,
+            rec,
+            ns,
+            "late debug response omitted truth planned-request count",
+            serde_json::json!({ "debug": debug }),
         )];
     }
     Vec::new()
@@ -2682,6 +2937,7 @@ mod tests {
     use zeppelin::index::quantization::QuantizationType;
     use zeppelin::types::DistanceMetric;
 
+    use crate::adversarial::model::LateModelRecord;
     use crate::adversarial::ops::{ActorSel, NamespaceSpec};
 
     use super::*;
@@ -2696,6 +2952,7 @@ mod tests {
             num_centroids: 1,
             fts_fields: vec!["body".to_string()],
             bitmap: false,
+            late_interaction: None,
         }
     }
 
@@ -2712,6 +2969,138 @@ mod tests {
             namespaces: BTreeMap::from([(NS.to_string(), ns_model)]),
             ..Model::default()
         }
+    }
+
+    fn late_model() -> Model {
+        let mut ns_model = NsModel::new(namespace_spec(), 1);
+        let attributes = |group: &str| {
+            Some(HashMap::from([(
+                "group".to_string(),
+                AttributeValue::String(group.to_string()),
+            )]))
+        };
+        for id in ["b", "a"] {
+            ns_model.late_live.insert(
+                id.to_string(),
+                LateModelRecord {
+                    values: vec![vec![1.0, 0.0]],
+                    attributes: attributes("keep"),
+                },
+            );
+        }
+        ns_model.late_live.insert(
+            "z".to_string(),
+            LateModelRecord {
+                values: vec![vec![2.0, 0.0]],
+                attributes: attributes("drop"),
+            },
+        );
+        Model {
+            namespaces: BTreeMap::from([(NS.to_string(), ns_model)]),
+            ..Model::default()
+        }
+    }
+
+    fn late_query_record(filter: Option<Filter>, results: serde_json::Value) -> OpRecord {
+        OpRecord {
+            index: 31,
+            wall_ms: 0,
+            op: Op::LateQuery {
+                actor: ActorSel::ADMIN,
+                ns: NS.to_string(),
+                query: vec![vec![1.0, 0.0]],
+                top_k: 2,
+                filter,
+                consistency: ConsistencyLevel::Strong,
+            },
+            method: "POST".to_string(),
+            path: format!("/v1/namespaces/{NS}/query"),
+            status: 200,
+            response: json!({
+                "results": results,
+                "debug": {
+                    "consistency_effective": "strong",
+                    "truth_planned_requests": 2,
+                    "future_additive_field": true
+                }
+            }),
+            outcome: "applied".to_string(),
+            target_node: 0,
+            execution: Default::default(),
+            gen_after: Some(1),
+            duration_ms: 1,
+            violations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn i31_matches_filtered_maxsim_in_score_descending_id_ascending_order() {
+        let filter = Filter::Eq {
+            field: "group".to_string(),
+            value: AttributeValue::String("keep".to_string()),
+        };
+        let rec = late_query_record(
+            Some(filter),
+            json!([
+                { "id": "a", "score": 1.0 },
+                { "id": "b", "score": 1.0 }
+            ]),
+        );
+
+        let violations = check_i31_late_exact(&late_model(), &rec, RunMode::Deterministic, None);
+
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn late_skew_score_mutation_fires_i31() {
+        let rec = late_query_record(
+            Some(Filter::Eq {
+                field: "group".to_string(),
+                value: AttributeValue::String("keep".to_string()),
+            }),
+            json!([
+                { "id": "a", "score": 1.0 },
+                { "id": "b", "score": 1.0 }
+            ]),
+        );
+
+        let violations = check_i31_late_exact(
+            &late_model(),
+            &rec,
+            RunMode::Deterministic,
+            Some(OracleMutation::LateSkewScore),
+        );
+
+        assert!(violations
+            .iter()
+            .any(|violation| violation.id == ViolationId::I31LateExactEquivalence));
+    }
+
+    #[test]
+    fn late_hidden_get_mutation_fires_i32_and_clean_accounting_passes() {
+        let rec = late_query_record(None, json!([]));
+        let observation = LateReadObservation {
+            candidate_gets: 0,
+            truth_gets: 2,
+        };
+
+        assert!(check_i32_late_read_accounting(&rec, observation, None).is_empty());
+        let violations =
+            check_i32_late_read_accounting(&rec, observation, Some(OracleMutation::LateHiddenGet));
+
+        assert!(violations
+            .iter()
+            .any(|violation| violation.id == ViolationId::I32LateReadAccounting));
+    }
+
+    #[test]
+    fn late_debug_structural_accepts_additive_trace_fields() {
+        let rec = late_query_record(None, json!([]));
+
+        let violations = check_i12_structural_sanity(&late_model(), &rec);
+
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 
     #[test]

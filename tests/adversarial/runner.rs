@@ -16,8 +16,10 @@ use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::compaction::gc;
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{Config, GcConfig};
+use zeppelin::embedding::MultiVectorEncoderProvider;
 use zeppelin::error::ZeppelinError;
 use zeppelin::namespace::manager::{NamespaceMetadata, NamespaceState};
+use zeppelin::namespace::NamespaceManager;
 use zeppelin::security::{
     verify_audit_day, AuditRecord, AuditRuntime, PolicyHead, PolicySnapshot, SecurityKernel,
 };
@@ -31,7 +33,9 @@ use crate::common::harness::TestHarness;
 use crate::common::server::{
     cleanup_ns, client_with_bearer, start_test_server_full,
     start_test_server_full_with_disk_cache_max_bytes,
-    start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer, FullTestServer,
+    start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer,
+    start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer_and_encoder_provider,
+    start_test_server_full_with_disk_cache_max_bytes_and_encoder_provider, FullTestServer,
     FullTestServerWatchdogHandle, WorkloadCredentialRegistry,
 };
 
@@ -53,6 +57,10 @@ use super::faults::{
     TimelineEvent,
 };
 use super::generator::{AdversarialGenerator, Coverage};
+use super::late_support::{
+    activate_late_embedding_profile, encode_matrix_text, enrich_pending_retrieval_units,
+    late_encoder_provider,
+};
 use super::model::{
     AmbiguityReason, IndetEffect, Model, ModelRecord, NsIndeterminate, OpOutcome, OracleMutation,
 };
@@ -529,7 +537,11 @@ struct OpExecutionTarget {
     store: ZeppelinStore,
     clock: Clock,
     compactor: Arc<Compactor>,
+    lease_manager: Arc<LeaseManager>,
     manifest_cache: Arc<ManifestCache>,
+    namespace_manager: Arc<NamespaceManager>,
+    encoder_provider: Arc<dyn MultiVectorEncoderProvider>,
+    object_store_counter: Option<GetCounter>,
     security: Arc<SecurityKernel>,
     audit: zeppelin::security::AuditClient,
     audit_node_id: String,
@@ -543,7 +555,11 @@ impl From<&FullTestServer> for OpExecutionTarget {
             store: server.store.clone(),
             clock: server.clock.clone(),
             compactor: Arc::clone(&server.compactor),
+            lease_manager: Arc::clone(&server.lease_manager),
             manifest_cache: Arc::clone(&server.manifest_cache),
+            namespace_manager: Arc::clone(&server.namespace_manager),
+            encoder_provider: Arc::clone(&server.encoder_provider),
+            object_store_counter: server.object_store_counter.clone(),
             security: Arc::clone(&server.security),
             audit: server.audit.clone(),
             audit_node_id: server.audit_node_id.clone(),
@@ -698,6 +714,9 @@ impl OperationalState {
     }
 
     fn choose_target_node_for_op(&mut self, op: &Op) -> u8 {
+        if matches!(op, Op::LateUpsert { .. } | Op::LateQuery { .. }) {
+            return 0;
+        }
         if self.second_node_read_only && !op.is_read_only_request() {
             return 0;
         }
@@ -1951,8 +1970,9 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let old_prefix = recorded_namespace_prefix(seed_config.seed, &seed_config.namespace_specs);
     let harness = TestHarness::new().await;
     let prefix = harness.prefix.clone();
+    let (counted_backend, counter) = counting_store(&harness.store);
     let (legacy_instrumented_store, chaos_handle) =
-        wrap_chaos_store(&harness.store, chaos_plan.clone());
+        wrap_chaos_store(&counted_backend, chaos_plan.clone());
     if let Some(chaos) = &chaos_handle {
         chaos.disable();
     }
@@ -1961,7 +1981,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         .map_or(legacy_instrumented_store.clone(), |scheduler| {
             store_fault_proxy(&legacy_instrumented_store, scheduler.clone())
         });
-    let (store, counter) = counting_store(&instrumented_store);
+    let store = instrumented_store;
     let require_compaction_evidence = requires_two_node_compaction_evidence(scheduler.as_ref());
     let operational_observer = requires_operational_store_observer(scheduler.as_ref())
         .then(OperationalStoreObserver::default);
@@ -1969,12 +1989,13 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         || store.clone(),
         |observer| operational_store_proxy(&store, observer.clone(), 0),
     );
-    let config = seed_config.config.clone();
+    let mut config = seed_config.config.clone();
     let specs = seed_config
         .namespace_specs
         .iter()
         .map(|(ns, spec)| (rewrite_prefix(ns, &old_prefix, &prefix), spec.clone()))
         .collect::<BTreeMap<_, _>>();
+    apply_late_namespace_config(&mut config, &specs);
     let security_program = seed_config
         .security_program
         .as_ref()
@@ -1992,14 +2013,18 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         security_program.as_ref(),
     );
     let disk_cache_max_bytes = disk_cache_max_bytes_for_schedule(scheduler.as_ref());
+    let encoder_provider = late_encoder_provider(&config.mmli)
+        .expect("adversarial replay encoder provider must construct");
     let mut server = RestartableFullTestServer::new(
-        start_test_server_full_with_disk_cache_max_bytes(
+        start_test_server_full_with_disk_cache_max_bytes_and_encoder_provider(
             primary_store,
             Some(prefix.clone()),
             config.clone(),
             mode == RunMode::Chaos,
             injected_clock(test_clock.as_ref()),
             disk_cache_max_bytes,
+            encoder_provider,
+            counter.clone(),
         )
         .await,
     );
@@ -3258,8 +3283,12 @@ fn wrap_chaos_store(
 }
 
 fn scheduled_profile(profile: Option<FaultProfile>) -> Option<FaultProfile> {
-    profile
-        .filter(|profile| !matches!(profile, FaultProfile::LegacyChaos | FaultProfile::Branching))
+    profile.filter(|profile| {
+        !matches!(
+            profile,
+            FaultProfile::LegacyChaos | FaultProfile::Branching | FaultProfile::Late
+        )
+    })
 }
 
 fn test_clock_for_scheduler(scheduler: Option<&FaultScheduler>) -> Option<Arc<TestClock>> {
@@ -3516,6 +3545,8 @@ async fn restart_after_crash(
     let clock = server.clock.clone();
     let admin_bearer = server.admin_bearer.clone();
     let workload_credentials = server.workload_credentials.clone();
+    let encoder_provider = Arc::clone(&server.encoder_provider);
+    let object_store_counter = server.object_store_counter.clone();
     let old_server = server.take();
     controller.park_token.cancel();
     let held_call_retirement = scheduler.begin_held_call_retirement();
@@ -3526,16 +3557,31 @@ async fn restart_after_crash(
     drop(held_call_retirement);
     shutdown_http_fault_injector(injector).await;
 
-    let mut replacement = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
-        server_store.clone(),
-        Some(prefix.to_string()),
-        config.clone(),
-        spawn_compaction_loop,
-        Some(clock),
-        100 * 1024 * 1024,
-        &admin_bearer,
-    )
-    .await;
+    let mut replacement = if let Some(counter) = object_store_counter {
+        start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer_and_encoder_provider(
+            server_store.clone(),
+            Some(prefix.to_string()),
+            config.clone(),
+            spawn_compaction_loop,
+            Some(clock),
+            100 * 1024 * 1024,
+            &admin_bearer,
+            encoder_provider,
+            counter,
+        )
+        .await
+    } else {
+        start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
+            server_store.clone(),
+            Some(prefix.to_string()),
+            config.clone(),
+            spawn_compaction_loop,
+            Some(clock),
+            100 * 1024 * 1024,
+            &admin_bearer,
+        )
+        .await
+    };
     replacement.workload_credentials = workload_credentials;
     server.install(replacement);
     wait_for_health(client, &server.base_url).await;
@@ -3632,6 +3678,12 @@ fn sanitize_op_for_mode(op: Op, mode: RunMode) -> Op {
         | Op::CompactEndpoint { actor, ns }
         | Op::GcCycle { actor, ns, .. }
         | Op::ProbeSandwich { actor, ns, .. } => Op::GetNamespace { actor, ns },
+        // Phase 1 deliberately gives MMLI its own deterministic profile. Keep
+        // its direct enrichment/compaction bridge outside legacy fault runs;
+        // later phases add late-specific fault semantics.
+        Op::LateUpsert { actor, ns, .. } | Op::LateQuery { actor, ns, .. } => {
+            Op::GetNamespace { actor, ns }
+        }
         Op::FetchVectors { actor, ns, ids, .. } => Op::FetchVectors {
             actor,
             ns,
@@ -4167,6 +4219,8 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 fired.contains(&ViolationId::I28PreservationBypass)
             }
             OracleMutation::AuditChainRecordDrop => fired.contains(&ViolationId::I25AuditEvidence),
+            OracleMutation::LateSkewScore => fired.contains(&ViolationId::I31LateExactEquivalence),
+            OracleMutation::LateHiddenGet => fired.contains(&ViolationId::I32LateReadAccounting),
         };
         assert!(
             accepted,
@@ -4236,6 +4290,7 @@ async fn run_seed_inner(
     let misdirected_write_selftest = mutation == Some(OracleMutation::MisdirectedWriteReachability);
     let assignment = effective_seed_assignment(env.mode, env.profile, seed);
     let branching_profile = assignment.profile == Some(FaultProfile::Branching);
+    let late_profile = assignment.profile == Some(FaultProfile::Late);
     let profile = scheduled_profile(assignment.profile);
     let mode = if profile.is_some()
         || mutation == Some(OracleMutation::ChaosLostWrite)
@@ -4261,6 +4316,8 @@ async fn run_seed_inner(
     }
     let mut generator = if branching_profile {
         AdversarialGenerator::new_branching(seed, &prefix)
+    } else if late_profile {
+        AdversarialGenerator::new_late(seed, &prefix)
     } else if profile == Some(FaultProfile::Security) {
         AdversarialGenerator::new_security_profile(seed, &prefix)
     } else if security_program_enabled {
@@ -4326,9 +4383,11 @@ async fn run_seed_inner(
         .as_ref()
         .map(|scheduler| scheduler.schedule().profile)
         .or_else(|| chaos_plan.as_ref().map(|_| FaultProfile::LegacyChaos))
-        .or_else(|| branching_profile.then_some(FaultProfile::Branching));
+        .or_else(|| branching_profile.then_some(FaultProfile::Branching))
+        .or_else(|| late_profile.then_some(FaultProfile::Late));
+    let (counted_backend, counter) = counting_store(&harness.store);
     let (legacy_instrumented_store, chaos_handle) =
-        wrap_chaos_store(&harness.store, chaos_plan.clone());
+        wrap_chaos_store(&counted_backend, chaos_plan.clone());
     if let Some(chaos) = &chaos_handle {
         chaos.disable();
     }
@@ -4337,7 +4396,7 @@ async fn run_seed_inner(
         .map_or(legacy_instrumented_store.clone(), |scheduler| {
             store_fault_proxy(&legacy_instrumented_store, scheduler.clone())
         });
-    let (store, counter) = counting_store(&instrumented_store);
+    let store = instrumented_store;
     let require_compaction_evidence = requires_two_node_compaction_evidence(scheduler.as_ref());
     let operational_observer = requires_operational_store_observer(scheduler.as_ref())
         .then(OperationalStoreObserver::default);
@@ -4346,6 +4405,7 @@ async fn run_seed_inner(
         |observer| operational_store_proxy(&store, observer.clone(), 0),
     );
     let mut config = config_for_mode(mode, seed, scheduler.as_ref().map(FaultScheduler::schedule));
+    apply_late_namespace_config(&mut config, &specs);
     if branching_profile {
         config.branching.enabled = true;
     }
@@ -4362,13 +4422,17 @@ async fn run_seed_inner(
         security_program.as_ref(),
     );
     let disk_cache_max_bytes = disk_cache_max_bytes_for_schedule(scheduler.as_ref());
-    let initial_server = start_test_server_full_with_disk_cache_max_bytes(
+    let encoder_provider = late_encoder_provider(&config.mmli)
+        .expect("adversarial seed encoder provider must construct");
+    let initial_server = start_test_server_full_with_disk_cache_max_bytes_and_encoder_provider(
         primary_store,
         Some(prefix.clone()),
         config.clone(),
         mode == RunMode::Chaos,
         injected_clock(test_clock.as_ref()),
         disk_cache_max_bytes,
+        encoder_provider,
+        counter.clone(),
     )
     .await;
     let mut server = match watchdog {
@@ -5643,6 +5707,7 @@ fn foreground_hold_calls(op: &Op) -> Vec<(StoreOp, String)> {
         op,
         Op::FetchVectors { .. }
             | Op::Query { .. }
+            | Op::LateQuery { .. }
             | Op::BatchQuery { .. }
             | Op::PaginateAll { .. }
             | Op::Hydrate { .. }
@@ -5676,7 +5741,7 @@ fn op_can_run_while_hold_is_pending(op: &Op, held_namespace: &str) -> bool {
 fn op_uses_query_admission(op: &Op) -> bool {
     matches!(
         op,
-        Op::Query { .. } | Op::BatchQuery { .. } | Op::PaginateAll { .. }
+        Op::Query { .. } | Op::LateQuery { .. } | Op::BatchQuery { .. } | Op::PaginateAll { .. }
     ) || matches!(
         op,
         Op::InvalidProbe {
@@ -6014,6 +6079,7 @@ async fn execute_recorded_op(
 
 struct RawRecordedOp {
     rec: OpRecord,
+    late_read_observation: Option<oracle::LateReadObservation>,
     outcome: OpOutcome,
     post_commit_ack_lost: bool,
     crash: Option<CrashRequest>,
@@ -6062,13 +6128,23 @@ async fn execute_raw_recorded_op(
         || client.clone(),
         |actor| target.workload_credentials.client(actor.0, 0),
     );
+    let late_read_baseline = matches!(op, Op::LateQuery { .. }).then(|| {
+        let counter = target
+            .object_store_counter
+            .as_ref()
+            .expect("late query execution requires a per-seed CountingStore");
+        oracle::LateReadObservation {
+            candidate_gets: counter.gets_matching("candidate-cluster-"),
+            truth_gets: counter.gets_matching("/matrix_") + counter.gets_matching("/attrs_"),
+        }
+    });
     let request = WORKLOAD_REQUEST_ID.scope(
         format!("adv-{index}-{}", op.kind()),
         REQUEST_AMBIGUITY_ALLOWED.scope(
             ambiguity_allowed,
             REQUEST_IS_MUTATION.scope(
                 op.is_mutating(),
-                execute_op(
+                Box::pin(execute_op(
                     &execution_client,
                     &request_target,
                     &op,
@@ -6076,7 +6152,7 @@ async fn execute_raw_recorded_op(
                     started,
                     allow_missing_manifest_bookkeeping,
                     durably_tainted_keys.as_ref(),
-                ),
+                )),
             ),
         ),
     );
@@ -6096,6 +6172,21 @@ async fn execute_raw_recorded_op(
     } else {
         (request.await, None)
     };
+    let late_read_observation = late_read_baseline.map(|baseline| {
+        let counter = target
+            .object_store_counter
+            .as_ref()
+            .expect("late query execution requires a per-seed CountingStore");
+        oracle::LateReadObservation {
+            candidate_gets: counter
+                .gets_matching("candidate-cluster-")
+                .checked_sub(baseline.candidate_gets)
+                .expect("candidate GET counter must remain monotonic"),
+            truth_gets: (counter.gets_matching("/matrix_") + counter.gets_matching("/attrs_"))
+                .checked_sub(baseline.truth_gets)
+                .expect("truth GET counter must remain monotonic"),
+        }
+    });
     rec.target_node = target_node;
     mark_injected_store_failure(
         &mut rec,
@@ -6141,6 +6232,7 @@ async fn execute_raw_recorded_op(
     }
     RawRecordedOp {
         rec,
+        late_read_observation,
         outcome,
         post_commit_ack_lost,
         crash,
@@ -6393,6 +6485,7 @@ async fn finish_recorded_op(
 ) -> StepOutcome {
     let RawRecordedOp {
         rec,
+        late_read_observation,
         outcome,
         post_commit_ack_lost,
         crash,
@@ -6468,6 +6561,17 @@ async fn finish_recorded_op(
         });
     let mut violations =
         oracle::check_op_with_faults(model, &rec, mode, mutation, corruption.as_ref());
+    if mode == RunMode::Deterministic
+        && (200..300).contains(&rec.status)
+        && matches!(op, Op::LateQuery { .. })
+    {
+        violations.extend(oracle::check_i32_late_read_accounting(
+            &rec,
+            late_read_observation
+                .expect("successful deterministic late query must retain GET accounting"),
+            mutation,
+        ));
+    }
     if matches!(
         mutation,
         Some(
@@ -6578,6 +6682,7 @@ fn op_records_manifest_generation(op: &Op) -> bool {
         op,
         Op::CreateNamespace { .. }
             | Op::Upsert { .. }
+            | Op::LateUpsert { .. }
             | Op::DeleteVectors { .. }
             | Op::CompactEndpoint { .. }
             | Op::ProbeSandwich { .. }
@@ -6668,6 +6773,13 @@ async fn execute_op(
                 Some(body),
             )
             .await;
+            if (200..300).contains(&status) && spec.late_interaction.is_some() {
+                activate_late_embedding_profile(&target.store, &target.namespace_manager, ns)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("failed to activate adversarial late profile for {ns}: {error}")
+                    });
+            }
             ("POST".to_string(), path, status, response)
         }
         Op::GetNamespace { ns, .. } => {
@@ -6690,6 +6802,57 @@ async fn execute_op(
                 Some(json!({ "vectors": vectors })),
             )
             .await;
+            ("POST".to_string(), path, status, response)
+        }
+        Op::LateUpsert { ns, records, .. } => {
+            let path = format!("/v1/namespaces/{ns}/retrieval-units");
+            let upserts = records
+                .iter()
+                .map(|record| {
+                    let text = encode_matrix_text(&record.values).unwrap_or_else(|error| {
+                        panic!(
+                            "failed to encode adversarial late document matrix {}: {error}",
+                            record.id
+                        )
+                    });
+                    json!({
+                        "id": record.id,
+                        "input": { "type": "text", "text": text },
+                        "attributes": record.attributes,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", target.base_url, path),
+                Some(json!({ "upserts": upserts })),
+            )
+            .await;
+            if (200..300).contains(&status) {
+                let admitted = enrich_pending_retrieval_units(
+                    &target.store,
+                    Arc::clone(&target.lease_manager),
+                    Arc::clone(&target.encoder_provider),
+                    &target.namespace_manager,
+                    ns,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("failed to enrich adversarial late upsert for {ns}: {error}")
+                });
+                assert!(
+                    admitted > 0,
+                    "successful adversarial late upsert for {ns} must admit enrichment work"
+                );
+                let compaction = target.compactor.compact(ns).await.unwrap_or_else(|error| {
+                    panic!("failed to compact adversarial late namespace {ns}: {error}")
+                });
+                assert!(
+                    compaction.segment_id.is_some(),
+                    "adversarial late upsert for {ns} must publish an immutable segment"
+                );
+            }
             ("POST".to_string(), path, status, response)
         }
         Op::DeleteVectors { ns, ids, .. } => {
@@ -6735,6 +6898,45 @@ async fn execute_op(
                 Method::POST,
                 &format!("{}{}", target.base_url, path),
                 Some(q.body.clone()),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
+        Op::LateQuery {
+            ns,
+            query,
+            top_k,
+            filter,
+            consistency,
+            ..
+        } => {
+            let path = format!("/v1/namespaces/{ns}/query");
+            let text = encode_matrix_text(query).unwrap_or_else(|error| {
+                panic!("failed to encode adversarial late query matrix for {ns}: {error}")
+            });
+            let mut body = json!({
+                "sources": [{
+                    "type": "late_interaction",
+                    "text": text,
+                    "top_k": top_k,
+                    "semantic_wait_ms": 5_000,
+                }],
+                "candidate_k": 64,
+                "top_k": top_k,
+                "consistency": consistency,
+                "projection": { "include_attributes": true },
+                "debug": true,
+            });
+            if let Some(filter) = filter {
+                body.as_object_mut()
+                    .expect("late query body must be an object")
+                    .insert("filter".to_string(), json!(filter));
+            }
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", target.base_url, path),
+                Some(body),
             )
             .await;
             ("POST".to_string(), path, status, response)
@@ -9237,6 +9439,8 @@ impl QuietPeriod<'_> {
             let clock = self.server.clock.clone();
             let admin_bearer = self.server.admin_bearer.clone();
             let workload_credentials = self.server.workload_credentials.clone();
+            let encoder_provider = Arc::clone(&self.server.encoder_provider);
+            let object_store_counter = self.server.object_store_counter.clone();
             let spawn_compaction_loop = self.server.shutdown_compaction.is_some();
             let old_server = self.server.take();
             if let Err(error) = old_server.abort_and_drop().await {
@@ -9245,7 +9449,20 @@ impl QuietPeriod<'_> {
                     "retired primary whose HTTP task had already failed"
                 );
             }
-            let mut replacement =
+            let mut replacement = if let Some(counter) = object_store_counter {
+                start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer_and_encoder_provider(
+                    store,
+                    Some(self.prefix.to_string()),
+                    self.config.clone(),
+                    spawn_compaction_loop,
+                    Some(clock),
+                    self.disk_cache_max_bytes,
+                    &admin_bearer,
+                    encoder_provider,
+                    counter,
+                )
+                .await
+            } else {
                 start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
                     store,
                     Some(self.prefix.to_string()),
@@ -9255,7 +9472,8 @@ impl QuietPeriod<'_> {
                     self.disk_cache_max_bytes,
                     &admin_bearer,
                 )
-                .await;
+                .await
+            };
             replacement.workload_credentials = workload_credentials;
             self.server.install(replacement);
             true
@@ -10463,11 +10681,56 @@ async fn run_quiescent_checks(
     }
 
     'sweep: for ns in &namespaces {
-        let ids = model
+        let ns_model = model
             .namespaces
             .get(ns)
-            .map(|ns_model| ns_model.live.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+            .unwrap_or_else(|| panic!("quiescence namespace {ns} disappeared from the model"));
+        if ns_model.spec.late_interaction.is_some() {
+            let Some(query) = ns_model
+                .late_live
+                .values()
+                .next()
+                .map(|record| record.values.clone())
+            else {
+                continue;
+            };
+            let query = Op::LateQuery {
+                actor: ActorSel::ADMIN,
+                ns: ns.clone(),
+                query,
+                top_k: ns_model.late_live.len().min(8),
+                filter: None,
+                consistency: ConsistencyLevel::Strong,
+            };
+            let step = execute_recorded_op(
+                client,
+                server,
+                artifacts,
+                model,
+                coverage,
+                s3_tracker,
+                corruption_tracker,
+                &query,
+                *op_index,
+                started,
+                mutation,
+                mode,
+                ExecutionPhase::Quiescence,
+                true,
+                0,
+                None,
+                false,
+            )
+            .await;
+            *op_index += 1;
+            if !step.violations.is_empty() {
+                violations = step.violations;
+                break 'sweep;
+            }
+            continue;
+        }
+
+        let ids = ns_model.live.keys().cloned().collect::<Vec<_>>();
         let fetch = Op::FetchVectors {
             actor: ActorSel::ADMIN,
             ns: ns.clone(),
@@ -11403,6 +11666,17 @@ fn selftest_probe_op(
                 ns: ns.clone(),
             })
         }
+        (
+            OracleMutation::LateSkewScore | OracleMutation::LateHiddenGet,
+            Op::LateUpsert { ns, records, .. },
+        ) => records.first().map(|record| Op::LateQuery {
+            actor: ActorSel::ADMIN,
+            ns: ns.clone(),
+            query: record.values.clone(),
+            top_k: records.len().min(8),
+            filter: None,
+            consistency: ConsistencyLevel::Strong,
+        }),
         _ => None,
     }
 }
@@ -11426,6 +11700,35 @@ fn deterministic_config() -> Config {
     config.server.write_rate_limit_rps = 1_000_000;
     config.server.write_rate_limit_burst = 1_000_000;
     config
+}
+
+fn apply_late_namespace_config(config: &mut Config, specs: &BTreeMap<String, NamespaceSpec>) {
+    let mut late_specs = specs
+        .values()
+        .filter_map(|spec| spec.late_interaction.as_ref());
+    let Some(late) = late_specs.next() else {
+        return;
+    };
+    assert!(
+        late_specs.next().is_none(),
+        "one adversarial seed may contain at most one late namespace"
+    );
+    assert_eq!(
+        late.candidate_kind,
+        zeppelin::wal::LateCandidateKind::FlatSq8,
+        "phase-1 adversarial late namespace must use flat-SQ8 candidates"
+    );
+    config.mmli.allow_dev_encoder = true;
+    config.mmli.segment.nlist = late.nlist;
+    config.mmli.segment.probe_budget = late.probe_budget;
+    config.mmli.segment.candidate_k = late.candidate_k;
+    config.mmli.segment.kmeans_max_iterations = late.kmeans_max_iterations;
+    config.mmli.segment.max_matrix_object_bytes = late.max_matrix_object_bytes;
+    config.mmli.segment.max_cluster_object_bytes = late.max_cluster_object_bytes;
+    config.mmli.segment.max_resident_bootstrap_bytes = late.max_resident_bootstrap_bytes;
+    config.mmli.segment.read_gap_budget_bytes = late.read_gap_budget_bytes;
+    config.mmli.segment.read_max_request_bytes = late.read_max_request_bytes;
+    config.mmli.segment.read_max_concurrency = late.read_max_concurrency;
 }
 
 fn inspection_config() -> Config {
@@ -12008,6 +12311,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let config = deterministic_config();
         let server = start_test_server_full(
@@ -12631,6 +12935,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let ns_fenced = format!("{prefix}-f1-fenced");
         let ns_deleting = format!("{prefix}-f1-deleting");
@@ -12934,6 +13239,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let vectors = (0..8)
             .map(|index| GenVector {
@@ -13302,6 +13608,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let setup_server = start_test_server_full(
             harness.store.clone(),
@@ -14282,6 +14589,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let mut model = Model::default();
         model.apply(
@@ -14727,6 +15035,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let (create_status, _) = request_json(
             &client,
@@ -14872,6 +15181,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let (create_status, _) = request_json(
             &client,
@@ -14992,6 +15302,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let (create_status, _) = request_json(
             &client,
@@ -15133,6 +15444,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let (create_status, _) = request_json(
             &client,
@@ -15201,6 +15513,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let server = start_test_server_full(
             operational_store_proxy(&harness.store, operational_observer.clone(), 0),
@@ -15302,6 +15615,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let config = deterministic_config();
         let schedule = FaultSchedule {
@@ -15428,6 +15742,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let server = start_test_server_full(
             operational_store_proxy(&harness.store, operational_observer.clone(), 0),
@@ -15680,6 +15995,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let scheduler = FaultScheduler::from_schedule(FaultSchedule {
             profile: FaultProfile::Sched,
@@ -16415,6 +16731,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let config = deterministic_config();
         let schedule = FaultSchedule {
@@ -16826,6 +17143,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let mut server = start_test_server_full(
             harness.store.clone(),
@@ -16932,6 +17250,7 @@ mod outcome_tests {
             num_centroids: 4,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let setup_server = start_test_server_full(
             harness.store.clone(),

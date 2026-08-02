@@ -592,6 +592,11 @@ pub struct QueryDebug {
     pub consistency_effective: ConsistencyLevel,
     /// Stable reason code for underfill, or `None` when `top_k` was filled.
     pub underfill_reason: Option<String>,
+    /// Truth-wave ranged requests planned by late-interaction segment search.
+    ///
+    /// Dense, BM25, and pre-segment late-interaction queries omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truth_planned_requests: Option<usize>,
 }
 
 /// Counts immutable-object cache outcomes scoped to one debug execution.
@@ -1586,6 +1591,7 @@ async fn execute_query_with_manifest_scoped(
                 scanned_fragments,
                 scanned_segments,
             ),
+            truth_planned_requests: None,
         }
     });
 
@@ -2793,6 +2799,7 @@ async fn execute_bm25_query_with_manifest_scoped(
                 scanned_fragments,
                 scanned_segments,
             ),
+            truth_planned_requests: None,
         }
     });
 
@@ -2949,6 +2956,7 @@ async fn execute_filtered_bm25_query_with_manifest(
                 scanned_fragments,
                 scanned_segments,
             ),
+            truth_planned_requests: None,
         }
     });
 
@@ -4438,6 +4446,27 @@ mod tests {
             score,
             attributes: None,
         }
+    }
+
+    /// Locks the legacy wire bytes for a response whose request did not enable debug.
+    #[test]
+    fn query_response_without_debug_preserves_wire_bytes() {
+        let response = QueryResponse {
+            results: Vec::new(),
+            scanned_fragments: 0,
+            scanned_segments: 0,
+            debug: None,
+            next_cursor: None,
+            groups: None,
+            facets: None,
+            explain: None,
+            semantic_coverage: None,
+        };
+
+        assert_eq!(
+            serde_json::to_vec(&response).expect("query response must serialize"),
+            br#"{"results":[],"scanned_fragments":0,"scanned_segments":0}"#
+        );
     }
 
     /// Builds a two-dimensional WAL vector with a clone-detectable payload.

@@ -5,6 +5,7 @@ pub mod branching;
 pub mod chaos;
 pub mod faults;
 pub mod generator;
+pub mod late_support;
 pub mod model;
 pub mod ops;
 pub mod oracle;
@@ -46,7 +47,7 @@ pub fn effective_seed_assignment(
 ) -> SeedAssignment {
     if let Some(profile) = forced_profile {
         return SeedAssignment {
-            mode: if profile == FaultProfile::Branching {
+            mode: if matches!(profile, FaultProfile::Branching | FaultProfile::Late) {
                 RunMode::Deterministic
             } else {
                 RunMode::Chaos

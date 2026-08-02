@@ -1,12 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
+use half::f16;
 use serde::{Deserialize, Serialize};
-use zeppelin::types::{AttributeValue, DistanceMetric};
+use zeppelin::index::filter::evaluate_filter;
+use zeppelin::types::{AttributeValue, DistanceMetric, Filter};
 
 use super::branching::{BranchDeleteBookkeeping, BranchDeleteViolation};
 use super::ops::{
-    AsOfTarget, BranchingOp, GenVector, GeneratedQuery, MaintenanceKind, NamespaceSpec, Op,
+    AsOfTarget, BranchingOp, GenVector, GeneratedQuery, LateGenRecord, MaintenanceKind,
+    NamespaceSpec, Op,
 };
 use super::security_program::SecurityPolicyModel;
 
@@ -93,10 +96,12 @@ pub enum OracleMutation {
     DelegationNarrowingBypass,
     PreservationBypass,
     AuditChainRecordDrop,
+    LateSkewScore,
+    LateHiddenGet,
 }
 
 impl OracleMutation {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 28] = [
         Self::DropDelete,
         Self::SkewScore,
         Self::PhantomId,
@@ -123,6 +128,8 @@ impl OracleMutation {
         Self::DelegationNarrowingBypass,
         Self::PreservationBypass,
         Self::AuditChainRecordDrop,
+        Self::LateSkewScore,
+        Self::LateHiddenGet,
     ];
 
     #[must_use]
@@ -154,6 +161,8 @@ impl OracleMutation {
             "delegation-narrowing-bypass" => Self::DelegationNarrowingBypass,
             "preservation-bypass" => Self::PreservationBypass,
             "audit-chain-record-drop" => Self::AuditChainRecordDrop,
+            "late-skew-score" => Self::LateSkewScore,
+            "late-hidden-get" => Self::LateHiddenGet,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -187,6 +196,8 @@ impl OracleMutation {
             Self::DelegationNarrowingBypass => "delegation-narrowing-bypass",
             Self::PreservationBypass => "preservation-bypass",
             Self::AuditChainRecordDrop => "audit-chain-record-drop",
+            Self::LateSkewScore => "late-skew-score",
+            Self::LateHiddenGet => "late-hidden-get",
         }
     }
 
@@ -221,6 +232,13 @@ pub struct Model {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelRecord {
     pub values: Vec<f32>,
+    pub attributes: Option<HashMap<String, AttributeValue>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LateModelRecord {
+    pub values: Vec<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attributes: Option<HashMap<String, AttributeValue>>,
 }
 
@@ -272,6 +290,8 @@ pub struct NsModel {
     pub spec: NamespaceSpec,
     pub oracle_class: NsOracleClass,
     pub live: BTreeMap<String, ModelRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub late_live: BTreeMap<String, LateModelRecord>,
     pub compacted_live: BTreeMap<String, ModelRecord>,
     pub wal_tombstones: BTreeSet<String>,
     pub checkpoints: BTreeMap<u64, BTreeMap<String, ModelRecord>>,
@@ -485,6 +505,17 @@ impl Model {
                         branch.observe_target_upserts(ids.clone());
                     }
                 }
+            }
+            Op::LateUpsert { ns, records, .. } => {
+                let Some(model) = self.namespaces.get_mut(ns) else {
+                    panic!("late upsert acked for unknown namespace {ns}");
+                };
+                for record in records {
+                    model
+                        .late_live
+                        .insert(record.id.clone(), LateModelRecord::from(record));
+                }
+                model.checkpoint_if_enabled(gen_after, generation_checkpoints);
             }
             Op::DeleteVectors { ns, ids, .. } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
@@ -751,6 +782,7 @@ impl Model {
             Op::GetNamespace { .. }
             | Op::FetchVectors { .. }
             | Op::Query { .. }
+            | Op::LateQuery { .. }
             | Op::BatchQuery { .. }
             | Op::PaginateAll { .. }
             | Op::InvalidProbe { .. }
@@ -1054,8 +1086,10 @@ impl Model {
                 }
             }
             Op::GetNamespace { .. }
+            | Op::LateUpsert { .. }
             | Op::FetchVectors { .. }
             | Op::Query { .. }
+            | Op::LateQuery { .. }
             | Op::BatchQuery { .. }
             | Op::PaginateAll { .. }
             | Op::InvalidProbe { .. }
@@ -1157,6 +1191,7 @@ impl NsModel {
             spec,
             oracle_class,
             live: BTreeMap::new(),
+            late_live: BTreeMap::new(),
             compacted_live: BTreeMap::new(),
             wal_tombstones: BTreeSet::new(),
             checkpoints,
@@ -1209,6 +1244,99 @@ impl NsModel {
             return;
         };
         *first += 10_000.0;
+    }
+}
+
+impl NsModel {
+    /// Exact late-interaction results over the current live record set.
+    ///
+    /// Filtering precedes MaxSim scoring. Document values are already
+    /// canonicalized to persisted f16 precision when the model applies the
+    /// upsert; query values remain at the encoder's f32 precision.
+    #[must_use]
+    pub fn late_expected_results(
+        &self,
+        query: &[Vec<f32>],
+        top_k: usize,
+        filter: Option<&Filter>,
+    ) -> Vec<(String, f32)> {
+        let empty_attributes = HashMap::new();
+        let mut expected = self
+            .late_live
+            .iter()
+            .filter(|(_, record)| {
+                filter.is_none_or(|filter| {
+                    evaluate_filter(
+                        filter,
+                        record.attributes.as_ref().unwrap_or(&empty_attributes),
+                    )
+                })
+            })
+            .map(|(id, record)| {
+                (
+                    id.clone(),
+                    model_late_max_sim(query, record.values.as_slice()),
+                )
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        expected.truncate(top_k);
+        expected
+    }
+}
+
+fn canonicalize_late_matrix(values: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    values
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| f16::from_f32(*value).to_f32())
+                .collect()
+        })
+        .collect()
+}
+
+#[must_use]
+fn model_late_max_sim(query: &[Vec<f32>], document: &[Vec<f32>]) -> f32 {
+    assert!(!query.is_empty(), "late query matrix must not be empty");
+    assert!(
+        !document.is_empty(),
+        "late document matrix must not be empty"
+    );
+    query
+        .iter()
+        .map(|query_row| {
+            document
+                .iter()
+                .map(|document_row| {
+                    assert_eq!(
+                        query_row.len(),
+                        document_row.len(),
+                        "late model matrix dimension mismatch"
+                    );
+                    query_row
+                        .iter()
+                        .zip(document_row)
+                        .map(|(query_value, document_value)| query_value * document_value)
+                        .sum::<f32>()
+                })
+                .max_by(f32::total_cmp)
+                .expect("late document matrix must have a row")
+        })
+        .sum()
+}
+
+impl From<&LateGenRecord> for LateModelRecord {
+    fn from(record: &LateGenRecord) -> Self {
+        Self {
+            values: canonicalize_late_matrix(&record.values),
+            attributes: record.attributes.clone(),
+        }
     }
 }
 
@@ -1277,6 +1405,8 @@ pub fn model_distance(metric: DistanceMetric, query: &[f32], values: &[f32]) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use serde_json::json;
     use zeppelin::index::quantization::QuantizationType;
     use zeppelin::types::{AttributeValue, DistanceMetric};
@@ -1284,10 +1414,13 @@ mod tests {
     use crate::adversarial::oracle::{score_close, SCORE_ABS_EPS, SCORE_REL_EPS};
     use crate::common::server::{cleanup_ns, start_test_server_with_compactor};
 
-    use crate::adversarial::ops::{ActorSel, AsOfTarget, GenVector, NamespaceSpec, Op};
+    use crate::adversarial::ops::{
+        ActorSel, AsOfTarget, GenVector, LateGenRecord, NamespaceSpec, Op,
+    };
 
     use super::{
-        model_distance, AmbiguityReason, Model, ModelRecord, NsModel, OpOutcome, OracleMutation,
+        model_distance, AmbiguityReason, LateModelRecord, Model, ModelRecord, NsModel, OpOutcome,
+        OracleMutation,
     };
 
     #[test]
@@ -1323,6 +1456,86 @@ mod tests {
         for mutation in OracleMutation::ALL {
             assert_eq!(OracleMutation::from_key(mutation.key()), mutation);
         }
+    }
+
+    #[test]
+    fn late_model_record_canonicalizes_every_value_through_f16() {
+        let generated = LateGenRecord {
+            id: "late-row".to_string(),
+            values: vec![vec![0.333_3, -0.777_7], vec![0.125_1, 0.875_1]],
+            attributes: None,
+        };
+
+        let modeled = LateModelRecord::from(&generated);
+
+        let expected = generated
+            .values
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| half::f16::from_f32(*value).to_f32())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(modeled.values, expected);
+        assert_ne!(modeled.values, generated.values);
+    }
+
+    #[test]
+    fn late_expected_results_filter_before_maxsim_and_sort_deterministically() {
+        let mut model = NsModel::new(
+            NamespaceSpec {
+                dims: 2,
+                metric: DistanceMetric::DotProduct,
+                quantization: QuantizationType::None,
+                num_centroids: 1,
+                fts_fields: Vec::new(),
+                bitmap: false,
+                late_interaction: None,
+            },
+            1,
+        );
+        let attributes = |group: &str| {
+            Some(HashMap::from([(
+                "group".to_string(),
+                AttributeValue::String(group.to_string()),
+            )]))
+        };
+        for id in ["b", "a"] {
+            model.late_live.insert(
+                id.to_string(),
+                LateModelRecord {
+                    values: vec![vec![1.0, 0.0]],
+                    attributes: attributes("keep"),
+                },
+            );
+        }
+        model.late_live.insert(
+            "z".to_string(),
+            LateModelRecord {
+                values: vec![vec![2.0, 0.0]],
+                attributes: attributes("drop"),
+            },
+        );
+        let keep = zeppelin::types::Filter::Eq {
+            field: "group".to_string(),
+            value: AttributeValue::String("keep".to_string()),
+        };
+
+        let all = model.late_expected_results(&[vec![1.0, 0.0]], 3, None);
+        let filtered = model.late_expected_results(&[vec![1.0, 0.0]], 3, Some(&keep));
+
+        assert_eq!(
+            all.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["z", "a", "b"]
+        );
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
     }
 
     #[test]
@@ -1393,6 +1606,7 @@ mod tests {
                 num_centroids: 1,
                 fts_fields: Vec::new(),
                 bitmap: false,
+                late_interaction: None,
             },
             1,
         );
@@ -1754,6 +1968,7 @@ mod tests {
                 num_centroids: 1,
                 fts_fields: Vec::new(),
                 bitmap: false,
+                late_interaction: None,
             },
             1,
         );

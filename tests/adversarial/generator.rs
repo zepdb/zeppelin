@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter};
+use zeppelin::wal::LateCandidateKind;
 
 use super::model::Model;
 use super::ops::{
-    ActorSel, AsOfTarget, BranchingOp, GenVector, GeneratedQuery, InvalidProbe, MaintenanceKind,
-    NamespaceSpec, Op, QueryOracleClass,
+    ActorSel, AsOfTarget, BranchingOp, GenVector, GeneratedQuery, InvalidProbe, LateGenRecord,
+    LateInteractionSpec, MaintenanceKind, NamespaceSpec, Op, QueryOracleClass,
 };
 use super::security_program::{SecurityProgramConfig, SECURITY_PROGRAM_START_OP};
 use super::vocab;
@@ -24,6 +25,8 @@ const PAGINATION_TAG: &str = "pagination";
 const BATCH_TAG: &str = "batch";
 const SKETCH_ADC_TAG: &str = "sketch-adc-v4";
 pub const BRANCHING_PROFILE_TAG: &str = "branching";
+pub const LATE_INTERACTION_TAG: &str = "late-interaction";
+const MAX_LATE_ROWS: usize = 2_000;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Coverage {
@@ -143,6 +146,8 @@ pub struct AdversarialGenerator {
     scenario: ScenarioState,
     phase3_started: bool,
     security_program: Option<SecurityProgramConfig>,
+    late_weighting: bool,
+    late_rows_generated: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +155,12 @@ struct GenNamespace {
     name: String,
     spec: NamespaceSpec,
     next_id: u64,
+}
+
+impl GenNamespace {
+    fn is_late(&self) -> bool {
+        self.spec.late_interaction.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -170,6 +181,14 @@ impl AdversarialGenerator {
     #[must_use]
     pub fn new(seed: u64, namespace_prefix: &str) -> Self {
         Self::new_with_security(seed, namespace_prefix, false, false)
+    }
+
+    /// Construct the explicit deterministic MMLI-heavy workload profile.
+    #[must_use]
+    pub fn new_late(seed: u64, namespace_prefix: &str) -> Self {
+        let mut generator = Self::new(seed, namespace_prefix);
+        generator.late_weighting = true;
+        generator
     }
 
     /// Construct the stable Phase 10 branching workload profile.
@@ -233,6 +252,7 @@ impl AdversarialGenerator {
                     Vec::new()
                 },
                 bitmap: rng.gen_bool(0.5),
+                late_interaction: None,
             };
             let name = format!("{namespace_prefix}-adv-{seed}-{index}");
             pending.push_back(Op::CreateNamespace {
@@ -258,6 +278,7 @@ impl AdversarialGenerator {
             num_centroids: 16,
             fts_fields: Vec::new(),
             bitmap: false,
+            late_interaction: None,
         };
         let sketch_name = format!("{namespace_prefix}-adv-{seed}-sketch");
         pending.push_back(Op::CreateNamespace {
@@ -275,6 +296,34 @@ impl AdversarialGenerator {
             next_id: 0,
         });
 
+        let late_spec = NamespaceSpec {
+            dims: 16,
+            metric: DistanceMetric::DotProduct,
+            quantization: QuantizationType::None,
+            num_centroids: 2,
+            fts_fields: Vec::new(),
+            bitmap: false,
+            late_interaction: Some(LateInteractionSpec {
+                candidate_kind: LateCandidateKind::FlatSq8,
+                nlist: 2,
+                probe_budget: 2,
+                candidate_k: 64,
+                kmeans_max_iterations: 10,
+                max_matrix_object_bytes: 1024 * 1024,
+                max_cluster_object_bytes: 1024 * 1024,
+                max_resident_bootstrap_bytes: 1024 * 1024,
+                read_gap_budget_bytes: 16 * 1024,
+                read_max_request_bytes: 1024 * 1024,
+                read_max_concurrency: 2,
+            }),
+        };
+        let late_name = format!("{namespace_prefix}-adv-{seed}-late");
+        namespaces.push(GenNamespace {
+            name: late_name,
+            spec: late_spec,
+            next_id: 0,
+        });
+
         let mut generator = Self {
             rng,
             namespaces,
@@ -282,7 +331,17 @@ impl AdversarialGenerator {
             scenario: ScenarioState::Waiting,
             phase3_started: false,
             security_program: None,
+            late_weighting: false,
+            late_rows_generated: 0,
         };
+        let late_index = generator
+            .namespaces
+            .iter()
+            .position(GenNamespace::is_late)
+            .expect("generator must contain one late namespace");
+        if !security_enabled {
+            generator.enqueue_late_namespace(late_index);
+        }
         let exact_ns = generator
             .namespaces
             .iter()
@@ -339,10 +398,60 @@ impl AdversarialGenerator {
             generator.pending.push_back(Op::AuditChainCheck {
                 actor: ActorSel::ADMIN,
             });
+            generator.enqueue_late_namespace(late_index);
         }
+        generator.enqueue_late_workload(late_index);
         generator.enqueue_phase2_script(exact_ns, &exact_vectors);
         generator.enqueue_sketch_adc_script(namespace_count);
         generator
+    }
+
+    fn enqueue_late_namespace(&mut self, late_index: usize) {
+        let late = self.namespaces[late_index].clone();
+        self.pending.extend([
+            Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
+                ns: late.name.clone(),
+                spec: late.spec,
+            },
+            Op::GetNamespace {
+                actor: ActorSel::ADMIN,
+                ns: late.name,
+            },
+        ]);
+    }
+
+    fn enqueue_late_workload(&mut self, late_index: usize) {
+        let late = self.namespaces[late_index].clone();
+        let records = self.make_late_records(late_index, 8, 8);
+        let initial_query = self.random_late_matrix(late.spec.dims, 8);
+        let filtered_query = self.random_late_matrix(late.spec.dims, 6);
+        self.pending.extend([
+            Op::LateUpsert {
+                actor: ActorSel::ADMIN,
+                ns: late.name.clone(),
+                records,
+            },
+            Op::LateQuery {
+                actor: ActorSel::ADMIN,
+                ns: late.name.clone(),
+                query: initial_query,
+                top_k: 8,
+                filter: None,
+                consistency: ConsistencyLevel::Strong,
+            },
+            Op::LateQuery {
+                actor: ActorSel::ADMIN,
+                ns: late.name,
+                query: filtered_query,
+                top_k: 5,
+                filter: Some(Filter::Eq {
+                    field: "group".to_string(),
+                    value: AttributeValue::String("g0".to_string()),
+                }),
+                consistency: ConsistencyLevel::Strong,
+            },
+        ]);
     }
 
     fn enqueue_branching_profile(&mut self, seed: u64) {
@@ -1005,14 +1114,43 @@ impl AdversarialGenerator {
 
     fn weighted_op(&mut self, model: &Model) -> Op {
         let roll = self.rng.gen_range(0..100);
+        if self.late_weighting {
+            return if roll < 25 {
+                self.random_late_upsert(model)
+            } else if roll < 50 {
+                self.random_late_query()
+            } else if roll < 63 {
+                self.random_upsert(model)
+            } else if roll < 70 {
+                self.random_delete(model)
+            } else if roll < 78 {
+                self.random_fetch(model)
+            } else if roll < 86 {
+                self.random_query(model)
+            } else if roll < 90 {
+                self.random_batch_query(model)
+            } else if roll < 94 {
+                self.random_paginate(model)
+            } else if roll < 98 {
+                self.random_compact(model)
+            } else if roll < 99 {
+                self.random_invalid_probe()
+            } else {
+                self.random_get_namespace()
+            };
+        }
         if roll < 25 {
             self.random_upsert(model)
         } else if roll < 35 {
             self.random_delete(model)
         } else if roll < 50 {
             self.random_fetch(model)
-        } else if roll < 74 {
+        } else if roll < 66 {
             self.random_query(model)
+        } else if roll < 70 {
+            self.random_late_upsert(model)
+        } else if roll < 74 {
+            self.random_late_query()
         } else if roll < 82 {
             self.random_batch_query(model)
         } else if roll < 89 {
@@ -1027,7 +1165,7 @@ impl AdversarialGenerator {
     }
 
     fn random_upsert(&mut self, model: &Model) -> Op {
-        let index = self.random_namespace_index();
+        let index = self.random_dense_namespace_index();
         let ns = self.namespaces[index].name.clone();
         let live = model
             .namespaces
@@ -1041,6 +1179,84 @@ impl AdversarialGenerator {
             actor: ActorSel::ADMIN,
             ns,
             vectors,
+        }
+    }
+
+    fn random_late_upsert(&mut self, model: &Model) -> Op {
+        let index = self.late_namespace_index();
+        let ns = self.namespaces[index].name.clone();
+        let late_config = self.namespaces[index]
+            .spec
+            .late_interaction
+            .as_ref()
+            .expect("late namespace must retain its candidate bound");
+        let model_records = model
+            .namespaces
+            .get(&ns)
+            .map(|ns_model| ns_model.late_live.len())
+            .unwrap_or(0);
+        let generated_records = usize::try_from(self.namespaces[index].next_id)
+            .expect("generated late record count must fit usize");
+        let remaining_records = late_config
+            .candidate_k
+            .saturating_sub(generated_records.max(model_records));
+        if remaining_records == 0 {
+            return self.random_late_query();
+        }
+
+        let model_rows = model
+            .namespaces
+            .get(&ns)
+            .map(|ns_model| {
+                ns_model
+                    .late_live
+                    .values()
+                    .map(|record| record.values.len())
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        let current_rows = self.late_rows_generated.max(model_rows);
+        let mut remaining_rows = MAX_LATE_ROWS.saturating_sub(current_rows);
+        if remaining_rows == 0 {
+            return self.random_late_query();
+        }
+
+        let desired_records = self
+            .rng
+            .gen_range(1..=4)
+            .min(remaining_rows)
+            .min(remaining_records);
+        let mut records = Vec::with_capacity(desired_records);
+        for _ in 0..desired_records {
+            let max_tokens = remaining_rows.min(32);
+            let mut generated = self.make_late_records(index, 1, max_tokens);
+            let record = generated.pop().expect("one late record must be generated");
+            remaining_rows -= record.values.len();
+            records.push(record);
+            if remaining_rows == 0 {
+                break;
+            }
+        }
+        Op::LateUpsert {
+            actor: ActorSel::ADMIN,
+            ns,
+            records,
+        }
+    }
+
+    fn random_late_query(&mut self) -> Op {
+        let index = self.late_namespace_index();
+        let ns = self.namespaces[index].name.clone();
+        let dims = self.namespaces[index].spec.dims;
+        let vector_count = self.rng.gen_range(1..=16);
+        let filter = self.rng.gen_bool(0.35).then(|| self.random_filter(0));
+        Op::LateQuery {
+            actor: ActorSel::ADMIN,
+            ns,
+            query: self.random_late_matrix(dims, vector_count),
+            top_k: self.rng.gen_range(1..=20),
+            filter,
+            consistency: ConsistencyLevel::Strong,
         }
     }
 
@@ -1081,7 +1297,7 @@ impl AdversarialGenerator {
     }
 
     fn random_fetch(&mut self, model: &Model) -> Op {
-        let ns = self.random_namespace_name();
+        let ns = self.random_dense_namespace_name();
         let mut ids = Vec::new();
         if let Some(ns_model) = model.namespaces.get(&ns) {
             ids.extend(
@@ -1114,7 +1330,7 @@ impl AdversarialGenerator {
     }
 
     fn random_query(&mut self, model: &Model) -> Op {
-        let ns = self.random_namespace_name();
+        let ns = self.random_dense_namespace_name();
         let namespace = self.namespace(&ns).clone();
         if !namespace.spec.fts_fields.is_empty() && self.rng.gen_bool(0.35) {
             let top_k = self.rng.gen_range(1..=20);
@@ -1165,7 +1381,7 @@ impl AdversarialGenerator {
     }
 
     fn random_batch_query(&mut self, model: &Model) -> Op {
-        let ns = self.random_namespace_name();
+        let ns = self.random_dense_namespace_name();
         let namespace = self.namespace(&ns).clone();
         let candidate_count = model
             .namespaces
@@ -1205,7 +1421,7 @@ impl AdversarialGenerator {
     }
 
     fn random_paginate(&mut self, model: &Model) -> Op {
-        let ns = self.random_namespace_name();
+        let ns = self.random_dense_namespace_name();
         let namespace = self.namespace(&ns).clone();
         let candidate_count = model
             .namespaces
@@ -1232,7 +1448,7 @@ impl AdversarialGenerator {
     }
 
     fn random_invalid_probe(&mut self) -> Op {
-        let ns = self.random_namespace_name();
+        let ns = self.random_dense_namespace_name();
         let probe = *[
             InvalidProbe::NanVector,
             InvalidProbe::WrongDims,
@@ -1257,6 +1473,7 @@ impl AdversarialGenerator {
         let candidates: Vec<String> = self
             .namespaces
             .iter()
+            .filter(|namespace| !namespace.is_late())
             .filter(|namespace| {
                 let Some(ns_model) = model.namespaces.get(&namespace.name) else {
                     return true;
@@ -1272,14 +1489,14 @@ impl AdversarialGenerator {
             ns: candidates
                 .choose(&mut self.rng)
                 .cloned()
-                .unwrap_or_else(|| self.random_namespace_name()),
+                .unwrap_or_else(|| self.random_dense_namespace_name()),
         }
     }
 
     fn random_get_namespace(&mut self) -> Op {
         Op::GetNamespace {
             actor: ActorSel::ADMIN,
-            ns: self.random_namespace_name(),
+            ns: self.random_dense_namespace_name(),
         }
     }
 
@@ -1538,6 +1755,62 @@ impl AdversarialGenerator {
             .collect()
     }
 
+    fn make_late_records(
+        &mut self,
+        namespace_index: usize,
+        count: usize,
+        max_tokens: usize,
+    ) -> Vec<LateGenRecord> {
+        assert!(max_tokens > 0 && max_tokens <= 32);
+        let dims = self.namespaces[namespace_index].spec.dims;
+        let ns_name = self.namespaces[namespace_index].name.clone();
+        (0..count)
+            .map(|_| {
+                let ordinal = self.namespaces[namespace_index].next_id;
+                self.namespaces[namespace_index].next_id += 1;
+                let mut attributes = self.random_attributes(false);
+                attributes.insert(
+                    "group".to_string(),
+                    AttributeValue::String(format!("g{}", ordinal % 4)),
+                );
+                let vector_count = self.rng.gen_range(1..=max_tokens);
+                self.late_rows_generated = self
+                    .late_rows_generated
+                    .checked_add(vector_count)
+                    .expect("generated late row count must not overflow");
+                assert!(self.late_rows_generated <= MAX_LATE_ROWS);
+                LateGenRecord {
+                    id: format!("{ns_name}-r{ordinal}"),
+                    values: self.random_late_matrix(dims, vector_count),
+                    attributes: Some(attributes),
+                }
+            })
+            .collect()
+    }
+
+    fn random_late_matrix(&mut self, dims: usize, vector_count: usize) -> Vec<Vec<f32>> {
+        assert!(dims > 0 && dims <= 32);
+        assert!(vector_count > 0 && vector_count <= 32);
+        (0..vector_count)
+            .map(|_| {
+                let mut row = self.random_values(dims);
+                let squared_norm = row
+                    .iter()
+                    .map(|value| f64::from(*value) * f64::from(*value))
+                    .sum::<f64>();
+                if squared_norm == 0.0 {
+                    row[0] = 1.0;
+                } else {
+                    let reciprocal = squared_norm.sqrt().recip() as f32;
+                    for value in &mut row {
+                        *value *= reciprocal;
+                    }
+                }
+                row
+            })
+            .collect()
+    }
+
     fn random_values(&mut self, dims: usize) -> Vec<f32> {
         (0..dims)
             .map(|_| self.rng.gen_range(-10.0f32..10.0f32))
@@ -1695,13 +1968,28 @@ impl AdversarialGenerator {
         vocab::words().choose(&mut self.rng).copied().unwrap()
     }
 
-    fn random_namespace_index(&mut self) -> usize {
-        self.rng.gen_range(0..self.namespaces.len())
+    fn random_dense_namespace_index(&mut self) -> usize {
+        let candidates = self
+            .namespaces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, namespace)| (!namespace.is_late()).then_some(index))
+            .collect::<Vec<_>>();
+        *candidates
+            .choose(&mut self.rng)
+            .expect("generator must contain a dense namespace")
     }
 
-    fn random_namespace_name(&mut self) -> String {
-        let index = self.random_namespace_index();
+    fn random_dense_namespace_name(&mut self) -> String {
+        let index = self.random_dense_namespace_index();
         self.namespaces[index].name.clone()
+    }
+
+    fn late_namespace_index(&self) -> usize {
+        self.namespaces
+            .iter()
+            .position(GenNamespace::is_late)
+            .expect("generator must contain one late namespace")
     }
 
     fn namespace(&self, ns: &str) -> &GenNamespace {
@@ -1714,6 +2002,7 @@ impl AdversarialGenerator {
     fn namespaces_with_live(&self, model: &Model) -> Vec<String> {
         self.namespaces
             .iter()
+            .filter(|namespace| !namespace.is_late())
             .filter(|namespace| {
                 model
                     .namespaces
@@ -1760,6 +2049,101 @@ fn branching_exact_query(spec: &NamespaceSpec) -> GeneratedQuery {
 mod tests {
     use super::*;
     use crate::adversarial::branching::BranchDeleteBookkeeping;
+
+    #[test]
+    fn every_seed_has_one_small_dedicated_late_namespace() {
+        let generator = AdversarialGenerator::new(23, "test");
+        let late = generator
+            .namespaces
+            .iter()
+            .filter(|namespace| namespace.is_late())
+            .collect::<Vec<_>>();
+        assert_eq!(late.len(), 1);
+        let late = late[0];
+        assert!(late.name.ends_with("-late"));
+        assert!(late.spec.dims <= 32);
+        let config = late
+            .spec
+            .late_interaction
+            .as_ref()
+            .expect("late config must exist");
+        assert_eq!(config.candidate_kind, LateCandidateKind::FlatSq8);
+        assert_eq!(config.candidate_k, 64);
+
+        let mut saw_filtered_query = false;
+        let mut generated_rows = 0;
+        for op in &generator.pending {
+            match op {
+                Op::LateUpsert { ns, records, .. } => {
+                    assert_eq!(ns, &late.name);
+                    generated_rows += records
+                        .iter()
+                        .map(|record| {
+                            assert!((1..=32).contains(&record.values.len()));
+                            assert!(record.values.iter().all(|row| row.len() == late.spec.dims));
+                            record.values.len()
+                        })
+                        .sum::<usize>();
+                }
+                Op::LateQuery {
+                    ns, query, filter, ..
+                } => {
+                    assert_eq!(ns, &late.name);
+                    assert!((1..=32).contains(&query.len()));
+                    assert!(query.iter().all(|row| row.len() == late.spec.dims));
+                    saw_filtered_query |= filter.is_some();
+                }
+                Op::Upsert { ns, .. }
+                | Op::DeleteVectors { ns, .. }
+                | Op::FetchVectors { ns, .. }
+                | Op::Query { ns, .. }
+                | Op::BatchQuery { ns, .. }
+                | Op::PaginateAll { ns, .. }
+                | Op::InvalidProbe { ns, .. } => assert_ne!(ns, &late.name),
+                _ => {}
+            }
+        }
+        assert!(generated_rows < MAX_LATE_ROWS);
+        assert!(saw_filtered_query);
+    }
+
+    #[test]
+    fn late_profile_is_seeded_and_weights_late_ops_up() {
+        let first = AdversarialGenerator::new_late(41, "stable");
+        let second = AdversarialGenerator::new_late(41, "stable");
+        assert_eq!(
+            serde_json::to_value(&first.pending).unwrap(),
+            serde_json::to_value(&second.pending).unwrap()
+        );
+
+        let model = Model::default();
+        let mut baseline = AdversarialGenerator::new(41, "stable");
+        let mut weighted = AdversarialGenerator::new_late(41, "stable");
+        baseline.pending.clear();
+        weighted.pending.clear();
+        let baseline_late = (0..400)
+            .filter(|_| {
+                matches!(
+                    baseline.weighted_op(&model),
+                    Op::LateUpsert { .. } | Op::LateQuery { .. }
+                )
+            })
+            .count();
+        let weighted_late = (0..400)
+            .filter(|_| {
+                matches!(
+                    weighted.weighted_op(&model),
+                    Op::LateUpsert { .. } | Op::LateQuery { .. }
+                )
+            })
+            .count();
+        assert!(
+            weighted_late > baseline_late * 3,
+            "baseline={baseline_late} weighted={weighted_late}"
+        );
+        assert!(baseline.late_rows_generated <= MAX_LATE_ROWS);
+        assert!(weighted.late_rows_generated <= MAX_LATE_ROWS);
+    }
 
     #[test]
     fn branching_delete_schedule_is_seeded_and_uses_runner_ops() {

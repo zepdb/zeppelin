@@ -2618,6 +2618,7 @@ fn profile_contracts(profile: Option<FaultProfile>) -> Vec<FaultContract> {
             | FaultProfile::SupportedFull
             | FaultProfile::Security
             | FaultProfile::Branching
+            | FaultProfile::Late
             | FaultProfile::Sched,
         )
         | None => &[ContractClass::SupportedV1],
@@ -2725,9 +2726,11 @@ const REQUIRED_OP_KINDS: &[&str] = &[
     "create_namespace",
     "get_namespace",
     "upsert",
+    "late_upsert",
     "delete_vectors",
     "fetch_vectors",
     "query",
+    "late_query",
     "batch_query",
     "paginate_all",
     "invalid_probe",
@@ -2783,6 +2786,7 @@ const REQUIRED_TAGS: &[&str] = &[
     "sandwich",
     "delete-recreate",
     "sketch-adc-v4",
+    "late-interaction",
 ];
 
 fn object_store_totals<'a>(

@@ -5,6 +5,7 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter};
+use zeppelin::wal::LateCandidateKind;
 
 use super::oracle::ViolationId;
 
@@ -343,6 +344,12 @@ pub enum Op {
         ns: String,
         vectors: Vec<GenVector>,
     },
+    LateUpsert {
+        #[serde(default)]
+        actor: ActorSel,
+        ns: String,
+        records: Vec<LateGenRecord>,
+    },
     DeleteVectors {
         #[serde(default)]
         actor: ActorSel,
@@ -362,6 +369,16 @@ pub enum Op {
         ns: String,
         q: GeneratedQuery,
         as_of: Option<AsOfTarget>,
+    },
+    LateQuery {
+        #[serde(default)]
+        actor: ActorSel,
+        ns: String,
+        query: Vec<Vec<f32>>,
+        top_k: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<Filter>,
+        consistency: Consistency,
     },
     BatchQuery {
         #[serde(default)]
@@ -552,12 +569,44 @@ pub struct NamespaceSpec {
     pub num_centroids: usize,
     pub fts_fields: Vec<String>,
     pub bitmap: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_interaction: Option<LateInteractionSpec>,
+}
+
+/// Per-seed late-interaction settings consumed by the adversarial test server.
+///
+/// Only the immutable admission fields are emitted by [`NamespaceSpec::create_body`].
+/// The remaining values configure the seed's server and keep the exact small-corpus
+/// operating point in replay artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LateInteractionSpec {
+    pub candidate_kind: LateCandidateKind,
+    pub nlist: usize,
+    pub probe_budget: usize,
+    pub candidate_k: usize,
+    pub kmeans_max_iterations: usize,
+    pub max_matrix_object_bytes: usize,
+    pub max_cluster_object_bytes: usize,
+    pub max_resident_bootstrap_bytes: usize,
+    pub read_gap_budget_bytes: usize,
+    pub read_max_request_bytes: usize,
+    pub read_max_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenVector {
     pub id: String,
     pub values: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<HashMap<String, AttributeValue>>,
+}
+
+/// One replayable multi-vector retrieval unit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LateGenRecord {
+    pub id: String,
+    /// Token-major matrix: one inner vector per document token.
+    pub values: Vec<Vec<f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attributes: Option<HashMap<String, AttributeValue>>,
 }
@@ -711,9 +760,11 @@ impl Op {
             Self::CreateNamespace { actor, .. }
             | Self::GetNamespace { actor, .. }
             | Self::Upsert { actor, .. }
+            | Self::LateUpsert { actor, .. }
             | Self::DeleteVectors { actor, .. }
             | Self::FetchVectors { actor, .. }
             | Self::Query { actor, .. }
+            | Self::LateQuery { actor, .. }
             | Self::BatchQuery { actor, .. }
             | Self::PaginateAll { actor, .. }
             | Self::InvalidProbe { actor, .. }
@@ -762,6 +813,7 @@ impl Op {
             Op::GetNamespace { .. }
                 | Op::FetchVectors { .. }
                 | Op::Query { .. }
+                | Op::LateQuery { .. }
                 | Op::BatchQuery { .. }
                 | Op::PaginateAll { .. }
                 | Op::GetSnapshot { .. }
@@ -790,9 +842,11 @@ impl Op {
             Op::CreateNamespace { .. } => "create_namespace",
             Op::GetNamespace { .. } => "get_namespace",
             Op::Upsert { .. } => "upsert",
+            Op::LateUpsert { .. } => "late_upsert",
             Op::DeleteVectors { .. } => "delete_vectors",
             Op::FetchVectors { .. } => "fetch_vectors",
             Op::Query { .. } => "query",
+            Op::LateQuery { .. } => "late_query",
             Op::BatchQuery { .. } => "batch_query",
             Op::PaginateAll { .. } => "paginate_all",
             Op::InvalidProbe { .. } => "invalid_probe",
@@ -865,9 +919,11 @@ impl Op {
             Op::CreateNamespace { ns, .. }
             | Op::GetNamespace { ns, .. }
             | Op::Upsert { ns, .. }
+            | Op::LateUpsert { ns, .. }
             | Op::DeleteVectors { ns, .. }
             | Op::FetchVectors { ns, .. }
             | Op::Query { ns, .. }
+            | Op::LateQuery { ns, .. }
             | Op::BatchQuery { ns, .. }
             | Op::PaginateAll { ns, .. }
             | Op::InvalidProbe { ns, .. }
@@ -912,6 +968,7 @@ impl Op {
             self,
             Op::CreateNamespace { .. }
                 | Op::Upsert { .. }
+                | Op::LateUpsert { .. }
                 | Op::DeleteVectors { .. }
                 | Op::CompactEndpoint { .. }
                 | Op::CreateSnapshot { .. }
@@ -943,6 +1000,7 @@ impl Op {
     #[must_use]
     pub fn tags(&self) -> Vec<&str> {
         match self {
+            Op::LateUpsert { .. } | Op::LateQuery { .. } => vec!["late-interaction"],
             Op::Query { q, .. } => q.pattern_tags.iter().map(String::as_str).collect(),
             Op::BatchQuery { qs, .. } => qs
                 .iter()
@@ -1012,6 +1070,11 @@ impl Op {
                 ns: rewrite(ns),
                 vectors: vectors.clone(),
             },
+            Op::LateUpsert { actor, ns, records } => Op::LateUpsert {
+                actor: *actor,
+                ns: rewrite(ns),
+                records: records.clone(),
+            },
             Op::DeleteVectors { actor, ns, ids } => Op::DeleteVectors {
                 actor: *actor,
                 ns: rewrite(ns),
@@ -1038,6 +1101,21 @@ impl Op {
                 ns: rewrite(ns),
                 q: q.clone(),
                 as_of: as_of.clone(),
+            },
+            Op::LateQuery {
+                actor,
+                ns,
+                query,
+                top_k,
+                filter,
+                consistency,
+            } => Op::LateQuery {
+                actor: *actor,
+                ns: rewrite(ns),
+                query: query.clone(),
+                top_k: *top_k,
+                filter: filter.clone(),
+                consistency: *consistency,
             },
             Op::BatchQuery { actor, ns, qs } => Op::BatchQuery {
                 actor: *actor,
@@ -1290,6 +1368,18 @@ fn rewrite_security_grants(
 impl NamespaceSpec {
     #[must_use]
     pub fn create_body(&self, ns: &str) -> serde_json::Value {
+        if self.late_interaction.is_some() {
+            return json!({
+                "name": ns,
+                "dimensions": 0,
+                "index_type": "late_interaction_fde",
+                "late_interaction": {
+                    "accepted_modalities": ["text"]
+                },
+                "distance_metric": DistanceMetric::DotProduct,
+                "full_text_search": {}
+            });
+        }
         let full_text_search = self
             .fts_fields
             .iter()
@@ -1313,7 +1403,7 @@ impl NamespaceSpec {
 
     #[must_use]
     pub fn is_exact(&self) -> bool {
-        self.quantization == QuantizationType::None
+        self.late_interaction.is_none() && self.quantization == QuantizationType::None
     }
 }
 
@@ -1415,6 +1505,98 @@ impl fmt::Display for AsOfTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn late_spec() -> NamespaceSpec {
+        NamespaceSpec {
+            dims: 16,
+            metric: DistanceMetric::DotProduct,
+            quantization: QuantizationType::None,
+            num_centroids: 2,
+            fts_fields: Vec::new(),
+            bitmap: false,
+            late_interaction: Some(LateInteractionSpec {
+                candidate_kind: LateCandidateKind::FlatSq8,
+                nlist: 2,
+                probe_budget: 2,
+                candidate_k: 64,
+                kmeans_max_iterations: 10,
+                max_matrix_object_bytes: 1024 * 1024,
+                max_cluster_object_bytes: 1024 * 1024,
+                max_resident_bootstrap_bytes: 1024 * 1024,
+                read_gap_budget_bytes: 16 * 1024,
+                read_max_request_bytes: 1024 * 1024,
+                read_max_concurrency: 2,
+            }),
+        }
+    }
+
+    #[test]
+    fn late_namespace_body_is_additive_and_legacy_specs_default_dense() {
+        let spec = late_spec();
+        let body = spec.create_body("seed-late");
+        assert_eq!(body["dimensions"], 0);
+        assert_eq!(body["index_type"], "late_interaction_fde");
+        assert_eq!(body["late_interaction"]["accepted_modalities"][0], "text");
+        assert!(body.get("index_config").is_none());
+        assert!(!spec.is_exact());
+
+        let legacy: NamespaceSpec = serde_json::from_value(json!({
+            "dims": 8,
+            "metric": "cosine",
+            "quantization": "none",
+            "num_centroids": 4,
+            "fts_fields": [],
+            "bitmap": false
+        }))
+        .unwrap();
+        assert!(legacy.late_interaction.is_none());
+        assert!(legacy.is_exact());
+        assert!(legacy.create_body("legacy").get("index_config").is_some());
+    }
+
+    #[test]
+    fn late_operations_wire_replay_metadata() {
+        let upsert = Op::LateUpsert {
+            actor: ActorSel(3),
+            ns: "old-late".to_string(),
+            records: vec![LateGenRecord {
+                id: "row-1".to_string(),
+                values: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+                attributes: None,
+            }],
+        };
+        assert_eq!(upsert.actor(), ActorSel(3));
+        assert!(!upsert.is_read_only_request());
+        assert_eq!(upsert.kind(), "late_upsert");
+        assert!(!upsert.is_security_op());
+        assert_eq!(upsert.namespace(), "old-late");
+        assert!(upsert.is_mutating());
+        assert_eq!(upsert.tags(), vec!["late-interaction"]);
+        assert_eq!(
+            upsert.rewrite_namespace_prefix("old-", "new-").namespace(),
+            "new-late"
+        );
+
+        let query = Op::LateQuery {
+            actor: ActorSel(4),
+            ns: "old-late".to_string(),
+            query: vec![vec![1.0, 0.0]],
+            top_k: 3,
+            filter: None,
+            consistency: ConsistencyLevel::Strong,
+        };
+        assert_eq!(query.actor(), ActorSel(4));
+        assert!(query.is_read_only_request());
+        assert_eq!(query.kind(), "late_query");
+        assert!(!query.is_security_op());
+        assert_eq!(query.namespace(), "old-late");
+        assert!(!query.is_mutating());
+        assert_eq!(query.tags(), vec!["late-interaction"]);
+        assert_eq!(
+            query.rewrite_namespace_prefix("old-", "new-").namespace(),
+            "new-late"
+        );
+    }
 
     #[test]
     fn op_record_serializes_execution_and_defaults_legacy_metadata() {

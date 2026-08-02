@@ -4757,6 +4757,7 @@ async fn execute_query_source_with_manifest(
                 effective_filter,
                 manifest,
                 manifest_refresh,
+                emit_debug,
             )
             .await
         }
@@ -4780,6 +4781,7 @@ async fn execute_late_interaction_source_with_manifest(
     filter: Option<&Filter>,
     manifest: Manifest,
     manifest_refresh: ManifestRefresh,
+    emit_debug: bool,
 ) -> Result<SourceQueryResponse, ZeppelinError> {
     let accepted_modalities = &meta
         .late_interaction
@@ -4813,6 +4815,20 @@ async fn execute_late_interaction_source_with_manifest(
         LateInteractionCoverage::Complete => query::SemanticCoverage::Complete,
         LateInteractionCoverage::Partial => query::SemanticCoverage::Partial,
     };
+    let debug = emit_debug.then(|| QueryDebug {
+        wal_ms: 0,
+        segment_ms: 0,
+        merge_ms: 0,
+        fragments_scanned: 0,
+        segments_scanned: 0,
+        clusters_probed: 0,
+        cache: QueryDebugCache { hits: 0, misses: 0 },
+        consistency_effective: req.consistency,
+        underfill_reason: (output.results.len() < top_k).then(|| "not_enough_matches".to_string()),
+        truth_planned_requests: output
+            .read_trace
+            .map(|trace| trace.truth_wave.planned_requests),
+    });
     let response = QueryResponse {
         results: output
             .results
@@ -4825,7 +4841,7 @@ async fn execute_late_interaction_source_with_manifest(
             .collect(),
         scanned_fragments: 0,
         scanned_segments: 0,
-        debug: None,
+        debug,
         next_cursor: None,
         groups: None,
         facets: None,
@@ -5030,6 +5046,10 @@ fn aggregate_source_debug(
             .map(str::to_string)
             .or_else(|| Some("not_enough_matches".to_string()))
     };
+    let truth_planned_requests = source_debugs
+        .iter()
+        .filter_map(|debug| debug.truth_planned_requests)
+        .reduce(usize::saturating_add);
     QueryDebug {
         wal_ms,
         segment_ms,
@@ -5040,6 +5060,7 @@ fn aggregate_source_debug(
         cache,
         consistency_effective: consistency,
         underfill_reason,
+        truth_planned_requests,
     }
 }
 

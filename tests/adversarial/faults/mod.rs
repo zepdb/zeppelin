@@ -58,6 +58,8 @@ pub enum FaultProfile {
     /// generic fault family because the branch program carries its own replay
     /// and lifecycle boundaries.
     Branching,
+    /// Deterministic MMLI-heavy workload. Phase 1 schedules no faults.
+    Late,
     ProviderContractAbuse,
     FutureArchitecture,
     // Legacy Phase 5-7 profiles remain decodable and explicitly runnable for
@@ -81,6 +83,7 @@ impl FaultProfile {
             "supported_full" => Self::SupportedFull,
             "security" => Self::Security,
             "branching" => Self::Branching,
+            "late" => Self::Late,
             "provider_contract_abuse" => Self::ProviderContractAbuse,
             "future_architecture" => Self::FutureArchitecture,
             "content" => Self::Content,
@@ -103,6 +106,7 @@ impl FaultProfile {
             Self::SupportedFull => "supported_full",
             Self::Security => "security",
             Self::Branching => "branching",
+            Self::Late => "late",
             Self::ProviderContractAbuse => "provider_contract_abuse",
             Self::FutureArchitecture => "future_architecture",
             Self::Content => "content",
@@ -123,6 +127,7 @@ impl FaultProfile {
             Self::SupportedFull => "supported-full",
             Self::Security => "security",
             Self::Branching => "branching",
+            Self::Late => "late",
             Self::ProviderContractAbuse => "provider-contract-abuse",
             Self::FutureArchitecture => "future-architecture",
             Self::Content => "content",
@@ -1759,8 +1764,7 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
     let mut rng = StdRng::seed_from_u64(seed ^ 0x5c4e_d01e_fa17_2026);
     let mut events = Vec::new();
     match profile {
-        FaultProfile::LegacyChaos => {}
-        FaultProfile::Branching => {}
+        FaultProfile::LegacyChaos | FaultProfile::Branching | FaultProfile::Late => {}
         FaultProfile::PostCommit => {
             let selectors = [
                 (StoreOp::Put, ".wal"),
@@ -2803,6 +2807,7 @@ mod tests {
             FaultProfile::Crash,
             FaultProfile::Clock,
             FaultProfile::Security,
+            FaultProfile::Late,
             FaultProfile::Content,
             FaultProfile::Semantic,
             FaultProfile::Sched,
@@ -3301,6 +3306,12 @@ mod tests {
         );
         assert_eq!(FaultProfile::from_env("content"), FaultProfile::Content);
         assert_eq!(FaultProfile::from_env("full"), FaultProfile::Full);
+        assert_eq!(FaultProfile::from_env("late"), FaultProfile::Late);
+        assert_eq!(FaultProfile::Late.as_env(), "late");
+        assert!(FaultScheduler::for_seed(7, FaultProfile::Late)
+            .schedule()
+            .events
+            .is_empty());
 
         let legacy = serde_json::json!({
             "profile": "full",

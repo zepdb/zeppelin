@@ -1722,6 +1722,11 @@ fn simple_operation_requirement(op: &Op) -> Option<GrantRequirement<'_>> {
             namespace: Some(ns),
             unconstrained: false,
         }),
+        Op::LateUpsert { ns, .. } => Some(GrantRequirement {
+            action: Action::VectorUpsert,
+            namespace: Some(ns),
+            unconstrained: false,
+        }),
         Op::DeleteVectors { ns, .. } => Some(GrantRequirement {
             action: Action::VectorDelete,
             namespace: Some(ns),
@@ -1732,13 +1737,14 @@ fn simple_operation_requirement(op: &Op) -> Option<GrantRequirement<'_>> {
             namespace: Some(ns),
             unconstrained: false,
         }),
-        Op::Query { ns, .. } | Op::BatchQuery { ns, .. } | Op::PaginateAll { ns, .. } => {
-            Some(GrantRequirement {
-                action: Action::Query,
-                namespace: Some(ns),
-                unconstrained: false,
-            })
-        }
+        Op::Query { ns, .. }
+        | Op::LateQuery { ns, .. }
+        | Op::BatchQuery { ns, .. }
+        | Op::PaginateAll { ns, .. } => Some(GrantRequirement {
+            action: Action::Query,
+            namespace: Some(ns),
+            unconstrained: false,
+        }),
         Op::InvalidProbe { ns, probe, .. } => Some(GrantRequirement {
             action: if probe.is_write_shaped() {
                 Action::VectorUpsert
@@ -2649,6 +2655,7 @@ mod tests {
                 num_centroids: 1,
                 fts_fields: Vec::new(),
                 bitmap: false,
+                late_interaction: None,
             },
         };
         let expected = model
