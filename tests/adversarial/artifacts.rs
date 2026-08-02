@@ -2620,6 +2620,7 @@ fn profile_contracts(profile: Option<FaultProfile>) -> Vec<FaultContract> {
             | FaultProfile::Branching
             | FaultProfile::Late
             | FaultProfile::LateStream
+            | FaultProfile::LateCrash
             | FaultProfile::Sched,
         )
         | None => &[ContractClass::SupportedV1],

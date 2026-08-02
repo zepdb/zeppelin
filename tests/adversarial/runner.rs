@@ -3632,6 +3632,21 @@ async fn restart_after_crash(
     replacement.workload_credentials = workload_credentials;
     server.install(replacement);
     wait_for_health(client, &server.base_url).await;
+    // Late embedding-profile activation is a harness-owned test seam applied
+    // at namespace creation against the old server's manager; the replacement
+    // server needs it re-applied (idempotent) or every late query 409s.
+    for (namespace, ns_model) in &model.namespaces {
+        if ns_model.spec.late_interaction.is_some() {
+            activate_late_embedding_profile(server_store, &server.namespace_manager, namespace)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to re-activate adversarial late profile for {namespace} \
+                         after crash restart: {error}"
+                    )
+                });
+        }
+    }
     scheduler.record(TimelineEvent {
         event_id: crash.event_id,
         op_index: crash.op_index,
@@ -4286,6 +4301,11 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 fired.contains(&ViolationId::I33LateWorkerLifecycle)
             }
             OracleMutation::LateTieOrder => fired.contains(&ViolationId::I31LateExactEquivalence),
+            OracleMutation::LateCrashLostSegment => {
+                fired.contains(&ViolationId::I31LateExactEquivalence)
+                    || fired.contains(&ViolationId::I16Quiescence)
+                    || fired.contains(&ViolationId::I19CrashRecovery)
+            }
         };
         assert!(
             accepted,
@@ -4457,11 +4477,18 @@ async fn run_seed_inner(
     let swallow_corruption_selftest = mutation == Some(OracleMutation::SwallowCorruption);
     let late_swallow_corruption_selftest = mutation == Some(OracleMutation::LateSwallowCorruption);
     let misdirected_write_selftest = mutation == Some(OracleMutation::MisdirectedWriteReachability);
+    let late_crash_lost_segment_selftest =
+        mutation.or(selftest_probe) == Some(OracleMutation::LateCrashLostSegment);
     let assignment = effective_seed_assignment(env.mode, env.profile, seed);
     let branching_profile = assignment.profile == Some(FaultProfile::Branching);
     let late_profile = matches!(
         assignment.profile,
-        Some(FaultProfile::Late | FaultProfile::LateStream | FaultProfile::LateContent)
+        Some(
+            FaultProfile::Late
+                | FaultProfile::LateStream
+                | FaultProfile::LateContent
+                | FaultProfile::LateCrash
+        )
     );
     let profile = scheduled_profile(assignment.profile);
     let mode = if profile.is_some()
@@ -4507,6 +4534,10 @@ async fn run_seed_inner(
     } else if dual_writer_fencing_selftest {
         Some(FaultScheduler::from_schedule(
             FaultSchedule::dual_writer_fencing_selftest(),
+        ))
+    } else if late_crash_lost_segment_selftest {
+        Some(FaultScheduler::from_schedule(
+            FaultSchedule::late_crash_lost_segment_selftest(),
         ))
     } else if late_swallow_corruption_selftest {
         Some(FaultScheduler::from_schedule(
@@ -4929,7 +4960,9 @@ async fn run_seed_inner(
                         scheduler.as_ref().is_some_and(|scheduler| {
                             matches!(
                                 scheduler.schedule().profile,
-                                FaultProfile::LateStream | FaultProfile::LateContent
+                                FaultProfile::LateStream
+                                    | FaultProfile::LateContent
+                                    | FaultProfile::LateCrash
                             )
                         }),
                     )
@@ -6859,6 +6892,11 @@ async fn execute_raw_recorded_op(
                     durably_tainted_keys.as_ref(),
                     http_fault_context.as_ref().is_some_and(|context| {
                         context.scheduler.fault_window_active(index, op.namespace())
+                            || context.scheduler.schedule().events.iter().any(|event| {
+                                event.boundary == Boundary::Process
+                                    && index >= event.start_op
+                                    && event.end_op.is_none_or(|end_op| index < end_op)
+                            })
                     }),
                 )),
             ),
@@ -7643,8 +7681,11 @@ async fn execute_op(
                     }
                 };
                 if let Some(admitted) = admitted {
+                    // After a crash-restart the redelivered upsert's units
+                    // may already be durably enriched, so zero admissions is
+                    // legitimate inside an active fault window.
                     assert!(
-                        admitted > 0,
+                        admitted > 0 || late_fault_window_active,
                         "successful adversarial late upsert for {ns} must admit enrichment work"
                     );
                     // A durable PUT-side corruption (torn/misdirected write)

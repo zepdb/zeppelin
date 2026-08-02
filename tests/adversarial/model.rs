@@ -101,10 +101,11 @@ pub enum OracleMutation {
     LateHiddenGet,
     LateTruncatedResultSuccess,
     LateTieOrder,
+    LateCrashLostSegment,
 }
 
 impl OracleMutation {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::DropDelete,
         Self::SkewScore,
         Self::PhantomId,
@@ -136,6 +137,7 @@ impl OracleMutation {
         Self::LateHiddenGet,
         Self::LateTruncatedResultSuccess,
         Self::LateTieOrder,
+        Self::LateCrashLostSegment,
     ];
 
     #[must_use]
@@ -172,6 +174,7 @@ impl OracleMutation {
             "late-hidden-get" => Self::LateHiddenGet,
             "late-truncated-result-success" => Self::LateTruncatedResultSuccess,
             "late-tie-order" => Self::LateTieOrder,
+            "late-crash-lost-segment" => Self::LateCrashLostSegment,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -210,6 +213,7 @@ impl OracleMutation {
             Self::LateHiddenGet => "late-hidden-get",
             Self::LateTruncatedResultSuccess => "late-truncated-result-success",
             Self::LateTieOrder => "late-tie-order",
+            Self::LateCrashLostSegment => "late-crash-lost-segment",
         }
     }
 
@@ -522,10 +526,15 @@ impl Model {
                 let Some(model) = self.namespaces.get_mut(ns) else {
                     panic!("late upsert acked for unknown namespace {ns}");
                 };
-                for record in records {
-                    model
-                        .late_live
-                        .insert(record.id.clone(), LateModelRecord::from(record));
+                // Self-test mutation: the model pretends the acked late
+                // segment publication never happened; the oracle must catch
+                // the server serving rows the model does not expect.
+                if mutation != Some(OracleMutation::LateCrashLostSegment) {
+                    for record in records {
+                        model
+                            .late_live
+                            .insert(record.id.clone(), LateModelRecord::from(record));
+                    }
                 }
                 model.checkpoint_if_enabled(gen_after, generation_checkpoints);
             }

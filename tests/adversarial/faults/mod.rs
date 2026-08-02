@@ -72,6 +72,8 @@ pub enum FaultProfile {
     LateStream,
     /// MMLI-heavy workload with deterministic late-artifact corruption windows.
     LateContent,
+    /// MMLI-heavy workload with crash points at late durability boundaries.
+    LateCrash,
     ProviderContractAbuse,
     FutureArchitecture,
     // Legacy Phase 5-7 profiles remain decodable and explicitly runnable for
@@ -98,6 +100,7 @@ impl FaultProfile {
             "late" => Self::Late,
             "late-stream" => Self::LateStream,
             "late-content" => Self::LateContent,
+            "late-crash" => Self::LateCrash,
             "provider_contract_abuse" => Self::ProviderContractAbuse,
             "future_architecture" => Self::FutureArchitecture,
             "content" => Self::Content,
@@ -123,6 +126,7 @@ impl FaultProfile {
             Self::Late => "late",
             Self::LateStream => "late-stream",
             Self::LateContent => "late-content",
+            Self::LateCrash => "late-crash",
             Self::ProviderContractAbuse => "provider_contract_abuse",
             Self::FutureArchitecture => "future_architecture",
             Self::Content => "content",
@@ -146,6 +150,7 @@ impl FaultProfile {
             Self::Late => "late",
             Self::LateStream => "late-stream",
             Self::LateContent => "late-content",
+            Self::LateCrash => "late-crash",
             Self::ProviderContractAbuse => "provider-contract-abuse",
             Self::FutureArchitecture => "future-architecture",
             Self::Content => "content",
@@ -1660,6 +1665,29 @@ impl FaultSchedule {
     }
 
     #[must_use]
+    pub fn late_crash_lost_segment_selftest() -> Self {
+        let point = CrashPoint::LateSectionPut;
+        let (store_op, key_substring, _) = point.selector();
+        Self {
+            profile: FaultProfile::LateCrash,
+            events: vec![FaultEvent {
+                id: "late-crash-00".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::Process,
+                target: TargetSelector {
+                    store_op: Some(store_op),
+                    key_substring: Some(key_substring.to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::CrashAt {
+                    point,
+                    position: TriggerPosition::Post,
+                },
+            }],
+        }
+    }
+
     pub fn crash_lost_ack_selftest() -> Self {
         let point = CrashPoint::WalFragmentPut;
         let (store_op, key_substring, _) = point.selector();
@@ -2046,6 +2074,42 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
                         ..TargetSelector::default()
                     },
                     kind,
+                );
+            }
+        }
+        FaultProfile::LateCrash => {
+            // Crash at late durability boundaries: segment artifact upload,
+            // section publication, the manifest CAS that references them,
+            // and the staging drop that ends the compaction. Recovery must
+            // serve either the full old late segment or the full new one.
+            let points = [
+                CrashPoint::LateSegmentArtifactPut,
+                CrashPoint::LateSectionPut,
+                CrashPoint::ManifestCas,
+                CrashPoint::StagingDrop,
+            ];
+            let count = rng.gen_range(1..=2);
+            for index in 0..count {
+                let point = points[rng.gen_range(0..points.len())];
+                let (store_op, key_substring, _) = point.selector();
+                let start_op = 30 + (index as u64 * 180) + rng.gen_range(0..=30);
+                let position = if rng.gen_bool(0.5) {
+                    TriggerPosition::Pre
+                } else {
+                    TriggerPosition::Post
+                };
+                push_event(
+                    &mut events,
+                    profile,
+                    start_op,
+                    None,
+                    Boundary::Process,
+                    TargetSelector {
+                        store_op: Some(store_op),
+                        key_substring: Some(key_substring.to_string()),
+                        ..TargetSelector::default()
+                    },
+                    FaultKind::CrashAt { point, position },
                 );
             }
         }

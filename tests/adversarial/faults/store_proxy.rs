@@ -1840,6 +1840,8 @@ pub async fn run_crash_matrix() {
         CrashPoint::NamespaceDeleteBatch { nth: 1 },
         CrashPoint::SnapshotPut,
         CrashPoint::HydrationGet,
+        CrashPoint::LateSegmentArtifactPut,
+        CrashPoint::LateSectionPut,
     ];
     for point in points {
         for position in [TriggerPosition::Pre, TriggerPosition::Post] {
@@ -1889,7 +1891,9 @@ pub async fn run_crash_matrix() {
                     | CrashPoint::ManifestCas
                     | CrashPoint::SegmentPut
                     | CrashPoint::StagingSideObjectPut
-                    | CrashPoint::SnapshotPut => faulted
+                    | CrashPoint::SnapshotPut
+                    | CrashPoint::LateSegmentArtifactPut
+                    | CrashPoint::LateSectionPut => faulted
                         .put(&task_key, Bytes::from_static(b"after"))
                         .await
                         .map(|_| ()),
@@ -1930,7 +1934,9 @@ pub async fn run_crash_matrix() {
                     | CrashPoint::SegmentPut
                     | CrashPoint::StagingSideObjectPut
                     | CrashPoint::SnapshotPut
-                    | CrashPoint::CloneCopy { .. },
+                    | CrashPoint::CloneCopy { .. }
+                    | CrashPoint::LateSegmentArtifactPut
+                    | CrashPoint::LateSectionPut,
                     TriggerPosition::Pre,
                 ) => assert!(!inner_exists),
                 (
@@ -1939,7 +1945,9 @@ pub async fn run_crash_matrix() {
                     | CrashPoint::SegmentPut
                     | CrashPoint::StagingSideObjectPut
                     | CrashPoint::SnapshotPut
-                    | CrashPoint::CloneCopy { .. },
+                    | CrashPoint::CloneCopy { .. }
+                    | CrashPoint::LateSegmentArtifactPut
+                    | CrashPoint::LateSectionPut,
                     TriggerPosition::Post,
                 ) => assert!(inner_exists),
                 (
@@ -1970,6 +1978,8 @@ fn crash_matrix_key(point: CrashPoint) -> String {
         CrashPoint::NamespaceDeleteBatch { .. } => "matrix/delete/me.bin",
         CrashPoint::SnapshotPut => "matrix/snapshots/pin.msgpack",
         CrashPoint::HydrationGet => "matrix/segments/segment/cluster_0.bin",
+        CrashPoint::LateSegmentArtifactPut => "matrix/late/segments/seg_x/attrs_0.bin",
+        CrashPoint::LateSectionPut => "matrix/late/state/00ff00ff",
     }
     .to_string()
 }

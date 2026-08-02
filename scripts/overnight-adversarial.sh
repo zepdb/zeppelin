@@ -124,6 +124,26 @@ else
     "${RUN_CMD[@]}"
 fi
 
+# Late-interaction profiles run as an explicit extra batch: the mixed-mode
+# nine-slot seed table is replay-load-bearing and must not be reshuffled.
+LATE_SECONDS="${ZEPPELIN_ADVERSARIAL_LATE_SECONDS:-420}"
+for late_profile in late late-stream late-content late-crash; do
+    LATE_CMD=(
+        env
+        TEST_BACKEND=minio
+        ZEPPELIN_ADVERSARIAL_SECONDS="$LATE_SECONDS"
+        ZEPPELIN_ADVERSARIAL_MAX_OPS="${ZEPPELIN_ADVERSARIAL_MAX_OPS:-500}"
+        ZEPPELIN_ADVERSARIAL_PROFILE="$late_profile"
+        ZEPPELIN_ADVERSARIAL_SEEDS=8
+        cargo test --test adversarial_workload_tests smoke -- --ignored --nocapture
+    )
+    if [ "$(uname -s)" = "Darwin" ] && command -v caffeinate >/dev/null 2>&1; then
+        caffeinate -dimsu "${LATE_CMD[@]}" || echo "late profile $late_profile FAILED" >&2
+    else
+        "${LATE_CMD[@]}" || echo "late profile $late_profile FAILED" >&2
+    fi
+done
+
 latest_report="$(find "$PROJECT_ROOT/target/adversarial" \
     -path '*/report.md' \
     -type f \

@@ -19,6 +19,8 @@ pub enum CrashPoint {
     NamespaceDeleteBatch { nth: u32 },
     SnapshotPut,
     HydrationGet,
+    LateSegmentArtifactPut,
+    LateSectionPut,
 }
 
 impl CrashPoint {
@@ -34,6 +36,8 @@ impl CrashPoint {
             Self::NamespaceDeleteBatch { nth } => (StoreOp::Delete, "/", nth),
             Self::SnapshotPut => (StoreOp::Put, "/snapshots/", 1),
             Self::HydrationGet => (StoreOp::Get, "cluster_", 1),
+            Self::LateSegmentArtifactPut => (StoreOp::Put, "late/segments/", 1),
+            Self::LateSectionPut => (StoreOp::Put, "late/state/", 1),
         }
     }
 }
