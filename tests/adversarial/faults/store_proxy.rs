@@ -9,6 +9,10 @@ use object_store::{
     GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMode, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
+use zeppelin::embedding::{
+    ContentHash, MatrixArtifact, MatrixArtifactRow, MatrixDtype, MultiVectorEmbedding,
+    MultiVectorEpochId,
+};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::wal::Manifest;
 
@@ -517,6 +521,10 @@ pub fn operational_store_proxy(
 }
 
 const BODY_HISTORY_CAPACITY: usize = 8;
+const DTYPE_SWAP_FIXTURE_DIMENSION: usize = 128;
+const DTYPE_SWAP_FIXTURE_SOURCE_CHECKSUM: u64 = 0xd7_70_03;
+const DTYPE_SWAP_FIXTURE_EPOCH: MultiVectorEpochId = MultiVectorEpochId::new([0x5a; 32]);
+const DTYPE_SWAP_FIXTURE_CONTENT: ContentHash = ContentHash::new([0x3c; 32]);
 
 #[derive(Debug)]
 struct BodyVersion {
@@ -528,10 +536,14 @@ struct BodyVersion {
 #[derive(Debug, Default)]
 struct BodyHistory {
     entries: VecDeque<BodyVersion>,
+    matrix_dtypes: BTreeMap<String, MatrixDtype>,
 }
 
 impl BodyHistory {
     fn observe_put(&mut self, key: String, body: bytes::Bytes) {
+        if let Some(dtype) = tracked_matrix_dtype(&key, &body) {
+            self.matrix_dtypes.insert(key.clone(), dtype);
+        }
         let previous = self
             .entries
             .iter()
@@ -562,6 +574,65 @@ impl BodyHistory {
             .find(|entry| entry.key == key)
             .and_then(|entry| entry.previous.clone())
     }
+
+    fn matrix_dtype(&self, key: &str) -> Option<MatrixDtype> {
+        self.matrix_dtypes.get(key).copied()
+    }
+}
+
+fn tracked_matrix_dtype(key: &str, body: &[u8]) -> Option<MatrixDtype> {
+    if !key.contains("/late/segments/")
+        || !key
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.starts_with("matrix_"))
+        || body.len() < 8
+        || !matches!(&body[..4], b"ZMB1" | b"ZME1")
+        || body[4] != 1
+    {
+        return None;
+    }
+    let group_size = u16::from_le_bytes([body[6], body[7]]);
+    match (body[5], group_size) {
+        (1, 0) => Some(MatrixDtype::F16),
+        (2, group_size @ (16 | 32 | 128)) => Some(MatrixDtype::Int8SymV1 { group_size }),
+        _ => None,
+    }
+}
+
+fn opposite_dtype_fixture(target: MatrixDtype) -> (bytes::Bytes, MatrixDtype) {
+    let opposite = match target {
+        MatrixDtype::F16 => MatrixDtype::Int8SymV1 { group_size: 32 },
+        MatrixDtype::Int8SymV1 { .. } => MatrixDtype::F16,
+    };
+    let embedding = MultiVectorEmbedding::new(
+        vec![0.25; DTYPE_SWAP_FIXTURE_DIMENSION],
+        1,
+        DTYPE_SWAP_FIXTURE_DIMENSION,
+        1,
+    )
+    .expect("dtype-swap fixture matrix must be valid");
+    let artifact = MatrixArtifact::new(
+        opposite,
+        DTYPE_SWAP_FIXTURE_EPOCH,
+        DTYPE_SWAP_FIXTURE_SOURCE_CHECKSUM,
+        DTYPE_SWAP_FIXTURE_DIMENSION,
+        vec![MatrixArtifactRow::new(
+            DTYPE_SWAP_FIXTURE_CONTENT,
+            embedding,
+        )],
+    )
+    .expect("dtype-swap fixture artifact must be valid")
+    .to_bytes()
+    .expect("dtype-swap fixture artifact must encode");
+    (artifact.bytes().clone(), opposite)
+}
+
+fn matrix_dtype_label(dtype: MatrixDtype) -> String {
+    match dtype {
+        MatrixDtype::F16 => "f16".to_string(),
+        MatrixDtype::Int8SymV1 { group_size } => format!("int8_sym_v1_g{group_size}"),
+    }
 }
 
 impl StoreFaultProxy {
@@ -569,6 +640,7 @@ impl StoreFaultProxy {
         matches!(
             self.scheduler.schedule().profile,
             super::FaultProfile::Content
+                | super::FaultProfile::LateContent
                 | super::FaultProfile::Semantic
                 | super::FaultProfile::ProviderContractAbuse
                 | super::FaultProfile::Full
@@ -1119,6 +1191,7 @@ impl ObjectStore for StoreFaultProxy {
                             }
                         }
                     }
+                    FaultKind::Content(super::ContentFault::DtypeSwap) => None,
                     _ => None,
                 };
                 let result = self.inner.get_opts(location, options).await?;
@@ -1149,6 +1222,43 @@ impl ObjectStore for StoreFaultProxy {
                             ObservedResult::Corrupted,
                             Some(format!(
                                 "served {replacement_len} bytes from another live key"
+                            )),
+                        );
+                        Ok(result)
+                    }
+                    FaultKind::Content(super::ContentFault::DtypeSwap) => {
+                        let target_dtype = self
+                            .bodies
+                            .lock()
+                            .expect("store fault body-history mutex poisoned")
+                            .matrix_dtype(&key);
+                        let Some(target_dtype) = target_dtype else {
+                            assert!(reservation.commit());
+                            self.record(
+                                &action,
+                                &key,
+                                FaultSemantics::PostCommit,
+                                ObservedResult::DefiniteNotApplied,
+                                Some(
+                                    "dtype swap requires a tracked valid matrix artifact"
+                                        .to_string(),
+                                ),
+                            );
+                            return Err(injected_error(InjectedErrorKind::Generic, &key));
+                        };
+                        let (fixture, opposite_dtype) = opposite_dtype_fixture(target_dtype);
+                        let fixture_len = fixture.len();
+                        let result = content_result(result, |_| fixture).await?;
+                        assert!(reservation.commit());
+                        self.record(
+                            &action,
+                            &key,
+                            FaultSemantics::PostCommit,
+                            ObservedResult::Corrupted,
+                            Some(format!(
+                                "served valid {opposite} matrix fixture ({fixture_len} bytes) in place of {target}",
+                                opposite = matrix_dtype_label(opposite_dtype),
+                                target = matrix_dtype_label(target_dtype),
                             )),
                         );
                         Ok(result)
@@ -1190,9 +1300,10 @@ impl ObjectStore for StoreFaultProxy {
                         Ok(result)
                     }
                     FaultKind::TruncatedGetStream { after_bytes } => {
-                        let (result, recovery) = if self.scheduler.schedule().profile
-                            == super::FaultProfile::LateStream
-                        {
+                        let (result, recovery) = if matches!(
+                            self.scheduler.schedule().profile,
+                            super::FaultProfile::LateStream | super::FaultProfile::LateContent
+                        ) {
                             let (result, expected_bytes, actual_bytes) =
                                 successful_short_result(result, after_bytes).await?;
                             (
@@ -2654,6 +2765,130 @@ mod tests {
             Bytes::from_static(b"first")
         );
         assert_eq!(scheduler.timeline()[0].observed, ObservedResult::Corrupted);
+    }
+
+    #[tokio::test]
+    async fn dtype_swap_serves_a_valid_opposite_dtype_fixture() {
+        use zeppelin::embedding::ArtifactChecksum;
+
+        const FIXTURE_DIMENSION: usize = 128;
+        const FIXTURE_SOURCE_CHECKSUM: u64 = 0xd7_70_03;
+        const FIXTURE_EPOCH: MultiVectorEpochId = MultiVectorEpochId::new([0x5a; 32]);
+
+        for (case, target_dtype, opposite_dtype) in [
+            (
+                "f16",
+                MatrixDtype::F16,
+                MatrixDtype::Int8SymV1 { group_size: 32 },
+            ),
+            (
+                "int8",
+                MatrixDtype::Int8SymV1 { group_size: 32 },
+                MatrixDtype::F16,
+            ),
+        ] {
+            let source = MatrixArtifact::new(
+                target_dtype,
+                FIXTURE_EPOCH,
+                FIXTURE_SOURCE_CHECKSUM,
+                FIXTURE_DIMENSION,
+                vec![MatrixArtifactRow::new(
+                    ContentHash::new([0x3c; 32]),
+                    MultiVectorEmbedding::new(
+                        vec![0.25; FIXTURE_DIMENSION],
+                        1,
+                        FIXTURE_DIMENSION,
+                        1,
+                    )
+                    .unwrap(),
+                )],
+            )
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+            let key = format!("test-adv-0-late/late/segments/seg/matrix_{case}.bin");
+            let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+            let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+                profile: FaultProfile::LateContent,
+                events: vec![FaultEvent {
+                    id: format!("late-content-dtype-swap-{case}"),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Get),
+                        key_substring: Some("/matrix_".to_string()),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::Content(ContentFault::DtypeSwap),
+                }],
+            });
+            let faulted = store_fault_proxy(&inner, scheduler.clone());
+            faulted.put(&key, source.bytes().clone()).await.unwrap();
+
+            let swapped = faulted.get(&key).await.unwrap();
+            assert_ne!(swapped, *source.bytes());
+            let swapped_checksum = ArtifactChecksum::digest(&swapped);
+            let decoded = MatrixArtifact::from_bytes(
+                &swapped,
+                swapped_checksum,
+                opposite_dtype,
+                FIXTURE_EPOCH,
+                FIXTURE_SOURCE_CHECKSUM,
+                FIXTURE_DIMENSION,
+                1,
+                1,
+            )
+            .expect("DtypeSwap must serve a valid opposite-dtype matrix fixture");
+            assert_eq!(decoded.dtype(), opposite_dtype);
+            assert_eq!(scheduler.timeline().len(), 1);
+            assert_eq!(scheduler.timeline()[0].observed, ObservedResult::Corrupted);
+            assert!(scheduler.timeline()[0]
+                .recovery
+                .as_deref()
+                .is_some_and(|detail| detail.contains(&matrix_dtype_label(opposite_dtype))));
+        }
+    }
+
+    #[tokio::test]
+    async fn dtype_swap_fails_loudly_without_a_tracked_matrix_dtype() {
+        let key = "test-adv-0-late/late/segments/seg/matrix_0.bin";
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::LateContent,
+            events: vec![FaultEvent {
+                id: "late-content-dtype-swap-untracked".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("/matrix_".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::Content(ContentFault::DtypeSwap),
+            }],
+        });
+        let faulted = store_fault_proxy(&inner, scheduler.clone());
+        faulted
+            .put(key, Bytes::from_static(b"not-a-matrix"))
+            .await
+            .unwrap();
+
+        let error = faulted
+            .get(key)
+            .await
+            .expect_err("DtypeSwap must not silently choose a fallback dtype");
+        assert!(error.to_string().contains("injected"));
+        assert_eq!(scheduler.timeline().len(), 1);
+        assert_eq!(
+            scheduler.timeline()[0].observed,
+            ObservedResult::DefiniteNotApplied
+        );
+        assert!(scheduler.timeline()[0]
+            .recovery
+            .as_deref()
+            .is_some_and(|detail| detail.contains("tracked valid matrix artifact")));
     }
 
     #[tokio::test]

@@ -87,9 +87,9 @@ fn tag_coverage_required(mode: adversarial::RunMode, tag: &str) -> bool {
     mode != adversarial::RunMode::Chaos || !matches!(tag, "gc-cycle" | "sandwich")
 }
 
-fn minimum_explicit_compactions(security_profile: bool, seed_count: u64) -> u64 {
-    if security_profile {
-        // The security profile runs in chaos mode, where foreground maintenance
+fn minimum_explicit_compactions(quiet_compaction_profile: bool, seed_count: u64) -> u64 {
+    if quiet_compaction_profile {
+        // These profiles run in chaos mode, where foreground maintenance
         // operations are deliberately sanitized. Require the quiet-period proof
         // from every seed instead of the mixed-profile foreground floor.
         seed_count
@@ -98,24 +98,48 @@ fn minimum_explicit_compactions(security_profile: bool, seed_count: u64) -> u64 
     }
 }
 
-#[tokio::test]
+#[test]
 #[ignore]
-async fn smoke() {
+fn smoke() {
+    // The seed future is too large for the 2 MiB libtest stack in debug
+    // builds; run the whole smoke on a dedicated wide-stack thread.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(smoke_inner)
+        .expect("smoke thread must spawn")
+        .join()
+        .expect("smoke thread must join");
+}
+
+fn smoke_inner() {
     let env = adversarial::RunnerEnv::from_env();
     let security_profile = env.profile == Some(adversarial::faults::FaultProfile::Security);
+    let late_content_profile = env.profile == Some(adversarial::faults::FaultProfile::LateContent);
     let configured_seed_count = env.seeds.len() as u64;
     let mode = if env.profile.is_some() {
         adversarial::RunMode::Chaos
     } else {
         env.mode
     };
-    let summary = adversarial::runner::run_smoke(env).await;
+    let summary = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(16 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("smoke runtime must build")
+        .block_on(adversarial::runner::run_smoke(env));
 
     assert!(
         summary.failed_seeds == 0,
         "adversarial smoke had {} failed seed(s)",
         summary.failed_seeds
     );
+    if late_content_profile {
+        assert_eq!(
+            summary.non_blocking_findings, 0,
+            "late-content smoke must not hide provider-contract findings"
+        );
+    }
     assert!(
         configured_seed_count >= 2,
         "adversarial smoke requires at least 2 configured seeds, got {configured_seed_count}"
@@ -129,8 +153,10 @@ async fn smoke() {
         "expected at least 200 ops, ran {}",
         summary.ops_total
     );
-    let required_compactions =
-        minimum_explicit_compactions(security_profile, configured_seed_count);
+    let required_compactions = minimum_explicit_compactions(
+        security_profile || late_content_profile,
+        configured_seed_count,
+    );
     assert!(
         summary.compactions_total >= required_compactions,
         "expected at least {required_compactions} compactions, ran {}",
@@ -207,6 +233,30 @@ async fn smoke() {
         summary.non_blocking_findings,
         summary.ops_per_sec
     );
+}
+
+#[test]
+#[ignore]
+fn late_content_pinned_faults() {
+    // The pinned seed future is too large for the 2 MiB libtest stack in
+    // debug builds; run it on a dedicated wide-stack thread and runtime.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("pinned late-content runtime must build")
+                .block_on(async {
+                    let env = adversarial::RunnerEnv::from_env();
+                    adversarial::runner::run_late_content_pinned_faults(env).await;
+                });
+        })
+        .expect("pinned late-content thread must spawn")
+        .join()
+        .expect("pinned late-content thread must join");
 }
 
 /// Deterministic deletion-unification smoke. Active branch setup uses the

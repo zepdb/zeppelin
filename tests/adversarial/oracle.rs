@@ -162,7 +162,10 @@ pub(crate) fn check_i31_late_exact(
         )];
     };
     let mut expected = ns_model.late_expected_results(query, *top_k, filter.as_ref());
-    if mutation == Some(OracleMutation::LateSkewScore) {
+    if matches!(
+        mutation,
+        Some(OracleMutation::LateSkewScore | OracleMutation::LateSwallowCorruption)
+    ) {
         if let Some((_, score)) = expected.first_mut() {
             *score += score_eps(*score) * 10.0;
         }
@@ -304,10 +307,13 @@ pub struct LateReadObservation {
 ///
 /// The runner owns the counting store and passes the per-operation deltas;
 /// the oracle compares them with the opt-in trace carried by the response.
+/// A caller may admit retry excess only for a narrowly scoped corruption
+/// window. Missing planned reads and candidate-wave reads remain violations.
 #[must_use]
 pub fn check_i32_late_read_accounting(
     rec: &OpRecord,
     observation: LateReadObservation,
+    retry_excess_allowed: bool,
     mutation: Option<OracleMutation>,
 ) -> Vec<Violation> {
     let Op::LateQuery { ns, .. } = &rec.op else {
@@ -355,7 +361,12 @@ pub fn check_i32_late_read_accounting(
             }),
         ));
     }
-    if observation.truth_gets != compared_planned {
+    let accounting_breach = if retry_excess_allowed {
+        observation.truth_gets < compared_planned
+    } else {
+        observation.truth_gets != compared_planned
+    };
+    if accounting_breach {
         violations.push(violation(
             ViolationId::I32LateReadAccounting,
             rec,
@@ -365,6 +376,7 @@ pub fn check_i32_late_read_accounting(
                 "observed_truth_gets": observation.truth_gets,
                 "truth_planned_requests": planned,
                 "compared_planned_requests": compared_planned,
+                "retry_excess_allowed": retry_excess_allowed,
                 "mutation": mutation == Some(OracleMutation::LateHiddenGet),
             }),
         ));
@@ -689,6 +701,9 @@ fn security_finding_violation(rec: &OpRecord, finding: SecurityFinding) -> Viola
 pub struct CorruptionContext<'a> {
     pub tainted_keys: &'a BTreeSet<String>,
     pub fault_window_active: bool,
+    /// A durable late artifact or resident candidate digest remains live after
+    /// the scheduler's bounded corruption window has closed.
+    pub late_persistent_taint: bool,
 }
 
 #[must_use]
@@ -714,22 +729,33 @@ fn check_i20_corruption_surfaced(
     mutation: Option<OracleMutation>,
     corruption: &CorruptionContext<'_>,
 ) -> Vec<Violation> {
-    if !(200..300).contains(&rec.status) || corruption.tainted_keys.is_empty() {
+    if !(200..300).contains(&rec.status)
+        || (corruption.tainted_keys.is_empty() && !corruption.late_persistent_taint)
+    {
         return Vec::new();
     }
     let namespace = rec.op.namespace();
     let Some(ns_model) = model.namespaces.get(namespace) else {
         return Vec::new();
     };
-    if !ns_model.spec.is_exact()
-        || !ns_model.indeterminate.is_empty()
-        || !ns_model.indeterminate_ns.is_empty()
-    {
+    if !ns_model.indeterminate.is_empty() || !ns_model.indeterminate_ns.is_empty() {
         // TODO tighten once per-record read sets can exclude ambiguous state.
         return Vec::new();
     }
 
     let divergences = match &rec.op {
+        Op::LateQuery { .. } => {
+            if !corruption.fault_window_active && !corruption.late_persistent_taint {
+                return Vec::new();
+            }
+            let i20_mutation = if mutation == Some(OracleMutation::LateSwallowCorruption) {
+                None
+            } else {
+                mutation
+            };
+            check_i31_late_exact(model, rec, RunMode::Deterministic, i20_mutation)
+        }
+        _ if !ns_model.spec.is_exact() => return Vec::new(),
         Op::FetchVectors { .. } => check_i4_fetch_exact(model, rec, RunMode::Deterministic),
         Op::Query { q, as_of: None, .. }
             if matches!(q.class, QueryOracleClass::ExactAnn { .. }) =>
@@ -758,6 +784,7 @@ fn check_i20_corruption_surfaced(
         serde_json::json!({
             "tainted_keys": corruption.tainted_keys,
             "fault_window_active": corruption.fault_window_active,
+            "late_persistent_taint": corruption.late_persistent_taint,
             "exact_divergences": divergences,
         }),
     )]
@@ -3179,9 +3206,13 @@ mod tests {
             truth_gets: 2,
         };
 
-        assert!(check_i32_late_read_accounting(&rec, observation, None).is_empty());
-        let violations =
-            check_i32_late_read_accounting(&rec, observation, Some(OracleMutation::LateHiddenGet));
+        assert!(check_i32_late_read_accounting(&rec, observation, false, None).is_empty());
+        let violations = check_i32_late_read_accounting(
+            &rec,
+            observation,
+            false,
+            Some(OracleMutation::LateHiddenGet),
+        );
 
         assert!(violations
             .iter()
@@ -3189,7 +3220,7 @@ mod tests {
     }
 
     #[test]
-    fn late_read_accounting_rejects_excess_and_shortfall() {
+    fn late_read_accounting_tolerates_excess_only_when_caller_opts_in() {
         let rec = late_query_record(None, json!([]));
         let retry_excess = LateReadObservation {
             candidate_gets: 0,
@@ -3200,8 +3231,145 @@ mod tests {
             truth_gets: 1,
         };
 
-        assert!(!check_i32_late_read_accounting(&rec, retry_excess, None).is_empty());
-        assert!(!check_i32_late_read_accounting(&rec, shortfall, None).is_empty());
+        assert!(check_i32_late_read_accounting(&rec, retry_excess, true, None).is_empty());
+        assert!(!check_i32_late_read_accounting(&rec, retry_excess, false, None).is_empty());
+        assert!(!check_i32_late_read_accounting(&rec, shortfall, true, None).is_empty());
+    }
+
+    #[test]
+    fn i20_attributes_divergent_late_success_only_to_active_or_persistent_taint() {
+        let rec = late_query_record(
+            None,
+            json!([
+                { "id": "a", "score": 1.0 },
+                { "id": "b", "score": 1.0 }
+            ]),
+        );
+        let tainted_keys =
+            BTreeSet::from(["ns/late/segments/segment/matrix_f16_00000000.bin".to_string()]);
+        let check = |fault_window_active, late_persistent_taint| {
+            let corruption = CorruptionContext {
+                tainted_keys: &tainted_keys,
+                fault_window_active,
+                late_persistent_taint,
+            };
+            check_op_with_faults(&late_model(), &rec, RunMode::Chaos, None, Some(&corruption))
+        };
+
+        let closed = check(false, false);
+        assert!(
+            closed
+                .iter()
+                .all(|violation| violation.id != ViolationId::I20CorruptionSurfaced),
+            "{closed:#?}"
+        );
+        for violations in [check(true, false), check(false, true)] {
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.id == ViolationId::I20CorruptionSurfaced),
+                "{violations:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn i20_accepts_consistent_or_ambiguous_late_success() {
+        let consistent = late_query_record(
+            None,
+            json!([
+                { "id": "z", "score": 2.0 },
+                { "id": "a", "score": 1.0 }
+            ]),
+        );
+        let divergent = late_query_record(
+            None,
+            json!([
+                { "id": "a", "score": 1.0 },
+                { "id": "b", "score": 1.0 }
+            ]),
+        );
+        let tainted_keys =
+            BTreeSet::from(["ns/late/segments/segment/matrix_f16_00000000.bin".to_string()]);
+        let corruption = CorruptionContext {
+            tainted_keys: &tainted_keys,
+            fault_window_active: true,
+            late_persistent_taint: false,
+        };
+
+        let consistent_findings = check_op_with_faults(
+            &late_model(),
+            &consistent,
+            RunMode::Chaos,
+            None,
+            Some(&corruption),
+        );
+        assert!(
+            consistent_findings
+                .iter()
+                .all(|violation| violation.id != ViolationId::I20CorruptionSurfaced),
+            "{consistent_findings:#?}"
+        );
+
+        let mut ambiguous_model = late_model();
+        ambiguous_model
+            .namespaces
+            .get_mut(NS)
+            .expect("late namespace must exist")
+            .indeterminate_ns
+            .push(NsIndeterminate::MaybeCompacted);
+        let ambiguous_findings = check_op_with_faults(
+            &ambiguous_model,
+            &divergent,
+            RunMode::Chaos,
+            None,
+            Some(&corruption),
+        );
+        assert!(
+            ambiguous_findings
+                .iter()
+                .all(|violation| violation.id != ViolationId::I20CorruptionSurfaced),
+            "{ambiguous_findings:#?}"
+        );
+    }
+
+    #[test]
+    fn late_swallow_corruption_bypasses_i20_but_fires_i31() {
+        let rec = late_query_record(
+            None,
+            json!([
+                { "id": "z", "score": 2.0 },
+                { "id": "a", "score": 1.0 }
+            ]),
+        );
+        let tainted_keys =
+            BTreeSet::from(["ns/late/segments/segment/matrix_f16_00000000.bin".to_string()]);
+        let corruption = CorruptionContext {
+            tainted_keys: &tainted_keys,
+            fault_window_active: true,
+            late_persistent_taint: false,
+        };
+        let mutation = Some(OracleMutation::LateSwallowCorruption);
+
+        let i20 = check_op_with_faults(
+            &late_model(),
+            &rec,
+            RunMode::Chaos,
+            mutation,
+            Some(&corruption),
+        );
+        assert!(
+            i20.iter()
+                .all(|violation| violation.id != ViolationId::I20CorruptionSurfaced),
+            "{i20:#?}"
+        );
+
+        let i31 = check_i31_late_exact(&late_model(), &rec, RunMode::Deterministic, mutation);
+        assert!(
+            i31.iter()
+                .any(|violation| violation.id == ViolationId::I31LateExactEquivalence),
+            "{i31:#?}"
+        );
     }
 
     #[test]
@@ -3452,6 +3620,7 @@ mod tests {
         let corruption = CorruptionContext {
             tainted_keys: &tainted_keys,
             fault_window_active: true,
+            late_persistent_taint: false,
         };
 
         let violations =
@@ -3473,6 +3642,7 @@ mod tests {
         let corruption = CorruptionContext {
             tainted_keys: &tainted_keys,
             fault_window_active: true,
+            late_persistent_taint: false,
         };
 
         let violations =
@@ -3494,6 +3664,7 @@ mod tests {
         let corruption = CorruptionContext {
             tainted_keys: &tainted_keys,
             fault_window_active: false,
+            late_persistent_taint: false,
         };
 
         let violations =

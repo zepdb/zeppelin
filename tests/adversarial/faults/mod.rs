@@ -22,6 +22,11 @@ const FAULT_WINDOW_TRAILING_OPS: u64 = 8;
 const LATE_STREAM_FIRST_FAULT_OP: u64 = 80;
 const LATE_STREAM_FAULT_LIMIT: u64 = 480;
 const LATE_STREAM_KEY_SUBSTRINGS: [&str; 3] = ["late/segments/", "/matrix_", "/attrs_"];
+const LATE_CONTENT_FIRST_FAULT_OP: u64 = 80;
+// GET windows must end early enough that the trailing durable PUT event
+// (scheduled after them) still lands inside a ~420-470-op seed run.
+const LATE_CONTENT_FAULT_LIMIT: u64 = 360;
+const LATE_CONTENT_GET_EVENT_COUNT: usize = 6;
 
 tokio::task_local! {
     static ARMED_HOLD_EVENT_ID: String;
@@ -65,6 +70,8 @@ pub enum FaultProfile {
     Late,
     /// MMLI-heavy workload with deterministic streamed-read fault windows.
     LateStream,
+    /// MMLI-heavy workload with deterministic late-artifact corruption windows.
+    LateContent,
     ProviderContractAbuse,
     FutureArchitecture,
     // Legacy Phase 5-7 profiles remain decodable and explicitly runnable for
@@ -90,6 +97,7 @@ impl FaultProfile {
             "branching" => Self::Branching,
             "late" => Self::Late,
             "late-stream" => Self::LateStream,
+            "late-content" => Self::LateContent,
             "provider_contract_abuse" => Self::ProviderContractAbuse,
             "future_architecture" => Self::FutureArchitecture,
             "content" => Self::Content,
@@ -114,6 +122,7 @@ impl FaultProfile {
             Self::Branching => "branching",
             Self::Late => "late",
             Self::LateStream => "late-stream",
+            Self::LateContent => "late-content",
             Self::ProviderContractAbuse => "provider_contract_abuse",
             Self::FutureArchitecture => "future_architecture",
             Self::Content => "content",
@@ -136,6 +145,7 @@ impl FaultProfile {
             Self::Branching => "branching",
             Self::Late => "late",
             Self::LateStream => "late-stream",
+            Self::LateContent => "late-content",
             Self::ProviderContractAbuse => "provider-contract-abuse",
             Self::FutureArchitecture => "future-architecture",
             Self::Content => "content",
@@ -150,10 +160,18 @@ impl FaultProfile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentFault {
-    TruncateBody { keep_bytes: usize },
-    BitFlip { offset_hint: u64 },
+    TruncateBody {
+        keep_bytes: usize,
+    },
+    BitFlip {
+        offset_hint: u64,
+    },
     WrongObject,
-    TornWrite { keep_bytes: usize },
+    /// Serve a valid matrix artifact encoded with the opposite scalar dtype.
+    DtypeSwap,
+    TornWrite {
+        keep_bytes: usize,
+    },
     MisdirectedWrite,
     SilentDeleteFailure,
 }
@@ -260,6 +278,7 @@ impl FaultEvent {
             FaultKind::Content(ContentFault::TruncateBody { .. })
             | FaultKind::Content(ContentFault::BitFlip { .. })
             | FaultKind::Content(ContentFault::WrongObject)
+            | FaultKind::Content(ContentFault::DtypeSwap)
             | FaultKind::ListOmit { .. }
             | FaultKind::ListDuplicate { .. }
             | FaultKind::ListReorder
@@ -1447,18 +1466,65 @@ impl FaultScheduler {
     }
 
     #[must_use]
+    pub fn late_get_fault_window_active(&self, op_index: u64, namespace: &str) -> bool {
+        if self.runtime.quiesced.load(Ordering::SeqCst) {
+            return false;
+        }
+        matches!(
+            self.schedule.profile,
+            FaultProfile::LateStream | FaultProfile::LateContent
+        ) && namespace.ends_with("-late")
+            && self
+                .schedule
+                .events
+                .iter()
+                .zip(&self.runtime.events)
+                .any(|(event, runtime)| {
+                    event.boundary == Boundary::ObjectStore
+                        && event.target.store_op == Some(StoreOp::Get)
+                        && event_is_active(event, op_index)
+                        && (event.end_op.is_some()
+                            || !runtime.fired.load(Ordering::SeqCst)
+                            || self.timeline().iter().any(|fired| {
+                                fired.event_id == event.id && fired.op_index == op_index
+                            }))
+                })
+    }
+
+    #[must_use]
     pub fn fault_window_active(&self, op_index: u64, namespace: &str) -> bool {
         if self.runtime.quiesced.load(Ordering::SeqCst) {
             return false;
         }
 
         if self.schedule.profile == FaultProfile::LateStream {
-            return namespace.ends_with("-late")
-                && self.schedule.events.iter().any(|event| {
-                    event.boundary == Boundary::ObjectStore
-                        && event.target.store_op == Some(StoreOp::Get)
-                        && event_is_active(event, op_index)
-                });
+            return self.late_get_fault_window_active(op_index, namespace);
+        }
+
+        if self.schedule.profile == FaultProfile::LateContent {
+            if !namespace.ends_with("-late") {
+                return false;
+            }
+            let scheduled_window = self.schedule.events.iter().any(|event| {
+                event.boundary == Boundary::ObjectStore
+                    && event.target.store_op == Some(StoreOp::Get)
+                    && event.end_op.is_some_and(|end| {
+                        op_index >= event.start_op
+                            && op_index <= end.saturating_add(FAULT_WINDOW_TRAILING_OPS)
+                    })
+            });
+            if scheduled_window {
+                return true;
+            }
+            return self.timeline().into_iter().any(|event| {
+                event.boundary == Boundary::ObjectStore
+                    && op_index >= event.op_index
+                    && op_index <= event.op_index.saturating_add(FAULT_WINDOW_TRAILING_OPS)
+                    && event
+                        .key
+                        .as_deref()
+                        .is_some_and(|key| key_is_in_namespace(key, namespace))
+            });
         }
 
         if !matches!(
@@ -1651,6 +1717,26 @@ impl FaultSchedule {
         }
     }
 
+    /// Pins late-content corruption to the first matrix-row GET.
+    #[must_use]
+    pub fn late_swallow_corruption_selftest() -> Self {
+        Self {
+            profile: FaultProfile::LateContent,
+            events: vec![FaultEvent {
+                id: "late-content-swallow-corruption".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("/matrix_".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::Content(ContentFault::BitFlip { offset_hint: 3 }),
+            }],
+        }
+    }
+
     #[must_use]
     pub fn misdirected_write_reachability_selftest() -> Self {
         Self {
@@ -1735,7 +1821,14 @@ fn event_is_active(event: &FaultEvent, current: u64) -> bool {
 }
 
 fn store_target_matches(profile: FaultProfile, event: &FaultEvent, op: StoreOp, key: &str) -> bool {
-    (profile != FaultProfile::LateStream || key.contains("/late/segments/"))
+    let profile_key_matches = match profile {
+        FaultProfile::LateStream => key.contains("/late/segments/"),
+        FaultProfile::LateContent => {
+            key.contains("/late/segments/") || key.contains("/late/state/")
+        }
+        _ => true,
+    };
+    profile_key_matches
         && event.target.store_op.is_none_or(|expected| expected == op)
         && event
             .target
@@ -1752,6 +1845,7 @@ fn deferred_get_fault(kind: &FaultKind) -> bool {
                 ContentFault::TruncateBody { .. }
                     | ContentFault::BitFlip { .. }
                     | ContentFault::WrongObject
+                    | ContentFault::DtypeSwap
             )
             | FaultKind::TruncatedGetStream { .. }
             | FaultKind::CrashAt {
@@ -1847,6 +1941,98 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
                         },
                     ),
                     _ => unreachable!("late-stream kind rotation has three entries"),
+                };
+                push_event(
+                    &mut events,
+                    profile,
+                    start_op,
+                    Some(start_op + 1),
+                    Boundary::ObjectStore,
+                    TargetSelector {
+                        store_op: Some(StoreOp::Get),
+                        key_substring: Some(key_substring.to_string()),
+                        ..TargetSelector::default()
+                    },
+                    kind,
+                );
+            }
+        }
+        FaultProfile::LateContent => {
+            // Phase-1 seed 0 recorded these exact immutable late families:
+            // matrix/attribute blocks, the resident `flat-sq8-*` (`ZFQ1`)
+            // candidate, and the content-addressed late-state section.
+            let durable = if rng.gen_bool(0.5) {
+                FaultKind::Content(ContentFault::TornWrite {
+                    keep_bytes: rng.gen_range(1..=64),
+                })
+            } else {
+                FaultKind::Content(ContentFault::MisdirectedWrite)
+            };
+            // The durable PUT corruption must fire AFTER every GET window:
+            // once it lands, the store lies about a segment artifact write and
+            // the namespace can brick compaction (and starve artifact reads)
+            // until GC — scheduling it first left the six GET events unfired
+            // in every seed. Quiesce still exercises the durable damage.
+            push_event(
+                &mut events,
+                profile,
+                LATE_CONTENT_FAULT_LIMIT + rng.gen_range(10..=40),
+                None,
+                Boundary::ObjectStore,
+                TargetSelector {
+                    store_op: Some(StoreOp::Put),
+                    key_substring: Some("/late/segments/".to_string()),
+                    ..TargetSelector::default()
+                },
+                durable,
+            );
+
+            let lane_width = (LATE_CONTENT_FAULT_LIMIT - LATE_CONTENT_FIRST_FAULT_OP)
+                / u64::try_from(LATE_CONTENT_GET_EVENT_COUNT)
+                    .expect("late-content event count must fit u64");
+            for index in 0..LATE_CONTENT_GET_EVENT_COUNT {
+                let lane_start = LATE_CONTENT_FIRST_FAULT_OP
+                    + u64::try_from(index).expect("late-content event index must fit u64")
+                        * lane_width;
+                let lane_end = if index + 1 == LATE_CONTENT_GET_EVENT_COUNT {
+                    LATE_CONTENT_FAULT_LIMIT
+                } else {
+                    lane_start + lane_width
+                };
+                let start_op = rng.gen_range(lane_start..=lane_end - 2);
+                let (key_substring, kind) = match index {
+                    0 => (
+                        "/matrix_",
+                        FaultKind::Content(ContentFault::BitFlip {
+                            offset_hint: rng.gen(),
+                        }),
+                    ),
+                    1 => (
+                        "/attrs_",
+                        FaultKind::Content(ContentFault::TruncateBody {
+                            keep_bytes: rng.gen_range(1..=128),
+                        }),
+                    ),
+                    2 => (
+                        "/flat-sq8-",
+                        FaultKind::Content(ContentFault::BitFlip {
+                            offset_hint: rng.gen(),
+                        }),
+                    ),
+                    3 => ("/matrix_", FaultKind::Content(ContentFault::DtypeSwap)),
+                    4 => (
+                        "/matrix_",
+                        FaultKind::TruncatedGetStream {
+                            after_bytes: rng.gen_range(1..=32),
+                        },
+                    ),
+                    5 => (
+                        "/late/state/",
+                        FaultKind::Content(ContentFault::BitFlip {
+                            offset_hint: rng.gen(),
+                        }),
+                    ),
+                    _ => unreachable!("late-content catalog has six entries"),
                 };
                 push_event(
                     &mut events,
@@ -2907,6 +3093,7 @@ mod tests {
             FaultProfile::Security,
             FaultProfile::Late,
             FaultProfile::LateStream,
+            FaultProfile::LateContent,
             FaultProfile::Content,
             FaultProfile::Semantic,
             FaultProfile::Sched,
@@ -3027,6 +3214,164 @@ mod tests {
                 "namespace-late/late/segments/segment-id/attrs_0.bin"
             )
             .is_some());
+    }
+
+    #[test]
+    fn late_content_catalog_only_matches_recorded_late_artifact_families() {
+        const CASES: [(&str, &str, &str); 4] = [
+            (
+                "/matrix_",
+                "ordinary/segments/segment-id/matrix_0.bin",
+                "namespace-late/late/segments/segment-id/matrix_0.bin",
+            ),
+            (
+                "/attrs_",
+                "ordinary/segments/segment-id/attrs_0.bin",
+                "namespace-late/late/segments/segment-id/attrs_0.bin",
+            ),
+            (
+                "/flat-sq8-",
+                "ordinary/segments/segment-id/flat-sq8-digest.bin",
+                "namespace-late/late/segments/segment-id/flat-sq8-digest.bin",
+            ),
+            (
+                "/late/state/",
+                "ordinary/state/digest",
+                "namespace-late/late/state/digest",
+            ),
+        ];
+
+        for (selector, ordinary_key, late_key) in CASES {
+            let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+                profile: FaultProfile::LateContent,
+                events: vec![FaultEvent {
+                    id: format!("late-content-selector-{selector}"),
+                    start_op: 7,
+                    end_op: Some(8),
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Get),
+                        key_substring: Some(selector.to_string()),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::Content(ContentFault::BitFlip { offset_hint: 0 }),
+                }],
+            });
+            scheduler.advance_to(7);
+
+            assert!(
+                scheduler
+                    .store_decision(StoreOp::Get, ordinary_key)
+                    .is_none(),
+                "selector {selector} escaped the late artifact catalog"
+            );
+            assert!(
+                scheduler.store_decision(StoreOp::Get, late_key).is_some(),
+                "selector {selector} did not match its recorded late artifact family"
+            );
+        }
+    }
+
+    #[test]
+    fn late_content_schedule_is_catalog_scoped_and_bounds_durable_corruption() {
+        const EXPECTED_GETS: [(&str, &str); 6] = [
+            ("/matrix_", "bit_flip"),
+            ("/attrs_", "truncate_body"),
+            ("/flat-sq8-", "bit_flip"),
+            ("/matrix_", "dtype_swap"),
+            ("/matrix_", "truncated_get_stream"),
+            ("/late/state/", "bit_flip"),
+        ];
+
+        for seed in 0..100 {
+            let scheduler = FaultScheduler::for_seed(seed, FaultProfile::LateContent);
+            let events = &scheduler.schedule().events;
+            assert_eq!(
+                events.len(),
+                EXPECTED_GETS.len() + 1,
+                "seed {seed}: {events:#?}"
+            );
+
+            let durable = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        FaultKind::Content(
+                            ContentFault::TornWrite { .. } | ContentFault::MisdirectedWrite
+                        )
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(durable.len(), 1, "seed {seed}: {events:#?}");
+            assert_eq!(durable[0].target.store_op, Some(StoreOp::Put));
+            assert_eq!(
+                durable[0].target.key_substring.as_deref(),
+                Some("/late/segments/")
+            );
+            assert!(durable[0].end_op.is_none());
+
+            let gets = events
+                .iter()
+                .filter(|event| event.target.store_op == Some(StoreOp::Get))
+                .collect::<Vec<_>>();
+            assert_eq!(gets.len(), EXPECTED_GETS.len(), "seed {seed}: {events:#?}");
+            let mut previous_start = None;
+            for (event, (selector, kind)) in gets.into_iter().zip(EXPECTED_GETS) {
+                assert_eq!(event.target.key_substring.as_deref(), Some(selector));
+                assert_eq!(event.end_op, Some(event.start_op + 1));
+                if let Some(previous_start) = previous_start {
+                    assert!(event.start_op >= previous_start + 2);
+                }
+                previous_start = Some(event.start_op);
+                match kind {
+                    "bit_flip" => assert!(matches!(
+                        event.kind,
+                        FaultKind::Content(ContentFault::BitFlip { .. })
+                    )),
+                    "truncate_body" => assert!(matches!(
+                        event.kind,
+                        FaultKind::Content(ContentFault::TruncateBody { .. })
+                    )),
+                    "dtype_swap" => assert!(matches!(
+                        event.kind,
+                        FaultKind::Content(ContentFault::DtypeSwap)
+                    )),
+                    "truncated_get_stream" => {
+                        assert!(matches!(event.kind, FaultKind::TruncatedGetStream { .. }))
+                    }
+                    other => panic!("unknown expected late-content kind {other}"),
+                }
+                assert!(scheduler.fault_window_active(event.start_op, "test-adv-7-late"));
+                assert!(scheduler.late_get_fault_window_active(event.start_op, "test-adv-7-late"));
+                assert!(
+                    !scheduler.late_get_fault_window_active(event.start_op + 1, "test-adv-7-late")
+                );
+                assert!(scheduler.fault_window_active(
+                    event.start_op + 1 + FAULT_WINDOW_TRAILING_OPS,
+                    "test-adv-7-late"
+                ));
+                assert!(!scheduler.fault_window_active(event.start_op, "ordinary"));
+            }
+        }
+    }
+
+    #[test]
+    fn late_swallow_corruption_selftest_is_one_shot_matrix_bit_flip() {
+        let schedule = FaultSchedule::late_swallow_corruption_selftest();
+        assert_eq!(schedule.profile, FaultProfile::LateContent);
+        assert_eq!(schedule.events.len(), 1);
+        let event = &schedule.events[0];
+        assert_eq!(event.id, "late-content-swallow-corruption");
+        assert_eq!(event.start_op, 0);
+        assert_eq!(event.end_op, None);
+        assert_eq!(event.boundary, Boundary::ObjectStore);
+        assert_eq!(event.target.store_op, Some(StoreOp::Get));
+        assert_eq!(event.target.key_substring.as_deref(), Some("/matrix_"));
+        assert!(matches!(
+            event.kind,
+            FaultKind::Content(ContentFault::BitFlip { offset_hint: 3 })
+        ));
     }
 
     #[test]
@@ -3514,6 +3859,11 @@ mod tests {
             FaultProfile::LateStream
         );
         assert_eq!(FaultProfile::LateStream.as_env(), "late-stream");
+        assert_eq!(
+            FaultProfile::from_env("late-content"),
+            FaultProfile::LateContent
+        );
+        assert_eq!(FaultProfile::LateContent.as_env(), "late-content");
         assert!(FaultScheduler::for_seed(7, FaultProfile::Late)
             .schedule()
             .events

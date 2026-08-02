@@ -1244,6 +1244,34 @@ impl AdversarialGenerator {
         }
     }
 
+    /// Generate one late upsert for deterministic corruption/cache choreography.
+    #[must_use]
+    pub fn late_repair_upsert(&mut self, model: &Model) -> Op {
+        let generated = self.random_late_upsert(model);
+        if matches!(generated, Op::LateUpsert { .. }) {
+            return generated;
+        }
+
+        // Once the bounded candidate corpus is full, update a known record so
+        // the active late segment and resident flat-candidate digest still
+        // advance without growing the corpus beyond its profile limit.
+        let index = self.late_namespace_index();
+        let namespace = self.namespaces[index].name.clone();
+        let dims = self.namespaces[index].spec.dims;
+        Op::LateUpsert {
+            actor: ActorSel::ADMIN,
+            ns: namespace.clone(),
+            records: vec![LateGenRecord {
+                id: format!("{namespace}-r0"),
+                values: self.random_late_matrix(dims, 1),
+                attributes: Some(HashMap::from([(
+                    "group".to_string(),
+                    AttributeValue::String("g0".to_string()),
+                )])),
+            }],
+        }
+    }
+
     fn random_late_query(&mut self) -> Op {
         let index = self.late_namespace_index();
         let ns = self.namespaces[index].name.clone();
@@ -2143,6 +2171,23 @@ mod tests {
         );
         assert!(baseline.late_rows_generated <= MAX_LATE_ROWS);
         assert!(weighted.late_rows_generated <= MAX_LATE_ROWS);
+    }
+
+    #[test]
+    fn late_repair_upsert_rewrites_a_known_row_after_capacity() {
+        let mut generator = AdversarialGenerator::new_late(41, "stable");
+        let late_index = generator.late_namespace_index();
+        let namespace = generator.namespaces[late_index].name.clone();
+        generator.namespaces[late_index].next_id = 64;
+        generator.late_rows_generated = MAX_LATE_ROWS;
+
+        let repair = generator.late_repair_upsert(&Model::default());
+        let Op::LateUpsert { ns, records, .. } = repair else {
+            panic!("capacity repair must remain a late upsert");
+        };
+        assert_eq!(ns, namespace);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, format!("{namespace}-r0"));
     }
 
     #[test]

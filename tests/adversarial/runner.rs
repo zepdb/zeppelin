@@ -52,9 +52,9 @@ use super::faults::store_proxy::{
     OperationalStoreObserver,
 };
 use super::faults::{
-    Boundary, ClockCommand, ContentFault, FaultKind, FaultProfile, FaultSchedule, FaultScheduler,
-    FaultSemantics, ForegroundHold, HttpFaultAction, ObservedResult, SchedulerCommand,
-    TimelineEvent,
+    Boundary, ClockCommand, ContentFault, FaultEvent, FaultKind, FaultProfile, FaultSchedule,
+    FaultScheduler, FaultSemantics, ForegroundHold, HttpFaultAction, ObservedResult,
+    SchedulerCommand, TargetSelector, TimelineEvent,
 };
 use super::generator::{AdversarialGenerator, Coverage};
 use super::late_support::{
@@ -1655,7 +1655,10 @@ async fn run_seed_bounded(
             deadline,
             mutation,
             selftest_probe,
-            Some(&task_watchdog),
+            SeedRunOverrides {
+                schedule: None,
+                watchdog: Some(&task_watchdog),
+            },
         ))
         .await
     };
@@ -4221,6 +4224,9 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
             }
             OracleMutation::AuditChainRecordDrop => fired.contains(&ViolationId::I25AuditEvidence),
             OracleMutation::LateSkewScore => fired.contains(&ViolationId::I31LateExactEquivalence),
+            OracleMutation::LateSwallowCorruption => {
+                fired == vec![ViolationId::I31LateExactEquivalence]
+            }
             OracleMutation::LateHiddenGet => fired.contains(&ViolationId::I32LateReadAccounting),
             OracleMutation::LateTruncatedResultSuccess => {
                 fired.contains(&ViolationId::I33LateWorkerLifecycle)
@@ -4241,6 +4247,99 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
     }
 }
 
+/// Run one isolated deterministic LateContent event for each required GET
+/// corruption family. The per-seed audit proves the event fired on a late key,
+/// and the normal clean-follow-up path proves recovery after window closure or
+/// active-segment replacement.
+pub async fn run_late_content_pinned_faults(env: RunnerEnv) {
+    let cases = [
+        (
+            "matrix-bit-flip",
+            "/matrix_",
+            FaultKind::Content(ContentFault::BitFlip { offset_hint: 3 }),
+        ),
+        (
+            "attrs-truncation",
+            "/attrs_",
+            FaultKind::Content(ContentFault::TruncateBody { keep_bytes: 1 }),
+        ),
+        (
+            "zfq1-corruption",
+            "/flat-sq8-",
+            FaultKind::Content(ContentFault::BitFlip { offset_hint: 5 }),
+        ),
+        (
+            "dtype-swap",
+            "/matrix_",
+            FaultKind::Content(ContentFault::DtypeSwap),
+        ),
+        (
+            "short-range",
+            "/matrix_",
+            FaultKind::TruncatedGetStream { after_bytes: 1 },
+        ),
+    ];
+
+    for (case_index, (case, selector, kind)) in cases.into_iter().enumerate() {
+        let seed = 70_u64
+            .checked_add(u64::try_from(case_index).expect("case index must fit u64"))
+            .expect("pinned late-content seed must not overflow");
+        let mut case_env = env.clone();
+        case_env.mode = RunMode::Chaos;
+        case_env.profile = Some(FaultProfile::LateContent);
+        case_env.seeds = vec![seed];
+        case_env.max_ops = Some(case_env.max_ops.unwrap_or(64).max(64));
+        case_env.seconds = case_env.seconds.max(60);
+        case_env.artifacts = case_env.artifacts.join(format!("pinned-{case}"));
+        let artifacts = RunArtifacts::create(&case_env);
+        let schedule = FaultSchedule {
+            profile: FaultProfile::LateContent,
+            events: vec![FaultEvent {
+                id: format!("late-content-pinned-{case}"),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some(selector.to_string()),
+                    ..TargetSelector::default()
+                },
+                kind,
+            }],
+        };
+        // Mirror run_seed_bounded: move the (very large) seed future into a
+        // spawned task so it is never materialized on the libtest thread's
+        // 2 MiB stack — driving it inline overflows in debug builds.
+        let case_seconds = case_env.seconds;
+        let outcome = tokio::spawn(async move {
+            Box::pin(run_seed_inner(
+                &case_env,
+                &artifacts,
+                seed,
+                Instant::now() + Duration::from_secs(case_seconds),
+                None,
+                None,
+                SeedRunOverrides {
+                    schedule: Some(schedule),
+                    watchdog: None,
+                },
+            ))
+            .await
+        })
+        .await
+        .expect("pinned late-content seed task must join");
+        assert!(
+            !outcome.failed && outcome.violations.is_empty(),
+            "pinned late-content case {case} failed: {:?}",
+            outcome.violations
+        );
+        println!(
+            "pinned late-content {case}: ops={} status=green",
+            outcome.ops
+        );
+    }
+}
+
 async fn run_seed(
     env: &RunnerEnv,
     artifacts: &RunArtifacts,
@@ -4256,9 +4355,15 @@ async fn run_seed(
         deadline,
         mutation,
         selftest_probe,
-        None,
+        SeedRunOverrides::default(),
     ))
     .await
+}
+
+#[derive(Default)]
+struct SeedRunOverrides<'a> {
+    schedule: Option<FaultSchedule>,
+    watchdog: Option<&'a SeedWatchdogContext>,
 }
 
 async fn run_seed_inner(
@@ -4268,8 +4373,12 @@ async fn run_seed_inner(
     deadline: Instant,
     mutation: Option<OracleMutation>,
     selftest_probe: Option<OracleMutation>,
-    watchdog: Option<&SeedWatchdogContext>,
+    overrides: SeedRunOverrides<'_>,
 ) -> SeedOutcome {
+    let SeedRunOverrides {
+        schedule: schedule_override,
+        watchdog,
+    } = overrides;
     let post_commit_selftest = matches!(
         mutation.or(selftest_probe),
         Some(OracleMutation::PostCommitLostWrite | OracleMutation::IndetResolutionLie)
@@ -4291,12 +4400,13 @@ async fn run_seed_inner(
         Some(OracleMutation::DualWriterFencing)
     );
     let swallow_corruption_selftest = mutation == Some(OracleMutation::SwallowCorruption);
+    let late_swallow_corruption_selftest = mutation == Some(OracleMutation::LateSwallowCorruption);
     let misdirected_write_selftest = mutation == Some(OracleMutation::MisdirectedWriteReachability);
     let assignment = effective_seed_assignment(env.mode, env.profile, seed);
     let branching_profile = assignment.profile == Some(FaultProfile::Branching);
     let late_profile = matches!(
         assignment.profile,
-        Some(FaultProfile::Late | FaultProfile::LateStream)
+        Some(FaultProfile::Late | FaultProfile::LateStream | FaultProfile::LateContent)
     );
     let profile = scheduled_profile(assignment.profile);
     let mode = if profile.is_some()
@@ -4306,6 +4416,7 @@ async fn run_seed_inner(
         || crash_lost_ack_selftest
         || clock_gc_eats_live_selftest
         || swallow_corruption_selftest
+        || late_swallow_corruption_selftest
         || misdirected_write_selftest
         || dual_writer_fencing_selftest
     {
@@ -4334,9 +4445,15 @@ async fn run_seed_inner(
     };
     let security_program = generator.security_program().cloned();
     let specs = generator.specs();
-    let scheduler = if dual_writer_fencing_selftest {
+    let scheduler = if let Some(schedule) = schedule_override {
+        Some(FaultScheduler::from_schedule(schedule))
+    } else if dual_writer_fencing_selftest {
         Some(FaultScheduler::from_schedule(
             FaultSchedule::dual_writer_fencing_selftest(),
+        ))
+    } else if late_swallow_corruption_selftest {
+        Some(FaultScheduler::from_schedule(
+            FaultSchedule::late_swallow_corruption_selftest(),
         ))
     } else if swallow_corruption_selftest {
         Some(FaultScheduler::from_schedule(
@@ -4498,6 +4615,7 @@ async fn run_seed_inner(
     let mut pending_held_op = None;
     let mut deferred_ops = VecDeque::new();
     let mut clean_late_followups = VecDeque::new();
+    let mut pending_state_probe_repair = false;
     let mut late_stream_fault_probe = None;
     let mut quiet_drain_ops = VecDeque::new();
     let mut dual_writer_lease_hold = None;
@@ -4687,71 +4805,110 @@ async fn run_seed_inner(
             clean_late_followups
                 .front()
                 .is_some_and(|followup: &CleanLateFollowup| {
-                    scheduler.as_ref().is_none_or(|scheduler| {
-                        !scheduler.fault_window_active(op_index, followup.op.namespace())
-                    })
+                    !corruption_tracker.late_persistent_active(followup.op.namespace())
+                        && scheduler.as_ref().is_none_or(|scheduler| {
+                            !scheduler.fault_window_active(op_index, followup.op.namespace())
+                        })
                 });
         let pending = pending_held_op.as_ref();
-        let scheduled_late_stream_probe = late_stream_fault_probe_for_window(
+        let scheduled_late_probe = late_fault_probe_for_window(
             scheduler.as_ref(),
             op_index,
             late_stream_fault_probe.as_ref(),
         );
-        let (op, clean_followup_source_index, late_stream_event_id) = if clean_followup_ready {
-            let followup = clean_late_followups
-                .pop_front()
-                .expect("ready clean late-query follow-up disappeared");
-            (followup.op, Some(followup.faulted_op_index), None)
-        } else if let Some((event_id, probe)) = scheduled_late_stream_probe {
-            (probe, None, Some(event_id))
-        } else if let Some(op) = next_fifo_deferred_op_with_budget(
-            &mut deferred_ops,
-            generation_budget,
-            || {
-                sanitize_op_for_mode(
-                    generator.next(&model),
-                    mode,
-                    assignment.profile == Some(FaultProfile::LateStream),
+        let scheduled_late_repair = late_content_repair_due(scheduler.as_ref(), op_index);
+        let (op, clean_followup_source_index, late_stream_event_id, durable_probe_after) =
+            if let Some(durable_probe_after) = scheduled_late_repair {
+                (
+                    generator.late_repair_upsert(&model),
+                    None,
+                    None,
+                    durable_probe_after,
                 )
-            },
-            |op, deferred| {
-                pending.is_some_and(|pending| {
-                    op_conflicts_with_pending_hold(op, op_index, scheduler.as_ref(), pending)
-                }) || op_awaits_store_fault_window_close(op, op_index, scheduler.as_ref(), deferred)
-            },
-        ) {
-            (op, None, None)
-        } else {
-            assert!(
+            } else if clean_followup_ready {
+                let followup = clean_late_followups
+                    .pop_front()
+                    .expect("ready clean late-query follow-up disappeared");
+                (followup.op, Some(followup.faulted_op_index), None, false)
+            } else if pending_state_probe_repair {
+                // Drain the enrichment work the /late/state/ probe left
+                // pending; the window is closed and the fire-once fault is
+                // spent, so this repair upsert enriches cleanly before any
+                // follow-up query runs.
+                pending_state_probe_repair = false;
+                (generator.late_repair_upsert(&model), None, None, false)
+            } else if let Some((event_id, probe)) = scheduled_late_probe {
+                // A None probe marks the /late/state/ window: enrichment is
+                // the read that re-fetches the cached state section, so
+                // probe with a repair upsert whose enrichment failure is
+                // tolerated inside the window, then drain on the next op.
+                let probe_op = match probe {
+                    Some(query) => query,
+                    None => {
+                        pending_state_probe_repair = true;
+                        generator.late_repair_upsert(&model)
+                    }
+                };
+                (probe_op, None, Some(event_id), false)
+            } else if let Some(op) = next_fifo_deferred_op_with_budget(
+                &mut deferred_ops,
+                generation_budget,
+                || {
+                    sanitize_op_for_mode(
+                        generator.next(&model),
+                        mode,
+                        scheduler.as_ref().is_some_and(|scheduler| {
+                            matches!(
+                                scheduler.schedule().profile,
+                                FaultProfile::LateStream | FaultProfile::LateContent
+                            )
+                        }),
+                    )
+                },
+                |op, deferred| {
+                    pending.is_some_and(|pending| {
+                        op_conflicts_with_pending_hold(op, op_index, scheduler.as_ref(), pending)
+                    }) || op_awaits_store_fault_window_close(
+                        op,
+                        op_index,
+                        scheduler.as_ref(),
+                        deferred,
+                    )
+                },
+            ) {
+                (op, None, None, false)
+            } else {
+                assert!(
                 clean_late_followups.is_empty(),
                 "workload exhausted before mandatory clean late-query follow-ups became runnable"
             );
-            if let Some(pending) = pending_held_op.as_mut() {
-                assert!(
-                    op_index <= pending.release_op,
-                    "boundary release moved a foreground hold past its scheduled release"
-                );
-                pending.release_op = op_index;
-                pending.release_cause = HoldReleaseCause::Quiesce;
-            }
-            let mut ack_loss_reserved = post_commit_ack_loss_fired;
-            for (offset, op) in deferred_ops.drain(..).enumerate() {
-                let index = op_index
-                    .checked_add(
-                        u64::try_from(offset).expect("deferred drain offset must fit in u64"),
-                    )
-                    .expect("deferred drain operation index overflowed");
-                assert_recorded_op_matches(recorded_ops.as_deref(), seed, index, &op);
-                let inject_post_commit_ack_loss =
-                    post_commit_selftest && !ack_loss_reserved && matches!(op, Op::Upsert { .. });
-                ack_loss_reserved |= inject_post_commit_ack_loss;
-                quiet_drain_ops.push_back(QuietDrainOp::Generated {
-                    op,
-                    inject_post_commit_ack_loss,
-                });
-            }
-            break;
-        };
+                if let Some(pending) = pending_held_op.as_mut() {
+                    assert!(
+                        op_index <= pending.release_op,
+                        "boundary release moved a foreground hold past its scheduled release"
+                    );
+                    pending.release_op = op_index;
+                    pending.release_cause = HoldReleaseCause::Quiesce;
+                }
+                let mut ack_loss_reserved = post_commit_ack_loss_fired;
+                for (offset, op) in deferred_ops.drain(..).enumerate() {
+                    let index = op_index
+                        .checked_add(
+                            u64::try_from(offset).expect("deferred drain offset must fit in u64"),
+                        )
+                        .expect("deferred drain operation index overflowed");
+                    assert_recorded_op_matches(recorded_ops.as_deref(), seed, index, &op);
+                    let inject_post_commit_ack_loss = post_commit_selftest
+                        && !ack_loss_reserved
+                        && matches!(op, Op::Upsert { .. });
+                    ack_loss_reserved |= inject_post_commit_ack_loss;
+                    quiet_drain_ops.push_back(QuietDrainOp::Generated {
+                        op,
+                        inject_post_commit_ack_loss,
+                    });
+                }
+                break;
+            };
         assert_recorded_op_matches(recorded_ops.as_deref(), seed, op_index, &op);
         let target_node = operational_state.choose_target_node_for_op(&op);
         let target_server = operational_state.target(&server, target_node);
@@ -4761,8 +4918,12 @@ async fn run_seed_inner(
         let execution_phase = ExecutionPhase::Workload;
         let inject_post_commit_ack_loss =
             post_commit_selftest && !post_commit_ack_loss_fired && matches!(op, Op::Upsert { .. });
-        let faulted_late_query = assignment.profile == Some(FaultProfile::LateStream)
-            && matches!(op, Op::LateQuery { .. })
+        let late_fault_query = scheduler.as_ref().is_some_and(|scheduler| {
+            matches!(
+                scheduler.schedule().profile,
+                FaultProfile::LateStream | FaultProfile::LateContent
+            )
+        }) && matches!(op, Op::LateQuery { .. })
             && scheduler
                 .as_ref()
                 .is_some_and(|scheduler| scheduler.fault_window_active(op_index, op.namespace()));
@@ -4822,27 +4983,48 @@ async fn run_seed_inner(
                 continue;
             }
         };
+        let faulted_late_query = late_fault_query
+            || (matches!(op, Op::LateQuery { .. })
+                && scheduler.as_ref().is_some_and(|scheduler| {
+                    scheduler.timeline().iter().any(|event| {
+                        event.op_index == op_index
+                            && event.observed == ObservedResult::Corrupted
+                            && event.key.as_deref().is_some_and(late_artifact_key)
+                    })
+                }));
         if let Some(event_id) = late_stream_event_id.as_deref() {
-            let event_fired_on_late_truth = scheduler
+            let event_fired_on_late_artifact = scheduler
                 .as_ref()
-                .expect("late-stream probe requires a fault scheduler")
+                .expect("late artifact probe requires a fault scheduler")
                 .timeline()
                 .iter()
                 .any(|event| {
                     event.event_id == event_id
                         && event.op_index == op_index
-                        && event
-                            .key
-                            .as_deref()
-                            .is_some_and(|key| key.contains("/late/segments/"))
+                        && event.key.as_deref().is_some_and(late_artifact_key)
                 });
-            if !event_fired_on_late_truth {
+            // A fired durable PUT corruption can legitimately starve later
+            // artifact reads (bricked compaction, missing published
+            // artifacts), so only insist the window fired on namespaces
+            // without durable taint.
+            let ns_durably_tainted = corruption_tracker
+                .durably_tainted_keys(op.namespace())
+                .is_some();
+            if !event_fired_on_late_artifact && !ns_durably_tainted {
+                let profile = scheduler
+                    .as_ref()
+                    .expect("late artifact probe requires a fault scheduler")
+                    .schedule()
+                    .profile;
                 step.violations.push(Violation {
-                    id: ViolationId::I33LateWorkerLifecycle,
+                    id: if profile == FaultProfile::LateContent {
+                        ViolationId::I20CorruptionSurfaced
+                    } else {
+                        ViolationId::I33LateWorkerLifecycle
+                    },
                     op_index,
                     namespace: op.namespace().to_string(),
-                    detail: "scheduled late-stream fault did not reach a late truth read"
-                        .to_string(),
+                    detail: "scheduled late fault did not reach a late artifact read".to_string(),
                     evidence: json!({ "event_id": event_id }),
                 });
             }
@@ -4914,19 +5096,33 @@ async fn run_seed_inner(
         {
             compactions += 1;
         }
-        if assignment.profile == Some(FaultProfile::LateStream)
-            && late_stream_event_id.is_none()
+        if scheduler.as_ref().is_some_and(|scheduler| {
+            matches!(
+                scheduler.schedule().profile,
+                FaultProfile::LateStream | FaultProfile::LateContent
+            )
+        }) && late_stream_event_id.is_none()
             && (200..300).contains(&step.status)
             && matches!(op, Op::LateQuery { filter: None, .. })
         {
             late_stream_fault_probe = Some(op.clone());
         }
         op_index += 1;
+        if durable_probe_after {
+            deferred_ops.push_front(
+                late_stream_fault_probe
+                    .clone()
+                    .expect("durable late corruption opened before a clean probe"),
+            );
+        }
         if faulted_late_query {
             clean_late_followups.push_back(CleanLateFollowup {
                 faulted_op_index: op_index - 1,
                 op: op.clone(),
             });
+            if corruption_tracker.late_persistent_active(op.namespace()) {
+                deferred_ops.push_front(generator.late_repair_upsert(&model));
+            }
         }
         if !step.violations.is_empty() {
             failed = true;
@@ -5293,10 +5489,16 @@ async fn run_seed_inner(
         );
     }
 
-    if assignment.profile == Some(FaultProfile::LateStream) && !failed {
+    if scheduler.as_ref().is_some_and(|scheduler| {
+        matches!(
+            scheduler.schedule().profile,
+            FaultProfile::LateStream | FaultProfile::LateContent
+        )
+    }) && !failed
+    {
         let scheduler = scheduler
             .as_ref()
-            .expect("late-stream campaign requires a fault scheduler");
+            .expect("late campaign requires a fault scheduler");
         let fired_event_ids = scheduler
             .timeline()
             .into_iter()
@@ -5312,13 +5514,36 @@ async fn run_seed_inner(
         if !missing_event_ids.is_empty() {
             failed = true;
             failure_violations.push(Violation {
-                id: ViolationId::I33LateWorkerLifecycle,
+                id: if scheduler.schedule().profile == FaultProfile::LateContent {
+                    ViolationId::I20CorruptionSurfaced
+                } else {
+                    ViolationId::I33LateWorkerLifecycle
+                },
                 op_index,
-                namespace: "late-stream".to_string(),
-                detail: "late-stream campaign finished without firing every scheduled fault"
-                    .to_string(),
+                namespace: scheduler.schedule().profile.as_env().to_string(),
+                detail: "late campaign finished without firing every scheduled fault".to_string(),
                 evidence: json!({ "missing_event_ids": missing_event_ids }),
             });
+        }
+        if scheduler.schedule().profile == FaultProfile::LateContent {
+            let non_late_keys = scheduler
+                .timeline()
+                .into_iter()
+                .filter(|event| event.observed == ObservedResult::Corrupted)
+                .filter_map(|event| event.key)
+                .filter(|key| !late_artifact_key(key))
+                .collect::<Vec<_>>();
+            if !non_late_keys.is_empty() {
+                failed = true;
+                failure_violations.push(Violation {
+                    id: ViolationId::I20CorruptionSurfaced,
+                    op_index,
+                    namespace: "late-content".to_string(),
+                    detail: "late-content campaign corrupted keys outside the late catalog"
+                        .to_string(),
+                    evidence: json!({ "non_late_keys": non_late_keys }),
+                });
+            }
         }
     }
 
@@ -5970,37 +6195,61 @@ fn op_awaits_store_fault_window_close(
     deferred_namespace_delete_targets(deferred, op.namespace())
 }
 
-fn late_stream_fault_probe_for_window(
+fn late_fault_probe_for_window(
     scheduler: Option<&FaultScheduler>,
     op_index: u64,
     cached_probe: Option<&Op>,
-) -> Option<(String, Op)> {
+) -> Option<(String, Option<Op>)> {
     let scheduler = scheduler?;
-    if scheduler.schedule().profile != FaultProfile::LateStream {
+    if !matches!(
+        scheduler.schedule().profile,
+        FaultProfile::LateStream | FaultProfile::LateContent
+    ) {
         return None;
     }
     let mut active_events = scheduler.schedule().events.iter().filter(|event| {
         event.boundary == Boundary::ObjectStore
             && event.target.store_op == Some(StoreOp::Get)
+            && event.end_op.is_some()
             && op_index >= event.start_op
             && event.end_op.is_none_or(|end_op| op_index < end_op)
     });
     let event = active_events.next()?;
     assert!(
         active_events.next().is_none(),
-        "late-stream GET fault windows must not overlap"
+        "late GET fault windows must not overlap"
     );
-    let probe = cached_probe.unwrap_or_else(|| {
-        panic!(
-            "late-stream window {} opened before a clean probe",
-            event.id
-        )
-    });
+    // Late queries never re-read the cached late/state section, so that
+    // window can only fire during a compaction's state reload — probe it
+    // with a compacting upsert (None) instead of a query.
+    if event.target.key_substring.as_deref() == Some("/late/state/") {
+        return Some((event.id.clone(), None));
+    }
+    let probe = cached_probe
+        .unwrap_or_else(|| panic!("late fault window {} opened before a clean probe", event.id));
     assert!(
         matches!(probe, Op::LateQuery { filter: None, .. }),
-        "late-stream fault probe must be an unfiltered late query"
+        "late fault probe must be an unfiltered late query"
     );
-    Some((event.id.clone(), probe.clone()))
+    Some((event.id.clone(), Some(probe.clone())))
+}
+
+fn late_content_repair_due(scheduler: Option<&FaultScheduler>, op_index: u64) -> Option<bool> {
+    let scheduler = scheduler?;
+    if scheduler.schedule().profile != FaultProfile::LateContent {
+        return None;
+    }
+    let prepare_get = scheduler.schedule().events.iter().any(|event| {
+        event.boundary == Boundary::ObjectStore
+            && event.target.store_op == Some(StoreOp::Get)
+            && event.start_op == op_index.saturating_add(1)
+    });
+    let fire_put = scheduler.schedule().events.iter().any(|event| {
+        event.boundary == Boundary::ObjectStore
+            && event.target.store_op == Some(StoreOp::Put)
+            && event.start_op == op_index
+    });
+    (prepare_get || fire_put).then_some(fire_put)
 }
 
 fn deferred_namespace_delete_targets(deferred: &VecDeque<Op>, namespace: &str) -> bool {
@@ -6060,6 +6309,8 @@ struct CorruptionTracker {
     seen_timeline_events: usize,
     tainted: BTreeMap<String, BTreeSet<String>>,
     durably_tainted: BTreeMap<String, BTreeSet<String>>,
+    late_transient_taint: BTreeMap<String, BTreeMap<String, u64>>,
+    late_persistent_taint: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl CorruptionTracker {
@@ -6089,6 +6340,22 @@ impl CorruptionTracker {
                         .or_default()
                         .insert(key.clone());
                 }
+                if late_artifact_key(key) {
+                    if durable_content_corruption(event) || flat_candidate_key(key) {
+                        self.late_persistent_taint
+                            .entry(namespace.clone())
+                            .or_default()
+                            .insert(key.clone());
+                    } else {
+                        self.late_transient_taint
+                            .entry(namespace.clone())
+                            .or_default()
+                            .insert(
+                                key.clone(),
+                                event.op_index.saturating_add(LATE_CONTENT_TAINT_SLOP_OPS),
+                            );
+                    }
+                }
             }
         }
         self.seen_timeline_events = timeline.len();
@@ -6102,6 +6369,50 @@ impl CorruptionTracker {
         self.durably_tainted
             .get(namespace)
             .filter(|keys| !keys.is_empty())
+    }
+
+    fn expire_late_transient(&mut self, op_index: u64) {
+        self.late_transient_taint.retain(|_, keys| {
+            keys.retain(|_, expires_at| op_index <= *expires_at);
+            !keys.is_empty()
+        });
+    }
+
+    fn late_tainted_keys(&self, namespace: &str) -> BTreeSet<String> {
+        let mut keys = self
+            .late_persistent_taint
+            .get(namespace)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(transient) = self.late_transient_taint.get(namespace) {
+            keys.extend(transient.keys().cloned());
+        }
+        keys
+    }
+
+    fn late_persistent_active(&self, namespace: &str) -> bool {
+        self.late_persistent_taint
+            .get(namespace)
+            .is_some_and(|keys| !keys.is_empty())
+    }
+
+    fn retain_active_late(&mut self, namespace: &str, active: &BTreeSet<String>) {
+        let Some(keys) = self.late_persistent_taint.get_mut(namespace) else {
+            return;
+        };
+        let active_flat_digests = active
+            .iter()
+            .filter_map(|key| flat_candidate_digest(key))
+            .collect::<BTreeSet<_>>();
+        keys.retain(|key| {
+            flat_candidate_digest(key).map_or_else(
+                || active.contains(key),
+                |digest| active_flat_digests.contains(digest),
+            )
+        });
+        if keys.is_empty() {
+            self.late_persistent_taint.remove(namespace);
+        }
     }
 
     fn retain_reachable(&mut self, namespace: &str, reachable: &BTreeSet<String>) {
@@ -6124,7 +6435,24 @@ impl CorruptionTracker {
     fn forget_namespace(&mut self, namespace: &str) {
         self.tainted.remove(namespace);
         self.durably_tainted.remove(namespace);
+        self.late_transient_taint.remove(namespace);
+        self.late_persistent_taint.remove(namespace);
     }
+}
+
+const LATE_CONTENT_TAINT_SLOP_OPS: u64 = 8;
+
+fn late_artifact_key(key: &str) -> bool {
+    key.contains("/late/segments/") || key.contains("/late/state/")
+}
+
+fn flat_candidate_key(key: &str) -> bool {
+    flat_candidate_digest(key).is_some()
+}
+
+fn flat_candidate_digest(key: &str) -> Option<&str> {
+    let digest = key.split("/flat-sq8-").nth(1)?.split(".bin").next()?;
+    (!digest.is_empty()).then_some(digest)
 }
 
 fn durable_content_corruption(event: &TimelineEvent) -> bool {
@@ -6182,6 +6510,55 @@ async fn reachable_keys_for_taint(
     .await
     .map(Some)
     .map_err(|error| error.to_string())
+}
+
+async fn active_late_keys_for_taint(
+    store: &ZeppelinStore,
+    namespace: &str,
+) -> Result<Option<BTreeSet<String>>, String> {
+    let manifest = Manifest::read(store, namespace)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(manifest) = manifest else {
+        return Ok(None);
+    };
+    let mut keys = BTreeSet::new();
+    if let Some(reference) = manifest.late_state.as_ref() {
+        keys.insert(reference.key.clone());
+    }
+    let Some(section) = manifest
+        .load_late_state(store)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(Some(keys));
+    };
+    let Some(active_id) = section.active_late_segment.as_deref() else {
+        return Ok(Some(keys));
+    };
+    let segment = section
+        .late_interaction_segments
+        .iter()
+        .find(|segment| segment.id == active_id)
+        .ok_or_else(|| {
+            format!("active late segment {active_id} is absent from its selected section")
+        })?;
+    keys.extend(
+        segment
+            .matrix_objects
+            .iter()
+            .map(|object| object.key.clone()),
+    );
+    keys.extend(
+        segment
+            .attribute_objects
+            .iter()
+            .map(|object| object.key.clone()),
+    );
+    if let Some(flat) = segment.flat_candidate.as_ref() {
+        keys.insert(flat.key.clone());
+    }
+    Ok(Some(keys))
 }
 
 fn unresolved_create_allows_missing_manifest_bookkeeping(model: &Model, op: &Op) -> bool {
@@ -6329,6 +6706,9 @@ async fn execute_raw_recorded_op(
                     started,
                     allow_missing_manifest_bookkeeping,
                     durably_tainted_keys.as_ref(),
+                    http_fault_context.as_ref().is_some_and(|context| {
+                        context.scheduler.fault_window_active(index, op.namespace())
+                    }),
                 )),
             ),
         ),
@@ -6721,56 +7101,105 @@ async fn finish_recorded_op(
     if let Some(context) = http_fault_context {
         corruption_tracker.observe(&context.scheduler.timeline(), &model.namespace_names());
     }
+    if (200..300).contains(&rec.status) && matches!(op, Op::LateUpsert { .. }) {
+        let reachability_store = http_fault_context
+            .map(|context| &context.bookkeeping_store)
+            .unwrap_or(&target.store);
+        match active_late_keys_for_taint(reachability_store, op.namespace()).await {
+            Ok(Some(active)) => {
+                corruption_tracker.retain_active_late(op.namespace(), &active);
+            }
+            Ok(None) => corruption_tracker.forget_namespace(op.namespace()),
+            Err(error) => eprintln!(
+                "late taint reachability refresh failed for {}: {error}",
+                op.namespace()
+            ),
+        }
+    }
     if (200..300).contains(&rec.status) {
         if let Op::DeleteNamespace { ns, .. } = op {
             s3_tracker.forget_namespace(ns);
             corruption_tracker.forget_namespace(ns);
         }
     }
-    let corruption = corruption_tracker
-        .tainted_keys(op.namespace())
-        .map(|tainted_keys| oracle::CorruptionContext {
-            tainted_keys,
-            fault_window_active: http_fault_context.is_some_and(|context| {
-                context
-                    .scheduler
-                    .fault_window_active(rec.index, op.namespace())
-            }),
-        });
+    corruption_tracker.expire_late_transient(rec.index);
+    let fault_window_active = http_fault_context.is_some_and(|context| {
+        context
+            .scheduler
+            .fault_window_active(rec.index, op.namespace())
+    });
+    let late_tainted_keys = matches!(op, Op::LateQuery { .. })
+        .then(|| corruption_tracker.late_tainted_keys(op.namespace()));
+    let tainted_keys = if matches!(op, Op::LateQuery { .. }) {
+        late_tainted_keys.as_ref().filter(|keys| !keys.is_empty())
+    } else {
+        corruption_tracker.tainted_keys(op.namespace())
+    };
+    let late_persistent_taint = matches!(op, Op::LateQuery { .. })
+        && corruption_tracker.late_persistent_active(op.namespace());
+    let corruption = tainted_keys.map(|tainted_keys| oracle::CorruptionContext {
+        tainted_keys,
+        fault_window_active,
+        late_persistent_taint,
+    });
     let mut violations =
         oracle::check_op_with_faults(model, &rec, mode, mutation, corruption.as_ref());
-    let late_stream_profile = http_fault_context
-        .is_some_and(|context| context.scheduler.schedule().profile == FaultProfile::LateStream);
-    let late_stream_fault_window_active = late_stream_profile
-        && http_fault_context.is_some_and(|context| {
-            context
-                .scheduler
-                .fault_window_active(rec.index, op.namespace())
-        });
-    if late_stream_profile && matches!(op, Op::LateQuery { .. }) {
-        violations.extend(oracle::check_i33_late_worker_lifecycle(
-            model,
-            &rec,
-            late_stream_fault_window_active,
-            mutation,
-        ));
-        if (200..300).contains(&rec.status) {
+    let scheduled_late_profile = http_fault_context.is_some_and(|context| {
+        matches!(
+            context.scheduler.schedule().profile,
+            FaultProfile::LateStream | FaultProfile::LateContent
+        )
+    });
+    let late_failure_explained =
+        scheduled_late_profile && (fault_window_active || late_persistent_taint);
+    if scheduled_late_profile && matches!(op, Op::LateQuery { .. }) {
+        let late_model_ambiguous = model
+            .namespaces
+            .get(op.namespace())
+            .is_some_and(|namespace| {
+                !namespace.indeterminate.is_empty() || !namespace.indeterminate_ns.is_empty()
+            });
+        if !(200..300).contains(&rec.status) || !late_model_ambiguous {
+            violations.extend(oracle::check_i33_late_worker_lifecycle(
+                model,
+                &rec,
+                late_failure_explained,
+                mutation,
+            ));
+        }
+        // TODO tighten once the model can exclude ambiguous late writes from
+        // the exact record set consulted by this query.
+        if (200..300).contains(&rec.status) && !late_model_ambiguous {
+            let direct_mutation = if mutation == Some(OracleMutation::LateSwallowCorruption)
+                && corruption.is_none()
+            {
+                None
+            } else {
+                mutation
+            };
             violations.extend(oracle::check_i31_late_exact(
                 model,
                 &rec,
                 RunMode::Deterministic,
-                mutation,
+                direct_mutation,
             ));
         }
     }
-    if (mode == RunMode::Deterministic || late_stream_profile)
+    if (mode == RunMode::Deterministic || scheduled_late_profile)
         && (200..300).contains(&rec.status)
         && matches!(op, Op::LateQuery { .. })
     {
+        let retry_excess_allowed = http_fault_context.is_some_and(|context| {
+            context.scheduler.schedule().profile == FaultProfile::LateContent
+                && context
+                    .scheduler
+                    .late_get_fault_window_active(rec.index, op.namespace())
+        });
         violations.extend(oracle::check_i32_late_read_accounting(
             &rec,
             late_read_observation
                 .expect("successful deterministic late query must retain GET accounting"),
+            retry_excess_allowed,
             mutation,
         ));
     }
@@ -6954,6 +7383,7 @@ fn inject_lost_http_acknowledgement_after_commit(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_op(
     client: &Client,
     target: &OpExecutionTarget,
@@ -6962,6 +7392,7 @@ async fn execute_op(
     started: Instant,
     allow_missing_manifest_bookkeeping: bool,
     durably_tainted_keys: Option<&BTreeSet<String>>,
+    late_fault_window_active: bool,
 ) -> OpRecord {
     let before = Instant::now();
     let (method, path, status, response) = match op {
@@ -7032,7 +7463,12 @@ async fn execute_op(
             )
             .await;
             if (200..300).contains(&status) {
-                let admitted = enrich_pending_retrieval_units(
+                // Inside an active late fault window the enrichment state
+                // read may be the very read a scheduled corruption targets;
+                // its loud failure is the expected outcome, and the runner
+                // drains the pending units with a repair upsert on the next
+                // op (fire-once faults cannot re-fire there).
+                let admitted = match enrich_pending_retrieval_units(
                     &target.store,
                     Arc::clone(&target.lease_manager),
                     Arc::clone(&target.encoder_provider),
@@ -7040,20 +7476,52 @@ async fn execute_op(
                     ns,
                 )
                 .await
-                .unwrap_or_else(|error| {
-                    panic!("failed to enrich adversarial late upsert for {ns}: {error}")
-                });
-                assert!(
-                    admitted > 0,
-                    "successful adversarial late upsert for {ns} must admit enrichment work"
-                );
-                let compaction = target.compactor.compact(ns).await.unwrap_or_else(|error| {
-                    panic!("failed to compact adversarial late namespace {ns}: {error}")
-                });
-                assert!(
-                    compaction.segment_id.is_some(),
-                    "adversarial late upsert for {ns} must publish an immutable segment"
-                );
+                {
+                    Ok(admitted) => Some(admitted),
+                    Err(error) if late_fault_window_active => {
+                        println!(
+                            "tolerated late enrichment failure inside fault window for {ns}: {error}"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        panic!("failed to enrich adversarial late upsert for {ns}: {error}")
+                    }
+                };
+                if let Some(admitted) = admitted {
+                    assert!(
+                        admitted > 0,
+                        "successful adversarial late upsert for {ns} must admit enrichment work"
+                    );
+                    // A durable PUT-side corruption (torn/misdirected write)
+                    // can legitimately make compaction fail loudly until GC
+                    // or a rewrite clears the tainted artifact. Absorb that
+                    // outcome only for namespaces with a fired durable
+                    // taint; clean namespaces keep the fail-loud panic.
+                    let ns_durably_tainted = durably_tainted_keys
+                        .is_some_and(|keys| keys.iter().any(|key| key.contains(&format!("{ns}/"))));
+                    match target.compactor.compact(ns).await {
+                        Ok(compaction) => {
+                            assert!(
+                                compaction.segment_id.is_some() || ns_durably_tainted,
+                                "adversarial late upsert for {ns} must publish an immutable segment"
+                            );
+                        }
+                        Err(error) if ns_durably_tainted => {
+                            println!(
+                                "tolerated late compaction failure under durable taint for {ns}: {error}"
+                            );
+                        }
+                        Err(error) if late_fault_window_active => {
+                            println!(
+                                "tolerated late compaction failure inside fault window for {ns}: {error}"
+                            );
+                        }
+                        Err(error) => {
+                            panic!("failed to compact adversarial late namespace {ns}: {error}")
+                        }
+                    }
+                }
             }
             ("POST".to_string(), path, status, response)
         }
@@ -11870,6 +12338,7 @@ fn selftest_probe_op(
         }
         (
             OracleMutation::LateSkewScore
+            | OracleMutation::LateSwallowCorruption
             | OracleMutation::LateHiddenGet
             | OracleMutation::LateTruncatedResultSuccess,
             Op::LateUpsert { ns, records, .. },
@@ -14480,7 +14949,7 @@ mod outcome_tests {
     }
 
     #[test]
-    fn late_stream_window_selects_cached_unfiltered_late_query() {
+    fn late_fault_window_selects_cached_unfiltered_late_query() {
         let scheduler = FaultScheduler::from_schedule(FaultSchedule {
             profile: FaultProfile::LateStream,
             events: vec![FaultEvent {
@@ -14507,12 +14976,55 @@ mod outcome_tests {
             consistency: ConsistencyLevel::Strong,
         };
 
-        let (event_id, selected) =
-            late_stream_fault_probe_for_window(Some(&scheduler), 7, Some(&cached))
-                .expect("active late-stream window must select its cached query");
+        let (event_id, selected) = late_fault_probe_for_window(Some(&scheduler), 7, Some(&cached))
+            .expect("active late-stream window must select its cached query");
         assert_eq!(event_id, "late-stream-window");
-        assert!(matches!(selected, Op::LateQuery { filter: None, .. }));
-        assert!(late_stream_fault_probe_for_window(Some(&scheduler), 8, Some(&cached)).is_none());
+        assert!(matches!(selected, Some(Op::LateQuery { filter: None, .. })));
+        assert!(late_fault_probe_for_window(Some(&scheduler), 8, Some(&cached)).is_none());
+    }
+
+    #[test]
+    fn late_content_choreography_rebuilds_before_gets_and_on_durable_puts() {
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::LateContent,
+            events: vec![
+                FaultEvent {
+                    id: "late-content-get".to_string(),
+                    start_op: 20,
+                    end_op: Some(21),
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Get),
+                        key_substring: Some("/flat-sq8-".to_string()),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::Content(ContentFault::BitFlip { offset_hint: 1 }),
+                },
+                FaultEvent {
+                    id: "late-content-put".to_string(),
+                    start_op: 40,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Put),
+                        key_substring: Some("/late/segments/".to_string()),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::Content(ContentFault::MisdirectedWrite),
+                },
+            ],
+        });
+
+        assert_eq!(late_content_repair_due(Some(&scheduler), 19), Some(false));
+        assert_eq!(late_content_repair_due(Some(&scheduler), 40), Some(true));
+        assert_eq!(late_content_repair_due(Some(&scheduler), 18), None);
+    }
+
+    #[test]
+    fn one_shot_late_get_waits_for_a_natural_matching_query() {
+        let scheduler =
+            FaultScheduler::from_schedule(FaultSchedule::late_swallow_corruption_selftest());
+        assert!(late_fault_probe_for_window(Some(&scheduler), 0, None).is_none());
     }
 
     #[test]
@@ -14689,6 +15201,7 @@ mod outcome_tests {
                     "ns/segments/live.bin".to_string(),
                 ]),
             )]),
+            ..CorruptionTracker::default()
         };
 
         tracker.retain_reachable("ns", &BTreeSet::from(["ns/segments/live.bin".to_string()]));
@@ -14701,6 +15214,59 @@ mod outcome_tests {
             tracker.durably_tainted_keys("ns"),
             Some(&BTreeSet::from(["ns/segments/live.bin".to_string()]))
         );
+    }
+
+    #[test]
+    fn late_flat_taint_follows_active_content_digest() {
+        let digest = "a".repeat(64);
+        let replacement_digest = "b".repeat(64);
+        let old_key = format!("ns-late/late/segments/old/flat-sq8-{digest}.bin");
+        let same_digest_key = format!("ns-late/late/segments/new/flat-sq8-{digest}.bin");
+        let replacement_key =
+            format!("ns-late/late/segments/newer/flat-sq8-{replacement_digest}.bin");
+        let event = TimelineEvent {
+            event_id: "late-content-flat".to_string(),
+            op_index: 80,
+            wall_ms: 0,
+            boundary: Boundary::ObjectStore,
+            action: "Content(BitFlip { offset_hint: 1 })".to_string(),
+            key: Some(old_key.clone()),
+            semantics: FaultSemantics::PostCommit,
+            observed: ObservedResult::Corrupted,
+            recovery: None,
+        };
+        let mut tracker = CorruptionTracker::default();
+        tracker.observe(&[event], &["ns-late".to_string()]);
+
+        assert!(tracker.late_persistent_active("ns-late"));
+        tracker.retain_active_late("ns-late", &BTreeSet::from([same_digest_key]));
+        assert!(tracker.late_persistent_active("ns-late"));
+        tracker.retain_active_late("ns-late", &BTreeSet::from([replacement_key]));
+        assert!(!tracker.late_persistent_active("ns-late"));
+    }
+
+    #[test]
+    fn transient_late_taint_expires_after_bounded_slop() {
+        let key = "ns-late/late/segments/segment/matrix_0.bin".to_string();
+        let event = TimelineEvent {
+            event_id: "late-content-matrix".to_string(),
+            op_index: 40,
+            wall_ms: 0,
+            boundary: Boundary::ObjectStore,
+            action: "Content(BitFlip { offset_hint: 1 })".to_string(),
+            key: Some(key.clone()),
+            semantics: FaultSemantics::PostCommit,
+            observed: ObservedResult::Corrupted,
+            recovery: None,
+        };
+        let mut tracker = CorruptionTracker::default();
+        tracker.observe(&[event], &["ns-late".to_string()]);
+
+        assert_eq!(tracker.late_tainted_keys("ns-late"), BTreeSet::from([key]));
+        tracker.expire_late_transient(48);
+        assert!(!tracker.late_tainted_keys("ns-late").is_empty());
+        tracker.expire_late_transient(49);
+        assert!(tracker.late_tainted_keys("ns-late").is_empty());
     }
 
     #[test]

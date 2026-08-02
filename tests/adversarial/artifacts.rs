@@ -2598,9 +2598,9 @@ fn seed_fault_contracts(seed: &SeedReport) -> Vec<FaultContract> {
 
 fn profile_contracts(profile: Option<FaultProfile>) -> Vec<FaultContract> {
     let classes: &[ContractClass] = match profile {
-        Some(FaultProfile::ProviderContractAbuse | FaultProfile::Content) => {
-            &[ContractClass::ProviderContractAbuse]
-        }
+        Some(
+            FaultProfile::ProviderContractAbuse | FaultProfile::Content | FaultProfile::LateContent,
+        ) => &[ContractClass::ProviderContractAbuse],
         Some(FaultProfile::FutureArchitecture | FaultProfile::Ops) => {
             &[ContractClass::FutureArchitecture]
         }

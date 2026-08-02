@@ -97,12 +97,13 @@ pub enum OracleMutation {
     PreservationBypass,
     AuditChainRecordDrop,
     LateSkewScore,
+    LateSwallowCorruption,
     LateHiddenGet,
     LateTruncatedResultSuccess,
 }
 
 impl OracleMutation {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::DropDelete,
         Self::SkewScore,
         Self::PhantomId,
@@ -130,6 +131,7 @@ impl OracleMutation {
         Self::PreservationBypass,
         Self::AuditChainRecordDrop,
         Self::LateSkewScore,
+        Self::LateSwallowCorruption,
         Self::LateHiddenGet,
         Self::LateTruncatedResultSuccess,
     ];
@@ -164,6 +166,7 @@ impl OracleMutation {
             "preservation-bypass" => Self::PreservationBypass,
             "audit-chain-record-drop" => Self::AuditChainRecordDrop,
             "late-skew-score" => Self::LateSkewScore,
+            "late-swallow-corruption" => Self::LateSwallowCorruption,
             "late-hidden-get" => Self::LateHiddenGet,
             "late-truncated-result-success" => Self::LateTruncatedResultSuccess,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
@@ -200,6 +203,7 @@ impl OracleMutation {
             Self::PreservationBypass => "preservation-bypass",
             Self::AuditChainRecordDrop => "audit-chain-record-drop",
             Self::LateSkewScore => "late-skew-score",
+            Self::LateSwallowCorruption => "late-swallow-corruption",
             Self::LateHiddenGet => "late-hidden-get",
             Self::LateTruncatedResultSuccess => "late-truncated-result-success",
         }
