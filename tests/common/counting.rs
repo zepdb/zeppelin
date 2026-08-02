@@ -31,6 +31,8 @@ use object_store::{
 use serde::Serialize;
 use zeppelin::storage::ZeppelinStore;
 
+use super::server::background_compaction_origin_active;
+
 /// The kind of S3 artifact a key refers to, derived from the real key
 /// builders in `src/` (see `classify`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -227,6 +229,7 @@ impl ClassCounters {
 #[derive(Clone, Debug, Default)]
 pub struct GetCounter {
     gets: Arc<DashMap<String, u64>>,
+    foreground_gets: Arc<DashMap<String, u64>>,
     ranges: Arc<DashMap<String, Vec<Range<usize>>>>,
     puts: Arc<DashMap<String, u64>>,
     create_puts: Arc<DashMap<String, u64>>,
@@ -245,6 +248,19 @@ impl GetCounter {
             .iter()
             .filter(|r| r.key().contains(substr))
             .map(|r| *r.value())
+            .sum()
+    }
+
+    /// Total foreground GETs whose key contains `substr`.
+    ///
+    /// Reads issued by the spawned background compaction loop are excluded so
+    /// request-level adversarial accounting is not polluted by maintenance.
+    #[must_use]
+    pub fn foreground_gets_matching(&self, substr: &str) -> u64 {
+        self.foreground_gets
+            .iter()
+            .filter(|record| record.key().contains(substr))
+            .map(|record| *record.value())
             .sum()
     }
 
@@ -445,6 +461,7 @@ impl GetCounter {
     /// Reset all recorded counts.
     pub fn reset(&self) {
         self.gets.clear();
+        self.foreground_gets.clear();
         self.ranges.clear();
         self.puts.clear();
         self.create_puts.clear();
@@ -558,6 +575,13 @@ impl ObjectStore for CountingStore {
             .entry(location.to_string())
             .and_modify(|v| *v += 1)
             .or_insert(1);
+        if !background_compaction_origin_active() {
+            self.counter
+                .foreground_gets
+                .entry(location.to_string())
+                .and_modify(|value| *value += 1)
+                .or_insert(1);
+        }
         if options.if_none_match.is_some() {
             self.counter
                 .conditional_gets
@@ -874,6 +898,27 @@ mod tests {
         assert!(is_control_plane_key("_audit/day/node/object.jsonl"));
         assert!(is_control_plane_key("_security/policies/version.json"));
         assert!(!is_control_plane_key("namespace/meta.json"));
+    }
+
+    #[tokio::test]
+    async fn foreground_get_count_excludes_background_compaction_reads() {
+        let base = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let (counted, counter) = counting_store(&base);
+        let backend = counted.inner();
+        let key = Path::from("namespace/late/segments/segment/matrix_0.bin");
+        backend
+            .put(&key, PutPayload::from_static(b"truth"))
+            .await
+            .expect("write late truth object");
+
+        backend.get(&key).await.expect("foreground late truth GET");
+        crate::common::server::with_background_compaction_origin(async {
+            backend.get(&key).await.expect("background late truth GET");
+        })
+        .await;
+
+        assert_eq!(counter.gets_matching("/matrix_"), 2);
+        assert_eq!(counter.foreground_gets_matching("/matrix_"), 1);
     }
 
     #[test]

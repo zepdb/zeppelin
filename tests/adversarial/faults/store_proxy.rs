@@ -874,6 +874,34 @@ fn truncated_result(result: GetResult, after_bytes: usize, key: String) -> GetRe
     }
 }
 
+async fn successful_short_result(
+    result: GetResult,
+    keep_bytes: usize,
+) -> OsResult<(GetResult, usize, usize)> {
+    let meta = result.meta.clone();
+    let range = result.range.clone();
+    let attributes = result.attributes.clone();
+    let bytes = result.bytes().await?;
+    assert!(
+        !bytes.is_empty(),
+        "late-stream short-range fault requires a non-empty GET body"
+    );
+    let expected_bytes = bytes.len();
+    let actual_bytes = keep_bytes.min(expected_bytes - 1);
+    let bytes = bytes.slice(..actual_bytes);
+    let payload = stream::once(async move { Ok(bytes) }).boxed();
+    Ok((
+        GetResult {
+            payload: GetResultPayload::Stream(payload),
+            meta,
+            range,
+            attributes,
+        },
+        expected_bytes,
+        actual_bytes,
+    ))
+}
+
 async fn content_result(
     result: GetResult,
     mutate: impl FnOnce(bytes::Bytes) -> bytes::Bytes,
@@ -1162,14 +1190,30 @@ impl ObjectStore for StoreFaultProxy {
                         Ok(result)
                     }
                     FaultKind::TruncatedGetStream { after_bytes } => {
-                        let result = truncated_result(result, after_bytes, key.clone());
+                        let (result, recovery) = if self.scheduler.schedule().profile
+                            == super::FaultProfile::LateStream
+                        {
+                            let (result, expected_bytes, actual_bytes) =
+                                successful_short_result(result, after_bytes).await?;
+                            (
+                                result,
+                                format!(
+                                    "served successful short range: expected {expected_bytes} bytes, got {actual_bytes}"
+                                ),
+                            )
+                        } else {
+                            (
+                                truncated_result(result, after_bytes, key.clone()),
+                                format!("stream errors after {after_bytes} bytes"),
+                            )
+                        };
                         assert!(reservation.commit());
                         self.record(
                             &action,
                             &key,
                             FaultSemantics::PostCommit,
                             ObservedResult::Ambiguous,
-                            Some(format!("stream errors after {after_bytes} bytes")),
+                            Some(recovery),
                         );
                         Ok(result)
                     }
@@ -2081,6 +2125,70 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn late_stream_short_body_surfaces_short_read_and_next_op_is_clean() {
+        use zeppelin::storage::read_plan::{
+            execute_read_plan, ReadPlan, ReadPlanConfig, ReadPlanError, ReadRequest,
+        };
+
+        let key = "test-adv-0-late/late/segments/seg/matrix_0.bin";
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        inner
+            .put(key, Bytes::from_static(b"0123456789abcdef"))
+            .await
+            .unwrap();
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::LateStream,
+            events: vec![FaultEvent {
+                id: "late-stream-00".to_string(),
+                start_op: 0,
+                end_op: Some(1),
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("/matrix_".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::TruncatedGetStream { after_bytes: 3 },
+            }],
+        });
+        let faulted = store_fault_proxy(&inner, scheduler.clone());
+        let config = ReadPlanConfig::new(1, 32, 1).unwrap();
+        let plan = ReadPlan::build(
+            &[ReadRequest {
+                object_key: key.to_string(),
+                range: 2..10,
+            }],
+            &config,
+        )
+        .unwrap();
+
+        let error = execute_read_plan(&faulted, &plan)
+            .await
+            .expect_err("successful short ranged body must fail the read plan");
+        assert!(matches!(
+            error,
+            ReadPlanError::ShortRead {
+                object_key,
+                expected_bytes: 8,
+                actual_bytes: 3,
+            } if object_key == key
+        ));
+        let timeline = scheduler.timeline();
+        assert_eq!(timeline.len(), 1);
+        assert!(timeline[0]
+            .recovery
+            .as_deref()
+            .is_some_and(|detail| detail.contains("expected 8 bytes, got 3")));
+
+        scheduler.advance_to(1);
+        let clean = execute_read_plan(&faulted, &plan)
+            .await
+            .expect("the next logical op must bypass the closed fault window");
+        assert_eq!(clean, vec![Bytes::from_static(b"23456789")]);
+        assert_eq!(scheduler.timeline().len(), 1);
     }
 
     #[tokio::test]

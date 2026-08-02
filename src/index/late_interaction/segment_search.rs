@@ -7,6 +7,8 @@
 //! cross-object read plan. Every retained exact matrix plus attribute payload
 //! forms one second (truth) plan; no row-dependent read occurs outside it.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
@@ -643,6 +645,37 @@ struct ScoredReadyTruthChunk {
     timing: TruthWaveTiming,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TruthPipelineTestFault {
+    #[default]
+    None,
+    DuplicateFirstPlannedDelivery,
+    PanicFirstWorker,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRUTH_PIPELINE_TEST_FAULT: Cell<TruthPipelineTestFault> =
+        const { Cell::new(TruthPipelineTestFault::None) };
+}
+
+#[cfg(test)]
+struct TruthPipelineTestFaultGuard(TruthPipelineTestFault);
+
+#[cfg(test)]
+impl Drop for TruthPipelineTestFaultGuard {
+    fn drop(&mut self) {
+        TRUTH_PIPELINE_TEST_FAULT.with(|fault| fault.set(self.0));
+    }
+}
+
+#[cfg(test)]
+fn inject_truth_pipeline_test_fault(fault: TruthPipelineTestFault) -> TruthPipelineTestFaultGuard {
+    let previous = TRUTH_PIPELINE_TEST_FAULT.with(|current| current.replace(fault));
+    TruthPipelineTestFaultGuard(previous)
+}
+
 /// Output from overlapping physical reads with parallel scoring.
 pub(crate) struct PipelinedTruthWave {
     pub(crate) rows: Vec<SegmentScoredRow>,
@@ -662,6 +695,8 @@ pub(crate) async fn execute_truth_wave_pipelined(
     candidates: Vec<LateCandidate>,
     plan: &ReadPlan,
 ) -> Result<PipelinedTruthWave> {
+    #[cfg(test)]
+    let test_fault = TRUTH_PIPELINE_TEST_FAULT.with(Cell::get);
     let candidate_count = candidates.len();
     let expected_logical = candidate_count
         .checked_mul(2)
@@ -693,6 +728,8 @@ pub(crate) async fn execute_truth_wave_pipelined(
         thread::scope(|scope| {
             let mut workers = Vec::with_capacity(worker_count);
             for mut receiver in receivers {
+                #[cfg(test)]
+                let worker_index = workers.len();
                 let query_values = &query_values;
                 let mandatory_filter = &mandatory_filter;
                 let request_filter = &request_filter;
@@ -713,6 +750,12 @@ pub(crate) async fn execute_truth_wave_pipelined(
                     let mut timing = TruthWaveTiming::default();
                     let mut first_error = None;
                     while let Some(ready) = receiver.blocking_recv() {
+                        #[cfg(test)]
+                        assert!(
+                            test_fault != TruthPipelineTestFault::PanicFirstWorker
+                                || worker_index != 0,
+                            "injected truth scoring worker panic"
+                        );
                         if first_error.is_some() {
                             continue;
                         }
@@ -777,6 +820,8 @@ pub(crate) async fn execute_truth_wave_pipelined(
     let mut logical_bytes = 0_u64;
     #[cfg(test)]
     let fetch_started = Instant::now();
+    #[cfg(test)]
+    let mut duplicate_delivery_injected = false;
     let completions = execute_read_plan_streamed(request.store, plan);
     futures::pin_mut!(completions);
     while let Some(completion) = completions.next().await {
@@ -784,6 +829,20 @@ pub(crate) async fn execute_truth_wave_pipelined(
         let logical = plan
             .logical_slices_for(planned_index, &bytes)
             .map_err(map_read_plan_error)?;
+        #[cfg(test)]
+        let logical = {
+            // ObjectStore controls returned bytes and failures, but ReadPlan owns
+            // planned indices and emits each one once. Duplicate the completion
+            // here to exercise the driver's otherwise-unreachable loud guard.
+            let mut logical = logical;
+            if test_fault == TruthPipelineTestFault::DuplicateFirstPlannedDelivery
+                && !duplicate_delivery_injected
+            {
+                logical.extend(logical.clone());
+                duplicate_delivery_injected = true;
+            }
+            logical
+        };
         for (logical_index, bytes) in logical {
             #[cfg(test)]
             {
@@ -942,9 +1001,21 @@ fn map_read_plan_error(error: ReadPlanError) -> ZeppelinError {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
-    use std::sync::Arc;
+    use std::fmt;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
 
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
     use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    };
 
     use crate::embedding::{
         ArtifactChecksum, ContentHash, EmbeddingProfileId, FdeGenerationId, MatrixDtype,
@@ -963,14 +1034,15 @@ mod tests {
     use crate::index::late_interaction::matrix_artifact::{
         build_matrix_blocks, BuiltMatrixBlock, MatrixBlockInputRow,
     };
-    use crate::storage::read_plan::{execute_read_plan, ReadPlan, ReadPlanConfig};
+    use crate::storage::read_plan::{execute_read_plan, ReadPlan, ReadPlanConfig, ReadRequest};
     use crate::storage::ZeppelinStore;
     use crate::types::{AttributeValue, Filter};
     use crate::wal::{LateCandidateKind, LateInteractionSegmentRef};
 
     use super::{
-        build_truth_requests, execute_truth_wave_pipelined, score_truth_wave_with_workers,
-        search_segment, SegmentSearchBounds, SegmentSearchRequest,
+        build_truth_requests, execute_truth_wave_pipelined, inject_truth_pipeline_test_fault,
+        score_truth_wave_with_workers, search_segment, PipelinedTruthWave, SegmentSearchBounds,
+        SegmentSearchRequest, TruthPipelineTestFault,
     };
 
     const MAX_BYTES: usize = 1024 * 1024;
@@ -979,6 +1051,129 @@ mod tests {
         store: ZeppelinStore,
         segment: LateInteractionSegmentRef,
         candidates: Vec<LateCandidate>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RangeReadFault {
+        Fail,
+        Short,
+    }
+
+    #[derive(Debug)]
+    struct FaultingRangeStore {
+        inner: Arc<dyn ObjectStore>,
+        target_key: String,
+        target_range: Range<usize>,
+        fault: RangeReadFault,
+        delay: Duration,
+        fired: Arc<AtomicBool>,
+    }
+
+    impl fmt::Display for FaultingRangeStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "FaultingRangeStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FaultingRangeStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            options: PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_range(
+            &self,
+            location: &ObjectPath,
+            range: Range<usize>,
+        ) -> object_store::Result<Bytes> {
+            let should_fault = location.as_ref() == self.target_key
+                && range == self.target_range
+                && self
+                    .fired
+                    .compare_exchange(false, true, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
+                    .is_ok();
+            if !should_fault {
+                return self.inner.get_range(location, range).await;
+            }
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            match self.fault {
+                RangeReadFault::Fail => Err(object_store::Error::Generic {
+                    store: "late_truth_test",
+                    source: Box::new(std::io::Error::other(
+                        "injected mid-stream truth read failure",
+                    )),
+                }),
+                RangeReadFault::Short => {
+                    let bytes = self.inner.get_range(location, range).await?;
+                    if bytes.is_empty() {
+                        return Err(object_store::Error::Generic {
+                            store: "late_truth_test",
+                            source: Box::new(std::io::Error::other(
+                                "cannot truncate an empty truth payload",
+                            )),
+                        });
+                    }
+                    Ok(bytes.slice(..bytes.len() - 1))
+                }
+            }
+        }
+
+        async fn head(&self, location: &ObjectPath) -> object_store::Result<ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
     }
 
     async fn fixture(candidate_k: usize, corrupt_matrix: bool) -> Fixture {
@@ -1209,6 +1404,61 @@ mod tests {
         ReadPlanConfig::new(4096, MAX_BYTES, 2).expect("read plan")
     }
 
+    fn fault_test_plan(requests: &[ReadRequest]) -> ReadPlanConfig {
+        let max_request_bytes = requests
+            .iter()
+            .map(|request| request.range.end - request.range.start)
+            .max()
+            .expect("truth requests must not be empty");
+        assert!(max_request_bytes > 1, "test payloads must exceed one byte");
+        ReadPlanConfig::new(1, max_request_bytes, requests.len())
+            .expect("fault-test truth read plan config")
+    }
+
+    fn faulting_store(
+        store: &ZeppelinStore,
+        target: &ReadRequest,
+        fault: RangeReadFault,
+        delay: Duration,
+    ) -> (ZeppelinStore, Arc<AtomicBool>) {
+        let fired = Arc::new(AtomicBool::new(false));
+        let faulting = FaultingRangeStore {
+            inner: store.inner(),
+            target_key: target.object_key.clone(),
+            target_range: target.range.clone(),
+            fault,
+            delay,
+            fired: Arc::clone(&fired),
+        };
+        (ZeppelinStore::new(Arc::new(faulting)), fired)
+    }
+
+    async fn execute_fixture_truth(
+        fixture: &Fixture,
+        store: &ZeppelinStore,
+        read_plan: &ReadPlanConfig,
+    ) -> crate::error::Result<PipelinedTruthWave> {
+        let truth_requests =
+            build_truth_requests(&fixture.segment, &fixture.candidates).expect("truth requests");
+        let truth_plan = ReadPlan::build(&truth_requests, read_plan).expect("truth plan");
+        let query = MultiVectorEmbedding::new(vec![1.0, 0.0], 1, 2, 4).expect("query");
+        let excluded_ids = BTreeSet::new();
+        let request = SegmentSearchRequest {
+            store,
+            bootstrap_cache: None,
+            segment: &fixture.segment,
+            exact_query: query.matrix_ref().expect("query matrix"),
+            candidate_query_fde: &[1.0, 0.0],
+            mandatory_filter: None,
+            request_filter: None,
+            excluded_ids: &excluded_ids,
+            top_k: fixture.candidates.len(),
+            read_plan,
+            bounds: bounds(),
+        };
+        execute_truth_wave_pipelined(&request, fixture.candidates.clone(), &truth_plan).await
+    }
+
     #[tokio::test]
     async fn parallel_truth_scoring_is_bit_identical_and_ordered() {
         let fixture = fixture(2, false).await;
@@ -1276,6 +1526,178 @@ mod tests {
             assert_eq!(pipelined.parent_id, sequential.parent_id);
             assert_eq!(pipelined.unit_ordinal, sequential.unit_ordinal);
             assert_eq!(pipelined.attributes, sequential.attributes);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipelined_truth_rejects_duplicate_planned_delivery_without_hanging() {
+        let fixture = fixture(2, false).await;
+        let fault =
+            inject_truth_pipeline_test_fault(TruthPipelineTestFault::DuplicateFirstPlannedDelivery);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_fixture_truth(&fixture, &fixture.store, &plan()),
+        )
+        .await
+        .expect("duplicate delivery must not hang");
+        let error = match result {
+            Ok(_) => panic!("duplicate planned delivery must fail"),
+            Err(error) => error,
+        };
+        drop(fault);
+
+        assert!(
+            error
+                .to_string()
+                .contains("truth pipeline delivered a payload twice"),
+            "unexpected duplicate-delivery error: {error}"
+        );
+        let follow_up = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_fixture_truth(&fixture, &fixture.store, &plan()),
+        )
+        .await
+        .expect("follow-up after duplicate delivery must not hang")
+        .expect("follow-up after duplicate delivery must succeed");
+        assert_eq!(follow_up.rows.len(), fixture.candidates.len());
+    }
+
+    #[tokio::test]
+    async fn pipelined_truth_surfaces_short_read_without_hanging() {
+        let fixture = fixture(2, false).await;
+        let requests =
+            build_truth_requests(&fixture.segment, &fixture.candidates).expect("truth requests");
+        let read_plan = fault_test_plan(&requests);
+        let (faulting, fired) = faulting_store(
+            &fixture.store,
+            &requests[1],
+            RangeReadFault::Short,
+            Duration::ZERO,
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_fixture_truth(&fixture, &faulting, &read_plan),
+        )
+        .await
+        .expect("short read must not hang");
+        let error = match result {
+            Ok(_) => panic!("short truth payload must fail"),
+            Err(error) => error,
+        };
+
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("short read for")
+                && error_text.contains("expected")
+                && error_text.contains("got"),
+            "unexpected short-read error: {error_text}"
+        );
+        assert!(fired.load(AtomicOrdering::SeqCst));
+        let follow_up = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_fixture_truth(&fixture, &faulting, &read_plan),
+        )
+        .await
+        .expect("follow-up after short read must not hang")
+        .expect("follow-up after one-shot short read must succeed");
+        assert_eq!(follow_up.rows.len(), fixture.candidates.len());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipelined_truth_worker_panic_errors_and_next_call_succeeds() {
+        let fixture = fixture(2, false).await;
+        let fault = inject_truth_pipeline_test_fault(TruthPipelineTestFault::PanicFirstWorker);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_fixture_truth(&fixture, &fixture.store, &plan()),
+        )
+        .await
+        .expect("worker panic must not hang");
+        let error = match result {
+            Ok(_) => panic!("worker panic must fail the truth pipeline"),
+            Err(error) => error,
+        };
+        drop(fault);
+
+        assert!(
+            error.to_string().contains("truth scoring worker"),
+            "unexpected worker-panic error: {error}"
+        );
+        let follow_up = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_fixture_truth(&fixture, &fixture.store, &plan()),
+        )
+        .await
+        .expect("follow-up after worker panic must not hang")
+        .expect("follow-up after worker panic must succeed");
+        assert_eq!(follow_up.rows.len(), fixture.candidates.len());
+    }
+
+    #[test]
+    fn pipelined_truth_midstream_failure_releases_runtime_and_recovers() {
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                runtime.block_on(async {
+                    let fixture = fixture(2, false).await;
+                    let requests = build_truth_requests(&fixture.segment, &fixture.candidates)
+                        .expect("truth requests");
+                    let read_plan = fault_test_plan(&requests);
+                    let (faulting, fired) = faulting_store(
+                        &fixture.store,
+                        requests.last().expect("candidate-two attribute request"),
+                        RangeReadFault::Fail,
+                        Duration::from_millis(25),
+                    );
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        execute_fixture_truth(&fixture, &faulting, &read_plan),
+                    )
+                    .await
+                    .expect("mid-stream failure must return promptly");
+                    let error = match result {
+                        Ok(_) => panic!("mid-stream storage failure must fail the truth pipeline"),
+                        Err(error) => error,
+                    };
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("injected mid-stream truth read failure"),
+                        "unexpected mid-stream error: {error}"
+                    );
+                    assert!(fired.load(AtomicOrdering::SeqCst));
+
+                    let follow_up = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        execute_fixture_truth(&fixture, &faulting, &read_plan),
+                    )
+                    .await
+                    .expect("follow-up after mid-stream failure must not hang")
+                    .expect("follow-up on the same store must succeed");
+                    assert_eq!(follow_up.rows.len(), fixture.candidates.len());
+                });
+                drop(runtime);
+            });
+            let result = outcome.map_err(|panic| {
+                if let Some(message) = panic.downcast_ref::<String>() {
+                    message.clone()
+                } else if let Some(message) = panic.downcast_ref::<&str>() {
+                    (*message).to_string()
+                } else {
+                    "runtime thread panicked without a string payload".to_string()
+                }
+            });
+            let _ = done_sender.send(result);
+        });
+
+        match done_receiver.recv_timeout(Duration::from_secs(8)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("mid-stream lifecycle test failed: {error}"),
+            Err(error) => panic!("runtime did not shut down promptly: {error}"),
         }
     }
 

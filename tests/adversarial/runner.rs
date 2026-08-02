@@ -3664,7 +3664,7 @@ async fn crash_recovery_probe(
     violations
 }
 
-fn sanitize_op_for_mode(op: Op, mode: RunMode) -> Op {
+fn sanitize_op_for_mode(op: Op, mode: RunMode, preserve_late_ops: bool) -> Op {
     if mode != RunMode::Chaos {
         return op;
     }
@@ -3681,6 +3681,7 @@ fn sanitize_op_for_mode(op: Op, mode: RunMode) -> Op {
         // Phase 1 deliberately gives MMLI its own deterministic profile. Keep
         // its direct enrichment/compaction bridge outside legacy fault runs;
         // later phases add late-specific fault semantics.
+        late @ (Op::LateUpsert { .. } | Op::LateQuery { .. }) if preserve_late_ops => late,
         Op::LateUpsert { actor, ns, .. } | Op::LateQuery { actor, ns, .. } => {
             Op::GetNamespace { actor, ns }
         }
@@ -4221,6 +4222,9 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
             OracleMutation::AuditChainRecordDrop => fired.contains(&ViolationId::I25AuditEvidence),
             OracleMutation::LateSkewScore => fired.contains(&ViolationId::I31LateExactEquivalence),
             OracleMutation::LateHiddenGet => fired.contains(&ViolationId::I32LateReadAccounting),
+            OracleMutation::LateTruncatedResultSuccess => {
+                fired.contains(&ViolationId::I33LateWorkerLifecycle)
+            }
         };
         assert!(
             accepted,
@@ -4290,7 +4294,10 @@ async fn run_seed_inner(
     let misdirected_write_selftest = mutation == Some(OracleMutation::MisdirectedWriteReachability);
     let assignment = effective_seed_assignment(env.mode, env.profile, seed);
     let branching_profile = assignment.profile == Some(FaultProfile::Branching);
-    let late_profile = assignment.profile == Some(FaultProfile::Late);
+    let late_profile = matches!(
+        assignment.profile,
+        Some(FaultProfile::Late | FaultProfile::LateStream)
+    );
     let profile = scheduled_profile(assignment.profile);
     let mode = if profile.is_some()
         || mutation == Some(OracleMutation::ChaosLostWrite)
@@ -4490,6 +4497,8 @@ async fn run_seed_inner(
     let mut post_commit_ack_loss_fired = false;
     let mut pending_held_op = None;
     let mut deferred_ops = VecDeque::new();
+    let mut clean_late_followups = VecDeque::new();
+    let mut late_stream_fault_probe = None;
     let mut quiet_drain_ops = VecDeque::new();
     let mut dual_writer_lease_hold = None;
     let mut dual_writer_lease_hold_activated = false;
@@ -4656,8 +4665,8 @@ async fn run_seed_inner(
                 break;
             }
         }
-        let deferred_count =
-            u64::try_from(deferred_ops.len()).expect("deferred operation count must fit in u64");
+        let deferred_count = u64::try_from(deferred_ops.len() + clean_late_followups.len())
+            .expect("deferred operation count must fit in u64");
         let reserved_workload_slots = op_index
             .checked_add(deferred_count)
             .expect("workload operation reservation overflow");
@@ -4674,17 +4683,49 @@ async fn run_seed_inner(
         } else {
             0
         };
+        let clean_followup_ready =
+            clean_late_followups
+                .front()
+                .is_some_and(|followup: &CleanLateFollowup| {
+                    scheduler.as_ref().is_none_or(|scheduler| {
+                        !scheduler.fault_window_active(op_index, followup.op.namespace())
+                    })
+                });
         let pending = pending_held_op.as_ref();
-        let Some(op) = next_fifo_deferred_op_with_budget(
+        let scheduled_late_stream_probe = late_stream_fault_probe_for_window(
+            scheduler.as_ref(),
+            op_index,
+            late_stream_fault_probe.as_ref(),
+        );
+        let (op, clean_followup_source_index, late_stream_event_id) = if clean_followup_ready {
+            let followup = clean_late_followups
+                .pop_front()
+                .expect("ready clean late-query follow-up disappeared");
+            (followup.op, Some(followup.faulted_op_index), None)
+        } else if let Some((event_id, probe)) = scheduled_late_stream_probe {
+            (probe, None, Some(event_id))
+        } else if let Some(op) = next_fifo_deferred_op_with_budget(
             &mut deferred_ops,
             generation_budget,
-            || sanitize_op_for_mode(generator.next(&model), mode),
+            || {
+                sanitize_op_for_mode(
+                    generator.next(&model),
+                    mode,
+                    assignment.profile == Some(FaultProfile::LateStream),
+                )
+            },
             |op, deferred| {
                 pending.is_some_and(|pending| {
                     op_conflicts_with_pending_hold(op, op_index, scheduler.as_ref(), pending)
                 }) || op_awaits_store_fault_window_close(op, op_index, scheduler.as_ref(), deferred)
             },
-        ) else {
+        ) {
+            (op, None, None)
+        } else {
+            assert!(
+                clean_late_followups.is_empty(),
+                "workload exhausted before mandatory clean late-query follow-ups became runnable"
+            );
             if let Some(pending) = pending_held_op.as_mut() {
                 assert!(
                     op_index <= pending.release_op,
@@ -4720,6 +4761,11 @@ async fn run_seed_inner(
         let execution_phase = ExecutionPhase::Workload;
         let inject_post_commit_ack_loss =
             post_commit_selftest && !post_commit_ack_loss_fired && matches!(op, Op::Upsert { .. });
+        let faulted_late_query = assignment.profile == Some(FaultProfile::LateStream)
+            && matches!(op, Op::LateQuery { .. })
+            && scheduler
+                .as_ref()
+                .is_some_and(|scheduler| scheduler.fault_window_active(op_index, op.namespace()));
         let execution = if pending_held_op.is_some() {
             RecordedExecutionOutcome::Completed(Box::new(
                 execute_recorded_op(
@@ -4765,7 +4811,7 @@ async fn run_seed_inner(
             )
             .await
         };
-        let step = match execution {
+        let mut step = match execution {
             RecordedExecutionOutcome::Completed(step) => *step,
             RecordedExecutionOutcome::Held(pending) => {
                 assert!(
@@ -4776,6 +4822,50 @@ async fn run_seed_inner(
                 continue;
             }
         };
+        if let Some(event_id) = late_stream_event_id.as_deref() {
+            let event_fired_on_late_truth = scheduler
+                .as_ref()
+                .expect("late-stream probe requires a fault scheduler")
+                .timeline()
+                .iter()
+                .any(|event| {
+                    event.event_id == event_id
+                        && event.op_index == op_index
+                        && event
+                            .key
+                            .as_deref()
+                            .is_some_and(|key| key.contains("/late/segments/"))
+                });
+            if !event_fired_on_late_truth {
+                step.violations.push(Violation {
+                    id: ViolationId::I33LateWorkerLifecycle,
+                    op_index,
+                    namespace: op.namespace().to_string(),
+                    detail: "scheduled late-stream fault did not reach a late truth read"
+                        .to_string(),
+                    evidence: json!({ "event_id": event_id }),
+                });
+            }
+        }
+        if let Some(faulted_op_index) = clean_followup_source_index {
+            if !(200..300).contains(&step.status)
+                && !step
+                    .violations
+                    .iter()
+                    .any(|violation| violation.id == ViolationId::I33LateWorkerLifecycle)
+            {
+                step.violations.push(Violation {
+                    id: ViolationId::I33LateWorkerLifecycle,
+                    op_index,
+                    namespace: op.namespace().to_string(),
+                    detail: "mandatory clean late query failed after a faulted query".to_string(),
+                    evidence: json!({
+                        "faulted_op_index": faulted_op_index,
+                        "followup_status": step.status,
+                    }),
+                });
+            }
+        }
         let pending_crash = take_step_crash(&step, scheduler.as_ref());
         post_commit_ack_loss_fired |= step.post_commit_ack_lost;
         if matches!(op, Op::CreateNamespace { .. }) && (200..300).contains(&step.status) {
@@ -4824,7 +4914,20 @@ async fn run_seed_inner(
         {
             compactions += 1;
         }
+        if assignment.profile == Some(FaultProfile::LateStream)
+            && late_stream_event_id.is_none()
+            && (200..300).contains(&step.status)
+            && matches!(op, Op::LateQuery { filter: None, .. })
+        {
+            late_stream_fault_probe = Some(op.clone());
+        }
         op_index += 1;
+        if faulted_late_query {
+            clean_late_followups.push_back(CleanLateFollowup {
+                faulted_op_index: op_index - 1,
+                op: op.clone(),
+            });
+        }
         if !step.violations.is_empty() {
             failed = true;
             failure_violations = step.violations;
@@ -4861,8 +4964,8 @@ async fn run_seed_inner(
             }
         }
 
-        let deferred_count =
-            u64::try_from(deferred_ops.len()).expect("deferred operation count must fit in u64");
+        let deferred_count = u64::try_from(deferred_ops.len() + clean_late_followups.len())
+            .expect("deferred operation count must fit in u64");
         let probe_slot_available = op_index
             .checked_add(deferred_count)
             .is_some_and(|reserved| reserved < max_ops);
@@ -5032,6 +5135,11 @@ async fn run_seed_inner(
             "workload ended with {} generated operations still deferred",
             deferred_ops.len()
         );
+        assert!(
+            clean_late_followups.is_empty(),
+            "workload ended with {} mandatory clean late-query follow-ups pending",
+            clean_late_followups.len()
+        );
         if generation_cap_reached {
             assert_eq!(
                 expected_workload_count, max_ops,
@@ -5183,6 +5291,35 @@ async fn run_seed_inner(
             }),
             "post-commit selftest never exercised manifest acknowledgement recovery"
         );
+    }
+
+    if assignment.profile == Some(FaultProfile::LateStream) && !failed {
+        let scheduler = scheduler
+            .as_ref()
+            .expect("late-stream campaign requires a fault scheduler");
+        let fired_event_ids = scheduler
+            .timeline()
+            .into_iter()
+            .map(|event| event.event_id)
+            .collect::<BTreeSet<_>>();
+        let missing_event_ids = scheduler
+            .schedule()
+            .events
+            .iter()
+            .filter(|event| !fired_event_ids.contains(&event.id))
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>();
+        if !missing_event_ids.is_empty() {
+            failed = true;
+            failure_violations.push(Violation {
+                id: ViolationId::I33LateWorkerLifecycle,
+                op_index,
+                namespace: "late-stream".to_string(),
+                detail: "late-stream campaign finished without firing every scheduled fault"
+                    .to_string(),
+                evidence: json!({ "missing_event_ids": missing_event_ids }),
+            });
+        }
     }
 
     let audit_store = server.store.clone();
@@ -5339,6 +5476,12 @@ struct StepOutcome {
     violations: Vec<Violation>,
     post_commit_ack_lost: bool,
     crash: Option<CrashRequest>,
+}
+
+#[derive(Debug)]
+struct CleanLateFollowup {
+    faulted_op_index: u64,
+    op: Op,
 }
 
 fn take_step_crash(step: &StepOutcome, scheduler: Option<&FaultScheduler>) -> Option<CrashRequest> {
@@ -5827,6 +5970,39 @@ fn op_awaits_store_fault_window_close(
     deferred_namespace_delete_targets(deferred, op.namespace())
 }
 
+fn late_stream_fault_probe_for_window(
+    scheduler: Option<&FaultScheduler>,
+    op_index: u64,
+    cached_probe: Option<&Op>,
+) -> Option<(String, Op)> {
+    let scheduler = scheduler?;
+    if scheduler.schedule().profile != FaultProfile::LateStream {
+        return None;
+    }
+    let mut active_events = scheduler.schedule().events.iter().filter(|event| {
+        event.boundary == Boundary::ObjectStore
+            && event.target.store_op == Some(StoreOp::Get)
+            && op_index >= event.start_op
+            && event.end_op.is_none_or(|end_op| op_index < end_op)
+    });
+    let event = active_events.next()?;
+    assert!(
+        active_events.next().is_none(),
+        "late-stream GET fault windows must not overlap"
+    );
+    let probe = cached_probe.unwrap_or_else(|| {
+        panic!(
+            "late-stream window {} opened before a clean probe",
+            event.id
+        )
+    });
+    assert!(
+        matches!(probe, Op::LateQuery { filter: None, .. }),
+        "late-stream fault probe must be an unfiltered late query"
+    );
+    Some((event.id.clone(), probe.clone()))
+}
+
 fn deferred_namespace_delete_targets(deferred: &VecDeque<Op>, namespace: &str) -> bool {
     deferred
         .iter()
@@ -6134,8 +6310,9 @@ async fn execute_raw_recorded_op(
             .as_ref()
             .expect("late query execution requires a per-seed CountingStore");
         oracle::LateReadObservation {
-            candidate_gets: counter.gets_matching("candidate-cluster-"),
-            truth_gets: counter.gets_matching("/matrix_") + counter.gets_matching("/attrs_"),
+            candidate_gets: counter.foreground_gets_matching("candidate-cluster-"),
+            truth_gets: counter.foreground_gets_matching("/matrix_")
+                + counter.foreground_gets_matching("/attrs_"),
         }
     });
     let request = WORKLOAD_REQUEST_ID.scope(
@@ -6179,12 +6356,13 @@ async fn execute_raw_recorded_op(
             .expect("late query execution requires a per-seed CountingStore");
         oracle::LateReadObservation {
             candidate_gets: counter
-                .gets_matching("candidate-cluster-")
+                .foreground_gets_matching("candidate-cluster-")
                 .checked_sub(baseline.candidate_gets)
                 .expect("candidate GET counter must remain monotonic"),
-            truth_gets: (counter.gets_matching("/matrix_") + counter.gets_matching("/attrs_"))
-                .checked_sub(baseline.truth_gets)
-                .expect("truth GET counter must remain monotonic"),
+            truth_gets: (counter.foreground_gets_matching("/matrix_")
+                + counter.foreground_gets_matching("/attrs_"))
+            .checked_sub(baseline.truth_gets)
+            .expect("truth GET counter must remain monotonic"),
         }
     });
     rec.target_node = target_node;
@@ -6561,7 +6739,31 @@ async fn finish_recorded_op(
         });
     let mut violations =
         oracle::check_op_with_faults(model, &rec, mode, mutation, corruption.as_ref());
-    if mode == RunMode::Deterministic
+    let late_stream_profile = http_fault_context
+        .is_some_and(|context| context.scheduler.schedule().profile == FaultProfile::LateStream);
+    let late_stream_fault_window_active = late_stream_profile
+        && http_fault_context.is_some_and(|context| {
+            context
+                .scheduler
+                .fault_window_active(rec.index, op.namespace())
+        });
+    if late_stream_profile && matches!(op, Op::LateQuery { .. }) {
+        violations.extend(oracle::check_i33_late_worker_lifecycle(
+            model,
+            &rec,
+            late_stream_fault_window_active,
+            mutation,
+        ));
+        if (200..300).contains(&rec.status) {
+            violations.extend(oracle::check_i31_late_exact(
+                model,
+                &rec,
+                RunMode::Deterministic,
+                mutation,
+            ));
+        }
+    }
+    if (mode == RunMode::Deterministic || late_stream_profile)
         && (200..300).contains(&rec.status)
         && matches!(op, Op::LateQuery { .. })
     {
@@ -6569,6 +6771,7 @@ async fn finish_recorded_op(
             &rec,
             late_read_observation
                 .expect("successful deterministic late query must retain GET accounting"),
+            late_stream_fault_window_active,
             mutation,
         ));
     }
@@ -11667,7 +11870,9 @@ fn selftest_probe_op(
             })
         }
         (
-            OracleMutation::LateSkewScore | OracleMutation::LateHiddenGet,
+            OracleMutation::LateSkewScore
+            | OracleMutation::LateHiddenGet
+            | OracleMutation::LateTruncatedResultSuccess,
             Op::LateUpsert { ns, records, .. },
         ) => records.first().map(|record| Op::LateQuery {
             actor: ActorSel::ADMIN,
@@ -11752,6 +11957,7 @@ mod outcome_tests {
     use axum::{Json, Router};
     use object_store::memory::InMemory;
     use zeppelin::index::quantization::QuantizationType;
+    use zeppelin::storage::read_plan::{ReadPlan, ReadPlanConfig, ReadRequest};
     use zeppelin::time::TimeSource;
     use zeppelin::types::DistanceMetric;
 
@@ -11759,6 +11965,35 @@ mod outcome_tests {
     use crate::adversarial::faults::{Direction, FaultEvent, InjectedErrorKind, TargetSelector};
     use crate::adversarial::model::NsModel;
     use crate::adversarial::ops::AsOfTarget;
+
+    #[test]
+    fn mmli_default_read_concurrency_reaches_the_built_read_plan() {
+        let config = Config::default();
+        let segment = &config.mmli.segment;
+        assert_eq!(segment.read_max_concurrency, 16);
+        let bounds = ReadPlanConfig::new(
+            segment.read_gap_budget_bytes,
+            segment.read_max_request_bytes,
+            segment.read_max_concurrency,
+        )
+        .expect("default MMLI read-plan bounds must validate");
+        let plan = ReadPlan::build(
+            &[ReadRequest {
+                object_key: "late/segments/default-probe/matrix_0.bin".to_string(),
+                range: 0..1,
+            }],
+            &bounds,
+        )
+        .expect("default MMLI read plan must build");
+
+        // ReadPlan intentionally keeps this execution bound private. Its
+        // derived Debug view lets this test pin the copied field without
+        // adding a production getter solely for test access.
+        assert!(
+            format!("{plan:?}").contains("max_concurrent_requests: 16"),
+            "MMLI config default did not reach ReadPlan.max_concurrent_requests"
+        );
+    }
 
     #[tokio::test]
     async fn seed_watchdog_fails_loudly_and_retires_a_hung_server_owner() {
@@ -14243,6 +14478,42 @@ mod outcome_tests {
         scheduled_ids.sort();
         assert_eq!(scheduled_ids, baseline_ids);
         assert_eq!(scheduled.len(), baseline.len());
+    }
+
+    #[test]
+    fn late_stream_window_selects_cached_unfiltered_late_query() {
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::LateStream,
+            events: vec![FaultEvent {
+                id: "late-stream-window".to_string(),
+                start_op: 7,
+                end_op: Some(8),
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("/matrix_".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::PreFail {
+                    error: InjectedErrorKind::Http500,
+                },
+            }],
+        });
+        let cached = Op::LateQuery {
+            actor: ActorSel::ADMIN,
+            ns: "namespace-late".to_string(),
+            query: vec![vec![1.0, 0.0]],
+            top_k: 1,
+            filter: None,
+            consistency: ConsistencyLevel::Strong,
+        };
+
+        let (event_id, selected) =
+            late_stream_fault_probe_for_window(Some(&scheduler), 7, Some(&cached))
+                .expect("active late-stream window must select its cached query");
+        assert_eq!(event_id, "late-stream-window");
+        assert!(matches!(selected, Op::LateQuery { filter: None, .. }));
+        assert!(late_stream_fault_probe_for_window(Some(&scheduler), 8, Some(&cached)).is_none());
     }
 
     #[test]

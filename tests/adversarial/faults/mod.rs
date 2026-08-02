@@ -19,6 +19,9 @@ use super::chaos::StoreOp;
 use super::security_program::SECURITY_AUDIT_BARRIER_OP;
 
 const FAULT_WINDOW_TRAILING_OPS: u64 = 8;
+const LATE_STREAM_FIRST_FAULT_OP: u64 = 80;
+const LATE_STREAM_FAULT_LIMIT: u64 = 480;
+const LATE_STREAM_KEY_SUBSTRINGS: [&str; 3] = ["late/segments/", "/matrix_", "/attrs_"];
 
 tokio::task_local! {
     static ARMED_HOLD_EVENT_ID: String;
@@ -60,6 +63,8 @@ pub enum FaultProfile {
     Branching,
     /// Deterministic MMLI-heavy workload. Phase 1 schedules no faults.
     Late,
+    /// MMLI-heavy workload with deterministic streamed-read fault windows.
+    LateStream,
     ProviderContractAbuse,
     FutureArchitecture,
     // Legacy Phase 5-7 profiles remain decodable and explicitly runnable for
@@ -84,6 +89,7 @@ impl FaultProfile {
             "security" => Self::Security,
             "branching" => Self::Branching,
             "late" => Self::Late,
+            "late-stream" => Self::LateStream,
             "provider_contract_abuse" => Self::ProviderContractAbuse,
             "future_architecture" => Self::FutureArchitecture,
             "content" => Self::Content,
@@ -107,6 +113,7 @@ impl FaultProfile {
             Self::Security => "security",
             Self::Branching => "branching",
             Self::Late => "late",
+            Self::LateStream => "late-stream",
             Self::ProviderContractAbuse => "provider_contract_abuse",
             Self::FutureArchitecture => "future_architecture",
             Self::Content => "content",
@@ -128,6 +135,7 @@ impl FaultProfile {
             Self::Security => "security",
             Self::Branching => "branching",
             Self::Late => "late",
+            Self::LateStream => "late-stream",
             Self::ProviderContractAbuse => "provider-contract-abuse",
             Self::FutureArchitecture => "future-architecture",
             Self::Content => "content",
@@ -944,9 +952,9 @@ impl FaultScheduler {
                 (event.boundary == Boundary::ObjectStore
                     && event_is_active(event, op_index)
                     && (!runtime.fired.load(Ordering::SeqCst) || op_index < release_op)
-                    && calls
-                        .iter()
-                        .any(|(op, key)| store_target_matches(event, *op, key)))
+                    && calls.iter().any(|(op, key)| {
+                        store_target_matches(self.schedule.profile, event, *op, key)
+                    }))
                 .then(|| ForegroundHold {
                     event_id: event.id.clone(),
                     window_op,
@@ -997,7 +1005,7 @@ impl FaultScheduler {
         for (index, event) in self.schedule.events.iter().enumerate() {
             if !matches!(event.boundary, Boundary::ObjectStore | Boundary::Process)
                 || !event_is_active(event, current)
-                || !store_target_matches(event, op, key)
+                || !store_target_matches(self.schedule.profile, event, op, key)
                 || !partition_matches(&event.kind, op)
                 || !self.claim(index, event, current)
             {
@@ -1026,7 +1034,7 @@ impl FaultScheduler {
         'events: for (index, event) in self.schedule.events.iter().enumerate() {
             if !matches!(event.boundary, Boundary::ObjectStore | Boundary::Process)
                 || !event_is_active(event, current)
-                || !store_target_matches(event, StoreOp::Get, key)
+                || !store_target_matches(self.schedule.profile, event, StoreOp::Get, key)
                 || !partition_matches(&event.kind, StoreOp::Get)
             {
                 continue;
@@ -1440,16 +1448,27 @@ impl FaultScheduler {
 
     #[must_use]
     pub fn fault_window_active(&self, op_index: u64, namespace: &str) -> bool {
-        if self.runtime.quiesced.load(Ordering::SeqCst)
-            || !matches!(
-                self.schedule.profile,
-                FaultProfile::Content
-                    | FaultProfile::Semantic
-                    | FaultProfile::ProviderContractAbuse
-                    | FaultProfile::SupportedFull
-                    | FaultProfile::Full
-            )
-        {
+        if self.runtime.quiesced.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        if self.schedule.profile == FaultProfile::LateStream {
+            return namespace.ends_with("-late")
+                && self.schedule.events.iter().any(|event| {
+                    event.boundary == Boundary::ObjectStore
+                        && event.target.store_op == Some(StoreOp::Get)
+                        && event_is_active(event, op_index)
+                });
+        }
+
+        if !matches!(
+            self.schedule.profile,
+            FaultProfile::Content
+                | FaultProfile::Semantic
+                | FaultProfile::ProviderContractAbuse
+                | FaultProfile::SupportedFull
+                | FaultProfile::Full
+        ) {
             return false;
         }
 
@@ -1464,7 +1483,12 @@ impl FaultScheduler {
                         && event_is_active(event, op_index)
                         && matches!(event.kind, FaultKind::StaleRead)
                         && !runtime.fired.load(Ordering::SeqCst)
-                        && store_target_matches(event, StoreOp::Get, &manifest_key)
+                        && store_target_matches(
+                            self.schedule.profile,
+                            event,
+                            StoreOp::Get,
+                            &manifest_key,
+                        )
                         && partition_matches(&event.kind, StoreOp::Get)
                 });
         if prospective_one_shot {
@@ -1710,8 +1734,9 @@ fn event_is_active(event: &FaultEvent, current: u64) -> bool {
     current >= event.start_op && event.end_op.is_none_or(|end| current < end)
 }
 
-fn store_target_matches(event: &FaultEvent, op: StoreOp, key: &str) -> bool {
-    event.target.store_op.is_none_or(|expected| expected == op)
+fn store_target_matches(profile: FaultProfile, event: &FaultEvent, op: StoreOp, key: &str) -> bool {
+    (profile != FaultProfile::LateStream || key.contains("/late/segments/"))
+        && event.target.store_op.is_none_or(|expected| expected == op)
         && event
             .target
             .key_substring
@@ -1765,6 +1790,79 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
     let mut events = Vec::new();
     match profile {
         FaultProfile::LegacyChaos | FaultProfile::Branching | FaultProfile::Late => {}
+        FaultProfile::LateStream => {
+            // Phase-1 seed 0 persisted late truth artifacts as
+            // `late/segments/<segment>/matrix_0.bin` and
+            // `late/segments/<segment>/attrs_0.bin`. Keep these selectors
+            // coupled to logical operation windows so replay never depends on
+            // wall-clock timing.
+            let count: usize = rng.gen_range(3..=5);
+            let lane_width = (LATE_STREAM_FAULT_LIMIT - LATE_STREAM_FIRST_FAULT_OP)
+                / u64::try_from(count).expect("late-stream event count must fit u64");
+            let kind_rotation: usize = rng.gen_range(0..3);
+            let swap_truth_selectors = rng.gen_bool(0.5);
+
+            for index in 0..count {
+                let lane_start = LATE_STREAM_FIRST_FAULT_OP
+                    + u64::try_from(index).expect("late-stream event index must fit u64")
+                        * lane_width;
+                let lane_end = if index + 1 == count {
+                    LATE_STREAM_FAULT_LIMIT
+                } else {
+                    lane_start + lane_width
+                };
+                // The exclusive one-op end leaves at least one clean logical
+                // slot before the next event for the lifecycle follow-up.
+                let start_op = rng.gen_range(lane_start..=lane_end - 2);
+                let (kind, key_substring) = match (kind_rotation + index) % 3 {
+                    0 => (
+                        FaultKind::PreFail {
+                            error: if rng.gen_bool(0.5) {
+                                InjectedErrorKind::Http500
+                            } else {
+                                InjectedErrorKind::Http503
+                            },
+                        },
+                        if swap_truth_selectors {
+                            "/attrs_"
+                        } else {
+                            "/matrix_"
+                        },
+                    ),
+                    1 => (
+                        FaultKind::Latency {
+                            base_ms: rng.gen_range(5..=15),
+                            jitter_ms: rng.gen_range(10..=40),
+                        },
+                        "late/segments/",
+                    ),
+                    2 => (
+                        FaultKind::TruncatedGetStream {
+                            after_bytes: rng.gen_range(1..=32),
+                        },
+                        if swap_truth_selectors {
+                            "/matrix_"
+                        } else {
+                            "/attrs_"
+                        },
+                    ),
+                    _ => unreachable!("late-stream kind rotation has three entries"),
+                };
+                push_event(
+                    &mut events,
+                    profile,
+                    start_op,
+                    Some(start_op + 1),
+                    Boundary::ObjectStore,
+                    TargetSelector {
+                        store_op: Some(StoreOp::Get),
+                        key_substring: Some(key_substring.to_string()),
+                        ..TargetSelector::default()
+                    },
+                    kind,
+                );
+            }
+        }
         FaultProfile::PostCommit => {
             let selectors = [
                 (StoreOp::Put, ".wal"),
@@ -2808,6 +2906,7 @@ mod tests {
             FaultProfile::Clock,
             FaultProfile::Security,
             FaultProfile::Late,
+            FaultProfile::LateStream,
             FaultProfile::Content,
             FaultProfile::Semantic,
             FaultProfile::Sched,
@@ -2826,6 +2925,108 @@ mod tests {
                 }));
             }
         }
+    }
+
+    #[test]
+    fn late_stream_schedule_is_get_only_mixed_and_has_clean_followup_slots() {
+        for seed in 0..100 {
+            let scheduler = FaultScheduler::for_seed(seed, FaultProfile::LateStream);
+            let schedule = scheduler.schedule();
+            let events = &schedule.events;
+            assert_eq!(schedule.profile, FaultProfile::LateStream);
+            assert!((2..=5).contains(&events.len()), "seed {seed}: {events:#?}");
+
+            let mut kinds_seen = [false; 3];
+            let mut selectors_seen = [false; 3];
+            let mut previous_start = None;
+            for event in events {
+                assert_eq!(event.boundary, Boundary::ObjectStore);
+                assert_eq!(event.target.store_op, Some(StoreOp::Get));
+                assert!(event.target.path_substring.is_none());
+                assert!(event.target.methods.is_none());
+                assert!(event.start_op >= LATE_STREAM_FIRST_FAULT_OP);
+                assert_eq!(event.end_op, Some(event.start_op + 1));
+                assert!(event.start_op < LATE_STREAM_FAULT_LIMIT);
+                if let Some(previous_start) = previous_start {
+                    assert!(
+                        event.start_op >= previous_start + 2,
+                        "seed {seed} has no clean slot between {previous_start} and {}",
+                        event.start_op
+                    );
+                }
+                previous_start = Some(event.start_op);
+
+                let selector = event
+                    .target
+                    .key_substring
+                    .as_deref()
+                    .expect("late-stream GET must select a persisted artifact family");
+                match event.kind {
+                    FaultKind::PreFail { .. } => {
+                        assert!(matches!(selector, "/matrix_" | "/attrs_"));
+                        kinds_seen[0] = true;
+                    }
+                    FaultKind::Latency { jitter_ms, .. } => {
+                        assert!(jitter_ms > 0, "seed {seed}: {event:#?}");
+                        assert_eq!(selector, "late/segments/");
+                        kinds_seen[1] = true;
+                    }
+                    FaultKind::TruncatedGetStream { after_bytes } => {
+                        assert!(after_bytes > 0, "seed {seed}: {event:#?}");
+                        assert!(matches!(selector, "/matrix_" | "/attrs_"));
+                        kinds_seen[2] = true;
+                    }
+                    ref other => panic!("seed {seed} scheduled non-stream fault {other:?}"),
+                }
+
+                let selector_index = LATE_STREAM_KEY_SUBSTRINGS
+                    .iter()
+                    .position(|expected| selector == *expected)
+                    .unwrap_or_else(|| panic!("seed {seed} used unknown selector {selector}"));
+                selectors_seen[selector_index] = true;
+
+                assert!(scheduler.fault_window_active(event.start_op, "test-prefix-adv-7-late"));
+                assert!(
+                    !scheduler.fault_window_active(event.start_op + 1, "test-prefix-adv-7-late")
+                );
+                assert!(!scheduler.fault_window_active(event.start_op, "ordinary-namespace"));
+            }
+
+            assert_eq!(kinds_seen, [true; 3], "seed {seed}: {events:#?}");
+            assert_eq!(selectors_seen, [true; 3], "seed {seed}: {events:#?}");
+        }
+    }
+
+    #[test]
+    fn late_stream_artifact_selector_cannot_fault_ordinary_ivf_keys() {
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::LateStream,
+            events: vec![FaultEvent {
+                id: "late-stream-selector".to_string(),
+                start_op: 7,
+                end_op: Some(8),
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("/attrs_".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::PreFail {
+                    error: InjectedErrorKind::Http500,
+                },
+            }],
+        });
+        scheduler.advance_to(7);
+
+        assert!(scheduler
+            .store_decision(StoreOp::Get, "ordinary/segments/segment-id/attrs_0.bin")
+            .is_none());
+        assert!(scheduler
+            .store_decision(
+                StoreOp::Get,
+                "namespace-late/late/segments/segment-id/attrs_0.bin"
+            )
+            .is_some());
     }
 
     #[test]
@@ -3308,6 +3509,11 @@ mod tests {
         assert_eq!(FaultProfile::from_env("full"), FaultProfile::Full);
         assert_eq!(FaultProfile::from_env("late"), FaultProfile::Late);
         assert_eq!(FaultProfile::Late.as_env(), "late");
+        assert_eq!(
+            FaultProfile::from_env("late-stream"),
+            FaultProfile::LateStream
+        );
+        assert_eq!(FaultProfile::LateStream.as_env(), "late-stream");
         assert!(FaultScheduler::for_seed(7, FaultProfile::Late)
             .schedule()
             .events

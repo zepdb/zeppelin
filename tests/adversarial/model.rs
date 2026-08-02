@@ -98,10 +98,11 @@ pub enum OracleMutation {
     AuditChainRecordDrop,
     LateSkewScore,
     LateHiddenGet,
+    LateTruncatedResultSuccess,
 }
 
 impl OracleMutation {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::DropDelete,
         Self::SkewScore,
         Self::PhantomId,
@@ -130,6 +131,7 @@ impl OracleMutation {
         Self::AuditChainRecordDrop,
         Self::LateSkewScore,
         Self::LateHiddenGet,
+        Self::LateTruncatedResultSuccess,
     ];
 
     #[must_use]
@@ -163,6 +165,7 @@ impl OracleMutation {
             "audit-chain-record-drop" => Self::AuditChainRecordDrop,
             "late-skew-score" => Self::LateSkewScore,
             "late-hidden-get" => Self::LateHiddenGet,
+            "late-truncated-result-success" => Self::LateTruncatedResultSuccess,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -198,6 +201,7 @@ impl OracleMutation {
             Self::AuditChainRecordDrop => "audit-chain-record-drop",
             Self::LateSkewScore => "late-skew-score",
             Self::LateHiddenGet => "late-hidden-get",
+            Self::LateTruncatedResultSuccess => "late-truncated-result-success",
         }
     }
 

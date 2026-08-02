@@ -54,6 +54,7 @@ pub enum ViolationId {
     I30BranchingLifecycle,
     I31LateExactEquivalence,
     I32LateReadAccounting,
+    I33LateWorkerLifecycle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +108,7 @@ pub fn check_op(
         if mode == RunMode::Deterministic {
             violations.extend(check_i1_strong_exact(model, rec, mode, mutation));
             violations.extend(check_i31_late_exact(model, rec, mode, mutation));
+            violations.extend(check_i33_late_worker_lifecycle(model, rec, false, mutation));
             violations.extend(check_i8_as_of_exact(model, rec, mode, mutation));
             violations.extend(check_i3_membership(model, rec));
             violations.extend(check_i5_batch_equivalence(rec));
@@ -122,7 +124,7 @@ pub fn check_op(
 ///
 /// Deterministic successful late queries must match the f16-canonical model
 /// exactly by ID and order, with only the shared score tolerance allowed.
-fn check_i31_late_exact(
+pub(crate) fn check_i31_late_exact(
     model: &Model,
     rec: &OpRecord,
     mode: RunMode,
@@ -150,7 +152,7 @@ fn check_i31_late_exact(
             serde_json::json!({ "namespace": ns }),
         )];
     };
-    let Ok(results) = query_results(&rec.response) else {
+    let Ok(results) = late_query_results_for_oracle(rec, mutation) else {
         return vec![violation(
             ViolationId::I31LateExactEquivalence,
             rec,
@@ -164,6 +166,11 @@ fn check_i31_late_exact(
         if let Some((_, score)) = expected.first_mut() {
             *score += score_eps(*score) * 10.0;
         }
+    }
+    if mutation == Some(OracleMutation::LateTruncatedResultSuccess) {
+        // The mutation deliberately removes I31's cardinality defense. I33
+        // must independently reject the shortened successful response.
+        expected.truncate(results.len());
     }
 
     let actual_ids = results
@@ -208,6 +215,82 @@ fn check_i31_late_exact(
     violations
 }
 
+/// I33 — late streamed-read and worker-pool lifecycle safety.
+///
+/// A late query may fail loudly only while its request-scoped streamed-read
+/// fault window is active. Every successful response, faulted or clean, must
+/// retain the full model-derived result cardinality. The latter check is kept
+/// independent of I31 so a scorer/stream cannot surface a truncated top-K as
+/// success even if the exact-results comparison loses its count assertion.
+#[must_use]
+pub(crate) fn check_i33_late_worker_lifecycle(
+    model: &Model,
+    rec: &OpRecord,
+    fault_window_active: bool,
+    mutation: Option<OracleMutation>,
+) -> Vec<Violation> {
+    let Op::LateQuery {
+        ns,
+        query,
+        top_k,
+        filter,
+        ..
+    } = &rec.op
+    else {
+        return Vec::new();
+    };
+    if !(200..300).contains(&rec.status) {
+        if fault_window_active {
+            return Vec::new();
+        }
+        return vec![violation(
+            ViolationId::I33LateWorkerLifecycle,
+            rec,
+            ns,
+            "late query failed after its streamed-read fault window closed",
+            serde_json::json!({
+                "status": rec.status,
+                "response": rec.response,
+            }),
+        )];
+    }
+    let Some(ns_model) = model.namespaces.get(ns) else {
+        return vec![violation(
+            ViolationId::I33LateWorkerLifecycle,
+            rec,
+            ns,
+            "successful late query had no modeled namespace",
+            serde_json::json!({ "namespace": ns }),
+        )];
+    };
+    let Ok(results) = late_query_results_for_oracle(rec, mutation) else {
+        return vec![violation(
+            ViolationId::I33LateWorkerLifecycle,
+            rec,
+            ns,
+            "successful late query omitted a parseable result set",
+            rec.response.clone(),
+        )];
+    };
+    let expected_len = ns_model
+        .late_expected_results(query, *top_k, filter.as_ref())
+        .len();
+    if results.len() == expected_len {
+        return Vec::new();
+    }
+    vec![violation(
+        ViolationId::I33LateWorkerLifecycle,
+        rec,
+        ns,
+        "successful late query returned a truncated or oversized result set",
+        serde_json::json!({
+            "actual_len": results.len(),
+            "expected_len": expected_len,
+            "fault_window_active": fault_window_active,
+        }),
+    )]
+}
+
 /// Object-store GETs observed around one late query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LateReadObservation {
@@ -221,10 +304,18 @@ pub struct LateReadObservation {
 ///
 /// The runner owns the counting store and passes the per-operation deltas;
 /// the oracle compares them with the opt-in trace carried by the response.
+///
+/// Inside an active late-stream fault window the storage client may retry
+/// faulted GETs, so the backend legitimately observes more truth-wave GETs
+/// than planned. Window-scoped absorption: tolerate `observed >= planned`
+/// there (excess is retries; a shortfall still means the response skipped
+/// planned reads). Candidate-wave GETs stay forbidden, and strict equality
+/// applies whenever no window is active.
 #[must_use]
 pub fn check_i32_late_read_accounting(
     rec: &OpRecord,
     observation: LateReadObservation,
+    fault_window_active: bool,
     mutation: Option<OracleMutation>,
 ) -> Vec<Violation> {
     let Op::LateQuery { ns, .. } = &rec.op else {
@@ -272,7 +363,12 @@ pub fn check_i32_late_read_accounting(
             }),
         ));
     }
-    if observation.truth_gets != compared_planned {
+    let accounting_breach = if fault_window_active {
+        observation.truth_gets < compared_planned
+    } else {
+        observation.truth_gets != compared_planned
+    };
+    if accounting_breach {
         violations.push(violation(
             ViolationId::I32LateReadAccounting,
             rec,
@@ -282,6 +378,7 @@ pub fn check_i32_late_read_accounting(
                 "observed_truth_gets": observation.truth_gets,
                 "truth_planned_requests": planned,
                 "compared_planned_requests": compared_planned,
+                "fault_window_active": fault_window_active,
                 "mutation": mutation == Some(OracleMutation::LateHiddenGet),
             }),
         ));
@@ -2841,6 +2938,17 @@ fn query_results(response: &serde_json::Value) -> Result<Vec<WireSearchResult>, 
     serde_json::from_value(response["results"].clone())
 }
 
+fn late_query_results_for_oracle(
+    rec: &OpRecord,
+    mutation: Option<OracleMutation>,
+) -> Result<Vec<WireSearchResult>, serde_json::Error> {
+    let mut results = query_results(&rec.response)?;
+    if mutation == Some(OracleMutation::LateTruncatedResultSuccess) {
+        results.pop();
+    }
+    Ok(results)
+}
+
 fn fetch_response(response: &serde_json::Value) -> Result<WireFetchResponse, serde_json::Error> {
     serde_json::from_value(response.clone())
 }
@@ -3085,13 +3193,80 @@ mod tests {
             truth_gets: 2,
         };
 
-        assert!(check_i32_late_read_accounting(&rec, observation, None).is_empty());
-        let violations =
-            check_i32_late_read_accounting(&rec, observation, Some(OracleMutation::LateHiddenGet));
+        assert!(check_i32_late_read_accounting(&rec, observation, false, None).is_empty());
+        let violations = check_i32_late_read_accounting(
+            &rec,
+            observation,
+            false,
+            Some(OracleMutation::LateHiddenGet),
+        );
 
         assert!(violations
             .iter()
             .any(|violation| violation.id == ViolationId::I32LateReadAccounting));
+    }
+
+    #[test]
+    fn late_read_accounting_tolerates_retry_excess_only_inside_fault_window() {
+        let rec = late_query_record(None, json!([]));
+        let retry_excess = LateReadObservation {
+            candidate_gets: 0,
+            truth_gets: 5,
+        };
+        let shortfall = LateReadObservation {
+            candidate_gets: 0,
+            truth_gets: 1,
+        };
+
+        assert!(check_i32_late_read_accounting(&rec, retry_excess, true, None).is_empty());
+        assert!(!check_i32_late_read_accounting(&rec, retry_excess, false, None).is_empty());
+        assert!(!check_i32_late_read_accounting(&rec, shortfall, true, None).is_empty());
+    }
+
+    #[test]
+    fn late_truncated_success_mutation_is_absorbed_by_i31_but_fires_i33() {
+        let filter = Filter::Eq {
+            field: "group".to_string(),
+            value: AttributeValue::String("keep".to_string()),
+        };
+        let rec = late_query_record(
+            Some(filter),
+            json!([
+                { "id": "a", "score": 1.0 },
+                { "id": "b", "score": 1.0 }
+            ]),
+        );
+        let mutation = Some(OracleMutation::LateTruncatedResultSuccess);
+
+        let i31 = check_i31_late_exact(&late_model(), &rec, RunMode::Deterministic, mutation);
+        assert!(
+            i31.is_empty(),
+            "I31 mutation did not suppress count: {i31:#?}"
+        );
+
+        let i33 = check_i33_late_worker_lifecycle(&late_model(), &rec, true, mutation);
+        assert!(i33
+            .iter()
+            .any(|violation| violation.id == ViolationId::I33LateWorkerLifecycle));
+    }
+
+    #[test]
+    fn i33_absorbs_valid_fault_window_error_but_rejects_clean_error() {
+        let mut rec = late_query_record(None, json!([]));
+        rec.status = 500;
+        rec.response = json!({
+            "code": "STORAGE_ERROR",
+            "error": "injected ranged-read failure",
+            "status": 500,
+            "retryable": true,
+            "request_id": "i33-test"
+        });
+
+        assert!(check_i33_late_worker_lifecycle(&late_model(), &rec, true, None).is_empty());
+        let violations = check_i33_late_worker_lifecycle(&late_model(), &rec, false, None);
+        assert!(violations
+            .iter()
+            .any(|violation| violation.id == ViolationId::I33LateWorkerLifecycle));
     }
 
     #[test]
