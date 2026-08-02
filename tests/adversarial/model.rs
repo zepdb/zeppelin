@@ -315,6 +315,8 @@ pub struct NsModel {
     pub retained_generations: BTreeSet<u64>,
     pub live_generation: u64,
     pub indeterminate: BTreeMap<String, IndeterminateWrite>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub late_indeterminate: BTreeMap<String, LateIndeterminateWrite>,
     pub indeterminate_ns: Vec<NsIndeterminate>,
     pub canonical_queries: Vec<GeneratedQuery>,
     pub deleted_ever: BTreeSet<String>,
@@ -337,6 +339,17 @@ pub struct IndeterminateWrite {
 pub enum IndetEffect {
     MaybeUpserted(ModelRecord),
     MaybeDeleted,
+}
+
+/// One ambiguous late upsert record. Late record ids are minted
+/// monotonically and never overwritten, so resolution is a pure membership
+/// question: the candidate either became durable with exactly these
+/// canonicalized values or it does not exist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LateIndeterminateWrite {
+    pub op_index: u64,
+    pub reason: String,
+    pub candidate: LateModelRecord,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +544,7 @@ impl Model {
                 // the server serving rows the model does not expect.
                 if mutation != Some(OracleMutation::LateCrashLostSegment) {
                     for record in records {
+                        model.late_indeterminate.remove(&record.id);
                         model
                             .late_live
                             .insert(record.id.clone(), LateModelRecord::from(record));
@@ -1051,6 +1065,21 @@ impl Model {
                     );
                 }
             }
+            Op::LateUpsert { ns, records, .. } => {
+                let Some(model) = self.namespaces.get_mut(ns) else {
+                    return;
+                };
+                for record in records {
+                    model.late_indeterminate.insert(
+                        record.id.clone(),
+                        LateIndeterminateWrite {
+                            op_index,
+                            reason: reason.clone(),
+                            candidate: LateModelRecord::from(record),
+                        },
+                    );
+                }
+            }
             Op::DeleteVectors { ns, ids, .. } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
                     return;
@@ -1107,7 +1136,6 @@ impl Model {
                 }
             }
             Op::GetNamespace { .. }
-            | Op::LateUpsert { .. }
             | Op::FetchVectors { .. }
             | Op::Query { .. }
             | Op::LateQuery { .. }
@@ -1188,6 +1216,26 @@ impl Model {
             }
         }
     }
+
+    /// Resolve one ambiguous late upsert against a full-corpus membership
+    /// probe. Late ids are never reused, so presence in the probe result is
+    /// authoritative: present means the crashed upsert became durable with
+    /// the recorded candidate values; absent means it was lost.
+    pub fn resolve_late_indeterminate_record(
+        &mut self,
+        ns: &str,
+        id: &str,
+        applied: bool,
+    ) -> Option<LateIndeterminateWrite> {
+        let model = self.namespaces.get_mut(ns)?;
+        let pending = model.late_indeterminate.remove(id)?;
+        if applied {
+            model
+                .late_live
+                .insert(id.to_string(), pending.candidate.clone());
+        }
+        Some(pending)
+    }
 }
 
 fn records_semantically_equal(left: Option<&ModelRecord>, right: Option<&ModelRecord>) -> bool {
@@ -1220,6 +1268,7 @@ impl NsModel {
             retained_generations: BTreeSet::new(),
             live_generation: generation,
             indeterminate: BTreeMap::new(),
+            late_indeterminate: BTreeMap::new(),
             indeterminate_ns: Vec::new(),
             canonical_queries: Vec::new(),
             deleted_ever: BTreeSet::new(),

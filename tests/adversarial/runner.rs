@@ -12407,6 +12407,94 @@ async fn resolve_indeterminates(
         }
     }
 
+    for ns in model.namespace_names() {
+        let pending_late = model
+            .namespaces
+            .get(&ns)
+            .map(|ns_model| ns_model.late_indeterminate.clone())
+            .unwrap_or_default();
+        if pending_late.is_empty() {
+            continue;
+        }
+        // A crashed late upsert can be durable in the WAL while the
+        // harness-driven enrichment it interrupted never ran; force
+        // enrichment so the membership probe sees every durable row.
+        if let Err(error) = enrich_pending_retrieval_units(
+            &server.store,
+            Arc::clone(&server.lease_manager),
+            Arc::clone(&server.encoder_provider),
+            &server.namespace_manager,
+            &ns,
+        )
+        .await
+        {
+            panic!("late indeterminate enrichment failed for {ns}: {error}");
+        }
+        // Full-corpus strong probe: top_k covers the candidate bound (64),
+        // so membership in the result set is authoritative for every
+        // pending id. Late ids are never reused, which makes presence a
+        // complete answer — there is no old-versus-new value question.
+        let probe = pending_late
+            .values()
+            .next()
+            .expect("non-empty pending late map must have a candidate");
+        let mut probe_query = probe.candidate.values.clone();
+        probe_query.truncate(LATE_MAX_QUERY_VECTORS);
+        let text = encode_query_matrix_text(&probe_query).unwrap_or_else(|error| {
+            panic!("failed to encode late resolution probe for {ns}: {error}")
+        });
+        let (status, response) = request_json(
+            client,
+            Method::POST,
+            &format!("{}/v1/namespaces/{ns}/query", server.base_url),
+            Some(json!({
+                "sources": [{
+                    "type": "late_interaction",
+                    "text": text,
+                    "top_k": 64,
+                    "semantic_wait_ms": 5_000,
+                }],
+                "candidate_k": 64,
+                "top_k": 64,
+                "consistency": ConsistencyLevel::Strong,
+                "projection": { "include_attributes": true },
+            })),
+        )
+        .await;
+        if !(200..300).contains(&status) {
+            violations.push(indeterminate_violation(
+                op_index,
+                &ns,
+                "strong late query failed while resolving indeterminate late upserts",
+                json!({ "status": status, "response": response }),
+            ));
+            continue;
+        }
+        let durable_ids = response["results"]
+            .as_array()
+            .map(|results| {
+                results
+                    .iter()
+                    .filter_map(|result| result["id"].as_str().map(str::to_string))
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        for id in pending_late.keys() {
+            let applied = durable_ids.contains(id);
+            let Some(resolved) = model.resolve_late_indeterminate_record(&ns, id, applied) else {
+                continue;
+            };
+            resolutions.push(json!({
+                "namespace": ns,
+                "id": id,
+                "op_index": resolved.op_index,
+                "reason": resolved.reason,
+                "effect": "maybe_late_upserted",
+                "resolved": if applied { "applied" } else { "not_applied" },
+            }));
+        }
+    }
+
     artifacts.write_resolutions(&resolutions);
     violations
 }

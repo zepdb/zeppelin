@@ -1115,7 +1115,9 @@ fn membership_delta(
     let mut gained = 0usize;
     let mut lost = 0usize;
     let mut changed_memberships = Vec::new();
+    #[allow(clippy::needless_range_loop)]
     for query_index in 0..gold.len() {
+        #[allow(clippy::needless_range_loop)]
         for gold_index in 0..GOLD_PER_QUERY {
             let left = &from.gold_states[query_index][gold_index];
             let right = &to.gold_states[query_index][gold_index];
