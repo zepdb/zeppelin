@@ -366,11 +366,29 @@ pub struct MmliSegmentConfig {
     pub max_cluster_object_bytes: usize,
     /// Maximum resident centroid/bootstrap bytes admitted at activation.
     pub max_resident_bootstrap_bytes: usize,
-    /// Maximum cumulative coalesced gap bytes per ranged request.
+    /// Maximum cumulative coalesced gap bytes per ranged request. Default:
+    /// `65536` bytes (64 KiB). Although 256 KiB was the SciFact knee
+    /// (−37% GETs at +64% bytes), phase 05 proved it corpus-specific: out of
+    /// regime it removes only 7.4% of GETs while paying +83% planned bytes.
+    /// Raising this to 1 MiB+ is strictly worse everywhere measured
+    /// because the extra bytes regress fetch time; lowering it permits less
+    /// gap coalescing, trading fewer planned bytes for more GETs. Revisit only
+    /// after the attribute-fold format change lands.
     pub read_gap_budget_bytes: usize,
-    /// Maximum bytes in one physical ranged request.
+    /// Maximum bytes in one physical ranged request. Default: `8388608`
+    /// bytes (8 MiB), kept because it never bound in any measured arm and
+    /// 16 MiB produced byte-identical plans. There is no evidence for moving
+    /// it in either direction: raising it did not change the measured plans,
+    /// while lowering it can split a currently valid request into more GETs
+    /// without a measured benefit.
     pub read_max_request_bytes: usize,
-    /// Maximum physical ranged reads in flight per wave.
+    /// Maximum physical ranged reads in flight per wave. Default: `16`, the
+    /// knee of the phase 02 sweep (SciFact fetch p50 64.3→46.8 ms from 8→16)
+    /// with TRANSFERS on the 50k heavy-tail corpus (fetch −19% at identical
+    /// plan). Raising it buys almost nothing: 32/64 were within noise as
+    /// per-GET `t_req` rose ~proportionally from request-stack saturation, and
+    /// 128 regressed outright (p95 tail + shed risk on macOS mbuf). Lowering
+    /// it to 8 wastes ~17-27% fetch p50 for no benefit.
     pub read_max_concurrency: usize,
     /// Maximum changed-row fraction (changed ids over the previous segment's
     /// rows) for incremental flat compaction; larger churn or `0.0` forces a
@@ -481,7 +499,7 @@ impl Default for MmliSegmentConfig {
             max_resident_bootstrap_bytes: 128 * 1024 * 1024,
             read_gap_budget_bytes: 64 * 1024,
             read_max_request_bytes: 8 * 1024 * 1024,
-            read_max_concurrency: 8,
+            read_max_concurrency: 16,
             incremental_max_changed_fraction: 0.2,
         }
     }
@@ -1272,7 +1290,7 @@ mod tests {
         );
         assert_eq!(defaults.segment.read_gap_budget_bytes, 64 * 1024);
         assert_eq!(defaults.segment.read_max_request_bytes, 8 * 1024 * 1024);
-        assert_eq!(defaults.segment.read_max_concurrency, 8);
+        assert_eq!(defaults.segment.read_max_concurrency, 16);
         assert!(defaults.worker.is_none());
 
         let source = r#"

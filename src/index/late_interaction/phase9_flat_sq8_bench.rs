@@ -43,7 +43,7 @@ use crate::embedding::{
     MultiVectorEmbedding, MultiVectorEpochId,
 };
 use crate::index::quantization::sq::SqCalibration;
-use crate::storage::read_plan::{execute_read_plan, ReadPlan, ReadPlanConfig};
+use crate::storage::read_plan::{ReadPlan, ReadPlanConfig};
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, Filter, VectorId};
 use crate::wal::LateInteractionSegmentRef;
@@ -56,7 +56,7 @@ use super::candidate::{
 use super::matrix_artifact::{build_matrix_blocks, MatrixBlockInputRow};
 use super::segment_search::{
     build_truth_requests, compare_scored_rows, execute_truth_wave_pipelined, filter_matches,
-    score_truth_wave, SegmentSearchBounds, SegmentSearchRequest, TruthWaveTiming,
+    SegmentSearchBounds, SegmentSearchRequest,
 };
 use super::{
     FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection, InnerProjection,
@@ -400,7 +400,7 @@ async fn run_benchmark() -> BenchResult<()> {
     let tensor_dir = required_path("MMLI_REAL_MATRIX_DIR")?;
     let output = required_path("MMLI_FLAT_BENCH_OUTPUT")?;
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let pipeline_enabled = optional_one_flag("MMLI_FLAT_BENCH_PIPELINE")?;
+    let pipeline_enabled = true;
     let query_count = optional_usize("MMLI_FLAT_BENCH_QUERY_LIMIT", QUERY_COUNT)?;
     if !(1..=QUERY_COUNT).contains(&query_count) {
         return Err(format!(
@@ -743,40 +743,16 @@ async fn run_benchmark() -> BenchResult<()> {
             read_plan: &read_plan_config,
             bounds,
         };
-        let (mut rows, logical_bytes, fetch_elapsed, score_elapsed, timing) = if pipeline_enabled {
-            let piped = execute_truth_wave_pipelined(&request, candidates, &plan)
-                .await
-                .map_err(|error| error.to_string())?;
-            (
-                piped.rows,
-                piped.logical_bytes,
-                piped.fetch_elapsed,
-                piped.score_elapsed,
-                piped.timing,
-            )
-        } else {
-            let fetch_started = Instant::now();
-            let truth_bytes = execute_read_plan(&store, &plan)
-                .await
-                .map_err(|error| error.to_string())?;
-            let fetch_elapsed = fetch_started.elapsed();
-            let logical_bytes = truth_bytes.iter().try_fold(0_u64, |total, bytes| {
-                total
-                    .checked_add(bytes.len() as u64)
-                    .ok_or_else(|| "truth logical byte count overflowed u64".to_string())
-            })?;
-            let mut timing = TruthWaveTiming::default();
-            let score_started = Instant::now();
-            let rows = score_truth_wave(&request, candidates, &truth_bytes, Some(&mut timing))
-                .map_err(|error| error.to_string())?;
-            (
-                rows,
-                logical_bytes,
-                fetch_elapsed,
-                score_started.elapsed(),
-                timing,
-            )
-        };
+        let piped = execute_truth_wave_pipelined(&request, candidates, &plan)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (mut rows, logical_bytes, fetch_elapsed, score_elapsed, timing) = (
+            piped.rows,
+            piped.logical_bytes,
+            piped.fetch_elapsed,
+            piped.score_elapsed,
+            piped.timing,
+        );
         if truth_score_workers == 0 {
             truth_score_workers = timing.workers;
         } else if truth_score_workers != timing.workers {
@@ -908,18 +884,10 @@ async fn run_benchmark() -> BenchResult<()> {
             read_plan: &read_plan_config,
             bounds,
         };
-        let mut rows = if pipeline_enabled {
-            execute_truth_wave_pipelined(&request, candidates, &plan)
-                .await
-                .map_err(|error| error.to_string())?
-                .rows
-        } else {
-            let truth_bytes = execute_read_plan(&store, &plan)
-                .await
-                .map_err(|error| error.to_string())?;
-            score_truth_wave(&request, candidates, &truth_bytes, None)
-                .map_err(|error| error.to_string())?
-        };
+        let mut rows = execute_truth_wave_pipelined(&request, candidates, &plan)
+            .await
+            .map_err(|error| error.to_string())?
+            .rows;
         let observed_delta = get_requests.load(AtomicOrdering::Relaxed) - observed_before;
         if observed_delta != plan.planned_request_count() as u64 {
             return Err(format!(
@@ -1321,15 +1289,6 @@ fn optional_usize(name: &str, default: usize) -> BenchResult<usize> {
             .parse::<usize>()
             .map_err(|error| format!("invalid {name}={value:?}: {error}")),
         Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(format!("cannot read {name}: {error}")),
-    }
-}
-
-fn optional_one_flag(name: &str) -> BenchResult<bool> {
-    match env::var(name) {
-        Ok(value) if value == "1" => Ok(true),
-        Ok(value) => Err(format!("{name} must be 1 when set, got {value:?}")),
-        Err(env::VarError::NotPresent) => Ok(false),
         Err(error) => Err(format!("cannot read {name}: {error}")),
     }
 }
