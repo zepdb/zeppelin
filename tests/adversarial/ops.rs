@@ -657,6 +657,9 @@ pub enum InvalidProbe {
     WeightsLenMismatch,
     AsOfGenZero,
     AsOfGenFuture,
+    LateZeroTokenDocument,
+    LateOverMaxTokenQuery,
+    LateKZero,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1000,14 +1003,26 @@ impl Op {
     #[must_use]
     pub fn tags(&self) -> Vec<&str> {
         match self {
-            Op::LateUpsert { .. } | Op::LateQuery { .. } => vec!["late-interaction"],
+            Op::LateUpsert { ns, .. } | Op::LateQuery { ns, .. } => {
+                let mut tags = vec!["late-interaction"];
+                if let Some(tag) = late_pathological_tag(ns) {
+                    tags.push(tag);
+                }
+                tags
+            }
             Op::Query { q, .. } => q.pattern_tags.iter().map(String::as_str).collect(),
             Op::BatchQuery { qs, .. } => qs
                 .iter()
                 .flat_map(|q| q.pattern_tags.iter().map(String::as_str))
                 .collect(),
             Op::PaginateAll { q, .. } => q.pattern_tags.iter().map(String::as_str).collect(),
-            Op::InvalidProbe { probe, .. } => vec!["invalid-probe", probe.tag()],
+            Op::InvalidProbe { ns, probe, .. } => {
+                let mut tags = vec!["invalid-probe", probe.tag()];
+                if let Some(tag) = late_pathological_tag(ns) {
+                    tags.push(tag);
+                }
+                tags
+            }
             Op::CompactEndpoint { .. } => vec!["compact-endpoint"],
             Op::GcCycle { .. } => vec!["gc-cycle"],
             Op::CreateSnapshot { .. } | Op::GetSnapshot { .. } | Op::ListSnapshots { .. } => {
@@ -1422,6 +1437,7 @@ impl InvalidProbe {
         match self {
             Self::OversizedBatch => "PAYLOAD_TOO_LARGE",
             Self::AsOfGenZero | Self::AsOfGenFuture => "POINT_IN_TIME_NOT_RETAINED",
+            Self::LateZeroTokenDocument => "RETRIEVAL_UNIT_EMPTY",
             _ => "VALIDATION_ERROR",
         }
     }
@@ -1430,7 +1446,7 @@ impl InvalidProbe {
     pub fn is_write_shaped(self) -> bool {
         matches!(
             self,
-            Self::WrongDims | Self::BadIdCharset | Self::EmptyBatch
+            Self::WrongDims | Self::BadIdCharset | Self::EmptyBatch | Self::LateZeroTokenDocument
         )
     }
 
@@ -1448,8 +1464,24 @@ impl InvalidProbe {
             Self::WeightsLenMismatch => "weights-len-mismatch",
             Self::AsOfGenZero => "as-of-410",
             Self::AsOfGenFuture => "as-of-410",
+            Self::LateZeroTokenDocument => "late-zero-token-document",
+            Self::LateOverMaxTokenQuery => "late-over-max-token-query",
+            Self::LateKZero => "late-k-zero",
         }
     }
+}
+
+fn late_pathological_tag(namespace: &str) -> Option<&'static str> {
+    [
+        "late-empty-ns",
+        "late-all-ties",
+        "late-single-token",
+        "late-giant-rows",
+        "late-k-edges",
+        "late-byte-bound",
+    ]
+    .into_iter()
+    .find(|tag| namespace.ends_with(tag))
 }
 
 impl MaintenanceKind {

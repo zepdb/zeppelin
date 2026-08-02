@@ -100,10 +100,11 @@ pub enum OracleMutation {
     LateSwallowCorruption,
     LateHiddenGet,
     LateTruncatedResultSuccess,
+    LateTieOrder,
 }
 
 impl OracleMutation {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::DropDelete,
         Self::SkewScore,
         Self::PhantomId,
@@ -134,6 +135,7 @@ impl OracleMutation {
         Self::LateSwallowCorruption,
         Self::LateHiddenGet,
         Self::LateTruncatedResultSuccess,
+        Self::LateTieOrder,
     ];
 
     #[must_use]
@@ -169,6 +171,7 @@ impl OracleMutation {
             "late-swallow-corruption" => Self::LateSwallowCorruption,
             "late-hidden-get" => Self::LateHiddenGet,
             "late-truncated-result-success" => Self::LateTruncatedResultSuccess,
+            "late-tie-order" => Self::LateTieOrder,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -206,6 +209,7 @@ impl OracleMutation {
             Self::LateSwallowCorruption => "late-swallow-corruption",
             Self::LateHiddenGet => "late-hidden-get",
             Self::LateTruncatedResultSuccess => "late-truncated-result-success",
+            Self::LateTieOrder => "late-tie-order",
         }
     }
 

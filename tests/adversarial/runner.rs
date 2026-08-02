@@ -48,8 +48,8 @@ use super::faults::clock::TestClock;
 use super::faults::http_proxy::{HttpFaultInjector, HttpFaultRequestHandle};
 use super::faults::process::{CrashRequest, ProcessController, TriggerPosition};
 use super::faults::store_proxy::{
-    operational_store_proxy, stale_manifest_cas_selftest_proxy, store_fault_proxy,
-    OperationalStoreObserver,
+    late_all_ties_reordering_proxy, operational_store_proxy, stale_manifest_cas_selftest_proxy,
+    store_fault_proxy, OperationalStoreObserver,
 };
 use super::faults::{
     Boundary, ClockCommand, ContentFault, FaultEvent, FaultKind, FaultProfile, FaultSchedule,
@@ -58,8 +58,9 @@ use super::faults::{
 };
 use super::generator::{AdversarialGenerator, Coverage};
 use super::late_support::{
-    activate_late_embedding_profile, encode_matrix_text, enrich_pending_retrieval_units,
-    late_encoder_provider,
+    activate_late_embedding_profile, encode_document_matrix_text, encode_matrix_text_unchecked,
+    encode_query_matrix_text, enrich_pending_retrieval_units, late_encoder_provider,
+    LATE_MAX_QUERY_VECTORS, LATE_VECTOR_DIMENSION,
 };
 use super::model::{
     AmbiguityReason, IndetEffect, Model, ModelRecord, NsIndeterminate, OpOutcome, OracleMutation,
@@ -82,6 +83,7 @@ use super::{effective_seed_assignment, PreserveMode, RunMode, RunnerEnv};
 
 const AMBIGUITY_MARKER: &str = "_adversarial_ambiguity";
 const STORE_FAULT_MARKER: &str = "_adversarial_store_fault";
+const RAW_HTTP_BODY_SHA256_MARKER: &str = "_adversarial_raw_http_body_sha256";
 const DUAL_WRITER_LEASE_HOLD_EVENT_ID: &str = "ops-dual-writer-lease-hold";
 const SEED_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(60);
 const SEED_WATCHDOG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1936,6 +1938,11 @@ pub async fn inspect_from_env() {
 
 async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let seed_config = replay_seed_config(replay);
+    let source_records = read_ops(replay);
+    let source_failure = read_failure_manifest(replay);
+    let replays_all_ties = source_records
+        .iter()
+        .any(|record| record.op.namespace().ends_with("late-all-ties"));
     let replay_mutation = env.selftest.or(seed_config.fault_plan);
     let replay_post_commit_selftest = matches!(
         seed_config.selftest_probe,
@@ -1969,7 +1976,8 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let active_profile = scheduler
         .as_ref()
         .map(|scheduler| scheduler.schedule().profile)
-        .or_else(|| chaos_plan.as_ref().map(|_| FaultProfile::LegacyChaos));
+        .or_else(|| chaos_plan.as_ref().map(|_| FaultProfile::LegacyChaos))
+        .or_else(|| replays_all_ties.then_some(FaultProfile::Late));
     let old_prefix = recorded_namespace_prefix(seed_config.seed, &seed_config.namespace_specs);
     let harness = TestHarness::new().await;
     let prefix = harness.prefix.clone();
@@ -1984,7 +1992,18 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         .map_or(legacy_instrumented_store.clone(), |scheduler| {
             store_fault_proxy(&legacy_instrumented_store, scheduler.clone())
         });
-    let store = instrumented_store;
+    let (store, late_all_ties_replay_evidence) = if active_profile == Some(FaultProfile::Late) {
+        let reorder_scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Late,
+            events: Vec::new(),
+        });
+        let namespace = format!("{prefix}-adv-{}-late-all-ties", seed_config.seed);
+        let (store, evidence) =
+            late_all_ties_reordering_proxy(&instrumented_store, reorder_scheduler, namespace);
+        (store, Some(evidence))
+    } else {
+        (instrumented_store, None)
+    };
     let require_compaction_evidence = requires_two_node_compaction_evidence(scheduler.as_ref());
     let operational_observer = requires_operational_store_observer(scheduler.as_ref())
         .then(OperationalStoreObserver::default);
@@ -2080,8 +2099,6 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let started = Instant::now();
     let max_ops = env.max_ops.unwrap_or(u64::MAX);
 
-    let source_records = read_ops(replay);
-    let source_failure = read_failure_manifest(replay);
     let source_failure_before_quiet =
         source_failure_precedes_unrecorded_quiet_period(&source_records, source_failure.as_ref());
     let (exact_execution_trace, workload_records) = replay_workload_records(&source_records);
@@ -2501,6 +2518,33 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
                 failure_violations = recovery;
                 break;
             }
+        }
+    }
+
+    let replays_all_ties_query = records.iter().any(|record| {
+        matches!(
+            &record.op,
+            Op::LateQuery { ns, .. } if ns.ends_with("late-all-ties")
+        )
+    });
+    if !failed && replays_all_ties_query {
+        let reordered_pairs = late_all_ties_replay_evidence
+            .as_ref()
+            .expect("all-ties replay omitted completion reordering evidence")
+            .reordered_pairs();
+        if reordered_pairs == 0 {
+            failed = true;
+            failure_violations.push(Violation {
+                id: ViolationId::I31LateExactEquivalence,
+                op_index: replay_op_index,
+                namespace: format!("{prefix}-adv-{}-late-all-ties", seed_config.seed),
+                detail: "all-ties replay did not exercise reordered streamed completions"
+                    .to_string(),
+                evidence: json!({
+                    "reordered_matrix_attribute_pairs": reordered_pairs,
+                    "required_minimum": 1,
+                }),
+            });
         }
     }
 
@@ -4137,8 +4181,15 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
         .map_or_else(|| OracleMutation::ALL.to_vec(), |mutation| vec![mutation]);
 
     for mutation in mutations {
-        let seed = 7;
-        let clean_env = env.for_oracle_selftest(seed);
+        let seed = if mutation == OracleMutation::LateTieOrder {
+            1
+        } else {
+            7
+        };
+        let mut clean_env = env.for_oracle_selftest(seed);
+        if mutation == OracleMutation::LateTieOrder {
+            clean_env.profile = Some(FaultProfile::Late);
+        }
         let clean_artifacts = RunArtifacts::create(&clean_env);
         let clean = Box::pin(run_seed(
             &clean_env,
@@ -4156,7 +4207,10 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
             clean.violations
         );
 
-        let mutated_env = env.for_oracle_selftest(seed);
+        let mut mutated_env = env.for_oracle_selftest(seed);
+        if mutation == OracleMutation::LateTieOrder {
+            mutated_env.profile = Some(FaultProfile::Late);
+        }
         let mutated_artifacts = RunArtifacts::create(&mutated_env);
         let mutated = Box::pin(run_seed(
             &mutated_env,
@@ -4231,6 +4285,7 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
             OracleMutation::LateTruncatedResultSuccess => {
                 fired.contains(&ViolationId::I33LateWorkerLifecycle)
             }
+            OracleMutation::LateTieOrder => fired.contains(&ViolationId::I31LateExactEquivalence),
         };
         assert!(
             accepted,
@@ -4434,6 +4489,8 @@ async fn run_seed_inner(
     }
     let mut generator = if branching_profile {
         AdversarialGenerator::new_branching(seed, &prefix)
+    } else if assignment.profile == Some(FaultProfile::Late) {
+        AdversarialGenerator::new_late_pathological(seed, &prefix)
     } else if late_profile {
         AdversarialGenerator::new_late(seed, &prefix)
     } else if profile == Some(FaultProfile::Security) {
@@ -4520,7 +4577,19 @@ async fn run_seed_inner(
         .map_or(legacy_instrumented_store.clone(), |scheduler| {
             store_fault_proxy(&legacy_instrumented_store, scheduler.clone())
         });
-    let store = instrumented_store;
+    let (store, late_all_ties_reorder_evidence) = if assignment.profile == Some(FaultProfile::Late)
+    {
+        let reorder_scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Late,
+            events: Vec::new(),
+        });
+        let namespace = format!("{prefix}-adv-{seed}-late-all-ties");
+        let (store, evidence) =
+            late_all_ties_reordering_proxy(&instrumented_store, reorder_scheduler, namespace);
+        (store, Some(evidence))
+    } else {
+        (instrumented_store, None)
+    };
     let require_compaction_evidence = requires_two_node_compaction_evidence(scheduler.as_ref());
     let operational_observer = requires_operational_store_observer(scheduler.as_ref())
         .then(OperationalStoreObserver::default);
@@ -5308,6 +5377,31 @@ async fn run_seed_inner(
                     }
                 }
             }
+        }
+    }
+
+    if !failed && assignment.profile == Some(FaultProfile::Late) && seed % 6 == 1 {
+        let reordered_pairs = late_all_ties_reorder_evidence
+            .as_ref()
+            .expect("exact late all-ties seed omitted completion reordering evidence")
+            .reordered_pairs();
+        if reordered_pairs == 0 {
+            failed = true;
+            failure_violations.push(Violation {
+                id: ViolationId::I31LateExactEquivalence,
+                op_index,
+                namespace: format!("{prefix}-adv-{seed}-late-all-ties"),
+                detail: "all-ties queries did not exercise reordered streamed completions"
+                    .to_string(),
+                evidence: json!({
+                    "reordered_matrix_attribute_pairs": reordered_pairs,
+                    "required_minimum": 1,
+                }),
+            });
+        } else {
+            eprintln!(
+                "late all-ties reordered matrix/attribute completion pairs: {reordered_pairs}"
+            );
         }
     }
 
@@ -6120,7 +6214,9 @@ fn op_uses_query_admission(op: &Op) -> bool {
                 | InvalidProbe::GroupingPlusCursor
                 | InvalidProbe::WeightsLenMismatch
                 | InvalidProbe::AsOfGenZero
-                | InvalidProbe::AsOfGenFuture,
+                | InvalidProbe::AsOfGenFuture
+                | InvalidProbe::LateOverMaxTokenQuery
+                | InvalidProbe::LateKZero,
             ..
         }
     )
@@ -6311,6 +6407,7 @@ struct CorruptionTracker {
     durably_tainted: BTreeMap<String, BTreeSet<String>>,
     late_transient_taint: BTreeMap<String, BTreeMap<String, u64>>,
     late_persistent_taint: BTreeMap<String, BTreeSet<String>>,
+    late_tie_results: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl CorruptionTracker {
@@ -6437,6 +6534,60 @@ impl CorruptionTracker {
         self.durably_tainted.remove(namespace);
         self.late_transient_taint.remove(namespace);
         self.late_persistent_taint.remove(namespace);
+        self.late_tie_results.remove(namespace);
+    }
+
+    fn check_late_tie_stability(&mut self, rec: &OpRecord) -> Vec<Violation> {
+        let Op::LateQuery {
+            ns,
+            query,
+            top_k,
+            filter,
+            consistency,
+            ..
+        } = &rec.op
+        else {
+            return Vec::new();
+        };
+        if !ns.ends_with("late-all-ties") || !(200..300).contains(&rec.status) {
+            return Vec::new();
+        }
+        let signature = serde_json::to_string(&(query, top_k, filter, consistency))
+            .expect("late tie query signature must serialize");
+        let Some(result_bytes_sha256) = rec
+            .response
+            .get(RAW_HTTP_BODY_SHA256_MARKER)
+            .and_then(serde_json::Value::as_str)
+        else {
+            return vec![Violation {
+                id: ViolationId::I31LateExactEquivalence,
+                op_index: rec.index,
+                namespace: ns.clone(),
+                detail: "all-ties query omitted raw HTTP response-byte evidence".to_string(),
+                evidence: json!({
+                    "marker": RAW_HTTP_BODY_SHA256_MARKER,
+                }),
+            }];
+        };
+        let previous = self
+            .late_tie_results
+            .entry(ns.clone())
+            .or_default()
+            .entry(signature)
+            .or_insert_with(|| result_bytes_sha256.to_string());
+        if previous == result_bytes_sha256 {
+            return Vec::new();
+        }
+        vec![Violation {
+            id: ViolationId::I31LateExactEquivalence,
+            op_index: rec.index,
+            namespace: ns.clone(),
+            detail: "repeated all-ties query changed its raw HTTP response bytes".to_string(),
+            evidence: json!({
+                "previous_sha256": previous,
+                "actual_sha256": result_bytes_sha256,
+            }),
+        }]
     }
 }
 
@@ -7128,6 +7279,7 @@ async fn finish_recorded_op(
             .scheduler
             .fault_window_active(rec.index, op.namespace())
     });
+    let late_tie_violations = corruption_tracker.check_late_tie_stability(&rec);
     let late_tainted_keys = matches!(op, Op::LateQuery { .. })
         .then(|| corruption_tracker.late_tainted_keys(op.namespace()));
     let tainted_keys = if matches!(op, Op::LateQuery { .. }) {
@@ -7144,6 +7296,7 @@ async fn finish_recorded_op(
     });
     let mut violations =
         oracle::check_op_with_faults(model, &rec, mode, mutation, corruption.as_ref());
+    violations.extend(late_tie_violations);
     let scheduled_late_profile = http_fault_context.is_some_and(|context| {
         matches!(
             context.scheduler.schedule().profile,
@@ -7442,12 +7595,13 @@ async fn execute_op(
             let upserts = records
                 .iter()
                 .map(|record| {
-                    let text = encode_matrix_text(&record.values).unwrap_or_else(|error| {
-                        panic!(
-                            "failed to encode adversarial late document matrix {}: {error}",
-                            record.id
-                        )
-                    });
+                    let text =
+                        encode_document_matrix_text(&record.values).unwrap_or_else(|error| {
+                            panic!(
+                                "failed to encode adversarial late document matrix {}: {error}",
+                                record.id
+                            )
+                        });
                     json!({
                         "id": record.id,
                         "input": { "type": "text", "text": text },
@@ -7581,7 +7735,7 @@ async fn execute_op(
             ..
         } => {
             let path = format!("/v1/namespaces/{ns}/query");
-            let text = encode_matrix_text(query).unwrap_or_else(|error| {
+            let text = encode_query_matrix_text(query).unwrap_or_else(|error| {
                 panic!("failed to encode adversarial late query matrix for {ns}: {error}")
             });
             let mut body = json!({
@@ -8861,6 +9015,54 @@ async fn execute_invalid_probe(
             .await;
             ("POST".to_string(), path, status, response)
         }
+        InvalidProbe::LateZeroTokenDocument => {
+            let path = format!("/v1/namespaces/{ns}/retrieval-units");
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", target.base_url, path),
+                Some(json!({
+                    "upserts": [{
+                        "id": "zero-token-document",
+                        "input": { "type": "text", "text": "" }
+                    }]
+                })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
+        InvalidProbe::LateOverMaxTokenQuery | InvalidProbe::LateKZero => {
+            let path = format!("/v1/namespaces/{ns}/query");
+            let (matrix, top_k) = match probe {
+                InvalidProbe::LateOverMaxTokenQuery => (
+                    vec![vec![0.0; LATE_VECTOR_DIMENSION]; LATE_MAX_QUERY_VECTORS + 1],
+                    1,
+                ),
+                InvalidProbe::LateKZero => (vec![vec![0.0; LATE_VECTOR_DIMENSION]], 0),
+                _ => unreachable!("late boundary probe match narrowed above"),
+            };
+            let text = encode_matrix_text_unchecked(&matrix)
+                .expect("late boundary matrix must serialize without validation");
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", target.base_url, path),
+                Some(json!({
+                    "sources": [{
+                        "type": "late_interaction",
+                        "text": text,
+                        "top_k": top_k,
+                        "semantic_wait_ms": 5_000,
+                    }],
+                    "candidate_k": 64,
+                    "top_k": top_k,
+                    "consistency": ConsistencyLevel::Strong,
+                    "debug": true,
+                })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
     }
 }
 
@@ -9151,13 +9353,30 @@ async fn send_exchange(
             },
         };
     }
-    let response = match response.json::<serde_json::Value>().await {
+    let response_bytes = match response.bytes().await {
+        Ok(response) => response,
+        Err(_) if ambiguity_allowed => {
+            return ambiguous_exchange(status, AmbiguityReason::JsonParse);
+        }
+        Err(error) => panic!("HTTP response body read failed for {url}: {error}"),
+    };
+    let raw_response_sha256 = format!("{:x}", Sha256::digest(&response_bytes));
+    let mut response = match serde_json::from_slice::<serde_json::Value>(&response_bytes) {
         Ok(response) => response,
         Err(_) if ambiguity_allowed => {
             return ambiguous_exchange(status, AmbiguityReason::JsonParse);
         }
         Err(error) => panic!("HTTP response JSON parse failed for {url}: {error}"),
     };
+    if url.contains("late-all-ties") {
+        response
+            .as_object_mut()
+            .expect("late all-ties response must be a JSON object")
+            .insert(
+                RAW_HTTP_BODY_SHA256_MARKER.to_string(),
+                json!(raw_response_sha256),
+            );
+    }
     let outcome = if (200..300).contains(&status) {
         OpOutcome::Applied {
             status,
@@ -11356,7 +11575,7 @@ async fn run_quiescent_checks(
             .get(ns)
             .unwrap_or_else(|| panic!("quiescence namespace {ns} disappeared from the model"));
         if ns_model.spec.late_interaction.is_some() {
-            let Some(query) = ns_model
+            let Some(mut query) = ns_model
                 .late_live
                 .values()
                 .next()
@@ -11364,6 +11583,10 @@ async fn run_quiescent_checks(
             else {
                 continue;
             };
+            // Stored documents may carry up to LATE_MAX_DOCUMENT_VECTORS
+            // rows (the giant-rows shape), but queries are capped far lower;
+            // a truncated prefix is still a valid exhaustive probe.
+            query.truncate(LATE_MAX_QUERY_VECTORS);
             let query = Op::LateQuery {
                 actor: ActorSel::ADMIN,
                 ns: ns.clone(),
@@ -12350,6 +12573,22 @@ fn selftest_probe_op(
             filter: None,
             consistency: ConsistencyLevel::Strong,
         }),
+        (OracleMutation::LateTieOrder, Op::LateUpsert { ns, records, .. })
+            if records.len() >= 2
+                && records
+                    .iter()
+                    .skip(1)
+                    .all(|record| record.values == records[0].values) =>
+        {
+            Some(Op::LateQuery {
+                actor: ActorSel::ADMIN,
+                ns: ns.clone(),
+                query: records[0].values.clone(),
+                top_k: records.len().min(8),
+                filter: None,
+                consistency: ConsistencyLevel::Strong,
+            })
+        }
         _ => None,
     }
 }
@@ -15181,6 +15420,44 @@ mod outcome_tests {
         assert!(tracker.durably_tainted_keys("ns-a").is_none());
         assert!(tracker.tainted_keys("ns-b").is_none());
         assert_eq!(tracker.seen_timeline_events, 1);
+    }
+
+    #[test]
+    fn all_ties_stability_compares_raw_http_body_hashes() {
+        let record = |index, digest: &str| {
+            let mut record = replay_trace_record(
+                index,
+                ExecutionPhase::Workload,
+                Op::LateQuery {
+                    actor: ActorSel::ADMIN,
+                    ns: "fixture-late-all-ties".to_string(),
+                    query: vec![vec![1.0; LATE_VECTOR_DIMENSION]],
+                    top_k: 1,
+                    filter: None,
+                    consistency: ConsistencyLevel::Strong,
+                },
+            );
+            record.response = json!({
+                "results": [{"id": "tie-00", "score": 1.0}],
+            });
+            record
+                .response
+                .as_object_mut()
+                .expect("fixture response must be an object")
+                .insert(RAW_HTTP_BODY_SHA256_MARKER.to_string(), json!(digest));
+            record
+        };
+        let mut tracker = CorruptionTracker::default();
+
+        assert!(tracker
+            .check_late_tie_stability(&record(0, "same"))
+            .is_empty());
+        assert!(tracker
+            .check_late_tie_stability(&record(1, "same"))
+            .is_empty());
+        let violations = tracker.check_late_tie_stability(&record(2, "different"));
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].id, ViolationId::I31LateExactEquivalence);
     }
 
     #[test]

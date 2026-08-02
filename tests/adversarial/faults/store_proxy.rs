@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -33,6 +34,8 @@ pub struct StoreFaultProxy {
     bodies: Mutex<BodyHistory>,
     admit_stale_manifest_cas_selftest: bool,
     operational_observer: Option<(OperationalStoreObserver, u8)>,
+    late_all_ties_reorder_namespace: Option<String>,
+    late_all_ties_reorder_evidence: Option<LateAllTiesReorderEvidence>,
 }
 
 #[must_use]
@@ -91,7 +94,90 @@ fn build_store_fault_proxy(
         bodies: Mutex::new(BodyHistory::default()),
         admit_stale_manifest_cas_selftest,
         operational_observer: None,
+        late_all_ties_reorder_namespace: None,
+        late_all_ties_reorder_evidence: None,
     }))
+}
+
+const LATE_ALL_TIES_REORDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Shared evidence that late matrix/attribute GET pairs completed out of key order.
+#[derive(Debug, Clone)]
+pub struct LateAllTiesReorderEvidence {
+    shared: Arc<LateAllTiesReorderShared>,
+}
+
+#[derive(Debug)]
+struct LateAllTiesReorderShared {
+    matrix_completions: tokio::sync::Semaphore,
+    reordered_pairs: AtomicU64,
+}
+
+impl Default for LateAllTiesReorderEvidence {
+    fn default() -> Self {
+        Self {
+            shared: Arc::new(LateAllTiesReorderShared {
+                matrix_completions: tokio::sync::Semaphore::new(0),
+                reordered_pairs: AtomicU64::new(0),
+            }),
+        }
+    }
+}
+
+impl LateAllTiesReorderEvidence {
+    #[must_use]
+    pub fn reordered_pairs(&self) -> u64 {
+        self.shared.reordered_pairs.load(Ordering::SeqCst)
+    }
+
+    fn record_matrix_completion(&self) {
+        self.shared.matrix_completions.add_permits(1);
+    }
+
+    async fn await_matrix_completion(&self, key: &str) {
+        let permit = tokio::time::timeout(
+            LATE_ALL_TIES_REORDER_TIMEOUT,
+            self.shared.matrix_completions.acquire(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out after {LATE_ALL_TIES_REORDER_TIMEOUT:?} waiting to reorder late \
+                 attribute GET {key} behind a matrix GET"
+            )
+        })
+        .expect("late all-ties matrix-completion semaphore closed");
+        permit.forget();
+    }
+
+    fn record_reordered_pair(&self) {
+        self.shared.reordered_pairs.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Reorders late all-ties artifact completions without changing object bytes.
+#[must_use]
+pub fn late_all_ties_reordering_proxy(
+    store: &ZeppelinStore,
+    scheduler: FaultScheduler,
+    namespace: impl Into<String>,
+) -> (ZeppelinStore, LateAllTiesReorderEvidence) {
+    let namespace = namespace.into();
+    assert!(
+        !namespace.is_empty() && !namespace.ends_with('/'),
+        "late all-ties reordering requires an exact non-empty namespace"
+    );
+    let evidence = LateAllTiesReorderEvidence::default();
+    let proxy = ZeppelinStore::new(Arc::new(StoreFaultProxy {
+        inner: store.inner(),
+        scheduler,
+        bodies: Mutex::new(BodyHistory::default()),
+        admit_stale_manifest_cas_selftest: false,
+        operational_observer: None,
+        late_all_ties_reorder_namespace: Some(namespace),
+        late_all_ties_reorder_evidence: Some(evidence.clone()),
+    }));
+    (proxy, evidence)
 }
 
 /// Shared proof recorder for temporary two-node operational windows.
@@ -517,6 +603,8 @@ pub fn operational_store_proxy(
         bodies: Mutex::new(BodyHistory::default()),
         admit_stale_manifest_cas_selftest: false,
         operational_observer: Some((observer, node)),
+        late_all_ties_reorder_namespace: None,
+        late_all_ties_reorder_evidence: None,
     }))
 }
 
@@ -636,6 +724,48 @@ fn matrix_dtype_label(dtype: MatrixDtype) -> String {
 }
 
 impl StoreFaultProxy {
+    fn late_all_ties_reorder_kind(&self, key: &str) -> Option<LateAllTiesArtifactKind> {
+        let namespace = self.late_all_ties_reorder_namespace.as_deref()?;
+        let relative = key.strip_prefix(&format!("{namespace}/late/segments/"))?;
+        let basename = relative.rsplit('/').next()?;
+        if basename.starts_with("matrix_") && basename.ends_with(".bin") {
+            Some(LateAllTiesArtifactKind::Matrix)
+        } else if basename.starts_with("attrs_") && basename.ends_with(".bin") {
+            Some(LateAllTiesArtifactKind::Attributes)
+        } else {
+            None
+        }
+    }
+
+    async fn inner_get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+        key: &str,
+    ) -> OsResult<GetResult> {
+        let Some(kind) = self.late_all_ties_reorder_kind(key) else {
+            return self.inner.get_opts(location, options).await;
+        };
+        let evidence = self
+            .late_all_ties_reorder_evidence
+            .as_ref()
+            .expect("late all-ties reordering namespace requires shared evidence");
+        match kind {
+            LateAllTiesArtifactKind::Matrix => {
+                let result = self.inner.get_opts(location, options).await?;
+                Ok(matrix_completion_result(result, evidence.clone()))
+            }
+            LateAllTiesArtifactKind::Attributes => {
+                evidence.await_matrix_completion(key).await;
+                let result = self.inner.get_opts(location, options).await;
+                if result.is_ok() {
+                    evidence.record_reordered_pair();
+                }
+                result
+            }
+        }
+    }
+
     fn tracks_bodies(&self) -> bool {
         matches!(
             self.scheduler.schedule().profile,
@@ -822,6 +952,41 @@ impl StoreFaultProxy {
             Ok(()) => Err(injected_error(InjectedErrorKind::NotFound, key)),
             Err(error) => Err(error),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LateAllTiesArtifactKind {
+    Matrix,
+    Attributes,
+}
+
+fn matrix_completion_result(result: GetResult, evidence: LateAllTiesReorderEvidence) -> GetResult {
+    let meta = result.meta.clone();
+    let range = result.range.clone();
+    let attributes = result.attributes.clone();
+    let inner = result.into_stream();
+    let payload = stream::unfold(
+        (inner, evidence, false),
+        |(mut inner, evidence, failed)| async move {
+            match inner.next().await {
+                Some(Ok(bytes)) => Some((Ok(bytes), (inner, evidence, failed))),
+                Some(Err(error)) => Some((Err(error), (inner, evidence, true))),
+                None => {
+                    if !failed {
+                        evidence.record_matrix_completion();
+                    }
+                    None
+                }
+            }
+        },
+    )
+    .boxed();
+    GetResult {
+        payload: GetResultPayload::Stream(payload),
+        meta,
+        range,
+        attributes,
     }
 }
 
@@ -1194,7 +1359,7 @@ impl ObjectStore for StoreFaultProxy {
                     FaultKind::Content(super::ContentFault::DtypeSwap) => None,
                     _ => None,
                 };
-                let result = self.inner.get_opts(location, options).await?;
+                let result = self.inner_get_opts(location, options, &key).await?;
                 return match action.kind.clone() {
                     FaultKind::StaleRead => {
                         let previous = replacement.expect("stale-read replacement disappeared");
@@ -1344,7 +1509,7 @@ impl ObjectStore for StoreFaultProxy {
             }
             self.apply_before(&action, &key).await?;
         }
-        self.inner.get_opts(location, options).await
+        self.inner_get_opts(location, options, &key).await
     }
 
     async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
@@ -2036,6 +2201,64 @@ mod tests {
         async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
             self.inner.copy_if_not_exists(from, to).await
         }
+    }
+
+    #[tokio::test]
+    async fn late_all_ties_reordering_waits_for_matrix_body_completion() {
+        let namespace = "test-late-all-ties";
+        let matrix_key = format!("{namespace}/late/segments/seg/matrix_0.bin");
+        let attrs_key = format!("{namespace}/late/segments/seg/attrs_0.bin");
+        let other_attrs_key = "test-late-all-ties-other/late/segments/seg/attrs_0.bin";
+        let inner = Arc::new(InMemory::new());
+        let setup = ZeppelinStore::new(inner.clone());
+        setup
+            .put(&matrix_key, Bytes::from_static(b"matrix"))
+            .await
+            .unwrap();
+        setup
+            .put(&attrs_key, Bytes::from_static(b"attrs"))
+            .await
+            .unwrap();
+        setup
+            .put(other_attrs_key, Bytes::from_static(b"other"))
+            .await
+            .unwrap();
+
+        let blocked_body = Arc::new(FirstBodyStore::new(inner, FirstBodyBehavior::Block));
+        let store = ZeppelinStore::new(blocked_body.clone());
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Late,
+            events: Vec::new(),
+        });
+        let (reordered, evidence) = late_all_ties_reordering_proxy(&store, scheduler, namespace);
+
+        let matrix_store = reordered.clone();
+        let matrix_task = tokio::spawn(async move { matrix_store.get(&matrix_key).await });
+        blocked_body.body_started.notified().await;
+
+        let attrs_store = reordered.clone();
+        let attrs_task = tokio::spawn(async move { attrs_store.get(&attrs_key).await });
+        tokio::task::yield_now().await;
+        assert_eq!(blocked_body.calls.load(Ordering::SeqCst), 1);
+        assert!(!attrs_task.is_finished());
+        assert_eq!(evidence.reordered_pairs(), 0);
+
+        blocked_body.release_body.notify_one();
+        assert_eq!(
+            matrix_task.await.unwrap().unwrap(),
+            Bytes::from_static(b"matrix")
+        );
+        assert_eq!(
+            attrs_task.await.unwrap().unwrap(),
+            Bytes::from_static(b"attrs")
+        );
+        assert_eq!(evidence.reordered_pairs(), 1);
+
+        assert_eq!(
+            reordered.get(other_attrs_key).await.unwrap(),
+            Bytes::from_static(b"other")
+        );
+        assert_eq!(evidence.reordered_pairs(), 1);
     }
 
     #[tokio::test]

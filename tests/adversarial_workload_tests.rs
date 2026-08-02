@@ -49,6 +49,21 @@ const REQUIRED_TAGS: &[&str] = &[
     "delete-recreate",
     "sketch-adc-v4",
     "late-interaction",
+    "late-empty-ns",
+    "late-single-token",
+    "late-giant-rows",
+    "late-k-edges",
+    "late-all-ties",
+    "late-byte-bound",
+];
+
+const PATHOLOGICAL_LATE_TAGS: &[&str] = &[
+    "late-empty-ns",
+    "late-single-token",
+    "late-giant-rows",
+    "late-k-edges",
+    "late-all-ties",
+    "late-byte-bound",
 ];
 
 const REQUIRED_SECURITY_OP_KINDS: &[&str] = &[
@@ -83,8 +98,13 @@ fn operation_coverage_required(mode: adversarial::RunMode, kind: &str) -> bool {
         )
 }
 
-fn tag_coverage_required(mode: adversarial::RunMode, tag: &str) -> bool {
-    mode != adversarial::RunMode::Chaos || !matches!(tag, "gc-cycle" | "sandwich")
+fn tag_coverage_required(
+    mode: adversarial::RunMode,
+    tag: &str,
+    pathological_late_profile: bool,
+) -> bool {
+    (pathological_late_profile || !PATHOLOGICAL_LATE_TAGS.contains(&tag))
+        && (mode != adversarial::RunMode::Chaos || !matches!(tag, "gc-cycle" | "sandwich"))
 }
 
 fn minimum_explicit_compactions(quiet_compaction_profile: bool, seed_count: u64) -> u64 {
@@ -115,6 +135,7 @@ fn smoke_inner() {
     let env = adversarial::RunnerEnv::from_env();
     let security_profile = env.profile == Some(adversarial::faults::FaultProfile::Security);
     let late_content_profile = env.profile == Some(adversarial::faults::FaultProfile::LateContent);
+    let pathological_late_profile = env.profile == Some(adversarial::faults::FaultProfile::Late);
     let configured_seed_count = env.seeds.len() as u64;
     let mode = if env.profile.is_some() {
         adversarial::RunMode::Chaos
@@ -185,7 +206,7 @@ fn smoke_inner() {
     for tag in REQUIRED_TAGS
         .iter()
         .copied()
-        .filter(|tag| tag_coverage_required(mode, tag))
+        .filter(|tag| tag_coverage_required(mode, tag, pathological_late_profile))
     {
         assert!(
             summary.coverage.tag_counts.get(tag).copied().unwrap_or(0) > 0,
@@ -371,7 +392,7 @@ fn smoke_coverage_contract_is_mode_aware() {
             assert!(operation_coverage_required(mode, kind));
         }
         for tag in REQUIRED_TAGS {
-            assert!(tag_coverage_required(mode, tag));
+            assert!(tag_coverage_required(mode, tag, true));
         }
     }
 
@@ -387,7 +408,11 @@ fn smoke_coverage_contract_is_mode_aware() {
         ));
     }
     for tag in ["gc-cycle", "sandwich"] {
-        assert!(!tag_coverage_required(adversarial::RunMode::Chaos, tag));
+        assert!(!tag_coverage_required(
+            adversarial::RunMode::Chaos,
+            tag,
+            false
+        ));
     }
 
     assert!(operation_coverage_required(
@@ -396,8 +421,21 @@ fn smoke_coverage_contract_is_mode_aware() {
     ));
     assert!(tag_coverage_required(
         adversarial::RunMode::Chaos,
-        "delete-then-reupsert"
+        "delete-then-reupsert",
+        false
     ));
+    for tag in PATHOLOGICAL_LATE_TAGS {
+        assert!(!tag_coverage_required(
+            adversarial::RunMode::Deterministic,
+            tag,
+            false
+        ));
+        assert!(tag_coverage_required(
+            adversarial::RunMode::Chaos,
+            tag,
+            true
+        ));
+    }
 }
 
 #[test]
@@ -406,17 +444,45 @@ fn security_smoke_requires_quiet_period_compaction_per_seed() {
     assert_eq!(minimum_explicit_compactions(true, 2), 2);
 }
 
-#[tokio::test]
+#[test]
 #[ignore]
-async fn oracle_selftest() {
-    let env = adversarial::RunnerEnv::from_env();
-    adversarial::runner::run_oracle_selftest(env).await;
+fn oracle_selftest() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("build oracle self-test runtime")
+                .block_on(async {
+                    let env = adversarial::RunnerEnv::from_env();
+                    adversarial::runner::run_oracle_selftest(env).await;
+                });
+        })
+        .expect("spawn oracle self-test thread")
+        .join()
+        .expect("oracle self-test thread panicked");
 }
 
-#[tokio::test]
+#[test]
 #[ignore]
-async fn replay_seed() {
-    adversarial::runner::replay_seed_from_env().await;
+fn replay_seed() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("replay runtime must build")
+                .block_on(adversarial::runner::replay_seed_from_env());
+        })
+        .expect("replay thread must spawn")
+        .join()
+        .expect("replay thread must join");
 }
 
 #[tokio::test]
@@ -425,23 +491,38 @@ async fn inspect() {
     adversarial::runner::inspect_from_env().await;
 }
 
-#[tokio::test]
+#[test]
 #[ignore]
-async fn overnight() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init();
-    let env = adversarial::RunnerEnv::from_env();
-    let summary = adversarial::runner::run_overnight(env).await;
-    println!(
-        "adversarial overnight: seeds={} ops={} compactions={} background_compactions={} failed={} ops/sec={:.2}",
-        summary.seeds_run,
-        summary.ops_total,
-        summary.compactions_total,
-        summary.background_compactions_total,
-        summary.failed_seeds,
-        summary.ops_per_sec
-    );
+fn overnight() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("overnight runtime must build")
+                .block_on(async {
+                    let _ = tracing_subscriber::fmt()
+                        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                        .try_init();
+                    let env = adversarial::RunnerEnv::from_env();
+                    let summary = adversarial::runner::run_overnight(env).await;
+                    println!(
+                        "adversarial overnight: seeds={} ops={} compactions={} background_compactions={} failed={} ops/sec={:.2}",
+                        summary.seeds_run,
+                        summary.ops_total,
+                        summary.compactions_total,
+                        summary.background_compactions_total,
+                        summary.failed_seeds,
+                        summary.ops_per_sec
+                    );
+                });
+        })
+        .expect("overnight thread must spawn")
+        .join()
+        .expect("overnight thread must join");
 }
 
 #[tokio::test]

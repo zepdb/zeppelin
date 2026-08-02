@@ -2788,6 +2788,12 @@ const REQUIRED_TAGS: &[&str] = &[
     "delete-recreate",
     "sketch-adc-v4",
     "late-interaction",
+    "late-empty-ns",
+    "late-single-token",
+    "late-giant-rows",
+    "late-k-edges",
+    "late-all-ties",
+    "late-byte-bound",
 ];
 
 fn object_store_totals<'a>(

@@ -24,8 +24,10 @@ use zeppelin::wal::{LeaseManager, Manifest};
 
 /// Fixed coordinate count for every adversarial late-interaction matrix.
 pub const LATE_VECTOR_DIMENSION: usize = 16;
-/// Fixed upper bound for document and query token rows.
-pub const LATE_MAX_VECTORS: usize = 32;
+/// Fixed upper bound for adversarial late query token rows.
+pub const LATE_MAX_QUERY_VECTORS: usize = 32;
+/// Fixed upper bound for adversarial late document token rows.
+pub const LATE_MAX_DOCUMENT_VECTORS: usize = 1_500;
 
 const ENCODED_MATRIX_PREFIX: &str = "zeppelin-adversarial-matrix-v1:";
 const ENCODER_VERSION: &str = "adversarial-matrix-v1";
@@ -33,9 +35,24 @@ const PROFILE_ID: &str = "adversarial-matrix-v1";
 const TRANSFORM_SEED: u64 = 17;
 const TEXT_MODALITIES: &[InputModality] = &[InputModality::Text];
 
-/// Encode one replayable matrix inside the typed inline-text HTTP surface.
-pub fn encode_matrix_text(matrix: &[Vec<f32>]) -> Result<String> {
-    validate_matrix(matrix)?;
+/// Encode one validated document matrix inside the typed inline-text HTTP surface.
+pub fn encode_document_matrix_text(matrix: &[Vec<f32>]) -> Result<String> {
+    validate_matrix(matrix, MatrixRole::Document)?;
+    encode_matrix_text_unchecked(matrix)
+}
+
+/// Encode one validated query matrix inside the typed inline-text HTTP surface.
+pub fn encode_query_matrix_text(matrix: &[Vec<f32>]) -> Result<String> {
+    validate_matrix(matrix, MatrixRole::Query)?;
+    encode_matrix_text_unchecked(matrix)
+}
+
+/// Encode a matrix without shape validation for deterministic boundary probes.
+///
+/// Normal document and query execution must use their role-specific validated
+/// helpers above. This seam exists only so invalid row-count requests can reach
+/// the HTTP and encoder boundaries instead of panicking in harness setup.
+pub fn encode_matrix_text_unchecked(matrix: &[Vec<f32>]) -> Result<String> {
     let encoded = serde_json::to_string(matrix).map_err(|error| {
         ZeppelinError::Serialization(format!(
             "adversarial late matrix JSON encoding failed: {error}"
@@ -231,8 +248,8 @@ fn late_epoch() -> Result<MultiVectorEpoch> {
         },
         preprocessing_digest: ArtifactChecksum::digest(ENCODER_VERSION.as_bytes()),
         vector_dimension: LATE_VECTOR_DIMENSION as u32,
-        max_query_vectors: LATE_MAX_VECTORS as u32,
-        max_document_vectors: LATE_MAX_VECTORS as u32,
+        max_query_vectors: LATE_MAX_QUERY_VECTORS as u32,
+        max_document_vectors: LATE_MAX_DOCUMENT_VECTORS as u32,
         output_normalization: NormalizationRecipe::Identity,
         exact_scoring_transform: VectorTransformRecipe::Identity,
         matrix_dtype: MatrixDtype::F16,
@@ -282,7 +299,7 @@ impl MultiVectorEncoder for ReplayMatrixEncoder {
             .map(|input| match input.input_ref() {
                 EncoderInputRef::Text {
                     content: TextContentRef::Inline(text),
-                } => decode_matrix_text(text),
+                } => decode_matrix_text(text, MatrixRole::Document),
                 EncoderInputRef::Image { .. } | EncoderInputRef::ImageText { .. } => {
                     Err(ZeppelinError::Validation(
                         "adversarial matrix encoder accepts only inline text".to_string(),
@@ -294,11 +311,11 @@ impl MultiVectorEncoder for ReplayMatrixEncoder {
     }
 
     async fn encode_query(&self, input: EncoderQueryInput<'_>) -> Result<MultiVectorEmbedding> {
-        decode_matrix_text(input.text())
+        decode_matrix_text(input.text(), MatrixRole::Query)
     }
 }
 
-fn decode_matrix_text(text: &str) -> Result<MultiVectorEmbedding> {
+fn decode_matrix_text(text: &str, role: MatrixRole) -> Result<MultiVectorEmbedding> {
     let encoded = text.strip_prefix(ENCODED_MATRIX_PREFIX).ok_or_else(|| {
         ZeppelinError::Validation(
             "adversarial matrix encoder input is missing its codec prefix".to_string(),
@@ -309,36 +326,120 @@ fn decode_matrix_text(text: &str) -> Result<MultiVectorEmbedding> {
             "adversarial late matrix JSON decoding failed: {error}"
         ))
     })?;
-    validate_matrix(&matrix)?;
+    validate_matrix(&matrix, role)?;
     let vector_count = matrix.len();
     let values = matrix.into_iter().flatten().collect();
     MultiVectorEmbedding::new(
         values,
         vector_count,
         LATE_VECTOR_DIMENSION,
-        LATE_MAX_VECTORS,
+        role.max_vectors(),
     )
 }
 
-fn validate_matrix(matrix: &[Vec<f32>]) -> Result<()> {
-    if matrix.is_empty() || matrix.len() > LATE_MAX_VECTORS {
+#[derive(Clone, Copy)]
+enum MatrixRole {
+    Document,
+    Query,
+}
+
+impl MatrixRole {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Document => "document",
+            Self::Query => "query",
+        }
+    }
+
+    const fn max_vectors(self) -> usize {
+        match self {
+            Self::Document => LATE_MAX_DOCUMENT_VECTORS,
+            Self::Query => LATE_MAX_QUERY_VECTORS,
+        }
+    }
+}
+
+fn validate_matrix(matrix: &[Vec<f32>], role: MatrixRole) -> Result<()> {
+    let max_vectors = role.max_vectors();
+    let role = role.label();
+    if matrix.is_empty() || matrix.len() > max_vectors {
         return Err(ZeppelinError::Validation(format!(
-            "adversarial late matrix row count must be in 1..={LATE_MAX_VECTORS}, got {}",
+            "adversarial late {role} matrix row count must be in 1..={max_vectors}, got {}",
             matrix.len()
         )));
     }
     for (row_index, row) in matrix.iter().enumerate() {
         if row.len() != LATE_VECTOR_DIMENSION {
             return Err(ZeppelinError::Validation(format!(
-                "adversarial late matrix row {row_index} dimension must be {LATE_VECTOR_DIMENSION}, got {}",
+                "adversarial late {role} matrix row {row_index} dimension must be {LATE_VECTOR_DIMENSION}, got {}",
                 row.len()
             )));
         }
         if let Some(column_index) = row.iter().position(|value| !value.is_finite()) {
             return Err(ZeppelinError::Validation(format!(
-                "adversarial late matrix row {row_index} column {column_index} is not finite"
+                "adversarial late {role} matrix row {row_index} column {column_index} is not finite"
             )));
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn matrix(vector_count: usize) -> Vec<Vec<f32>> {
+        vec![vec![0.0; LATE_VECTOR_DIMENSION]; vector_count]
+    }
+
+    #[test]
+    fn role_specific_codecs_pin_distinct_vector_caps() {
+        encode_query_matrix_text(&matrix(LATE_MAX_QUERY_VECTORS))
+            .expect("query cap must be accepted");
+        let query_error = encode_query_matrix_text(&matrix(LATE_MAX_QUERY_VECTORS + 1))
+            .expect_err("query cap plus one must be rejected");
+        assert_eq!(
+            query_error.to_string(),
+            "validation error: adversarial late query matrix row count must be in 1..=32, got 33"
+        );
+
+        encode_document_matrix_text(&matrix(LATE_MAX_DOCUMENT_VECTORS))
+            .expect("document cap must be accepted");
+        let document_error = encode_document_matrix_text(&matrix(LATE_MAX_DOCUMENT_VECTORS + 1))
+            .expect_err("document cap plus one must be rejected");
+        assert_eq!(
+            document_error.to_string(),
+            "validation error: adversarial late document matrix row count must be in 1..=1500, got 1501"
+        );
+
+        let epoch = late_epoch().expect("adversarial epoch must validate");
+        assert_eq!(epoch.max_query_vectors, 32);
+        assert_eq!(epoch.max_document_vectors, 1_500);
+    }
+
+    #[test]
+    fn unchecked_codec_reaches_decoder_boundary_with_invalid_counts() {
+        let empty = encode_matrix_text_unchecked(&[]).expect("empty matrix must serialize");
+        let empty_error = decode_matrix_text(&empty, MatrixRole::Query)
+            .expect_err("query decoder must reject an empty matrix");
+        assert_eq!(
+            empty_error.to_string(),
+            "validation error: adversarial late query matrix row count must be in 1..=32, got 0"
+        );
+        let empty_document_error = decode_matrix_text(&empty, MatrixRole::Document)
+            .expect_err("document decoder must reject an empty matrix");
+        assert_eq!(
+            empty_document_error.to_string(),
+            "validation error: adversarial late document matrix row count must be in 1..=1500, got 0"
+        );
+
+        let over_max = encode_matrix_text_unchecked(&matrix(LATE_MAX_DOCUMENT_VECTORS + 1))
+            .expect("over-max matrix must serialize for a boundary probe");
+        let over_max_error = decode_matrix_text(&over_max, MatrixRole::Document)
+            .expect_err("document decoder must reject cap plus one");
+        assert_eq!(
+            over_max_error.to_string(),
+            "validation error: adversarial late document matrix row count must be in 1..=1500, got 1501"
+        );
+    }
 }

@@ -9,6 +9,7 @@ use zeppelin::index::quantization::QuantizationType;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter};
 use zeppelin::wal::LateCandidateKind;
 
+use super::late_support::LATE_MAX_DOCUMENT_VECTORS;
 use super::model::Model;
 use super::ops::{
     ActorSel, AsOfTarget, BranchingOp, GenVector, GeneratedQuery, InvalidProbe, LateGenRecord,
@@ -27,6 +28,8 @@ const SKETCH_ADC_TAG: &str = "sketch-adc-v4";
 pub const BRANCHING_PROFILE_TAG: &str = "branching";
 pub const LATE_INTERACTION_TAG: &str = "late-interaction";
 const MAX_LATE_ROWS: usize = 2_000;
+const BYTE_BOUND_DOCUMENTS: usize = 60;
+const BYTE_BOUND_TOKENS: usize = 32;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Coverage {
@@ -177,6 +180,41 @@ enum ScenarioState {
     Done,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LatePathologicalScenario {
+    EmptyNamespace,
+    AllTies,
+    SingleToken,
+    GiantRows,
+    KEdges,
+    ByteBound,
+}
+
+impl LatePathologicalScenario {
+    fn for_seed(seed: u64) -> Self {
+        match seed % 6 {
+            0 => Self::EmptyNamespace,
+            1 => Self::AllTies,
+            2 => Self::SingleToken,
+            3 => Self::GiantRows,
+            4 => Self::KEdges,
+            5 => Self::ByteBound,
+            _ => unreachable!("seed modulo six must be in 0..=5"),
+        }
+    }
+
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::EmptyNamespace => "late-empty-ns",
+            Self::AllTies => "late-all-ties",
+            Self::SingleToken => "late-single-token",
+            Self::GiantRows => "late-giant-rows",
+            Self::KEdges => "late-k-edges",
+            Self::ByteBound => "late-byte-bound",
+        }
+    }
+}
+
 impl AdversarialGenerator {
     #[must_use]
     pub fn new(seed: u64, namespace_prefix: &str) -> Self {
@@ -188,6 +226,32 @@ impl AdversarialGenerator {
     pub fn new_late(seed: u64, namespace_prefix: &str) -> Self {
         let mut generator = Self::new(seed, namespace_prefix);
         generator.late_weighting = true;
+        generator
+    }
+
+    /// Construct the Phase 4 late profile with one seeded pathological
+    /// namespace in addition to the ordinary bounded late corpus.
+    #[must_use]
+    pub fn new_late_pathological(seed: u64, namespace_prefix: &str) -> Self {
+        let mut generator = Self::new_late(seed, namespace_prefix);
+        let late_index = generator.late_namespace_index();
+        let late_namespace = generator.namespaces[late_index].name.clone();
+        let late_spec = &mut generator.namespaces[late_index].spec;
+        let late_config = late_spec
+            .late_interaction
+            .as_mut()
+            .expect("pathological profile must retain late config");
+        late_config.read_gap_budget_bytes = 64 * 1024;
+        late_config.read_max_request_bytes = 8 * 1024 * 1024;
+        late_config.read_max_concurrency = 16;
+        for op in &mut generator.pending {
+            if let Op::CreateNamespace { ns, spec, .. } = op {
+                if ns == &late_namespace {
+                    spec.clone_from(late_spec);
+                }
+            }
+        }
+        generator.enqueue_late_pathological_scenario(seed, namespace_prefix);
         generator
     }
 
@@ -452,6 +516,190 @@ impl AdversarialGenerator {
                 consistency: ConsistencyLevel::Strong,
             },
         ]);
+    }
+
+    fn enqueue_late_pathological_scenario(&mut self, seed: u64, namespace_prefix: &str) {
+        let scenario = LatePathologicalScenario::for_seed(seed);
+        let spec = self.namespaces[self.late_namespace_index()].spec.clone();
+        let namespace = format!("{namespace_prefix}-adv-{seed}-{}", scenario.tag());
+        let dims = spec.dims;
+        assert_eq!(dims, 16);
+        self.pending.push_back(Op::CreateNamespace {
+            actor: ActorSel::ADMIN,
+            ns: namespace.clone(),
+            spec,
+        });
+        let query = deterministic_late_matrix(dims, 4, 9);
+
+        match scenario {
+            LatePathologicalScenario::EmptyNamespace => {
+                self.pending.push_back(Op::LateQuery {
+                    actor: ActorSel::ADMIN,
+                    ns: namespace,
+                    query,
+                    top_k: 8,
+                    filter: None,
+                    consistency: ConsistencyLevel::Strong,
+                });
+            }
+            LatePathologicalScenario::SingleToken => {
+                let records = (0..8)
+                    .map(|index| LateGenRecord {
+                        id: format!("{namespace}-single-{index:02}"),
+                        values: deterministic_late_matrix(dims, 1, index),
+                        attributes: late_group(index),
+                    })
+                    .collect::<Vec<_>>();
+                self.enqueue_pathological_records(&namespace, records.clone());
+                self.pending.extend([
+                    Op::InvalidProbe {
+                        actor: ActorSel::ADMIN,
+                        ns: namespace.clone(),
+                        probe: InvalidProbe::LateZeroTokenDocument,
+                    },
+                    Op::LateQuery {
+                        actor: ActorSel::ADMIN,
+                        ns: namespace,
+                        query: records[0].values.clone(),
+                        top_k: records.len(),
+                        filter: None,
+                        consistency: ConsistencyLevel::Strong,
+                    },
+                ]);
+            }
+            LatePathologicalScenario::GiantRows => {
+                let mut records = vec![LateGenRecord {
+                    id: format!("{namespace}-giant"),
+                    values: deterministic_late_matrix(dims, LATE_MAX_DOCUMENT_VECTORS, 101),
+                    attributes: late_group(0),
+                }];
+                records.extend((0..4).map(|index| LateGenRecord {
+                    id: format!("{namespace}-single-{index:02}"),
+                    values: deterministic_late_matrix(dims, 1, 200 + index),
+                    attributes: late_group(index),
+                }));
+                self.enqueue_pathological_records(&namespace, records.clone());
+                self.pending.extend([
+                    Op::InvalidProbe {
+                        actor: ActorSel::ADMIN,
+                        ns: namespace.clone(),
+                        probe: InvalidProbe::LateOverMaxTokenQuery,
+                    },
+                    Op::LateQuery {
+                        actor: ActorSel::ADMIN,
+                        ns: namespace,
+                        query,
+                        top_k: records.len(),
+                        filter: None,
+                        consistency: ConsistencyLevel::Strong,
+                    },
+                ]);
+            }
+            LatePathologicalScenario::KEdges => {
+                let records = (0..6)
+                    .map(|index| LateGenRecord {
+                        id: format!("{namespace}-k-{index:02}"),
+                        values: deterministic_late_matrix(dims, 2, 300 + index),
+                        attributes: late_group(index),
+                    })
+                    .collect::<Vec<_>>();
+                let corpus_size = records.len();
+                self.enqueue_pathological_records(&namespace, records);
+                for top_k in [1, corpus_size, corpus_size + 3] {
+                    self.pending.push_back(Op::LateQuery {
+                        actor: ActorSel::ADMIN,
+                        ns: namespace.clone(),
+                        query: query.clone(),
+                        top_k,
+                        filter: None,
+                        consistency: ConsistencyLevel::Strong,
+                    });
+                }
+                self.pending.extend([
+                    Op::InvalidProbe {
+                        actor: ActorSel::ADMIN,
+                        ns: namespace.clone(),
+                        probe: InvalidProbe::LateKZero,
+                    },
+                    Op::LateQuery {
+                        actor: ActorSel::ADMIN,
+                        ns: namespace,
+                        query,
+                        top_k: corpus_size,
+                        filter: None,
+                        consistency: ConsistencyLevel::Strong,
+                    },
+                ]);
+            }
+            LatePathologicalScenario::AllTies => {
+                let tied_matrix = deterministic_late_matrix(dims, 8, 401);
+                let records = (0..16)
+                    .rev()
+                    .map(|index| LateGenRecord {
+                        id: format!("{namespace}-tie-{index:02}"),
+                        values: tied_matrix.clone(),
+                        attributes: late_group(index),
+                    })
+                    .collect::<Vec<_>>();
+                self.enqueue_pathological_records(&namespace, records);
+                for _ in 0..3 {
+                    self.pending.push_back(Op::LateQuery {
+                        actor: ActorSel::ADMIN,
+                        ns: namespace.clone(),
+                        query: tied_matrix.clone(),
+                        top_k: 8,
+                        filter: None,
+                        consistency: ConsistencyLevel::Strong,
+                    });
+                }
+            }
+            LatePathologicalScenario::ByteBound => {
+                let records = (0..BYTE_BOUND_DOCUMENTS)
+                    .map(|index| LateGenRecord {
+                        id: format!("{namespace}-byte-{index:03}"),
+                        values: deterministic_late_matrix(dims, BYTE_BOUND_TOKENS, 500 + index),
+                        attributes: late_group(index),
+                    })
+                    .collect::<Vec<_>>();
+                let byte_query = records[0].values.clone();
+                self.enqueue_pathological_records(&namespace, records);
+                self.pending.extend([
+                    Op::LateQuery {
+                        actor: ActorSel::ADMIN,
+                        ns: namespace.clone(),
+                        query: byte_query.clone(),
+                        top_k: BYTE_BOUND_DOCUMENTS,
+                        filter: None,
+                        consistency: ConsistencyLevel::Strong,
+                    },
+                    Op::LateQuery {
+                        actor: ActorSel::ADMIN,
+                        ns: namespace,
+                        query: byte_query,
+                        top_k: BYTE_BOUND_DOCUMENTS,
+                        filter: Some(Filter::Eq {
+                            field: "group".to_string(),
+                            value: AttributeValue::String("g0".to_string()),
+                        }),
+                        consistency: ConsistencyLevel::Strong,
+                    },
+                ]);
+            }
+        }
+    }
+
+    fn enqueue_pathological_records(&mut self, namespace: &str, records: Vec<LateGenRecord>) {
+        let row_count = records
+            .iter()
+            .map(|record| record.values.len())
+            .sum::<usize>();
+        assert!(row_count <= MAX_LATE_ROWS);
+        assert!(records.len() <= 2_000);
+        self.pending.push_back(Op::LateUpsert {
+            actor: ActorSel::ADMIN,
+            ns: namespace.to_string(),
+            records,
+        });
     }
 
     fn enqueue_branching_profile(&mut self, seed: u64) {
@@ -2042,6 +2290,32 @@ impl AdversarialGenerator {
     }
 }
 
+fn deterministic_late_matrix(dims: usize, vector_count: usize, seed: usize) -> Vec<Vec<f32>> {
+    assert!((1..=32).contains(&dims));
+    assert!((1..=LATE_MAX_DOCUMENT_VECTORS).contains(&vector_count));
+    (0..vector_count)
+        .map(|row_index| {
+            let mut row = vec![0.0; dims];
+            let primary = seed.wrapping_mul(17).wrapping_add(row_index) % dims;
+            let secondary = (primary + 1 + seed % dims.saturating_sub(1).max(1)) % dims;
+            row[primary] = 1.0;
+            row[secondary] = 0.25;
+            let reciprocal = (1.0_f32 + 0.25_f32.powi(2)).sqrt().recip();
+            for value in &mut row {
+                *value *= reciprocal;
+            }
+            row
+        })
+        .collect()
+}
+
+fn late_group(index: usize) -> Option<HashMap<String, AttributeValue>> {
+    Some(HashMap::from([(
+        "group".to_string(),
+        AttributeValue::String(format!("g{}", index % 2)),
+    )]))
+}
+
 fn branching_vector(dims: usize, axis: usize) -> Vec<f32> {
     let mut vector = vec![0.0; dims];
     if dims != 0 {
@@ -2171,6 +2445,210 @@ mod tests {
         );
         assert!(baseline.late_rows_generated <= MAX_LATE_ROWS);
         assert!(weighted.late_rows_generated <= MAX_LATE_ROWS);
+    }
+
+    #[test]
+    fn late_pathological_rotation_is_seeded_unlisted_and_fifo() {
+        let all_tags = [
+            "late-empty-ns",
+            "late-all-ties",
+            "late-single-token",
+            "late-giant-rows",
+            "late-k-edges",
+            "late-byte-bound",
+        ];
+        let tags = (0..8)
+            .map(|seed| {
+                let generator = AdversarialGenerator::new_late_pathological(seed, "shape");
+                let tag = LatePathologicalScenario::for_seed(seed).tag();
+                let operations = pathological_ops(&generator, tag);
+                let Op::CreateNamespace {
+                    ns: pathological_ns,
+                    spec,
+                    ..
+                } = operations[0]
+                else {
+                    panic!("pathological script must begin with namespace creation");
+                };
+                assert!(pathological_ns.ends_with(tag));
+                assert_eq!(spec.dims, 16);
+                assert!(spec.late_interaction.is_some());
+                assert!(matches!(operations.last(), Some(Op::LateQuery { .. })));
+                assert!(!generator
+                    .namespaces
+                    .iter()
+                    .any(|namespace| namespace.name == *pathological_ns));
+                assert_eq!(
+                    generator
+                        .namespaces
+                        .iter()
+                        .filter(|namespace| namespace.is_late())
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    generator
+                        .pending
+                        .iter()
+                        .filter(|operation| matches!(
+                            operation,
+                            Op::CreateNamespace { ns, .. }
+                                if all_tags.iter().any(|candidate| ns.ends_with(candidate))
+                        ))
+                        .count(),
+                    1
+                );
+                for operation in operations {
+                    match operation {
+                        Op::LateUpsert { records, .. } => {
+                            let rows = records
+                                .iter()
+                                .map(|record| {
+                                    assert!(record.values.iter().all(|row| row.len() == 16));
+                                    record.values.len()
+                                })
+                                .sum::<usize>();
+                            assert!(rows <= MAX_LATE_ROWS);
+                        }
+                        Op::LateQuery { query, .. } => {
+                            assert!((1..=32).contains(&query.len()));
+                            assert!(query.iter().all(|row| row.len() == 16));
+                        }
+                        _ => {}
+                    }
+                }
+                tag
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tags,
+            vec![
+                "late-empty-ns",
+                "late-all-ties",
+                "late-single-token",
+                "late-giant-rows",
+                "late-k-edges",
+                "late-byte-bound",
+                "late-empty-ns",
+                "late-all-ties",
+            ]
+        );
+    }
+
+    #[test]
+    fn late_pathological_boundaries_are_pinned() {
+        let single = AdversarialGenerator::new_late_pathological(2, "shape");
+        let single_ops = pathological_ops(&single, "late-single-token");
+        let single_records = late_records(&single_ops);
+        assert_eq!(single_records.len(), 8);
+        assert!(single_records.iter().all(|record| record.values.len() == 1));
+        assert!(single_ops.iter().any(|operation| matches!(
+            operation,
+            Op::InvalidProbe {
+                probe: InvalidProbe::LateZeroTokenDocument,
+                ..
+            }
+        )));
+
+        let giant = AdversarialGenerator::new_late_pathological(3, "shape");
+        let giant_ops = pathological_ops(&giant, "late-giant-rows");
+        let giant_records = late_records(&giant_ops);
+        assert_eq!(giant_records[0].values.len(), LATE_MAX_DOCUMENT_VECTORS);
+        assert!(giant_records[1..]
+            .iter()
+            .all(|record| record.values.len() == 1));
+        assert_eq!(
+            giant_records
+                .iter()
+                .map(|record| record.values.len())
+                .sum::<usize>(),
+            LATE_MAX_DOCUMENT_VECTORS + 4
+        );
+        assert!(giant_ops.iter().any(|operation| matches!(
+            operation,
+            Op::InvalidProbe {
+                probe: InvalidProbe::LateOverMaxTokenQuery,
+                ..
+            }
+        )));
+
+        let k_edges = AdversarialGenerator::new_late_pathological(4, "shape");
+        let k_edge_ops = pathological_ops(&k_edges, "late-k-edges");
+        let top_ks = k_edge_ops
+            .iter()
+            .filter_map(|operation| match operation {
+                Op::LateQuery { top_k, .. } => Some(*top_k),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(top_ks, vec![1, 6, 9, 6]);
+        assert!(k_edge_ops.iter().any(|operation| matches!(
+            operation,
+            Op::InvalidProbe {
+                probe: InvalidProbe::LateKZero,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn late_ties_and_byte_bound_shapes_are_explicit() {
+        let tied = AdversarialGenerator::new_late_pathological(1, "shape");
+        let tied_ops = pathological_ops(&tied, "late-all-ties");
+        let tied_records = late_records(&tied_ops);
+        assert!(tied_records
+            .windows(2)
+            .all(|pair| pair[0].values == pair[1].values));
+        assert!(tied_records.windows(2).all(|pair| pair[0].id > pair[1].id));
+        let tied_queries = tied_ops
+            .iter()
+            .filter_map(|operation| match operation {
+                Op::LateQuery { query, .. } => Some(query),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tied_queries.len(), 3);
+        assert!(tied_queries.windows(2).all(|pair| pair[0] == pair[1]));
+
+        let byte_bound = AdversarialGenerator::new_late_pathological(5, "shape");
+        let byte_ops = pathological_ops(&byte_bound, "late-byte-bound");
+        let byte_records = late_records(&byte_ops);
+        assert_eq!(byte_records.len(), BYTE_BOUND_DOCUMENTS);
+        assert_eq!(
+            byte_records
+                .iter()
+                .map(|record| record.values.len())
+                .sum::<usize>(),
+            BYTE_BOUND_DOCUMENTS * BYTE_BOUND_TOKENS
+        );
+        assert!(byte_records.iter().enumerate().all(|(index, record)| {
+            record.id == format!("shape-adv-5-late-byte-bound-byte-{index:03}")
+        }));
+        assert!(matches!(
+            byte_ops.last(),
+            Some(Op::LateQuery {
+                filter: Some(_),
+                ..
+            })
+        ));
+    }
+
+    fn pathological_ops<'a>(generator: &'a AdversarialGenerator, tag: &str) -> Vec<&'a Op> {
+        generator
+            .pending
+            .iter()
+            .filter(|operation| operation.namespace().ends_with(tag))
+            .collect()
+    }
+
+    fn late_records<'a>(operations: &[&'a Op]) -> &'a [LateGenRecord] {
+        operations
+            .iter()
+            .find_map(|operation| match operation {
+                Op::LateUpsert { records, .. } => Some(records.as_slice()),
+                _ => None,
+            })
+            .expect("pathological corpus must be upserted")
     }
 
     #[test]

@@ -680,6 +680,111 @@ mod tests {
     }
 
     #[test]
+    fn planner_round_trips_giant_and_single_token_ranges_across_coalescing_extremes() {
+        use bytes::Bytes;
+
+        const DIMENSION: usize = 32;
+        const F16_BYTES: usize = 2;
+        const ONE_TOKEN_BYTES: usize = DIMENSION * F16_BYTES;
+        const GIANT_TOKENS: usize = 1_500;
+        const GIANT_BYTES: usize = GIANT_TOKENS * ONE_TOKEN_BYTES;
+
+        let first_giant = 0..GIANT_BYTES;
+        let first_single_start = first_giant.end + DEFAULT_GAP_BUDGET_BYTES;
+        let first_single = first_single_start..first_single_start + ONE_TOKEN_BYTES;
+        let second_giant = first_single.end..first_single.end + GIANT_BYTES;
+
+        // One byte beyond the gap budget forces a new physical run.
+        let second_single_start = second_giant.end + DEFAULT_GAP_BUDGET_BYTES + 1;
+        let second_single = second_single_start..second_single_start + ONE_TOKEN_BYTES;
+        let third_giant = second_single.end..second_single.end + GIANT_BYTES;
+
+        // Deliberately caller-unsorted so the inverse map, not physical order,
+        // restores results.
+        let requests = vec![
+            ReadRequest {
+                object_key: "matrix-block".to_string(),
+                range: third_giant.clone(),
+            },
+            ReadRequest {
+                object_key: "matrix-block".to_string(),
+                range: first_single.clone(),
+            },
+            ReadRequest {
+                object_key: "matrix-block".to_string(),
+                range: first_giant.clone(),
+            },
+            ReadRequest {
+                object_key: "matrix-block".to_string(),
+                range: second_single.clone(),
+            },
+            ReadRequest {
+                object_key: "matrix-block".to_string(),
+                range: second_giant.clone(),
+            },
+        ];
+        let config = ReadPlanConfig::new(DEFAULT_GAP_BUDGET_BYTES, DEFAULT_MAX_REQUEST_BYTES, 16)
+            .expect("late read-plan bounds must validate");
+        let plan = ReadPlan::build(&requests, &config).expect("mixed plan must build");
+
+        assert_eq!(
+            plan.planned,
+            vec![
+                PlannedRead {
+                    object_key: "matrix-block".to_string(),
+                    range: 0..second_giant.end,
+                },
+                PlannedRead {
+                    object_key: "matrix-block".to_string(),
+                    range: second_single.start..third_giant.end,
+                },
+            ]
+        );
+        assert_eq!(plan.logical_request_count(), requests.len());
+        assert_eq!(plan.planned_request_count(), 2);
+        assert_eq!(plan.planned_bytes(), 353_664);
+
+        let object = Bytes::from(
+            (0..third_giant.end)
+                .map(|offset| ((offset.wrapping_mul(37) ^ (offset >> 8)) % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let mut restored = vec![None; requests.len()];
+        let mut completion_logical_indices = Vec::new();
+
+        // Reverse completion order to exercise the streamed-consumer shape.
+        for planned_index in (0..plan.planned.len()).rev() {
+            let fetched = object.slice(plan.planned[planned_index].range.clone());
+            let logical = plan
+                .logical_slices_for(planned_index, &fetched)
+                .expect("physical bytes must restore every logical slice");
+            completion_logical_indices.push(
+                logical
+                    .iter()
+                    .map(|(logical_index, _)| *logical_index)
+                    .collect::<Vec<_>>(),
+            );
+            for (logical_index, bytes) in logical {
+                assert!(
+                    restored[logical_index].replace(bytes).is_none(),
+                    "logical request must be delivered exactly once"
+                );
+            }
+        }
+
+        assert_eq!(completion_logical_indices, vec![vec![0, 3], vec![1, 2, 4]]);
+        let restored = restored
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .expect("every logical request must be restored");
+        let expected = requests
+            .iter()
+            .map(|request| object.slice(request.range.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(restored, expected);
+    }
+
+    #[test]
     fn planner_rejects_invalid_ranges_and_config_bounds() {
         for config in [
             ReadPlanConfig {

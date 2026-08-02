@@ -170,6 +170,14 @@ pub(crate) fn check_i31_late_exact(
             *score += score_eps(*score) * 10.0;
         }
     }
+    if mutation == Some(OracleMutation::LateTieOrder) {
+        if let Some(tie_index) = expected
+            .windows(2)
+            .position(|pair| pair[0].1.total_cmp(&pair[1].1).is_eq())
+        {
+            expected.swap(tie_index, tie_index + 1);
+        }
+    }
     if mutation == Some(OracleMutation::LateTruncatedResultSuccess) {
         // The mutation deliberately removes I31's cardinality defense. I33
         // must independently reject the shortened successful response.
@@ -322,25 +330,44 @@ pub fn check_i32_late_read_accounting(
     if !(200..300).contains(&rec.status) {
         return Vec::new();
     }
-    let Some(planned) = rec
+    let planned = rec
         .response
         .get("debug")
         .and_then(|debug| debug.get("truth_planned_requests"))
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return vec![violation(
-            ViolationId::I32LateReadAccounting,
-            rec,
-            ns,
-            "late debug response omitted truth planned-request count",
-            serde_json::json!({
-                "debug": rec.response.get("debug"),
-                "observation": {
-                    "candidate_gets": observation.candidate_gets,
-                    "truth_gets": observation.truth_gets,
-                },
-            }),
-        )];
+        .and_then(serde_json::Value::as_u64);
+    let planned = match planned {
+        Some(planned) => planned,
+        None if ns.ends_with("late-empty-ns")
+            && rec
+                .response
+                .get("debug")
+                .and_then(serde_json::Value::as_object)
+                .is_some()
+            && rec
+                .response
+                .get("results")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty)
+            && observation.candidate_gets == 0
+            && observation.truth_gets == 0 =>
+        {
+            0
+        }
+        None => {
+            return vec![violation(
+                ViolationId::I32LateReadAccounting,
+                rec,
+                ns,
+                "late debug response omitted truth planned-request count",
+                serde_json::json!({
+                    "debug": rec.response.get("debug"),
+                    "observation": {
+                        "candidate_gets": observation.candidate_gets,
+                        "truth_gets": observation.truth_gets,
+                    },
+                }),
+            )];
+        }
     };
     let compared_planned = if mutation == Some(OracleMutation::LateHiddenGet) {
         planned.saturating_sub(1)
@@ -380,6 +407,26 @@ pub fn check_i32_late_read_accounting(
                 "mutation": mutation == Some(OracleMutation::LateHiddenGet),
             }),
         ));
+    }
+    if ns.ends_with("late-byte-bound") {
+        let candidate_count = rec
+            .response
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0_u64, |results| results.len() as u64);
+        if candidate_count == 0 || planned.saturating_mul(4) >= candidate_count.saturating_mul(2) {
+            violations.push(violation(
+                ViolationId::I32LateReadAccounting,
+                rec,
+                ns,
+                "byte-bound truth reads did not coalesce far below per-candidate reads",
+                serde_json::json!({
+                    "truth_planned_requests": planned,
+                    "candidate_count": candidate_count,
+                    "required_relation": "4 * planned_requests < 2 * candidates",
+                }),
+            ));
+        }
     }
     violations
 }
@@ -2080,7 +2127,14 @@ fn check_debug_structural(
             }),
         )];
     }
+    let empty_late_zero_plan = require_late_trace
+        && ns.ends_with("late-empty-ns")
+        && response
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty);
     if require_late_trace
+        && !empty_late_zero_plan
         && debug
             .get("truth_planned_requests")
             .and_then(serde_json::Value::as_u64)
@@ -3024,6 +3078,12 @@ const KNOWN_ERROR_CODES: &[&str] = &[
     "NOT_IMPLEMENTED",
     "HYDRATION_DISABLED",
     "FTS_FIELD_NOT_CONFIGURED",
+    "RETRIEVAL_UNIT_EMPTY",
+    "RETRIEVAL_UNIT_TOO_LARGE",
+    "LATE_INTERACTION_NAMESPACE_REQUIRED",
+    "LATE_INTERACTION_QUERY_EMPTY",
+    "LATE_INTERACTION_QUERY_TOO_LARGE",
+    "LATE_INTERACTION_WEIGHTED_FUSION_UNSUPPORTED",
     "INDEX_UNAVAILABLE",
     "CONCURRENCY_LIMIT",
     "RATE_LIMITED",
@@ -3199,6 +3259,32 @@ mod tests {
     }
 
     #[test]
+    fn late_tie_order_mutation_fires_i31() {
+        let rec = late_query_record(
+            Some(Filter::Eq {
+                field: "group".to_string(),
+                value: AttributeValue::String("keep".to_string()),
+            }),
+            json!([
+                { "id": "a", "score": 1.0 },
+                { "id": "b", "score": 1.0 }
+            ]),
+        );
+
+        let violations = check_i31_late_exact(
+            &late_model(),
+            &rec,
+            RunMode::Deterministic,
+            Some(OracleMutation::LateTieOrder),
+        );
+
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].id, ViolationId::I31LateExactEquivalence);
+        assert_eq!(violations[0].evidence["actual_ids"], json!(["a", "b"]));
+        assert_eq!(violations[0].evidence["expected_ids"], json!(["b", "a"]));
+    }
+
+    #[test]
     fn late_hidden_get_mutation_fires_i32_and_clean_accounting_passes() {
         let rec = late_query_record(None, json!([]));
         let observation = LateReadObservation {
@@ -3234,6 +3320,37 @@ mod tests {
         assert!(check_i32_late_read_accounting(&rec, retry_excess, true, None).is_empty());
         assert!(!check_i32_late_read_accounting(&rec, retry_excess, false, None).is_empty());
         assert!(!check_i32_late_read_accounting(&rec, shortfall, true, None).is_empty());
+    }
+
+    #[test]
+    fn empty_late_namespace_pins_the_trace_early_exit_to_zero_gets() {
+        let mut rec = late_query_record(None, json!([]));
+        let Op::LateQuery { ns, .. } = &mut rec.op else {
+            unreachable!("late query fixture changed kind")
+        };
+        *ns = "fixture-late-empty-ns".to_string();
+        rec.response["debug"]
+            .as_object_mut()
+            .expect("fixture debug must be an object")
+            .remove("truth_planned_requests");
+
+        let zero = LateReadObservation {
+            candidate_gets: 0,
+            truth_gets: 0,
+        };
+        assert!(check_i32_late_read_accounting(&rec, zero, false, None).is_empty());
+
+        let unexpected_get = LateReadObservation {
+            candidate_gets: 0,
+            truth_gets: 1,
+        };
+        assert!(!check_i32_late_read_accounting(&rec, unexpected_get, false, None).is_empty());
+
+        rec.response
+            .as_object_mut()
+            .expect("fixture response must be an object")
+            .remove("debug");
+        assert!(!check_i32_late_read_accounting(&rec, zero, false, None).is_empty());
     }
 
     #[test]
