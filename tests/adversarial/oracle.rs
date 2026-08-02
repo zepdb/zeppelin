@@ -304,18 +304,10 @@ pub struct LateReadObservation {
 ///
 /// The runner owns the counting store and passes the per-operation deltas;
 /// the oracle compares them with the opt-in trace carried by the response.
-///
-/// Inside an active late-stream fault window the storage client may retry
-/// faulted GETs, so the backend legitimately observes more truth-wave GETs
-/// than planned. Window-scoped absorption: tolerate `observed >= planned`
-/// there (excess is retries; a shortfall still means the response skipped
-/// planned reads). Candidate-wave GETs stay forbidden, and strict equality
-/// applies whenever no window is active.
 #[must_use]
 pub fn check_i32_late_read_accounting(
     rec: &OpRecord,
     observation: LateReadObservation,
-    fault_window_active: bool,
     mutation: Option<OracleMutation>,
 ) -> Vec<Violation> {
     let Op::LateQuery { ns, .. } = &rec.op else {
@@ -363,12 +355,7 @@ pub fn check_i32_late_read_accounting(
             }),
         ));
     }
-    let accounting_breach = if fault_window_active {
-        observation.truth_gets < compared_planned
-    } else {
-        observation.truth_gets != compared_planned
-    };
-    if accounting_breach {
+    if observation.truth_gets != compared_planned {
         violations.push(violation(
             ViolationId::I32LateReadAccounting,
             rec,
@@ -378,7 +365,6 @@ pub fn check_i32_late_read_accounting(
                 "observed_truth_gets": observation.truth_gets,
                 "truth_planned_requests": planned,
                 "compared_planned_requests": compared_planned,
-                "fault_window_active": fault_window_active,
                 "mutation": mutation == Some(OracleMutation::LateHiddenGet),
             }),
         ));
@@ -3193,13 +3179,9 @@ mod tests {
             truth_gets: 2,
         };
 
-        assert!(check_i32_late_read_accounting(&rec, observation, false, None).is_empty());
-        let violations = check_i32_late_read_accounting(
-            &rec,
-            observation,
-            false,
-            Some(OracleMutation::LateHiddenGet),
-        );
+        assert!(check_i32_late_read_accounting(&rec, observation, None).is_empty());
+        let violations =
+            check_i32_late_read_accounting(&rec, observation, Some(OracleMutation::LateHiddenGet));
 
         assert!(violations
             .iter()
@@ -3207,7 +3189,7 @@ mod tests {
     }
 
     #[test]
-    fn late_read_accounting_tolerates_retry_excess_only_inside_fault_window() {
+    fn late_read_accounting_rejects_excess_and_shortfall() {
         let rec = late_query_record(None, json!([]));
         let retry_excess = LateReadObservation {
             candidate_gets: 0,
@@ -3218,9 +3200,8 @@ mod tests {
             truth_gets: 1,
         };
 
-        assert!(check_i32_late_read_accounting(&rec, retry_excess, true, None).is_empty());
-        assert!(!check_i32_late_read_accounting(&rec, retry_excess, false, None).is_empty());
-        assert!(!check_i32_late_read_accounting(&rec, shortfall, true, None).is_empty());
+        assert!(!check_i32_late_read_accounting(&rec, retry_excess, None).is_empty());
+        assert!(!check_i32_late_read_accounting(&rec, shortfall, None).is_empty());
     }
 
     #[test]

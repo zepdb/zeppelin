@@ -6771,7 +6771,6 @@ async fn finish_recorded_op(
             &rec,
             late_read_observation
                 .expect("successful deterministic late query must retain GET accounting"),
-            late_stream_fault_window_active,
             mutation,
         ));
     }
