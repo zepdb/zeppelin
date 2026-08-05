@@ -26,6 +26,34 @@
 - **Strong & eventual consistency** -- Choose per-query (see [Consistency semantics](#consistency-semantics))
 - **Object storage** -- S3, MinIO, and S3-compatible backends. GCS and Azure planned
 
+## Performance
+
+Measured on the production default query path — TwoBit (2-bit Extended-RaBitQ)
+coarse scoring with exact f32 rerank and the scale-aware `nprobe` policy — over
+dbpedia-100k (100,000 x 1,536-dim cosine vectors; 256 clusters, so an omitted
+`nprobe` resolves to 48), strong consistency, no filter, single warm node
+against loopback MinIO (Apple M3 Max, rustc 1.93, release build):
+
+| Warm repeat query (n=200) | `top_k = 10` | `top_k = 100` |
+| --- | --- | --- |
+| mean / p50 | 8.0 ms / 8.0 ms | 11.5 ms / 11.0 ms |
+| p95 / p99 | 9.3 ms / 9.7 ms | 15.8 ms / -- |
+| recall vs exact ground truth | 0.989 @10 | 0.982 @100 |
+
+Every warm query stays honest to the S3-native design: one conditional
+manifest GET (strong consistency re-verifies the authoritative manifest) plus
+~37 parallel segment range GETs (~16 MB) per query — nothing above is served
+from index state that bypasses object storage. On byte-dominated deployments
+(local disk / MinIO), setting `query.cost_latency_profile = "low_latency"`
+trades more range requests for fewer bytes and cuts warm mean latency a
+further ~7%; the default profile stays request-optimized for real S3 pricing.
+
+These are loopback-MinIO measurements, not cloud-S3 latency claims: real S3
+adds its per-request round-trip floors to the manifest, coarse, and rerank
+waves. Methodology, per-slice attribution, and bit-exactness evidence for the
+2026-08 optimization pass (-30% warm latency at identical results) are in
+[`tasks/optimization_2bit_results/summary.md`](tasks/optimization_2bit_results/summary.md).
+
 ## Quick Start
 
 Spin up Zeppelin with MinIO locally using Docker Compose:
