@@ -203,6 +203,22 @@ enum ResidentEncoding {
     },
 }
 
+/// Borrowed two-bit rotation geometry shared with the coarse scan.
+///
+/// Returned by [`ResidentSketch::rabitq_geometry`]. Every field is borrowed
+/// from validated resident sketch state; callers cross-check the manifest
+/// sketch reference and fail loudly on disagreement.
+pub(crate) struct RabitqGeometry<'a> {
+    /// Padded rotation dimension persisted in the sketch header.
+    pub(crate) code_dims: usize,
+    /// Deterministic rotation seed persisted in the header and manifest.
+    pub(crate) rotation_seed: u64,
+    /// Shared prepared structured rotation.
+    pub(crate) rotation: &'a Arc<StructuredRotation>,
+    /// Centroids rotated once when attached, when available.
+    pub(crate) rotated_centroids: Option<&'a Arc<Vec<Vec<f32>>>>,
+}
+
 /// Validated in-memory coarse index loaded from an immutable segment artifact.
 ///
 /// Rows are represented only by compact quantized codes and cluster boundaries; full
@@ -708,6 +724,31 @@ impl ResidentSketch {
                 rotated_centroids: None,
             },
         })
+    }
+
+    /// Borrows the prepared two-bit rotation geometry for coarse-scan reuse.
+    ///
+    /// Returns the padded code dimension, persisted rotation seed, the shared
+    /// [`StructuredRotation`], and the immutable rotated centroids prepared by
+    /// [`ResidentSketch::with_centroids`] (absent when centroids were never
+    /// attached). Legacy PQ sketches return `None`. The values are borrowed
+    /// from validated resident state; callers must still cross-check the
+    /// manifest sketch reference and fail loudly on disagreement.
+    pub(crate) fn rabitq_geometry(&self) -> Option<RabitqGeometry<'_>> {
+        match &self.encoding {
+            ResidentEncoding::Rabitq2 {
+                code_dims,
+                rotation_seed,
+                rotation,
+                rotated_centroids,
+            } => Some(RabitqGeometry {
+                code_dims: *code_dims,
+                rotation_seed: *rotation_seed,
+                rotation,
+                rotated_centroids: rotated_centroids.as_ref(),
+            }),
+            ResidentEncoding::LegacyPq { .. } => None,
+        }
     }
 
     /// Prepares immutable rotated centroids needed by v4 query scoring.

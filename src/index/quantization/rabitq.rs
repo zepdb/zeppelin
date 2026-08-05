@@ -906,6 +906,87 @@ impl QueryAdc4 {
         let query_sum = self.step * self.code_sum as f32 + self.lower * self.dim as f32;
         Ok(unsigned_dot - 1.5 * query_sum)
     }
+
+    /// Fused single-pass form of [`QueryAdc4::two_bit_grid_dot`] plus the
+    /// low/high agreement popcount used to recover the grid norm.
+    ///
+    /// Traverses the two stored planes and all four query planes once,
+    /// accumulating every popcount in one word loop. All counts are exact
+    /// integers combined with the same shifts and the same final `f32`
+    /// expressions as the unfused pair, so the returned values are
+    /// bit-identical to `two_bit_grid_dot` plus a separate
+    /// `!(low ^ high)` agreement pass.
+    ///
+    /// # Parameters
+    ///
+    /// - `planes`: `[low, high]` borrowed bit planes of the row being scored.
+    ///
+    /// # Returns
+    ///
+    /// `(grid_dot, agreement_count)`: the dot product between the row's grid
+    /// vector and the dequantized query, and the number of coordinates whose
+    /// low and high bits agree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RabitqError::LengthMismatch`] when either plane is not
+    /// `dim / 64` words long, naming which plane was wrong.
+    fn two_bit_grid_dot_and_agreement(
+        &self,
+        planes: [&[u64]; 2],
+    ) -> Result<(f32, u32), RabitqError> {
+        let words = self.dim / 64;
+        for (index, plane) in planes.iter().enumerate() {
+            check_len(
+                if index == 0 {
+                    "two-bit low plane"
+                } else {
+                    "two-bit high plane"
+                },
+                plane.len(),
+                words,
+            )?;
+        }
+
+        // Explicit equal-length reslices let the optimizer drop per-access
+        // bounds checks inside the fused loop.
+        let low = &planes[0][..words];
+        let high = &planes[1][..words];
+        let q0 = &self.planes[0][..words];
+        let q1 = &self.planes[1][..words];
+        let q2 = &self.planes[2][..words];
+        let q3 = &self.planes[3][..words];
+
+        let mut low_ones = 0_u32;
+        let mut high_ones = 0_u32;
+        let mut agree = 0_u32;
+        let mut low_q = [0_u32; QUERY_BITS];
+        let mut high_q = [0_u32; QUERY_BITS];
+        for index in 0..words {
+            let low_word = low[index];
+            let high_word = high[index];
+            low_ones += low_word.count_ones();
+            high_ones += high_word.count_ones();
+            agree += (!(low_word ^ high_word)).count_ones();
+            let query_words = [q0[index], q1[index], q2[index], q3[index]];
+            for (plane_index, &query_word) in query_words.iter().enumerate() {
+                low_q[plane_index] += (low_word & query_word).count_ones();
+                high_q[plane_index] += (high_word & query_word).count_ones();
+            }
+        }
+
+        let stored_code_sum = low_ones + 2 * high_ones;
+        let mut selected_product_sum = 0_u32;
+        for query_plane_index in 0..QUERY_BITS {
+            selected_product_sum += low_q[query_plane_index] << query_plane_index;
+            selected_product_sum += high_q[query_plane_index] << (1 + query_plane_index);
+        }
+
+        let unsigned_dot =
+            self.step * selected_product_sum as f32 + self.lower * stored_code_sum as f32;
+        let query_sum = self.step * self.code_sum as f32 + self.lower * self.dim as f32;
+        Ok((unsigned_dot - 1.5 * query_sum, agree))
+    }
 }
 
 /// Encode signs plus the two RaBitQ correction scalars.
@@ -1340,21 +1421,42 @@ pub fn prepare_query_adc4(
     let mut code_sum = 0_u32;
     let mut rng = SplitMix64::new(seed ^ 0x5141_4443_345f_524e);
 
-    for (index, &value) in rotated_query_residual.iter().enumerate() {
-        let code = if step == 0.0 {
-            0_u8
-        } else {
+    if step == 0.0 {
+        // Every coordinate was identical: all codes are zero, no dither is
+        // drawn, and the zero-initialized planes are already correct. This
+        // matches the per-coordinate loop below coordinate for coordinate.
+        return Ok(QueryAdc4 {
+            planes,
+            lower,
+            step,
+            code_sum,
+            dim,
+        });
+    }
+
+    // `dim` is a non-zero multiple of BLOCK_DIM (validated above), so the
+    // residual splits into exact 64-coordinate words. Accumulating each
+    // word's four plane bits in registers and storing once per word keeps
+    // the per-coordinate arithmetic, dither draw sequence, and bit layout
+    // identical to the scalar formulation while removing per-coordinate
+    // indexed read-modify-write traffic.
+    for (word_index, chunk) in rotated_query_residual.chunks_exact(64).enumerate() {
+        let mut words = [0_u64; QUERY_BITS];
+        for (bit, &value) in chunk.iter().enumerate() {
             let scaled = f64::from((value - lower) / step);
             let dither = rng.next_open_unit_f64();
-            (scaled + dither)
+            let code = (scaled + dither)
                 .floor()
-                .clamp(0.0, f64::from(QUERY_LEVELS)) as u8
-        };
-        code_sum += u32::from(code);
+                .clamp(0.0, f64::from(QUERY_LEVELS)) as u8;
+            code_sum += u32::from(code);
+            let code = u64::from(code);
+            words[0] |= (code & 1) << bit;
+            words[1] |= ((code >> 1) & 1) << bit;
+            words[2] |= ((code >> 2) & 1) << bit;
+            words[3] |= ((code >> 3) & 1) << bit;
+        }
         for (plane_index, plane) in planes.iter_mut().enumerate() {
-            if ((code >> plane_index) & 1) != 0 {
-                plane[index / 64] |= 1_u64 << (index % 64);
-            }
+            plane[word_index] = words[plane_index];
         }
     }
 
@@ -1631,12 +1733,7 @@ pub fn estimate_residual_dot_two_bit_parts(
     if factors.residual_norm == 0.0 {
         return Ok(0.0);
     }
-    let grid_dot = query.two_bit_grid_dot([low_plane, high_plane])?;
-    let outer = low_plane
-        .iter()
-        .zip(high_plane)
-        .map(|(low, high)| (!(low ^ high)).count_ones())
-        .sum::<u32>();
+    let (grid_dot, outer) = query.two_bit_grid_dot_and_agreement([low_plane, high_plane])?;
     let grid_norm = (0.25 * query.dim as f32 + 2.0 * outer as f32).sqrt();
     let bar_dot_query = grid_dot / grid_norm;
     Ok(factors.residual_norm * factors.residual_norm * bar_dot_query / factors.bar_dot_residual)

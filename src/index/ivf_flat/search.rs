@@ -2529,7 +2529,32 @@ async fn scan_clusters_rq(
             index.dim
         )));
     }
-    let rotation = StructuredRotation::new(code_dims, rotation_seed)?;
+    // Reuse the resident sketch's validated rotation and pre-rotated
+    // centroids when present: the sketch was decoded from the same manifest
+    // sketch artifact, so a geometry disagreement is corrupted index state
+    // and must fail loudly rather than fall back to a rebuilt rotation.
+    let sketch_geometry = index
+        .resident_sketch
+        .as_deref()
+        .and_then(|sketch| sketch.rabitq_geometry());
+    let owned_rotation;
+    let (rotation, prepared_centroids) = match sketch_geometry {
+        Some(geometry) => {
+            if geometry.code_dims != code_dims || geometry.rotation_seed != rotation_seed {
+                return Err(ZeppelinError::Index(format!(
+                    "two-bit segment {} resident sketch geometry (dims {}, seed {}) \
+                     disagrees with its manifest sketch reference (dims {code_dims}, \
+                     seed {rotation_seed})",
+                    index.segment_id, geometry.code_dims, geometry.rotation_seed
+                )));
+            }
+            (geometry.rotation.as_ref(), geometry.rotated_centroids)
+        }
+        None => {
+            owned_rotation = StructuredRotation::new(code_dims, rotation_seed)?;
+            (&owned_rotation, None)
+        }
+    };
     let mut rotated_query = vec![0.0_f32; code_dims];
     rotated_query[..query.len()].copy_from_slice(query);
     let mut rotation_scratch = vec![0.0_f32; code_dims];
@@ -2550,16 +2575,6 @@ async fn scan_clusters_rq(
         SqSearchByteStats::set_usize(&stats.selected_clusters, probe_clusters.len());
         SqSearchByteStats::set_usize(&stats.sq_objects, fetch_objects.len());
     }
-    let rq_prefetched =
-        futures::future::join_all(
-            fetch_objects.iter().map(|object| {
-                let stats = byte_stats.clone();
-                async move {
-                    load_rq_object_for_coarse(index, object, store, cache, stats.as_deref()).await
-                }
-            }),
-        )
-        .await;
     let meta_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
         let owner = index.cluster_owner(cluster_idx);
         let stats = byte_stats.clone();
@@ -2580,9 +2595,39 @@ async fn scan_clusters_rq(
     }))
     .await;
 
-    let mut rq_by_cluster = HashMap::new();
+    let mut meta_by_cluster = HashMap::new();
+    for (cluster_idx, metadata) in meta_prefetched {
+        if meta_by_cluster.insert(cluster_idx, metadata?).is_some() {
+            return Err(ZeppelinError::Index(format!(
+                "RQ coarse fetched duplicate metadata for cluster {cluster_idx}"
+            )));
+        }
+    }
+
+    // Consume coarse objects as their range reads complete so decode, ADC
+    // preparation, and row scoring overlap the remaining outstanding reads.
+    // Candidate ordering across objects becomes completion-dependent, but ids
+    // are unique per segment, so the strict (score, id) comparators used by
+    // every downstream selection produce results identical to the previous
+    // fetch-all-then-score ordering.
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let probe_set: HashSet<usize> = probe_clusters.iter().copied().collect();
+    let mut seen_clusters: HashSet<usize> = HashSet::with_capacity(probe_clusters.len());
     let mut vector_ranges_by_cluster: HashMap<usize, Vec<Range<usize>>> = HashMap::new();
-    for object_res in rq_prefetched {
+    let mut centroid_scratch = vec![0.0_f32; code_dims];
+    let mut query_residual = vec![0.0_f32; code_dims];
+    let mut coarse_candidates: Vec<QuantizedCoarseCandidate> = Vec::new();
+    let mut coarse_fetches: FuturesUnordered<_> =
+        fetch_objects
+            .iter()
+            .map(|object| {
+                let stats = byte_stats.clone();
+                async move {
+                    load_rq_object_for_coarse(index, object, store, cache, stats.as_deref()).await
+                }
+            })
+            .collect();
+    while let Some(object_res) = coarse_fetches.next().await {
         let fetched = object_res?;
         for (cluster_idx, ranges) in fetched.vector_ranges {
             if vector_ranges_by_cluster
@@ -2594,95 +2639,103 @@ async fn scan_clusters_rq(
                 )));
             }
         }
-        for (cluster_idx, rq_cluster) in fetched.rq_clusters {
-            if rq_by_cluster.insert(cluster_idx, rq_cluster).is_some() {
+        for (cluster_idx, mut rq_cluster) in fetched.rq_clusters {
+            if !seen_clusters.insert(cluster_idx) {
                 return Err(ZeppelinError::Index(format!(
                     "RQ coarse fetched duplicate cluster {cluster_idx}"
                 )));
             }
-        }
-    }
-
-    let mut meta_by_cluster = HashMap::new();
-    for (cluster_idx, metadata) in meta_prefetched {
-        if meta_by_cluster.insert(cluster_idx, metadata?).is_some() {
-            return Err(ZeppelinError::Index(format!(
-                "RQ coarse fetched duplicate metadata for cluster {cluster_idx}"
-            )));
-        }
-    }
-
-    let mut rotated_centroid = vec![0.0_f32; code_dims];
-    let mut query_residual = vec![0.0_f32; code_dims];
-    let mut coarse_candidates: Vec<QuantizedCoarseCandidate> = Vec::new();
-    for &cluster_idx in probe_clusters {
-        let rq_cluster = rq_by_cluster.remove(&cluster_idx).ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "RQ coarse missing cluster data for cluster {cluster_idx}"
-            ))
-        })?;
-        if rq_cluster.dim() != code_dims {
-            return Err(ZeppelinError::Index(format!(
-                "RQ cluster {cluster_idx} dimension mismatch: manifest={code_dims}, object={}",
-                rq_cluster.dim()
-            )));
-        }
-        let (prefilter, attrs) = meta_by_cluster.remove(&cluster_idx).ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "RQ coarse missing metadata for cluster {cluster_idx}"
-            ))
-        })?;
-        let centroid = index.centroids.get(cluster_idx).ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "RQ coarse missing centroid for cluster {cluster_idx}"
-            ))
-        })?;
-        rotated_centroid.fill(0.0);
-        rotated_centroid[..centroid.len()].copy_from_slice(centroid);
-        rotation.rotate_in_place(&mut rotated_centroid, &mut rotation_scratch)?;
-
-        let (query_adc, cluster_score_offset) = match distance_metric {
-            DistanceMetric::Cosine | DistanceMetric::Euclidean => {
-                for ((residual, query_value), centroid_value) in query_residual
-                    .iter_mut()
-                    .zip(&rotated_query)
-                    .zip(&rotated_centroid)
-                {
-                    *residual = *query_value - *centroid_value;
-                }
-                let query_residual_norm_sq = query_residual.iter().map(|value| value * value).sum();
-                let adc = rabitq::prepare_query_adc4(
-                    &query_residual,
-                    rq_query_adc_seed(rotation_seed, query_hash, cluster_idx),
-                )?;
-                (std::borrow::Cow::Owned(adc), query_residual_norm_sq)
-            }
-            DistanceMetric::DotProduct => {
-                let adc = dot_query_adc.as_ref().ok_or_else(|| {
-                    ZeppelinError::Index("RQ dot-product ADC was not prepared".into())
-                })?;
-                let centroid_dot_query = rotated_centroid
-                    .iter()
-                    .zip(&rotated_query)
-                    .map(|(centroid, query)| centroid * query)
-                    .sum::<f32>();
-                (std::borrow::Cow::Borrowed(adc), -centroid_dot_query)
-            }
-        };
-
-        for row_idx in 0..rq_cluster.row_count() {
-            if !coarse_row_passes(filter, &prefilter, &attrs, row_idx) {
+            if !probe_set.contains(&cluster_idx) {
+                // Decoded because it shares a grouped object with a probed
+                // cluster; the pre-overlap implementation also never scored it.
                 continue;
             }
-            let approx_score =
-                rq_cluster.asymmetric_distance(query_adc.as_ref(), row_idx, distance_metric)?
-                    + cluster_score_offset;
-            coarse_candidates.push((
-                rq_cluster.id(row_idx)?.to_owned(),
-                approx_score,
-                cluster_idx,
-                row_idx,
-            ));
+            if rq_cluster.dim() != code_dims {
+                return Err(ZeppelinError::Index(format!(
+                    "RQ cluster {cluster_idx} dimension mismatch: manifest={code_dims}, object={}",
+                    rq_cluster.dim()
+                )));
+            }
+            let (prefilter, attrs) = meta_by_cluster.remove(&cluster_idx).ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "RQ coarse missing metadata for cluster {cluster_idx}"
+                ))
+            })?;
+            let centroid = index.centroids.get(cluster_idx).ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "RQ coarse missing centroid for cluster {cluster_idx}"
+                ))
+            })?;
+            let rotated_centroid: &[f32] = match prepared_centroids {
+                Some(prepared) => prepared
+                    .get(cluster_idx)
+                    .ok_or_else(|| {
+                        ZeppelinError::Index(format!(
+                            "RQ coarse missing prepared rotated centroid for cluster {cluster_idx}"
+                        ))
+                    })?
+                    .as_slice(),
+                None => {
+                    centroid_scratch.fill(0.0);
+                    centroid_scratch[..centroid.len()].copy_from_slice(centroid);
+                    rotation.rotate_in_place(&mut centroid_scratch, &mut rotation_scratch)?;
+                    centroid_scratch.as_slice()
+                }
+            };
+
+            let (query_adc, cluster_score_offset) = match distance_metric {
+                DistanceMetric::Cosine | DistanceMetric::Euclidean => {
+                    for ((residual, query_value), centroid_value) in query_residual
+                        .iter_mut()
+                        .zip(&rotated_query)
+                        .zip(rotated_centroid)
+                    {
+                        *residual = *query_value - *centroid_value;
+                    }
+                    let query_residual_norm_sq =
+                        query_residual.iter().map(|value| value * value).sum();
+                    let adc = rabitq::prepare_query_adc4(
+                        &query_residual,
+                        rq_query_adc_seed(rotation_seed, query_hash, cluster_idx),
+                    )?;
+                    (std::borrow::Cow::Owned(adc), query_residual_norm_sq)
+                }
+                DistanceMetric::DotProduct => {
+                    let adc = dot_query_adc.as_ref().ok_or_else(|| {
+                        ZeppelinError::Index("RQ dot-product ADC was not prepared".into())
+                    })?;
+                    let centroid_dot_query = rotated_centroid
+                        .iter()
+                        .zip(&rotated_query)
+                        .map(|(centroid, query)| centroid * query)
+                        .sum::<f32>();
+                    (std::borrow::Cow::Borrowed(adc), -centroid_dot_query)
+                }
+            };
+
+            coarse_candidates.reserve(rq_cluster.row_count());
+            for row_idx in 0..rq_cluster.row_count() {
+                if !coarse_row_passes(filter, &prefilter, &attrs, row_idx) {
+                    continue;
+                }
+                let approx_score =
+                    rq_cluster.asymmetric_distance(query_adc.as_ref(), row_idx, distance_metric)?
+                        + cluster_score_offset;
+                coarse_candidates.push((
+                    rq_cluster.take_id(row_idx)?,
+                    approx_score,
+                    cluster_idx,
+                    row_idx,
+                ));
+            }
+        }
+    }
+    drop(coarse_fetches);
+    for &cluster_idx in probe_clusters {
+        if !seen_clusters.contains(&cluster_idx) {
+            return Err(ZeppelinError::Index(format!(
+                "RQ coarse missing cluster data for cluster {cluster_idx}"
+            )));
         }
     }
 
@@ -2889,22 +2942,38 @@ impl RqCoarseRows {
         }
     }
 
-    /// Borrows one row's identifier.
+    /// Moves one row's identifier out of the decoded rows.
+    ///
+    /// The scan visits every row at most once and discards the decoded rows
+    /// afterwards, so the `ZBP5` codes-only variant can surrender each owned
+    /// ID instead of cloning it. The legacy inline-ID variant keeps its
+    /// existing clone cost because its IDs are borrowed from shared state.
     ///
     /// # Errors
     ///
     /// Returns an index error when `row` is outside the decoded rows.
-    fn id(&self, row: usize) -> Result<&str> {
-        let ids = match self {
-            Self::WithIds(codes) => codes.ids(),
-            Self::CodesOnly { ids, .. } => ids.as_slice(),
-        };
-        ids.get(row).map(String::as_str).ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "two-bit coarse row {row} is outside {} decoded IDs",
-                ids.len()
-            ))
-        })
+    fn take_id(&mut self, row: usize) -> Result<String> {
+        match self {
+            Self::WithIds(codes) => Ok(codes
+                .ids()
+                .get(row)
+                .ok_or_else(|| {
+                    ZeppelinError::Index(format!(
+                        "two-bit coarse row {row} is outside {} decoded IDs",
+                        codes.ids().len()
+                    ))
+                })?
+                .clone()),
+            Self::CodesOnly { ids, .. } => {
+                let len = ids.len();
+                let slot = ids.get_mut(row).ok_or_else(|| {
+                    ZeppelinError::Index(format!(
+                        "two-bit coarse row {row} is outside {len} decoded IDs"
+                    ))
+                })?;
+                Ok(std::mem::take(slot))
+            }
+        }
     }
 
     /// Scores one row with the shared two-bit estimator.

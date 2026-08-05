@@ -381,9 +381,16 @@ impl RqClusterCodes {
                 actual_bytes: 0,
             })?;
 
-        let mut ids = Vec::new();
-        let mut planes = Vec::new();
-        let mut factors = Vec::new();
+        // Capacity hints clamped by payload length; corrupt row counts still
+        // fail through the per-row truncation checks rather than allocating.
+        let max_payload_words = data.len() / std::mem::size_of::<u64>();
+        let mut ids = Vec::with_capacity(row_count.min(data.len() / 8 + 1));
+        let mut planes = Vec::with_capacity(
+            row_count
+                .saturating_mul(words_per_row)
+                .min(max_payload_words),
+        );
+        let mut factors = Vec::with_capacity(row_count.min(data.len() / FACTOR_BYTES + 1));
         let mut offset = RQ_HEADER_LEN;
         for row in 0..row_count {
             let Some(id_len_end) = offset.checked_add(8).filter(|&end| end <= data.len()) else {
@@ -418,9 +425,7 @@ impl RqClusterCodes {
                 });
             }
             let plane_end = offset + plane_bytes;
-            for chunk in data[offset..plane_end].chunks_exact(8) {
-                planes.push(read_u64(chunk));
-            }
+            planes.extend(data[offset..plane_end].chunks_exact(8).map(read_u64));
             offset = plane_end;
 
             let available = data.len() - offset;
@@ -627,8 +632,16 @@ impl RqClusterCodesOnly {
                 actual_bytes: 0,
             })?;
 
-        let mut planes = Vec::new();
-        let mut factors = Vec::new();
+        // Capacity hints are clamped by the payload length so a corrupt row
+        // count still fails through the per-row truncation checks below
+        // instead of attempting an absurd allocation first.
+        let max_payload_words = data.len() / std::mem::size_of::<u64>();
+        let mut planes = Vec::with_capacity(
+            row_count
+                .saturating_mul(words_per_row)
+                .min(max_payload_words),
+        );
+        let mut factors = Vec::with_capacity(row_count.min(data.len() / FACTOR_BYTES + 1));
         let mut offset = RQ_CODES_ONLY_HEADER_LEN;
         for row in 0..row_count {
             let available = data.len() - offset;
@@ -640,9 +653,7 @@ impl RqClusterCodesOnly {
                 });
             }
             let plane_end = offset + plane_bytes;
-            for chunk in data[offset..plane_end].chunks_exact(8) {
-                planes.push(read_u64(chunk));
-            }
+            planes.extend(data[offset..plane_end].chunks_exact(8).map(read_u64));
             offset = plane_end;
 
             let available = data.len() - offset;
