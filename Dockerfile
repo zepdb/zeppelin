@@ -19,7 +19,10 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src/bin benches && \
     echo "fn main() {}" > src/main.rs && \
     echo "" > src/lib.rs && \
-    echo "fn main() {}" > src/bin/quant_bakeoff.rs && \
+    for b in quant_bakeoff mmli_lab zeppelin_license zeppelin_audit_verify \
+             zeppelin_advisor; do \
+        echo "fn main() {}" > "src/bin/$b.rs"; \
+    done && \
     echo "fn main() {}" > benches/core_benchmarks.rs && \
     cargo build --release ${FEATURES:+--features $FEATURES} && \
     rm -rf src benches
@@ -29,7 +32,7 @@ COPY src/ src/
 COPY benches/ benches/
 
 # Touch files so cargo detects changes from the dummy build
-RUN touch src/main.rs src/lib.rs && \
+RUN touch src/main.rs src/lib.rs src/bin/*.rs && \
     cargo build --release ${FEATURES:+--features $FEATURES}
 
 # ---- Runtime stage ----

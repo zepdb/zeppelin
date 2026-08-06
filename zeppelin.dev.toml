@@ -1,0 +1,10 @@
+# Local development config. docker-compose.yml and the README quick start
+# point ZEPPELIN_CONFIG at this file.
+#
+# open_unsafe boots WITHOUT authentication or authorization. Local
+# development only — never expose a node booted from this file. For
+# production, start from `zeppelin_advisor emit-config` or
+# zeppelin.toml.example and read docs/security-deployment.md.
+
+[security]
+mode = "open_unsafe"

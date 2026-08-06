@@ -20,8 +20,11 @@ services:
       AWS_REGION: us-east-1
       S3_ALLOW_HTTP: "true"
       RUST_LOG: "${RUST_LOG:-info}"
+      # Local-dev security posture (open_unsafe, no auth) — see zeppelin.dev.toml
+      ZEPPELIN_CONFIG: /etc/zeppelin/zeppelin.toml
     volumes:
       - zeppelin_cache:/var/cache/zeppelin
+      - ./zeppelin.dev.toml:/etc/zeppelin/zeppelin.toml:ro
     depends_on:
       minio-init:
         condition: service_completed_successfully
