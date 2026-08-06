@@ -29,6 +29,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use half::f16;
 use object_store::path::Path as ObjectPath;
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
@@ -53,6 +54,7 @@ use super::candidate::{
     AttributeLocator, LateCandidateBootstrapRef, LateCandidateIndexRef, LateCandidateRecipe,
     LateRoutingMetric,
 };
+use super::flat_candidate::{select_flat_top_k, FlatScanTiming};
 use super::matrix_artifact::{build_matrix_blocks, MatrixBlockInputRow};
 use super::segment_search::{
     build_truth_requests, compare_scored_rows, execute_truth_wave_pipelined, filter_matches,
@@ -65,14 +67,22 @@ use super::{
 
 pub(super) const DOCUMENT_DIGEST: &str =
     "1960f7bc88a667beb76b6e15a750469e615aafe9a925928c23f7c546d12cfe22";
+// Query-side pins regenerated 2026-08-05: the original 2026-07-30 query
+// tensors were lost with /private/tmp and the pinned bytes could not be
+// reproduced bit-exactly (document tensors DID reproduce byte-for-byte, so
+// the corpus-side artifacts and their digests are unchanged). The
+// regenerated queries share the pinned tokenization exactly (1,109 ids,
+// 23,540 rows, min 9/max 48/mean 21.226330027051397) and differ only by
+// sub-f16-ulp encoder drift. Gold memberships remain the committed
+// lab-diagnostics config-E set. See tasks/LateLatency/results/phase09.
 pub(super) const QUERY_DIGEST: &str =
-    "cefbff5713a3944f4007676b243985f393f87a7a7579bb5cba6ca09899b0aa0c";
+    "4b9ec012149c4678cbab23835ee7d8d04641f817655374d244262f6b63093b6f";
 pub(super) const TRANSFORM_DIGEST: &str =
     "00ad4edb4292ddd64c6df00c84c2f8dfced3a092d9ddc307239d9e070deb2ad4";
 pub(super) const PRODUCTION_DOCUMENT_FDE_DIGEST: &str =
     "399264618538eabd2fdbe0e979d92ed5d552768a2ad5235b4c934acbb1b3dad1";
 pub(super) const PRODUCTION_QUERY_FDE_DIGEST: &str =
-    "c63a2756f5d74cf0079383d512fa1d0b9171c006d5a5dfcd9939d5870e28ab8e";
+    "b1aa3739b07b985745db72e3b2ffc7d2035b1a84eb2d373c84662e6ef37ae937";
 const SQ8_CODE_DIGEST: &str = "08d3e1d29684689b18330e838acc92f10872c5ecd2cb89ba57a8c7fe8f247d98";
 const SQ8_CALIBRATION_DIGEST: &str =
     "ba1b608200e4568711dfa0cf16e978990fb1064ab4901bc816d4c10b907144ae";
@@ -96,6 +106,18 @@ const MAX_ATTRIBUTE_OBJECT_BYTES: usize = 8 * 1024 * 1024;
 const FILTER_COLORS: [&str; 4] = ["c0", "c1", "c2", "c3"];
 const FILTERED_QUERY_COUNT: usize = 20;
 const COLD_HYDRATIONS: usize = 3;
+const SYNTHETIC_DOCUMENT_COUNT: usize = 50_000;
+const SYNTHETIC_QUERY_COUNT: usize = 300;
+const SYNTHETIC_QUERY_TOKENS: usize = 20;
+const SYNTHETIC_TOKEN_MEDIAN: f64 = 120.0;
+const SYNTHETIC_TOKEN_P99: f64 = 1_500.0;
+const SYNTHETIC_TOKEN_P99_Z: f64 = 2.326_347_874_040_841;
+const SYNTHETIC_MAX_TOKENS: usize = 16_384;
+const SYNTHETIC_DOCUMENT_SEED: u64 = 0x4c4c_3035_444f_4353;
+const SYNTHETIC_QUERY_SEED: u64 = 0x4c4c_3035_5152_5953;
+const SYNTHETIC_SIZE_LIMIT_BYTES: u64 = 30 * 1024 * 1024 * 1024;
+const SYNTHETIC_CONSERVATIVE_RUNTIME_SECONDS: u64 = 15 * 60;
+const SYNTHETIC_RUNTIME_LIMIT_SECONDS: u64 = 60 * 60;
 
 type BenchResult<T> = Result<T, String>;
 pub(super) type ProductionFdes = (Vec<Vec<f32>>, Vec<Vec<f32>>, f64);
@@ -251,6 +273,13 @@ struct BenchReport {
     cold_hydrations: Vec<ColdHydration>,
     warm_query_ms: IntegerSummary,
     sq8_scan_ms: IntegerSummary,
+    sq8_scan_wall_ms: FloatSummary,
+    sq8_scan_sequential_ms: IntegerSummary,
+    sq8_scan_sequential_wall_ms: FloatSummary,
+    sq8_scan_scoring_ms: FloatSummary,
+    sq8_scan_merge_ms: FloatSummary,
+    sq8_scan_workers: usize,
+    scan_parallel_equals_sequential: bool,
     truth_wave_ms: IntegerSummary,
     truth_fetch_ms: FloatSummary,
     truth_score_ms: FloatSummary,
@@ -275,6 +304,75 @@ struct BenchReport {
     sq8_code_sha256: String,
     sq8_calibration_sha256: String,
     elapsed_ms: u128,
+}
+
+#[derive(Serialize)]
+struct SyntheticBenchReport {
+    schema_version: u32,
+    source_revision: String,
+    synthetic_document_seed: u64,
+    synthetic_query_seed: u64,
+    synthetic_document_sha256: String,
+    synthetic_query_sha256: String,
+    candidate_k: usize,
+    read_gap_budget_bytes: usize,
+    read_max_request_bytes: usize,
+    read_max_concurrency: usize,
+    pipeline_enabled: bool,
+    document_count: usize,
+    query_count: usize,
+    query_tokens: usize,
+    token_counts: IntegerSummary,
+    total_vector_count: u64,
+    prebuild_estimated_artifact_bytes: u64,
+    prebuild_size_limit_bytes: u64,
+    prebuild_size_gate_passed: bool,
+    flat_artifact_bytes: u64,
+    flat_metadata_bytes: u64,
+    flat_code_bytes: u64,
+    resident_bytes: u64,
+    uploaded_objects: usize,
+    uploaded_bytes: u64,
+    setup_put_requests: u64,
+    cold_hydrations: Vec<ColdHydration>,
+    warm_query_ms: IntegerSummary,
+    sq8_scan_ms: IntegerSummary,
+    sq8_scan_wall_ms: FloatSummary,
+    sq8_scan_sequential_ms: IntegerSummary,
+    sq8_scan_sequential_wall_ms: FloatSummary,
+    sq8_scan_scoring_ms: FloatSummary,
+    sq8_scan_merge_ms: FloatSummary,
+    sq8_scan_workers: usize,
+    scan_parallel_equals_sequential: bool,
+    truth_wave_ms: IntegerSummary,
+    truth_fetch_ms: FloatSummary,
+    truth_score_ms: FloatSummary,
+    truth_decode_ms: FloatSummary,
+    truth_maxsim_ms: FloatSummary,
+    truth_score_workers: usize,
+    truth_get_latency_ms: FloatSummary,
+    truth_logical_ranges: IntegerSummary,
+    truth_logical_bytes: IntegerSummary,
+    truth_planned_requests: IntegerSummary,
+    truth_planned_bytes: IntegerSummary,
+    truth_gap_waste_bytes: IntegerSummary,
+    truth_coalescing_factor: FloatSummary,
+    truth_request_waves: IntegerSummary,
+    truth_total_get_requests: u64,
+    truth_total_request_waves: u64,
+    observed_get_requests_equal_planned: bool,
+    query_fde_encode_ms_mean: f64,
+    flat_artifact_sha256: String,
+    sq8_code_sha256: String,
+    sq8_calibration_sha256: String,
+    elapsed_ms: u128,
+}
+
+struct SyntheticMetadata {
+    document_sha256: String,
+    query_sha256: String,
+    token_counts: Vec<u64>,
+    estimated_artifact_bytes: u64,
 }
 
 /// Counts physical object-store operations issued beneath `ZeppelinStore`.
@@ -397,14 +495,24 @@ async fn run_benchmark() -> BenchResult<()> {
     if backend != "minio" {
         return Err("TEST_BACKEND=minio is required for the physical benchmark".to_string());
     }
-    let tensor_dir = required_path("MMLI_REAL_MATRIX_DIR")?;
     let output = required_path("MMLI_FLAT_BENCH_OUTPUT")?;
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let pipeline_enabled = true;
-    let query_count = optional_usize("MMLI_FLAT_BENCH_QUERY_LIMIT", QUERY_COUNT)?;
-    if !(1..=QUERY_COUNT).contains(&query_count) {
+    let synthetic_document_count = optional_usize_value("MMLI_FLAT_BENCH_SYNTHETIC")?;
+    if synthetic_document_count.is_some_and(|count| count != SYNTHETIC_DOCUMENT_COUNT) {
         return Err(format!(
-            "MMLI_FLAT_BENCH_QUERY_LIMIT must be between 1 and {QUERY_COUNT}"
+            "MMLI_FLAT_BENCH_SYNTHETIC must be {SYNTHETIC_DOCUMENT_COUNT} when set"
+        ));
+    }
+    let synthetic_mode = synthetic_document_count.is_some();
+    let pipeline_enabled = true;
+    let available_query_count = if synthetic_mode {
+        SYNTHETIC_QUERY_COUNT
+    } else {
+        QUERY_COUNT
+    };
+    let query_count = optional_usize("MMLI_FLAT_BENCH_QUERY_LIMIT", available_query_count)?;
+    if !(1..=available_query_count).contains(&query_count) {
+        return Err(format!(
+            "MMLI_FLAT_BENCH_QUERY_LIMIT must be between 1 and {available_query_count}"
         ));
     }
     let default_read_plan_config = ReadPlanConfig::default();
@@ -427,25 +535,38 @@ async fn run_benchmark() -> BenchResult<()> {
     )
     .map_err(|error| error.to_string())?;
 
-    eprintln!("flat-bench: loading and verifying pinned tensors");
-    let documents = load_tensor(
-        &tensor_dir.join("text-documents.f16"),
-        &tensor_dir.join("text-documents.json"),
-        DOCUMENT_DIGEST,
-    )?;
-    let queries = load_tensor(
-        &tensor_dir.join("text-queries.f16"),
-        &tensor_dir.join("text-queries.json"),
-        QUERY_DIGEST,
-    )?;
-    if documents.sidecar.ids.len() != DOCUMENT_COUNT || queries.sidecar.ids.len() != QUERY_COUNT {
-        return Err("pinned tensor counts changed".to_string());
-    }
-    let gold = load_gold(
-        &manifest_dir.join("tasks/MMLI-2/results/lab-diagnostics.json"),
-        &documents,
-        &queries,
-    )?;
+    let (documents, queries, gold, synthetic_metadata) = if synthetic_mode {
+        eprintln!("flat-bench: generating deterministic synthetic tensors");
+        let (documents, queries, metadata) = generate_synthetic_tensors()?;
+        (documents, queries, None, Some(metadata))
+    } else {
+        let tensor_dir = required_path("MMLI_REAL_MATRIX_DIR")?;
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        eprintln!("flat-bench: loading and verifying pinned tensors");
+        let documents = load_tensor(
+            &tensor_dir.join("text-documents.f16"),
+            &tensor_dir.join("text-documents.json"),
+            DOCUMENT_DIGEST,
+        )?;
+        let queries = load_tensor(
+            &tensor_dir.join("text-queries.f16"),
+            &tensor_dir.join("text-queries.json"),
+            QUERY_DIGEST,
+        )?;
+        if documents.sidecar.ids.len() != DOCUMENT_COUNT || queries.sidecar.ids.len() != QUERY_COUNT
+        {
+            return Err("pinned tensor counts changed".to_string());
+        }
+        let gold = load_gold(
+            &manifest_dir.join("tasks/MMLI-2/results/lab-diagnostics.json"),
+            &documents,
+            &queries,
+        )?;
+        (documents, queries, Some(gold), None)
+    };
+    let document_count = documents.sidecar.ids.len();
+    let document_ids = documents.sidecar.ids.clone();
+    let max_vectors_per_document = documents.sidecar.rows.iter().copied().max().unwrap_or(1);
 
     eprintln!("flat-bench: building production-semantics FDEs");
     let transform = FdeTransform::generate(
@@ -467,11 +588,16 @@ async fn run_benchmark() -> BenchResult<()> {
     }
     let (document_fdes, query_fdes, query_fde_encode_ms_mean) =
         build_production_fdes(&documents, &queries, &transform)?;
-    if checksum_vectors(&document_fdes, FDE_DIMENSION) != PRODUCTION_DOCUMENT_FDE_DIGEST {
-        return Err("production document FDEs diverge from the pinned diagnosis".to_string());
-    }
-    if checksum_vectors(&query_fdes, FDE_DIMENSION) != PRODUCTION_QUERY_FDE_DIGEST {
-        return Err("production query FDEs diverge from the pinned diagnosis".to_string());
+    if !synthetic_mode {
+        if checksum_vectors(&document_fdes, FDE_DIMENSION) != PRODUCTION_DOCUMENT_FDE_DIGEST {
+            return Err("production document FDEs diverge from the pinned diagnosis".to_string());
+        }
+        let query_fde_digest = checksum_vectors(&query_fdes, FDE_DIMENSION);
+        if query_fde_digest != PRODUCTION_QUERY_FDE_DIGEST {
+            return Err(format!(
+                "production query FDEs diverge from the pinned diagnosis: got {query_fde_digest}"
+            ));
+        }
     }
 
     eprintln!("flat-bench: building SQ8 codes through the production quantizer");
@@ -480,25 +606,28 @@ async fn run_benchmark() -> BenchResult<()> {
     let codes = calibration.encode_batch(&document_refs);
     let sq8_code_sha256 = checksum_bytes_rows(&codes);
     let sq8_calibration_sha256 = checksum_calibration(&calibration);
-    if sq8_code_sha256 != SQ8_CODE_DIGEST {
-        return Err("SQ8 codes diverge from the pinned diagnosis".to_string());
-    }
-    if sq8_calibration_sha256 != SQ8_CALIBRATION_DIGEST {
-        return Err("SQ8 calibration diverges from the pinned diagnosis".to_string());
+    if !synthetic_mode {
+        if sq8_code_sha256 != SQ8_CODE_DIGEST {
+            return Err("SQ8 codes diverge from the pinned diagnosis".to_string());
+        }
+        if sq8_calibration_sha256 != SQ8_CALIBRATION_DIGEST {
+            return Err("SQ8 calibration diverges from the pinned diagnosis".to_string());
+        }
     }
     drop(document_refs);
+    drop(document_fdes);
 
     eprintln!("flat-bench: building production truth and attribute blocks");
     let epoch = MultiVectorEpochId::new([9; 32]);
     let generation = FdeGenerationId::new([10; 32]);
     let namespace = format!("mmli-flat-bench-{}", uuid::Uuid::new_v4());
-    let matrix_rows = (0..DOCUMENT_COUNT)
+    let matrix_rows = (0..document_count)
         .map(|index| {
             let matrix = documents.matrix(index)?;
             Ok(MatrixBlockInputRow::encoded(
-                production_document_id(index),
+                document_ids[index].clone(),
                 index as u32,
-                document_content_hash(index),
+                content_hash_for_id(&document_ids[index]),
                 MatrixDtype::F16,
                 MultiVectorEmbedding::new(
                     matrix.values().to_vec(),
@@ -521,9 +650,9 @@ async fn run_benchmark() -> BenchResult<()> {
         matrix_rows,
     )
     .map_err(|error| error.to_string())?;
-    let attribute_rows = (0..DOCUMENT_COUNT)
+    let attribute_rows = (0..document_count)
         .map(|index| AttributeBlockInputRow {
-            id: production_document_id(index),
+            id: document_ids[index].clone(),
             ordinal: index as u32,
             attributes: Some(document_attributes(index)),
         })
@@ -543,19 +672,19 @@ async fn run_benchmark() -> BenchResult<()> {
         .iter()
         .flat_map(|block| block.locators.iter().cloned())
         .collect();
-    if matrix_locators.len() != DOCUMENT_COUNT || attribute_locators.len() != DOCUMENT_COUNT {
+    if matrix_locators.len() != document_count || attribute_locators.len() != document_count {
         return Err("block locator counts disagree with the corpus".to_string());
     }
     let total_vector_count = documents.total_rows as u64;
     drop(documents);
 
     eprintln!("flat-bench: encoding the ZFQ1 flat artifact");
-    let flat_rows: Vec<FlatRowMeta> = (0..DOCUMENT_COUNT)
+    let flat_rows: Vec<FlatRowMeta> = (0..document_count)
         .map(|index| FlatRowMeta {
-            id: production_document_id(index),
+            id: document_ids[index].clone(),
             matrix_locator: matrix_locators[index].clone(),
             attr_locator: attribute_locators[index].clone(),
-            content_hash: document_content_hash_bytes(index),
+            content_hash: content_hash_bytes_for_id(&document_ids[index]),
             source_sequence: index as u64,
             color: FILTER_COLORS[index % FILTER_COLORS.len()].to_string(),
         })
@@ -570,6 +699,7 @@ async fn run_benchmark() -> BenchResult<()> {
     eprintln!("flat-bench: uploading artifacts to MinIO");
     let (store, get_requests, put_requests, get_latency_ms) = counting_minio_store()?;
     let mut uploaded_objects = 0usize;
+    let benchmark_result: BenchResult<()> = async {
     let mut uploaded_bytes = 0u64;
     for block in &matrix_blocks {
         store
@@ -603,12 +733,16 @@ async fn run_benchmark() -> BenchResult<()> {
         semantic_epoch: epoch,
         fde_generation: generation,
         matrix_dtype: MatrixDtype::F16,
-        record_count: DOCUMENT_COUNT as u64,
+        record_count: document_count as u64,
         total_vector_count,
         vector_dimension: DIMENSION as u32,
         fde_dimension: FDE_DIMENSION as u32,
         coverage_sequence: 1,
-        candidate_index: Some(placeholder_candidate_index(generation, &namespace)),
+        candidate_index: Some(placeholder_candidate_index(
+            generation,
+            &namespace,
+            document_count,
+        )),
         matrix_objects: matrix_blocks
             .into_iter()
             .map(|block| block.reference)
@@ -644,8 +778,8 @@ async fn run_benchmark() -> BenchResult<()> {
         resident = Some(decoded);
     }
     let resident = resident.ok_or_else(|| "cold hydration produced no index".to_string())?;
-    if resident.rows.len() != DOCUMENT_COUNT
-        || resident.codes.len() != DOCUMENT_COUNT * FDE_DIMENSION
+    if resident.rows.len() != document_count
+        || resident.codes.len() != document_count * FDE_DIMENSION
     {
         return Err("hydrated flat index shape mismatch".to_string());
     }
@@ -661,11 +795,18 @@ async fn run_benchmark() -> BenchResult<()> {
     let bounds = SegmentSearchBounds {
         max_resident_bytes: 64 * 1024 * 1024,
         max_cluster_bytes: 64 * 1024 * 1024,
-        max_vectors_per_document: 512,
+        max_vectors_per_document: if synthetic_mode {
+            max_vectors_per_document
+        } else {
+            512
+        },
         max_attribute_payload_bytes: 64 * 1024,
     };
-    let id_to_index: HashMap<String, usize> = (0..DOCUMENT_COUNT)
-        .map(|index| (production_document_id(index), index))
+    let id_to_index: HashMap<String, usize> = document_ids
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, id)| (id, index))
         .collect();
     let excluded_ids = BTreeSet::new();
 
@@ -676,6 +817,10 @@ async fn run_benchmark() -> BenchResult<()> {
     let mut per_query_top10_ids = Vec::with_capacity(query_count);
     let mut warm_ms = Vec::with_capacity(query_count);
     let mut scan_ms = Vec::with_capacity(query_count);
+    let mut scan_sequential_ms = Vec::with_capacity(query_count);
+    let mut scan_scoring_ms = Vec::with_capacity(query_count);
+    let mut scan_merge_ms = Vec::with_capacity(query_count);
+    let mut scan_workers = 0usize;
     let mut truth_ms = Vec::with_capacity(query_count);
     let mut fetch_ms = Vec::with_capacity(query_count);
     let mut score_ms = Vec::with_capacity(query_count);
@@ -687,6 +832,7 @@ async fn run_benchmark() -> BenchResult<()> {
     let mut truth_planned_requests = Vec::with_capacity(query_count);
     let mut truth_planned_bytes = Vec::with_capacity(query_count);
     let mut truth_gap_waste_bytes = Vec::with_capacity(query_count);
+    let mut truth_coalescing_factor = Vec::with_capacity(query_count);
     let mut truth_request_waves = Vec::with_capacity(query_count);
     let observed_equals_planned = true;
     {
@@ -698,26 +844,50 @@ async fn run_benchmark() -> BenchResult<()> {
     for query_index in 0..query_count {
         let query_started = Instant::now();
         let scan_started = Instant::now();
-        let order = flat_selection_order(&resident, &query_fdes[query_index]);
+        let mut scan_timing = FlatScanTiming::default();
+        let selected = select_flat_top_k(
+            &resident.calibration,
+            &resident.codes,
+            FDE_DIMENSION,
+            &query_fdes[query_index],
+            CANDIDATE_K,
+            &|_| true,
+            Some(&mut scan_timing),
+        )
+        .map_err(|error| error.to_string())?;
         let scan_elapsed = scan_started.elapsed();
-        let selected = &order[..CANDIDATE_K];
+        if selected.len() != CANDIDATE_K {
+            return Err(format!(
+                "query {query_index}: parallel scan selected {} rows, expected {CANDIDATE_K}",
+                selected.len()
+            ));
+        }
+        if scan_workers == 0 {
+            scan_workers = scan_timing.workers;
+        } else if scan_workers != scan_timing.workers {
+            return Err(format!(
+                "scan worker count changed from {scan_workers} to {}",
+                scan_timing.workers
+            ));
+        }
 
-        let gold_set: HashSet<usize> = gold[query_index]
-            .iter()
-            .map(|gold| gold.document_index)
-            .collect();
-        hits_k700 += order[..700]
-            .iter()
-            .filter(|(index, _)| gold_set.contains(index))
-            .count();
-        hits_k1500 += order[..1_500]
-            .iter()
-            .filter(|(index, _)| gold_set.contains(index))
-            .count();
-        let candidate_hits = selected
-            .iter()
-            .filter(|(index, _)| gold_set.contains(index))
-            .count();
+        let (gold_set, candidate_hits) = if let Some(gold) = gold.as_ref() {
+            let gold_set: HashSet<usize> = gold[query_index]
+                .iter()
+                .map(|gold| gold.document_index)
+                .collect();
+            hits_k700 += selected[..700]
+                .iter()
+                .filter(|(index, _)| gold_set.contains(index))
+                .count();
+            let candidate_hits = selected
+                .iter()
+                .filter(|(index, _)| gold_set.contains(index))
+                .count();
+            (Some(gold_set), candidate_hits)
+        } else {
+            (None, 0)
+        };
 
         let candidates = selected
             .iter()
@@ -783,25 +953,53 @@ async fn run_benchmark() -> BenchResult<()> {
         let truth_elapsed = truth_started.elapsed();
         let query_elapsed = query_started.elapsed();
 
-        let final_hits = rows
-            .iter()
-            .filter(|row| {
-                id_to_index
-                    .get(row.id.as_str())
-                    .is_some_and(|index| gold_set.contains(index))
-            })
-            .count();
-        if final_hits != candidate_hits {
-            return Err(format!(
-                "query {query_index}: exact rerank returned {final_hits} golds but the \
-                 candidate frontier contained {candidate_hits}"
-            ));
+        // Untimed verification pass: the pinned sequential scan order must
+        // agree bit-for-bit with the timed parallel selection, including tie
+        // handling. Runs outside the warm-query wall so the e2e timing stays
+        // comparable to prior phases.
+        let sequential_started = Instant::now();
+        let order = flat_selection_order(&resident, &query_fdes[query_index]);
+        let sequential_elapsed = sequential_started.elapsed();
+        for (rank, (parallel, sequential)) in selected.iter().zip(order.iter()).enumerate() {
+            if parallel.0 != sequential.0 || parallel.1.to_bits() != sequential.1.to_bits() {
+                return Err(format!(
+                    "query {query_index}: parallel scan diverged from sequential at rank \
+                     {rank}: parallel=({}, {:.9}), sequential=({}, {:.9})",
+                    parallel.0, parallel.1, sequential.0, sequential.1
+                ));
+            }
         }
-        hits_k1000 += final_hits;
-        per_query_hits.push(final_hits as u64);
-        per_query_top10_ids.push(rows.iter().map(|row| row.id.clone()).collect());
+        if let Some(gold_set) = gold_set.as_ref() {
+            hits_k1500 += order[..1_500]
+                .iter()
+                .filter(|(index, _)| gold_set.contains(index))
+                .count();
+        }
+
+        if let Some(gold_set) = gold_set.as_ref() {
+            let final_hits = rows
+                .iter()
+                .filter(|row| {
+                    id_to_index
+                        .get(row.id.as_str())
+                        .is_some_and(|index| gold_set.contains(index))
+                })
+                .count();
+            if final_hits != candidate_hits {
+                return Err(format!(
+                    "query {query_index}: exact rerank returned {final_hits} golds but the \
+                     candidate frontier contained {candidate_hits}"
+                ));
+            }
+            hits_k1000 += final_hits;
+            per_query_hits.push(final_hits as u64);
+            per_query_top10_ids.push(rows.iter().map(|row| row.id.clone()).collect());
+        }
         warm_ms.push(query_elapsed.as_secs_f64() * 1_000.0);
         scan_ms.push(scan_elapsed.as_secs_f64() * 1_000.0);
+        scan_sequential_ms.push(sequential_elapsed.as_secs_f64() * 1_000.0);
+        scan_scoring_ms.push(scan_timing.scoring.as_secs_f64() * 1_000.0);
+        scan_merge_ms.push(scan_timing.merge.as_secs_f64() * 1_000.0);
         truth_ms.push(truth_elapsed.as_secs_f64() * 1_000.0);
         fetch_ms.push(fetch_elapsed.as_secs_f64() * 1_000.0);
         score_ms.push(score_elapsed.as_secs_f64() * 1_000.0);
@@ -812,9 +1010,13 @@ async fn run_benchmark() -> BenchResult<()> {
         truth_planned_requests.push(planned_request_count);
         truth_planned_bytes.push(plan.planned_bytes());
         truth_gap_waste_bytes.push(gap_waste_bytes);
+        truth_coalescing_factor
+            .push(truth_requests.len() as f64 / planned_request_count as f64);
         truth_request_waves
             .push(planned_request_count.div_ceil(read_plan_config.max_concurrent_requests as u64));
-        if (query_index + 1) % 200 == 0 {
+        if synthetic_mode && (query_index + 1) % 50 == 0 {
+            eprintln!("flat-bench: {} synthetic queries done", query_index + 1);
+        } else if !synthetic_mode && (query_index + 1) % 200 == 0 {
             eprintln!(
                 "flat-bench: {} queries done, running recall {:.6}",
                 query_index + 1,
@@ -823,7 +1025,8 @@ async fn run_benchmark() -> BenchResult<()> {
         }
     }
 
-    if query_count == QUERY_COUNT
+    if !synthetic_mode
+        && query_count == QUERY_COUNT
         && (hits_k700 != EXPECTED_HITS_K700
             || hits_k1000 != EXPECTED_HITS_K1000
             || hits_k1500 != EXPECTED_HITS_K1500)
@@ -844,8 +1047,14 @@ async fn run_benchmark() -> BenchResult<()> {
     }
     let truth_total_request_waves = truth_request_waves.iter().sum::<u64>();
 
-    let filtered_query_count = FILTERED_QUERY_COUNT.min(query_count);
-    eprintln!("flat-bench: running {filtered_query_count} filtered queries");
+    let filtered_query_count = if synthetic_mode {
+        0
+    } else {
+        FILTERED_QUERY_COUNT.min(query_count)
+    };
+    if filtered_query_count > 0 {
+        eprintln!("flat-bench: running {filtered_query_count} filtered queries");
+    }
     let filter = Filter::Eq {
         field: "color".to_string(),
         value: AttributeValue::String(FILTER_COLORS[0].to_string()),
@@ -853,14 +1062,41 @@ async fn run_benchmark() -> BenchResult<()> {
     let mut filtered_planned = Vec::with_capacity(filtered_query_count);
     let mut filtered_all_results_match = true;
     for (query_index, query_fde) in query_fdes.iter().enumerate().take(filtered_query_count) {
+        let admit_filtered = |index: usize| {
+            let attributes = Some(document_attributes(index));
+            filter_matches(Some(&filter), attributes.as_ref())
+        };
+        let filtered_selection = select_flat_top_k(
+            &resident.calibration,
+            &resident.codes,
+            FDE_DIMENSION,
+            query_fde,
+            CANDIDATE_K,
+            &admit_filtered,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
         let order = flat_selection_order(&resident, query_fde);
-        let candidates = order
+        let sequential_filtered: Vec<(usize, f32)> = order
             .iter()
-            .filter(|(index, _)| {
-                let attributes = Some(document_attributes(*index));
-                filter_matches(Some(&filter), attributes.as_ref())
-            })
+            .filter(|(index, _)| admit_filtered(*index))
             .take(CANDIDATE_K)
+            .copied()
+            .collect();
+        if filtered_selection.len() != sequential_filtered.len()
+            || filtered_selection
+                .iter()
+                .zip(&sequential_filtered)
+                .any(|(parallel, sequential)| {
+                    parallel.0 != sequential.0 || parallel.1.to_bits() != sequential.1.to_bits()
+                })
+        {
+            return Err(format!(
+                "filtered query {query_index}: parallel filtered scan diverged from sequential"
+            ));
+        }
+        let candidates = filtered_selection
+            .iter()
             .map(|&(index, negated_dot)| {
                 flat_candidate(&resident.rows[index], -negated_dot, Some(&filter))
             })
@@ -910,88 +1146,181 @@ async fn run_benchmark() -> BenchResult<()> {
         return Err("filtered arm returned a row that fails the filter".to_string());
     }
 
-    let report = BenchReport {
-        schema_version: 4,
-        source_revision: "518aa23+flat-bench".to_string(),
-        candidate_k: CANDIDATE_K,
-        read_gap_budget_bytes,
-        read_max_request_bytes,
-        read_max_concurrency,
-        pipeline_enabled,
-        document_count: DOCUMENT_COUNT,
-        query_count,
-        gold_memberships: query_count * GOLD_PER_QUERY,
-        hits_k700,
-        hits_k1000,
-        hits_k1500,
-        recall_k1000: hits_k1000 as f64 / (query_count * GOLD_PER_QUERY) as f64,
-        per_query_hits_k1000: integer_summary(&per_query_hits),
-        per_query_hits_k1000_values: per_query_hits.clone(),
-        per_query_top10_ids,
-        queries_below_8_of_10: per_query_hits.iter().filter(|&&hits| hits < 8).count(),
-        queries_below_5_of_10: per_query_hits.iter().filter(|&&hits| hits < 5).count(),
-        flat_artifact_bytes,
-        flat_metadata_bytes,
-        flat_code_bytes,
-        resident_bytes,
-        uploaded_objects,
-        uploaded_bytes,
-        setup_put_requests,
-        cold_hydrations,
-        warm_query_ms: integer_summary_f64(&warm_ms),
-        sq8_scan_ms: integer_summary_f64(&scan_ms),
-        truth_wave_ms: integer_summary_f64(&truth_ms),
-        truth_fetch_ms: float_summary(&fetch_ms),
-        truth_score_ms: float_summary(&score_ms),
-        truth_decode_ms: float_summary(&decode_ms),
-        truth_maxsim_ms: float_summary(&maxsim_ms),
-        truth_score_workers,
-        truth_get_latency_ms: float_summary(&truth_get_latency_ms),
-        truth_logical_ranges: integer_summary(&truth_logical),
-        truth_logical_bytes: integer_summary(&truth_logical_bytes),
-        truth_planned_requests: integer_summary(&truth_planned_requests),
-        truth_planned_bytes: integer_summary(&truth_planned_bytes),
-        truth_gap_waste_bytes: integer_summary(&truth_gap_waste_bytes),
-        truth_request_waves: integer_summary(&truth_request_waves),
-        truth_total_get_requests,
-        truth_total_request_waves,
-        observed_get_requests_equal_planned: observed_equals_planned,
-        query_fde_encode_ms_mean,
-        filtered_queries: filtered_query_count,
-        filtered_all_results_match,
-        filtered_planned_requests: integer_summary(&filtered_planned),
-        flat_artifact_sha256,
-        sq8_code_sha256,
-        sq8_calibration_sha256,
-        elapsed_ms: started.elapsed().as_millis(),
+    let serialized = if let Some(metadata) = synthetic_metadata {
+        let report = SyntheticBenchReport {
+            schema_version: 2,
+            source_revision: "a159c4b+ll09-scanpar".to_string(),
+            synthetic_document_seed: SYNTHETIC_DOCUMENT_SEED,
+            synthetic_query_seed: SYNTHETIC_QUERY_SEED,
+            synthetic_document_sha256: metadata.document_sha256,
+            synthetic_query_sha256: metadata.query_sha256,
+            candidate_k: CANDIDATE_K,
+            read_gap_budget_bytes,
+            read_max_request_bytes,
+            read_max_concurrency,
+            pipeline_enabled,
+            document_count,
+            query_count,
+            query_tokens: SYNTHETIC_QUERY_TOKENS,
+            token_counts: integer_summary(&metadata.token_counts),
+            total_vector_count,
+            prebuild_estimated_artifact_bytes: metadata.estimated_artifact_bytes,
+            prebuild_size_limit_bytes: SYNTHETIC_SIZE_LIMIT_BYTES,
+            prebuild_size_gate_passed: true,
+            flat_artifact_bytes,
+            flat_metadata_bytes,
+            flat_code_bytes,
+            resident_bytes,
+            uploaded_objects,
+            uploaded_bytes,
+            setup_put_requests,
+            cold_hydrations,
+            warm_query_ms: integer_summary_f64(&warm_ms),
+            sq8_scan_ms: integer_summary_f64(&scan_ms),
+            sq8_scan_wall_ms: float_summary(&scan_ms),
+            sq8_scan_sequential_ms: integer_summary_f64(&scan_sequential_ms),
+            sq8_scan_sequential_wall_ms: float_summary(&scan_sequential_ms),
+            sq8_scan_scoring_ms: float_summary(&scan_scoring_ms),
+            sq8_scan_merge_ms: float_summary(&scan_merge_ms),
+            sq8_scan_workers: scan_workers,
+            scan_parallel_equals_sequential: true,
+            truth_wave_ms: integer_summary_f64(&truth_ms),
+            truth_fetch_ms: float_summary(&fetch_ms),
+            truth_score_ms: float_summary(&score_ms),
+            truth_decode_ms: float_summary(&decode_ms),
+            truth_maxsim_ms: float_summary(&maxsim_ms),
+            truth_score_workers,
+            truth_get_latency_ms: float_summary(&truth_get_latency_ms),
+            truth_logical_ranges: integer_summary(&truth_logical),
+            truth_logical_bytes: integer_summary(&truth_logical_bytes),
+            truth_planned_requests: integer_summary(&truth_planned_requests),
+            truth_planned_bytes: integer_summary(&truth_planned_bytes),
+            truth_gap_waste_bytes: integer_summary(&truth_gap_waste_bytes),
+            truth_coalescing_factor: float_summary(&truth_coalescing_factor),
+            truth_request_waves: integer_summary(&truth_request_waves),
+            truth_total_get_requests,
+            truth_total_request_waves,
+            observed_get_requests_equal_planned: observed_equals_planned,
+            query_fde_encode_ms_mean,
+            flat_artifact_sha256,
+            sq8_code_sha256,
+            sq8_calibration_sha256,
+            elapsed_ms: started.elapsed().as_millis(),
+        };
+        eprintln!(
+            "phase9_flat_sq8 lane=text synthetic_documents={document_count} \
+             candidate_k={CANDIDATE_K} warm_p50_ms={} requests_p50={} \
+             planned_bytes_p50={} artifact_bytes={flat_artifact_bytes} elapsed_ms={}",
+            report.warm_query_ms.p50,
+            report.truth_planned_requests.p50,
+            report.truth_planned_bytes.p50,
+            report.elapsed_ms,
+        );
+        serde_json::to_vec_pretty(&report)
+            .map_err(|error| format!("cannot serialize synthetic report: {error}"))?
+    } else {
+        let report = BenchReport {
+            schema_version: 5,
+            source_revision: "a159c4b+ll09-scanpar".to_string(),
+            candidate_k: CANDIDATE_K,
+            read_gap_budget_bytes,
+            read_max_request_bytes,
+            read_max_concurrency,
+            pipeline_enabled,
+            document_count,
+            query_count,
+            gold_memberships: query_count * GOLD_PER_QUERY,
+            hits_k700,
+            hits_k1000,
+            hits_k1500,
+            recall_k1000: hits_k1000 as f64 / (query_count * GOLD_PER_QUERY) as f64,
+            per_query_hits_k1000: integer_summary(&per_query_hits),
+            per_query_hits_k1000_values: per_query_hits.clone(),
+            per_query_top10_ids,
+            queries_below_8_of_10: per_query_hits.iter().filter(|&&hits| hits < 8).count(),
+            queries_below_5_of_10: per_query_hits.iter().filter(|&&hits| hits < 5).count(),
+            flat_artifact_bytes,
+            flat_metadata_bytes,
+            flat_code_bytes,
+            resident_bytes,
+            uploaded_objects,
+            uploaded_bytes,
+            setup_put_requests,
+            cold_hydrations,
+            warm_query_ms: integer_summary_f64(&warm_ms),
+            sq8_scan_ms: integer_summary_f64(&scan_ms),
+            sq8_scan_wall_ms: float_summary(&scan_ms),
+            sq8_scan_sequential_ms: integer_summary_f64(&scan_sequential_ms),
+            sq8_scan_sequential_wall_ms: float_summary(&scan_sequential_ms),
+            sq8_scan_scoring_ms: float_summary(&scan_scoring_ms),
+            sq8_scan_merge_ms: float_summary(&scan_merge_ms),
+            sq8_scan_workers: scan_workers,
+            scan_parallel_equals_sequential: true,
+            truth_wave_ms: integer_summary_f64(&truth_ms),
+            truth_fetch_ms: float_summary(&fetch_ms),
+            truth_score_ms: float_summary(&score_ms),
+            truth_decode_ms: float_summary(&decode_ms),
+            truth_maxsim_ms: float_summary(&maxsim_ms),
+            truth_score_workers,
+            truth_get_latency_ms: float_summary(&truth_get_latency_ms),
+            truth_logical_ranges: integer_summary(&truth_logical),
+            truth_logical_bytes: integer_summary(&truth_logical_bytes),
+            truth_planned_requests: integer_summary(&truth_planned_requests),
+            truth_planned_bytes: integer_summary(&truth_planned_bytes),
+            truth_gap_waste_bytes: integer_summary(&truth_gap_waste_bytes),
+            truth_request_waves: integer_summary(&truth_request_waves),
+            truth_total_get_requests,
+            truth_total_request_waves,
+            observed_get_requests_equal_planned: observed_equals_planned,
+            query_fde_encode_ms_mean,
+            filtered_queries: filtered_query_count,
+            filtered_all_results_match,
+            filtered_planned_requests: integer_summary(&filtered_planned),
+            flat_artifact_sha256,
+            sq8_code_sha256,
+            sq8_calibration_sha256,
+            elapsed_ms: started.elapsed().as_millis(),
+        };
+        eprintln!(
+            "phase9_flat_sq8 lane=text candidate_k={CANDIDATE_K} hits={hits_k1000}/{} \
+             recall={:.6} warm_p50_ms={:.1} warm_p95_ms={:.1} \
+             planned_bytes_p50={} artifact_bytes={flat_artifact_bytes} elapsed_ms={}",
+            query_count * GOLD_PER_QUERY,
+            report.recall_k1000,
+            report.warm_query_ms.p50,
+            report.warm_query_ms.p95,
+            report.truth_planned_bytes.p50,
+            report.elapsed_ms,
+        );
+        serde_json::to_vec_pretty(&report)
+            .map_err(|error| format!("cannot serialize report: {error}"))?
     };
-    let serialized = serde_json::to_vec_pretty(&report)
-        .map_err(|error| format!("cannot serialize report: {error}"))?;
     fs::write(&output, serialized)
         .map_err(|error| format!("cannot write {}: {error}", output.display()))?;
-    eprintln!(
-        "phase9_flat_sq8 lane=text candidate_k={CANDIDATE_K} hits={hits_k1000}/{} \
-         recall={:.6} warm_p50_ms={:.1} warm_p95_ms={:.1} \
-         planned_bytes_p50={} artifact_bytes={flat_artifact_bytes} elapsed_ms={}",
-        query_count * GOLD_PER_QUERY,
-        report.recall_k1000,
-        report.warm_query_ms.p50,
-        report.warm_query_ms.p95,
-        report.truth_planned_bytes.p50,
-        report.elapsed_ms,
-    );
+    Ok(())
+    }
+    .await;
 
     eprintln!("flat-bench: cleaning namespace {namespace}");
-    let removed = store
+    let cleanup_result = store
         .delete_prefix(&format!("{namespace}/"))
         .await
-        .map_err(|error| error.to_string())?;
-    if removed < uploaded_objects {
-        return Err(format!(
+        .map_err(|error| error.to_string());
+    match (benchmark_result, cleanup_result) {
+        (Ok(()), Ok(removed)) if removed >= uploaded_objects => Ok(()),
+        (Ok(()), Ok(removed)) => Err(format!(
             "cleanup removed {removed} objects, expected at least {uploaded_objects}"
-        ));
+        )),
+        (Ok(()), Err(cleanup_error)) => Err(format!("namespace cleanup failed: {cleanup_error}")),
+        (Err(benchmark_error), Ok(removed)) if removed >= uploaded_objects => Err(benchmark_error),
+        (Err(benchmark_error), Ok(removed)) => Err(format!(
+            "{benchmark_error}; cleanup removed {removed} objects, expected at least \
+             {uploaded_objects}"
+        )),
+        (Err(benchmark_error), Err(cleanup_error)) => Err(format!(
+            "{benchmark_error}; namespace cleanup also failed: {cleanup_error}"
+        )),
     }
-    Ok(())
 }
 
 /// Score every resident SQ8 row and return the full ascending selection order.
@@ -1045,6 +1374,7 @@ fn flat_candidate(
 fn placeholder_candidate_index(
     generation: FdeGenerationId,
     namespace: &str,
+    document_count: usize,
 ) -> LateCandidateIndexRef {
     // The flat arm never routes through the IVF candidate index; the segment
     // descriptor requires one, so a minimal unused reference is recorded.
@@ -1061,7 +1391,7 @@ fn placeholder_candidate_index(
                 candidate_k: CANDIDATE_K as u32,
                 routing_metric: LateRoutingMetric::NegativeL2,
             },
-            row_count: DOCUMENT_COUNT as u64,
+            row_count: document_count as u64,
             format_version: 1,
         },
         clusters: Vec::new(),
@@ -1079,12 +1409,12 @@ fn color_attributes(color: &str) -> HashMap<String, AttributeValue> {
     )])
 }
 
-fn document_content_hash(index: usize) -> ContentHash {
-    ContentHash::new(document_content_hash_bytes(index))
+fn content_hash_for_id(id: &str) -> ContentHash {
+    ContentHash::new(content_hash_bytes_for_id(id))
 }
 
-fn document_content_hash_bytes(index: usize) -> [u8; 32] {
-    *ArtifactChecksum::digest(production_document_id(index).as_bytes()).as_bytes()
+fn content_hash_bytes_for_id(id: &str) -> [u8; 32] {
+    *ArtifactChecksum::digest(id.as_bytes()).as_bytes()
 }
 
 fn encode_flat_artifact(
@@ -1190,6 +1520,262 @@ fn counting_minio_store() -> BenchResult<CountingStoreSetup> {
     ))
 }
 
+struct SyntheticRng {
+    state: u64,
+    spare_normal: Option<f64>,
+}
+
+impl SyntheticRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed,
+            spare_normal: None,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn open_unit_f64(&mut self) -> f64 {
+        let mantissa = self.next_u64() >> 11;
+        (mantissa as f64 + 0.5) * (1.0 / ((1_u64 << 53) as f64))
+    }
+
+    fn normal(&mut self) -> f64 {
+        if let Some(spare) = self.spare_normal.take() {
+            return spare;
+        }
+        let radius = (-2.0 * self.open_unit_f64().ln()).sqrt();
+        let angle = std::f64::consts::TAU * self.open_unit_f64();
+        self.spare_normal = Some(radius * angle.sin());
+        radius * angle.cos()
+    }
+}
+
+fn generate_synthetic_tensors() -> BenchResult<(TensorSet, TensorSet, SyntheticMetadata)> {
+    let sigma = (SYNTHETIC_TOKEN_P99 / SYNTHETIC_TOKEN_MEDIAN).ln() / SYNTHETIC_TOKEN_P99_Z;
+    let mut shape_rng = SyntheticRng::new(SYNTHETIC_DOCUMENT_SEED ^ 0x7368_6170_652d_7631);
+    let document_rows: Vec<usize> = (0..SYNTHETIC_DOCUMENT_COUNT)
+        .map(|_| {
+            (SYNTHETIC_TOKEN_MEDIAN.ln() + sigma * shape_rng.normal())
+                .exp()
+                .round()
+                .clamp(1.0, SYNTHETIC_MAX_TOKENS as f64) as usize
+        })
+        .collect();
+    let document_ids: Vec<String> = (0..SYNTHETIC_DOCUMENT_COUNT)
+        .map(production_document_id)
+        .collect();
+    let token_counts: Vec<u64> = document_rows.iter().map(|&rows| rows as u64).collect();
+    let token_summary = integer_summary(&token_counts);
+    let estimated_artifact_bytes =
+        estimate_synthetic_artifact_bytes(&document_rows, &document_ids)?;
+    eprintln!(
+        "flat-bench: prebuild synthetic sizing vectors={} token_p50={} token_p99={} \
+         token_max={} estimated_artifact_bytes={} limit_bytes={SYNTHETIC_SIZE_LIMIT_BYTES} \
+         conservative_runtime_seconds={SYNTHETIC_CONSERVATIVE_RUNTIME_SECONDS} \
+         runtime_limit_seconds={SYNTHETIC_RUNTIME_LIMIT_SECONDS}",
+        token_counts.iter().sum::<u64>(),
+        token_summary.p50,
+        token_summary.p99,
+        token_summary.max,
+        estimated_artifact_bytes,
+    );
+    if estimated_artifact_bytes > SYNTHETIC_SIZE_LIMIT_BYTES {
+        return Err(format!(
+            "synthetic artifact estimate {estimated_artifact_bytes} exceeds \
+             {SYNTHETIC_SIZE_LIMIT_BYTES} bytes"
+        ));
+    }
+    if SYNTHETIC_CONSERVATIVE_RUNTIME_SECONDS > SYNTHETIC_RUNTIME_LIMIT_SECONDS {
+        return Err(format!(
+            "synthetic runtime estimate {SYNTHETIC_CONSERVATIVE_RUNTIME_SECONDS} seconds \
+             exceeds {SYNTHETIC_RUNTIME_LIMIT_SECONDS} seconds"
+        ));
+    }
+
+    let documents = generate_synthetic_tensor_set(
+        document_rows,
+        document_ids,
+        SYNTHETIC_DOCUMENT_SEED,
+        b"documents",
+    )?;
+    let query_rows = vec![SYNTHETIC_QUERY_TOKENS; SYNTHETIC_QUERY_COUNT];
+    let query_ids = (0..SYNTHETIC_QUERY_COUNT)
+        .map(|index| format!("mmli-synthetic-q-{index:020}"))
+        .collect();
+    let queries =
+        generate_synthetic_tensor_set(query_rows, query_ids, SYNTHETIC_QUERY_SEED, b"queries")?;
+    let document_sha256 =
+        synthetic_tensor_digest(&documents, SYNTHETIC_DOCUMENT_SEED, b"documents");
+    let query_sha256 = synthetic_tensor_digest(&queries, SYNTHETIC_QUERY_SEED, b"queries");
+    eprintln!(
+        "flat-bench: synthetic_document_seed={SYNTHETIC_DOCUMENT_SEED:#018x} \
+         synthetic_document_sha256={document_sha256}"
+    );
+    eprintln!(
+        "flat-bench: synthetic_query_seed={SYNTHETIC_QUERY_SEED:#018x} \
+         synthetic_query_sha256={query_sha256}"
+    );
+    Ok((
+        documents,
+        queries,
+        SyntheticMetadata {
+            document_sha256,
+            query_sha256,
+            token_counts,
+            estimated_artifact_bytes,
+        },
+    ))
+}
+
+fn estimate_synthetic_artifact_bytes(rows: &[usize], ids: &[String]) -> BenchResult<u64> {
+    // Conservative v1 framing allowances. The persisted report carries the
+    // actual uploaded byte count after the builders finish.
+    const MATRIX_HEADER_BYTES: u64 = 168;
+    const MATRIX_DIRECTORY_FIXED_BYTES: u64 = 100;
+    const ATTRIBUTE_HEADER_BYTES: u64 = 92;
+    const ATTRIBUTE_ROW_FIXED_BYTES: u64 = 56;
+    const ATTRIBUTE_PAYLOAD_BYTES: u64 = 14;
+    const FLAT_METADATA_BYTES_PER_ROW: u64 = 1_024;
+    const FLAT_FIXED_ALLOWANCE_BYTES: u64 = 1024 * 1024;
+
+    if rows.len() != ids.len() || rows.is_empty() {
+        return Err("synthetic sizing rows and ids disagree".to_string());
+    }
+    let max_matrix_bytes = MAX_MATRIX_OBJECT_BYTES as u64;
+    let mut matrix_bytes = 0_u64;
+    let mut current_matrix_bytes = MATRIX_HEADER_BYTES;
+    for (&row_count, id) in rows.iter().zip(ids) {
+        let payload_bytes = (row_count as u64)
+            .checked_mul(DIMENSION as u64 * size_of::<u16>() as u64)
+            .ok_or_else(|| "synthetic matrix payload estimate overflowed".to_string())?;
+        let row_bytes = payload_bytes
+            .checked_add(MATRIX_DIRECTORY_FIXED_BYTES + id.len() as u64)
+            .ok_or_else(|| "synthetic matrix row estimate overflowed".to_string())?;
+        if MATRIX_HEADER_BYTES + row_bytes > max_matrix_bytes {
+            return Err(format!(
+                "synthetic matrix row requires {} bytes, object maximum is {max_matrix_bytes}",
+                MATRIX_HEADER_BYTES + row_bytes
+            ));
+        }
+        if current_matrix_bytes > MATRIX_HEADER_BYTES
+            && current_matrix_bytes + row_bytes > max_matrix_bytes
+        {
+            matrix_bytes = matrix_bytes
+                .checked_add(current_matrix_bytes)
+                .ok_or_else(|| "synthetic matrix block estimate overflowed".to_string())?;
+            current_matrix_bytes = MATRIX_HEADER_BYTES;
+        }
+        current_matrix_bytes = current_matrix_bytes
+            .checked_add(row_bytes)
+            .ok_or_else(|| "synthetic matrix block estimate overflowed".to_string())?;
+    }
+    matrix_bytes = matrix_bytes
+        .checked_add(current_matrix_bytes)
+        .ok_or_else(|| "synthetic matrix total estimate overflowed".to_string())?;
+    let attribute_bytes = ids.iter().try_fold(ATTRIBUTE_HEADER_BYTES, |total, id| {
+        total
+            .checked_add(ATTRIBUTE_ROW_FIXED_BYTES + id.len() as u64 + ATTRIBUTE_PAYLOAD_BYTES)
+            .ok_or_else(|| "synthetic attribute estimate overflowed".to_string())
+    })?;
+    let flat_bytes = (rows.len() as u64)
+        .checked_mul(FDE_DIMENSION as u64 + FLAT_METADATA_BYTES_PER_ROW)
+        .and_then(|bytes| bytes.checked_add(FLAT_FIXED_ALLOWANCE_BYTES))
+        .ok_or_else(|| "synthetic flat artifact estimate overflowed".to_string())?;
+    matrix_bytes
+        .checked_add(attribute_bytes)
+        .and_then(|bytes| bytes.checked_add(flat_bytes))
+        .ok_or_else(|| "synthetic total artifact estimate overflowed".to_string())
+}
+
+fn generate_synthetic_tensor_set(
+    rows: Vec<usize>,
+    ids: Vec<String>,
+    seed: u64,
+    label: &[u8],
+) -> BenchResult<TensorSet> {
+    let total_rows = rows.iter().try_fold(0_usize, |total, &row_count| {
+        total
+            .checked_add(row_count)
+            .ok_or_else(|| "synthetic tensor row count overflowed".to_string())
+    })?;
+    let scalar_count = total_rows
+        .checked_mul(DIMENSION)
+        .ok_or_else(|| "synthetic tensor scalar count overflowed".to_string())?;
+    let mut scalar_offsets = Vec::with_capacity(rows.len());
+    let mut offset = 0usize;
+    for &row_count in &rows {
+        scalar_offsets.push(offset);
+        offset = offset
+            .checked_add(row_count * DIMENSION)
+            .ok_or_else(|| "synthetic tensor offset overflowed".to_string())?;
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(scalar_count)
+        .map_err(|error| format!("cannot reserve synthetic tensor values: {error}"))?;
+    let mut rng = SyntheticRng::new(seed ^ 0x7661_6c75_6573_2d31);
+    for &row_count in &rows {
+        for _ in 0..row_count * DIMENSION {
+            let random = (rng.next_u64() >> 40) as u32;
+            let value = random as f32 * (2.0 / 16_777_216.0) - 1.0;
+            values.push(f16::from_f32(value).to_f32());
+        }
+    }
+    if values.len() != scalar_count {
+        return Err("synthetic tensor generator produced the wrong scalar count".to_string());
+    }
+    let tensor = TensorSet {
+        sidecar: TensorSidecar {
+            rows,
+            dim: DIMENSION,
+            dtype: TensorDtype::F16,
+            ids,
+        },
+        values,
+        scalar_offsets,
+        total_rows,
+    };
+    if label.is_empty() {
+        return Err("synthetic tensor digest label cannot be empty".to_string());
+    }
+    Ok(tensor)
+}
+
+fn synthetic_tensor_digest(tensor: &TensorSet, seed: u64, label: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hash_frame(&mut hasher, b"format", b"ll05-synthetic-f16-v1");
+    hash_frame(&mut hasher, b"lane", label);
+    hasher.update(seed.to_le_bytes());
+    hasher.update((tensor.sidecar.dim as u64).to_le_bytes());
+    hasher.update((tensor.sidecar.rows.len() as u64).to_le_bytes());
+    for (index, (&row_count, id)) in tensor
+        .sidecar
+        .rows
+        .iter()
+        .zip(&tensor.sidecar.ids)
+        .enumerate()
+    {
+        hasher.update((index as u64).to_le_bytes());
+        hash_frame(&mut hasher, b"id", id.as_bytes());
+        hasher.update((row_count as u64).to_le_bytes());
+        let start = tensor.scalar_offsets[index];
+        let end = start + row_count * tensor.sidecar.dim;
+        let mut encoded = Vec::with_capacity((end - start) * size_of::<u16>());
+        for &value in &tensor.values[start..end] {
+            encoded.extend_from_slice(&f16::from_f32(value).to_bits().to_le_bytes());
+        }
+        hash_frame(&mut hasher, b"matrix", &encoded);
+    }
+    hex(&hasher.finalize())
+}
+
 /// Build the production-semantics FDEs: subtract the f32 sampled document-row
 /// mean, push documents through the f16 persistence boundary, then encode.
 /// Replicates the routing diagnostic's `production_*` variant bit-for-bit
@@ -1289,6 +1875,17 @@ fn optional_usize(name: &str, default: usize) -> BenchResult<usize> {
             .parse::<usize>()
             .map_err(|error| format!("invalid {name}={value:?}: {error}")),
         Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(format!("cannot read {name}: {error}")),
+    }
+}
+
+fn optional_usize_value(name: &str) -> BenchResult<Option<usize>> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|error| format!("invalid {name}={value:?}: {error}")),
+        Err(env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(format!("cannot read {name}: {error}")),
     }
 }
