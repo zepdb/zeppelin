@@ -1,0 +1,26 @@
+//! Analytic sizing, cost, and throughput modeling for deployment planning.
+//!
+//! This module is the library home of the Tier 2 perf-contract prediction
+//! engine, promoted out of the test tree so operator tooling (the
+//! `zeppelin_advisor` binary) can rank hardware candidates and price
+//! deployments without linking test-only instrumentation.
+//!
+//! - [`model`] — [`model::predict`] turns per-query counters into QPS,
+//!   latency percentiles, and dollars; [`model::CalibratedShapeModel`]
+//!   scales fitted constants to arbitrary dataset shapes.
+//! - [`profiles`] — strict TOML profiles describing object-store behavior,
+//!   pricing, node fleets, and client populations.
+//! - [`lognormal`] — the deterministic lognormal TTFB distribution shared
+//!   with the perf-contract latency injector.
+//! - [`rows`] — closed-form stored-bytes-per-row for each quantization,
+//!   pinned against the production encoders.
+//!
+//! The perf-contract suite re-exports these types so its Tier 2 assertions
+//! and this module can never drift apart: the calibration (fit) still runs
+//! there, against real MinIO measurements, and its tolerances gate any
+//! change to the math here.
+
+pub mod lognormal;
+pub mod model;
+pub mod profiles;
+pub mod rows;

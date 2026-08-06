@@ -42,6 +42,12 @@ path = "src/bin/zeppelin_audit_verify.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "zeppelin_advisor"
+path = "src/bin/zeppelin_advisor.rs"
+test = false
+bench = false
+
 [dependencies]
 # HTTP server
 axum = { version = "0.7", features = ["macros"] }

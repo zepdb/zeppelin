@@ -43,7 +43,6 @@ use super::scenario::{
 };
 use super::{require_minio, scenarios, PerfEnv, ALL_SCENARIOS};
 
-const NORMAL_P99_Z: f64 = 2.326;
 const BYTES_PER_MB: f64 = 1_000_000.0;
 const DEFAULT_PROFILE: &str = "s3-standard-intra-region";
 const DEFAULT_SEED: u64 = 42;
@@ -51,44 +50,7 @@ const SERIAL_REQUESTS: usize = 200;
 const CLOSED_LOOP_REQUESTS: usize = 500;
 const DEFAULT_SCENARIOS: [&str; 3] = ["warm_query_strong", "cold_query_strong", "fts_query"];
 
-/// Lognormal milliseconds fitted to configured p50 and p99 values.
-#[derive(Debug, Clone, Copy)]
-pub struct LognormalMs {
-    mu: f64,
-    sigma: f64,
-}
-
-impl LognormalMs {
-    #[must_use]
-    pub fn from_percentiles(p50_ms: f64, p99_ms: f64) -> Self {
-        assert!(
-            p50_ms.is_finite() && p50_ms > 0.0,
-            "latency p50 must be finite and positive"
-        );
-        assert!(
-            p99_ms.is_finite() && p99_ms >= p50_ms,
-            "latency p99 must be finite and at least p50"
-        );
-        Self {
-            mu: p50_ms.ln(),
-            sigma: (p99_ms.ln() - p50_ms.ln()) / NORMAL_P99_Z,
-        }
-    }
-
-    fn sample_us(self, seed: u64) -> u64 {
-        let first = splitmix64(seed);
-        let second = splitmix64(first);
-        let u1 = unit_open(first);
-        let u2 = unit_open(second);
-        let standard_normal = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
-        let micros = (self.mu + self.sigma * standard_normal).exp() * 1_000.0;
-        assert!(
-            micros.is_finite() && micros >= 0.0 && micros <= u64::MAX as f64,
-            "sampled latency is outside the u64 microsecond range"
-        );
-        micros.round() as u64
-    }
-}
+pub use zeppelin::sizing::lognormal::LognormalMs;
 
 /// Latency parameters derived from one profile's storage block.
 #[derive(Debug, Clone, Copy)]
@@ -855,18 +817,6 @@ fn stable_logical_key(key: &str) -> String {
     }
 }
 
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut mixed = value;
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    mixed ^ (mixed >> 31)
-}
-
-fn unit_open(value: u64) -> f64 {
-    ((value >> 11) as f64 + 0.5) / ((1_u64 << 53) as f64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,10 +836,9 @@ mod tests {
     }
 
     #[test]
-    fn percentile_fit_is_exact_at_distribution_quantiles() {
-        let fitted = LognormalMs::from_percentiles(15.0, 60.0);
-        assert!((fitted.mu.exp() - 15.0).abs() < 1e-12);
-        assert!(((fitted.mu + NORMAL_P99_Z * fitted.sigma).exp() - 60.0).abs() < 1e-9);
+    fn transfer_constant_is_pinned() {
+        // The exact quantile-fit assertions moved with LognormalMs to
+        // zeppelin::sizing::lognormal, where the fit fields are visible.
         assert_eq!(BYTES_PER_MB as u64, 1_000_000);
     }
 }

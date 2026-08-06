@@ -3147,6 +3147,21 @@ mod tests {
         assert_eq!(rabitq_row_bytes(1536).unwrap(), 392);
     }
 
+    /// The sizing model's closed-form row bytes never drift from the
+    /// production encoder arithmetic this module owns.
+    #[test]
+    fn sizing_row_bytes_match_the_production_encoder() {
+        use crate::sizing::rows::{row_bytes, Quantization};
+        for dims in [64usize, 100, 256, 384, 768, 1024, 1536, 3072] {
+            let padded = padded_code_dims(dims).unwrap();
+            assert_eq!(
+                row_bytes(Quantization::RabitqTwoBit, dims),
+                rabitq_row_bytes(padded).unwrap(),
+                "two-bit sizing row bytes drifted at dims={dims}"
+            );
+        }
+    }
+
     /// Target dimensions persist exact header metadata and one-row arithmetic.
     #[test]
     fn v4_target_dimension_objects_have_exact_size() {

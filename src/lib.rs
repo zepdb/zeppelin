@@ -267,6 +267,13 @@ pub mod security;
 /// [`server::build_router`] assembles the API/middleware stack. Handlers validate
 /// wire contracts and delegate durable behavior to domain modules.
 pub mod server;
+/// Analytic sizing, cost, and throughput modeling for deployment planning.
+///
+/// [`sizing::model::predict`] converts per-query counters into QPS, latency,
+/// and dollar predictions under a [`sizing::profiles::Profile`]. The math is
+/// calibrated by the perf-contract Tier 2 suite; operator tooling consumes
+/// serialized calibration snapshots and never fits its own.
+pub mod sizing;
 /// Process configuration discovery, service construction, background tasks, and shutdown.
 ///
 /// [`startup::build_app`] validates configuration, probes storage, constructs

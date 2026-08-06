@@ -1,12 +1,26 @@
 //! Tier 2 analytic prediction, calibration, validation, and what-if tables.
+//!
+//! The prediction math (`predict`, `CalibratedShapeModel`) lives in
+//! `zeppelin::sizing::model`; this module re-exports it and keeps the parts
+//! that consume test-only instrumentation: fitting the shape model from a
+//! measured repeat, ground-truth validation, CPU calibration, and the
+//! frozen what-if report rendering.
 
 use std::collections::BTreeMap;
 
 use crate::common::counting::ClassStats;
 use zeppelin::config::IndexingConfig;
+use zeppelin::sizing::model::{CalibratedShapeModel, CalibratedStage, CalibratedStageClass};
+
+// Re-exported for API continuity: perf-contract code keeps importing the
+// prediction type family from this module even though it now lives in the lib.
+#[allow(unused_imports)]
+pub use zeppelin::sizing::model::{
+    predict, Bottleneck, ModelInput, ModeledClassStats, ModeledStage, Prediction,
+};
 
 use super::dataset::{DatasetSpec, SHAPE_MEDIUM, SHAPE_SMALL};
-use super::depth::{DepthStage, DepthTracker, SpanKind};
+use super::depth::{DepthTracker, SpanKind};
 use super::ground_truth::{load_gt_a, load_gt_b, GroundTruthA, GroundTruthB};
 use super::profiles::{load_profile, selected_profiles, Profile, WhatIfProfile};
 use super::report::RunArtifacts;
@@ -14,75 +28,10 @@ use super::scenario::{run_scenario, RepeatCounters, ScenarioOutcome};
 use super::{require_minio, scenarios, PerfEnv};
 
 const BYTES_PER_MB: f64 = 1_000_000.0;
-const BYTES_PER_GIB: f64 = 1_073_741_824.0;
 const GT_A_QPS_TOLERANCE: f64 = 0.10;
 const GT_B_QPS_TOLERANCE: f64 = 0.20;
 const GT_B_MEAN_TOLERANCE: f64 = 0.25;
 const SHAPE_TOLERANCE: f64 = 0.10;
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ModeledClassStats {
-    pub get_ops: f64,
-    pub get_bytes: f64,
-    pub put_ops: f64,
-    pub put_bytes: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct ModeledStage {
-    pub ops: f64,
-    pub bytes: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct ModelInput {
-    pub classes: BTreeMap<String, ModeledClassStats>,
-    pub stages: Vec<ModeledStage>,
-    pub clients: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Prediction {
-    pub bytes_per_query: f64,
-    pub gets_per_query: f64,
-    pub service_time_ms: f64,
-    pub qps_bw_cap: f64,
-    pub qps_closed: f64,
-    pub qps: f64,
-    pub mean_latency_ms: f64,
-    pub p50_ms: f64,
-    pub p99_ms: f64,
-    pub request_cost: f64,
-    pub node_cost: f64,
-    pub total_cost: f64,
-    pub bottleneck: Bottleneck,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Bottleneck {
-    Bandwidth,
-    ClosedLoop,
-}
-
-impl Bottleneck {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Bandwidth => "bandwidth",
-            Self::ClosedLoop => "closed-loop",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ShapeModel {
-    source_classes: BTreeMap<String, ModeledClassStats>,
-    source_stages: Vec<DepthStage>,
-    coarse_overhead_per_row: f64,
-    rerank_overhead_per_row: f64,
-    clusters_per_coarse_get: f64,
-    rerank_get_ops: f64,
-    target_overhead_per_probe: f64,
-}
 
 #[derive(Debug, Clone)]
 struct ValidationSummary {
@@ -121,12 +70,19 @@ pub async fn run_predict_entry() {
     let report = artifacts.write_report();
 
     let small_repeat = only_repeat(&small);
-    let model = ShapeModel::fit(&SHAPE_SMALL, 4, small_repeat);
+    let model = fit_shape_model(&SHAPE_SMALL, 4, small_repeat);
     let validations = validate_model(&model, &medium);
     let whatif = render_whatif(&model, &selected, &validations);
     let path = artifacts.write_whatif(&whatif);
+    let snapshot_path = path.with_file_name("shape_model.toml");
+    std::fs::write(&snapshot_path, model.to_toml_string())
+        .unwrap_or_else(|error| panic!("failed to write shape-model snapshot: {error}"));
     println!("performance prediction report: {}", report.display());
     println!("performance what-if table: {}", path.display());
+    println!(
+        "calibrated shape-model snapshot: {}",
+        snapshot_path.display()
+    );
 }
 
 async fn measure_shape(name: &str, shape: DatasetSpec) -> ScenarioOutcome {
@@ -143,277 +99,92 @@ fn only_repeat(outcome: &ScenarioOutcome) -> &RepeatCounters {
     &outcome.per_repeat[0]
 }
 
-impl ShapeModel {
-    fn fit(source: &DatasetSpec, source_nprobe: usize, repeat: &RepeatCounters) -> Self {
-        let source_classes = modeled_classes(&repeat.classes);
-        let cluster = source_classes
-            .get("cluster")
-            .copied()
-            .expect("shape source omitted cluster counters");
-        assert!(cluster.get_ops > 0.0, "shape source made no cluster GETs");
-        let source_stages = DepthTracker::stages(
-            &repeat.spans,
-            &[SpanKind::Get, SpanKind::Head],
-            Some(repeat.response_cutoff_us),
-        );
-        assert!(
-            !source_stages.is_empty(),
-            "shape source produced no GET stages"
-        );
-        let cluster_stages = source_stages
-            .iter()
-            .filter_map(|stage| stage.classes.get("cluster"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            cluster_stages.len(),
-            2,
-            "shape source must expose coarse and rerank cluster stages"
-        );
-        let rows_per_cluster = source.vectors as f64 / source.nlist as f64;
-        let expanded_clusters = grouped_cluster_coverage(source.nlist, source_nprobe);
-        let coarse = cluster_stages[0];
-        let rerank = cluster_stages[1];
-        let coarse_payload = expanded_clusters * rows_per_cluster * source.dims as f64;
-        assert!(
-            coarse.bytes as f64 >= coarse_payload,
-            "coarse stage bytes are below the closed-form row payload"
-        );
-        let coarse_overhead_per_row =
-            coarse.bytes as f64 / expanded_clusters / rows_per_cluster - source.dims as f64;
-        let rerank_payload = rows_per_cluster * source.dims as f64 * 4.0;
-        assert!(
-            rerank.bytes as f64 >= rerank_payload,
-            "rerank stage bytes are below one full-precision cluster"
-        );
-        let rerank_overhead_per_row = (rerank.bytes as f64 - rerank_payload) / rows_per_cluster;
-        let target_payload = source_nprobe as f64 * rows_per_cluster * source.dims as f64;
-        let target_overhead_per_probe = (cluster.get_bytes - target_payload) / source_nprobe as f64;
-        let clusters_per_coarse_get = expanded_clusters / coarse.ops as f64;
-        let rerank_get_ops = rerank.ops as f64;
-        Self {
-            source_classes,
-            source_stages,
-            coarse_overhead_per_row,
-            rerank_overhead_per_row,
-            clusters_per_coarse_get,
-            rerank_get_ops,
-            target_overhead_per_probe,
-        }
-    }
-
-    fn predict_synthetic(
-        &self,
-        vectors: usize,
-        dims: usize,
-        nlist: usize,
-        nprobe: usize,
-        row_bytes: usize,
-        clients: usize,
-    ) -> ModelInput {
-        assert!(vectors > 0, "shape-model vectors must be nonzero");
-        assert!(dims > 0, "shape-model dims must be nonzero");
-        assert!(nlist > 0, "shape-model nlist must be nonzero");
-        assert!(
-            nprobe > 0 && nprobe <= nlist,
-            "shape-model nprobe outside nlist"
-        );
-        assert!(row_bytes > 0, "shape-model row bytes must be nonzero");
-        assert!(clients > 0, "shape-model clients must be nonzero");
-
-        let mut classes = self.source_classes.clone();
-        let rows_per_cluster = vectors as f64 / nlist as f64;
-        let group_count = (nlist as f64 / self.clusters_per_coarse_get).ceil();
-        let coarse_ops = distinct_group_coverage(group_count, nprobe);
-        let expanded_clusters = (coarse_ops * self.clusters_per_coarse_get)
-            .round()
-            .min(nlist as f64);
-        let coarse_bytes = expanded_clusters
-            * rows_per_cluster
-            * (row_bytes as f64 + self.coarse_overhead_per_row);
-        let rerank_bytes = rows_per_cluster * (dims as f64 * 4.0 + self.rerank_overhead_per_row);
-        let cluster_ops = coarse_ops + self.rerank_get_ops;
-        let cluster_bytes = coarse_bytes + rerank_bytes;
-        let cluster = classes
-            .get_mut("cluster")
-            .expect("shape source omitted cluster counters");
-        cluster.get_ops = cluster_ops;
-        cluster.get_bytes = cluster_bytes;
-
-        let stages = self
-            .source_stages
-            .iter()
-            .scan(0usize, |cluster_stage, stage| {
-                let mut ops = 0.0;
-                let mut bytes = 0.0;
-                for (class, totals) in &stage.classes {
-                    if class == "cluster" {
-                        match *cluster_stage {
-                            0 => {
-                                ops += coarse_ops;
-                                bytes += coarse_bytes;
-                            }
-                            1 => {
-                                ops += self.rerank_get_ops;
-                                bytes += rerank_bytes;
-                            }
-                            _ => panic!("shape template contains more than two cluster stages"),
-                        }
-                        *cluster_stage += 1;
-                    } else {
-                        ops += totals.ops as f64;
-                        bytes += totals.bytes as f64;
-                    }
-                }
-                Some(ModeledStage { ops, bytes })
-            })
-            .collect();
-        ModelInput {
-            classes,
-            stages,
-            clients,
-        }
-    }
-
-    fn predict_target(
-        &self,
-        vectors: usize,
-        dims: usize,
-        nlist: usize,
-        nprobe: usize,
-        row_bytes: usize,
-        clients: usize,
-    ) -> ModelInput {
-        assert!(vectors > 0, "shape-model vectors must be nonzero");
-        assert!(dims > 0, "shape-model dims must be nonzero");
-        assert!(nlist > 0, "shape-model nlist must be nonzero");
-        assert!(
-            nprobe > 0 && nprobe <= nlist,
-            "shape-model nprobe outside nlist"
-        );
-        assert!(row_bytes > 0, "shape-model row bytes must be nonzero");
-        assert!(clients > 0, "shape-model clients must be nonzero");
-        let mut classes = self.source_classes.clone();
-        let cluster_ops = nprobe as f64;
-        let cluster_bytes = cluster_ops * vectors as f64 / nlist as f64 * row_bytes as f64
-            + cluster_ops * self.target_overhead_per_probe;
-        let cluster = classes
-            .get_mut("cluster")
-            .expect("shape source omitted cluster counters");
-        cluster.get_ops = cluster_ops;
-        cluster.get_bytes = cluster_bytes;
-
-        let source_cluster = self.source_classes["cluster"];
-        let stages = self
-            .source_stages
-            .iter()
-            .map(|stage| {
-                let mut ops = 0.0;
-                let mut bytes = 0.0;
-                for (class, totals) in &stage.classes {
-                    if class == "cluster" {
-                        ops += totals.ops as f64 / source_cluster.get_ops * cluster_ops;
-                        bytes += totals.bytes as f64 / source_cluster.get_bytes * cluster_bytes;
-                    } else {
-                        ops += totals.ops as f64;
-                        bytes += totals.bytes as f64;
-                    }
-                }
-                ModeledStage { ops, bytes }
-            })
-            .collect();
-        ModelInput {
-            classes,
-            stages,
-            clients,
-        }
-    }
-}
-
-/// Predict throughput, latency, and cost from measured stages and a profile.
+/// Fit the shape-scaling constants from one instrumented small-shape repeat.
 ///
-/// For each stage `i`, latency is
-/// `ttfb + stage_bytes / min(per_conn_MBps * stage_ops, aggregate_share)`.
-/// Service time adds profile CPU time to all stages. Closed-loop throughput is
-/// `clients / service_time`; bandwidth throughput is
-/// `aggregate_MBps * nodes / bytes_per_query`; predicted QPS is their minimum.
-/// Mean latency follows Little's closed-loop identity `clients / QPS`. p50 uses
-/// p50 TTFB and p99 uses p99 TTFB with the same transfer term. Cost adds GET,
-/// PUT, egress, and amortized node cost per query exactly as specified in the
-/// Phase 3 plan.
-#[must_use]
-pub fn predict(input: &ModelInput, profile: &Profile) -> Prediction {
-    assert!(input.clients > 0, "prediction clients must be nonzero");
-    assert!(
-        !input.stages.is_empty(),
-        "prediction requires at least one stage"
+/// This is the calibration seam that keeps `CalibratedShapeModel` honest: it
+/// consumes the test-tree depth/counting instrumentation and produces the
+/// serializable constants the library model scales from.
+pub fn fit_shape_model(
+    source: &DatasetSpec,
+    source_nprobe: usize,
+    repeat: &RepeatCounters,
+) -> CalibratedShapeModel {
+    let source_classes = modeled_classes(&repeat.classes);
+    let cluster = source_classes
+        .get("cluster")
+        .copied()
+        .expect("shape source omitted cluster counters");
+    assert!(cluster.get_ops > 0.0, "shape source made no cluster GETs");
+    let source_stages = DepthTracker::stages(
+        &repeat.spans,
+        &[SpanKind::Get, SpanKind::Head],
+        Some(repeat.response_cutoff_us),
     );
-    let aggregate_mbps = profile.storage.agg_mbps_per_node * profile.node.count as f64;
-    let mut stage_transfer_ms = 0.0;
-    for stage in &input.stages {
-        assert!(stage.ops > 0.0, "prediction stage ops must be positive");
-        assert!(
-            stage.bytes >= 0.0,
-            "prediction stage bytes must be nonnegative"
-        );
-        let available_mbps = (profile.storage.per_conn_mbps * stage.ops).min(aggregate_mbps);
-        stage_transfer_ms += stage.bytes / BYTES_PER_MB / available_mbps * 1_000.0;
-    }
-    let p50_ms = profile.node.cpu_ms_per_query
-        + input.stages.len() as f64 * profile.storage.ttfb_ms.p50
-        + stage_transfer_ms;
-    let p99_ms = profile.node.cpu_ms_per_query
-        + input.stages.len() as f64 * profile.storage.ttfb_ms.p99
-        + stage_transfer_ms;
-    let bytes_per_query = input
-        .classes
-        .values()
-        .map(|stats| stats.get_bytes)
-        .sum::<f64>();
-    let gets_per_query = input
-        .classes
-        .values()
-        .map(|stats| stats.get_ops)
-        .sum::<f64>();
     assert!(
-        bytes_per_query > 0.0,
-        "prediction requires positive GET bytes"
+        !source_stages.is_empty(),
+        "shape source produced no GET stages"
     );
-    let qps_bw_cap = aggregate_mbps / (bytes_per_query / BYTES_PER_MB);
-    let qps_closed = input.clients as f64 / (p50_ms / 1_000.0);
-    let qps = qps_bw_cap.min(qps_closed);
+    let cluster_stages = source_stages
+        .iter()
+        .filter_map(|stage| stage.classes.get("cluster"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cluster_stages.len(),
+        2,
+        "shape source must expose coarse and rerank cluster stages"
+    );
+    let rows_per_cluster = source.vectors as f64 / source.nlist as f64;
+    let expanded_clusters =
+        zeppelin::sizing::model::grouped_cluster_coverage(source.nlist, source_nprobe);
+    let coarse = cluster_stages[0];
+    let rerank = cluster_stages[1];
+    let coarse_payload = expanded_clusters * rows_per_cluster * source.dims as f64;
     assert!(
-        qps.is_finite() && qps > 0.0,
-        "prediction produced invalid QPS"
+        coarse.bytes as f64 >= coarse_payload,
+        "coarse stage bytes are below the closed-form row payload"
     );
-    let mean_latency_ms = input.clients as f64 / qps * 1_000.0;
-    let request_cost = input
-        .classes
-        .values()
-        .map(|stats| {
-            stats.get_ops * profile.storage.price.get_per_req
-                + stats.put_ops * profile.storage.price.put_per_req
-                + stats.get_bytes / BYTES_PER_GIB * profile.storage.price.egress_per_gb
-        })
-        .sum::<f64>();
-    let node_cost = profile.node.count as f64 * profile.node.price_hr / (qps * 3_600.0);
-    Prediction {
-        bytes_per_query,
-        gets_per_query,
-        service_time_ms: p50_ms,
-        qps_bw_cap,
-        qps_closed,
-        qps,
-        mean_latency_ms,
-        p50_ms,
-        p99_ms,
-        request_cost,
-        node_cost,
-        total_cost: request_cost + node_cost,
-        bottleneck: if qps_bw_cap <= qps_closed {
-            Bottleneck::Bandwidth
-        } else {
-            Bottleneck::ClosedLoop
-        },
+    let coarse_overhead_per_row =
+        coarse.bytes as f64 / expanded_clusters / rows_per_cluster - source.dims as f64;
+    let rerank_payload = rows_per_cluster * source.dims as f64 * 4.0;
+    assert!(
+        rerank.bytes as f64 >= rerank_payload,
+        "rerank stage bytes are below one full-precision cluster"
+    );
+    let rerank_overhead_per_row = (rerank.bytes as f64 - rerank_payload) / rows_per_cluster;
+    let target_payload = source_nprobe as f64 * rows_per_cluster * source.dims as f64;
+    let target_overhead_per_probe = (cluster.get_bytes - target_payload) / source_nprobe as f64;
+    let clusters_per_coarse_get = expanded_clusters / coarse.ops as f64;
+    let rerank_get_ops = rerank.ops as f64;
+    CalibratedShapeModel {
+        fitted_from: format!(
+            "{}x{} nlist={} nprobe={}",
+            source.vectors, source.dims, source.nlist, source_nprobe
+        ),
+        snapshot_date: chrono::Utc::now().date_naive().to_string(),
+        source_classes,
+        source_stages: source_stages
+            .iter()
+            .map(|stage| CalibratedStage {
+                classes: stage
+                    .classes
+                    .iter()
+                    .map(|(class, totals)| {
+                        (
+                            class.clone(),
+                            CalibratedStageClass {
+                                ops: totals.ops as f64,
+                                bytes: totals.bytes as f64,
+                            },
+                        )
+                    })
+                    .collect(),
+            })
+            .collect(),
+        coarse_overhead_per_row,
+        rerank_overhead_per_row,
+        clusters_per_coarse_get,
+        rerank_get_ops,
+        target_overhead_per_probe,
     }
 }
 
@@ -444,7 +215,7 @@ pub fn model_input_from_repeat(repeat: &RepeatCounters, clients: usize) -> Model
     }
 }
 
-fn validate_model(model: &ShapeModel, medium: &ScenarioOutcome) -> ValidationSummary {
+fn validate_model(model: &CalibratedShapeModel, medium: &ScenarioOutcome) -> ValidationSummary {
     let gt_a = load_gt_a();
     let gt_b = load_gt_b();
     assert_eq!(gt_a.name, "dbpedia100k-accepted-line");
@@ -617,7 +388,7 @@ fn metric_error(predicted: f64, actual: f64) -> f64 {
 }
 
 fn render_whatif(
-    model: &ShapeModel,
+    model: &CalibratedShapeModel,
     profiles: &[Profile],
     validation: &ValidationSummary,
 ) -> String {
@@ -669,7 +440,7 @@ fn render_whatif(
 
 fn render_profile_table(
     out: &mut String,
-    model: &ShapeModel,
+    model: &CalibratedShapeModel,
     profile: &Profile,
     target: &WhatIfProfile,
 ) {
@@ -717,17 +488,6 @@ fn render_profile_table(
     }
 }
 
-fn grouped_cluster_coverage(nlist: usize, nprobe: usize) -> f64 {
-    const MAX_CLUSTERS_PER_OBJECT: f64 = 3.0;
-    let miss_probability = 1.0 - MAX_CLUSTERS_PER_OBJECT / nlist as f64;
-    (nlist as f64 * (1.0 - miss_probability.powi(nprobe as i32))).round()
-}
-
-fn distinct_group_coverage(group_count: f64, nprobe: usize) -> f64 {
-    let miss_probability = 1.0 - 1.0 / group_count;
-    (group_count * (1.0 - miss_probability.powi(nprobe as i32))).round()
-}
-
 fn modeled_classes(classes: &BTreeMap<String, ClassStats>) -> BTreeMap<String, ModeledClassStats> {
     classes
         .iter()
@@ -753,30 +513,6 @@ fn relative_error(predicted: f64, actual: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bandwidth_cap_inflates_closed_loop_mean_latency() {
-        let profile = load_profile("minio-local-docker");
-        let input = ModelInput {
-            classes: BTreeMap::from([(
-                "cluster".to_string(),
-                ModeledClassStats {
-                    get_ops: 1.0,
-                    get_bytes: 410.0 * BYTES_PER_MB,
-                    ..ModeledClassStats::default()
-                },
-            )]),
-            stages: vec![ModeledStage {
-                ops: 1.0,
-                bytes: 410.0 * BYTES_PER_MB,
-            }],
-            clients: 8,
-        };
-        let prediction = predict(&input, &profile);
-        assert_eq!(prediction.bottleneck, Bottleneck::Bandwidth);
-        assert!((prediction.qps - 1.0).abs() < 1e-9);
-        assert!((prediction.mean_latency_ms - 8_000.0).abs() < 1e-9);
-    }
 
     #[test]
     fn fixture_schema_and_closed_loop_identity_are_pinned() {
