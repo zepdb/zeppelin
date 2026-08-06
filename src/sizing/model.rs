@@ -155,6 +155,16 @@ pub struct CalibratedShapeModel {
 }
 
 impl CalibratedShapeModel {
+    /// Loads the frozen calibration snapshot compiled into the library.
+    ///
+    /// The snapshot is minted by the ignored MinIO `perf_predict` run and
+    /// carries its capture date and source shape. A malformed checked-in
+    /// snapshot is a build artifact error, so parsing fails loudly.
+    #[must_use]
+    pub fn embedded() -> Self {
+        Self::from_toml_str(include_str!("data/shape_model.toml"))
+    }
+
     /// Parses a snapshot from strict TOML text.
     ///
     /// # Panics
@@ -550,6 +560,16 @@ closed_loop_clients = 8
         assert!(
             (reparsed.target_overhead_per_probe - model.target_overhead_per_probe).abs() < 1e-12
         );
+    }
+
+    #[test]
+    fn embedded_snapshot_retains_measured_minio_provenance() {
+        let model = CalibratedShapeModel::embedded();
+        assert_eq!(model.fitted_from, "4096x64 nlist=8 nprobe=4");
+        assert_eq!(model.snapshot_date, "2026-07-28");
+        assert_eq!(model.source_classes["cluster"].get_ops, 4.0);
+        assert_eq!(model.source_classes["cluster"].get_bytes, 429_027.0);
+        assert_eq!(model.source_stages.len(), 3);
     }
 
     #[test]

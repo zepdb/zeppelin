@@ -10,6 +10,8 @@
 //!   scales fitted constants to arbitrary dataset shapes.
 //! - [`catalog`] — the embedded, snapshot-dated cloud hardware and
 //!   object-store pricing dataset the advisor ranks candidates from.
+//! - [`advisor`] — deterministic hardware enumeration, constraint filtering,
+//!   prediction, monthly pricing, and ranking for one deployment shape.
 //! - [`profiles`] — strict TOML profiles describing object-store behavior,
 //!   pricing, node fleets, and client populations.
 //! - [`lognormal`] — the deterministic lognormal TTFB distribution shared
@@ -22,6 +24,7 @@
 //! there, against real MinIO measurements, and its tolerances gate any
 //! change to the math here.
 
+pub mod advisor;
 pub mod catalog;
 pub mod lognormal;
 pub mod model;

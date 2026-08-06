@@ -1,0 +1,93 @@
+# Frozen by the successful MinIO perf-contract run
+# target/perf-contract/run-1785252344-983455000-39373 at git
+# 7997334635a1012b85cc35cbd4e794beb275eb6b. The held-out shape gate and
+# GT-A/GT-B prediction gates passed in that run. Refresh only by running the
+# ignored `perf_predict` test against MinIO; never hand-tune these constants.
+fitted_from = "4096x64 nlist=8 nprobe=4"
+snapshot_date = "2026-07-28"
+coarse_overhead_per_row = 17.015625
+rerank_overhead_per_row = 14.833984375
+clusters_per_coarse_get = 2.3333333333333335
+rerank_get_ops = 1.0
+target_overhead_per_probe = 74488.75
+
+[source_classes.attrs]
+get_ops = 0.0
+get_bytes = 0.0
+put_ops = 0.0
+put_bytes = 0.0
+
+[source_classes.bitmap]
+get_ops = 0.0
+get_bytes = 0.0
+put_ops = 0.0
+put_bytes = 0.0
+
+[source_classes.bootstrap]
+get_ops = 0.0
+get_bytes = 0.0
+put_ops = 0.0
+put_bytes = 0.0
+
+[source_classes.centroids]
+get_ops = 0.0
+get_bytes = 0.0
+put_ops = 0.0
+put_bytes = 0.0
+
+[source_classes.cluster]
+get_ops = 4.0
+get_bytes = 429027.0
+put_ops = 0.0
+put_bytes = 0.0
+
+[source_classes.fts]
+get_ops = 0.0
+get_bytes = 0.0
+put_ops = 0.0
+put_bytes = 0.0
+
+[source_classes.manifest]
+get_ops = 1.0
+get_bytes = 0.0
+put_ops = 0.0
+put_bytes = 0.0
+
+[source_classes.other]
+get_ops = 0.0
+get_bytes = 0.0
+put_ops = 0.0
+put_bytes = 0.0
+
+[source_classes.sketch]
+get_ops = 0.0
+get_bytes = 0.0
+put_ops = 0.0
+put_bytes = 0.0
+
+[source_classes.sq]
+get_ops = 0.0
+get_bytes = 0.0
+put_ops = 0.0
+put_bytes = 0.0
+
+[source_classes.wal]
+get_ops = 0.0
+get_bytes = 0.0
+put_ops = 0.0
+put_bytes = 0.0
+
+[[source_stages]]
+[source_stages.classes.manifest]
+ops = 1.0
+bytes = 0.0
+
+[[source_stages]]
+[source_stages.classes.cluster]
+ops = 3.0
+bytes = 290360.0
+
+[[source_stages]]
+[source_stages.classes.cluster]
+ops = 1.0
+bytes = 138667.0
