@@ -113,9 +113,7 @@ impl TestHarness {
         };
         let bucket = match temp_dir.as_ref() {
             Some(dir) => dir.path().to_string_lossy().into_owned(),
-            None => {
-                std::env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "stormcrow-test".to_string())
-            }
+            None => std::env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "zeppelin-test".to_string()),
         };
 
         let store = match backend.as_str() {

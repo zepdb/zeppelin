@@ -64,11 +64,11 @@ jobs:
           curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
           chmod +x /usr/local/bin/mc
           mc alias set local http://localhost:9000 minioadmin minioadmin
-          mc mb local/stormcrow-test
+          mc mb local/zeppelin-test
       - name: Run integration tests
         env:
           TEST_BACKEND: minio
-          TEST_S3_BUCKET: stormcrow-test
+          TEST_S3_BUCKET: zeppelin-test
           MINIO_ENDPOINT: http://localhost:9000
           MINIO_ACCESS_KEY: minioadmin
           MINIO_SECRET_KEY: minioadmin
@@ -81,7 +81,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       RUSTFLAGS: -C link-arg=-Wl,--threads=1
       TEST_BACKEND: minio
-      TEST_S3_BUCKET: stormcrow-test
+      TEST_S3_BUCKET: zeppelin-test
       MINIO_ENDPOINT: http://localhost:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
@@ -110,7 +110,7 @@ jobs:
           curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
           chmod +x /usr/local/bin/mc
           mc alias set local http://localhost:9000 minioadmin minioadmin
-          mc mb local/stormcrow-test
+          mc mb local/zeppelin-test
       - name: Gate object-store performance contracts
         # --release is required: the security latency budgets are
         # release-calibrated and an unoptimized build misses them by an order
@@ -165,11 +165,11 @@ jobs:
           curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
           chmod +x /usr/local/bin/mc
           mc alias set local http://localhost:9000 minioadmin minioadmin
-          mc mb local/stormcrow-test
+          mc mb local/zeppelin-test
       - name: Generate coverage
         env:
           TEST_BACKEND: minio
-          TEST_S3_BUCKET: stormcrow-test
+          TEST_S3_BUCKET: zeppelin-test
           MINIO_ENDPOINT: http://localhost:9000
           MINIO_ACCESS_KEY: minioadmin
           MINIO_SECRET_KEY: minioadmin

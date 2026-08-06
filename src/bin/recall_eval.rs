@@ -1338,7 +1338,7 @@ fn minio_storage_config() -> Result<StorageConfig> {
 
     Ok(StorageConfig {
         backend: StorageBackend::S3,
-        bucket: env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "stormcrow-test".to_string()),
+        bucket: env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "zeppelin-test".to_string()),
         s3_region: Some("us-east-1".to_string()),
         s3_endpoint: Some(
             env::var("MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string()),

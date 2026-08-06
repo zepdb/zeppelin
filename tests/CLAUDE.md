@@ -23,7 +23,7 @@ Bringing up MinIO without Docker:
 MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
   minio server /tmp/miniodata --address 127.0.0.1:9000 &
 mc alias set zeptest http://127.0.0.1:9000 minioadmin minioadmin
-mc mb --ignore-existing zeptest/stormcrow-test
+mc mb --ignore-existing zeptest/zeppelin-test
 ```
 
 Signed-license startup tests additionally need an isolated

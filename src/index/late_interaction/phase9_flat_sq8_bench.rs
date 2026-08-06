@@ -1153,7 +1153,7 @@ fn counting_minio_store() -> BenchResult<CountingStoreSetup> {
     use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
     use object_store::ClientOptions;
 
-    let bucket = env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "stormcrow-test".to_string());
+    let bucket = env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "zeppelin-test".to_string());
     let endpoint =
         env::var("MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string());
     let access_key = env::var("MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string());
