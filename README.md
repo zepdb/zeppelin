@@ -25,6 +25,7 @@
 - **Namespace forks** -- Disabled-by-default, licensed copy-on-write branching ([operator guide](docs/branching-operations.md)); fork only, no merge
 - **Strong & eventual consistency** -- Choose per-query (see [Consistency semantics](#consistency-semantics))
 - **Object storage** -- S3, MinIO, and S3-compatible backends. GCS and Azure planned
+- **Sizing advisor** -- Ranked hardware recommendations and validated, tuned configs from an embedded cloud pricing catalog (see [Sizing advisor](#sizing-advisor))
 
 ## Performance
 
@@ -134,6 +135,42 @@ curl -s -X DELETE http://localhost:8080/v1/namespaces/<ns>/vectors \
   -H "Content-Type: application/json" \
   -d '{"ids": ["vec-1"]}' | jq
 ```
+
+## Sizing advisor
+
+`zeppelin_advisor` turns a data shape (vectors, dims, quantization, filters,
+FTS) into ranked hardware options and a production-ready config. It embeds a
+snapshot-dated cloud pricing catalog (AWS/GCP/Azure instances, block storage,
+object storage) and a cost/latency model calibrated against measured
+perf-contract runs. Predictions are calibrated on loopback MinIO and
+S3-intra-region profiles; non-AWS rows are extrapolated and labeled as such
+in the output banner.
+
+```bash
+# Rank instance / cache / nprobe combinations for your data shape
+cargo run --release --bin zeppelin_advisor -- plan \
+  --cloud aws --region us-east-1 --vectors 21000000 --dims 768 --replicas 3
+
+# Inspect the embedded pricing snapshot
+cargo run --release --bin zeppelin_advisor -- catalog --cloud aws --region us-east-1
+
+# Emit a tuned zeppelin.toml for the selected hardware
+cargo run --release --bin zeppelin_advisor -- emit-config \
+  --cloud aws --region us-east-1 --instance i4i.2xlarge --replicas 3 \
+  --vectors 21000000 --dims 768 --quantization rabitq-2bit --nprobe 256 \
+  --bucket my-bucket --security-mode enforced --out zeppelin.toml
+```
+
+`plan` ranks viable candidates by monthly cost with predicted QPS, p50/p99,
+$/query, and the per-row bottleneck, and lists every rejected row with its
+reason. `emit-config` renders a fully commented config, validates it through
+the real config loader before writing anything, recomputes the GC safety
+floor from the values it emits, and generates a fresh random HMAC key in
+enforced mode (move it to a secret manager before rollout). The knob-by-knob
+tuning rationale is documented in
+[`tasks/config_tuning.md`](tasks/config_tuning.md); refresh the pricing
+snapshot with
+[`scripts/refresh_cloud_catalog.py`](scripts/refresh_cloud_catalog.py).
 
 ## API Reference
 
