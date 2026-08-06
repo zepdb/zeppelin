@@ -279,7 +279,7 @@ pub fn plan(
             continue;
         };
         for &quantization in &request.quantizations {
-            let storage_gb = object_storage_gb(request.shape, quantization);
+            let storage_gb = estimated_object_storage_gb(request.shape, quantization);
             let mut caches = cache_plans(instance, &cloud_catalog.block_storage, storage_gb);
             caches.sort_by_key(CacheDevicePlan::label);
             for cache in caches {
@@ -485,7 +485,6 @@ fn candidate_profile(
     instance_price_hr: f64,
     store: &ObjectStoreSku,
 ) -> Profile {
-    let nic_mbps = instance.network_baseline_gbps * GBPS_TO_MBPS;
     Profile {
         name: format!(
             "advisor-{}-{}-{}",
@@ -496,7 +495,7 @@ fn candidate_profile(
         storage: StorageProfile {
             ttfb_ms: store.ttfb_ms,
             per_conn_mbps: store.per_conn_mbps,
-            agg_mbps_per_node: nic_mbps.min(SERVICE_AGGREGATE_CEILING_MBPS),
+            agg_mbps_per_node: node_aggregate_mbps(instance),
             price: StoragePrice {
                 get_per_req: store.get_per_req(),
                 put_per_req: store.put_per_req(),
@@ -517,7 +516,14 @@ fn candidate_profile(
     }
 }
 
-fn object_storage_gb(shape: DataShape, quantization: Quantization) -> f64 {
+/// Estimates source-of-truth storage in decimal GB for one data shape.
+///
+/// The estimate includes the chosen coarse row, a full-precision rerank row,
+/// optional FTS and bitmap sidecars, and the advisor's 15% immutable-artifact
+/// slack. It is shared with the config tuner so cache sizing cannot drift from
+/// plan pricing.
+#[must_use]
+pub fn estimated_object_storage_gb(shape: DataShape, quantization: Quantization) -> f64 {
     let mut bytes = shape.vectors as f64
         * (row_bytes(quantization, shape.dims) as f64 + (shape.dims * 4) as f64);
     if shape.fts {
@@ -528,6 +534,13 @@ fn object_storage_gb(shape: DataShape, quantization: Quantization) -> f64 {
     }
     bytes *= 1.15;
     bytes / GB_BYTES
+}
+
+/// Converts an instance's baseline network rating into the aggregate
+/// per-node storage bandwidth used by the advisor profile.
+#[must_use]
+pub fn node_aggregate_mbps(instance: &InstanceSku) -> f64 {
+    (instance.network_baseline_gbps * GBPS_TO_MBPS).min(SERVICE_AGGREGATE_CEILING_MBPS)
 }
 
 fn cache_plans(

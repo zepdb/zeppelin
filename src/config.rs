@@ -632,10 +632,7 @@ impl FromStr for Config {
     type Err = ZeppelinError;
 
     fn from_str(source: &str) -> Result<Self> {
-        let mut config = Self::parse_explicit_security(source)?;
-        config.resolve_query_config()?;
-        config.validate()?;
-        Ok(config)
+        Self::load_from_str(source)
     }
 }
 
@@ -1846,6 +1843,30 @@ mod tests {
             absent.effective_rerank_coalesce_gap_bytes(),
             DEFAULT_RERANK_COALESCE_GAP_BYTES
         );
+    }
+
+    /// Pins the generator seam to full validation without environment input.
+    #[test]
+    fn load_from_str_resolves_and_validates_without_environment_overrides() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+        std::env::set_var("ZEPPELIN_PORT", "9090");
+        let config = Config::load_from_str(
+            r#"
+            [server]
+            port = 8081
+
+            [query]
+            cost_latency_profile = "low_latency"
+
+            [security]
+            mode = "open_unsafe"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.server.port, 8081);
+        assert_eq!(config.effective_rerank_coalesce_gap_bytes(), 128 * 1024);
+        assert!(config.query.cost_latency_profile.is_none());
     }
 
     /// Pins each named query profile to its intended concrete byte gap.
@@ -3293,6 +3314,26 @@ impl CpuBudget {
 }
 
 impl Config {
+    /// Parses and validates one complete TOML document without environment
+    /// overrides.
+    ///
+    /// This is the in-memory counterpart to [`Self::load`]. It enforces the
+    /// same explicit `[security]` contract, resolves mutually exclusive query
+    /// choices, and runs every cross-field validator, but deliberately does
+    /// not consult process environment variables. Offline generators use this
+    /// seam to prove the bytes they are about to write are valid on their own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Config`] when TOML parsing, explicit security,
+    /// query resolution, or validation fails.
+    pub fn load_from_str(source: &str) -> Result<Self> {
+        let mut config = Self::parse_explicit_security(source)?;
+        config.resolve_query_config()?;
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Loads, resolves, and validates the process configuration before startup.
     ///
     /// The path must name a TOML document with an explicit `[security]` section

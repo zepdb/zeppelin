@@ -11,7 +11,11 @@ use std::process::ExitCode;
 use serde::Serialize;
 use zeppelin::sizing::advisor::{plan_embedded, ArchFilter, DataShape, PlanReport, PlanRequest};
 use zeppelin::sizing::catalog::{Arch, Catalog, Cloud};
+use zeppelin::sizing::emit::{render_and_validate, write_validated_config};
 use zeppelin::sizing::rows::Quantization;
+use zeppelin::sizing::tuner::{
+    tune, CacheSelection, SafetyIntervals, SecurityChoice, TuningRequest,
+};
 
 const PLAN_FLAGS: &[&str] = &[
     "--cloud",
@@ -32,6 +36,20 @@ const PLAN_FLAGS: &[&str] = &[
     "--format",
 ];
 const CATALOG_FLAGS: &[&str] = &["--cloud", "--region"];
+const EMIT_FLAGS: &[&str] = &[
+    "--cloud",
+    "--region",
+    "--instance",
+    "--replicas",
+    "--vectors",
+    "--dims",
+    "--quantization",
+    "--nprobe",
+    "--bucket",
+    "--cache-device",
+    "--security-mode",
+    "--out",
+];
 const PREDICTION_BANNER: &str = "PREDICTION — calibrated on minio-local + s3-intra-region (GT-A ≤10%, GT-B ≤20%); non-AWS rows (EXTRAPOLATED)";
 
 const USAGE: &str = "\
@@ -47,6 +65,12 @@ USAGE:
       [--clients <N>] [--top <N>] [--format <table|json>]
 
   zeppelin_advisor catalog [--cloud <aws|gcp|azure>] [--region <region>]
+
+  zeppelin_advisor emit-config --cloud <aws|gcp|azure> --region <region>
+      --instance <sku> --replicas <N> --vectors <N> --dims <N>
+      --quantization <rabitq-2bit|sq8|f32> --nprobe <N> --bucket <name>
+      [--cache-device <nvme|ebs:tier:GB>]
+      [--security-mode <enforced|open_unsafe>] --out <zeppelin.toml> [--force]
 
 EXIT CODES:
   0  command completed
@@ -85,9 +109,100 @@ fn run() -> Result<RunOutcome, String> {
     match subcommand.as_str() {
         "plan" => run_plan(&arguments[1..]),
         "catalog" => run_catalog(&arguments[1..]),
-        "emit-config" => Err("`emit-config` lands in Phase 5 and is not available yet".to_string()),
+        "emit-config" => run_emit_config(&arguments[1..]),
         other => Err(format!("unknown subcommand {other:?}")),
     }
+}
+
+fn run_emit_config(arguments: &[String]) -> Result<RunOutcome, String> {
+    let parsed = parse_emit_flags(arguments)?;
+    let flags = &parsed.values;
+    let cloud = parse_cloud(required(flags, "--cloud")?)?;
+    let region = required(flags, "--region")?;
+    let instance_name = required(flags, "--instance")?;
+    let replicas = parse_usize("--replicas", required(flags, "--replicas")?)?;
+    let vectors = parse_usize("--vectors", required(flags, "--vectors")?)?;
+    let dims = parse_usize("--dims", required(flags, "--dims")?)?;
+    let quantization = parse_emit_quantization(required(flags, "--quantization")?)?;
+    let nprobe = parse_usize("--nprobe", required(flags, "--nprobe")?)?;
+    let bucket = required(flags, "--bucket")?;
+    let output_path = required(flags, "--out")?;
+    let security = parse_security(optional(flags, "--security-mode", "enforced"))?;
+
+    let catalog = Catalog::embedded();
+    catalog
+        .object_store_for(cloud, region)
+        .ok_or_else(|| format!("catalog has no {} object store in {region}", cloud.name()))?;
+    let instance = catalog
+        .instance(cloud, instance_name)
+        .ok_or_else(|| format!("catalog has no {} instance {instance_name:?}", cloud.name()))?;
+    if instance.price_in(region).is_none() {
+        return Err(format!(
+            "instance {instance_name:?} has no catalog price in {region}"
+        ));
+    }
+    let shape = DataShape {
+        vectors,
+        dims,
+        filters: false,
+        fts: false,
+    };
+    let cache = resolve_emit_cache(
+        flags.get("--cache-device").map(String::as_str),
+        &catalog,
+        cloud,
+        instance,
+        shape,
+        quantization,
+    )?;
+
+    let report = plan_embedded(&PlanRequest {
+        cloud,
+        region: region.to_string(),
+        shape,
+        replicas,
+        min_qps: None,
+        max_p99_ms: None,
+        max_monthly_usd: None,
+        arch: ArchFilter::Any,
+        clients: 8,
+        quantizations: vec![quantization],
+        nprobes: vec![nprobe],
+    })
+    .map_err(|error| error.to_string())?;
+    let candidate = report
+        .candidates
+        .iter()
+        .find(|candidate| candidate.instance.name == instance.name)
+        .ok_or_else(|| {
+            format!("no calibrated prediction for {instance_name:?} at nprobe {nprobe}")
+        })?;
+    let knobs = tune(&TuningRequest {
+        cloud,
+        region,
+        instance,
+        replicas,
+        bucket,
+        shape,
+        quantization,
+        nprobe,
+        cache,
+        predicted_p99_ms: candidate.prediction.p99_ms,
+        security,
+        safety: SafetyIntervals::default(),
+    })
+    .map_err(|error| error.to_string())?;
+    let rendered = render_and_validate(&knobs).map_err(|error| error.to_string())?;
+    write_validated_config(std::path::Path::new(output_path), &rendered, parsed.force)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "wrote validated config {} (instance {}, canonical nlist {}, GC floor {}s)",
+        output_path,
+        instance.name,
+        knobs.nlist(),
+        knobs.gc_horizon_floor_secs()
+    );
+    Ok(RunOutcome::Success)
 }
 
 fn run_plan(arguments: &[String]) -> Result<RunOutcome, String> {
@@ -378,11 +493,51 @@ fn parse_flags(arguments: &[String], allowed: &[&str]) -> Result<BTreeMap<String
         if !allowed.contains(&flag.as_str()) {
             return Err(format!("unknown flag {flag:?}"));
         }
+        if pair[1].starts_with("--") {
+            return Err(format!("flag {flag:?} is missing its value"));
+        }
         if parsed.insert(flag.clone(), pair[1].clone()).is_some() {
             return Err(format!("duplicate flag {flag:?}"));
         }
     }
     Ok(parsed)
+}
+
+struct EmitFlags {
+    values: BTreeMap<String, String>,
+    force: bool,
+}
+
+fn parse_emit_flags(arguments: &[String]) -> Result<EmitFlags, String> {
+    let mut values = BTreeMap::new();
+    let mut force = false;
+    let mut index = 0usize;
+    while index < arguments.len() {
+        let flag = &arguments[index];
+        if flag == "--force" {
+            if force {
+                return Err("duplicate flag \"--force\"".to_string());
+            }
+            force = true;
+            index += 1;
+            continue;
+        }
+        if !EMIT_FLAGS.contains(&flag.as_str()) {
+            return Err(format!("unknown flag {flag:?}"));
+        }
+        let value_index = index + 1;
+        let Some(value) = arguments.get(value_index) else {
+            return Err(format!("flag {flag:?} is missing its value"));
+        };
+        if value.starts_with("--") {
+            return Err(format!("flag {flag:?} is missing its value"));
+        }
+        if values.insert(flag.clone(), value.clone()).is_some() {
+            return Err(format!("duplicate flag {flag:?}"));
+        }
+        index += 2;
+    }
+    Ok(EmitFlags { values, force })
 }
 
 fn required<'a>(flags: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, String> {
@@ -443,6 +598,90 @@ fn parse_quantizations(value: &str) -> Result<Vec<Quantization>, String> {
             "invalid --quantization {value:?}; expected rabitq-2bit, sq8, f32, or all"
         )),
     }
+}
+
+fn parse_emit_quantization(value: &str) -> Result<Quantization, String> {
+    match value {
+        "rabitq-2bit" => Ok(Quantization::RabitqTwoBit),
+        "sq8" => Ok(Quantization::Sq8),
+        "f32" => Ok(Quantization::F32),
+        _ => Err(format!(
+            "invalid --quantization {value:?}; emit-config expects rabitq-2bit, sq8, or f32"
+        )),
+    }
+}
+
+fn parse_security(value: &str) -> Result<SecurityChoice, String> {
+    match value {
+        "enforced" => Ok(SecurityChoice::Enforced),
+        "open_unsafe" => Ok(SecurityChoice::OpenUnsafe),
+        _ => Err(format!(
+            "invalid --security-mode {value:?}; expected enforced or open_unsafe"
+        )),
+    }
+}
+
+fn resolve_emit_cache(
+    value: Option<&str>,
+    catalog: &Catalog,
+    cloud: Cloud,
+    instance: &zeppelin::sizing::catalog::InstanceSku,
+    shape: DataShape,
+    quantization: Quantization,
+) -> Result<CacheSelection, String> {
+    if value.is_none() && instance.nvme_gb > 0 {
+        return Ok(CacheSelection::Nvme {
+            capacity_gb: instance.nvme_gb,
+        });
+    }
+    if value == Some("nvme") {
+        if instance.nvme_gb == 0 {
+            return Err(format!(
+                "instance {} has no local NVMe in the catalog",
+                instance.name
+            ));
+        }
+        return Ok(CacheSelection::Nvme {
+            capacity_gb: instance.nvme_gb,
+        });
+    }
+
+    let default_tier = match cloud {
+        Cloud::Aws => "gp3",
+        Cloud::Gcp => "hyperdisk-balanced",
+        Cloud::Azure => "premium-ssd-v2",
+    };
+    let default_volume_gb =
+        (zeppelin::sizing::advisor::estimated_object_storage_gb(shape, quantization) * 1.20).ceil()
+            as u64;
+    let (tier, volume_gb) = match value {
+        None => (default_tier, default_volume_gb.max(1)),
+        Some(specification) => {
+            let parts = specification.split(':').collect::<Vec<_>>();
+            if parts.len() != 3 || parts[0] != "ebs" || parts[1].is_empty() {
+                return Err(format!(
+                    "invalid --cache-device {specification:?}; expected nvme or ebs:tier:GB"
+                ));
+            }
+            let volume_gb = parse_usize("--cache-device volume", parts[2])?;
+            let volume_gb = u64::try_from(volume_gb)
+                .map_err(|error| format!("cache volume does not fit u64: {error}"))?;
+            if volume_gb == 0 {
+                return Err("--cache-device volume must be nonzero".to_string());
+            }
+            (parts[1], volume_gb)
+        }
+    };
+    if catalog.block_storage(cloud, tier).is_none() {
+        return Err(format!(
+            "catalog has no {} block-storage tier {tier:?}",
+            cloud.name()
+        ));
+    }
+    Ok(CacheSelection::Block {
+        tier: tier.to_string(),
+        volume_gb,
+    })
 }
 
 fn parse_nprobes(value: &str) -> Result<Vec<usize>, String> {

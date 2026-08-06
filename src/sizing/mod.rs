@@ -12,6 +12,10 @@
 //!   object-store pricing dataset the advisor ranks candidates from.
 //! - [`advisor`] — deterministic hardware enumeration, constraint filtering,
 //!   prediction, monthly pricing, and ranking for one deployment shape.
+//! - [`tuner`] — pure hardware-to-configuration tuning rules used after an
+//!   operator selects one advisor candidate.
+//! - [`emit`] — commented TOML rendering, real-loader round-trip validation,
+//!   intent cross-checks, and refusal to overwrite without explicit force.
 //! - [`profiles`] — strict TOML profiles describing object-store behavior,
 //!   pricing, node fleets, and client populations.
 //! - [`lognormal`] — the deterministic lognormal TTFB distribution shared
@@ -26,7 +30,9 @@
 
 pub mod advisor;
 pub mod catalog;
+pub mod emit;
 pub mod lognormal;
 pub mod model;
 pub mod profiles;
 pub mod rows;
+pub mod tuner;
