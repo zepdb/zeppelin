@@ -8,8 +8,11 @@
 //! future scale phase. Adopted 2026-07-31 from the measured Phase 9 benchmark
 //! (`tasks/MMLI-2/results/phase9-flat-sq8-benchmark.md`).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::mem::size_of;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -414,7 +417,8 @@ impl ResidentFlatCandidateIndex {
     /// recipe's `candidate_k`, so a filtered query still receives a full
     /// frontier of matching rows. Ordering is ascending negated reconstructed
     /// dot product with row-index tie-break, replicating the pinned Phase 9
-    /// selection exactly.
+    /// selection exactly. The scan itself runs chunked on scoped workers via
+    /// [`select_flat_top_k`], which is bit-identical to the sequential scan.
     pub(crate) fn select_candidates(
         &self,
         query_fde: &[f32],
@@ -433,37 +437,26 @@ impl ResidentFlatCandidateIndex {
         if query_fde.iter().any(|value| !value.is_finite()) {
             return Err(flat_error("flat query FDE contains a non-finite value"));
         }
-        let mut scores: Vec<(usize, f32)> = Vec::with_capacity(self.rows.len());
-        for index in 0..self.rows.len() {
-            let code = &self.codes[index * dimension..(index + 1) * dimension];
-            let negated_dot = self.calibration.asymmetric_dot_product(query_fde, code);
-            if !negated_dot.is_finite() {
-                return Err(flat_error("flat SQ8 score is not finite"));
-            }
-            scores.push((index, negated_dot));
-        }
-        scores.sort_unstable_by(|left, right| {
-            left.1
-                .total_cmp(&right.1)
-                .then_with(|| left.0.cmp(&right.0))
-        });
-
         let candidate_k = usize::try_from(self.recipe.candidate_k)
             .map_err(|_| flat_error("flat candidate K exceeds usize"))?;
-        let mut candidates = Vec::with_capacity(candidate_k.min(self.rows.len()));
-        for (index, negated_dot) in scores {
-            if candidates.len() == candidate_k {
-                break;
-            }
+        let admit = |index: usize| {
             let row = &self.rows[index];
-            if excluded_ids.contains(&row.id) {
-                continue;
-            }
-            if !filter_matches(mandatory_filter, row.filter_attributes.as_ref())
-                || !filter_matches(request_filter, row.filter_attributes.as_ref())
-            {
-                continue;
-            }
+            !excluded_ids.contains(&row.id)
+                && filter_matches(mandatory_filter, row.filter_attributes.as_ref())
+                && filter_matches(request_filter, row.filter_attributes.as_ref())
+        };
+        let selection = select_flat_top_k(
+            &self.calibration,
+            &self.codes,
+            dimension,
+            query_fde,
+            candidate_k,
+            &admit,
+            None,
+        )?;
+        let mut candidates = Vec::with_capacity(selection.len());
+        for (index, negated_dot) in selection {
+            let row = &self.rows[index];
             candidates.push(LateCandidate {
                 id: row.id.clone(),
                 approx_fde_score: -negated_dot,
@@ -480,6 +473,215 @@ impl ResidentFlatCandidateIndex {
         }
         Ok(candidates)
     }
+}
+
+/// Minimum rows per scan worker before another thread is worth its spawn cost.
+const FLAT_SCAN_MIN_ROWS_PER_WORKER: usize = 256;
+
+/// Wall-clock observability for one chunked flat scan.
+///
+/// `scoring` is the longest single-chunk scan wall (the critical worker,
+/// matching phase 07's truth-wave reporting convention), `merge` is the
+/// cross-chunk frontier merge wall, and `workers` is the scoped thread count.
+#[derive(Debug, Default)]
+pub(crate) struct FlatScanTiming {
+    /// Longest single-worker chunk-scan wall across the scoped workers.
+    pub(crate) scoring: Duration,
+    /// Wall time of the final cross-chunk frontier merge and truncation.
+    pub(crate) merge: Duration,
+    /// Scoped worker threads that scanned disjoint row chunks.
+    pub(crate) workers: usize,
+}
+
+/// One retained scan entry ordered exactly like the sequential selection.
+///
+/// Ascending `(score bits under `total_cmp`, row index)` replicates the
+/// pinned Phase 9 comparator, so the bounded per-chunk frontier and the merge
+/// reproduce the sequential candidate set, order, and tie-breaks exactly.
+#[derive(Clone, Copy, Debug)]
+struct FlatScanEntry {
+    negated_dot: f32,
+    index: usize,
+}
+
+impl Ord for FlatScanEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.negated_dot
+            .total_cmp(&other.negated_dot)
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+impl PartialOrd for FlatScanEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for FlatScanEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for FlatScanEntry {}
+
+/// Bounded per-chunk scan output in ascending selection order.
+struct ScannedFlatChunk {
+    entries: Vec<FlatScanEntry>,
+    scoring: Duration,
+}
+
+/// Select the top `candidate_k` admitted rows of the resident SQ8 scan.
+///
+/// The exhaustive scan is the corpus-size-scaling term of a late-interaction
+/// query (~42 ms at 5,183 rows, ~391-414 ms at 50k rows measured
+/// single-threaded), so disjoint contiguous row chunks are scored on scoped
+/// standard-library workers — the same mechanism the phase 07 truth wave
+/// uses — each keeping a bounded top-`candidate_k` heap of admitted rows.
+/// The merged result is bit-identical to the sequential scan-sort-truncate
+/// selection: every score comes from the identical scalar
+/// `asymmetric_dot_product` kernel, and ordering plus tie-breaks follow the
+/// pinned ascending `(total_cmp score, row index)` comparator everywhere.
+///
+/// `admit` decides per-row candidacy (exclusions and filters) and must be
+/// pure. Every row's score is checked for finiteness before admission so a
+/// non-finite score fails loud exactly as the sequential scan did; when
+/// several rows are non-finite the lowest-indexed one wins because chunks
+/// are joined in ascending row order and each worker stops at its first
+/// offending row.
+pub(crate) fn select_flat_top_k(
+    calibration: &SqCalibration,
+    codes: &[u8],
+    dimension: usize,
+    query_fde: &[f32],
+    candidate_k: usize,
+    admit: &(dyn Fn(usize) -> bool + Sync),
+    timing: Option<&mut FlatScanTiming>,
+) -> Result<Vec<(usize, f32)>> {
+    if dimension == 0 {
+        return Err(flat_error("flat FDE dimension must be positive"));
+    }
+    if codes.len() % dimension != 0 {
+        return Err(flat_error("flat code payload is not row-aligned"));
+    }
+    if candidate_k == 0 {
+        return Err(flat_error("flat candidate K must be positive"));
+    }
+    if query_fde.len() != dimension {
+        return Err(ZeppelinError::DimensionMismatch {
+            expected: dimension,
+            actual: query_fde.len(),
+        });
+    }
+    let row_count = codes.len() / dimension;
+    let worker_count = thread::available_parallelism()
+        .map_err(|error| flat_error(format!("cannot resolve flat scan workers: {error}")))?
+        .get()
+        .min(row_count.div_ceil(FLAT_SCAN_MIN_ROWS_PER_WORKER))
+        .max(1);
+    let chunk_rows = row_count.div_ceil(worker_count);
+    let chunks = if worker_count == 1 {
+        vec![scan_flat_chunk(
+            calibration,
+            codes,
+            dimension,
+            query_fde,
+            0,
+            candidate_k,
+            admit,
+        )?]
+    } else {
+        thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(worker_count);
+            for chunk_index in 0..worker_count {
+                let start_row = chunk_index * chunk_rows;
+                let end_row = (start_row + chunk_rows).min(row_count);
+                let chunk_codes = &codes[start_row * dimension..end_row * dimension];
+                workers.push(scope.spawn(move || {
+                    scan_flat_chunk(
+                        calibration,
+                        chunk_codes,
+                        dimension,
+                        query_fde,
+                        start_row,
+                        candidate_k,
+                        admit,
+                    )
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .map_err(|_| flat_error("flat scan worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?
+    };
+    let merge_started = Instant::now();
+    let scoring = chunks
+        .iter()
+        .map(|chunk| chunk.scoring)
+        .max()
+        .unwrap_or_default();
+    let mut merged: Vec<FlatScanEntry> =
+        chunks.into_iter().flat_map(|chunk| chunk.entries).collect();
+    merged.sort_unstable();
+    merged.truncate(candidate_k);
+    let selection = merged
+        .into_iter()
+        .map(|entry| (entry.index, entry.negated_dot))
+        .collect();
+    if let Some(timing) = timing {
+        timing.scoring = scoring;
+        timing.merge = merge_started.elapsed();
+        timing.workers = worker_count;
+    }
+    Ok(selection)
+}
+
+/// Scan one contiguous row chunk with the sequential scalar kernel.
+///
+/// Keeps a bounded max-heap of the `candidate_k` best admitted entries; the
+/// heap top is the worst retained entry under the pinned comparator, so a
+/// tie with the top never displaces it, matching sequential tie retention.
+fn scan_flat_chunk(
+    calibration: &SqCalibration,
+    chunk_codes: &[u8],
+    dimension: usize,
+    query_fde: &[f32],
+    start_row: usize,
+    candidate_k: usize,
+    admit: &(dyn Fn(usize) -> bool + Sync),
+) -> Result<ScannedFlatChunk> {
+    let started = Instant::now();
+    let rows = chunk_codes.len() / dimension;
+    let mut heap: BinaryHeap<FlatScanEntry> = BinaryHeap::with_capacity(candidate_k + 1);
+    for offset in 0..rows {
+        let code = &chunk_codes[offset * dimension..(offset + 1) * dimension];
+        let negated_dot = calibration.asymmetric_dot_product(query_fde, code);
+        if !negated_dot.is_finite() {
+            return Err(flat_error("flat SQ8 score is not finite"));
+        }
+        let index = start_row + offset;
+        if !admit(index) {
+            continue;
+        }
+        let entry = FlatScanEntry { negated_dot, index };
+        if heap.len() < candidate_k {
+            heap.push(entry);
+        } else if let Some(mut worst) = heap.peek_mut() {
+            if entry < *worst {
+                *worst = entry;
+            }
+        }
+    }
+    Ok(ScannedFlatChunk {
+        entries: heap.into_sorted_vec(),
+        scoring: started.elapsed(),
+    })
 }
 
 fn flat_row_wire(row: LateCandidateInputRow) -> FlatRowWire {
@@ -714,5 +916,152 @@ mod tests {
         )
         .expect_err("artifact over the resident maximum must fail activation");
         assert!(error.to_string().contains("resident maximum"));
+    }
+
+    /// Deterministic sequential reference replicating the pinned pre-phase-09
+    /// selection: score every row, sort ascending by `(total_cmp, index)`,
+    /// walk in order admitting rows, truncate to `candidate_k`.
+    fn sequential_reference(
+        calibration: &crate::index::quantization::sq::SqCalibration,
+        codes: &[u8],
+        dimension: usize,
+        query: &[f32],
+        candidate_k: usize,
+        admit: &dyn Fn(usize) -> bool,
+    ) -> Vec<(usize, f32)> {
+        let row_count = codes.len() / dimension;
+        let mut scores: Vec<(usize, f32)> = (0..row_count)
+            .map(|index| {
+                let code = &codes[index * dimension..(index + 1) * dimension];
+                (index, calibration.asymmetric_dot_product(query, code))
+            })
+            .collect();
+        scores.sort_unstable_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        scores
+            .into_iter()
+            .filter(|&(index, _)| admit(index))
+            .take(candidate_k)
+            .collect()
+    }
+
+    #[test]
+    fn parallel_scan_matches_sequential_selection_exactly() {
+        // 4,096 rows drawn from 64 distinct patterns: every score group has
+        // 64 exact ties, so the whole selection is decided by tie-breaking.
+        // The row count engages 16 workers past the 256-row chunk floor.
+        let dimension = 32usize;
+        let row_count = 4_096usize;
+        let pattern_count = 64usize;
+        let mut state = 0x1234_5678_9abc_def0_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32) / (u32::MAX as f32) - 0.5
+        };
+        let patterns: Vec<Vec<f32>> = (0..pattern_count)
+            .map(|_| (0..dimension).map(|_| next()).collect())
+            .collect();
+        let fdes: Vec<&[f32]> = (0..row_count)
+            .map(|row| patterns[row % pattern_count].as_slice())
+            .collect();
+        let calibration =
+            crate::index::quantization::sq::SqCalibration::calibrate(&fdes, dimension);
+        let codes: Vec<u8> = fdes
+            .iter()
+            .flat_map(|fde| calibration.encode(fde))
+            .collect();
+        let query: Vec<f32> = (0..dimension)
+            .map(|coordinate| (coordinate as f32 * 0.37).sin())
+            .collect();
+        let candidate_k = 100usize;
+
+        let admit_all = |_: usize| true;
+        let admit_some = |index: usize| index % 7 != 0;
+        for admit in [&admit_all as &(dyn Fn(usize) -> bool + Sync), &admit_some] {
+            let mut timing = super::FlatScanTiming::default();
+            let parallel = super::select_flat_top_k(
+                &calibration,
+                &codes,
+                dimension,
+                &query,
+                candidate_k,
+                admit,
+                Some(&mut timing),
+            )
+            .expect("parallel selection must succeed");
+            let sequential =
+                sequential_reference(&calibration, &codes, dimension, &query, candidate_k, admit);
+            assert_eq!(parallel.len(), sequential.len());
+            for (left, right) in parallel.iter().zip(&sequential) {
+                assert_eq!(left.0, right.0, "candidate row index diverged");
+                assert_eq!(
+                    left.1.to_bits(),
+                    right.1.to_bits(),
+                    "candidate score bits diverged at row {}",
+                    left.0
+                );
+            }
+            assert!(timing.workers > 1, "fixture must engage several workers");
+            // The 64-way duplicated patterns force exact ties inside the
+            // selection; every equal-score run must be in ascending row order.
+            let mut tie_seen = false;
+            for pair in parallel.windows(2) {
+                if pair[0].1.to_bits() == pair[1].1.to_bits() {
+                    tie_seen = true;
+                    assert!(pair[0].0 < pair[1].0, "tie must break by row index");
+                }
+            }
+            assert!(tie_seen, "constructed duplicates must tie inside the top K");
+        }
+
+        // K larger than the admitted row count returns every admitted row.
+        let wide = super::select_flat_top_k(
+            &calibration,
+            &codes,
+            dimension,
+            &query,
+            row_count * 2,
+            &admit_some,
+            None,
+        )
+        .expect("wide selection must succeed");
+        let wide_reference = sequential_reference(
+            &calibration,
+            &codes,
+            dimension,
+            &query,
+            row_count * 2,
+            &admit_some,
+        );
+        assert_eq!(wide.len(), wide_reference.len());
+        for (left, right) in wide.iter().zip(&wide_reference) {
+            assert_eq!(left.0, right.0);
+            assert_eq!(left.1.to_bits(), right.1.to_bits());
+        }
+    }
+
+    #[test]
+    fn flat_scan_rejects_invalid_shapes() {
+        let calibration = crate::index::quantization::sq::SqCalibration::calibrate(
+            &[[0.0f32, 1.0].as_slice(), [1.0f32, 0.0].as_slice()],
+            2,
+        );
+        let admit = |_: usize| true;
+        let error =
+            super::select_flat_top_k(&calibration, &[0u8; 3], 2, &[0.5, 0.5], 1, &admit, None)
+                .expect_err("misaligned code payload must fail loud");
+        assert!(error.to_string().contains("row-aligned"));
+        let error =
+            super::select_flat_top_k(&calibration, &[0u8; 4], 2, &[0.5, 0.5], 0, &admit, None)
+                .expect_err("zero candidate K must fail loud");
+        assert!(error.to_string().contains("must be positive"));
+        let error = super::select_flat_top_k(&calibration, &[0u8; 4], 2, &[0.5], 1, &admit, None)
+            .expect_err("query dimension mismatch must fail loud");
+        assert!(error.to_string().contains("imension"));
     }
 }
