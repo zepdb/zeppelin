@@ -262,11 +262,14 @@ pub struct Config {
 pub struct MmliConfig {
     /// Exact matrix dtype for text-only namespaces. Default: `f16`.
     ///
-    /// Pinned text replay at K=1000: `f16` recall@10 `0.980072`
-    /// (gate `>=0.975`, PASS), `58.35 MB`/query, `730` requests,
-    /// p50 `596 ms`; `int8_g32` recall@10 `0.974211`
-    /// (gate `>=0.975`, MISS), `35.95 MB`/query, `622` requests,
-    /// p50 `530 ms`.
+    /// Post-optimization loopback-MinIO replay: the general f16 K=1000
+    /// profile retained recall@10 `0.980072` at p50 `72 ms`. A speed-biased
+    /// INT8-G32 K=1000 profile measured recall `0.974662` at `48 ms`. Widening
+    /// the INT8 frontier to K=1200 recovered recall to `0.980703` at `53 ms`.
+    /// Those latency profiles used explicit 512/768 KiB read gaps respectively;
+    /// the general default remains 64 KiB because large-gap byte amplification
+    /// did not transfer to the sparse 50k-unit shape. Evidence:
+    /// `tasks/LateLatency/results/phase09-scan-int8.md`.
     #[serde(default)]
     pub text_matrix_dtype: MmliMatrixDtype,
     /// Exact matrix dtype for namespaces accepting image or image-text. Default: `f16`.
@@ -353,8 +356,10 @@ pub struct MmliSegmentConfig {
     pub nlist: usize,
     /// Candidate IVF clusters read per query. Phase-2 routing point: `16`.
     pub probe_budget: usize,
-    /// Approximate rows retained before exact MaxSim. Flat-SQ8 text
-    /// operating point (measured 2026-07-31): `1000`.
+    /// Approximate rows retained before exact MaxSim. General flat-SQ8 text
+    /// operating point: `1000`. For INT8-G32, the measured quality-preserving
+    /// operating point is `1200` (recall@10 `0.980703` versus f16 K=1000
+    /// `0.980072`); configure it explicitly for an INT8 namespace.
     pub candidate_k: usize,
     /// Maximum Lloyd iterations for late-candidate centroid training.
     pub kmeans_max_iterations: usize,
@@ -367,13 +372,14 @@ pub struct MmliSegmentConfig {
     /// Maximum resident centroid/bootstrap bytes admitted at activation.
     pub max_resident_bootstrap_bytes: usize,
     /// Maximum cumulative coalesced gap bytes per ranged request. Default:
-    /// `65536` bytes (64 KiB). Although 256 KiB was the SciFact knee
-    /// (−37% GETs at +64% bytes), phase 05 proved it corpus-specific: out of
-    /// regime it removes only 7.4% of GETs while paying +83% planned bytes.
-    /// Raising this to 1 MiB+ is strictly worse everywhere measured
-    /// because the extra bytes regress fetch time; lowering it permits less
-    /// gap coalescing, trading fewer planned bytes for more GETs. Revisit only
-    /// after the attribute-fold format change lands.
+    /// `65536` bytes (64 KiB). Phase 05 proved larger gaps corpus-specific:
+    /// at 50k units, 256 KiB removed only 7.4% of GETs while adding 83%
+    /// planned bytes. After streamed/parallel scoring, the dense 5,183-row
+    /// replay instead reached its latency knee at 512–896 KiB: INT8-G32
+    /// K=1200 used 768 KiB for 53 ms p50 and f16 K=1000 used 896 KiB for
+    /// 52 ms. Configure a large gap only for a qualified high-density latency
+    /// profile; the general default stays 64 KiB to bound sparse-workload
+    /// amplification. Evidence: `tasks/LateLatency/results/phase09-scan-int8.md`.
     pub read_gap_budget_bytes: usize,
     /// Maximum bytes in one physical ranged request. Default: `8388608`
     /// bytes (8 MiB), kept because it never bound in any measured arm and
