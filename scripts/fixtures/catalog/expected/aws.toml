@@ -1,0 +1,33 @@
+[meta]
+cloud = "aws"
+snapshot_date = "2026-08-05"
+currency = "USD"
+sources = ["fixture"]
+
+[[instance]]
+name = "i4i.2xlarge"
+family = "i4i"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 64.0
+nvme_gb = 1875
+network_baseline_gbps = 3.125
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.686 }
+
+[[instance]]
+name = "m7i.2xlarge"
+family = "m7i"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 3.125
+network_burst_gbps = 12.5
+price_hr = { eu-west-1 = 0.4435, us-east-1 = 0.4032 }
+
+[[block_storage]]
+name = "gp3"
+price_gb_month = 0.08
+max_iops = 80000
+max_throughput_mbps = 2000

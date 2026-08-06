@@ -1,0 +1,7 @@
+FormatVersion,aws_v1
+Disclaimer,fixture
+Publication Date,2026-08-05
+OfferCode,AmazonEC2
+Version,fixture
+SKU,TermType,PricePerUnit,Unit,Product Family,Instance Type,Operating System,Tenancy,Pre Installed S/W,CapacityStatus
+sku-m7i,OnDemand,0.4435,Hrs,Compute Instance,m7i.2xlarge,Linux,Shared,NA,Used

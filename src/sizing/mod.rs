@@ -8,6 +8,8 @@
 //! - [`model`] — [`model::predict`] turns per-query counters into QPS,
 //!   latency percentiles, and dollars; [`model::CalibratedShapeModel`]
 //!   scales fitted constants to arbitrary dataset shapes.
+//! - [`catalog`] — the embedded, snapshot-dated cloud hardware and
+//!   object-store pricing dataset the advisor ranks candidates from.
 //! - [`profiles`] — strict TOML profiles describing object-store behavior,
 //!   pricing, node fleets, and client populations.
 //! - [`lognormal`] — the deterministic lognormal TTFB distribution shared
@@ -20,6 +22,7 @@
 //! there, against real MinIO measurements, and its tolerances gate any
 //! change to the math here.
 
+pub mod catalog;
 pub mod lognormal;
 pub mod model;
 pub mod profiles;

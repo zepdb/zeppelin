@@ -1,0 +1,307 @@
+# GCP Compute Engine instance and Persistent Disk/Hyperdisk catalog.
+# Prices were captured 2026-08-05 from the public Cloud Billing catalog
+# mirror and checked against Google Cloud pricing pages. Network figures
+# are the standard per-VM caps; Tier_1 values are recorded as burst because
+# enabling Tier_1 can carry an additional networking charge.
+#
+# Z3 prices include the bundled Titanium SSD. Z3 uses real `-highlssd` /
+# `-standardlssd` SKU names and 3,000-GB SSD increments; plain names such
+# as `z3-highmem-8` do not exist.
+[meta]
+cloud = "gcp"
+snapshot_date = "2026-08-05"
+currency = "USD"
+sources = [
+    "https://cloud.google.com/products/compute/pricing",
+    "https://cloud.google.com/compute/disks-image-pricing",
+    "https://docs.cloud.google.com/compute/docs/general-purpose-machines",
+    "https://docs.cloud.google.com/compute/docs/storage-optimized-machines",
+    "https://docs.cloud.google.com/compute/docs/network-bandwidth",
+    "https://gcloud-compute.com/",
+]
+
+# N2 (Intel). The 32-vCPU row can use 50-Gbps Tier_1 networking.
+[[instance]]
+name = "n2-standard-4"
+family = "n2"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 16.0
+nvme_gb = 0
+network_baseline_gbps = 10.0
+network_burst_gbps = 10.0
+price_hr = { us-central1 = 0.1942, us-west1 = 0.1942, europe-west1 = 0.2137, europe-west4 = 0.2138, asia-south1 = 0.2333, asia-southeast1 = 0.2396 }
+
+[[instance]]
+name = "n2-standard-8"
+family = "n2"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 16.0
+network_burst_gbps = 16.0
+price_hr = { us-central1 = 0.3885, us-west1 = 0.3885, europe-west1 = 0.4273, europe-west4 = 0.4277, asia-south1 = 0.4666, asia-southeast1 = 0.4792 }
+
+[[instance]]
+name = "n2-standard-16"
+family = "n2"
+arch = "x86_64"
+vcpus = 16
+mem_gb = 64.0
+nvme_gb = 0
+network_baseline_gbps = 32.0
+network_burst_gbps = 32.0
+price_hr = { us-central1 = 0.7769, us-west1 = 0.7769, europe-west1 = 0.8547, europe-west4 = 0.8553, asia-south1 = 0.9332, asia-southeast1 = 0.9584 }
+
+[[instance]]
+name = "n2-standard-32"
+family = "n2"
+arch = "x86_64"
+vcpus = 32
+mem_gb = 128.0
+nvme_gb = 0
+network_baseline_gbps = 32.0
+network_burst_gbps = 50.0
+price_hr = { us-central1 = 1.5539, us-west1 = 1.5539, europe-west1 = 1.7093, europe-west4 = 1.7107, asia-south1 = 1.8663, asia-southeast1 = 1.9169 }
+
+# N2D (AMD). Tier_1 starts at 48 vCPUs, so none of these rows qualify.
+# The unusually low asia-south1 price was independently cross-checked.
+[[instance]]
+name = "n2d-standard-4"
+family = "n2d"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 16.0
+nvme_gb = 0
+network_baseline_gbps = 10.0
+network_burst_gbps = 10.0
+price_hr = { us-central1 = 0.1690, us-west1 = 0.1690, europe-west1 = 0.1859, europe-west4 = 0.1860, asia-south1 = 0.1115, asia-southeast1 = 0.2085 }
+
+[[instance]]
+name = "n2d-standard-8"
+family = "n2d"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 16.0
+network_burst_gbps = 16.0
+price_hr = { us-central1 = 0.3380, us-west1 = 0.3380, europe-west1 = 0.3718, europe-west4 = 0.3721, asia-south1 = 0.2231, asia-southeast1 = 0.4169 }
+
+[[instance]]
+name = "n2d-standard-16"
+family = "n2d"
+arch = "x86_64"
+vcpus = 16
+mem_gb = 64.0
+nvme_gb = 0
+network_baseline_gbps = 32.0
+network_burst_gbps = 32.0
+price_hr = { us-central1 = 0.6759, us-west1 = 0.6759, europe-west1 = 0.7436, europe-west4 = 0.7442, asia-south1 = 0.4461, asia-southeast1 = 0.8339 }
+
+[[instance]]
+name = "n2d-standard-32"
+family = "n2d"
+arch = "x86_64"
+vcpus = 32
+mem_gb = 128.0
+nvme_gb = 0
+network_baseline_gbps = 32.0
+network_burst_gbps = 32.0
+price_hr = { us-central1 = 1.3519, us-west1 = 1.3519, europe-west1 = 1.4871, europe-west4 = 1.4883, asia-south1 = 0.8923, asia-southeast1 = 1.6677 }
+
+# C3 (Intel Sapphire Rapids/Titanium).
+[[instance]]
+name = "c3-standard-4"
+family = "c3"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 16.0
+nvme_gb = 0
+network_baseline_gbps = 23.0
+network_burst_gbps = 23.0
+price_hr = { us-central1 = 0.2016, us-west1 = 0.2016, europe-west1 = 0.2220, europe-west4 = 0.2117, asia-south1 = 0.2097, asia-southeast1 = 0.2487 }
+
+[[instance]]
+name = "c3-standard-8"
+family = "c3"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 23.0
+network_burst_gbps = 23.0
+price_hr = { us-central1 = 0.4032, us-west1 = 0.4032, europe-west1 = 0.4440, europe-west4 = 0.4234, asia-south1 = 0.4193, asia-southeast1 = 0.4974 }
+
+[[instance]]
+name = "c3-standard-22"
+family = "c3"
+arch = "x86_64"
+vcpus = 22
+mem_gb = 88.0
+nvme_gb = 0
+network_baseline_gbps = 23.0
+network_burst_gbps = 23.0
+price_hr = { us-central1 = 1.1088, us-west1 = 1.1088, europe-west1 = 1.2209, europe-west4 = 1.1643, asia-south1 = 1.1532, asia-southeast1 = 1.3680 }
+
+[[instance]]
+name = "c3-standard-44"
+family = "c3"
+arch = "x86_64"
+vcpus = 44
+mem_gb = 176.0
+nvme_gb = 0
+network_baseline_gbps = 32.0
+network_burst_gbps = 50.0
+price_hr = { us-central1 = 2.2177, us-west1 = 2.2177, europe-west1 = 2.4419, europe-west4 = 2.3286, asia-south1 = 2.3064, asia-southeast1 = 2.7360 }
+
+# C3D (AMD Genoa/Titanium).
+[[instance]]
+name = "c3d-standard-4"
+family = "c3d"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 16.0
+nvme_gb = 0
+network_baseline_gbps = 20.0
+network_burst_gbps = 20.0
+price_hr = { us-central1 = 0.1816, us-west1 = 0.1816, europe-west1 = 0.2000, europe-west4 = 0.1907, asia-south1 = 0.1889, asia-southeast1 = 0.2240 }
+
+[[instance]]
+name = "c3d-standard-8"
+family = "c3d"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 20.0
+network_burst_gbps = 20.0
+price_hr = { us-central1 = 0.3632, us-west1 = 0.3632, europe-west1 = 0.3999, europe-west4 = 0.3814, asia-south1 = 0.3777, asia-southeast1 = 0.4481 }
+
+[[instance]]
+name = "c3d-standard-16"
+family = "c3d"
+arch = "x86_64"
+vcpus = 16
+mem_gb = 64.0
+nvme_gb = 0
+network_baseline_gbps = 20.0
+network_burst_gbps = 20.0
+price_hr = { us-central1 = 0.7264, us-west1 = 0.7264, europe-west1 = 0.7998, europe-west4 = 0.7627, asia-south1 = 0.7554, asia-southeast1 = 0.8961 }
+
+[[instance]]
+name = "c3d-standard-30"
+family = "c3d"
+arch = "x86_64"
+vcpus = 30
+mem_gb = 120.0
+nvme_gb = 0
+network_baseline_gbps = 20.0
+network_burst_gbps = 50.0
+price_hr = { us-central1 = 1.3620, us-west1 = 1.3620, europe-west1 = 1.4997, europe-west4 = 1.4301, asia-south1 = 1.4164, asia-southeast1 = 1.6803 }
+
+# Z3 storage-optimized (bundled Titanium SSD).
+[[instance]]
+name = "z3-highmem-8-highlssd"
+family = "z3"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 64.0
+nvme_gb = 3000
+network_baseline_gbps = 23.0
+network_burst_gbps = 23.0
+price_hr = { us-central1 = 1.1519, us-west1 = 1.1519, europe-west1 = 1.4071, europe-west4 = 1.2260, asia-south1 = 1.2506, asia-southeast1 = 1.3772 }
+
+[[instance]]
+name = "z3-highmem-14-standardlssd"
+family = "z3"
+arch = "x86_64"
+vcpus = 14
+mem_gb = 112.0
+nvme_gb = 3000
+network_baseline_gbps = 23.0
+network_burst_gbps = 23.0
+price_hr = { us-central1 = 1.7693, us-west1 = 1.7693, europe-west1 = 2.2159, europe-west4 = 1.8742, asia-south1 = 1.8927, asia-southeast1 = 2.1388 }
+
+[[instance]]
+name = "z3-highmem-16-highlssd"
+family = "z3"
+arch = "x86_64"
+vcpus = 16
+mem_gb = 128.0
+nvme_gb = 6000
+network_baseline_gbps = 23.0
+network_burst_gbps = 23.0
+price_hr = { us-central1 = 2.3039, us-west1 = 2.3039, europe-west1 = 2.8142, europe-west4 = 2.4519, asia-south1 = 2.5012, asia-southeast1 = 2.7544 }
+
+[[instance]]
+name = "z3-highmem-22-standardlssd"
+family = "z3"
+arch = "x86_64"
+vcpus = 22
+mem_gb = 176.0
+nvme_gb = 6000
+network_baseline_gbps = 23.0
+network_burst_gbps = 23.0
+price_hr = { us-central1 = 2.9212, us-west1 = 2.9212, europe-west1 = 3.6230, europe-west4 = 3.1002, asia-south1 = 3.1433, asia-southeast1 = 3.5160 }
+
+[[instance]]
+name = "z3-highmem-22-highlssd"
+family = "z3"
+arch = "x86_64"
+vcpus = 22
+mem_gb = 176.0
+nvme_gb = 9000
+network_baseline_gbps = 23.0
+network_burst_gbps = 23.0
+price_hr = { us-central1 = 3.2500, us-west1 = 3.2500, europe-west1 = 3.9517, europe-west4 = 3.4618, asia-south1 = 3.5378, asia-southeast1 = 3.8777 }
+
+# Base rates are us-central1. A single regional multiplier applies to all
+# price components in the advisor; component-specific rounding on the
+# provider sheet can differ by about one percent.
+[[block_storage]]
+name = "pd-balanced"
+price_gb_month = 0.10
+included_iops = 0
+included_throughput_mbps = 0
+price_per_iops_month = 0.0
+price_per_throughput_mbps_month = 0.0
+max_iops = 80000
+max_throughput_mbps = 1200
+price_multiplier = { us-west1 = 1.0, europe-west1 = 1.0, europe-west4 = 1.10, asia-south1 = 1.20, asia-southeast1 = 1.10 }
+
+[[block_storage]]
+name = "pd-ssd"
+price_gb_month = 0.17
+included_iops = 0
+included_throughput_mbps = 0
+price_per_iops_month = 0.0
+price_per_throughput_mbps_month = 0.0
+max_iops = 100000
+max_throughput_mbps = 1200
+price_multiplier = { us-west1 = 1.0, europe-west1 = 1.0, europe-west4 = 1.10, asia-south1 = 1.20, asia-southeast1 = 1.10 }
+
+[[block_storage]]
+name = "hyperdisk-balanced"
+price_gb_month = 0.08
+included_iops = 3000
+included_throughput_mbps = 140
+price_per_iops_month = 0.005
+price_per_throughput_mbps_month = 0.04
+max_iops = 160000
+max_throughput_mbps = 2400
+price_multiplier = { us-west1 = 1.0, europe-west1 = 1.10, europe-west4 = 1.05, asia-south1 = 1.0375, asia-southeast1 = 1.225 }
+
+# Hyperdisk Extreme throughput is derived from provisioned IOPS rather
+# than billed separately (250 MiB/s per 1,000 IOPS, capped at 5,000).
+[[block_storage]]
+name = "hyperdisk-extreme"
+price_gb_month = 0.125
+included_iops = 0
+included_throughput_mbps = 0
+price_per_iops_month = 0.032
+price_per_throughput_mbps_month = 0.0
+max_iops = 350000
+max_throughput_mbps = 5000
+price_multiplier = { us-west1 = 1.0, europe-west1 = 1.104, europe-west4 = 1.048, asia-south1 = 1.04, asia-southeast1 = 1.232 }

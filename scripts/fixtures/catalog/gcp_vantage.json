@@ -1,0 +1,27 @@
+[
+  {
+    "instance_type": "n2-standard-8",
+    "vCPU": 8,
+    "memory": 32.0,
+    "arch": "x86_64",
+    "storage": 0,
+    "network_baseline_gbps": 16.0,
+    "network_burst_gbps": 16.0,
+    "pricing": {
+      "us-central1": {"linux": {"ondemand": "0.3885"}},
+      "europe-west1": {"linux": {"ondemand": "0.4276"}}
+    }
+  },
+  {
+    "instance_type": "z3-highmem-8-highlssd",
+    "vCPU": 8,
+    "memory": 64.0,
+    "arch": "x86_64",
+    "storage": 3000,
+    "network_baseline_gbps": 23.0,
+    "network_burst_gbps": 23.0,
+    "pricing": {
+      "us-central1": {"linux": {"ondemand": "1.1519"}}
+    }
+  }
+]

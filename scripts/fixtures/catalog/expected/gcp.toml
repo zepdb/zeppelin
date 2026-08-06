@@ -1,0 +1,33 @@
+[meta]
+cloud = "gcp"
+snapshot_date = "2026-08-05"
+currency = "USD"
+sources = ["fixture"]
+
+[[instance]]
+name = "n2-standard-8"
+family = "n2"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 16.0
+network_burst_gbps = 16.0
+price_hr = { europe-west1 = 0.4276, us-central1 = 0.3885 }
+
+[[instance]]
+name = "z3-highmem-8-highlssd"
+family = "z3"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 64.0
+nvme_gb = 3000
+network_baseline_gbps = 23.0
+network_burst_gbps = 23.0
+price_hr = { us-central1 = 1.1519 }
+
+[[block_storage]]
+name = "pd-ssd"
+price_gb_month = 0.17
+max_iops = 100000
+max_throughput_mbps = 1200

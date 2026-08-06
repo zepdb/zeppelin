@@ -1,0 +1,35 @@
+[
+  {
+    "instance_type": "m7i.2xlarge",
+    "vCPU": 8,
+    "memory": 32.0,
+    "arch": "x86_64",
+    "storage": 0,
+    "network_baseline_gbps": 3.125,
+    "network_burst_gbps": 12.5,
+    "pricing": {
+      "us-east-1": {"linux": {"ondemand": "0.4032"}},
+      "eu-west-1": {"linux": {"ondemand": "0.4435"}}
+    }
+  },
+  {
+    "instance_type": "i4i.2xlarge",
+    "vCPU": 8,
+    "memory": 64.0,
+    "physical_processor": "Intel Xeon 8375C",
+    "storage": 1875,
+    "network_performance": "Up to 12.5 Gigabit",
+    "pricing": {
+      "us-east-1": {"linux": {"ondemand": "0.686"}}
+    }
+  },
+  {
+    "instance_type": "t3.nano",
+    "vCPU": 2,
+    "memory": 0.5,
+    "arch": "x86_64",
+    "storage": 0,
+    "network_performance": "Up to 5 Gigabit",
+    "pricing": {"us-east-1": {"linux": {"ondemand": "0.0052"}}}
+  }
+]

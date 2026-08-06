@@ -1,0 +1,512 @@
+# AWS EC2 instance and EBS catalog.
+# Prices verified 2026-08-05 across two independent sources: the Vantage
+# open dataset and AWS's own on-demand pricing JSON (every compared price
+# matched to 5 decimals). Specs and network baseline/burst confirmed
+# against docs.aws.amazon.com/ec2/latest/instancetypes/.
+# Notes:
+#   - i3en has no 4xlarge/8xlarge; 3xlarge and 6xlarge are the real ladder.
+#   - network_baseline_gbps is the sustained figure; burst is AWS "up to".
+#   - us-west-2 prices equal us-east-1 across all listed SKUs (verified).
+[meta]
+cloud = "aws"
+snapshot_date = "2026-08-05"
+currency = "USD"
+sources = [
+    "https://instances.vantage.sh/instances.json",
+    "https://b0.p.awsstatic.com/pricing/2.0/meteredUnitMaps/ec2/USD/current/ec2-ondemand-without-sec-sel/",
+    "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.csv",
+    "https://docs.aws.amazon.com/ec2/latest/instancetypes/",
+]
+
+[[instance]]
+name = "m7i.xlarge"
+family = "m7i"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 16.0
+nvme_gb = 0
+network_baseline_gbps = 1.562
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.2016, us-west-2 = 0.2016, eu-west-1 = 0.2247, eu-central-1 = 0.2415, ap-south-1 = 0.2121, ap-southeast-1 = 0.2520 }
+
+[[instance]]
+name = "m7i.2xlarge"
+family = "m7i"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 3.125
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.4032, us-west-2 = 0.4032, eu-west-1 = 0.4494, eu-central-1 = 0.4830, ap-south-1 = 0.4242, ap-southeast-1 = 0.5040 }
+
+[[instance]]
+name = "m7i.4xlarge"
+family = "m7i"
+arch = "x86_64"
+vcpus = 16
+mem_gb = 64.0
+nvme_gb = 0
+network_baseline_gbps = 6.25
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.8064, us-west-2 = 0.8064, eu-west-1 = 0.8988, eu-central-1 = 0.9660, ap-south-1 = 0.8484, ap-southeast-1 = 1.0080 }
+
+[[instance]]
+name = "m7i.8xlarge"
+family = "m7i"
+arch = "x86_64"
+vcpus = 32
+mem_gb = 128.0
+nvme_gb = 0
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 1.6128, us-west-2 = 1.6128, eu-west-1 = 1.7976, eu-central-1 = 1.9320, ap-south-1 = 1.6968, ap-southeast-1 = 2.0160 }
+
+[[instance]]
+name = "m7g.xlarge"
+family = "m7g"
+arch = "arm64"
+vcpus = 4
+mem_gb = 16.0
+nvme_gb = 0
+network_baseline_gbps = 1.876
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.1632, us-west-2 = 0.1632, eu-west-1 = 0.1819, eu-central-1 = 0.1955, ap-south-1 = 0.1166, ap-southeast-1 = 0.2040 }
+
+[[instance]]
+name = "m7g.2xlarge"
+family = "m7g"
+arch = "arm64"
+vcpus = 8
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 3.75
+network_burst_gbps = 15.0
+price_hr = { us-east-1 = 0.3264, us-west-2 = 0.3264, eu-west-1 = 0.3638, eu-central-1 = 0.3910, ap-south-1 = 0.2333, ap-southeast-1 = 0.4080 }
+
+[[instance]]
+name = "m7g.4xlarge"
+family = "m7g"
+arch = "arm64"
+vcpus = 16
+mem_gb = 64.0
+nvme_gb = 0
+network_baseline_gbps = 7.5
+network_burst_gbps = 15.0
+price_hr = { us-east-1 = 0.6528, us-west-2 = 0.6528, eu-west-1 = 0.7276, eu-central-1 = 0.7821, ap-south-1 = 0.4666, ap-southeast-1 = 0.8160 }
+
+[[instance]]
+name = "m7g.8xlarge"
+family = "m7g"
+arch = "arm64"
+vcpus = 32
+mem_gb = 128.0
+nvme_gb = 0
+network_baseline_gbps = 15.0
+network_burst_gbps = 15.0
+price_hr = { us-east-1 = 1.3056, us-west-2 = 1.3056, eu-west-1 = 1.4552, eu-central-1 = 1.5642, ap-south-1 = 0.9331, ap-southeast-1 = 1.6320 }
+
+[[instance]]
+name = "c7i.xlarge"
+family = "c7i"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 8.0
+nvme_gb = 0
+network_baseline_gbps = 1.562
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.1785, us-west-2 = 0.1785, eu-west-1 = 0.19152, eu-central-1 = 0.2037, ap-south-1 = 0.1785, ap-southeast-1 = 0.2058 }
+
+[[instance]]
+name = "c7i.2xlarge"
+family = "c7i"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 16.0
+nvme_gb = 0
+network_baseline_gbps = 3.125
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.3570, us-west-2 = 0.3570, eu-west-1 = 0.38304, eu-central-1 = 0.4074, ap-south-1 = 0.3570, ap-southeast-1 = 0.4116 }
+
+[[instance]]
+name = "c7i.4xlarge"
+family = "c7i"
+arch = "x86_64"
+vcpus = 16
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 6.25
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.7140, us-west-2 = 0.7140, eu-west-1 = 0.76608, eu-central-1 = 0.8148, ap-south-1 = 0.7140, ap-southeast-1 = 0.8232 }
+
+[[instance]]
+name = "c7i.8xlarge"
+family = "c7i"
+arch = "x86_64"
+vcpus = 32
+mem_gb = 64.0
+nvme_gb = 0
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 1.4280, us-west-2 = 1.4280, eu-west-1 = 1.53216, eu-central-1 = 1.6296, ap-south-1 = 1.4280, ap-southeast-1 = 1.6464 }
+
+[[instance]]
+name = "c7g.xlarge"
+family = "c7g"
+arch = "arm64"
+vcpus = 4
+mem_gb = 8.0
+nvme_gb = 0
+network_baseline_gbps = 1.876
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.1450, us-west-2 = 0.1450, eu-west-1 = 0.1550, eu-central-1 = 0.1649, ap-south-1 = 0.0982, ap-southeast-1 = 0.1666 }
+
+[[instance]]
+name = "c7g.2xlarge"
+family = "c7g"
+arch = "arm64"
+vcpus = 8
+mem_gb = 16.0
+nvme_gb = 0
+network_baseline_gbps = 3.75
+network_burst_gbps = 15.0
+price_hr = { us-east-1 = 0.2900, us-west-2 = 0.2900, eu-west-1 = 0.3101, eu-central-1 = 0.3298, ap-south-1 = 0.1963, ap-southeast-1 = 0.3332 }
+
+[[instance]]
+name = "c7g.4xlarge"
+family = "c7g"
+arch = "arm64"
+vcpus = 16
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 7.5
+network_burst_gbps = 15.0
+price_hr = { us-east-1 = 0.5800, us-west-2 = 0.5800, eu-west-1 = 0.6202, eu-central-1 = 0.6596, ap-south-1 = 0.3926, ap-southeast-1 = 0.6664 }
+
+[[instance]]
+name = "c7g.8xlarge"
+family = "c7g"
+arch = "arm64"
+vcpus = 32
+mem_gb = 64.0
+nvme_gb = 0
+network_baseline_gbps = 15.0
+network_burst_gbps = 15.0
+price_hr = { us-east-1 = 1.1600, us-west-2 = 1.1600, eu-west-1 = 1.2403, eu-central-1 = 1.3192, ap-south-1 = 0.7853, ap-southeast-1 = 1.3328 }
+
+[[instance]]
+name = "r7i.xlarge"
+family = "r7i"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 1.562
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.2646, us-west-2 = 0.2646, eu-west-1 = 0.2961, eu-central-1 = 0.3192, ap-south-1 = 0.2730, ap-southeast-1 = 0.3192 }
+
+[[instance]]
+name = "r7i.2xlarge"
+family = "r7i"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 64.0
+nvme_gb = 0
+network_baseline_gbps = 3.125
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.5292, us-west-2 = 0.5292, eu-west-1 = 0.5922, eu-central-1 = 0.6384, ap-south-1 = 0.5460, ap-southeast-1 = 0.6384 }
+
+[[instance]]
+name = "r7i.4xlarge"
+family = "r7i"
+arch = "x86_64"
+vcpus = 16
+mem_gb = 128.0
+nvme_gb = 0
+network_baseline_gbps = 6.25
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 1.0584, us-west-2 = 1.0584, eu-west-1 = 1.1844, eu-central-1 = 1.2768, ap-south-1 = 1.0920, ap-southeast-1 = 1.2768 }
+
+[[instance]]
+name = "r7i.8xlarge"
+family = "r7i"
+arch = "x86_64"
+vcpus = 32
+mem_gb = 256.0
+nvme_gb = 0
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 2.1168, us-west-2 = 2.1168, eu-west-1 = 2.3688, eu-central-1 = 2.5536, ap-south-1 = 2.1840, ap-southeast-1 = 2.5536 }
+
+[[instance]]
+name = "r7g.xlarge"
+family = "r7g"
+arch = "arm64"
+vcpus = 4
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 1.876
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.2142, us-west-2 = 0.2142, eu-west-1 = 0.2397, eu-central-1 = 0.2584, ap-south-1 = 0.1502, ap-southeast-1 = 0.2584 }
+
+[[instance]]
+name = "r7g.2xlarge"
+family = "r7g"
+arch = "arm64"
+vcpus = 8
+mem_gb = 64.0
+nvme_gb = 0
+network_baseline_gbps = 3.75
+network_burst_gbps = 15.0
+price_hr = { us-east-1 = 0.4284, us-west-2 = 0.4284, eu-west-1 = 0.4794, eu-central-1 = 0.5168, ap-south-1 = 0.3003, ap-southeast-1 = 0.5168 }
+
+[[instance]]
+name = "r7g.4xlarge"
+family = "r7g"
+arch = "arm64"
+vcpus = 16
+mem_gb = 128.0
+nvme_gb = 0
+network_baseline_gbps = 7.5
+network_burst_gbps = 15.0
+price_hr = { us-east-1 = 0.8568, us-west-2 = 0.8568, eu-west-1 = 0.9588, eu-central-1 = 1.0336, ap-south-1 = 0.6006, ap-southeast-1 = 1.0336 }
+
+[[instance]]
+name = "r7g.8xlarge"
+family = "r7g"
+arch = "arm64"
+vcpus = 32
+mem_gb = 256.0
+nvme_gb = 0
+network_baseline_gbps = 15.0
+network_burst_gbps = 15.0
+price_hr = { us-east-1 = 1.7136, us-west-2 = 1.7136, eu-west-1 = 1.9176, eu-central-1 = 2.0672, ap-south-1 = 1.2013, ap-southeast-1 = 2.0672 }
+
+[[instance]]
+name = "i4i.xlarge"
+family = "i4i"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 32.0
+nvme_gb = 937
+network_baseline_gbps = 1.875
+network_burst_gbps = 10.0
+price_hr = { us-east-1 = 0.343, us-west-2 = 0.343, eu-west-1 = 0.378, eu-central-1 = 0.409, ap-south-1 = 0.389, ap-southeast-1 = 0.411 }
+
+[[instance]]
+name = "i4i.2xlarge"
+family = "i4i"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 64.0
+nvme_gb = 1875
+network_baseline_gbps = 4.687
+network_burst_gbps = 12.0
+price_hr = { us-east-1 = 0.686, us-west-2 = 0.686, eu-west-1 = 0.757, eu-central-1 = 0.818, ap-south-1 = 0.779, ap-southeast-1 = 0.823 }
+
+[[instance]]
+name = "i4i.4xlarge"
+family = "i4i"
+arch = "x86_64"
+vcpus = 16
+mem_gb = 128.0
+nvme_gb = 3750
+network_baseline_gbps = 9.375
+network_burst_gbps = 25.0
+price_hr = { us-east-1 = 1.373, us-west-2 = 1.373, eu-west-1 = 1.514, eu-central-1 = 1.637, ap-south-1 = 1.558, ap-southeast-1 = 1.646 }
+
+[[instance]]
+name = "i4i.8xlarge"
+family = "i4i"
+arch = "x86_64"
+vcpus = 32
+mem_gb = 256.0
+nvme_gb = 7500
+network_baseline_gbps = 18.75
+network_burst_gbps = 18.75
+price_hr = { us-east-1 = 2.746, us-west-2 = 2.746, eu-west-1 = 3.027, eu-central-1 = 3.274, ap-south-1 = 3.115, ap-southeast-1 = 3.291 }
+
+# i3en ladder is xlarge/2xlarge/3xlarge/6xlarge — no 4xlarge/8xlarge exists.
+[[instance]]
+name = "i3en.xlarge"
+family = "i3en"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 32.0
+nvme_gb = 2500
+network_baseline_gbps = 4.2
+network_burst_gbps = 25.0
+price_hr = { us-east-1 = 0.452, us-west-2 = 0.452, eu-west-1 = 0.500, eu-central-1 = 0.540, ap-south-1 = 0.514, ap-southeast-1 = 0.542 }
+
+[[instance]]
+name = "i3en.2xlarge"
+family = "i3en"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 64.0
+nvme_gb = 5000
+network_baseline_gbps = 8.4
+network_burst_gbps = 25.0
+price_hr = { us-east-1 = 0.904, us-west-2 = 0.904, eu-west-1 = 1.000, eu-central-1 = 1.080, ap-south-1 = 1.028, ap-southeast-1 = 1.084 }
+
+[[instance]]
+name = "i3en.3xlarge"
+family = "i3en"
+arch = "x86_64"
+vcpus = 12
+mem_gb = 96.0
+nvme_gb = 7500
+network_baseline_gbps = 12.5
+network_burst_gbps = 25.0
+price_hr = { us-east-1 = 1.356, us-west-2 = 1.356, eu-west-1 = 1.500, eu-central-1 = 1.620, ap-south-1 = 1.542, ap-southeast-1 = 1.626 }
+
+[[instance]]
+name = "i3en.6xlarge"
+family = "i3en"
+arch = "x86_64"
+vcpus = 24
+mem_gb = 192.0
+nvme_gb = 15000
+network_baseline_gbps = 25.0
+network_burst_gbps = 25.0
+price_hr = { us-east-1 = 2.712, us-west-2 = 2.712, eu-west-1 = 3.000, eu-central-1 = 3.240, ap-south-1 = 3.084, ap-southeast-1 = 3.252 }
+
+[[instance]]
+name = "im4gn.xlarge"
+family = "im4gn"
+arch = "arm64"
+vcpus = 4
+mem_gb = 16.0
+nvme_gb = 1875
+network_baseline_gbps = 6.25
+network_burst_gbps = 25.0
+price_hr = { us-east-1 = 0.36379, us-west-2 = 0.36379, eu-west-1 = 0.40110, eu-central-1 = 0.43375, ap-south-1 = 0.41300, ap-southeast-1 = 0.43608 }
+
+[[instance]]
+name = "im4gn.2xlarge"
+family = "im4gn"
+arch = "arm64"
+vcpus = 8
+mem_gb = 32.0
+nvme_gb = 3750
+network_baseline_gbps = 12.5
+network_burst_gbps = 25.0
+price_hr = { us-east-1 = 0.72758, us-west-2 = 0.72758, eu-west-1 = 0.80221, eu-central-1 = 0.86750, ap-south-1 = 0.82600, ap-southeast-1 = 0.87217 }
+
+[[instance]]
+name = "im4gn.4xlarge"
+family = "im4gn"
+arch = "arm64"
+vcpus = 16
+mem_gb = 64.0
+nvme_gb = 7500
+network_baseline_gbps = 25.0
+network_burst_gbps = 25.0
+price_hr = { us-east-1 = 1.45517, us-west-2 = 1.45517, eu-west-1 = 1.60442, eu-central-1 = 1.73501, ap-south-1 = 1.65200, ap-southeast-1 = 1.74434 }
+
+[[instance]]
+name = "im4gn.8xlarge"
+family = "im4gn"
+arch = "arm64"
+vcpus = 32
+mem_gb = 128.0
+nvme_gb = 15000
+network_baseline_gbps = 50.0
+network_burst_gbps = 50.0
+price_hr = { us-east-1 = 2.91034, us-west-2 = 2.91034, eu-west-1 = 3.20883, eu-central-1 = 3.47002, ap-south-1 = 3.30400, ap-southeast-1 = 3.48867 }
+
+[[instance]]
+name = "m6i.xlarge"
+family = "m6i"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 16.0
+nvme_gb = 0
+network_baseline_gbps = 1.562
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.192, us-west-2 = 0.192, eu-west-1 = 0.214, eu-central-1 = 0.230, ap-south-1 = 0.202, ap-southeast-1 = 0.240 }
+
+[[instance]]
+name = "m6i.2xlarge"
+family = "m6i"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 3.125
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.384, us-west-2 = 0.384, eu-west-1 = 0.428, eu-central-1 = 0.460, ap-south-1 = 0.404, ap-southeast-1 = 0.480 }
+
+[[instance]]
+name = "m6i.4xlarge"
+family = "m6i"
+arch = "x86_64"
+vcpus = 16
+mem_gb = 64.0
+nvme_gb = 0
+network_baseline_gbps = 6.25
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 0.768, us-west-2 = 0.768, eu-west-1 = 0.856, eu-central-1 = 0.920, ap-south-1 = 0.808, ap-southeast-1 = 0.960 }
+
+[[instance]]
+name = "m6i.8xlarge"
+family = "m6i"
+arch = "x86_64"
+vcpus = 32
+mem_gb = 128.0
+nvme_gb = 0
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { us-east-1 = 1.536, us-west-2 = 1.536, eu-west-1 = 1.712, eu-central-1 = 1.840, ap-south-1 = 1.616, ap-southeast-1 = 1.920 }
+
+# EBS us-east-1 base rates from the AWS Bulk Price List CSV (2026-08-05).
+# io2 uses tiered IOPS pricing ($0.065 first 32K, $0.0455 to 64K, $0.03185
+# above); the single price_per_iops_month below is the first tier, which
+# covers every cache-volume shape the advisor recommends.
+# gp2 bundles IOPS with capacity (3 IOPS/GiB, burst to 3K below 1 TiB).
+# Regional multipliers: eu-west-1 measured 1.10; us-west-2 1.00;
+# eu-central-1/ap-south-1/ap-southeast-1 pattern-derived estimates.
+
+[[block_storage]]
+name = "gp3"
+price_gb_month = 0.08
+included_iops = 3000
+included_throughput_mbps = 125
+price_per_iops_month = 0.005
+price_per_throughput_mbps_month = 0.04
+max_iops = 80000
+max_throughput_mbps = 2000
+price_multiplier = { us-west-2 = 1.0, eu-west-1 = 1.10, eu-central-1 = 1.19, ap-south-1 = 1.14, ap-southeast-1 = 1.20 }
+
+[[block_storage]]
+name = "gp2"
+price_gb_month = 0.10
+included_iops = 16000
+included_throughput_mbps = 250
+price_per_iops_month = 0.0
+price_per_throughput_mbps_month = 0.0
+max_iops = 16000
+max_throughput_mbps = 250
+price_multiplier = { us-west-2 = 1.0, eu-west-1 = 1.10, eu-central-1 = 1.19, ap-south-1 = 1.14, ap-southeast-1 = 1.20 }
+
+[[block_storage]]
+name = "io1"
+price_gb_month = 0.125
+included_iops = 0
+included_throughput_mbps = 0
+price_per_iops_month = 0.065
+price_per_throughput_mbps_month = 0.0
+max_iops = 64000
+max_throughput_mbps = 1000
+price_multiplier = { us-west-2 = 1.0, eu-west-1 = 1.10, eu-central-1 = 1.19, ap-south-1 = 1.14, ap-southeast-1 = 1.20 }
+
+[[block_storage]]
+name = "io2"
+price_gb_month = 0.125
+included_iops = 0
+included_throughput_mbps = 0
+price_per_iops_month = 0.065
+price_per_throughput_mbps_month = 0.0
+max_iops = 256000
+max_throughput_mbps = 4000
+price_multiplier = { us-west-2 = 1.0, eu-west-1 = 1.10, eu-central-1 = 1.19, ap-south-1 = 1.14, ap-southeast-1 = 1.20 }

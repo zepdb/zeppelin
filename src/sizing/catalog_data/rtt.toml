@@ -1,0 +1,98 @@
+# Curated cross-region RTT medians (ms) for the (discouraged) cross-region
+# case. AWS pairs: cloudping.co P50 matrix, 1-day window, Aug 2026,
+# averaged across both directions. Azure pairs: Microsoft's published
+# monthly P50s (doc updated 2026-07-30). GCP pairs: gcping-derived
+# estimates.
+[meta]
+snapshot_date = "2026-08-05"
+currency = "USD"
+sources = [
+    "https://www.cloudping.co/",
+    "https://learn.microsoft.com/en-us/azure/networking/azure-network-latency",
+    "https://gcping.com/",
+]
+
+[[rtt]]
+from = "aws:us-east-1"
+to = "aws:us-west-2"
+rtt_ms = 66.0
+
+[[rtt]]
+from = "aws:us-east-1"
+to = "aws:eu-west-1"
+rtt_ms = 68.5
+
+[[rtt]]
+from = "aws:us-east-1"
+to = "aws:eu-central-1"
+rtt_ms = 92.0
+
+[[rtt]]
+from = "aws:eu-west-1"
+to = "aws:eu-central-1"
+rtt_ms = 21.5
+
+[[rtt]]
+from = "aws:us-west-2"
+to = "aws:ap-southeast-1"
+rtt_ms = 178.0
+
+[[rtt]]
+from = "aws:ap-south-1"
+to = "aws:ap-southeast-1"
+rtt_ms = 62.0
+
+[[rtt]]
+from = "aws:us-east-1"
+to = "aws:ap-south-1"
+rtt_ms = 193.0
+
+[[rtt]]
+from = "aws:us-east-1"
+to = "aws:ap-southeast-1"
+rtt_ms = 220.0
+
+[[rtt]]
+from = "aws:eu-west-1"
+to = "aws:ap-south-1"
+rtt_ms = 123.0
+
+[[rtt]]
+from = "gcp:us-central1"
+to = "gcp:europe-west1"
+rtt_ms = 105.0
+
+[[rtt]]
+from = "gcp:europe-west1"
+to = "gcp:europe-west4"
+rtt_ms = 7.0
+
+[[rtt]]
+from = "gcp:us-central1"
+to = "gcp:us-west1"
+rtt_ms = 35.0
+
+[[rtt]]
+from = "azure:eastus"
+to = "azure:westus2"
+rtt_ms = 72.0
+
+[[rtt]]
+from = "azure:eastus"
+to = "azure:westeurope"
+rtt_ms = 84.0
+
+[[rtt]]
+from = "azure:westeurope"
+to = "azure:germanywestcentral"
+rtt_ms = 11.0
+
+[[rtt]]
+from = "azure:centralindia"
+to = "azure:southeastasia"
+rtt_ms = 53.0
+
+[[rtt]]
+from = "azure:westus2"
+to = "azure:southeastasia"
+rtt_ms = 162.0

@@ -1,0 +1,283 @@
+# Azure VM and managed-disk catalog.
+# PAYG Linux prices were captured 2026-08-05 from the public Azure Retail
+# Prices API, excluding Spot, low-priority, Windows, and unrelated meters.
+# VM specs and documented maximum network bandwidth were checked against
+# the Microsoft Learn size-series tables. Azure exposes one maximum network
+# figure per size, so baseline and burst are equal in this schema.
+[meta]
+cloud = "azure"
+snapshot_date = "2026-08-05"
+currency = "USD"
+sources = [
+    "https://prices.azure.com/api/retail/prices",
+    "https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/general-purpose/dsv5-series",
+    "https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/general-purpose/ddsv5-series",
+    "https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/memory-optimized/esv5-series",
+    "https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/memory-optimized/edsv5-series",
+    "https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/storage-optimized/lsv3-series",
+]
+
+# Dsv5: no local temporary disk.
+[[instance]]
+name = "D4s_v5"
+family = "Dsv5"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 16.0
+nvme_gb = 0
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 0.192, westus2 = 0.192, westeurope = 0.230, germanywestcentral = 0.230, centralindia = 0.202, southeastasia = 0.240 }
+
+[[instance]]
+name = "D8s_v5"
+family = "Dsv5"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 0.384, westus2 = 0.384, westeurope = 0.460, germanywestcentral = 0.460, centralindia = 0.404, southeastasia = 0.480 }
+
+[[instance]]
+name = "D16s_v5"
+family = "Dsv5"
+arch = "x86_64"
+vcpus = 16
+mem_gb = 64.0
+nvme_gb = 0
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 0.768, westus2 = 0.768, westeurope = 0.920, germanywestcentral = 0.920, centralindia = 0.808, southeastasia = 0.960 }
+
+[[instance]]
+name = "D32s_v5"
+family = "Dsv5"
+arch = "x86_64"
+vcpus = 32
+mem_gb = 128.0
+nvme_gb = 0
+network_baseline_gbps = 16.0
+network_burst_gbps = 16.0
+price_hr = { eastus = 1.536, westus2 = 1.536, westeurope = 1.840, germanywestcentral = 1.840, centralindia = 1.616, southeastasia = 1.920 }
+
+# Ddsv5: one local temporary SSD, represented in `nvme_gb` because it is
+# the ephemeral cache device available to Zeppelin.
+[[instance]]
+name = "D4ds_v5"
+family = "Ddsv5"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 16.0
+nvme_gb = 150
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 0.226, westus2 = 0.226, westeurope = 0.272, germanywestcentral = 0.272, centralindia = 0.244, southeastasia = 0.282 }
+
+[[instance]]
+name = "D8ds_v5"
+family = "Ddsv5"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 32.0
+nvme_gb = 300
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 0.452, westus2 = 0.452, westeurope = 0.544, germanywestcentral = 0.544, centralindia = 0.488, southeastasia = 0.564 }
+
+[[instance]]
+name = "D16ds_v5"
+family = "Ddsv5"
+arch = "x86_64"
+vcpus = 16
+mem_gb = 64.0
+nvme_gb = 600
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 0.904, westus2 = 0.904, westeurope = 1.088, germanywestcentral = 1.088, centralindia = 0.976, southeastasia = 1.128 }
+
+[[instance]]
+name = "D32ds_v5"
+family = "Ddsv5"
+arch = "x86_64"
+vcpus = 32
+mem_gb = 128.0
+nvme_gb = 1200
+network_baseline_gbps = 16.0
+network_burst_gbps = 16.0
+price_hr = { eastus = 1.808, westus2 = 1.808, westeurope = 2.176, germanywestcentral = 2.176, centralindia = 1.952, southeastasia = 2.256 }
+
+# Esv5: memory-optimized, no local temporary disk.
+[[instance]]
+name = "E4s_v5"
+family = "Esv5"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 0.252, westus2 = 0.252, westeurope = 0.304, germanywestcentral = 0.304, centralindia = 0.260, southeastasia = 0.304 }
+
+[[instance]]
+name = "E8s_v5"
+family = "Esv5"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 64.0
+nvme_gb = 0
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 0.504, westus2 = 0.504, westeurope = 0.608, germanywestcentral = 0.608, centralindia = 0.520, southeastasia = 0.608 }
+
+[[instance]]
+name = "E16s_v5"
+family = "Esv5"
+arch = "x86_64"
+vcpus = 16
+mem_gb = 128.0
+nvme_gb = 0
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 1.008, westus2 = 1.008, westeurope = 1.216, germanywestcentral = 1.216, centralindia = 1.040, southeastasia = 1.216 }
+
+[[instance]]
+name = "E32s_v5"
+family = "Esv5"
+arch = "x86_64"
+vcpus = 32
+mem_gb = 256.0
+nvme_gb = 0
+network_baseline_gbps = 16.0
+network_burst_gbps = 16.0
+price_hr = { eastus = 2.016, westus2 = 2.016, westeurope = 2.432, germanywestcentral = 2.432, centralindia = 2.080, southeastasia = 2.432 }
+
+# Edsv5: memory-optimized with one local temporary SSD.
+[[instance]]
+name = "E4ds_v5"
+family = "Edsv5"
+arch = "x86_64"
+vcpus = 4
+mem_gb = 32.0
+nvme_gb = 150
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 0.288, westus2 = 0.288, westeurope = 0.346, germanywestcentral = 0.346, centralindia = 0.302, southeastasia = 0.348 }
+
+[[instance]]
+name = "E8ds_v5"
+family = "Edsv5"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 64.0
+nvme_gb = 300
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 0.576, westus2 = 0.576, westeurope = 0.692, germanywestcentral = 0.692, centralindia = 0.604, southeastasia = 0.696 }
+
+# Lsv3: dedicated ephemeral NVMe, one 1.92-TB device per 8 vCPUs.
+# The additional SCSI temporary disk is deliberately not counted.
+[[instance]]
+name = "L8s_v3"
+family = "Lsv3"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 64.0
+nvme_gb = 1920
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 0.696, westus2 = 0.698, westeurope = 0.832, germanywestcentral = 0.832, centralindia = 0.792, southeastasia = 0.836 }
+
+[[instance]]
+name = "L16s_v3"
+family = "Lsv3"
+arch = "x86_64"
+vcpus = 16
+mem_gb = 128.0
+nvme_gb = 3840
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 1.392, westus2 = 1.396, westeurope = 1.664, germanywestcentral = 1.664, centralindia = 1.584, southeastasia = 1.672 }
+
+[[instance]]
+name = "L32s_v3"
+family = "Lsv3"
+arch = "x86_64"
+vcpus = 32
+mem_gb = 256.0
+nvme_gb = 7680
+network_baseline_gbps = 16.0
+network_burst_gbps = 16.0
+price_hr = { eastus = 2.784, westus2 = 2.792, westeurope = 3.328, germanywestcentral = 3.328, centralindia = 3.168, southeastasia = 3.344 }
+
+# Fixed Premium SSD P tiers are represented as their eastus effective
+# $/GiB-month. Regional multipliers preserve the actual per-disk prices.
+[[block_storage]]
+name = "premium-ssd-p10"
+price_gb_month = 0.153984375
+included_iops = 500
+included_throughput_mbps = 100
+price_per_iops_month = 0.0
+price_per_throughput_mbps_month = 0.0
+max_iops = 500
+max_throughput_mbps = 100
+price_multiplier = { westus2 = 0.909183, westeurope = 1.099949, germanywestcentral = 1.099949, centralindia = 1.0, southeastasia = 1.0 }
+
+[[block_storage]]
+name = "premium-ssd-p20"
+price_gb_month = 0.1430078125
+included_iops = 2300
+included_throughput_mbps = 150
+price_per_iops_month = 0.0
+price_per_throughput_mbps_month = 0.0
+max_iops = 2300
+max_throughput_mbps = 150
+price_multiplier = { westus2 = 0.909042, westeurope = 1.099973, germanywestcentral = 1.099973, centralindia = 1.0, southeastasia = 1.0 }
+
+[[block_storage]]
+name = "premium-ssd-p30"
+price_gb_month = 0.132001953125
+included_iops = 5000
+included_throughput_mbps = 200
+price_per_iops_month = 0.0
+price_per_throughput_mbps_month = 0.0
+max_iops = 5000
+max_throughput_mbps = 200
+price_multiplier = { westus2 = 0.909076, westeurope = 1.099948, germanywestcentral = 1.099948, centralindia = 1.0, southeastasia = 1.0 }
+
+[[block_storage]]
+name = "premium-ssd-p40"
+price_gb_month = 0.1264892578125
+included_iops = 7500
+included_throughput_mbps = 250
+price_per_iops_month = 0.0
+price_per_throughput_mbps_month = 0.0
+max_iops = 7500
+max_throughput_mbps = 250
+price_multiplier = { westus2 = 0.909053, westeurope = 1.099981, germanywestcentral = 1.099981, centralindia = 1.0, southeastasia = 1.0 }
+
+# Hourly Retail API rates converted with 730 hours/month. The conversion,
+# rather than the underlying hourly prices, is the only estimate.
+[[block_storage]]
+name = "premium-ssd-v2"
+price_gb_month = 0.0803
+included_iops = 3000
+included_throughput_mbps = 125
+price_per_iops_month = 0.00511
+price_per_throughput_mbps_month = 0.04015
+max_iops = 80000
+max_throughput_mbps = 1200
+
+# Ultra Disk also charges a VM-level reservation fee for VMs that are not
+# Ultra-enabled; the shared catalog schema cannot represent that fee, so
+# advisor output must call it out rather than silently folding it in.
+[[block_storage]]
+name = "ultra-disk"
+price_gb_month = 0.1197
+included_iops = 0
+included_throughput_mbps = 0
+price_per_iops_month = 0.0496
+price_per_throughput_mbps_month = 0.3497
+max_iops = 400000
+max_throughput_mbps = 10000

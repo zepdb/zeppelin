@@ -1,0 +1,22 @@
+[meta]
+cloud = "azure"
+snapshot_date = "2026-08-05"
+currency = "USD"
+sources = ["fixture"]
+
+[[instance]]
+name = "D8s_v5"
+family = "Dsv5"
+arch = "x86_64"
+vcpus = 8
+mem_gb = 32.0
+nvme_gb = 0
+network_baseline_gbps = 12.5
+network_burst_gbps = 12.5
+price_hr = { eastus = 0.384, westeurope = 0.4416 }
+
+[[block_storage]]
+name = "premium-ssd-v2"
+price_gb_month = 0.0803
+max_iops = 80000
+max_throughput_mbps = 1200

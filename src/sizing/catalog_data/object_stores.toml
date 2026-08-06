@@ -1,0 +1,164 @@
+# Object-store pricing per region group. S3 Express One Zone is
+# deliberately excluded: standard tiers only.
+#
+# Prices verified 2026-08-05 against primary sources: the AWS Price List
+# API (offer publication 2026-07-28), the live Azure Retail Prices API,
+# and the GCS pricing page's per-region data. Azure quotes ops per 10k;
+# converted to per-1k here. GCS bills storage per GiB (binary) while
+# AWS/Azure bill per GB — a ~7.4% per-byte wedge left as-is.
+#
+# TTFB: no authoritative source differentiates in-region TTFB by region;
+# treat it as region-independent per cloud. AWS p50/p99 = 15/60 ms is the
+# calibrated pair from tests/perf_contract/profiles/s3-standard-intra-region
+# (the anchor the Tier 2 model was validated with; independent benchmarks
+# put S3 p50 at 12-25 ms). GCS and Azure pairs are estimates from public
+# comparisons (GCS equal-to-slightly-higher than S3; Azure Hot ~10-20 ms).
+# per_conn_mbps 80 is the measured S3 figure; GCS/Azure inherit it as an
+# estimate.
+[meta]
+snapshot_date = "2026-08-05"
+currency = "USD"
+sources = [
+    "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonS3/current/region_index.json",
+    "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AWSDataTransfer/current/us-east-1/index.json",
+    "https://cloud.google.com/storage/pricing",
+    "https://prices.azure.com/api/retail/prices",
+]
+
+[[object_store]]
+cloud = "aws"
+service = "s3-standard"
+regions = ["us-east-1", "us-west-2", "eu-west-1"]
+storage_gb_month = 0.023
+get_per_1k = 0.0004
+put_per_1k = 0.005
+egress_same_region_per_gb = 0.0
+egress_cross_region_per_gb = 0.02
+ttfb_ms = { p50 = 15.0, p99 = 60.0 }
+per_conn_mbps = 80.0
+
+[[object_store]]
+cloud = "aws"
+service = "s3-standard"
+regions = ["eu-central-1"]
+storage_gb_month = 0.0245
+get_per_1k = 0.00043
+put_per_1k = 0.0054
+egress_same_region_per_gb = 0.0
+egress_cross_region_per_gb = 0.02
+ttfb_ms = { p50 = 15.0, p99 = 60.0 }
+per_conn_mbps = 80.0
+
+[[object_store]]
+cloud = "aws"
+service = "s3-standard"
+regions = ["ap-south-1"]
+storage_gb_month = 0.025
+get_per_1k = 0.0004
+put_per_1k = 0.005
+egress_same_region_per_gb = 0.0
+egress_cross_region_per_gb = 0.086
+ttfb_ms = { p50 = 15.0, p99 = 60.0 }
+per_conn_mbps = 80.0
+
+[[object_store]]
+cloud = "aws"
+service = "s3-standard"
+regions = ["ap-southeast-1"]
+storage_gb_month = 0.025
+get_per_1k = 0.0004
+put_per_1k = 0.005
+egress_same_region_per_gb = 0.0
+egress_cross_region_per_gb = 0.09
+ttfb_ms = { p50 = 15.0, p99 = 60.0 }
+per_conn_mbps = 80.0
+
+# GCS regional Standard: storage identical across all six target regions
+# (asia-south1 dropped its premium); ops are class-based and
+# region-independent (Class B reads, Class A writes). Cross-region within
+# US/EU 0.02, Asia 0.08 per GiB.
+[[object_store]]
+cloud = "gcp"
+service = "gcs-standard-regional"
+regions = ["us-central1", "us-west1", "europe-west1", "europe-west4"]
+storage_gb_month = 0.020
+get_per_1k = 0.0004
+put_per_1k = 0.005
+egress_same_region_per_gb = 0.0
+egress_cross_region_per_gb = 0.02
+ttfb_ms = { p50 = 30.0, p99 = 120.0 }
+per_conn_mbps = 80.0
+
+[[object_store]]
+cloud = "gcp"
+service = "gcs-standard-regional"
+regions = ["asia-south1", "asia-southeast1"]
+storage_gb_month = 0.020
+get_per_1k = 0.0004
+put_per_1k = 0.005
+egress_same_region_per_gb = 0.0
+egress_cross_region_per_gb = 0.08
+ttfb_ms = { p50 = 30.0, p99 = 120.0 }
+per_conn_mbps = 80.0
+
+# Azure Blob Hot LRS: per-region op prices genuinely differ (unlike
+# AWS/GCS). Azure quotes per 10k; converted to per 1k here.
+[[object_store]]
+cloud = "azure"
+service = "blob-hot-lrs"
+regions = ["eastus"]
+storage_gb_month = 0.0208
+get_per_1k = 0.0004
+put_per_1k = 0.005
+egress_same_region_per_gb = 0.0
+egress_cross_region_per_gb = 0.02
+ttfb_ms = { p50 = 15.0, p99 = 80.0 }
+per_conn_mbps = 80.0
+
+[[object_store]]
+cloud = "azure"
+service = "blob-hot-lrs"
+regions = ["westus2"]
+storage_gb_month = 0.0184
+get_per_1k = 0.0004
+put_per_1k = 0.005
+egress_same_region_per_gb = 0.0
+egress_cross_region_per_gb = 0.02
+ttfb_ms = { p50 = 15.0, p99 = 80.0 }
+per_conn_mbps = 80.0
+
+[[object_store]]
+cloud = "azure"
+service = "blob-hot-lrs"
+regions = ["westeurope", "germanywestcentral"]
+storage_gb_month = 0.0196
+get_per_1k = 0.00043
+put_per_1k = 0.0054
+egress_same_region_per_gb = 0.0
+egress_cross_region_per_gb = 0.02
+ttfb_ms = { p50 = 15.0, p99 = 80.0 }
+per_conn_mbps = 80.0
+
+[[object_store]]
+cloud = "azure"
+service = "blob-hot-lrs"
+regions = ["centralindia"]
+storage_gb_month = 0.020
+get_per_1k = 0.00044
+put_per_1k = 0.0055
+egress_same_region_per_gb = 0.0
+egress_cross_region_per_gb = 0.08
+ttfb_ms = { p50 = 15.0, p99 = 80.0 }
+per_conn_mbps = 80.0
+
+[[object_store]]
+cloud = "azure"
+service = "blob-hot-lrs"
+regions = ["southeastasia"]
+storage_gb_month = 0.020
+get_per_1k = 0.0004
+put_per_1k = 0.005
+egress_same_region_per_gb = 0.0
+egress_cross_region_per_gb = 0.08
+ttfb_ms = { p50 = 15.0, p99 = 80.0 }
+per_conn_mbps = 80.0
