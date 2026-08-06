@@ -149,6 +149,34 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # lease_duration_secs = 300          # per-namespace compaction lease (multi-node); must be > 0
 
 [mmli]
+# Exact truth-matrix storage for NEW text namespace epochs. Default: "f16".
+# This choice is one-way: an existing f16 epoch cannot be switched in place.
+# INT8-G32 also requires the qualified text-lane stamp; startup fails closed
+# rather than falling back when the epoch/configuration is inconsistent.
+# text_matrix_dtype = "f16"          # "f16" or "int8_g32"
+# visual_matrix_dtype = "f16"        # keep f16; visual INT8-G32 is unqualified
+#
+# Measured late-query profiles (Apple M3 Max, loopback MinIO, 1,109 queries):
+#
+#   General/default profile — f16, exact historical quality:
+#     candidate_k = 1000, read_gap_budget_bytes = 65536
+#     recall@10 0.980072; p50 72 ms after parallel resident scanning.
+#
+#   Lowest-latency text profile — accepts 0.54 percentage-point recall loss:
+#     text_matrix_dtype = "int8_g32"
+#     candidate_k = 1000, read_gap_budget_bytes = 524288
+#     recall@10 0.974662; p50 48 ms.
+#
+#   Quality-preserving text profile — recommended when recall must not regress:
+#     text_matrix_dtype = "int8_g32"
+#     candidate_k = 1200, read_gap_budget_bytes = 786432
+#     recall@10 0.980703 (above f16 K=1000); p50 53 ms.
+#
+# Both INT8 profiles keep read_max_concurrency = 16. Large gap budgets are for
+# this qualified high-density latency shape only: the sparse 50k-unit replay
+# showed severe byte amplification without a corresponding GET reduction.
+# See tasks/LateLatency/results/phase09-scan-int8.md for full p50/p95/p99,
+# requests, bytes, and recall evidence.
 # allow_dev_encoder = false          # ZEPPELIN_MMLI_ALLOW_DEV_ENCODER; local/test opt-in only
 # enrichment_queue_capacity = 64     # ZEPPELIN_MMLI_ENRICHMENT_QUEUE_CAPACITY; must be > 0
 # max_fragments_per_tick = 8         # ZEPPELIN_MMLI_MAX_FRAGMENTS_PER_TICK; must be > 0
@@ -159,17 +187,18 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # Late-interaction segment index and read-plan knobs. The read defaults are
 # measured operating points (see tasks/LateLatency/results/); read_gap_budget
 # and read_max_request were probed across corpora and are not free wins to
-# raise.
+# raise. For a low-latency text namespace, take candidate_k and
+# read_gap_budget_bytes from exactly one measured profile above.
 # [mmli.segment]
 # nlist = 256                        # candidate IVF centroid count
 # probe_budget = 16                  # candidate IVF clusters read per query
-# candidate_k = 1000                 # approximate rows kept before exact MaxSim
+# candidate_k = 1000                 # use 1200 for quality-preserving INT8-G32
 # kmeans_max_iterations = 100
 # kmeans_convergence_epsilon = 0.0001
 # max_matrix_object_bytes = 67108864         # 64 MiB record-major matrix blocks
 # max_cluster_object_bytes = 8388608         # 8 MiB wave-one cluster shards
 # max_resident_bootstrap_bytes = 134217728   # 128 MiB resident centroid cap
-# read_gap_budget_bytes = 65536              # 64 KiB coalesced-gap cap per request
+# read_gap_budget_bytes = 65536              # speed INT8: 524288; quality INT8: 786432
 # read_max_request_bytes = 8388608           # 8 MiB per physical ranged request
 # read_max_concurrency = 16                  # concurrent truth-wave range reads
 # incremental_max_changed_fraction = 0.2
