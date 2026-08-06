@@ -14,18 +14,50 @@
 
 ---
 
+## Why Zeppelin
+
+Most vector databases replicate your data across SSD-backed nodes and keep
+indexes memory-resident — you pay for that fleet whether you query it or
+not. Zeppelin stores everything (vectors, indexes, WAL, manifest) in object
+storage and keeps nodes stateless. A warm dense query is one conditional
+manifest GET plus two bounded waves of parallel range reads — a quantized
+coarse scan, then an exact rerank — so compute scales with query volume,
+storage scales at object-store prices, and any node, including one that
+just booted, can serve any namespace. There is no rebalancing, no replica
+fleet, and nothing to lose when a node dies. The design target is recall
+parity with memory-resident engines at structurally lower cost, not peak
+QPS.
+
 ## Features
 
 - **S3-native** -- Object storage is the single source of truth
 - **Stateless nodes** -- Any node can serve any query
-- **IVF indexing** -- IVF-Flat, IVF-SQ8 (4x compression), IVF-PQ (16-32x), and Hierarchical ANN
+- **IVF indexing** -- Scale-aware IVF-Flat partitioning and Hierarchical ANN
+- **Quantization** -- 2-bit Extended-RaBitQ with exact f32 rerank (production default), SQ8 (4x), PQ (16-32x), and f16 storage
 - **BM25 full-text search** -- Inverted indexes with configurable tokenization, stemming, and multi-field `rank_by` expressions (opt-in, see below)
+- **Late-interaction retrieval** -- Multi-vector MaxSim with asynchronous semantic enrichment and RRF fusion ([guide](docs/late-interaction.md))
 - **Bitmap pre-filters** -- RoaringBitmap indexes for sub-millisecond attribute filtering
 - **Write-ahead log** -- Durable writes with compaction into indexed segments
 - **Namespace forks** -- Disabled-by-default, licensed copy-on-write branching ([operator guide](docs/branching-operations.md)); fork only, no merge
 - **Strong & eventual consistency** -- Choose per-query (see [Consistency semantics](#consistency-semantics))
+- **Licensed security suite** -- Fail-closed authorization kernel, RBAC, durable audit log, delegation tokens, and preservation holds ([deployment guide](docs/security-deployment.md))
 - **Object storage** -- S3, MinIO, and S3-compatible backends. GCS and Azure planned
 - **Sizing advisor** -- Ranked hardware recommendations and validated, tuned configs from an embedded cloud pricing catalog (see [Sizing advisor](#sizing-advisor))
+
+## Status
+
+Zeppelin is pre-1.0 software under active development:
+
+- **No on-disk format stability guarantee yet.** Stored artifacts may
+  change between pre-1.0 versions without migration tooling. Artifacts are
+  immutable within a version.
+- **Namespace branching is disabled by default**, gated behind a signed
+  license, and its release validation gates are not yet complete.
+- **GCS and Azure backends are planned, not implemented.** S3 and
+  S3-compatible stores are the supported substrates today.
+- Published performance numbers are loopback-MinIO measurements, not
+  cloud-S3 latency claims — see [Performance](#performance) for exactly
+  what was measured.
 
 ## Performance
 
@@ -41,6 +73,8 @@ against loopback MinIO (Apple M3 Max, rustc 1.93, release build):
 | p95 / p99 | 9.3 ms / 9.7 ms | 15.8 ms / -- |
 | recall vs exact ground truth | 0.989 @10 | 0.982 @100 |
 
+(p99 for the `top_k = 100` cell was not recorded in the measurement ledger.)
+
 Every warm query stays honest to the S3-native design: one conditional
 manifest GET (strong consistency re-verifies the authoritative manifest) plus
 ~37 parallel segment range GETs (~16 MB) per query — nothing above is served
@@ -48,6 +82,14 @@ from index state that bypasses object storage. On byte-dominated deployments
 (local disk / MinIO), setting `query.cost_latency_profile = "low_latency"`
 trades more range requests for fewer bytes and cuts warm mean latency a
 further ~7%; the default profile stays request-optimized for real S3 pricing.
+
+Late-interaction (`late_interaction_fde`) queries, measured on the same
+host: warm truth-wave p50 of 59 ms and end-to-end p50 of 102 ms on a
+50k-unit heavy-tail corpus (1,109 queries, K = 1000, f16 token matrices);
+~42 ms truth wave on SciFact (5,183 docs). The 2026-08 optimization ladder
+cut the 50k truth wave 7x (417 ms to 59 ms) via streamed range reads, f16
+decode acceleration, and parallel scoped scoring — per-phase attribution
+and caveats in [docs/late-interaction.md](docs/late-interaction.md).
 
 These are loopback-MinIO measurements, not cloud-S3 latency claims: real S3
 adds its per-request round-trip floors to the manifest, coarse, and rerank
@@ -63,28 +105,40 @@ Spin up Zeppelin with MinIO locally using Docker Compose:
 docker compose up
 ```
 
-This starts Zeppelin on port `8080` and MinIO on port `9000` with a pre-created `zeppelin` bucket.
+This starts Zeppelin on port `8080` and MinIO on port `9000` with a pre-created `zeppelin` bucket. The bundled [`zeppelin.dev.toml`](zeppelin.dev.toml) boots the server in `open_unsafe` security mode (no authentication) — local development only; see the [security deployment guide](docs/security-deployment.md) before deploying anywhere real.
+
+Every example below is copy-pasteable end-to-end (4-dimensional vectors
+keep them short — real embeddings just have more numbers).
 
 ### Create a namespace
 
 ```bash
 # Server generates a UUID name — save it!
-curl -s http://localhost:8080/v1/namespaces \
+NS=$(curl -s http://localhost:8080/v1/namespaces \
   -H "Content-Type: application/json" \
-  -d '{"dimensions": 384}' | jq
-# Response: {"name": "550e8400-e29b-41d4-a716-446655440000", "dimensions": 384, ..., "warning": "Save this namespace name..."}
+  -d '{"dimensions": 4, "full_text_search": {"content": {}}}' | jq -r .name)
+echo "$NS"
 ```
+
+The `full_text_search` block enables BM25 over the `content` attribute; omit
+it if you only need vector search.
 
 ### Upsert vectors
 
 ```bash
-# Replace <ns> with the UUID from the create response
-curl -s http://localhost:8080/v1/namespaces/<ns>/vectors \
+curl -s http://localhost:8080/v1/namespaces/$NS/vectors \
   -H "Content-Type: application/json" \
   -d '{
     "vectors": [
-      {"id": "vec-1", "values": [0.1, 0.2, 0.3, "...384 dims..."]},
-      {"id": "vec-2", "values": [0.4, 0.5, 0.6, "...384 dims..."]}
+      {"id": "vec-1", "values": [0.10, 0.20, 0.30, 0.40],
+       "attributes": {"genre": "systems", "year": 2026,
+                      "content": "object storage is the source of truth"}},
+      {"id": "vec-2", "values": [0.40, 0.30, 0.20, 0.10],
+       "attributes": {"genre": "databases", "year": 2025,
+                      "content": "stateless nodes serve any namespace"}},
+      {"id": "vec-3", "values": [0.11, 0.21, 0.31, 0.41],
+       "attributes": {"genre": "systems", "year": 2024,
+                      "content": "the write-ahead log compacts into segments"}}
     ]
   }' | jq
 ```
@@ -92,48 +146,68 @@ curl -s http://localhost:8080/v1/namespaces/<ns>/vectors \
 ### Query
 
 ```bash
-curl -s http://localhost:8080/v1/namespaces/<ns>/query \
+curl -s http://localhost:8080/v1/namespaces/$NS/query \
   -H "Content-Type: application/json" \
-  -d '{
-    "vector": [0.1, 0.2, 0.3, "...384 dims..."],
-    "top_k": 10
-  }' | jq
+  -d '{"vector": [0.1, 0.2, 0.3, 0.4], "top_k": 2}' | jq
 ```
 
-For a `late_interaction_fde` namespace with an active embedding profile, send
-query text through the retrieval algebra:
+```json
+{
+  "results": [
+    {"id": "vec-1", "score": 0.0,
+     "attributes": {"genre": "systems", "year": 2026,
+                    "content": "object storage is the source of truth"}},
+    {"id": "vec-3", "score": 0.000104129314,
+     "attributes": {"genre": "systems", "year": 2024,
+                    "content": "the write-ahead log compacts into segments"}}
+  ],
+  "scanned_fragments": 1,
+  "scanned_segments": 0
+}
+```
+
+Scores are distances for vector search (lower is better) and relevance for
+BM25 (higher is better).
+
+### Query with an attribute filter
 
 ```bash
-curl -s http://localhost:8080/v1/namespaces/<ns>/query \
+curl -s http://localhost:8080/v1/namespaces/$NS/query \
   -H "Content-Type: application/json" \
   -d '{
-    "sources": [{
-      "type": "late_interaction",
-      "text": "find the section about storage ownership",
-      "top_k": 100,
-      "semantic_wait_ms": 5000
-    }],
-    "consistency": "strong",
-    "top_k": 10
+    "vector": [0.1, 0.2, 0.3, 0.4],
+    "top_k": 10,
+    "filter": {"op": "eq", "field": "genre", "value": "systems"}
   }' | jq
 ```
 
-Strong queries wait for every visible live record to have an exact semantic
-overlay. If the budget expires, Zeppelin returns `SEMANTIC_INDEX_LAG` with
-`requested_generation`, `covered_sequence`, `pending_records`, and
-`failed_records`. Eventual queries score only covered live versions and
-suppress newer pending versions and tombstones. Their response reports
-`"semantic_coverage": "complete"` when every live version was covered and
-`"semantic_coverage": "partial"` when any live version was omitted.
-Late-interaction sources can participate in RRF fusion; weighted fusion is
-rejected because raw MaxSim is not calibrated against dense or BM25 scores.
+Filters compose with `and`, `or`, `not`, `in`, range, and `contains`
+operators — see the [OpenAPI spec](api/zeppelin-api.yaml) for the full
+grammar.
+
+### BM25 full-text query
+
+```bash
+curl -s http://localhost:8080/v1/namespaces/$NS/query \
+  -H "Content-Type: application/json" \
+  -d '{"rank_by": ["content", "BM25", "storage truth"], "top_k": 2}' | jq
+```
+
+For multi-vector late-interaction retrieval (query text scored with MaxSim
+against token matrices), see [docs/late-interaction.md](docs/late-interaction.md).
 
 ### Delete vectors
 
 ```bash
-curl -s -X DELETE http://localhost:8080/v1/namespaces/<ns>/vectors \
+curl -s -X DELETE http://localhost:8080/v1/namespaces/$NS/vectors \
   -H "Content-Type: application/json" \
   -d '{"ids": ["vec-1"]}' | jq
+```
+
+### Clean up
+
+```bash
+curl -s -X DELETE http://localhost:8080/v1/namespaces/$NS | jq
 ```
 
 ## Sizing advisor
@@ -171,6 +245,19 @@ tuning rationale is documented in
 [`tasks/config_tuning.md`](tasks/config_tuning.md); refresh the pricing
 snapshot with
 [`scripts/refresh_cloud_catalog.py`](scripts/refresh_cloud_catalog.py).
+
+## Configuration
+
+Zeppelin boots from built-in defaults, overridden by an optional
+`zeppelin.toml` (path via `ZEPPELIN_CONFIG`), overridden in turn by
+environment variables. [`zeppelin.toml.example`](zeppelin.toml.example)
+documents the commonly tuned knobs with their defaults and env-var names.
+For a hardware-tuned config validated through the real loader, use
+`zeppelin_advisor emit-config` (above). The knob-by-knob rationale —
+including safety couplings like the GC horizon floor, hardcoded constants,
+and env-only knobs — is documented in
+[`tasks/config_tuning.md`](tasks/config_tuning.md), which a CI test keeps
+consistent with the actual config surface.
 
 ## API Reference
 
@@ -241,6 +328,16 @@ returns a not-licensed error without it. See the
 
 Use the HTTP API directly or generate a client from the canonical [OpenAPI 3.1 spec](api/zeppelin-api.yaml). This repository does not maintain generated client SDK packages.
 
+## Documentation
+
+- [OpenAPI 3.1 spec](api/zeppelin-api.yaml) — the canonical API contract
+- [Late-interaction retrieval](docs/late-interaction.md) — multi-vector MaxSim: querying, coverage semantics, measured performance
+- [Security deployment guide](docs/security-deployment.md) — enforced mode, API keys, RBAC, audit
+- [Compliance mapping](docs/compliance-mapping.md) — control-framework mapping for the security features
+- [Branching operations](docs/branching-operations.md) — operator guide for licensed namespace forks
+- [Config tuning rationale](tasks/config_tuning.md) — every knob, its couplings, and which numbers are measured vs engineered
+- [Rustdoc style](docs/rustdoc-style.md) — documentation conventions for contributors
+
 ## Development
 
 ### Prerequisites
@@ -267,7 +364,7 @@ For the MinIO-backed integration pass:
 ```bash
 docker compose -f docker-compose.test.yml up -d
 TEST_BACKEND=minio \
-TEST_S3_BUCKET=stormcrow-test \
+TEST_S3_BUCKET=zeppelin-test \
 MINIO_ENDPOINT=http://localhost:9000 \
 MINIO_ACCESS_KEY=minioadmin \
 MINIO_SECRET_KEY=minioadmin \
@@ -280,22 +377,23 @@ cargo test --tests
 # Start MinIO
 docker compose -f docker-compose.test.yml up -d
 
-# Run Zeppelin against local MinIO
+# Run Zeppelin against local MinIO (open_unsafe dev security posture)
+ZEPPELIN_CONFIG=zeppelin.dev.toml \
 STORAGE_BACKEND=s3 \
-S3_BUCKET=stormcrow-test \
+S3_BUCKET=zeppelin-test \
 S3_ENDPOINT=http://localhost:9000 \
 AWS_ACCESS_KEY_ID=minioadmin \
 AWS_SECRET_ACCESS_KEY=minioadmin \
 AWS_REGION=us-east-1 \
 S3_ALLOW_HTTP=true \
-cargo run
+cargo run --bin zeppelin
 ```
 
 ### Lint and format
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 ```
 
 ## Architecture
@@ -311,6 +409,22 @@ src/
   compaction/  Background WAL-to-segment compaction
   security/    Authorization kernel, policy, entitlements, audit
   server/      Axum HTTP handlers, routes, middleware
+```
+
+```
+Write path                              Query path
+──────────                              ──────────
+client ── upsert ─▶ node                client ── query ─▶ node
+                     │                                      │
+        PUT WAL fragment ─────▶ S3      conditional GET manifest ──▶ S3
+                     │                                      │
+        CAS manifest (ETag) ──▶ S3      coarse wave: parallel range GETs
+                                        (quantized cluster scans)
+background compaction                                       │
+  WAL fragments ─▶ IVF segments         rerank wave: coalesced range GETs
+  + bitmap / BM25 indexes               (exact f32 rows)
+  (one owner via lease + CAS)                               │
+                                        merged, reranked top-k
 ```
 
 Writes land in the WAL as immutable fragments. Background compaction merges fragments into indexed segments (IVF, bitmap pre-filters, BM25 inverted indexes). Queries probe the closest centroids and merge results from any un-compacted WAL fragments.
@@ -359,6 +473,12 @@ compaction only when `indexing.fts_index = true` (or `ZEPPELIN_FTS_INDEX=true`)
 that never use FTS. Without it, segment BM25 falls back to a full scan,
 which is rejected above `bm25_max_full_scan_clusters` (default 500) to
 protect latency. Enable `fts_index` if you use `rank_by` at scale.
+
+## Contributing
+
+Issues and pull requests are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the gates to run before sending a PR
+and the ground rules (no silent fallbacks, tests hit real object storage).
 
 ## License
 

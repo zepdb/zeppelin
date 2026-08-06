@@ -2,6 +2,11 @@
 # Copy to zeppelin.toml and uncomment values to override defaults.
 # Environment variables (shown in comments) take precedence over file values.
 # Set ZEPPELIN_CONFIG to point to a custom config file path.
+#
+# For a validated config tuned to specific hardware, use the sizing advisor
+# (`zeppelin_advisor emit-config`, see the README). The knob-by-knob tuning
+# rationale, including hardcoded constants and env-only knobs not listed
+# here, is documented in tasks/config_tuning.md.
 
 [security]
 # REQUIRED: choose exactly one explicit process posture. `enforced` refuses to
@@ -74,6 +79,7 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 [cache]
 # dir = "/var/cache/zeppelin"        # ZEPPELIN_CACHE_DIR
 # max_size_gb = 50                   # ZEPPELIN_CACHE_MAX_SIZE_GB
+# memory_cache_max_mb = 256          # ZEPPELIN_MEMORY_CACHE_MAX_MB; in-memory cluster cache
 # wal_fragment_cache_max_mb = 128    # ZEPPELIN_WAL_FRAGMENT_CACHE_MAX_MB; 0 disables decoded memo
 # decoded_artifact_cache_max_mb = 64 # ZEPPELIN_DECODED_ARTIFACT_CACHE_MAX_MB; 0 disables FTS decode memo
 # namespace_registry_ttl_ms = 5000   # positive cache TTL for namespace metadata
@@ -92,7 +98,9 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 
 [indexing]
 # default_num_centroids = 256        # ZEPPELIN_DEFAULT_NUM_CENTROIDS
-# default_nprobe = 16                # ZEPPELIN_DEFAULT_NPROBE; must be > 0 and <= max_nprobe
+# default_nprobe = 32                # ZEPPELIN_DEFAULT_NPROBE; must be > 0 and <= max_nprobe
+#                                    # Flat segments resolve an omitted nprobe scale-aware:
+#                                    # 3/16 of the active segment's clusters, floored here
 # max_nprobe = 256                   # must be > 0
 # kmeans_max_iterations = 25
 # kmeans_convergence_epsilon = 0.0001
@@ -147,6 +155,24 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # max_bytes_per_tick = 67108864      # ZEPPELIN_MMLI_MAX_BYTES_PER_TICK; must be > 0
 # max_retry_attempts = 3             # ZEPPELIN_MMLI_MAX_RETRY_ATTEMPTS; must be > 0
 # shutdown_timeout_secs = 30         # ZEPPELIN_MMLI_SHUTDOWN_TIMEOUT_SECS; must be > 0
+
+# Late-interaction segment index and read-plan knobs. The read defaults are
+# measured operating points (see tasks/LateLatency/results/); read_gap_budget
+# and read_max_request were probed across corpora and are not free wins to
+# raise.
+# [mmli.segment]
+# nlist = 256                        # candidate IVF centroid count
+# probe_budget = 16                  # candidate IVF clusters read per query
+# candidate_k = 1000                 # approximate rows kept before exact MaxSim
+# kmeans_max_iterations = 100
+# kmeans_convergence_epsilon = 0.0001
+# max_matrix_object_bytes = 67108864         # 64 MiB record-major matrix blocks
+# max_cluster_object_bytes = 8388608         # 8 MiB wave-one cluster shards
+# max_resident_bootstrap_bytes = 134217728   # 128 MiB resident centroid cap
+# read_gap_budget_bytes = 65536              # 64 KiB coalesced-gap cap per request
+# read_max_request_bytes = 8388608           # 8 MiB per physical ranged request
+# read_max_concurrency = 16                  # concurrent truth-wave range reads
+# incremental_max_changed_fraction = 0.2
 
 # Optional. Required only when an active profile selects a pinned worker.
 # The profile epoch, not this mutable config, owns the S3 model-bundle prefix.
