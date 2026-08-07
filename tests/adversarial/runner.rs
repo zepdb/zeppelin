@@ -13873,8 +13873,53 @@ mod outcome_tests {
         );
     }
 
-    #[tokio::test]
-    async fn deterministic_seed_uses_the_canonical_quiet_period_order() {
+    /// Runs one runner-driving test body on a 16 MiB stack.
+    ///
+    /// `run_seed` and `run_replay` build the deepest async state machines in
+    /// this harness. A debug build does not collapse those nested `poll`
+    /// frames, so driving them from libtest's default thread stack overflows
+    /// and **aborts the process** — taking all 328 tests in this binary with
+    /// it instead of failing one, and truncating a `--no-fail-fast` sweep
+    /// without reporting the rest as failed or skipped.
+    ///
+    /// Every integration entry point that reaches this code already does
+    /// exactly this: `smoke`, `oracle_selftest`, `replay_seed`, and `inspect`
+    /// in `adversarial_workload_tests.rs` each spawn a 16 MiB thread with a
+    /// 16 MiB-stacked runtime. The unit tests in this module were never given
+    /// the same treatment, which went unnoticed while CI was dark from
+    /// 2026-07-16. This helper applies that established convention to all six
+    /// runner-driving tests here rather than the one that happened to abort
+    /// first — fixing only that one just moves the abort to the next-deepest
+    /// test, which is precisely what happened on 2026-08-07.
+    fn block_on_deep_runner<F>(body: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        // A current-thread runtime, matching what `#[tokio::test]` builds.
+        // These tests assert exact interleavings and recorded trace structure,
+        // so switching them to a multi-threaded scheduler would change what is
+        // under test. The only intended difference from the attribute form is
+        // the stack the body runs on.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("deep-runner runtime must build")
+                    .block_on(body);
+            })
+            .expect("deep-runner thread must spawn")
+            .join()
+            .expect("deep-runner thread must join");
+    }
+
+    #[test]
+    fn deterministic_seed_uses_the_canonical_quiet_period_order() {
+        block_on_deep_runner(deterministic_seed_uses_the_canonical_quiet_period_order_body());
+    }
+
+    async fn deterministic_seed_uses_the_canonical_quiet_period_order_body() {
         let root = tempfile::TempDir::new().unwrap();
         let env = RunnerEnv {
             seconds: 30,
@@ -13927,8 +13972,14 @@ mod outcome_tests {
         assert!(!seed_dir.join("faults.jsonl").exists());
     }
 
-    #[tokio::test]
-    async fn legacy_chaos_resolves_failed_initial_manifest_before_quiescence() {
+    #[test]
+    fn legacy_chaos_resolves_failed_initial_manifest_before_quiescence() {
+        block_on_deep_runner(
+            legacy_chaos_resolves_failed_initial_manifest_before_quiescence_body(),
+        );
+    }
+
+    async fn legacy_chaos_resolves_failed_initial_manifest_before_quiescence_body() {
         let root = tempfile::TempDir::new().unwrap();
         let env = RunnerEnv {
             seconds: 30,
@@ -14812,8 +14863,12 @@ mod outcome_tests {
         harness.cleanup().await;
     }
 
-    #[tokio::test]
-    async fn content_seed_127_classifies_durable_torn_manifest_loudly() {
+    #[test]
+    fn content_seed_127_classifies_durable_torn_manifest_loudly() {
+        block_on_deep_runner(content_seed_127_classifies_durable_torn_manifest_loudly_body());
+    }
+
+    async fn content_seed_127_classifies_durable_torn_manifest_loudly_body() {
         let root = tempfile::TempDir::new().unwrap();
         // The default mixed rotation no longer selects the legacy content
         // profile; pin it explicitly to keep this seed's recorded timeline.
@@ -16834,8 +16889,12 @@ mod outcome_tests {
         harness.cleanup().await;
     }
 
-    #[tokio::test]
-    async fn ops_delete_rendezvous_replay_reenacts_recorded_causality() {
+    #[test]
+    fn ops_delete_rendezvous_replay_reenacts_recorded_causality() {
+        block_on_deep_runner(ops_delete_rendezvous_replay_reenacts_recorded_causality_body());
+    }
+
+    async fn ops_delete_rendezvous_replay_reenacts_recorded_causality_body() {
         let source_root = tempfile::TempDir::new().unwrap();
         let source_env = RunnerEnv {
             seconds: 30,
@@ -17949,8 +18008,14 @@ mod outcome_tests {
         harness.cleanup().await;
     }
 
-    #[tokio::test]
-    async fn replay_preserves_terminal_join_when_hold_candidate_completes_early() {
+    #[test]
+    fn replay_preserves_terminal_join_when_hold_candidate_completes_early() {
+        block_on_deep_runner(
+            replay_preserves_terminal_join_when_hold_candidate_completes_early_body(),
+        );
+    }
+
+    async fn replay_preserves_terminal_join_when_hold_candidate_completes_early_body() {
         let source_root = tempfile::TempDir::new().unwrap();
         let source_env = RunnerEnv {
             seconds: 30,
@@ -18196,8 +18261,16 @@ mod outcome_tests {
         assert!(environment_restored < release_complete, "{timeline:#?}");
     }
 
-    #[tokio::test]
-    async fn sched_replay_preserves_recorded_hold_and_exact_trace_structure() {
+    /// The deepest test here: the only one driving `run_seed` **and**
+    /// `run_replay` in one body, so it was the first to overflow. See
+    /// [`block_on_deep_runner`] for why every runner-driving test in this
+    /// module needs the 16 MiB stack rather than just this one.
+    #[test]
+    fn sched_replay_preserves_recorded_hold_and_exact_trace_structure() {
+        block_on_deep_runner(sched_replay_preserves_recorded_hold_and_exact_trace_structure_body());
+    }
+
+    async fn sched_replay_preserves_recorded_hold_and_exact_trace_structure_body() {
         fn normalized_structure(records: &[OpRecord], prefix: &str) -> Vec<serde_json::Value> {
             records
                 .iter()
