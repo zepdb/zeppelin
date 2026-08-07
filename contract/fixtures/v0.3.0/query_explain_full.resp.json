@@ -29,12 +29,14 @@
           "candidate_k": 5,
           "index": 0,
           "nprobe": 4,
+          "score_direction": "lower_is_better",
           "type": "ann"
         },
         {
           "candidate_k": 5,
           "index": 1,
           "nprobe": null,
+          "score_direction": "higher_is_better",
           "type": "bm25"
         }
       ],
