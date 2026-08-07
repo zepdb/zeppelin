@@ -1146,6 +1146,49 @@ pub fn reachable_keys_with_staging(
     Ok(keys)
 }
 
+/// Drops the pending-delete entries a retained generation must not pin.
+///
+/// A retained generation's `pending_deletes` are its *uncertain* keys: recorded
+/// for deletion but not confirmed gone. For the ULID-named artifact families
+/// (WAL, input WAL, segment) that uncertainty is exactly what has to keep the
+/// object alive — a generation still inside the retention window may need it,
+/// and sweeping it is the `NoReachableKeyDeleted` violation `TwoPassGcSafety`
+/// forbids.
+///
+/// Content-addressed families are the opposite case. A superseded source or
+/// late-state section is still *referenced* by any retained generation that
+/// genuinely needs it, through that generation's own `late_state` and source
+/// inventory, so ordinary reachability already protects it. Its presence in
+/// `pending_deletes` means only "superseded, reap once the age gate allows",
+/// and that gate is the LIST modification time rather than an embedded ULID
+/// (see `pending_delete_horizon_satisfied`). Pinning those through history
+/// would make superseded sections uncollectable for the whole retention
+/// window.
+///
+/// Keys that do not parse are kept, which fails closed: an unrecognized key is
+/// pinned rather than swept.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace owning `manifest`, used to classify each key.
+/// - `manifest`: Retained historical generation, filtered in place.
+///
+/// # Side Effects
+///
+/// Mutates `manifest.pending_deletes` only. Performs no object-store I/O.
+fn retain_history_pinned_pending_deletes(namespace: &str, manifest: &mut Manifest) {
+    manifest.pending_deletes.retain(|key| {
+        !matches!(
+            parse_gc_artifact_key(namespace, key),
+            Some(
+                ParsedGcArtifact::LateSection
+                    | ParsedGcArtifact::Source
+                    | ParsedGcArtifact::LateArtifact
+            )
+        )
+    });
+}
+
 /// Loads retained manifest history and unions every referenced artifact key.
 ///
 /// Each retained history generation is a PITR root even when its objects are
@@ -1183,17 +1226,17 @@ pub fn reachable_keys_with_staging(
 ///
 /// If retained generations 7 and 8 both reference segment A while only 8
 /// references segment B, the returned set contains both segments' artifacts.
+
 pub async fn retained_manifest_history_reachable_keys(
     store: &ZeppelinStore,
     namespace: &str,
 ) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
     for entry in Manifest::list_history(store, namespace).await? {
-        let manifest = Manifest::read_history(store, namespace, entry.version)
+        let mut historical_roots = Manifest::read_history(store, namespace, entry.version)
             .await?
             .ok_or_else(|| crate::error::ZeppelinError::NotFound { key: entry.key })?;
-        let mut historical_roots = manifest;
-        historical_roots.pending_deletes.clear();
+        retain_history_pinned_pending_deletes(namespace, &mut historical_roots);
         keys.extend(
             reachable_keys_with_loaded_late_state(
                 store,
@@ -2900,7 +2943,7 @@ async fn load_history_observation_owned(
     let (bytes, get_version) = store.get_with_meta(&observation.history.key).await?;
     let manifest = Manifest::decode_history_body(&bytes, namespace, &observation.history)?;
     let mut historical_roots = manifest.clone();
-    historical_roots.pending_deletes.clear();
+    retain_history_pinned_pending_deletes(namespace, &mut historical_roots);
     let late_state = historical_roots.load_late_state(store).await?;
     let reachable_keys =
         reachable_keys_with_late_state(namespace, &historical_roots, late_state.as_ref())?;
