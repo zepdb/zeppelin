@@ -778,14 +778,14 @@ fn parse_registered_routes(source: &str) -> std::collections::HashSet<(String, S
             call.contains("secure_route("),
             "registered route {path} must use the central security method wrapper"
         );
-        for (needle, method) in [
-            ("get(", "GET"),
-            ("post(", "POST"),
-            ("patch(", "PATCH"),
-            (".put(", "PUT"),
-            ("delete(", "DELETE"),
+        for (constructor, method) in [
+            ("get", "GET"),
+            ("post", "POST"),
+            ("patch", "PATCH"),
+            ("put", "PUT"),
+            ("delete", "DELETE"),
         ] {
-            if call.contains(needle) {
+            if calls_method_constructor(call, constructor) {
                 routes.insert((method.to_string(), path.to_string()));
             }
         }
@@ -794,6 +794,36 @@ fn parse_registered_routes(source: &str) -> std::collections::HashSet<(String, S
     #[cfg(not(feature = "profiling"))]
     routes.remove(&("GET".to_string(), "/debug/pprof/cpu".to_string()));
     routes
+}
+
+/// Whether `call` invokes the axum method-router constructor `constructor` in
+/// its own right, rather than as the tail of a longer identifier.
+///
+/// Routes are registered in two shapes that must both count: chained
+/// (`.put(handler)`) and nested inside the security wrapper
+/// (`secure_route(put(handler), &state)`). Matching a bare `"put("` substring
+/// would also fire on `input(`/`output(`, and a bare `"get("` on
+/// `budget(`/`target(`, so a hit only counts when the preceding character
+/// cannot continue a Rust identifier.
+///
+/// This boundary check replaced a per-method needle table that special-cased
+/// PUT as `".put("`. That leading dot silently hid every `put(` registered
+/// through `secure_route(...)` — `PUT /v1/namespaces/:ns/embedding_profile`
+/// was invisible to this parser from `dd6aa2f` until 2026-08-07. A route this
+/// function cannot see is a route whose mandatory `secure_route(` wrapping is
+/// never asserted, so the miss weakened the guard, not just the comparison.
+fn calls_method_constructor(call: &str, constructor: &str) -> bool {
+    let needle = format!("{constructor}(");
+    let mut searched = 0;
+    while let Some(offset) = call[searched..].find(&needle) {
+        let start = searched + offset;
+        let preceding = call[..start].chars().next_back();
+        if !preceding.is_some_and(|character| character.is_alphanumeric() || character == '_') {
+            return true;
+        }
+        searched = start + needle.len();
+    }
+    false
 }
 
 fn balanced_route_call(source: &str) -> &str {
