@@ -338,7 +338,17 @@ struct PreparedCandidate {
 // lint pass.
 #[allow(clippy::large_enum_variant)]
 enum RootedProgress {
-    Candidate(PreparedCandidate),
+    /// The rooted candidate, plus the target intent this call just published.
+    ///
+    /// The second field carries the metadata written by the rooting CAS
+    /// together with the version that CAS returned, so the publish step can
+    /// seed its first attempt instead of re-reading an object this process
+    /// just wrote. It is `None` on the resume path, where no CAS happened
+    /// here and the publish step must read as before.
+    Candidate(
+        PreparedCandidate,
+        Option<(NamespaceMetadata, StorageVersion)>,
+    ),
     #[cfg(feature = "branching-test-support")]
     StoppedAfterRoot,
 }
@@ -4132,7 +4142,7 @@ impl NamespaceGraph {
                     .0;
                 Self::require_preparation_not_cancelled(&current)?;
                 let candidate = self.rebuild_rooted_candidate(&current).await?;
-                self.publish_and_mark_prepared(&target.name, &candidate, &mut lease)
+                self.publish_and_mark_prepared(&target.name, &candidate, &mut lease, None)
                     .await
             }
             .await;
@@ -4173,13 +4183,20 @@ impl NamespaceGraph {
                 not(feature = "branching-test-support"),
                 allow(clippy::infallible_destructuring_match)
             )]
-            let candidate = match rooted {
-                RootedProgress::Candidate(candidate) => candidate,
+            let (candidate, published_intent) = match rooted {
+                RootedProgress::Candidate(candidate, published_intent) => {
+                    (candidate, published_intent)
+                }
                 #[cfg(feature = "branching-test-support")]
                 RootedProgress::StoppedAfterRoot => return Ok(None),
             };
-            self.publish_and_mark_prepared(request.target.as_str(), &candidate, &mut lease)
-                .await?;
+            self.publish_and_mark_prepared(
+                request.target.as_str(),
+                &candidate,
+                &mut lease,
+                published_intent,
+            )
+            .await?;
             Ok::<_, ZeppelinError>(Some(candidate))
         }
         .await;
@@ -4432,7 +4449,7 @@ impl NamespaceGraph {
             })?;
             if prepare.stage != BranchPrepareStage::Reserved {
                 let candidate = self.rebuild_rooted_candidate(&target).await?;
-                return Ok(RootedProgress::Candidate(candidate));
+                return Ok(RootedProgress::Candidate(candidate, None));
             }
 
             let source = self.active_source_metadata(request.source.as_str()).await?;
@@ -4562,7 +4579,16 @@ impl NamespaceGraph {
                 .cas_update_creating_intent(&target, &target_etag)
                 .await
             {
-                Ok(_) => return Ok(RootedProgress::Candidate(candidate)),
+                // The CAS returns the version it just installed, so the publish
+                // step can start from that instead of reading the object back.
+                // A backend that supplies no version yields `None` and the read
+                // happens as before.
+                Ok(published) => {
+                    return Ok(RootedProgress::Candidate(
+                        candidate,
+                        published.map(|version| (target, version)),
+                    ))
+                }
                 Err(ZeppelinError::ManifestConflict { .. }) => continue,
                 Err(error) => return Err(error),
             }
@@ -4784,6 +4810,7 @@ impl NamespaceGraph {
         target: &str,
         candidate: &PreparedCandidate,
         lease: &mut Lease,
+        published_intent: Option<(NamespaceMetadata, StorageVersion)>,
     ) -> Result<()> {
         let source = candidate.branch.identity.source_namespace.as_str();
         let renewed = self.lease_manager.renew(source, lease).await?;
@@ -4793,19 +4820,44 @@ impl NamespaceGraph {
             });
         }
         *lease = renewed;
-        // The source manifest and the target's creating intent live in
-        // different namespaces and neither read's key or result feeds the
-        // other; the checks that follow are unchanged and still run in the
-        // same order. Reading them together removes one round trip.
-        let (source_read, target_read) = tokio::try_join!(
-            Manifest::read_versioned_required_for_incarnation(
-                &self.store,
-                source,
-                candidate.branch.identity.source_incarnation.as_uuid(),
-            ),
-            self.namespace_manager.read_creating_intent_strong(target),
-        )?;
-        let (source_manifest, source_version) = source_read;
+        // The rooting CAS returns the intent it just installed, so on the
+        // ordinary path there is nothing to read back here: `published_intent`
+        // is that exact object plus its version, and a read could only return
+        // the same bytes or a concurrent change that the publish CAS below
+        // would reject anyway.
+        //
+        // Seeding also skips no validation. `read_creating_intent_strong`
+        // checks `state == Creating` and a `Fork` creation kind, and
+        // `cas_update_creating_intent` refuses to write unless both already
+        // hold, so anything it returns satisfies them by construction.
+        //
+        // On the resume path (`published_intent == None`, no CAS happened in
+        // this process) the read still happens, and is overlapped with the
+        // source manifest read since the two touch different namespaces and
+        // neither feeds the other.
+        let (source_manifest, source_version, target_read) = match published_intent {
+            Some(observation) => {
+                let (source_manifest, source_version) =
+                    Manifest::read_versioned_required_for_incarnation(
+                        &self.store,
+                        source,
+                        candidate.branch.identity.source_incarnation.as_uuid(),
+                    )
+                    .await?;
+                (source_manifest, source_version, observation)
+            }
+            None => {
+                let (source_read, target_read) = tokio::try_join!(
+                    Manifest::read_versioned_required_for_incarnation(
+                        &self.store,
+                        source,
+                        candidate.branch.identity.source_incarnation.as_uuid(),
+                    ),
+                    self.namespace_manager.read_creating_intent_strong(target),
+                )?;
+                (source_read.0, source_read.1, target_read)
+            }
+        };
         if source_version.is_deletion_fenced() {
             return Err(BranchError::SourceDeleting {
                 namespace: candidate.branch.identity.source_namespace.clone(),
@@ -5755,11 +5807,18 @@ impl NamespaceGraph {
                             provisional: None,
                         });
                         rooted.updated_at = self.clock.now();
-                        self.namespace_manager
+                        let published = self
+                            .namespace_manager
                             .cas_update_creating_intent(&rooted, &etag)
                             .await?;
-                        self.publish_and_mark_prepared(target_name, &candidate, &mut lease)
-                            .await?;
+                        let published_intent = published.map(|version| (rooted.clone(), version));
+                        self.publish_and_mark_prepared(
+                            target_name,
+                            &candidate,
+                            &mut lease,
+                            published_intent,
+                        )
+                        .await?;
                         Ok(Some(candidate))
                     }
                     .await;
@@ -5784,7 +5843,7 @@ impl NamespaceGraph {
                             .0;
                         Self::require_preparation_not_cancelled(&current)?;
                         let candidate = self.rebuild_rooted_candidate(&current).await?;
-                        self.publish_and_mark_prepared(target_name, &candidate, &mut lease)
+                        self.publish_and_mark_prepared(target_name, &candidate, &mut lease, None)
                             .await
                     }
                     .await;

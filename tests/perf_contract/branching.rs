@@ -35,8 +35,10 @@ const CORPUS_LOGICAL_ROWS: usize = 1_000_000;
 // independent of logical row count). Each group backs a distinct state
 // transition or a deliberate phase-boundary re-verification:
 //
-//   <dst>/meta.json                         9  creating-intent probes, three
-//     metadata-transition CAS reads, publication reads, activation loops
+//   <dst>/meta.json                         8  creating-intent probes, two
+//     metadata-transition CAS reads, publication reads, activation loops.
+//     Was 9: the rooting CAS returns the intent it installs, so the publish
+//     step seeds from that instead of reading the object back
 //   _security/heads/policy.json             5  authority check at every
 //     activation step (head is mutable; never memoized)
 //   <src>/manifest.json                     5  candidate build, fenced CAS
@@ -57,7 +59,7 @@ const CORPUS_LOGICAL_ROWS: usize = 1_000_000;
 // Getting below 35 requires retiring a deliberate duplicate verification
 // (the second verify_prepared_target pass, -4) or the handler's terminal
 // read (-1); those are design decisions, not redundancy.
-const MAX_FORK_CONTROL_GETS: u64 = 35;
+const MAX_FORK_CONTROL_GETS: u64 = 34;
 const MAX_FORK_CONTROL_PUTS: u64 = 32;
 // Fork CAS-PUT budget, justified by the per-key census taken after the GET
 // census landed (22-23 PutUpdate spans, tiny fixture; this assertion was
