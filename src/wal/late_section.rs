@@ -1519,6 +1519,34 @@ impl LateStateSection {
         })
     }
 
+    /// Derives this section's content-addressed reference from its own bytes.
+    fn reference_for_bytes(bytes: &Bytes, namespace: &str) -> Result<ManifestSectionRef> {
+        let checksum = Self::checksum(bytes);
+        let size_bytes = u64::try_from(bytes.len()).map_err(|_| {
+            ZeppelinError::Serialization(
+                "late-state section size does not fit persisted u64".to_string(),
+            )
+        })?;
+        Ok(ManifestSectionRef {
+            key: Self::s3_key(namespace, &checksum),
+            checksum,
+            size_bytes,
+            format_version: LATE_STATE_FORMAT_VERSION,
+            artifact_origin: None,
+        })
+    }
+
+    /// Computes this section's reference **without** writing it.
+    ///
+    /// The section is content-addressed, so its reference is a pure function of
+    /// its bytes. A caller holding a reference to byte-identical content has
+    /// nothing to write, and can compare keys to find that out without paying
+    /// a create-only PUT plus the `AlreadyExists` verification GET.
+    pub(crate) fn reference(&self, namespace: &str) -> Result<ManifestSectionRef> {
+        let bytes = self.to_bytes()?;
+        Self::reference_for_bytes(&bytes, namespace)
+    }
+
     /// Serialize and create the local immutable object, byte-verifying retries.
     pub(crate) async fn put_create(
         &self,
@@ -1526,31 +1554,23 @@ impl LateStateSection {
         namespace: &str,
     ) -> Result<ManifestSectionRef> {
         let bytes = self.to_bytes()?;
-        let checksum = Self::checksum(&bytes);
-        let key = Self::s3_key(namespace, &checksum);
-        match store.put_create_outcome(&key, bytes.clone()).await? {
+        let reference = Self::reference_for_bytes(&bytes, namespace)?;
+        match store
+            .put_create_outcome(&reference.key, bytes.clone())
+            .await?
+        {
             CreateOnlyOutcome::Created { .. } => {}
             CreateOnlyOutcome::AlreadyExists => {
-                let existing = store.get(&key).await?;
+                let existing = store.get(&reference.key).await?;
                 if existing != bytes {
                     return Err(ZeppelinError::Serialization(format!(
-                        "late-state content-address collision at {key}: existing bytes differ"
+                        "late-state content-address collision at {}: existing bytes differ",
+                        reference.key
                     )));
                 }
             }
         }
-        let size_bytes = u64::try_from(bytes.len()).map_err(|_| {
-            ZeppelinError::Serialization(
-                "late-state section size does not fit persisted u64".to_string(),
-            )
-        })?;
-        Ok(ManifestSectionRef {
-            key,
-            checksum,
-            size_bytes,
-            format_version: LATE_STATE_FORMAT_VERSION,
-            artifact_origin: None,
-        })
+        Ok(reference)
     }
 }
 

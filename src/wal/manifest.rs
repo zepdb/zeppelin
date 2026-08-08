@@ -2841,7 +2841,18 @@ impl Manifest {
                     .source_inventory
                     .sort_unstable_by(|left, right| left.key.cmp(&right.key));
                 section.canonicalize_artifact_origins()?;
-                Some(section.put_create(store, namespace).await?)
+                // The caller already created the merged section and handed us
+                // its reference. Sections are content-addressed, so if this
+                // rebuild lands on the same key it is byte-identical and there
+                // is nothing to write: a second create-only PUT would rewrite
+                // the same immutable object and pay an AlreadyExists
+                // verification GET on top. A CAS retry that observes a newer
+                // root produces a different key and does write.
+                let candidate = section.reference(namespace)?;
+                match new_late_state.as_ref() {
+                    Some(published) if published.key == candidate.key => Some(published.clone()),
+                    _ => Some(section.put_create(store, namespace).await?),
+                }
             } else {
                 new_late_state.clone()
             };
