@@ -13984,7 +13984,12 @@ mod outcome_tests {
         let env = RunnerEnv {
             seconds: 30,
             seeds: vec![49],
-            max_ops: Some(30),
+            // The invalid-probe block sits at ops 33-38 for this seed. It used
+            // to fall at 29, inside the old cap of 30, until 69575df widened
+            // the generator vocabulary with late-interaction operations and
+            // pushed it past the cap - which is why this test stopped finding
+            // its probe. Cap high enough to cover the block with margin.
+            max_ops: Some(48),
             artifacts: root.path().to_path_buf(),
             preserve: PreserveMode::Never,
             selftest: None,
@@ -14006,17 +14011,24 @@ mod outcome_tests {
         assert!(!outcome.failed, "{:?}", outcome.violations);
 
         let records = read_ops(&seed_dir);
+        // Select the probe by shape, not by ordinal. The op index this landed
+        // on is an artifact of the generator's vocabulary: 69575df widened it
+        // with late-interaction operations, which re-numbered every seeded
+        // trace and broke a pin on `index == 29` without changing what this
+        // test is about. What must hold is that seed 49 still reaches a
+        // write-shaped invalid probe and that the server rejects it.
         let probe = records
             .iter()
-            .find(|record| record.index == 29)
+            .find(|record| {
+                matches!(
+                    record.op,
+                    Op::InvalidProbe {
+                        probe: InvalidProbe::WrongDims,
+                        ..
+                    }
+                )
+            })
             .expect("seed 49 must reach the write-shaped invalid probe");
-        assert!(matches!(
-            probe.op,
-            Op::InvalidProbe {
-                probe: InvalidProbe::WrongDims,
-                ..
-            }
-        ));
         assert_eq!(probe.status, StatusCode::BAD_REQUEST.as_u16());
         let recovered = json!({
             "namespace": probe.op.namespace(),
