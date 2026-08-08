@@ -508,7 +508,7 @@ async fn measure_query_contract(
         .into_iter()
         .collect::<Vec<_>>();
 
-    prepare_cold_query(server, source, &physical_keys).await;
+    prepare_cold_query(server, source, &source_manifest, &physical_keys).await;
     let (root_ids, root_product) =
         measured(counter, tracker, || query_ids(client, server, source)).await;
     let (_, root_oracle) = measured(counter, tracker, || async {
@@ -534,7 +534,7 @@ async fn measure_query_contract(
         "branch query must safely reuse source-populated physical-key caches"
     );
 
-    prepare_cold_query(server, branch, &physical_keys).await;
+    prepare_cold_query(server, branch, &source_manifest, &physical_keys).await;
     let (branch_ids, branch_product) =
         measured(counter, tracker, || query_ids(client, server, branch)).await;
     let (_, branch_oracle) = measured(counter, tracker, || async {
@@ -871,7 +871,32 @@ async fn upsert_one(client: &Client, server: &FullTestServer, namespace: &str, i
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-async fn prepare_cold_query(server: &FullTestServer, namespace: &str, physical_keys: &[String]) {
+/// Returns the query path to a genuinely cold state for `physical_keys`.
+///
+/// Immutable segment artifacts are **not** cached under their object key. They
+/// are cached by physical incarnation, `artifact-origin/<incarnation>/<store
+/// key>`, so that two branches sharing a source segment share one entry and
+/// neither can reconstruct a key from its own name. Invalidating the raw store
+/// key therefore matches nothing and silently leaves the artifact warm.
+///
+/// That is what this helper used to do. It went unnoticed because the census
+/// has never been executed: the first measured query in a run is cold anyway,
+/// having never populated the cache, so the no-op eviction only shows up on
+/// the *second* cold preparation - which is precisely the branch-versus-source
+/// comparison this census exists to make. `Manifest::segment_artifact_cache_key`
+/// is the seam for exactly this, and its own rustdoc warns that a caller
+/// carrying a divergent copy of the key format is what silently rots.
+///
+/// The derived key is computed for every (segment, key) pair rather than by
+/// parsing segment ids out of object keys. Pairs that do not belong together
+/// yield a key that is simply absent from the cache, so over-invalidating is
+/// harmless and cannot miss the pair that does belong together.
+async fn prepare_cold_query(
+    server: &FullTestServer,
+    namespace: &str,
+    manifest: &Manifest,
+    physical_keys: &[String],
+) {
     server.manifest_cache.invalidate(namespace);
     server.clear_decoded_artifact_cache();
     for key in physical_keys {
@@ -880,6 +905,18 @@ async fn prepare_cold_query(server: &FullTestServer, namespace: &str, physical_k
             .invalidate(key)
             .await
             .unwrap_or_else(|error| panic!("failed to invalidate query census key {key}: {error}"));
+        for segment in &manifest.segments {
+            let Ok(cache_key) = manifest.segment_artifact_cache_key(segment, key) else {
+                continue;
+            };
+            server
+                .cache
+                .invalidate(&cache_key)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("failed to invalidate query census cache key {cache_key}: {error}")
+                });
+        }
     }
 }
 
