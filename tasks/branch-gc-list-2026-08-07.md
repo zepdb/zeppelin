@@ -1,6 +1,6 @@
 # Stage 1.6 — branch deletion (EXECUTED 2026-08-08)
 
-**46 of 56 local branches deleted.** Recovery SHAs for every one:
+**47 of 56 local branches deleted.** Recovery SHAs for every one:
 `tasks/branch-deletion-record-2026-08-08.txt` (`git branch <name> <sha>`).
 
 Content was salvaged first: `50a819e` took the five tracked files that
@@ -23,10 +23,43 @@ goes:
 
 | Branch | Worktree | State |
 |---|---|---|
-| `codex/branching` | `~/Documents/code/zeppelin-branching` | **32 uncommitted changes — do not remove without reviewing them** |
+| ~~`codex/branching`~~ | ~~`~/Documents/code/zeppelin-branching`~~ | **DISCARDED 2026-08-08** — see below |
 | `ll-04-pipeline` | `~/Documents/code/zeppelin-ll-worktree` | clean |
 | `perf/phase1-contract-core` | `~/Documents/code/zeppelin-perf` | clean |
 | `quant/phase2-sketch` | `~/Documents/code/zeppelin-quant` | clean |
+
+### `codex/branching` — investigated and discarded, 2026-08-08
+
+Its worktree held **30 modified tracked files, +1,443/−121**, last touched
+2026-07-16, committed nowhere. It was a **draft of the artifact-origins
+work**: `ArtifactOrigin`, `ManifestExecutionBindingV2`, origin
+validation/canonicalization/admission, `local_origin`/`fragment_origin`/
+`segment_origin` — 1,350 of the 1,443 lines in `src/wal/manifest.rs`.
+
+Discarded because it was superseded three ways:
+
+1. **Every symbol it adds is on `main`**, landed by `fb333ac` (2026-07-17,
+   the day after the worktree was last touched). Five of its seven new
+   tests are on `main` verbatim.
+2. **The other two tests target deleted code.** Both are receipt tests, and
+   receipts were removed by `9ff6fbd` and `d83ad82`. Three files the diff
+   edits — `src/security/receipt.rs`, `tests/security_receipt_tests.rs`,
+   `tests/manifest_receipt_storage_tests.rs` — **no longer exist**.
+3. **It did not apply.** Plain `git apply` failed on the first file and
+   every one after; three-way conflicted in 6 of 12 source files and
+   hard-errored on `src/security/receipt.rs: does not exist in index`.
+   The base was 318 commits behind.
+
+Its two untracked paths (`src/namespace/branching/`, `src/namespace/types.rs`)
+were also earlier drafts — `main`'s versions are strictly larger
+(`branching/error.rs` 41 → 326 lines) and carry the same symbols.
+
+**Both archived before removal**, so the discard is reversible:
+
+- `~/Documents/code/zep-temp/branching-worktree-discarded-2026-08-08.patch`
+  (the tracked diff, with provenance header; `git apply --3way`)
+- `~/Documents/code/zep-temp/branching-worktree-untracked-2026-08-08.tar.gz`
+  (the untracked drafts)
 
 Five stale worktree registrations were pruned (their directories no
 longer existed, so nothing on disk was touched).
