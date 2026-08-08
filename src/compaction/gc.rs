@@ -1226,7 +1226,6 @@ fn retain_history_pinned_pending_deletes(namespace: &str, manifest: &mut Manifes
 ///
 /// If retained generations 7 and 8 both reference segment A while only 8
 /// references segment B, the returned set contains both segments' artifacts.
-
 pub async fn retained_manifest_history_reachable_keys(
     store: &ZeppelinStore,
     namespace: &str,
