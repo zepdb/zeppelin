@@ -18349,24 +18349,40 @@ mod outcome_tests {
         assert!(!source_outcome.failed, "{:?}", source_outcome.violations);
 
         let source_records = read_ops(&source_dir);
-        // The warm delete at op 10 now validates its writer memo through the
-        // manifest CAS and issues no manifest GET. The pinned HoldCall remains
-        // pending until the fetch at op 11 performs the next matching GET.
-        let expected_workload_indices = (0..12).collect::<Vec<_>>();
-        let expected_drain_indices = (12..20).collect::<Vec<_>>();
+        // Seed 3's shape under the current generator vocabulary.
+        //
+        // These were 12 workload ops and 8 deferred-drain ops, with the hold
+        // quiescing at op 12 before its scheduled release at 15. 69575df
+        // widened the vocabulary with late-interaction operations, which
+        // changed how many logical ops elapse before quiescence: the hold now
+        // reaches its scheduled release during the workload, so it joins by
+        // LogicalOp and the run never enters a deferred drain.
+        //
+        // Re-pinned rather than re-tuned, because the quiesce path this seed
+        // used to take is still exercised and still asserted elsewhere -
+        // `quiet_period_restarts_finished_primary_after_terminal_hold_and_drains_reserved_ops`
+        // pins a Quiesce-released hold followed by a DeferredDrain record, and
+        // `replay_preserves_terminal_join_when_hold_candidate_completes_early`
+        // covers the same shape across a replay. Both are green. So an empty
+        // drain here is this seed losing that shape, not the phase breaking.
+        //
+        // What this test uniquely owns is unchanged and is asserted below:
+        // replay must reproduce the source's records and timeline exactly.
+        let expected_workload_indices = (0..20).collect::<Vec<_>>();
+        let expected_drain_indices: Vec<u64> = Vec::new();
         assert_eq!(
             source_records
                 .iter()
                 .filter(|record| record.execution.phase == ExecutionPhase::Workload)
                 .count(),
-            12
+            20
         );
         assert_eq!(
             source_records
                 .iter()
                 .filter(|record| record.execution.phase == ExecutionPhase::DeferredDrain)
                 .count(),
-            8
+            0
         );
         assert_eq!(
             phase_indices(&source_records, ExecutionPhase::Workload),
@@ -18383,15 +18399,15 @@ mod outcome_tests {
             .iter()
             .find(|record| record.execution.hold.is_some())
             .expect("pinned seed 3 must record one held foreground op");
-        assert_eq!(held.index, 11);
+        assert_eq!(held.index, 10);
         assert_eq!(
             held.execution.hold,
             Some(HeldExecutionMetadata {
                 event_id: "sched-01".to_string(),
-                window_op: 11,
-                scheduled_release_op: Some(15),
-                actual_join_op: 12,
-                release_cause: HoldReleaseCause::Quiesce,
+                window_op: 10,
+                scheduled_release_op: Some(14),
+                actual_join_op: 14,
+                release_cause: HoldReleaseCause::LogicalOp,
             })
         );
 
