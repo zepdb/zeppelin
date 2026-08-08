@@ -517,16 +517,39 @@ async fn audit_batching_bounds() {
     let client = client_with_bearer(&reader_bearer());
     counter.reset();
 
-    let requests = (0..257).map(|index| {
-        client
-            .delete(format!(
-                "{}/v1/namespaces/{}-batch-{index}",
-                server.base_url, harness.prefix
-            ))
-            .header("x-request-id", format!("audit-batch-{index}"))
-            .send()
-    });
-    let responses = join_all(requests).await;
+    // Issue all 257 denials, but cap how many connects are in flight at once.
+    //
+    // What this test pins is the audit *batch* bound: 257 denied requests must
+    // collapse into exactly two audit objects. The simultaneity was incidental,
+    // and on macOS it broke the test for a reason that has nothing to do with
+    // the product: `kern.ipc.somaxconn` is 128, so a 257-way simultaneous
+    // connect overruns the listener backlog and the kernel resets the
+    // overflow. The failure landed deterministically on request 128 with
+    // `ConnectionReset`, and reproduces at commits whose archived sweep logs
+    // show this test passing — it tracks accept-queue drain speed, not any
+    // change in behaviour.
+    //
+    // 64 keeps every request concurrent enough to exercise batching while
+    // staying well inside the backlog on any supported host.
+    const TOTAL: usize = 257;
+    const IN_FLIGHT: usize = 64;
+    let mut responses = Vec::with_capacity(TOTAL);
+    let mut start = 0;
+    while start < TOTAL {
+        let end = (start + IN_FLIGHT).min(TOTAL);
+        let requests = (start..end).map(|index| {
+            client
+                .delete(format!(
+                    "{}/v1/namespaces/{}-batch-{index}",
+                    server.base_url, harness.prefix
+                ))
+                .header("x-request-id", format!("audit-batch-{index}"))
+                .send()
+        });
+        responses.extend(join_all(requests).await);
+        start = end;
+    }
+    assert_eq!(responses.len(), TOTAL);
     for response in responses {
         assert_eq!(response.unwrap().status(), 403);
     }
