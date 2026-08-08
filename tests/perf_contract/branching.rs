@@ -131,6 +131,17 @@ struct OperationSnapshot {
     wall_elapsed_us: u64,
     observed_get_ops: u64,
     observed_put_ops: u64,
+    /// Longest chain of pairwise non-overlapping reads.
+    ///
+    /// This is the *dependency depth*, not the operation count: operations
+    /// issued together share a `start_seq` and collapse into one stage, so
+    /// concurrency shows up here and nowhere else in this census. Without it a
+    /// fork that parallelizes its reads is indistinguishable from one that
+    /// serializes them, since every other assertion is a count or an
+    /// order-independent multiset.
+    get_depth: u32,
+    /// The same chain over reads and writes together.
+    put_get_depth: u32,
     classes: BTreeMap<String, ClassStats>,
     spans: Vec<OpSpan>,
 }
@@ -363,8 +374,12 @@ pub async fn run_branching_census_entry() {
     fs::write(
         &report_path,
         format!(
-            "# Branching performance contract\n\n- scenarios failed: 0\n- census: `{}`\n- tiny fork p50/p90/p99 us: `{}/{}/{}`\n- corpus fork p50/p90/p99 us: `{}/{}/{}`\n- first materialization GET/upload bytes: `{}/{}`\n",
+            "# Branching performance contract\n\n- scenarios failed: 0\n- census: `{}`\n- fork depth get/put_get (tiny): `{}/{}`\n- fork depth get/put_get (corpus): `{}/{}`\n- tiny fork p50/p90/p99 us: `{}/{}/{}`\n- corpus fork p50/p90/p99 us: `{}/{}/{}`\n- first materialization GET/upload bytes: `{}/{}`\n",
             json_path.display(),
+            census.fork_tiny.samples[0].product.get_depth,
+            census.fork_tiny.samples[0].product.put_get_depth,
+            census.fork_corpus.samples[0].product.get_depth,
+            census.fork_corpus.samples[0].product.put_get_depth,
             census.fork_tiny.latency.p50_us,
             census.fork_tiny.latency.p90_us,
             census.fork_tiny.latency.p99_us,
@@ -941,12 +956,26 @@ where
         .into_iter()
         .map(|(class, stats)| (class.name().to_string(), stats))
         .collect();
+    let spans = tracker.take_spans();
+    // No cutoff: this census measures a whole fork, not the portion of a
+    // request preceding an HTTP response, so there is no post-response
+    // background work to exclude.
+    let get_depth =
+        DepthTracker::critical_path(&spans, &[SpanKind::Get, SpanKind::Head], None).depth;
+    let put_get_depth = DepthTracker::critical_path(
+        &spans,
+        &[SpanKind::Get, SpanKind::Head, SpanKind::Put],
+        None,
+    )
+    .depth;
     let snapshot = OperationSnapshot {
         wall_elapsed_us,
         observed_get_ops: counter.total_observed_gets(),
         observed_put_ops: counter.total_observed_puts(),
+        get_depth,
+        put_get_depth,
         classes,
-        spans: tracker.take_spans(),
+        spans,
     };
     (result, snapshot)
 }
