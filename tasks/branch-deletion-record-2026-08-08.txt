@@ -51,3 +51,11 @@ wt/gc-cas-delta                          fcb76af23e9f46e56c461cdcb7e1caff7b64a6c
 wt/gc-horizon                            768dc3f9f678f0650a55c26c68682e29edcbe8bc
 wt/gc-upload-window                      4a6665af5734e2f32e4c3450cb9f868c3506cd44
 wt/namespace-stats                       7ab8b44d07f4f06533f9d71335364c5089c50446
+
+# --- second pass, 2026-08-08 ---
+opt/sketch                               b0bb8dd354381ea51af39bcc02695c18e702e190
+qps/f1-twophase-parked                   23a6db9393d4adc8fbff3230f0d9741b6cafc8fc
+opt/coalesce                             32012220d1f97471289a70f4eb96e300abca4328
+ll-04-pipeline                           dc73ad70c595c8cfbc29e4217eed7ce8c20c37f5
+perf/phase1-contract-core                51e2681034e3700bacfc9d6b544d08a14e6a1b8d
+quant/phase2-sketch                      a8f8bea0e74802fcfaace44a48ce272fad8b9fd8

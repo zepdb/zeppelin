@@ -1,6 +1,38 @@
-# Stage 1.6 — branch deletion (EXECUTED 2026-08-08)
+# Stage 1.6 — branch deletion (EXECUTED 2026-08-08) — **CLOSED**
 
-**47 of 56 local branches deleted.** Recovery SHAs for every one:
+**53 of 56 local branches deleted.** Every branch whose content is on
+`main` is gone. The three that remain each hold work that is genuinely
+not upstream.
+
+## What remains, and what it is
+
+| Branch | Unique | What it holds |
+|---|---|---|
+| `adversarial/phase1-coverage` | 7 | **Stage 1.1's open item.** Coverage floors that *fail* a run when deterministic coverage is missed, probe sandwiches, merged coverage tables. `main` has one coverage floor (`runner.rs:1822`) and **zero** sandwich support — `push_coverage_table`, `merge_workload`, `merge_quiescence`, `random_probe_sandwich`, `sandwich_record` are all absent. Real harness capability; 409 commits behind, so landing it is a rewrite, not a merge. Its worktree `~/Documents/code/zeppelin-phase1` is clean. |
+| `opt/recall` | 6 | `train_spherical_kmeans` (spherical k-means for cosine IVF), greedy k-means++ with local trials, deterministic boundary restarts. **Absent from `main`**, which has plain k-means++ plus mini-batch. Almost certainly superseded rather than forgotten: its own last commit is "Explore bounded recall recovery", and recall was fixed a different way — no-spill partitioning (`build.rs:4047`) plus the 0.20 scan budget, reaching 0.9688/0.9814 at 1M/2M. The July investigation also found *no geometry bug*, which is what spherical k-means would have addressed. |
+| `wip/query-api-surface-2026-07-06` | 1 | Explicitly a WIP snapshot, 4 files, 523 behind. |
+
+**Second-pass deletions (2026-08-08)** — all verified 0-unique except
+`opt/coalesce`:
+
+- `opt/sketch` (13 commits) — the family-5 sketch loop, cycles 3–10,
+  PQ sketch codes, buddy-paired cluster objects, bootstrap artifact
+  merge. All patch-equivalent to `main`; the loop that took 26.27 GETs
+  to 7.365.
+- `qps/f1-twophase-parked` (11 commits) — a strict subset of the above.
+  The branch name recorded the *decision* (F1 parked at the 13.1 QPS
+  knee) but the code itself landed.
+- `opt/coalesce` — substance on `main` (`get_decoded`, `insert_decoded`,
+  `pin`/`unpin`, `ZBP1`, since evolved to `ZBP5`). Its one unique commit
+  was resident-PQ diagnostics, self-described "not fully validated",
+  **archived** to `~/Documents/code/zep-temp/opt-coalesce-diagnostics-2026-08-08.patch`.
+- `ll-04-pipeline`, `perf/phase1-contract-core`, `quant/phase2-sketch` —
+  0-unique, blocked only by clean worktrees. All three worktrees were
+  verified to have **zero** uncommitted changes before removal.
+
+---
+
+**First pass: 47 of 56 local branches deleted.** Recovery SHAs for every one:
 `tasks/branch-deletion-record-2026-08-08.txt` (`git branch <name> <sha>`).
 
 Content was salvaged first: `50a819e` took the five tracked files that
