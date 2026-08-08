@@ -81,6 +81,7 @@ run_tlc SecurityPolicy SecurityPolicy.cfg SecurityPolicy.tlc.log
 run_negative_tlc PitrHistoryRetention PitrHistoryRetention.bug.cfg PitrHistoryRetention.bug.tlc.log
 run_negative_tlc TwoPassGcSafety TwoPassGcSafety.no-revalidate.cfg TwoPassGcSafety.no-revalidate.tlc.log
 run_negative_tlc TwoPassGcSafety TwoPassGcSafety.stale-history.cfg TwoPassGcSafety.stale-history.tlc.log
+run_negative_tlc TwoPassGcSafety TwoPassGcSafety.history-pending.cfg TwoPassGcSafety.history-pending.tlc.log
 run_negative_tlc RestoreCloneSafety RestoreCloneSafety.bug.cfg RestoreCloneSafety.bug.tlc.log
 run_negative_tlc IncrementalArtifactClosure IncrementalArtifactClosure.bug.cfg IncrementalArtifactClosure.bug.tlc.log
 run_negative_tlc GroupCommitWalWriter GroupCommitWalWriter.bug.cfg GroupCommitWalWriter.bug.tlc.log

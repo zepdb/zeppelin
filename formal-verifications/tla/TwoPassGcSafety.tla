@@ -9,8 +9,10 @@ CONSTANTS
     InitialLive,
     InitialHistory,
     InitialPendingDeletes,
+    InitialHistoryPendingDeletes,
     AllowBuggySweepWithoutRevalidate,
-    AllowBuggyStaleHistorySweep
+    AllowBuggyStaleHistorySweep,
+    AllowBuggyHistoryPendingDeleteFilter
 
 VARIABLES
     s3,
@@ -22,6 +24,11 @@ VARIABLES
     \* published images, and governed-forgetting lineage roots.
     futureRoots,
     pendingDeletes,
+    \* Keys a retained generation still pins through its own pending_deletes.
+    \* These are the *uncertain* keys of that generation: recorded for deletion
+    \* but not confirmed gone. Nothing else roots them - that is what makes
+    \* them the exact shape aaf7b86 swept by mistake.
+    historyPendingDeletes,
     staged,
     stagingActive,
     candidates,
@@ -35,7 +42,8 @@ VARIABLES
     pendingPruneBad
 
 vars ==
-    << s3, live, history, futureRoots, pendingDeletes, staged, stagingActive,
+    << s3, live, history, futureRoots, pendingDeletes, historyPendingDeletes,
+       staged, stagingActive,
        candidates, listedThisCycle, historyAtMark, now, deleteFailed,
        deleted, pendingPruneBad >>
 
@@ -44,16 +52,33 @@ NoCandidate == MaxTime + 1
 ActiveStaged ==
     IF stagingActive THEN staged ELSE {}
 
+\* What GC *computes* for a retained generation's pending_deletes.
+\*
+\* This is the seam aaf7b86 broke. retained_manifest_history_reachable_keys
+\* and load_history_observation_owned both cleared pending_deletes off a
+\* retained historical manifest before expanding its reachable set, so keys
+\* pinned only that way vanished from GC's view while still being needed.
+\* With the flag FALSE this equals historyPendingDeletes and the model
+\* describes the fixed code.
+HistoryPinnedAsComputed ==
+    IF AllowBuggyHistoryPendingDeleteFilter THEN {} ELSE historyPendingDeletes
+
+\* Ground truth: what must never be deleted. Deliberately NOT filtered - a
+\* retained generation's pending_deletes pin the object regardless of whether
+\* GC's expansion happens to see them. The gap between this and
+\* HistoryPinnedAsComputed is exactly the production defect.
 ClientReachable ==
-    live \cup history \cup ActiveStaged \cup futureRoots
+    live \cup history \cup ActiveStaged \cup futureRoots \cup historyPendingDeletes
 
 \* Production mark/sweep reachability also includes manifest pending_deletes.
 \* Pending-delete drain is the only path allowed to physically remove them.
 GcReachable ==
-    ClientReachable \cup pendingDeletes
+    live \cup history \cup ActiveStaged \cup futureRoots \cup pendingDeletes
+        \cup HistoryPinnedAsComputed
 
 MarkReachable ==
     live \cup historyAtMark \cup ActiveStaged \cup futureRoots \cup pendingDeletes
+        \cup HistoryPinnedAsComputed
 
 Candidate(k) ==
     candidates[k] # NoCandidate
@@ -64,10 +89,12 @@ CandidateEligible(k) ==
 
 Init ==
     /\ s3 = InitialLive \cup InitialHistory \cup InitialPendingDeletes
+             \cup InitialHistoryPendingDeletes
     /\ live = InitialLive
     /\ history = InitialHistory
     /\ futureRoots = {}
     /\ pendingDeletes = InitialPendingDeletes
+    /\ historyPendingDeletes = InitialHistoryPendingDeletes
     /\ staged = {}
     /\ stagingActive = FALSE
     /\ candidates = [k \in Keys |-> NoCandidate]
@@ -81,7 +108,7 @@ Init ==
 AdvanceTime ==
     /\ now < MaxTime
     /\ now' = now + 1
-    /\ UNCHANGED << s3, live, history, futureRoots, pendingDeletes,
+    /\ UNCHANGED << historyPendingDeletes, s3, live, history, futureRoots, pendingDeletes,
                     staged, stagingActive, candidates, listedThisCycle,
                     historyAtMark,
                     deleteFailed, deleted, pendingPruneBad >>
@@ -89,7 +116,7 @@ AdvanceTime ==
 StartCycle ==
     /\ listedThisCycle' = s3
     /\ historyAtMark' = history
-    /\ UNCHANGED << s3, live, history, futureRoots, pendingDeletes,
+    /\ UNCHANGED << historyPendingDeletes, s3, live, history, futureRoots, pendingDeletes,
                     staged, stagingActive, candidates, now,
                     deleteFailed, deleted, pendingPruneBad >>
 
@@ -107,14 +134,14 @@ MarkCandidates ==
     /\ deleteFailed' =
         {k \in deleteFailed :
             k \in pendingDeletes \/ nextCandidates[k] # NoCandidate}
-    /\ UNCHANGED << s3, live, history, futureRoots, pendingDeletes,
+    /\ UNCHANGED << historyPendingDeletes, s3, live, history, futureRoots, pendingDeletes,
                     staged, stagingActive, listedThisCycle, historyAtMark,
                     now, deleted, pendingPruneBad >>
 
 MakeLive ==
     \E k \in s3 \ (pendingDeletes \cup ActiveStaged) :
         /\ live' = live \cup {k}
-        /\ UNCHANGED << s3, history, futureRoots, pendingDeletes, staged,
+        /\ UNCHANGED << historyPendingDeletes, s3, history, futureRoots, pendingDeletes, staged,
                         stagingActive, candidates, listedThisCycle,
                         historyAtMark, now, deleteFailed, deleted,
                         pendingPruneBad >>
@@ -122,7 +149,7 @@ MakeLive ==
 DropLive ==
     \E k \in live :
         /\ live' = live \ {k}
-        /\ UNCHANGED << s3, history, futureRoots, pendingDeletes, staged,
+        /\ UNCHANGED << historyPendingDeletes, s3, history, futureRoots, pendingDeletes, staged,
                         stagingActive, candidates, listedThisCycle,
                         historyAtMark, now, deleteFailed, deleted,
                         pendingPruneBad >>
@@ -131,14 +158,14 @@ MoveLiveToPendingDelete ==
     \E k \in live :
         /\ live' = live \ {k}
         /\ pendingDeletes' = pendingDeletes \cup {k}
-        /\ UNCHANGED << s3, history, futureRoots, staged, stagingActive,
+        /\ UNCHANGED << historyPendingDeletes, s3, history, futureRoots, staged, stagingActive,
                         candidates, listedThisCycle, historyAtMark, now,
                         deleteFailed, deleted, pendingPruneBad >>
 
 AddHistoryRoot ==
     \E k \in live :
         /\ history' = history \cup {k}
-        /\ UNCHANGED << s3, live, futureRoots, pendingDeletes, staged,
+        /\ UNCHANGED << historyPendingDeletes, s3, live, futureRoots, pendingDeletes, staged,
                         stagingActive, candidates, listedThisCycle,
                         historyAtMark, now, deleteFailed, deleted,
                         pendingPruneBad >>
@@ -146,7 +173,7 @@ AddHistoryRoot ==
 PruneHistoryRoots ==
     \E kept \in SUBSET history :
         /\ history' = kept
-        /\ UNCHANGED << s3, live, futureRoots, pendingDeletes, staged,
+        /\ UNCHANGED << historyPendingDeletes, s3, live, futureRoots, pendingDeletes, staged,
                         stagingActive, candidates, listedThisCycle,
                         historyAtMark, now, deleteFailed, deleted,
                         pendingPruneBad >>
@@ -154,7 +181,7 @@ PruneHistoryRoots ==
 AddFutureRoot ==
     \E k \in s3 \ pendingDeletes :
         /\ futureRoots' = futureRoots \cup {k}
-        /\ UNCHANGED << s3, live, history, pendingDeletes, staged,
+        /\ UNCHANGED << historyPendingDeletes, s3, live, history, pendingDeletes, staged,
                         stagingActive, candidates, listedThisCycle,
                         historyAtMark, now, deleteFailed, deleted,
                         pendingPruneBad >>
@@ -162,7 +189,7 @@ AddFutureRoot ==
 DropFutureRoot ==
     \E k \in futureRoots :
         /\ futureRoots' = futureRoots \ {k}
-        /\ UNCHANGED << s3, live, history, pendingDeletes, staged,
+        /\ UNCHANGED << historyPendingDeletes, s3, live, history, pendingDeletes, staged,
                         stagingActive, candidates, listedThisCycle,
                         historyAtMark, now, deleteFailed, deleted,
                         pendingPruneBad >>
@@ -172,7 +199,7 @@ StageNewUpload ==
         /\ s3' = s3 \cup {k}
         /\ staged' = staged \cup {k}
         /\ stagingActive' = TRUE
-        /\ UNCHANGED << live, history, futureRoots, pendingDeletes,
+        /\ UNCHANGED << historyPendingDeletes, live, history, futureRoots, pendingDeletes,
                         candidates, listedThisCycle, historyAtMark, now,
                         deleteFailed, deleted, pendingPruneBad >>
 
@@ -180,7 +207,7 @@ StageExistingObject ==
     \E k \in s3 \ (pendingDeletes \cup live) :
         /\ staged' = staged \cup {k}
         /\ stagingActive' = TRUE
-        /\ UNCHANGED << s3, live, history, futureRoots, pendingDeletes,
+        /\ UNCHANGED << historyPendingDeletes, s3, live, history, futureRoots, pendingDeletes,
                         candidates, listedThisCycle, historyAtMark, now,
                         deleteFailed, deleted, pendingPruneBad >>
 
@@ -189,7 +216,7 @@ CommitStagedUploads ==
     /\ live' = live \cup staged
     /\ staged' = {}
     /\ stagingActive' = FALSE
-    /\ UNCHANGED << s3, history, futureRoots, pendingDeletes,
+    /\ UNCHANGED << historyPendingDeletes, s3, history, futureRoots, pendingDeletes,
                     candidates, listedThisCycle, historyAtMark, now,
                     deleteFailed, deleted, pendingPruneBad >>
 
@@ -197,7 +224,7 @@ ExpireStaging ==
     /\ stagingActive
     /\ staged' = {}
     /\ stagingActive' = FALSE
-    /\ UNCHANGED << s3, live, history, futureRoots, pendingDeletes,
+    /\ UNCHANGED << historyPendingDeletes, s3, live, history, futureRoots, pendingDeletes,
                     candidates, listedThisCycle, historyAtMark, now,
                     deleteFailed, deleted, pendingPruneBad >>
 
@@ -206,13 +233,18 @@ DrainPendingDeleteSuccess ==
         /\ k \in s3
         /\ k \notin history
         /\ k \notin futureRoots
+        \* Production's drain skips any key retained history still reaches
+        \* (`retained_history.contains(key)` -> retained, continue). It reads
+        \* the *computed* pin set, which is why clearing pending_deletes out
+        \* of that expansion let the drain delete protected objects.
+        /\ k \notin HistoryPinnedAsComputed
         /\ now >= Horizon
         /\ s3' = s3 \ {k}
         /\ pendingDeletes' = pendingDeletes \ {k}
         /\ candidates' = [candidates EXCEPT ![k] = NoCandidate]
         /\ deleteFailed' = deleteFailed \ {k}
         /\ deleted' = deleted \cup {k}
-        /\ UNCHANGED << live, history, futureRoots, staged, stagingActive,
+        /\ UNCHANGED << historyPendingDeletes, live, history, futureRoots, staged, stagingActive,
                         listedThisCycle, historyAtMark, now, pendingPruneBad >>
 
 DrainPendingDeleteAbsent ==
@@ -220,7 +252,7 @@ DrainPendingDeleteAbsent ==
         /\ k \notin s3
         /\ pendingDeletes' = pendingDeletes \ {k}
         /\ deleteFailed' = deleteFailed \ {k}
-        /\ UNCHANGED << s3, live, history, futureRoots, staged,
+        /\ UNCHANGED << historyPendingDeletes, s3, live, history, futureRoots, staged,
                         stagingActive, candidates, listedThisCycle,
                         historyAtMark, now, deleted, pendingPruneBad >>
 
@@ -229,8 +261,9 @@ DrainPendingDeleteFailure ==
         /\ k \in s3
         /\ k \notin history
         /\ k \notin futureRoots
+        /\ k \notin HistoryPinnedAsComputed
         /\ deleteFailed' = deleteFailed \cup {k}
-        /\ UNCHANGED << s3, live, history, futureRoots, pendingDeletes,
+        /\ UNCHANGED << historyPendingDeletes, s3, live, history, futureRoots, pendingDeletes,
                         staged, stagingActive, candidates, listedThisCycle,
                         historyAtMark, now, deleted, pendingPruneBad >>
 
@@ -244,7 +277,7 @@ SweepCandidate ==
         /\ candidates' = [candidates EXCEPT ![k] = NoCandidate]
         /\ deleteFailed' = deleteFailed \ {k}
         /\ deleted' = deleted \cup {k}
-        /\ UNCHANGED << live, history, futureRoots, pendingDeletes, staged,
+        /\ UNCHANGED << historyPendingDeletes, live, history, futureRoots, pendingDeletes, staged,
                         stagingActive, listedThisCycle, historyAtMark, now,
                         pendingPruneBad >>
 
@@ -255,7 +288,7 @@ SweepCandidateDeleteFailure ==
         /\ k \in s3
         /\ k \notin GcReachable
         /\ deleteFailed' = deleteFailed \cup {k}
-        /\ UNCHANGED << s3, live, history, futureRoots, pendingDeletes,
+        /\ UNCHANGED << historyPendingDeletes, s3, live, history, futureRoots, pendingDeletes,
                         staged, stagingActive, candidates, listedThisCycle,
                         historyAtMark, now, deleted, pendingPruneBad >>
 
@@ -269,7 +302,7 @@ BuggySweepWithoutRevalidate ==
         /\ candidates' = [candidates EXCEPT ![k] = NoCandidate]
         /\ deleteFailed' = deleteFailed \ {k}
         /\ deleted' = deleted \cup {k}
-        /\ UNCHANGED << live, history, futureRoots, pendingDeletes, staged,
+        /\ UNCHANGED << historyPendingDeletes, live, history, futureRoots, pendingDeletes, staged,
                         stagingActive, listedThisCycle, historyAtMark, now,
                         pendingPruneBad >>
 
@@ -284,8 +317,33 @@ BuggySweepWithStaleHistory ==
         /\ candidates' = [candidates EXCEPT ![k] = NoCandidate]
         /\ deleteFailed' = deleteFailed \ {k}
         /\ deleted' = deleted \cup {k}
-        /\ UNCHANGED << live, history, futureRoots, pendingDeletes, staged,
+        /\ UNCHANGED << historyPendingDeletes, live, history, futureRoots, pendingDeletes, staged,
                         stagingActive, listedThisCycle, historyAtMark, now,
+                        pendingPruneBad >>
+
+\* A generation retires an object into its own pending_deletes. Nothing else
+\* roots it from here on, so only the history pin keeps it alive.
+QueueHistoryPendingDelete ==
+    \E k \in s3 :
+        /\ k \notin live
+        /\ k \notin history
+        /\ k \notin futureRoots
+        /\ k \notin pendingDeletes
+        /\ k \notin historyPendingDeletes
+        /\ historyPendingDeletes' = historyPendingDeletes \cup {k}
+        /\ UNCHANGED << s3, live, history, futureRoots, pendingDeletes,
+                        staged, stagingActive, candidates, listedThisCycle,
+                        historyAtMark, now, deleteFailed, deleted,
+                        pendingPruneBad >>
+
+\* The pinning generation falls out of the retention window, so the pin goes
+\* with it and the object becomes collectable on the ordinary path.
+PruneHistoryPendingDelete ==
+    \E k \in historyPendingDeletes :
+        /\ historyPendingDeletes' = historyPendingDeletes \ {k}
+        /\ UNCHANGED << s3, live, history, futureRoots, pendingDeletes,
+                        staged, stagingActive, candidates, listedThisCycle,
+                        historyAtMark, now, deleteFailed, deleted,
                         pendingPruneBad >>
 
 Next ==
@@ -297,6 +355,8 @@ Next ==
     \/ MoveLiveToPendingDelete
     \/ AddHistoryRoot
     \/ PruneHistoryRoots
+    \/ QueueHistoryPendingDelete
+    \/ PruneHistoryPendingDelete
     \/ AddFutureRoot
     \/ DropFutureRoot
     \/ StageNewUpload
@@ -344,6 +404,7 @@ TypeOK ==
     /\ history \subseteq Keys
     /\ futureRoots \subseteq Keys
     /\ pendingDeletes \subseteq Keys
+    /\ historyPendingDeletes \subseteq Keys
     /\ staged \subseteq Keys
     /\ stagingActive \in BOOLEAN
     /\ candidates \in [Keys -> 0..NoCandidate]
@@ -358,5 +419,9 @@ TypeOK ==
     /\ InitialPendingDeletes \subseteq Keys
     /\ InitialPendingDeletes \cap InitialLive = {}
     /\ InitialPendingDeletes \cap InitialHistory = {}
+    /\ InitialHistoryPendingDeletes \subseteq Keys
+    /\ InitialHistoryPendingDeletes \cap InitialLive = {}
+    /\ InitialHistoryPendingDeletes \cap InitialHistory = {}
+    /\ InitialHistoryPendingDeletes \cap InitialPendingDeletes = {}
 
 ====
