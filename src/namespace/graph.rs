@@ -4793,12 +4793,19 @@ impl NamespaceGraph {
             });
         }
         *lease = renewed;
-        let (source_manifest, source_version) = Manifest::read_versioned_required_for_incarnation(
-            &self.store,
-            source,
-            candidate.branch.identity.source_incarnation.as_uuid(),
-        )
-        .await?;
+        // The source manifest and the target's creating intent live in
+        // different namespaces and neither read's key or result feeds the
+        // other; the checks that follow are unchanged and still run in the
+        // same order. Reading them together removes one round trip.
+        let (source_read, target_read) = tokio::try_join!(
+            Manifest::read_versioned_required_for_incarnation(
+                &self.store,
+                source,
+                candidate.branch.identity.source_incarnation.as_uuid(),
+            ),
+            self.namespace_manager.read_creating_intent_strong(target),
+        )?;
+        let (source_manifest, source_version) = source_read;
         if source_version.is_deletion_fenced() {
             return Err(BranchError::SourceDeleting {
                 namespace: candidate.branch.identity.source_namespace.clone(),
@@ -4815,10 +4822,7 @@ impl NamespaceGraph {
             }
             .into());
         }
-        let (before_publication, before_etag) = self
-            .namespace_manager
-            .read_creating_intent_strong(target)
-            .await?;
+        let (before_publication, before_etag) = target_read;
         Self::require_preparation_not_cancelled(&before_publication)?;
         if before_publication.branch_identity.as_ref() != Some(&candidate.branch.identity) {
             return Err(BranchError::IntentMismatch {
@@ -4944,21 +4948,25 @@ impl NamespaceGraph {
             }
             .into());
         }
+        // Both keys are known before either read is issued, and neither read
+        // consumes the other's bytes: the comparisons below check both against
+        // `candidate`, which this process already holds in memory. Issuing them
+        // together turns two round trips into one without changing what is
+        // verified or the order it is verified in.
+        //
+        // On the failure path both objects are now fetched where the live
+        // mismatch used to short-circuit the history read. That costs one
+        // speculative GET only when a fork is already failing.
         let live_key = Manifest::s3_key(&target.name);
-        let live_bytes = self.store.get(&live_key).await?;
+        let history_key = Manifest::history_key(&target.name, identity.target_generation.get());
+        let (live_bytes, history_bytes) =
+            tokio::try_join!(self.store.get(&live_key), self.store.get(&history_key))?;
         if live_bytes != *candidate.publication.exact_bytes() {
             return Err(BranchError::ManifestDigestMismatch {
                 generation: identity.target_generation,
             }
             .into());
         }
-        let history_bytes = self
-            .store
-            .get(&Manifest::history_key(
-                &target.name,
-                identity.target_generation.get(),
-            ))
-            .await?;
         if history_bytes != live_bytes {
             return Err(BranchError::ManifestDigestMismatch {
                 generation: identity.target_generation,
