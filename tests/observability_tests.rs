@@ -140,8 +140,8 @@ async fn test_s3_metrics_after_operations() {
         .unwrap();
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("zeppelin_s3_operation_duration_seconds"),
-        "metrics should contain S3 operation duration"
+        body.contains("zeppelin_storage_operation_duration_seconds"),
+        "metrics should contain object-store operation duration"
     );
 
     cleanup_ns(&harness.store, &ns).await;
@@ -677,10 +677,10 @@ async fn test_all_metrics_registered() {
     COMPACTION_INCREMENTAL_FALLBACK_TOTAL
         .with_label_values(&["__test__", "build_failed"])
         .inc();
-    S3_OPERATION_DURATION
+    STORAGE_OPERATION_DURATION
         .with_label_values(&["get"])
         .observe(0.0);
-    S3_ERRORS_TOTAL.with_label_values(&["get"]).inc();
+    STORAGE_ERRORS_TOTAL.with_label_values(&["get"]).inc();
     COMPACTION_DURATION
         .with_label_values(&["__test__"])
         .observe(0.0);
@@ -717,8 +717,8 @@ async fn test_all_metrics_registered() {
         "zeppelin_compaction_read_ops_total",
         "zeppelin_compaction_full_retrain_total",
         "zeppelin_compaction_incremental_fallback_total",
-        "zeppelin_s3_operation_duration_seconds",
-        "zeppelin_s3_errors_total",
+        "zeppelin_storage_operation_duration_seconds",
+        "zeppelin_storage_errors_total",
         "zeppelin_compaction_duration_seconds",
         "zeppelin_hydration_refused",
         "zeppelin_hydration_required_bytes",
@@ -741,4 +741,19 @@ async fn test_all_metrics_registered() {
             names
         );
     }
+
+    // D2: the object-store metrics are storage-neutral, because Zeppelin
+    // speaks to three substrates and used to report all of them as S3. This
+    // is the absence half of the rename's exit gate - the presence half is
+    // the `zeppelin_storage_*` entries in `expected` above - and it keeps the
+    // old names from creeping back in a later edit.
+    let s3_named: Vec<&String> = names
+        .iter()
+        .filter(|name| name.starts_with("zeppelin_s3_"))
+        .collect();
+    assert!(
+        s3_named.is_empty(),
+        "no exported metric may carry the substrate-specific zeppelin_s3_ \
+         prefix, found: {s3_named:?}"
+    );
 }

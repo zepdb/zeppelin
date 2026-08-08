@@ -122,14 +122,14 @@ mod inner {
         ).unwrap();
 
         /// Object-store operation latency in seconds, partitioned by operation.
-        pub static ref S3_OPERATION_DURATION: HistogramVec = register_histogram_vec!(
-            "zeppelin_s3_operation_duration_seconds", "S3 operation latency",
+        pub static ref STORAGE_OPERATION_DURATION: HistogramVec = register_histogram_vec!(
+            "zeppelin_storage_operation_duration_seconds", "Object-store operation latency",
             &["operation"],
             vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
         ).unwrap();
         /// Failed object-store operations partitioned by operation.
-        pub static ref S3_ERRORS_TOTAL: IntCounterVec = register_int_counter_vec!(
-            "zeppelin_s3_errors_total", "S3 operation errors", &["operation"]
+        pub static ref STORAGE_ERRORS_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_storage_errors_total", "Object-store operation errors", &["operation"]
         ).unwrap();
         /// End-to-end compaction latency in seconds for each namespace.
         pub static ref COMPACTION_DURATION: HistogramVec = register_histogram_vec!(
@@ -438,8 +438,8 @@ pub fn init() {
     lazy_static::initialize(&COMPACTION_FULL_RETRAIN_TOTAL);
     lazy_static::initialize(&COMPACTION_INCREMENTAL_FALLBACK_TOTAL);
     lazy_static::initialize(&COMPACTION_NAMESPACE_DEGRADED);
-    lazy_static::initialize(&S3_OPERATION_DURATION);
-    lazy_static::initialize(&S3_ERRORS_TOTAL);
+    lazy_static::initialize(&STORAGE_OPERATION_DURATION);
+    lazy_static::initialize(&STORAGE_ERRORS_TOTAL);
     lazy_static::initialize(&COMPACTION_DURATION);
     lazy_static::initialize(&CACHE_ENTRIES);
     lazy_static::initialize(&CACHE_EVICTIONS_TOTAL);

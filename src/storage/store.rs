@@ -969,14 +969,14 @@ impl ZeppelinStore {
             .put_opts(&path, PutPayload::from(data), options)
             .await
             .map_err(|error| {
-                crate::metrics::S3_ERRORS_TOTAL
+                crate::metrics::STORAGE_ERRORS_TOTAL
                     .with_label_values(&["put"])
                     .inc();
                 ZeppelinError::Storage(error)
             })?;
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 put_create");
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
         Ok(())
@@ -1006,7 +1006,7 @@ impl ZeppelinStore {
             },
             Err(object_store::Error::AlreadyExists { .. }) => CreateOnlyOutcome::AlreadyExists,
             Err(error) => {
-                crate::metrics::S3_ERRORS_TOTAL
+                crate::metrics::STORAGE_ERRORS_TOTAL
                     .with_label_values(&["put"])
                     .inc();
                 return Err(ZeppelinError::Storage(error));
@@ -1014,7 +1014,7 @@ impl ZeppelinStore {
         };
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 put_create_outcome");
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
         Ok(outcome)
@@ -1042,7 +1042,7 @@ impl ZeppelinStore {
         let result = self.inner.put(&path, PutPayload::from(data)).await?;
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 put");
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
         Ok(result)
@@ -1094,7 +1094,7 @@ impl ZeppelinStore {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let result = self.inner.get(&path).await.map_err(|e| {
-            crate::metrics::S3_ERRORS_TOTAL
+            crate::metrics::STORAGE_ERRORS_TOTAL
                 .with_label_values(&["get"])
                 .inc();
             match e {
@@ -1111,7 +1111,7 @@ impl ZeppelinStore {
             size = bytes.len(),
             "s3 get"
         );
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["get"])
             .observe(elapsed.as_secs_f64());
         Ok(bytes)
@@ -1168,7 +1168,7 @@ impl ZeppelinStore {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let result = self.inner.get_range(&path, range).await.map_err(|e| {
-            crate::metrics::S3_ERRORS_TOTAL
+            crate::metrics::STORAGE_ERRORS_TOTAL
                 .with_label_values(&["get"])
                 .inc();
             match e {
@@ -1184,7 +1184,7 @@ impl ZeppelinStore {
             size = result.len(),
             "s3 get_range"
         );
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["get"])
             .observe(elapsed.as_secs_f64());
         Ok(result)
@@ -1243,7 +1243,7 @@ impl ZeppelinStore {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let result = self.inner.get_ranges(&path, ranges).await.map_err(|e| {
-            crate::metrics::S3_ERRORS_TOTAL
+            crate::metrics::STORAGE_ERRORS_TOTAL
                 .with_label_values(&["get"])
                 .inc();
             match e {
@@ -1261,7 +1261,7 @@ impl ZeppelinStore {
             ranges = ranges.len(),
             "s3 get_ranges"
         );
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["get"])
             .observe(elapsed.as_secs_f64());
         Ok(result)
@@ -1325,7 +1325,7 @@ impl ZeppelinStore {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let result = self.inner.get(&path).await.map_err(|e| {
-            crate::metrics::S3_ERRORS_TOTAL
+            crate::metrics::STORAGE_ERRORS_TOTAL
                 .with_label_values(&["get"])
                 .inc();
             match e {
@@ -1346,7 +1346,7 @@ impl ZeppelinStore {
             version = ?version,
             "s3 get_with_meta"
         );
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["get"])
             .observe(elapsed.as_secs_f64());
         Ok((
@@ -1456,13 +1456,13 @@ impl ZeppelinStore {
                     etag = %etag,
                     "s3 get_if_none_match not modified"
                 );
-                crate::metrics::S3_OPERATION_DURATION
+                crate::metrics::STORAGE_OPERATION_DURATION
                     .with_label_values(&["get"])
                     .observe(elapsed.as_secs_f64());
                 return Ok(None);
             }
             Err(e) => {
-                crate::metrics::S3_ERRORS_TOTAL
+                crate::metrics::STORAGE_ERRORS_TOTAL
                     .with_label_values(&["get"])
                     .inc();
                 return Err(match e {
@@ -1484,7 +1484,7 @@ impl ZeppelinStore {
             version = ?next_version,
             "s3 get_if_none_match modified"
         );
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["get"])
             .observe(elapsed.as_secs_f64());
         Ok(Some((bytes, next_version)))
@@ -1619,7 +1619,7 @@ impl ZeppelinStore {
             },
             Err(object_store::Error::Precondition { .. }) => ConditionalPutOutcome::Conflict,
             Err(error) => {
-                crate::metrics::S3_ERRORS_TOTAL
+                crate::metrics::STORAGE_ERRORS_TOTAL
                     .with_label_values(&["put"])
                     .inc();
                 return Err(ZeppelinError::Storage(error));
@@ -1627,7 +1627,7 @@ impl ZeppelinStore {
         };
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 put_if_match_outcome");
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
         Ok(outcome)
@@ -1662,7 +1662,7 @@ impl ZeppelinStore {
                     namespace: namespace.to_string(),
                 },
                 other => {
-                    crate::metrics::S3_ERRORS_TOTAL
+                    crate::metrics::STORAGE_ERRORS_TOTAL
                         .with_label_values(&["put"])
                         .inc();
                     ZeppelinError::Storage(other)
@@ -1670,7 +1670,7 @@ impl ZeppelinStore {
             })?;
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 put_if_match");
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
         Ok(StorageVersion::from_parts(result.e_tag, result.version))
@@ -1750,7 +1750,7 @@ impl ZeppelinStore {
                     }
                 }
                 other => {
-                    crate::metrics::S3_ERRORS_TOTAL
+                    crate::metrics::STORAGE_ERRORS_TOTAL
                         .with_label_values(&["put"])
                         .inc();
                     ZeppelinError::Storage(other)
@@ -1758,7 +1758,7 @@ impl ZeppelinStore {
             })?;
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 put_if_not_exists");
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
         Ok(())
@@ -1814,14 +1814,14 @@ impl ZeppelinStore {
             .copy_if_not_exists(&from_path, &to_path)
             .await
             .map_err(|e| {
-                crate::metrics::S3_ERRORS_TOTAL
+                crate::metrics::STORAGE_ERRORS_TOTAL
                     .with_label_values(&["copy"])
                     .inc();
                 ZeppelinError::Storage(e)
             })?;
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 copy_if_not_exists");
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["copy"])
             .observe(elapsed.as_secs_f64());
         Ok(())
@@ -1874,7 +1874,7 @@ impl ZeppelinStore {
         })?;
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 delete");
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["delete"])
             .observe(elapsed.as_secs_f64());
         Ok(())
@@ -1970,11 +1970,11 @@ impl ZeppelinStore {
             count = expected,
             "s3 delete_many"
         );
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["delete_many"])
             .observe(elapsed.as_secs_f64());
         if let Some(error) = first_error {
-            crate::metrics::S3_ERRORS_TOTAL
+            crate::metrics::STORAGE_ERRORS_TOTAL
                 .with_label_values(&["delete_many"])
                 .inc();
             return Err(ZeppelinError::Storage(error));
@@ -2099,7 +2099,7 @@ impl ZeppelinStore {
             count = objects.len(),
             "s3 list_prefix"
         );
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["list_prefix"])
             .observe(elapsed.as_secs_f64());
         Ok(objects)
@@ -2176,7 +2176,7 @@ impl ZeppelinStore {
             count = prefixes.len(),
             "s3 list_common_prefixes"
         );
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["list_common_prefixes"])
             .observe(elapsed.as_secs_f64());
         Ok(prefixes)
@@ -2220,7 +2220,7 @@ impl ZeppelinStore {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => {
-                crate::metrics::S3_ERRORS_TOTAL
+                crate::metrics::STORAGE_ERRORS_TOTAL
                     .with_label_values(&["exists"])
                     .inc();
                 Err(ZeppelinError::Storage(e))
@@ -2228,7 +2228,7 @@ impl ZeppelinStore {
         };
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 exists");
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["exists"])
             .observe(elapsed.as_secs_f64());
         result
@@ -2268,7 +2268,7 @@ impl ZeppelinStore {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let meta = self.inner.head(&path).await.map_err(|e| {
-            crate::metrics::S3_ERRORS_TOTAL
+            crate::metrics::STORAGE_ERRORS_TOTAL
                 .with_label_values(&["head"])
                 .inc();
             match e {
@@ -2280,7 +2280,7 @@ impl ZeppelinStore {
         })?;
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 head");
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["head"])
             .observe(elapsed.as_secs_f64());
         Ok(meta)
@@ -2478,7 +2478,7 @@ impl ZeppelinStore {
             complete,
             "s3 delete_prefix"
         );
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["delete_prefix"])
             .observe(elapsed.as_secs_f64());
         Ok(DeletePrefixOutcome { deleted, complete })
@@ -2543,7 +2543,7 @@ impl ZeppelinStore {
             complete,
             "s3 delete namespace objects"
         );
-        crate::metrics::S3_OPERATION_DURATION
+        crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["delete_prefix"])
             .observe(elapsed.as_secs_f64());
         Ok(DeletePrefixOutcome { deleted, complete })
