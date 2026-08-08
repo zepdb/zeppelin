@@ -4190,14 +4190,15 @@ impl NamespaceGraph {
                 #[cfg(feature = "branching-test-support")]
                 RootedProgress::StoppedAfterRoot => return Ok(None),
             };
-            self.publish_and_mark_prepared(
-                request.target.as_str(),
-                &candidate,
-                &mut lease,
-                published_intent,
-            )
-            .await?;
-            Ok::<_, ZeppelinError>(Some(candidate))
+            let published = self
+                .publish_and_mark_prepared(
+                    request.target.as_str(),
+                    &candidate,
+                    &mut lease,
+                    published_intent,
+                )
+                .await?;
+            Ok::<_, ZeppelinError>(Some((candidate, published)))
         }
         .await;
         if let Err(error) = self.lease_manager.release(source_name, &lease).await {
@@ -4207,14 +4208,23 @@ impl NamespaceGraph {
                 "fork source lease release failed (best-effort)"
             );
         }
-        let Some(_candidate) = prepared? else {
+        let Some((_candidate, published)) = prepared? else {
             return Ok(None);
         };
-        let final_metadata = self
-            .namespace_manager
-            .read_creating_intent_strong(request.target.as_str())
-            .await?
-            .0;
+        // The publish step hands back the intent it observed at
+        // ManifestPublished. Only the source lease is released between there
+        // and here, which cannot touch target metadata, so re-reading it would
+        // return the same bytes. Backends that supply no version yield `None`
+        // and the read still happens.
+        let final_metadata = match published {
+            Some((metadata, _version)) => metadata,
+            None => {
+                self.namespace_manager
+                    .read_creating_intent_strong(request.target.as_str())
+                    .await?
+                    .0
+            }
+        };
         let verified = self.verify_prepared_target(&final_metadata).await?;
         Ok(Some(if newly_reserved {
             PrepareForkOutcome::Prepared(verified)
@@ -4811,7 +4821,7 @@ impl NamespaceGraph {
         candidate: &PreparedCandidate,
         lease: &mut Lease,
         published_intent: Option<(NamespaceMetadata, StorageVersion)>,
-    ) -> Result<()> {
+    ) -> Result<Option<(NamespaceMetadata, StorageVersion)>> {
         let source = candidate.branch.identity.source_namespace.as_str();
         let renewed = self.lease_manager.renew(source, lease).await?;
         if !self.lease_manager.validate(&renewed) {
@@ -4900,6 +4910,7 @@ impl NamespaceGraph {
         // re-read on the next iteration, exactly as before.
         let mut seeded_observation = Some((before_publication, before_etag));
         let mut marked_published = false;
+        let mut published_observation: Option<(NamespaceMetadata, StorageVersion)> = None;
         for _ in 0..MAX_PREPARE_ATTEMPTS {
             let (mut metadata, etag) = match seeded_observation.take() {
                 Some(observation) => observation,
@@ -4916,14 +4927,22 @@ impl NamespaceGraph {
                 }
                 .into());
             }
-            let prepare = metadata.branch_prepare.as_ref().ok_or_else(|| {
-                ZeppelinError::Serialization(format!(
-                    "rooted branch target {target} has no preparation milestone"
-                ))
-            })?;
-            match prepare.stage {
+            let stage = metadata
+                .branch_prepare
+                .as_ref()
+                .ok_or_else(|| {
+                    ZeppelinError::Serialization(format!(
+                        "rooted branch target {target} has no preparation milestone"
+                    ))
+                })?
+                .stage;
+            match stage {
                 BranchPrepareStage::ManifestPublished
                 | BranchPrepareStage::ActivationPending { .. } => {
+                    // Already published by an earlier attempt or process. The
+                    // observation just read is the published state, so it can
+                    // seed the caller exactly as a post-CAS one would.
+                    published_observation = Some((metadata, etag));
                     marked_published = true;
                     break;
                 }
@@ -4940,7 +4959,8 @@ impl NamespaceGraph {
                         .cas_update_creating_intent(&metadata, &etag)
                         .await
                     {
-                        Ok(_) => {
+                        Ok(published) => {
+                            published_observation = published.map(|version| (metadata, version));
                             marked_published = true;
                             break;
                         }
@@ -4962,7 +4982,7 @@ impl NamespaceGraph {
             });
         }
         self.manifest_cache.invalidate_at(target, self.clock.now());
-        Ok(())
+        Ok(published_observation)
     }
 
     async fn verify_prepared_target(&self, target: &NamespaceMetadata) -> Result<PreparedBranch> {
