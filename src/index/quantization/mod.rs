@@ -67,6 +67,11 @@
 //! small discriminant and does not allocate or transfer ownership.
 
 pub mod pq;
+// `rabitq.rs` is dual-compiled: `src/bin/quant_bakeoff.rs` includes the same
+// source through `#[path]` and drives the one-bit encode/estimate surface that
+// the library itself never calls. The allow covers that offline-only half, so
+// it is load-bearing rather than stale -- removing it makes the lib build warn
+// on roughly thirty items the bake-off still depends on.
 #[allow(dead_code)]
 #[cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 pub(crate) mod rabitq;

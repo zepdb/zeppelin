@@ -1469,40 +1469,6 @@ pub fn prepare_query_adc4(
     })
 }
 
-/// Estimate the residual inner product `<v-c, q-c>`.
-///
-/// Owned-code wrapper over [`estimate_residual_dot_one_bit_parts`]; see that
-/// function for the estimator itself.
-///
-/// # Parameters
-///
-/// - `code`: Row code produced by [`encode_one_bit`] under the same rotation
-///   and centroid as `query`.
-/// - `query`: Query representation from [`prepare_query_adc4`].
-///
-/// # Returns
-///
-/// An approximation of `<v - c, q - c>` in the original (unrotated) geometry,
-/// since the rotation preserves inner products.
-///
-/// # Errors
-///
-/// Returns [`RabitqError::LengthMismatch`] when the code and query dimensions
-/// disagree.
-pub fn estimate_residual_dot_one_bit(
-    code: &OneBitCode,
-    query: &QueryAdc4,
-) -> Result<f32, RabitqError> {
-    estimate_residual_dot_one_bit_parts(
-        &code.words,
-        OneBitFactors {
-            residual_norm: code.residual_norm,
-            bar_dot_residual: code.bar_dot_residual,
-        },
-        query,
-    )
-}
-
 /// Allocation-free one-bit residual-dot estimator over a borrowed code slice.
 ///
 /// This is the RaBitQ estimator itself. Writing `h_bar` for the unit sign
@@ -1647,41 +1613,6 @@ pub fn estimate_l2_one_bit_parts(
         .residual_norm
         .mul_add(factors.residual_norm, query_residual_norm_sq)
         - 2.0 * cross)
-}
-
-/// Estimate `<v-c, q-c>` from an owned two-bit code.
-///
-/// Owned-code wrapper over [`estimate_residual_dot_two_bit_parts`].
-///
-/// # Parameters
-///
-/// - `code`: Row code from [`encode_two_bit`], under the same rotation and
-///   centroid as `query`.
-/// - `query`: Query representation from [`prepare_query_adc4`].
-///
-/// # Returns
-///
-/// An approximation of `<v - c, q - c>`, more accurate than the one-bit
-/// estimate for the cost of one extra bit plane per row.
-///
-/// # Errors
-///
-/// Returns [`RabitqError::LengthMismatch`] when the code and query dimensions
-/// disagree.
-pub fn estimate_residual_dot_two_bit(
-    code: &TwoBitCode,
-    query: &QueryAdc4,
-) -> Result<f32, RabitqError> {
-    check_len("query ADC dimension", query.dim, code.dim)?;
-    estimate_residual_dot_two_bit_parts(
-        &code.planes[0],
-        &code.planes[1],
-        TwoBitFactors {
-            residual_norm: code.residual_norm,
-            bar_dot_residual: code.bar_dot_residual,
-        },
-        query,
-    )
 }
 
 /// Allocation-free two-bit residual-dot estimator over borrowed planes.

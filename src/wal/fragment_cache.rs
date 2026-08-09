@@ -22,7 +22,6 @@ use crate::namespace::branching::ArtifactOrigin;
 use crate::types::{AttributeValue, VectorEntry};
 use dashmap::DashMap;
 use rand::Rng;
-use ulid::Ulid;
 
 use super::fragment::WalFragment;
 use super::manifest::LocatedFragmentIdentity;
@@ -141,33 +140,6 @@ impl WalFragmentCache {
                 if entry.value().logical_origins.is_empty() {
                     retired.push(entry.key().clone());
                 }
-            }
-        }
-        for identity in retired {
-            self.remove_locked(&identity);
-        }
-    }
-
-    /// Compatibility lifecycle cleanup for namespace-local callers.
-    ///
-    /// Origin-aware production readers use [`Self::evict_compacted_located`].
-    pub fn evict_compacted(&self, namespace: &str, active_fragment_ids: &[Ulid]) {
-        let _guard = self
-            .mutation
-            .lock()
-            .unwrap_or_else(|_| panic!("WAL fragment cache mutation lock poisoned"));
-        let active: HashSet<&Ulid> = active_fragment_ids.iter().collect();
-        let mut retired = Vec::new();
-        for mut entry in self.entries.iter_mut() {
-            if active.contains(&entry.key().id) {
-                continue;
-            }
-            entry
-                .value_mut()
-                .logical_origins
-                .retain(|origin| origin.namespace.as_str() != namespace);
-            if entry.value().logical_origins.is_empty() {
-                retired.push(entry.key().clone());
             }
         }
         for identity in retired {

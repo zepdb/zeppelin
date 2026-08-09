@@ -514,18 +514,6 @@ impl Catalog {
             .iter()
             .find(|tier| tier.name == name)
     }
-
-    /// Curated median RTT between two `cloud:region` endpoints, either
-    /// direction.
-    #[must_use]
-    pub fn rtt_between(&self, from: &str, to: &str) -> Option<f64> {
-        self.rtt
-            .iter()
-            .find(|entry| {
-                (entry.from == from && entry.to == to) || (entry.from == to && entry.to == from)
-            })
-            .map(|entry| entry.rtt_ms)
-    }
 }
 
 #[cfg(test)]

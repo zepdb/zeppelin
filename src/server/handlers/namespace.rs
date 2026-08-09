@@ -20,10 +20,8 @@
 //!
 //! The routed operations are create, get, delete, named snapshot management,
 //! point-in-time clone, index-config patching, manual compaction, compaction
-//! status, and cache hydration.
-//! [`list_namespaces`][crate::server::handlers::namespace::list_namespaces]
-//! exists for internal use but is deliberately not registered as an HTTP route,
-//! preventing namespace enumeration. Rate limits, body limits, timeouts,
+//! status, and cache hydration. There is deliberately no list operation:
+//! namespace enumeration is not exposed. Rate limits, body limits, timeouts,
 //! request IDs, and tracing are applied by [`crate::server::build_router`]
 //! outside this file.
 //!
@@ -2429,84 +2427,6 @@ fn rewrite_namespace_key(source: &str, target: &str, key: &str) -> Result<String
         ))
     })?;
     Ok(format!("{target}/{suffix}"))
-}
-
-/// Builds metadata-only responses for all namespaces discovered in storage.
-///
-/// This function is intentionally not registered by
-/// [`crate::server::build_router`], so `GET /v1/namespaces` receives 405 rather
-/// than enumerating tenant names. If an internal caller invokes it, each result
-/// is combined with one empty manifest, so all live artifact statistics are
-/// zero; it is a metadata inventory, not a status endpoint.
-///
-/// # Parameters
-///
-/// - `state`: Shared namespace manager and indexing defaults.
-///
-/// # Returns
-///
-/// An unordered JSON array of namespace metadata responses. Empty means no
-/// top-level metadata records were discovered.
-///
-/// # Errors
-///
-/// Propagates common-prefix listing, per-namespace metadata GET, and metadata
-/// decoding failures through [`ApiError`]. A missing metadata object that
-/// disappears during listing is skipped by the domain manager.
-///
-/// # Side Effects
-///
-/// Refreshes process-local namespace registry entries and emits a count log. It
-/// does not read manifests or modify object storage.
-///
-/// # Performance
-///
-/// Performs one delimiter LIST plus one metadata GET per discovered namespace;
-/// those GETs currently run sequentially. It does not recursively walk WAL or
-/// segment objects.
-///
-/// # Examples
-///
-/// An internal inventory over `catalog` and `inventory` returns two metadata
-/// rows with zero live counts. External `GET /v1/namespaces` remains disabled.
-#[allow(dead_code)]
-#[instrument(skip(state))]
-pub async fn list_namespaces(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<NamespaceResponse>>, ApiError> {
-    let namespaces = state
-        .namespace_manager
-        .list(None)
-        .await
-        .map_err(ApiError::from)?;
-
-    info!(count = namespaces.len(), "listed namespaces");
-    let mut responses = Vec::with_capacity(namespaces.len());
-    for meta in namespaces {
-        let manifest = if meta.state == NamespaceState::Active {
-            state
-                .manifest_cache
-                .get_strong_required(&state.store, &meta.name)
-                .await
-                .map_err(ApiError::from)?
-        } else {
-            Manifest::new_at(state.clock.now())
-        };
-        let late_state = manifest
-            .load_late_state(&state.store)
-            .await
-            .map_err(ApiError::from)?;
-        responses.push(
-            NamespaceResponse::from_manifest(
-                meta,
-                &manifest,
-                late_state.as_ref(),
-                &state.config.indexing,
-            )
-            .map_err(ApiError::from)?,
-        );
-    }
-    Ok(Json(responses))
 }
 
 /// Returns lifecycle metadata plus strongly verified manifest statistics.

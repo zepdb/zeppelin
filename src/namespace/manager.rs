@@ -1938,55 +1938,6 @@ impl NamespaceManager {
         Ok(next)
     }
 
-    /// Idempotently creates a named namespace with optional FTS settings.
-    ///
-    /// Same name plus identical immutable configuration returns the existing
-    /// S3 metadata; same name plus different configuration remains a conflict.
-    /// This keeps create-by-name useful for multi-process clients without
-    /// silently changing an existing namespace's shape.
-    ///
-    /// # Parameters
-    ///
-    /// - `name`: Stable client-selected namespace identifier.
-    /// - `dimensions`: Requested vector dimensionality.
-    /// - `distance_metric`: Requested vector distance metric.
-    /// - `full_text_search`: Requested per-field FTS configuration.
-    ///
-    /// # Returns
-    ///
-    /// Returns [`CreateNamespaceOutcome::Created`] for the winning create or
-    /// [`CreateNamespaceOutcome::Existing`] when authoritative metadata already
-    /// has the same immutable configuration.
-    ///
-    /// # Errors
-    ///
-    /// Propagates validation and storage errors. A same-name namespace with a
-    /// different configuration remains a conflict; a deletion tombstone remains
-    /// unavailable.
-    ///
-    /// # Examples
-    ///
-    /// Two deployment processes can both request the same 384-dimensional
-    /// `catalog` namespace. One receives `Created`; the other receives
-    /// `Existing` if every immutable setting matches.
-    #[instrument(skip(self, full_text_search), fields(namespace = name))]
-    pub async fn create_idempotent_with_fts(
-        &self,
-        name: &str,
-        dimensions: usize,
-        distance_metric: DistanceMetric,
-        full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
-    ) -> Result<CreateNamespaceOutcome> {
-        self.create_idempotent_with_fts_and_index_config(
-            name,
-            dimensions,
-            distance_metric,
-            full_text_search,
-            None,
-        )
-        .await
-    }
-
     /// Idempotently creates or verifies a namespace including index settings.
     ///
     /// This method first attempts the same atomic creation as the non-idempotent

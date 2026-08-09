@@ -442,43 +442,6 @@ impl WalReader {
         Ok(fragments)
     }
 
-    /// Reads and checksum-validates one directly addressed fragment.
-    ///
-    /// This compatibility alias now validates the checksum because immutable
-    /// upload does not prove that later object-store reads preserved the bytes.
-    /// Like [`Self::read_fragment`], it does not consult manifest visibility.
-    ///
-    /// # Parameters
-    ///
-    /// - `namespace`: Namespace that owns the fragment object.
-    /// - `fragment_id`: ULID used to derive its key.
-    ///
-    /// # Returns
-    ///
-    /// The decoded, checksum-validated fragment.
-    ///
-    /// # Errors
-    ///
-    /// Returns storage, decoding, and checksum-mismatch errors.
-    ///
-    /// # Performance
-    ///
-    /// Performs one full-object GET and avoids the checksum's serialization and
-    /// hashing work.
-    ///
-    /// # Examples
-    ///
-    /// Compaction may use this historical entry point after selecting a
-    /// fragment; corruption still fails loud.
-    #[instrument(skip(self), fields(namespace = namespace, fragment_id = %fragment_id))]
-    pub async fn read_fragment_unchecked(
-        &self,
-        namespace: &str,
-        fragment_id: &Ulid,
-    ) -> Result<WalFragment> {
-        self.read_fragment(namespace, fragment_id).await
-    }
-
     /// Reads specific refs in input order with checksum validation.
     ///
     /// Missing-object revalidation, cache behavior, and ordering match
