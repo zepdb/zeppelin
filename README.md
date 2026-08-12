@@ -35,12 +35,12 @@ QPS.
 - **IVF indexing** -- Scale-aware IVF-Flat partitioning and Hierarchical ANN
 - **Quantization** -- 2-bit Extended-RaBitQ with exact f32 rerank (production default), SQ8 (4x), PQ (16-32x), and f16 storage
 - **BM25 full-text search** -- Inverted indexes with configurable tokenization, stemming, and multi-field `rank_by` expressions (opt-in, see below)
-- **Late-interaction retrieval** -- Multi-vector MaxSim with asynchronous semantic enrichment and RRF fusion ([guide](docs/late-interaction.md))
+- **Late-interaction retrieval** -- Multi-vector MaxSim with asynchronous semantic enrichment and RRF fusion
 - **Bitmap pre-filters** -- RoaringBitmap indexes for sub-millisecond attribute filtering
 - **Write-ahead log** -- Durable writes with compaction into indexed segments
-- **Namespace forks** -- Disabled-by-default, licensed copy-on-write branching ([operator guide](docs/branching-operations.md)); fork only, no merge
+- **Namespace forks** -- Disabled-by-default, licensed copy-on-write branching; fork only, no merge
 - **Strong & eventual consistency** -- Choose per-query (see [Consistency semantics](#consistency-semantics))
-- **Licensed security suite** -- Fail-closed authorization kernel, RBAC, durable audit log, delegation tokens, and preservation holds ([deployment guide](docs/security-deployment.md))
+- **Licensed security suite** -- Fail-closed authorization kernel, RBAC, durable audit log, delegation tokens, and preservation holds
 - **Object storage** -- S3, MinIO, and S3-compatible backends. GCS and Azure planned
 - **Sizing advisor** -- Ranked hardware recommendations and validated, tuned configs from an embedded cloud pricing catalog (see [Sizing advisor](#sizing-advisor))
 
@@ -88,14 +88,11 @@ host: warm truth-wave p50 of 59 ms and end-to-end p50 of 102 ms on a
 50k-unit heavy-tail corpus (1,109 queries, K = 1000, f16 token matrices);
 ~42 ms truth wave on SciFact (5,183 docs). The 2026-08 optimization ladder
 cut the 50k truth wave 7x (417 ms to 59 ms) via streamed range reads, f16
-decode acceleration, and parallel scoped scoring — per-phase attribution
-and caveats in [docs/late-interaction.md](docs/late-interaction.md).
+decode acceleration, and parallel scoped scoring.
 
 These are loopback-MinIO measurements, not cloud-S3 latency claims: real S3
 adds its per-request round-trip floors to the manifest, coarse, and rerank
-waves. Methodology, per-slice attribution, and bit-exactness evidence for the
-2026-08 optimization pass (-30% warm latency at identical results) are in
-[`tasks/optimization_2bit_results/summary.md`](tasks/optimization_2bit_results/summary.md).
+waves.
 
 ## Quick Start
 
@@ -105,7 +102,7 @@ Spin up Zeppelin with MinIO locally using Docker Compose:
 docker compose up
 ```
 
-This starts Zeppelin on port `8080` and MinIO on port `9000` with a pre-created `zeppelin` bucket. The bundled [`zeppelin.dev.toml`](zeppelin.dev.toml) boots the server in `open_unsafe` security mode (no authentication) — local development only; see the [security deployment guide](docs/security-deployment.md) before deploying anywhere real.
+This starts Zeppelin on port `8080` and MinIO on port `9000` with a pre-created `zeppelin` bucket. The bundled [`zeppelin.dev.toml`](zeppelin.dev.toml) boots the server in `open_unsafe` security mode (no authentication) — local development only; set `security.mode = "enforced"` (see the `[security]` section of [`zeppelin.toml.example`](zeppelin.toml.example)) before deploying anywhere real.
 
 Every example below is copy-pasteable end-to-end (4-dimensional vectors
 keep them short — real embeddings just have more numbers).
@@ -194,7 +191,8 @@ curl -s http://localhost:8080/v1/namespaces/$NS/query \
 ```
 
 For multi-vector late-interaction retrieval (query text scored with MaxSim
-against token matrices), see [docs/late-interaction.md](docs/late-interaction.md).
+against token matrices), see the late-interaction `rank_by` forms in the
+[OpenAPI spec](api/zeppelin-api.yaml).
 
 ### Delete vectors
 
@@ -240,10 +238,8 @@ $/query, and the per-row bottleneck, and lists every rejected row with its
 reason. `emit-config` renders a fully commented config, validates it through
 the real config loader before writing anything, recomputes the GC safety
 floor from the values it emits, and generates a fresh random HMAC key in
-enforced mode (move it to a secret manager before rollout). The knob-by-knob
-tuning rationale is documented in
-[`tasks/config_tuning.md`](tasks/config_tuning.md); refresh the pricing
-snapshot with
+enforced mode (move it to a secret manager before rollout). Refresh the
+pricing snapshot with
 [`scripts/refresh_cloud_catalog.py`](scripts/refresh_cloud_catalog.py).
 
 ## Configuration
@@ -253,11 +249,7 @@ Zeppelin boots from built-in defaults, overridden by an optional
 environment variables. [`zeppelin.toml.example`](zeppelin.toml.example)
 documents the commonly tuned knobs with their defaults and env-var names.
 For a hardware-tuned config validated through the real loader, use
-`zeppelin_advisor emit-config` (above). The knob-by-knob rationale —
-including safety couplings like the GC horizon floor, hardcoded constants,
-and env-only knobs — is documented in
-[`tasks/config_tuning.md`](tasks/config_tuning.md), which a CI test keeps
-consistent with the actual config surface.
+`zeppelin_advisor emit-config` (above).
 
 ## API Reference
 
@@ -309,8 +301,8 @@ tables below are a complete index of the served routes.
 ### Security
 
 These routes are always registered, but each is gated by a licensed feature and
-returns a not-licensed error without it. See the
-[security deployment guide](docs/security-deployment.md).
+returns a not-licensed error without it. Configure via the `[security]`
+section in [`zeppelin.toml.example`](zeppelin.toml.example).
 
 | Method             | Path                                            | Entitlement  |
 |--------------------|-------------------------------------------------|--------------|
@@ -331,12 +323,7 @@ Use the HTTP API directly or generate a client from the canonical [OpenAPI 3.1 s
 ## Documentation
 
 - [OpenAPI 3.1 spec](api/zeppelin-api.yaml) — the canonical API contract
-- [Late-interaction retrieval](docs/late-interaction.md) — multi-vector MaxSim: querying, coverage semantics, measured performance
-- [Security deployment guide](docs/security-deployment.md) — enforced mode, API keys, RBAC, audit
-- [Compliance mapping](docs/compliance-mapping.md) — control-framework mapping for the security features
-- [Branching operations](docs/branching-operations.md) — operator guide for licensed namespace forks
-- [Config tuning rationale](tasks/config_tuning.md) — every knob, its couplings, and which numbers are measured vs engineered
-- [Rustdoc style](docs/rustdoc-style.md) — documentation conventions for contributors
+  (versioned independently of the crate; see the spec's `info.version`)
 
 ## Development
 

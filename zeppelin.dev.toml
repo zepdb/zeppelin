@@ -4,7 +4,7 @@
 # open_unsafe boots WITHOUT authentication or authorization. Local
 # development only — never expose a node booted from this file. For
 # production, start from `zeppelin_advisor emit-config` or
-# zeppelin.toml.example and read docs/security-deployment.md.
+# zeppelin.toml.example.
 
 [security]
 mode = "open_unsafe"

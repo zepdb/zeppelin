@@ -4,9 +4,7 @@
 # Set ZEPPELIN_CONFIG to point to a custom config file path.
 #
 # For a validated config tuned to specific hardware, use the sizing advisor
-# (`zeppelin_advisor emit-config`, see the README). The knob-by-knob tuning
-# rationale, including hardcoded constants and env-only knobs not listed
-# here, is documented in tasks/config_tuning.md.
+# (`zeppelin_advisor emit-config`, see the README).
 
 [security]
 # REQUIRED: choose exactly one explicit process posture. `enforced` refuses to
@@ -58,8 +56,7 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 
 [branching]
 # Branch routes require this switch AND a verified signed-license entitlement.
-# See docs/branching-operations.md before enabling; Zeppelin supports forks,
-# not merge/rebase/diff operations.
+# Zeppelin supports forks, not merge/rebase/diff operations.
 # enabled = false
 # max_children_per_namespace = 256   # direct children; valid range 1..=4096
 # max_depth = 16                     # ancestry depth; valid range 1..=64
@@ -175,8 +172,6 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # Both INT8 profiles keep read_max_concurrency = 16. Large gap budgets are for
 # this qualified high-density latency shape only: the sparse 50k-unit replay
 # showed severe byte amplification without a corresponding GET reduction.
-# See tasks/LateLatency/results/phase09-scan-int8.md for full p50/p95/p99,
-# requests, bytes, and recall evidence.
 # allow_dev_encoder = false          # ZEPPELIN_MMLI_ALLOW_DEV_ENCODER; local/test opt-in only
 # enrichment_queue_capacity = 64     # ZEPPELIN_MMLI_ENRICHMENT_QUEUE_CAPACITY; must be > 0
 # max_fragments_per_tick = 8         # ZEPPELIN_MMLI_MAX_FRAGMENTS_PER_TICK; must be > 0
@@ -185,10 +180,10 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # shutdown_timeout_secs = 30         # ZEPPELIN_MMLI_SHUTDOWN_TIMEOUT_SECS; must be > 0
 
 # Late-interaction segment index and read-plan knobs. The read defaults are
-# measured operating points (see tasks/LateLatency/results/); read_gap_budget
-# and read_max_request were probed across corpora and are not free wins to
-# raise. For a low-latency text namespace, take candidate_k and
-# read_gap_budget_bytes from exactly one measured profile above.
+# measured operating points; read_gap_budget and read_max_request were probed
+# across corpora and are not free wins to raise. For a low-latency text
+# namespace, take candidate_k and read_gap_budget_bytes from exactly one
+# measured profile above.
 # [mmli.segment]
 # nlist = 256                        # candidate IVF centroid count
 # probe_budget = 16                  # candidate IVF clusters read per query

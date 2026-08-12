@@ -154,6 +154,7 @@ if [ -z "$latest_report" ]; then
     exit 1
 fi
 
+mkdir -p "$PROJECT_ROOT/tasks"
 cp "$latest_report" "$PROJECT_ROOT/tasks/overnight-adversarial-report.md"
 failed="$(grep -E '^Summary:' "$latest_report" | sed -E 's/.*failed=([0-9]+).*/\1/' | tail -n 1)"
 failed="${failed:-0}"

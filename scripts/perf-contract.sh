@@ -168,6 +168,7 @@ main() {
             fi
             return 1
         fi
+        mkdir -p "$PROJECT_ROOT/tasks"
         cp "$contracts_report" "$PROJECT_ROOT/tasks/perf-contract-report.md"
         echo "Tier 1 report: $contracts_report"
         echo "Copied report: $PROJECT_ROOT/tasks/perf-contract-report.md"
@@ -202,6 +203,7 @@ main() {
         return 1
     fi
 
+    mkdir -p "$PROJECT_ROOT/tasks"
     cp "$report" "$PROJECT_ROOT/tasks/perf-contract-report.md"
     local failed
     failed="$(sed -n 's/^- scenarios failed: \([0-9][0-9]*\)$/\1/p' "$report" | tail -n 1)"
