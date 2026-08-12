@@ -4377,7 +4377,13 @@ fn bm25_rerank_corpus_stats(field_data: &RerankFieldData) -> HashMap<String, Rer
             stats.doc_count += 1;
             stats.avg_doc_length += *doc_length as f32;
             for token in tf_map.keys() {
-                *stats.term_doc_freqs.entry(token.clone()).or_insert(0) += 1;
+                // The occupied path dominates across a corpus; look up first
+                // so the token String is cloned only on first sight.
+                if let Some(count) = stats.term_doc_freqs.get_mut(token) {
+                    *count += 1;
+                } else {
+                    stats.term_doc_freqs.insert(token.clone(), 1);
+                }
             }
         }
     }

@@ -2388,10 +2388,7 @@ async fn fetch_strong_wal_records(
         for vector in &fragment.vectors {
             if requested.contains(vector.id.as_str()) {
                 deleted.remove(vector.id.as_str());
-                found.insert(
-                    vector.id.clone(),
-                    project_vector_entry(vector.clone(), projection),
-                );
+                found.insert(vector.id.clone(), project_vector_entry(vector, projection));
             }
         }
     }
@@ -2716,35 +2713,35 @@ async fn fetch_segment_attrs(
     Ok(attrs)
 }
 
-/// Consumes a WAL vector entry and applies the requested response projection.
+/// Applies the requested response projection to a borrowed WAL vector entry.
 ///
 /// # Parameters
 ///
-/// - `vector`: Owned latest-visible WAL entry.
+/// - `vector`: Borrowed latest-visible WAL entry, typically shared through an
+///   `Arc`-held fragment.
 /// - `projection`: Borrowed policy selecting coordinates and metadata fields.
 ///
 /// # Returns
 ///
-/// An owned [`GetVectorRecord`] with the same ID. Included values move directly
-/// into the record; excluded buffers are dropped. Metadata follows
-/// `project_attributes` semantics.
+/// An owned [`GetVectorRecord`] with the same ID. Only the parts the
+/// projection keeps are cloned: excluded coordinate buffers and disabled
+/// metadata are never copied at all. Metadata follows `project_attributes`
+/// semantics.
 ///
 /// # Examples
 ///
 /// Projecting `A=[1,2], {color:red, tenant:x}` with vectors disabled and fields
 /// `[color]` returns ID `A`, no values, and `{color:red}`.
-///
-/// # Rust Notes for Java/C Engineers
-///
-/// Taking `VectorEntry` by value makes ownership transfer explicit. Included
-/// coordinate storage moves without copying; excluded storage is freed by RAII.
-/// Java would typically share an array until garbage collection, while C would
-/// need separate free/transfer branches.
-fn project_vector_entry(vector: VectorEntry, projection: FetchProjection<'_>) -> GetVectorRecord {
+fn project_vector_entry(vector: &VectorEntry, projection: FetchProjection<'_>) -> GetVectorRecord {
+    let attributes = if projection.include_attributes {
+        project_attributes(vector.attributes.clone(), projection)
+    } else {
+        None
+    };
     GetVectorRecord {
-        id: vector.id,
-        values: projection.include_vector.then_some(vector.values),
-        attributes: project_attributes(vector.attributes, projection),
+        id: vector.id.clone(),
+        values: projection.include_vector.then(|| vector.values.clone()),
+        attributes,
     }
 }
 

@@ -671,9 +671,10 @@ fn build_field_index(
 
         // Aggregate within the document first so a posting list has exactly one
         // entry per document, which makes its length the document frequency.
+        // Tokens are owned and unused afterward, so they move into the map.
         let mut tf_map: HashMap<String, u32> = HashMap::new();
-        for token in &tokens {
-            *tf_map.entry(token.clone()).or_insert(0) += 1;
+        for token in tokens {
+            *tf_map.entry(token).or_insert(0) += 1;
         }
 
         // Moving each owned term out of tf_map avoids cloning it again.

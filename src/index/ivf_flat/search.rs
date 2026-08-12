@@ -2203,8 +2203,8 @@ async fn scan_clusters_flat(
                     "cluster metadata mismatch for object {object_key}: cluster {cluster_idx}"
                 )));
             }
-            let (prefilter, attrs) = metadata?;
-            let cluster = deserialize_cluster_from_object(&object_data, cluster_idx)?;
+            let (prefilter, mut attrs) = metadata?;
+            let mut cluster = deserialize_cluster_from_object(&object_data, cluster_idx)?;
 
             for (j, vec) in cluster.vectors.iter().enumerate() {
                 if let Some(ref bm) = prefilter {
@@ -2214,10 +2214,16 @@ async fn scan_clusters_flat(
                 }
 
                 let score = compute_distance(query, vec, distance_metric);
-                let vector_attrs = attrs.as_ref().and_then(|a| a.get(j)).cloned().flatten();
+                // `attrs` and `cluster` are owned by this iteration and each
+                // row is visited once, so the attribute map and ID move out
+                // instead of deep-cloning per candidate.
+                let vector_attrs = attrs
+                    .as_mut()
+                    .and_then(|a| a.get_mut(j))
+                    .and_then(Option::take);
 
                 candidates.push(Candidate {
-                    id: cluster.ids[j].clone(),
+                    id: std::mem::take(&mut cluster.ids[j]),
                     score,
                     attributes: vector_attrs,
                     cluster_idx,
@@ -2448,7 +2454,7 @@ async fn scan_clusters_sq(
 
     let mut coarse_candidates: Vec<QuantizedCoarseCandidate> = Vec::new();
     for &cluster_idx in probe_clusters {
-        let sq_cluster = sq_by_cluster.remove(&cluster_idx).ok_or_else(|| {
+        let mut sq_cluster = sq_by_cluster.remove(&cluster_idx).ok_or_else(|| {
             ZeppelinError::Index(format!(
                 "SQ coarse missing cluster data for cluster {cluster_idx}"
             ))
@@ -2464,7 +2470,14 @@ async fn scan_clusters_sq(
                 continue;
             }
             let approx_score = calibration.asymmetric_distance(query, codes, distance_metric);
-            coarse_candidates.push((sq_cluster.ids[j].clone(), approx_score, cluster_idx, j));
+            // The cluster is owned and each row is visited once, so the ID
+            // moves out instead of allocating per scanned row.
+            coarse_candidates.push((
+                std::mem::take(&mut sq_cluster.ids[j]),
+                approx_score,
+                cluster_idx,
+                j,
+            ));
         }
     }
 
@@ -4194,19 +4207,20 @@ fn coalesce_rerank_ranges(
 /// # Performance
 ///
 /// Parses every requested full cluster, builds one borrowed ID-to-row map, and
-/// clones only winner vectors. Cost is linear in parsed cluster bytes plus
-/// `winner_count * dim` copied floats.
+/// moves only winner vectors out of the decoded cluster. Cost is linear in
+/// parsed cluster bytes; winner vectors transfer ownership without copying.
 ///
 /// # Examples
 ///
 /// If cluster 3 contains 1,000 rows but coarse ranking retained IDs `a` and `z`,
-/// the helper parses the cluster once and clones only those two vectors.
+/// the helper parses the cluster once and extracts only those two vectors.
 ///
 /// # Rust Notes for Java/C Engineers
 ///
 /// The hash map stores `&str` slices borrowed from the decoded cluster's owned
-/// strings. Rust prevents the map from outliving that cluster. Returned vectors
-/// are cloned into owned allocations, so they remain valid after both the map
+/// ID strings. Rust prevents the map from outliving that cluster. Winner
+/// vectors are moved out of the decoded cluster's separate `vectors` field
+/// (each row is matched at most once), so they remain valid after both the map
 /// and decoded object are dropped.
 fn rerank_vectors_from_object(
     object_key: &str,
@@ -4216,19 +4230,17 @@ fn rerank_vectors_from_object(
 ) -> Result<Vec<RerankFetchedVector>> {
     let mut vectors = Vec::new();
     for &cluster_idx in needed_clusters {
-        let needs = cluster_candidates
-            .get(&cluster_idx)
-            .ok_or_else(|| {
-                ZeppelinError::Index(format!(
-                    "missing rerank candidate IDs for cluster {cluster_idx}"
-                ))
-            })?
-            .clone();
-        let cluster = deserialize_cluster_from_object(object_data, cluster_idx).map_err(|e| {
+        let needs = cluster_candidates.get(&cluster_idx).ok_or_else(|| {
             ZeppelinError::Index(format!(
-                "failed to deserialize cluster {cluster_idx} from {object_key}: {e}"
+                "missing rerank candidate IDs for cluster {cluster_idx}"
             ))
         })?;
+        let mut cluster =
+            deserialize_cluster_from_object(object_data, cluster_idx).map_err(|e| {
+                ZeppelinError::Index(format!(
+                    "failed to deserialize cluster {cluster_idx} from {object_key}: {e}"
+                ))
+            })?;
         let row_by_id: HashMap<&str, usize> = cluster
             .ids
             .iter()
@@ -4244,9 +4256,12 @@ fn rerank_vectors_from_object(
             })?;
             vectors.push(RerankFetchedVector {
                 cluster_idx,
-                id: need.id,
+                id: need.id.clone(),
                 row_idx,
-                vector: cluster.vectors[row_idx].clone(),
+                // IDs are unique within a cluster, so each row is matched at
+                // most once; moving the vector out avoids a dim-sized copy
+                // per rerank candidate.
+                vector: std::mem::take(&mut cluster.vectors[row_idx]),
             });
         }
     }
@@ -4650,14 +4665,20 @@ async fn scan_clusters_pq(
     for (cluster_idx, metadata, pq_res) in coarse_prefetched {
         let (prefilter, attrs) = metadata?;
         let pq_data = pq_res?;
-        let pq_cluster = deserialize_pq_cluster(&pq_data)?;
+        let mut pq_cluster = deserialize_pq_cluster(&pq_data)?;
 
         for (j, codes) in pq_cluster.codes.iter().enumerate() {
             if !coarse_row_passes(filter, &prefilter, &attrs, j) {
                 continue;
             }
             let approx_score = codebook.adc_distance(&adc_table, codes);
-            coarse_candidates.push((pq_cluster.ids[j].clone(), approx_score, cluster_idx));
+            // The cluster is owned and each row is visited once, so the ID
+            // moves out instead of allocating per scanned row.
+            coarse_candidates.push((
+                std::mem::take(&mut pq_cluster.ids[j]),
+                approx_score,
+                cluster_idx,
+            ));
         }
     }
 
@@ -4709,17 +4730,23 @@ async fn scan_clusters_pq(
     let mut candidates = Vec::new();
     for (cluster_idx, needed_ids, cluster_res, attrs) in rerank_prefetched {
         let cluster_data = cluster_res?;
-        let attrs = attrs?;
-        let cluster = deserialize_cluster_from_object(&cluster_data, cluster_idx)?;
+        let mut attrs = attrs?;
+        let mut cluster = deserialize_cluster_from_object(&cluster_data, cluster_idx)?;
 
         let needed_set: HashSet<&str> = needed_ids.iter().map(|s| s.as_str()).collect();
 
-        for (j, id) in cluster.ids.iter().enumerate() {
-            if needed_set.contains(id.as_str()) {
+        // Indexed loop because matching rows move their ID and attribute map
+        // out of the owned cluster (each row is visited once) instead of
+        // deep-cloning per candidate.
+        for j in 0..cluster.ids.len() {
+            if needed_set.contains(cluster.ids[j].as_str()) {
                 let score = compute_distance(query, &cluster.vectors[j], distance_metric);
-                let vector_attrs = attrs.as_ref().and_then(|a| a.get(j)).cloned().flatten();
+                let vector_attrs = attrs
+                    .as_mut()
+                    .and_then(|a| a.get_mut(j))
+                    .and_then(Option::take);
                 candidates.push(Candidate {
-                    id: id.clone(),
+                    id: std::mem::take(&mut cluster.ids[j]),
                     score,
                     attributes: vector_attrs,
                     cluster_idx,
