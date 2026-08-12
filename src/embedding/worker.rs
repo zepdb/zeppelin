@@ -18,6 +18,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::embedding::encoder::{
@@ -143,7 +144,13 @@ impl PinnedWorker {
                 Ok(worker)
             }
             Err(error) => {
-                let _ = tokio::fs::remove_dir_all(&materialized).await;
+                // Cleanup is best-effort — the spawn failure is what the
+                // caller must see — but a leaked bundle dir should be visible.
+                if let Err(cleanup_error) = tokio::fs::remove_dir_all(&materialized).await {
+                    if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                        warn!(path = %materialized.display(), error = %cleanup_error, "failed to remove materialized bundle after spawn failure");
+                    }
+                }
                 Err(error)
             }
         }
@@ -383,7 +390,9 @@ impl PinnedWorker {
                     let path = match self.write_image_sidecar(input).await {
                         Ok(path) => path,
                         Err(error) => {
-                            let _ = remove_sidecars(&sidecars).await;
+                            if let Err(cleanup_error) = remove_sidecars(&sidecars).await {
+                                warn!(error = %cleanup_error, "failed to remove image sidecars after write failure");
+                            }
                             return Err(error);
                         }
                     };
@@ -404,7 +413,9 @@ impl PinnedWorker {
                     let path = match self.write_image_sidecar(input).await {
                         Ok(path) => path,
                         Err(error) => {
-                            let _ = remove_sidecars(&sidecars).await;
+                            if let Err(cleanup_error) = remove_sidecars(&sidecars).await {
+                                warn!(error = %cleanup_error, "failed to remove image sidecars after write failure");
+                            }
                             return Err(error);
                         }
                     };
@@ -553,7 +564,13 @@ impl PinnedWorker {
                 .await
                 .map_err(|error| worker_error(format!("failed to stat tensor sidecar: {error}")))?;
             if !metadata.is_file() || metadata.len() != expected_bytes_u64 {
-                let _ = tokio::fs::remove_file(&path).await;
+                // The mismatch error below is what matters; still surface a
+                // failed unlink so scratch-dir leaks are visible.
+                if let Err(cleanup_error) = tokio::fs::remove_file(&path).await {
+                    if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                        warn!(path = %path.display(), error = %cleanup_error, "failed to remove mismatched tensor sidecar");
+                    }
+                }
                 return Err(worker_error(format!(
                     "worker tensor length mismatch: expected {expected_bytes_u64}, got {}",
                     metadata.len()
@@ -787,7 +804,11 @@ pub async fn materialize_bundle_from_s3(
     }
     .await;
     if materialized.is_err() {
-        let _ = tokio::fs::remove_dir_all(&bundle_dir).await;
+        if let Err(cleanup_error) = tokio::fs::remove_dir_all(&bundle_dir).await {
+            if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                warn!(path = %bundle_dir.display(), error = %cleanup_error, "failed to remove bundle dir after materialization failure");
+            }
+        }
     }
     materialized
 }
@@ -1165,12 +1186,17 @@ fn drain_stderr(
                 Ok(0) | Err(_) => break,
                 Ok(count) => count,
             };
-            if let Ok(mut retained) = tail.lock() {
-                for byte in &buffer[..count] {
-                    retained.push_back(*byte);
-                    if retained.len() > max_bytes {
-                        retained.pop_front();
-                    }
+            // A poisoned lock only means another thread panicked while
+            // appending bytes; the buffer itself is still usable, and losing
+            // stderr capture exactly when a worker is crashing would discard
+            // the most valuable diagnostics.
+            let mut retained = tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for byte in &buffer[..count] {
+                retained.push_back(*byte);
+                if retained.len() > max_bytes {
+                    retained.pop_front();
                 }
             }
         }

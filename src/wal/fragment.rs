@@ -344,8 +344,9 @@ impl WalFragment {
             })
             .collect();
         #[allow(clippy::expect_used)]
-        let payload =
-            serde_json::to_vec(&(&canonical, deletes)).expect("serialization should not fail");
+        let payload = serde_json::to_vec(&(&canonical, deletes)).expect(
+            "checksum payload is slices, strings, and string-keyed BTreeMaps, which serde_json always serializes",
+        );
         xxh3_64(&payload)
     }
 

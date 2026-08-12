@@ -167,7 +167,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use rand::Rng;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 
 use crate::config::CacheConfig;
 use crate::error::{Result, ZeppelinError};
@@ -626,7 +626,11 @@ impl DiskCache {
             // A completed put is published by rename, so a remaining temporary
             // name can only be an interrupted or failed write.
             if filename.ends_with(".tmp") {
-                let _ = std::fs::remove_file(&path);
+                if let Err(io_error) = std::fs::remove_file(&path) {
+                    if io_error.kind() != std::io::ErrorKind::NotFound {
+                        warn!(path = %path.display(), error = %io_error, "startup scan could not remove leftover temp file");
+                    }
+                }
                 continue;
             }
 
@@ -1428,7 +1432,14 @@ impl DiskCache {
             self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
             crate::metrics::CACHE_ENTRIES.dec();
             let path = self.dir.join(&entry.filename);
-            let _ = tokio::fs::remove_file(&path).await;
+            // The index entry and size accounting are already gone, so a
+            // failed unlink leaks the file; surface it rather than letting
+            // disk usage silently drift past the configured bound.
+            if let Err(io_error) = tokio::fs::remove_file(&path).await {
+                if io_error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(path = %path.display(), error = %io_error, "cache invalidation could not unlink file");
+                }
+            }
             debug!("invalidated cache key");
         }
 
@@ -1530,7 +1541,13 @@ impl DiskCache {
             self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
             crate::metrics::CACHE_ENTRIES.dec();
             let path = self.dir.join(&entry.filename);
-            let _ = tokio::fs::remove_file(&path).await;
+            // As in invalidate: the accounting is already adjusted, so a
+            // failed unlink is a silent disk leak unless reported.
+            if let Err(io_error) = tokio::fs::remove_file(&path).await {
+                if io_error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(path = %path.display(), error = %io_error, "prefix invalidation could not unlink file");
+                }
+            }
         }
 
         let mut pinned = self.pinned.write().await;

@@ -5845,11 +5845,10 @@ impl NamespaceGraph {
                     if let Err(error) = self.lease_manager.release(source_name, &lease).await {
                         warn!(namespace = source_name, error = %error, "branch maintenance lease release failed (best-effort)");
                     }
-                    let Some(candidate) = repair? else {
+                    let Some(_candidate) = repair? else {
                         continue;
                     };
                     report.rooted_repaired += 1;
-                    let _ = candidate;
                     report.manifests_published += 1;
                 }
                 BranchPrepareStage::Rooted => {
