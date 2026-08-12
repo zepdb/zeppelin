@@ -92,7 +92,6 @@ ed25519-dalek = "2"
 
 # Metrics
 prometheus = { version = "0.14", default-features = false }
-lazy_static = "1"
 
 # Config
 dotenvy = "0.15"

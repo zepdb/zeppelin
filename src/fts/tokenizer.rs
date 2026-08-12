@@ -66,6 +66,7 @@
 //! or cleanup code.
 
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
@@ -397,16 +398,14 @@ static ENGLISH_STOPWORDS: &[&str] = &[
     "they", "this", "to", "was", "will", "with",
 ];
 
-lazy_static::lazy_static! {
-    /// Provides constant-time membership lookup over [`ENGLISH_STOPWORDS`].
-    ///
-    /// Initialization happens once on first use, after which all callers share
-    /// an immutable process-lifetime set.
-    static ref ENGLISH_STOPWORD_SET: HashSet<&'static str> =
-        ENGLISH_STOPWORDS.iter().copied().collect();
-    /// Provides an allocation-free shared empty table when removal is disabled.
-    static ref EMPTY_STOPWORDS: HashSet<&'static str> = HashSet::new();
-}
+/// Provides constant-time membership lookup over [`ENGLISH_STOPWORDS`].
+///
+/// Initialization happens once on first use, after which all callers share
+/// an immutable process-lifetime set.
+static ENGLISH_STOPWORD_SET: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| ENGLISH_STOPWORDS.iter().copied().collect());
+/// Provides an allocation-free shared empty table when removal is disabled.
+static EMPTY_STOPWORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(HashSet::new);
 
 /// Selects the process-wide stopword lookup table for a language.
 ///

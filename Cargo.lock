@@ -3588,7 +3588,6 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "half",
- "lazy_static",
  "object_store",
  "pprof",
  "prometheus",
