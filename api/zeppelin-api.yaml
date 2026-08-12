@@ -2,6 +2,7 @@ openapi: 3.1.0
 info:
   title: Zeppelin Vector Search API
   description: S3-native vector search engine with BM25 full-text search support.
+  # The API contract is versioned independently of the zeppelin crate.
   version: 0.2.0
   license:
     name: Apache-2.0

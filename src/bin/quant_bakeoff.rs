@@ -29,9 +29,8 @@ use zeppelin::index::quantization::pq::PqCodebook;
 use zeppelin::index::quantization::sq::SqCalibration;
 use zeppelin::types::DistanceMetric;
 
-const DATA_ROOT: &str = "/Users/aghatage/Documents/code/zeppelin-devbench/data";
-const RESULTS_PATH: &str =
-    "/Users/aghatage/Documents/code/zeppelin/tasks/July10Quant/results/bakeoff.md";
+const DATA_ROOT_ENV: &str = "ZEPPELIN_BAKEOFF_DATA_ROOT";
+const RESULTS_PATH_ENV: &str = "ZEPPELIN_BAKEOFF_RESULTS_PATH";
 const DBPEDIA_DIR: &str = "dbpedia100k";
 const WIKI_DIR: &str = "wikidpr2m";
 const REQUIRED_FILES: [&str; 6] = [
@@ -367,7 +366,9 @@ fn main() {
 
 fn run() -> Result<()> {
     validate_cli()?;
-    preflight_datasets()?;
+    let data_root = data_root()?;
+    let results_path = results_path()?;
+    preflight_datasets(&data_root)?;
     eprintln!("running deterministic structured-vs-dense 768d rotation oracle");
     let rotation_quality = rabitq::compare_structured_dense_quality_768().map_err(rabitq_error)?;
     if rotation_quality.mse_delta.abs() > 5.0 * rotation_quality.mse_delta_standard_error {
@@ -379,7 +380,7 @@ fn run() -> Result<()> {
 
     let mut results = Vec::with_capacity(DATASETS.len());
     for spec in DATASETS {
-        let path = Path::new(DATA_ROOT).join(spec.directory);
+        let path = data_root.join(spec.directory);
         eprintln!("loading {} from {}", spec.report_name, path.display());
         let dataset = load_dataset(spec, &path)?;
         validate_dataset_unit_norms(&dataset)?;
@@ -390,9 +391,29 @@ fn run() -> Result<()> {
     }
 
     let report = render_report(&results, &rotation_quality)?;
-    write_report(Path::new(RESULTS_PATH), report.as_bytes())?;
-    eprintln!("wrote {}", RESULTS_PATH);
+    write_report(&results_path, report.as_bytes())?;
+    eprintln!("wrote {}", results_path.display());
     Ok(())
+}
+
+fn data_root() -> Result<PathBuf> {
+    env::var_os(DATA_ROOT_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            BakeoffError::Usage(format!(
+                "{DATA_ROOT_ENV} must name the devbench dataset root directory"
+            ))
+        })
+}
+
+fn results_path() -> Result<PathBuf> {
+    env::var_os(RESULTS_PATH_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            BakeoffError::Usage(format!(
+                "{RESULTS_PATH_ENV} must name the markdown report output path"
+            ))
+        })
 }
 
 fn validate_cli() -> Result<()> {
@@ -402,8 +423,9 @@ fn validate_cli() -> Result<()> {
         if (argument == "--help" || argument == "-h") && args.next().is_none() {
             println!(
                 "{program}\n\nLoads the fixed dbpedia100k and wikidpr2m datasets from\n\
-                 {DATA_ROOT} and writes {RESULTS_PATH}.\n\
-                 No dataset substitution or command-line path override is supported."
+                 ${DATA_ROOT_ENV} and writes the report to ${RESULTS_PATH_ENV}.\n\
+                 Both environment variables are required. No dataset substitution\n\
+                 or command-line path override is supported."
             );
             std::process::exit(0);
         }
@@ -414,12 +436,12 @@ fn validate_cli() -> Result<()> {
     Ok(())
 }
 
-fn preflight_datasets() -> Result<()> {
+fn preflight_datasets(data_root: &Path) -> Result<()> {
     for spec in DATASETS {
-        let directory = Path::new(DATA_ROOT).join(spec.directory);
+        let directory = data_root.join(spec.directory);
         if !directory.is_dir() {
             let detail = if spec.is_gate_dataset {
-                "the required wiki_dpr_e5 prefix slice has not been built; follow the five-step runbook in tasks/July10Quant/01-bakeoff.md and do not substitute another dataset"
+                "the required wiki_dpr_e5 prefix slice has not been built; do not substitute another dataset"
             } else {
                 "the required devbench dataset directory is missing"
             };

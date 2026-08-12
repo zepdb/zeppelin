@@ -163,11 +163,6 @@ use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
 use zeppelin::wal::manifest::CoarsePayloadEncoding;
 use zeppelin::wal::{Manifest, WalReader, WalWriter};
 
-/// Default external holdout specification used when `--seed-file` is omitted.
-///
-/// The absolute path keeps the sealed seed material outside this repository.
-/// Operators can supply a different compatible file explicitly.
-const DEFAULT_SEED_FILE: &str = "/Users/aghatage/Documents/code/zeppelin-holdout/holdout_seed.toml";
 /// Default named dataset selected from the seed specification.
 const DEFAULT_DATASET: &str = "d1_primary";
 /// Maximum generated entries moved into one immutable WAL fragment.
@@ -897,7 +892,7 @@ fn parse_cli<I>(args: I) -> Result<Option<Cli>>
 where
     I: IntoIterator<Item = String>,
 {
-    let mut seed_file = PathBuf::from(DEFAULT_SEED_FILE);
+    let mut seed_file: Option<PathBuf> = None;
     let mut query_mode = QueryModeSelection::All;
     let mut nprobe = None;
     let mut top_k = None;
@@ -910,7 +905,7 @@ where
             "--help" | "-h" => return Ok(None),
             "--json" => json = true,
             "--seed-file" => {
-                seed_file = PathBuf::from(next_value(&mut iter, "--seed-file")?);
+                seed_file = Some(PathBuf::from(next_value(&mut iter, "--seed-file")?));
             }
             "--query-mode" => {
                 let value = next_value(&mut iter, "--query-mode")?;
@@ -943,6 +938,13 @@ where
             }
         }
     }
+
+    let seed_file = seed_file.ok_or_else(|| {
+        RecallEvalError::Usage(format!(
+            "--seed-file is required; it names the external holdout specification\n{}",
+            usage()
+        ))
+    })?;
 
     Ok(Some(Cli {
         seed_file,
@@ -1052,15 +1054,15 @@ fn parse_positive_usize(flag: &str, value: &str) -> Result<usize> {
 /// Help output and unknown-argument errors use the same synopsis so supported
 /// flags cannot drift between two strings.
 fn usage() -> &'static str {
-    "usage: recall_eval [--query-mode centroid|boundary|uniform|all] [--nprobe <n>|all] \
-     [--top-k <k>] [--dataset <name-or-size>] [--seed-file <path>] [--json]"
+    "usage: recall_eval --seed-file <path> [--query-mode centroid|boundary|uniform|all] \
+     [--nprobe <n>|all] [--top-k <k>] [--dataset <name-or-size>] [--json]"
 }
 
 /// Reads and decodes the external holdout specification.
 ///
 /// # Parameters
 ///
-/// - `path`: Filesystem path supplied by defaults or `--seed-file`.
+/// - `path`: Filesystem path supplied by the required `--seed-file` flag.
 ///
 /// # Returns
 ///

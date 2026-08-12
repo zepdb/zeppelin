@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  IMAGE: ghcr.io/zepdb/zeppelin
+
+jobs:
+  release:
+    name: Build, Publish Image, Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive and verify version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "tag v$VERSION does not match Cargo.toml version $CARGO_VERSION" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build image
+        run: |
+          docker build \
+            --label "org.opencontainers.image.title=zeppelin" \
+            --label "org.opencontainers.image.description=S3-native vector search engine" \
+            --label "org.opencontainers.image.source=https://github.com/zepdb/zeppelin" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.licenses=Apache-2.0" \
+            -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
+
+      - name: Smoke-test image
+        run: |
+          docker inspect "$IMAGE:$VERSION" --format '{{json .Config.Labels}}'
+          docker run --rm --entrypoint ls "$IMAGE:$VERSION" /usr/local/bin/zeppelin
+
+      - name: Push image
+        run: |
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:latest"
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          awk "/^## \\[$VERSION\\]/{flag=1; next} /^## \\[/{flag=0} flag" CHANGELOG.md > /tmp/notes.md
+          test -s /tmp/notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Zeppelin $GITHUB_REF_NAME" \
+            --notes-file /tmp/notes.md \
+            --verify-tag

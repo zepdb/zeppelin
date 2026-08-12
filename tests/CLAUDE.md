@@ -55,6 +55,10 @@ invocation plus MinIO.
 
 - `test_active_queries_returns_to_zero` — shared Prometheus metrics across test
   binaries; passes in isolation.
+- `adversarial::runner::outcome_tests::content_seed_127_classifies_durable_torn_manifest_loudly`
+  — fails under full-suite parallel load against a single local MinIO; passes
+  in isolation. Reproduced identically on a pre-2026-08-12 baseline, so it is
+  load-timing, not a regression.
 - `security::policy_publication::tests::*` (2) and
   `startup::tests::licensed_file_boot_enables_rbac_routes` — fail under
   `cargo test --lib` without MinIO because the `Local` backend has no ETag

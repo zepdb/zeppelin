@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "S3-native vector search engine"
 license = "Apache-2.0"
+repository = "https://github.com/zepdb/zeppelin"
+readme = "README.md"
 rust-version = "1.85"
+publish = false
 
 [features]
 default = []
@@ -46,6 +49,11 @@ bench = false
 name = "zeppelin_advisor"
 path = "src/bin/zeppelin_advisor.rs"
 test = false
+bench = false
+
+[[bin]]
+name = "recall_eval"
+path = "src/bin/recall_eval.rs"
 bench = false
 
 [dependencies]

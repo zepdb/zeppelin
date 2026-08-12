@@ -70,6 +70,10 @@ result_*.txt
 # Claude Code local settings
 .claude/
 
+# Agent session state and local audit notes
+.pi-glla/
+AUDIT.md
+
 # Local worktrees and session artifacts
 .ext-worktrees/
 .tokensave/
