@@ -102,8 +102,10 @@ pub fn compute_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
 ///
 /// # Panics
 ///
-/// Debug-asserts equal lengths. The SIMD kernels rely on that equality for safe
-/// pointer loads, so callers must not pass mismatched dimensions.
+/// Panics when the lengths differ. The SIMD kernels rely on that equality for
+/// safe pointer loads, so it is enforced in release builds as well: a
+/// mismatched pair must fail loud here rather than read out of bounds in the
+/// NEON or AVX2 path.
 ///
 /// # Performance
 ///
@@ -116,7 +118,7 @@ pub fn compute_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
 /// returns `2`.
 #[inline]
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vector dimensions must match");
+    assert_eq!(a.len(), b.len(), "vector dimensions must match");
 
     let (dot, norm_a, norm_b) = cosine_components(a, b);
 
@@ -146,8 +148,8 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Panics
 ///
-/// Debug-asserts equal lengths; callers must validate dimensions before this
-/// hot path.
+/// Panics when the lengths differ, in release builds as well; the SIMD kernels
+/// rely on that equality for safe pointer loads.
 ///
 /// # Performance
 ///
@@ -159,7 +161,7 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 /// `[0, 0]` and `[3, 4]` return `25`, not `5`.
 #[inline]
 pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vector dimensions must match");
+    assert_eq!(a.len(), b.len(), "vector dimensions must match");
     euclidean_squared_inner(a, b)
 }
 
@@ -180,7 +182,8 @@ pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Panics
 ///
-/// Debug-asserts equal lengths; callers must validate dimensions first.
+/// Panics when the lengths differ, in release builds as well; the SIMD kernels
+/// rely on that equality for safe pointer loads.
 ///
 /// # Performance
 ///
@@ -191,7 +194,7 @@ pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
 /// `[1, 2]` compared with itself has similarity `5` and distance `-5`.
 #[inline]
 pub fn dot_product_distance(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vector dimensions must match");
+    assert_eq!(a.len(), b.len(), "vector dimensions must match");
     -dot_product_inner(a, b)
 }
 
@@ -289,13 +292,16 @@ fn cosine_components(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
-    unsafe {
+    let chunks = a.len() / 8;
+    let remainder = a.len() % 8;
+
+    // SAFETY: the public wrappers assert `a.len() == b.len()`, and `chunks`
+    // is derived from that common length, so every unaligned eight-float load
+    // at `base` is in bounds for both slices.
+    let (mut dot_sum, mut norm_a, mut norm_b) = unsafe {
         let mut dot_acc = _mm256_setzero_ps();
         let mut norm_a_acc = _mm256_setzero_ps();
         let mut norm_b_acc = _mm256_setzero_ps();
-
-        let chunks = a.len() / 8;
-        let remainder = a.len() % 8;
 
         for i in 0..chunks {
             let base = i * 8;
@@ -306,24 +312,24 @@ fn cosine_components(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
             norm_b_acc = _mm256_fmadd_ps(vb, vb, norm_b_acc);
         }
 
-        // Horizontal sum for each accumulator.
-        let dot = hsum_avx(dot_acc);
-        let mut norm_a = hsum_avx(norm_a_acc);
-        let mut norm_b = hsum_avx(norm_b_acc);
-        let mut dot_sum = dot;
+        (
+            hsum_avx(dot_acc),
+            hsum_avx(norm_a_acc),
+            hsum_avx(norm_b_acc),
+        )
+    };
 
-        // Handle remainder.
-        let base = chunks * 8;
-        for i in 0..remainder {
-            let ai = a[base + i];
-            let bi = b[base + i];
-            dot_sum += ai * bi;
-            norm_a += ai * ai;
-            norm_b += bi * bi;
-        }
-
-        (dot_sum, norm_a, norm_b)
+    // Handle the remainder with safe bounds-checked indexing.
+    let base = chunks * 8;
+    for i in 0..remainder {
+        let ai = a[base + i];
+        let bi = b[base + i];
+        dot_sum += ai * bi;
+        norm_a += ai * ai;
+        norm_b += bi * bi;
     }
+
+    (dot_sum, norm_a, norm_b)
 }
 
 /// Accumulates cosine components with AArch64 NEON instructions.
@@ -350,13 +356,16 @@ fn cosine_components(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
 fn cosine_components(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
     use std::arch::aarch64::*;
 
-    unsafe {
+    let chunks = a.len() / 4;
+    let remainder = a.len() % 4;
+
+    // SAFETY: the public wrappers assert `a.len() == b.len()`, and `chunks`
+    // is derived from that common length, so every four-float load at `base`
+    // is in bounds for both slices.
+    let (mut dot_sum, mut norm_a, mut norm_b) = unsafe {
         let mut dot_acc = vdupq_n_f32(0.0);
         let mut norm_a_acc = vdupq_n_f32(0.0);
         let mut norm_b_acc = vdupq_n_f32(0.0);
-
-        let chunks = a.len() / 4;
-        let remainder = a.len() % 4;
 
         for i in 0..chunks {
             let base = i * 4;
@@ -367,22 +376,24 @@ fn cosine_components(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
             norm_b_acc = vfmaq_f32(norm_b_acc, vb, vb);
         }
 
-        let dot = vaddvq_f32(dot_acc);
-        let mut norm_a = vaddvq_f32(norm_a_acc);
-        let mut norm_b = vaddvq_f32(norm_b_acc);
-        let mut dot_sum = dot;
+        (
+            vaddvq_f32(dot_acc),
+            vaddvq_f32(norm_a_acc),
+            vaddvq_f32(norm_b_acc),
+        )
+    };
 
-        let base = chunks * 4;
-        for i in 0..remainder {
-            let ai = a[base + i];
-            let bi = b[base + i];
-            dot_sum += ai * bi;
-            norm_a += ai * ai;
-            norm_b += bi * bi;
-        }
-
-        (dot_sum, norm_a, norm_b)
+    // Handle the remainder with safe bounds-checked indexing.
+    let base = chunks * 4;
+    for i in 0..remainder {
+        let ai = a[base + i];
+        let bi = b[base + i];
+        dot_sum += ai * bi;
+        norm_a += ai * ai;
+        norm_b += bi * bi;
     }
+
+    (dot_sum, norm_a, norm_b)
 }
 
 /// Accumulates squared Euclidean distance with the scalar kernel.
@@ -440,11 +451,14 @@ fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
-    unsafe {
-        let mut acc = _mm256_setzero_ps();
-        let chunks = a.len() / 8;
-        let remainder = a.len() % 8;
+    let chunks = a.len() / 8;
+    let remainder = a.len() % 8;
 
+    // SAFETY: the public wrappers assert `a.len() == b.len()`, and `chunks`
+    // is derived from that common length, so every unaligned eight-float load
+    // at `base` is in bounds for both slices.
+    let mut sum = unsafe {
+        let mut acc = _mm256_setzero_ps();
         for i in 0..chunks {
             let base = i * 8;
             let va = _mm256_loadu_ps(a.as_ptr().add(base));
@@ -452,15 +466,16 @@ fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
             let diff = _mm256_sub_ps(va, vb);
             acc = _mm256_fmadd_ps(diff, diff, acc);
         }
+        hsum_avx(acc)
+    };
 
-        let mut sum = hsum_avx(acc);
-        let base = chunks * 8;
-        for i in 0..remainder {
-            let d = a[base + i] - b[base + i];
-            sum += d * d;
-        }
-        sum
+    // Handle the remainder with safe bounds-checked indexing.
+    let base = chunks * 8;
+    for i in 0..remainder {
+        let d = a[base + i] - b[base + i];
+        sum += d * d;
     }
+    sum
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -472,11 +487,14 @@ fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
 fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
 
-    unsafe {
-        let mut acc = vdupq_n_f32(0.0);
-        let chunks = a.len() / 4;
-        let remainder = a.len() % 4;
+    let chunks = a.len() / 4;
+    let remainder = a.len() % 4;
 
+    // SAFETY: the public wrappers assert `a.len() == b.len()`, and `chunks`
+    // is derived from that common length, so every four-float load at `base`
+    // is in bounds for both slices.
+    let mut sum = unsafe {
+        let mut acc = vdupq_n_f32(0.0);
         for i in 0..chunks {
             let base = i * 4;
             let va = vld1q_f32(a.as_ptr().add(base));
@@ -484,15 +502,16 @@ fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
             let diff = vsubq_f32(va, vb);
             acc = vfmaq_f32(acc, diff, diff);
         }
+        vaddvq_f32(acc)
+    };
 
-        let mut sum = vaddvq_f32(acc);
-        let base = chunks * 4;
-        for i in 0..remainder {
-            let d = a[base + i] - b[base + i];
-            sum += d * d;
-        }
-        sum
+    // Handle the remainder with safe bounds-checked indexing.
+    let base = chunks * 4;
+    for i in 0..remainder {
+        let d = a[base + i] - b[base + i];
+        sum += d * d;
     }
+    sum
 }
 
 /// Accumulates a dot product with the scalar kernel.
@@ -547,25 +566,29 @@ fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
-    unsafe {
-        let mut acc = _mm256_setzero_ps();
-        let chunks = a.len() / 8;
-        let remainder = a.len() % 8;
+    let chunks = a.len() / 8;
+    let remainder = a.len() % 8;
 
+    // SAFETY: the public wrappers assert `a.len() == b.len()`, and `chunks`
+    // is derived from that common length, so every unaligned eight-float load
+    // at `base` is in bounds for both slices.
+    let mut sum = unsafe {
+        let mut acc = _mm256_setzero_ps();
         for i in 0..chunks {
             let base = i * 8;
             let va = _mm256_loadu_ps(a.as_ptr().add(base));
             let vb = _mm256_loadu_ps(b.as_ptr().add(base));
             acc = _mm256_fmadd_ps(va, vb, acc);
         }
+        hsum_avx(acc)
+    };
 
-        let mut sum = hsum_avx(acc);
-        let base = chunks * 8;
-        for i in 0..remainder {
-            sum += a[base + i] * b[base + i];
-        }
-        sum
+    // Handle the remainder with safe bounds-checked indexing.
+    let base = chunks * 8;
+    for i in 0..remainder {
+        sum += a[base + i] * b[base + i];
     }
+    sum
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -576,25 +599,29 @@ fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
 fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
 
-    unsafe {
-        let mut acc = vdupq_n_f32(0.0);
-        let chunks = a.len() / 4;
-        let remainder = a.len() % 4;
+    let chunks = a.len() / 4;
+    let remainder = a.len() % 4;
 
+    // SAFETY: the public wrappers assert `a.len() == b.len()`, and `chunks`
+    // is derived from that common length, so every four-float load at `base`
+    // is in bounds for both slices.
+    let mut sum = unsafe {
+        let mut acc = vdupq_n_f32(0.0);
         for i in 0..chunks {
             let base = i * 4;
             let va = vld1q_f32(a.as_ptr().add(base));
             let vb = vld1q_f32(b.as_ptr().add(base));
             acc = vfmaq_f32(acc, va, vb);
         }
+        vaddvq_f32(acc)
+    };
 
-        let mut sum = vaddvq_f32(acc);
-        let base = chunks * 4;
-        for i in 0..remainder {
-            sum += a[base + i] * b[base + i];
-        }
-        sum
+    // Handle the remainder with safe bounds-checked indexing.
+    let base = chunks * 4;
+    for i in 0..remainder {
+        sum += a[base + i] * b[base + i];
     }
+    sum
 }
 
 /// Reduces eight AVX float lanes to one scalar sum.
@@ -606,25 +633,25 @@ fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
 /// # Returns
 ///
 /// Returns the arithmetic sum of all eight lanes.
-///
-/// # Safety
-///
-/// The caller must execute on a target where AVX2 is enabled and pass a valid
-/// initialized `__m256`. The function is compiled only under that target feature.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline]
-unsafe fn hsum_avx(v: std::arch::x86_64::__m256) -> f32 {
+fn hsum_avx(v: std::arch::x86_64::__m256) -> f32 {
     use std::arch::x86_64::*;
-    // Add high 128 to low 128.
-    let hi = _mm256_extractf128_ps(v, 1);
-    let lo = _mm256_castps256_ps128(v);
-    let sum128 = _mm_add_ps(lo, hi);
-    // Horizontal add within 128-bit lane.
-    let shuf = _mm_movehdup_ps(sum128);
-    let sums = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    let sums2 = _mm_add_ss(sums, shuf2);
-    _mm_cvtss_f32(sums2)
+    // SAFETY: pure register arithmetic on an already-valid `__m256`; nothing
+    // is dereferenced. AVX2 availability is guaranteed by the enclosing
+    // compile-time target-feature gate.
+    unsafe {
+        // Add high 128 to low 128.
+        let hi = _mm256_extractf128_ps(v, 1);
+        let lo = _mm256_castps256_ps128(v);
+        let sum128 = _mm_add_ps(lo, hi);
+        // Horizontal add within 128-bit lane.
+        let shuf = _mm_movehdup_ps(sum128);
+        let sums = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        let sums2 = _mm_add_ss(sums, shuf2);
+        _mm_cvtss_f32(sums2)
+    }
 }
 
 /// Computes a vector's Euclidean, or L2, norm.

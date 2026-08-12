@@ -3845,14 +3845,15 @@ fn colocated_cluster_sections(data: &[u8]) -> Result<ColocatedClusterSections<'_
 ///
 /// Returns an index error when the eight-byte slice is unavailable/malformed or
 /// the value cannot fit this platform's `usize`.
-///
-/// # Panics
-///
-/// Slicing panics if `offset + 8` exceeds `data.len()`. Callers first validate
-/// the fixed header/directory length that contains each requested field.
 fn read_u64_usize(data: &[u8], offset: usize, label: &str) -> Result<usize> {
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| ZeppelinError::Index(format!("{label} offset overflows")))?;
+    let bytes = data
+        .get(offset..end)
+        .ok_or_else(|| ZeppelinError::Index(format!("{label} is truncated")))?;
     let value = u64::from_le_bytes(
-        data[offset..offset + 8]
+        bytes
             .try_into()
             .map_err(|_| ZeppelinError::Index(format!("{label} parse error")))?,
     );
