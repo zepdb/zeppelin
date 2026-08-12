@@ -453,10 +453,11 @@ impl ZeppelinStore {
     ///
     /// # Performance
     ///
-    /// S3 requests use at most two configured retries, 100-500 ms exponential
-    /// backoff, a two-second retry window, a 30-second request timeout, and up
-    /// to 64 idle pooled connections per host. Local root creation performs
-    /// blocking filesystem work during construction.
+    /// S3 requests use at most five configured retries, exponential backoff
+    /// from 100 ms to a 5-second ceiling, a 15-second retry window, a
+    /// 30-second request timeout, and up to 64 idle pooled connections per
+    /// host. Local root creation performs blocking filesystem work during
+    /// construction.
     ///
     /// # Examples
     ///
@@ -506,14 +507,20 @@ impl ZeppelinStore {
                     // Enable atomic create semantics for server-side copy,
                     // used by restore-as-clone materialization.
                     builder = builder.with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
+                    // S3 returns 503 SlowDown and partition-level throttling
+                    // that routinely needs multi-second backoff; a budget of
+                    // two retries inside a two-second window surfaced routine
+                    // throttling to callers as hard errors. Five retries with
+                    // a 5 s backoff ceiling stay well inside the 30 s request
+                    // timeout below.
                     builder = builder.with_retry(RetryConfig {
                         backoff: BackoffConfig {
                             init_backoff: Duration::from_millis(100),
-                            max_backoff: Duration::from_millis(500),
+                            max_backoff: Duration::from_secs(5),
                             base: 2.0,
                         },
-                        max_retries: 2,
-                        retry_timeout: Duration::from_secs(2),
+                        max_retries: 5,
+                        retry_timeout: Duration::from_secs(15),
                     });
 
                     // Connection pool tuning: increase idle connections and timeouts
