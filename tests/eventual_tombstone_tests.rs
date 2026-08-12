@@ -409,7 +409,7 @@ async fn test_eventual_query_gets_only_delete_fragments_not_vector_wal_fragments
 // fragment must not be cancelled by an upsert of the same id in an OLDER
 // fetched fragment, and a delete→re-upsert→delete chain across three
 // fragments must end hidden. Guards hunt area 2 (manifest-order semantics
-// of read_delete_ids_from_refs_unchecked).
+// of read_located_delete_ids_unchecked).
 #[tokio::test]
 async fn test_eventual_tombstone_ordering_across_fragments() {
     let harness = TestHarness::new().await;
