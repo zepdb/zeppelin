@@ -301,15 +301,16 @@ impl LateStateSection {
     /// Serialize canonical version-5 bytes.
     pub fn to_bytes(&self) -> Result<Bytes> {
         self.validate_structural()?;
-        let payload = rmp_serde::to_vec(self).map_err(|error| {
+        // Serialize directly after the magic and version: one buffer, no
+        // second copy of the payload.
+        let mut bytes = Vec::with_capacity(LATE_STATE_MAGIC.len() + 1);
+        bytes.extend_from_slice(LATE_STATE_MAGIC);
+        bytes.push(LATE_STATE_VERSION_V5);
+        rmp_serde::encode::write(&mut bytes, self).map_err(|error| {
             ZeppelinError::Serialization(format!(
                 "late-state section MessagePack serialize: {error}"
             ))
         })?;
-        let mut bytes = Vec::with_capacity(LATE_STATE_MAGIC.len() + 1 + payload.len());
-        bytes.extend_from_slice(LATE_STATE_MAGIC);
-        bytes.push(LATE_STATE_VERSION_V5);
-        bytes.extend_from_slice(&payload);
         Ok(Bytes::from(bytes))
     }
 

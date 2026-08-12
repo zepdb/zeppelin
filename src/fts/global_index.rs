@@ -509,13 +509,14 @@ impl GlobalInvertedIndex {
     /// Serialization creates an immutable candidate artifact. It does not make
     /// the object query-visible and does not update cache or manifest state.
     pub fn to_bytes(&self) -> Result<Bytes> {
-        let msgpack = rmp_serde::to_vec(self).map_err(|e| {
-            ZeppelinError::Serialization(format!("global FTS index serialize: {e}"))
-        })?;
-        let mut data = Vec::with_capacity(6 + msgpack.len());
+        // Serialize directly after the magic and version: one buffer, no
+        // second copy of the payload.
+        let mut data = Vec::with_capacity(ZGFTS_MAGIC.len() + 1);
         data.extend_from_slice(ZGFTS_MAGIC);
         data.push(ZGFTS_VERSION);
-        data.extend_from_slice(&msgpack);
+        rmp_serde::encode::write(&mut data, self).map_err(|e| {
+            ZeppelinError::Serialization(format!("global FTS index serialize: {e}"))
+        })?;
         Ok(Bytes::from(data))
     }
 

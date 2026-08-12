@@ -6044,12 +6044,12 @@ impl Manifest {
     /// tracking. The intermediate `Vec<u8>` is moved into `Bytes` without
     /// exposing manual allocation or free operations.
     pub fn to_bytes(&self) -> Result<Bytes> {
-        let msgpack = rmp_serde::to_vec(self).map_err(|e| {
+        // Serialize directly after the marker byte: one buffer, no second
+        // copy of the payload.
+        let mut data = vec![MANIFEST_FORMAT_MSGPACK];
+        rmp_serde::encode::write(&mut data, self).map_err(|e| {
             ZeppelinError::Serialization(format!("manifest msgpack serialize: {e}"))
         })?;
-        let mut data = Vec::with_capacity(1 + msgpack.len());
-        data.push(MANIFEST_FORMAT_MSGPACK);
-        data.extend_from_slice(&msgpack);
         Ok(Bytes::from(data))
     }
 
@@ -7711,12 +7711,12 @@ impl NamedSnapshot {
     /// A pin for generation 42 round-trips through
     /// [`NamedSnapshot::from_bytes`] with its creation timestamp unchanged.
     pub fn to_bytes(&self) -> Result<Bytes> {
-        let msgpack = rmp_serde::to_vec(self).map_err(|e| {
+        // Serialize directly after the marker byte: one buffer, no second
+        // copy of the payload.
+        let mut data = vec![MANIFEST_FORMAT_MSGPACK];
+        rmp_serde::encode::write(&mut data, self).map_err(|e| {
             ZeppelinError::Serialization(format!("snapshot msgpack serialize: {e}"))
         })?;
-        let mut data = Vec::with_capacity(1 + msgpack.len());
-        data.push(MANIFEST_FORMAT_MSGPACK);
-        data.extend_from_slice(&msgpack);
         Ok(Bytes::from(data))
     }
 

@@ -204,6 +204,7 @@ pub mod background;
 pub mod gc;
 mod late;
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1999,8 +2000,10 @@ impl Compactor {
                 old_id_to_cluster = id_to_cluster;
                 for vec in existing_vecs {
                     // WAL overrides: only insert if not already in latest_vectors and not deleted
-                    if !latest_vectors.contains_key(&vec.id) && !deleted_ids.contains(&vec.id) {
-                        latest_vectors.insert(vec.id.clone(), vec);
+                    if !deleted_ids.contains(&vec.id) {
+                        if let Entry::Vacant(slot) = latest_vectors.entry(vec.id.clone()) {
+                            slot.insert(vec);
+                        }
                     }
                 }
             }
@@ -4063,8 +4066,10 @@ async fn load_full_surviving_vectors_for_fallback(
     if let Some(located) = old_segment {
         let (existing_vecs, _id_to_cluster) = load_segment_vectors(store, located).await?;
         for vector in existing_vecs {
-            if !latest_vectors.contains_key(&vector.id) && !deleted_ids.contains(&vector.id) {
-                latest_vectors.insert(vector.id.clone(), vector);
+            if !deleted_ids.contains(&vector.id) {
+                if let Entry::Vacant(slot) = latest_vectors.entry(vector.id.clone()) {
+                    slot.insert(vector);
+                }
             }
         }
     }

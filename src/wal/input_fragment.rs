@@ -102,13 +102,14 @@ impl EncoderInputWalFragment {
 
     /// Serialize as `[ZIW1][version=1][MessagePack payload]`.
     pub fn to_bytes(&self) -> Result<Bytes> {
-        let payload = rmp_serde::to_vec(self).map_err(|error| {
-            ZeppelinError::Serialization(format!("input WAL MessagePack serialize failed: {error}"))
-        })?;
-        let mut bytes = Vec::with_capacity(INPUT_WAL_MAGIC.len() + 1 + payload.len());
+        // Serialize directly after the magic and version: one buffer, no
+        // second copy of the payload.
+        let mut bytes = Vec::with_capacity(INPUT_WAL_MAGIC.len() + 1);
         bytes.extend_from_slice(INPUT_WAL_MAGIC);
         bytes.push(INPUT_WAL_VERSION);
-        bytes.extend_from_slice(&payload);
+        rmp_serde::encode::write(&mut bytes, self).map_err(|error| {
+            ZeppelinError::Serialization(format!("input WAL MessagePack serialize failed: {error}"))
+        })?;
         Ok(Bytes::from(bytes))
     }
 

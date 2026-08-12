@@ -446,11 +446,11 @@ impl WalFragment {
     /// the buffer by incrementing a reference count rather than copying all
     /// bytes, unlike cloning this `WalFragment`.
     pub fn to_bytes(&self) -> Result<Bytes> {
-        let msgpack = rmp_serde::to_vec(self)
+        // Serialize directly after the marker byte: one buffer, no second
+        // copy of a potentially multi-megabyte fragment.
+        let mut data = vec![WAL_FORMAT_MSGPACK];
+        rmp_serde::encode::write(&mut data, self)
             .map_err(|e| ZeppelinError::Serialization(format!("msgpack serialize: {e}")))?;
-        let mut data = Vec::with_capacity(1 + msgpack.len());
-        data.push(WAL_FORMAT_MSGPACK);
-        data.extend_from_slice(&msgpack);
         Ok(Bytes::from(data))
     }
 

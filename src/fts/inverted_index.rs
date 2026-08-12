@@ -81,7 +81,6 @@ use crate::error::{Result, ZeppelinError};
 use crate::fts::bm25::{self, Bm25Params};
 use crate::fts::tokenizer::tokenize_text;
 use crate::fts::FtsFieldConfig;
-use crate::index::topk::partial_topk_by;
 use crate::types::AttributeValue;
 
 /// Four-byte discriminator at the start of every cluster-local FTS artifact.
@@ -276,17 +275,19 @@ impl InvertedIndex {
         };
 
         // IDF is based on this cluster's field corpus, not the entire segment.
-        let token_idfs: Vec<(String, f32)> = query_tokens
+        // Borrowing each posting list here avoids both a per-token String
+        // clone and a second BTreeMap lookup in the scoring loop below.
+        let matched_postings: Vec<(&PostingList, f32)> = query_tokens
             .iter()
             .filter_map(|token| {
                 field_index.postings.get(token).map(|pl| {
                     let term_idf = bm25::idf(field_index.doc_count, pl.df);
-                    (token.clone(), term_idf)
+                    (pl, term_idf)
                 })
             })
             .collect();
 
-        if token_idfs.is_empty() {
+        if matched_postings.is_empty() {
             return Vec::new();
         }
 
@@ -296,25 +297,22 @@ impl InvertedIndex {
         // avoids storing a second per-document array.
         let doc_lengths = compute_doc_lengths(field_index);
 
-        for (token, term_idf) in &token_idfs {
-            if let Some(posting_list) = field_index.postings.get(token) {
-                for posting in &posting_list.entries {
-                    let dl = doc_lengths.get(&posting.position).copied().unwrap_or(0);
-                    let term_score = bm25::bm25_term_score(
-                        *term_idf,
-                        posting.tf,
-                        dl,
-                        field_index.avg_doc_length,
-                        params,
-                    );
-                    *doc_scores.entry(posting.position).or_insert(0.0) += term_score;
-                }
+        for (posting_list, term_idf) in matched_postings {
+            for posting in &posting_list.entries {
+                let dl = doc_lengths.get(&posting.position).copied().unwrap_or(0);
+                let term_score = bm25::bm25_term_score(
+                    term_idf,
+                    posting.tf,
+                    dl,
+                    field_index.avg_doc_length,
+                    params,
+                );
+                *doc_scores.entry(posting.position).or_insert(0.0) += term_score;
             }
         }
 
         let mut results: Vec<(u32, f32)> = doc_scores.into_iter().collect();
-        let k = results.len();
-        partial_topk_by(&mut results, k, doc_score_cmp);
+        results.sort_by(doc_score_cmp);
         results
     }
 

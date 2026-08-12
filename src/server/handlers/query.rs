@@ -3327,11 +3327,10 @@ fn compute_facets_if_requested(
     let mut requested_fields = Vec::<String>::new();
     for facet in facets {
         let field = facet.field();
-        if fields.contains_key(field) {
-            continue;
+        if let std::collections::btree_map::Entry::Vacant(slot) = fields.entry(field.to_string()) {
+            slot.insert(BTreeMap::new());
+            requested_fields.push(field.to_string());
         }
-        fields.insert(field.to_string(), BTreeMap::new());
-        requested_fields.push(field.to_string());
     }
 
     for result in results {

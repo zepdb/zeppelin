@@ -211,7 +211,6 @@ pub fn train_kmeans(
         );
         train_mini_batch(
             vectors,
-            dim,
             effective_k,
             max_iters,
             epsilon,
@@ -302,12 +301,13 @@ fn train_lloyds(
             }
         }
 
-        // Accumulate sums.
+        // Accumulate sums. The zip hoists the per-coordinate bounds checks
+        // out of the innermost loop so it can auto-vectorize.
         for (i, vec) in vectors.iter().enumerate() {
             let c = assignments[i];
             counts[c] += 1;
-            for d in 0..dim {
-                new_centroids[c][d] += vec[d];
+            for (acc, &val) in new_centroids[c].iter_mut().zip(vec.iter()) {
+                *acc += val;
             }
         }
 
@@ -367,7 +367,6 @@ fn train_lloyds(
 /// # Parameters
 ///
 /// - `vectors`: Validated training vectors borrowed from the caller.
-/// - `dim`: Component count shared by every vector and centroid.
 /// - `k`: Number of centroid buckets.
 /// - `max_iters`: Maximum sampled update passes.
 /// - `epsilon`: Exclusive maximum squared-shift threshold checked every five
@@ -411,7 +410,6 @@ fn train_lloyds(
 /// object discipline or synchronization for the same property.
 fn train_mini_batch(
     vectors: &[&[f32]],
-    dim: usize,
     k: usize,
     max_iters: usize,
     epsilon: f64,
@@ -451,14 +449,15 @@ fn train_mini_batch(
             batch_assignments.push((idx, best_idx));
         }
 
-        // Update centroids with online learning rate
+        // Update centroids with online learning rate. The zip hoists the
+        // per-coordinate bounds checks so the loop can auto-vectorize.
         for &(vec_idx, centroid_idx) in &batch_assignments {
             centroid_counts[centroid_idx] += 1;
             let eta = 1.0 / centroid_counts[centroid_idx] as f32;
             let vec = vectors[vec_idx];
             let centroid = &mut centroids[centroid_idx];
-            for d in 0..dim {
-                centroid[d] = (1.0 - eta) * centroid[d] + eta * vec[d];
+            for (c, &v) in centroid.iter_mut().zip(vec.iter()) {
+                *c = (1.0 - eta) * *c + eta * v;
             }
         }
 

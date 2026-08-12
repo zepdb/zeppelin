@@ -232,18 +232,18 @@ fn cosine_components(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
     let mut norm_a: f32 = 0.0;
     let mut norm_b: f32 = 0.0;
 
-    // Process in chunks of 8 to hint at vectorization.
-    let chunks = a.len() / 8;
-    let remainder = a.len() % 8;
-
-    for i in 0..chunks {
-        let base = i * 8;
+    // Process in chunks of 8 to hint at vectorization. chunks_exact ties both
+    // slices to the same known chunk length, so the per-element loads carry
+    // no bounds checks.
+    let mut a_chunks = a.chunks_exact(8);
+    let mut b_chunks = b.chunks_exact(8);
+    for (ca, cb) in (&mut a_chunks).zip(&mut b_chunks) {
         let mut d = [0.0f32; 8];
         let mut na = [0.0f32; 8];
         let mut nb = [0.0f32; 8];
         for j in 0..8 {
-            let ai = a[base + j];
-            let bi = b[base + j];
+            let ai = ca[j];
+            let bi = cb[j];
             d[j] = ai * bi;
             na[j] = ai * ai;
             nb[j] = bi * bi;
@@ -255,10 +255,7 @@ fn cosine_components(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
         }
     }
 
-    let base = chunks * 8;
-    for i in 0..remainder {
-        let ai = a[base + i];
-        let bi = b[base + i];
+    for (&ai, &bi) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
         dot += ai * bi;
         norm_a += ai * ai;
         norm_b += bi * bi;
@@ -417,14 +414,15 @@ fn cosine_components(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
 #[inline]
 fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
     let mut sum: f32 = 0.0;
-    let chunks = a.len() / 8;
-    let remainder = a.len() % 8;
 
-    for i in 0..chunks {
-        let base = i * 8;
+    // chunks_exact ties both slices to the same known chunk length, so the
+    // per-element loads carry no bounds checks and the loop vectorizes.
+    let mut a_chunks = a.chunks_exact(8);
+    let mut b_chunks = b.chunks_exact(8);
+    for (ca, cb) in (&mut a_chunks).zip(&mut b_chunks) {
         let mut tmp = [0.0f32; 8];
         for j in 0..8 {
-            let d = a[base + j] - b[base + j];
+            let d = ca[j] - cb[j];
             tmp[j] = d * d;
         }
         for val in tmp {
@@ -432,9 +430,8 @@ fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
         }
     }
 
-    let base = chunks * 8;
-    for i in 0..remainder {
-        let d = a[base + i] - b[base + i];
+    for (&ai, &bi) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        let d = ai - bi;
         sum += d * d;
     }
 
@@ -535,23 +532,23 @@ fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
     let mut sum: f32 = 0.0;
-    let chunks = a.len() / 8;
-    let remainder = a.len() % 8;
 
-    for i in 0..chunks {
-        let base = i * 8;
+    // chunks_exact ties both slices to the same known chunk length, so the
+    // per-element loads carry no bounds checks and the loop vectorizes.
+    let mut a_chunks = a.chunks_exact(8);
+    let mut b_chunks = b.chunks_exact(8);
+    for (ca, cb) in (&mut a_chunks).zip(&mut b_chunks) {
         let mut tmp = [0.0f32; 8];
         for j in 0..8 {
-            tmp[j] = a[base + j] * b[base + j];
+            tmp[j] = ca[j] * cb[j];
         }
         for val in tmp {
             sum += val;
         }
     }
 
-    let base = chunks * 8;
-    for i in 0..remainder {
-        sum += a[base + i] * b[base + i];
+    for (&ai, &bi) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        sum += ai * bi;
     }
 
     sum

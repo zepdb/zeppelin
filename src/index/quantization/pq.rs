@@ -888,9 +888,12 @@ pub fn pq_cluster_key(namespace: &str, segment_id: &str, cluster_idx: usize) -> 
 /// ignored. For example, `[1, 2]` and `[4, 6]` return `25`.
 #[inline]
 fn sq_l2(a: &[f32], b: &[f32]) -> f32 {
+    // The reslice keeps the documented panic on a shorter `b` while removing
+    // the per-element bounds check so the loop can vectorize.
+    let b = &b[..a.len()];
     let mut sum = 0.0f32;
-    for i in 0..a.len() {
-        let d = a[i] - b[i];
+    for (&x, &y) in a.iter().zip(b) {
+        let d = x - y;
         sum += d * d;
     }
     sum
@@ -903,9 +906,12 @@ fn sq_l2(a: &[f32], b: &[f32]) -> f32 {
 /// ignored. For example, `[1, 2]` and `[4, 6]` return `16`.
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
+    // The reslice keeps the documented panic on a shorter `b` while removing
+    // the per-element bounds check so the loop can vectorize.
+    let b = &b[..a.len()];
     let mut sum = 0.0f32;
-    for i in 0..a.len() {
-        sum += a[i] * b[i];
+    for (&x, &y) in a.iter().zip(b) {
+        sum += x * y;
     }
     sum
 }
