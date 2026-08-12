@@ -71,10 +71,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Count unsafe blocks
         run: |
+          # 7 = the SIMD kernels in src/index/distance.rs, each with a SAFETY
+          # comment and a release-mode length assert (see commit 9eccd49).
           UNSAFE_COUNT=$(grep -rn 'unsafe {' src/ --include='*.rs' | wc -l | tr -d ' ')
           echo "Unsafe blocks: $UNSAFE_COUNT"
-          if [ "$UNSAFE_COUNT" -gt 6 ]; then
-            echo "::error::Unsafe count ($UNSAFE_COUNT) exceeds threshold (6)"
+          if [ "$UNSAFE_COUNT" -gt 7 ]; then
+            echo "::error::Unsafe count ($UNSAFE_COUNT) exceeds threshold (7)"
             exit 1
           fi
       - name: Count unwrap/expect allows
