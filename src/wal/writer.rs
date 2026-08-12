@@ -150,6 +150,38 @@ fn cas_backoff(attempt: u32) -> Duration {
     Duration::from_millis(base_ms + jitter_ms)
 }
 
+/// Builds the per-waiter error for a batch whose manifest round-trip failed.
+///
+/// The original error cannot be handed to every waiter directly because
+/// [`ZeppelinError`] is not `Clone`, so each waiter receives a synthesized
+/// error carrying the original's message. What must survive the synthesis is
+/// the retryable classification: a transient storage failure (S3 throttle,
+/// timeout, connection reset) has to stay [`ZeppelinError::Storage`] so
+/// [`ZeppelinError::retryable`] keeps advising clients to retry. Collapsing
+/// it into [`ZeppelinError::Index`] would present a recoverable outage as a
+/// permanent failure.
+///
+/// # Parameters
+///
+/// - `retryable`: The original error's [`ZeppelinError::retryable`] value.
+/// - `msg`: Human-readable context including the original error's message.
+///
+/// # Returns
+///
+/// A retryable [`ZeppelinError::Storage`] when the underlying failure was
+/// retryable, otherwise a non-retryable [`ZeppelinError::Index`]. Both map to
+/// HTTP 500; only the retry advice differs.
+fn batch_commit_error(retryable: bool, msg: &str) -> ZeppelinError {
+    if retryable {
+        ZeppelinError::Storage(object_store::Error::Generic {
+            store: "wal manifest commit",
+            source: msg.to_string().into(),
+        })
+    } else {
+        ZeppelinError::Index(msg.to_string())
+    }
+}
+
 /// Exact authoritative manifest observation required by a derived write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestAppendGuard {
@@ -1032,11 +1064,10 @@ impl WalWriter {
                     }
                     Err(e) => {
                         group.clear_committed();
-                        let msg = e.to_string();
-                        self.fail_batch(namespace, batch, |_| {
-                            ZeppelinError::Index(format!("manifest read failed: {msg}"))
-                        })
-                        .await;
+                        let retryable = e.retryable();
+                        let msg = format!("manifest read failed: {e}");
+                        self.fail_batch(namespace, batch, |_| batch_commit_error(retryable, &msg))
+                            .await;
                         return true;
                     }
                 },
@@ -1114,6 +1145,7 @@ impl WalWriter {
                 }
                 Err(e) => {
                     group.clear_committed();
+                    let write_retryable = e.retryable();
                     let write_error = e.to_string();
                     match Manifest::read(&self.store, namespace).await {
                         Ok(Some(authoritative)) => {
@@ -1138,10 +1170,9 @@ impl WalWriter {
                                     let _ = item.reply.send(Ok(authoritative.clone()));
                                 }
                             } else if published == 0 {
+                                let msg = format!("manifest write failed: {write_error}");
                                 self.fail_batch(namespace, batch, |_| {
-                                    ZeppelinError::Index(format!(
-                                        "manifest write failed: {write_error}"
-                                    ))
+                                    batch_commit_error(write_retryable, &msg)
                                 })
                                 .await;
                             } else {
@@ -1463,5 +1494,27 @@ mod tests {
         // Should not panic
         writer.remove_lock("nonexistent");
         assert_eq!(writer.lock_count(), 0);
+    }
+
+    /// Verifies that batch failure errors preserve the retryable classification
+    /// of the underlying manifest round-trip failure.
+    ///
+    /// A transient storage error (S3 throttle, timeout) must surface to waiters
+    /// as a retryable error, not be collapsed into a permanent-looking one.
+    #[test]
+    fn test_batch_commit_error_preserves_retryable_classification() {
+        let transient = batch_commit_error(true, "manifest read failed: 503 SlowDown");
+        assert!(
+            transient.retryable(),
+            "transient storage failure must stay retryable for clients"
+        );
+        assert!(transient.to_string().contains("503 SlowDown"));
+
+        let permanent = batch_commit_error(false, "manifest read failed: corrupt payload");
+        assert!(
+            !permanent.retryable(),
+            "non-retryable failure must not be advertised as retryable"
+        );
+        assert!(permanent.to_string().contains("corrupt payload"));
     }
 }
