@@ -2085,8 +2085,13 @@ fn deserialize_legacy_cluster(data: &[u8]) -> Result<ClusterData> {
             .map_err(|_| ZeppelinError::Index("cluster header parse error".into()))?,
     ) as usize;
 
-    let mut ids = Vec::with_capacity(n);
-    let mut vectors = Vec::with_capacity(n);
+    // Cap the reservation by what the payload could possibly hold: each row
+    // carries at least a 4-byte id_len prefix, so a valid n never exceeds
+    // data.len() / 4. A hostile or corrupt header otherwise requests gigabytes
+    // before any per-row validation runs.
+    let cap = n.min(data.len() / 4);
+    let mut ids = Vec::with_capacity(cap);
+    let mut vectors = Vec::with_capacity(cap);
     let mut offset = 8;
 
     for _ in 0..n {
@@ -2867,7 +2872,11 @@ fn id_block_row_count(data: &[u8]) -> Result<usize> {
 pub(crate) fn deserialize_id_block(data: &[u8]) -> Result<Vec<String>> {
     let row_count = id_block_row_count(data)?;
 
-    let mut ids = Vec::with_capacity(row_count);
+    // Cap the reservation by what the payload could possibly hold: each row
+    // carries at least a 4-byte id_len prefix, so a valid row_count never
+    // exceeds data.len() / 4. A hostile or corrupt header otherwise requests
+    // gigabytes before any per-row validation runs.
+    let mut ids = Vec::with_capacity(row_count.min(data.len() / 4));
     let mut offset = 4;
     for row in 0..row_count {
         if offset + 4 > data.len() {
@@ -5296,6 +5305,24 @@ mod tests {
     //! failed prerequisite stops the test at the exact setup operation.
 
     use super::*;
+
+    /// Verifies hostile row counts in tiny payloads are rejected without
+    /// reserving row-count-proportional memory.
+    ///
+    /// Before the reservation cap, an 8-byte blob claiming `u32::MAX` rows
+    /// requested a multi-gigabyte allocation (aborting the process) before any
+    /// per-row validation ran. Covers the legacy cluster decoder and the v5 ID
+    /// block decoder.
+    #[test]
+    fn test_decoders_reject_hostile_row_counts() {
+        let mut cluster = Vec::new();
+        cluster.extend_from_slice(&u32::MAX.to_le_bytes());
+        cluster.extend_from_slice(&8u32.to_le_bytes());
+        assert!(deserialize_legacy_cluster(&cluster).is_err());
+
+        let id_block = u32::MAX.to_le_bytes().to_vec();
+        assert!(deserialize_id_block(&id_block).is_err());
+    }
 
     /// Pins the extracted partition seam to the pre-refactor assignment shape.
     ///

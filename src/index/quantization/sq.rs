@@ -797,8 +797,13 @@ pub fn deserialize_sq_cluster(data: &[u8]) -> Result<SqClusterData> {
             .map_err(|_| ZeppelinError::Index("SQ cluster header parse error".into()))?,
     ) as usize;
 
-    let mut ids = Vec::with_capacity(n);
-    let mut codes = Vec::with_capacity(n);
+    // Cap the reservation by what the payload could possibly hold: each row
+    // carries at least a 4-byte id_len prefix, so a valid n never exceeds
+    // data.len() / 4. A hostile or corrupt header otherwise requests gigabytes
+    // before any per-row validation runs.
+    let cap = n.min(data.len() / 4);
+    let mut ids = Vec::with_capacity(cap);
+    let mut codes = Vec::with_capacity(cap);
     let mut offset = 8;
 
     for _ in 0..n {
@@ -1060,6 +1065,20 @@ mod tests {
 
     use super::*;
     use crate::types::DistanceMetric;
+
+    /// Verifies a hostile row count in a tiny payload is rejected without
+    /// reserving row-count-proportional memory.
+    ///
+    /// Before the reservation cap, an 8-byte blob claiming `u32::MAX` rows
+    /// requested a multi-gigabyte allocation (aborting the process) before any
+    /// per-row validation ran.
+    #[test]
+    fn test_deserialize_sq_cluster_rejects_hostile_row_count() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        assert!(deserialize_sq_cluster(&data).is_err());
+    }
 
     /// Returns four small rows whose per-dimension extrema are easy to verify by
     /// hand across calibration and round-trip tests.
