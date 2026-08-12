@@ -75,7 +75,6 @@ pub mod pq;
 #[allow(dead_code)]
 #[cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 pub(crate) mod rabitq;
-#[allow(dead_code)]
 #[cfg_attr(test, allow(clippy::expect_used))]
 pub(crate) mod rq;
 pub mod sq;

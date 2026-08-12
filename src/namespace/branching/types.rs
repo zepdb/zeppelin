@@ -141,7 +141,6 @@ impl ArtifactOriginIndex {
 
 /// First pass of deterministic origin-table construction.
 #[derive(Debug, Default)]
-#[allow(dead_code)] // Frozen in phase 02; fork normalization adopts it in phase 05.
 pub(crate) struct ArtifactOriginSetBuilder {
     origins: BTreeSet<ArtifactOrigin>,
 }
@@ -203,7 +202,6 @@ impl ArtifactOriginSetBuilder {
 
 /// Frozen deterministic table plus its origin-to-final-index map.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Frozen in phase 02; fork normalization adopts it in phase 05.
 pub(crate) struct CanonicalArtifactOrigins {
     pub(crate) table: Vec<ArtifactOrigin>,
     pub(crate) indices: BTreeMap<ArtifactOrigin, ArtifactOriginIndex>,

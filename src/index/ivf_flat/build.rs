@@ -1678,7 +1678,6 @@ pub(crate) fn serialize_colocated_sq_cluster(
 /// The coarse and full offsets use the same field order and widths as `ZCL2`.
 /// This function only builds immutable bytes; compaction does not select or
 /// write this format until the later configuration slice.
-#[allow(dead_code)]
 pub(crate) fn serialize_colocated_rq_cluster(
     vectors: &[Vec<f32>],
     rq_codes: &crate::index::quantization::rq::RqClusterCodes,
@@ -2141,12 +2140,14 @@ fn deserialize_legacy_cluster(data: &[u8]) -> Result<ClusterData> {
 }
 
 /// Decoded coarse rows selected by manifest metadata.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum CoarseClusterData {
     /// Scalar-quantized IDs and codes from a `ZCL2` section.
     Sq8(crate::index::quantization::sq::SqClusterData),
     /// Two-bit RaBitQ IDs and codes from a `ZCL3` section.
+    // The payload is read only under cfg(test); production SQ8 accessors
+    // match this variant solely to reject a mis-encoded section.
+    #[allow(dead_code)]
     TwoBit(crate::index::quantization::rq::RqClusterCodes),
 }
 

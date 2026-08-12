@@ -1244,6 +1244,8 @@ pub enum ManifestBindingVersion {
 }
 
 #[derive(Serialize)]
+// Production digests use V2+; the V1 shape is retained because it is a
+// historical checksum input pinned by the v1-projection stability test.
 #[allow(dead_code)]
 struct FragmentExecutionBindingV1 {
     id: String,
@@ -1279,6 +1281,8 @@ struct BootstrapExecutionBindingV1<'a> {
 }
 
 #[derive(Serialize)]
+// Production digests use V2+; the V1 shape is retained because it is a
+// historical checksum input pinned by the v1-projection stability test.
 #[allow(dead_code)]
 struct SegmentExecutionBindingV1<'a> {
     id: &'a str,
@@ -1302,6 +1306,8 @@ struct HierarchicalRoutingExecutionBindingV1<'a> {
 }
 
 #[derive(Serialize)]
+// Production digests use V2+; the V1 shape is retained because it is a
+// historical checksum input pinned by the v1-projection stability test.
 #[allow(dead_code)]
 struct ManifestExecutionBindingV1<'a> {
     format: &'static str,
@@ -3675,7 +3681,6 @@ impl Manifest {
     }
 
     /// Canonicalize all resolved owners and remap descriptors in a second pass.
-    #[allow(dead_code)] // Phase 05 calls this after collecting a fork's ultimate owners.
     pub(crate) fn canonicalize_artifact_origins(&mut self) -> Result<()> {
         self.validate_artifact_origins_structural(false)?;
         let fragment_origins = self
@@ -4091,7 +4096,6 @@ impl Manifest {
     /// Returns `false` for an exact idempotent retry and `true` when the map was
     /// changed. A caller must still publish this candidate with the ETag and
     /// fencing token bound to the same source-head observation.
-    #[allow(dead_code)] // Phase 04 root primitive is the first production caller.
     pub(crate) fn insert_branch_root_candidate(
         &mut self,
         root: BranchRoot,
@@ -4139,7 +4143,6 @@ impl Manifest {
     }
 
     /// Remove only one exact root body from this candidate.
-    #[allow(dead_code)] // Phase 07 lifecycle removal is the first production caller.
     pub(crate) fn remove_branch_root_candidate(&mut self, expected: &BranchRoot) -> Result<()> {
         let namespace = self
             .namespace
@@ -4557,6 +4560,8 @@ impl Manifest {
         })
     }
 
+    // Production digests use V2+; the V1 shape is retained because it is a
+    // historical checksum input pinned by the v1-projection stability test.
     #[allow(dead_code)]
     fn execution_binding_v1<'a>(&'a self, namespace: &'a str) -> ManifestExecutionBindingV1<'a> {
         let fragments = self
@@ -8255,7 +8260,6 @@ impl ManifestVersion {
     }
 
     /// Return the exact authoritative live bytes paired with this observation.
-    #[allow(dead_code)] // Phase 04 root publication consumes the exact ETag-bound bytes.
     pub(crate) fn exact_manifest_bytes(&self) -> Result<Bytes> {
         self.history_snapshot.clone().ok_or_else(|| {
             ZeppelinError::Serialization(
@@ -8265,7 +8269,6 @@ impl ManifestVersion {
     }
 
     /// Hash the exact authoritative live bytes paired with this observation.
-    #[allow(dead_code)] // Phase 04 root publication consumes the exact ETag-bound digest.
     pub(crate) fn exact_manifest_digest(&self) -> Result<ManifestDigest> {
         Ok(ManifestDigest::new(
             Sha256::digest(self.exact_manifest_bytes()?).into(),
@@ -8334,7 +8337,6 @@ impl ManifestVersion {
 
     /// Return whether the same authoritative read observed a deletion fence.
     #[must_use]
-    #[allow(dead_code)] // Phase 04 root publication maps a fenced base before mutation.
     pub(crate) const fn is_deletion_fenced(&self) -> bool {
         self.deletion_fenced
     }

@@ -262,18 +262,27 @@ impl RqClusterCodes {
     }
 
     /// Returns the ID aligned with `row`, if it exists.
+    // Production readers use `ids()`; this row accessor is read by the
+    // round-trip tests below.
+    #[allow(dead_code)]
     #[must_use]
     pub fn id(&self, row: usize) -> Option<&str> {
         self.ids.get(row).map(String::as_str)
     }
 
     /// Returns the flat low-plane/high-plane words for all rows.
+    // Production readers score via asymmetric_distance; this raw accessor is
+    // read by the round-trip tests below.
+    #[allow(dead_code)]
     #[must_use]
     pub fn packed_planes(&self) -> &[u64] {
         &self.planes
     }
 
     /// Returns the factors aligned with the cluster rows.
+    // Production readers score via asymmetric_distance; this raw accessor is
+    // read by the round-trip tests below.
+    #[allow(dead_code)]
     #[must_use]
     pub fn factors(&self) -> &[TwoBitFactors] {
         &self.factors
@@ -543,12 +552,18 @@ impl RqClusterCodesOnly {
     }
 
     /// Returns the flat low-plane/high-plane words for all rows.
+    // Production readers score via asymmetric_distance; this raw accessor is
+    // read by the round-trip tests below.
+    #[allow(dead_code)]
     #[must_use]
     pub fn packed_planes(&self) -> &[u64] {
         &self.planes
     }
 
     /// Returns the factors aligned with the cluster rows.
+    // Production readers score via asymmetric_distance; this raw accessor is
+    // read by the round-trip tests below.
+    #[allow(dead_code)]
     #[must_use]
     pub fn factors(&self) -> &[TwoBitFactors] {
         &self.factors

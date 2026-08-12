@@ -1869,7 +1869,6 @@ pub(crate) async fn fetch_vector_values_by_id_with_trace(
 }
 
 /// Resolves a stored query seed while enforcing the current mandatory filter.
-#[allow(dead_code)]
 pub(crate) async fn fetch_vector_values_by_id_scoped(
     state: &AppState,
     ns: &str,
@@ -1993,7 +1992,6 @@ pub(crate) async fn fetch_vector_values_by_id_scoped_with_trace(
 /// directly into the result map. Java would normally retain references to the
 /// record's fields; C would need to detach pointers and prevent double free.
 /// Rust statically makes the consumed record unusable.
-#[allow(dead_code)]
 pub(crate) async fn fetch_vector_values_by_ids(
     state: &AppState,
     ns: &str,
