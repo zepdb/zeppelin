@@ -1,9 +1,0 @@
-   Compiling zeppelin v0.1.0 (/Users/aghatage/Documents/code/zeppelin)
-    Finished `release` profile [optimized + debuginfo] target(s) in 1m 44s
-     Running tests/perf_contract_tests.rs (target/release/deps/perf_contract_tests-6659776c7f6a2458)
-
-running 1 test
-test contracts ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 144 filtered out; finished in 10.03s
-
