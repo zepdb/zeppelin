@@ -706,8 +706,13 @@ impl SqCalibration {
 /// only one code would still declare two rows but write one, so such mismatched
 /// input must be rejected by the caller before this helper.
 pub fn serialize_sq_cluster(ids: &[String], codes: &[Vec<u8>], dim: usize) -> Result<Bytes> {
-    let n = ids.len() as u32;
-    let dimension = dim as u32;
+    // A silent `as u32` truncation would write a header that disagrees with
+    // the payload, making the decoder drop rows without any error. Fail loud
+    // instead; the Result channel already exists.
+    let n = u32::try_from(ids.len())
+        .map_err(|_| ZeppelinError::Index("SQ cluster row count exceeds u32".into()))?;
+    let dimension = u32::try_from(dim)
+        .map_err(|_| ZeppelinError::Index("SQ cluster dimension exceeds u32".into()))?;
 
     let mut buf = Vec::new();
     buf.extend_from_slice(&n.to_le_bytes());
@@ -715,7 +720,9 @@ pub fn serialize_sq_cluster(ids: &[String], codes: &[Vec<u8>], dim: usize) -> Re
 
     for (id, code) in ids.iter().zip(codes.iter()) {
         let id_bytes = id.as_bytes();
-        buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+        let id_len = u32::try_from(id_bytes.len())
+            .map_err(|_| ZeppelinError::Index("vector id length exceeds u32".into()))?;
+        buf.extend_from_slice(&id_len.to_le_bytes());
         buf.extend_from_slice(id_bytes);
         buf.extend_from_slice(code);
     }

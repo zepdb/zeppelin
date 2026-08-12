@@ -7439,7 +7439,10 @@ impl Manifest {
                 .saturating_add(retention.skew_slop_secs);
             let keep_by_time = retention.pitr_retention_secs > 0
                 && now.signed_duration_since(manifest.updated_at).num_seconds()
-                    <= retention_window as i64;
+                    // A window past i64::MAX seconds means "retain forever";
+                    // `as i64` would wrap negative and silently prune
+                    // everything the operator asked to keep.
+                    <= i64::try_from(retention_window).unwrap_or(i64::MAX);
             if keep_by_count || keep_by_time || keep_by_pin || keep_by_root {
                 retained_manifests.push(manifest);
             } else {

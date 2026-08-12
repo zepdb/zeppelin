@@ -681,15 +681,23 @@ impl PqCodebook {
 /// `m = 4`. Supplying only two codes would still declare three rows but emit
 /// two, so builders must reject that mismatch before calling this helper.
 pub fn serialize_pq_cluster(ids: &[String], codes: &[Vec<u8>], m: usize) -> Result<Bytes> {
-    let n = ids.len() as u32;
+    // A silent `as u32` truncation would write a header that disagrees with
+    // the payload, making the decoder drop rows without any error. Fail loud
+    // instead; the Result channel already exists.
+    let n = u32::try_from(ids.len())
+        .map_err(|_| ZeppelinError::Index("PQ cluster row count exceeds u32".into()))?;
+    let m_u32 = u32::try_from(m)
+        .map_err(|_| ZeppelinError::Index("PQ cluster code width exceeds u32".into()))?;
 
     let mut buf = Vec::new();
     buf.extend_from_slice(&n.to_le_bytes());
-    buf.extend_from_slice(&(m as u32).to_le_bytes());
+    buf.extend_from_slice(&m_u32.to_le_bytes());
 
     for (id, code) in ids.iter().zip(codes.iter()) {
         let id_bytes = id.as_bytes();
-        buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+        let id_len = u32::try_from(id_bytes.len())
+            .map_err(|_| ZeppelinError::Index("vector id length exceeds u32".into()))?;
+        buf.extend_from_slice(&id_len.to_le_bytes());
         buf.extend_from_slice(id_bytes);
         buf.extend_from_slice(code);
     }

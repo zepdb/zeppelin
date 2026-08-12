@@ -1588,8 +1588,13 @@ fn deserialize_centroids_v2(data: &[u8]) -> Result<CentroidsData> {
 /// IDs `[a, b]` and two two-dimensional vectors become two row records whose
 /// ID and vector remain adjacent and in the caller's order.
 pub(crate) fn serialize_cluster(ids: &[String], vectors: &[Vec<f32>], dim: usize) -> Result<Bytes> {
-    let n = ids.len() as u32;
-    let dimension = dim as u32;
+    // A silent `as u32` truncation here would write a header that disagrees
+    // with the payload, and the decoder would then drop rows without any
+    // error. Fail loud instead; the Result channel already exists.
+    let n = u32::try_from(ids.len())
+        .map_err(|_| ZeppelinError::Index("cluster row count exceeds u32".into()))?;
+    let dimension = u32::try_from(dim)
+        .map_err(|_| ZeppelinError::Index("cluster dimension exceeds u32".into()))?;
 
     let mut buf = Vec::new();
     buf.extend_from_slice(&n.to_le_bytes());
@@ -1597,7 +1602,8 @@ pub(crate) fn serialize_cluster(ids: &[String], vectors: &[Vec<f32>], dim: usize
 
     for (id, vec) in ids.iter().zip(vectors.iter()) {
         let id_bytes = id.as_bytes();
-        let id_len = id_bytes.len() as u32;
+        let id_len = u32::try_from(id_bytes.len())
+            .map_err(|_| ZeppelinError::Index("vector id length exceeds u32".into()))?;
         buf.extend_from_slice(&id_len.to_le_bytes());
         buf.extend_from_slice(id_bytes);
         for &val in vec {

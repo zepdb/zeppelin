@@ -3594,6 +3594,16 @@ impl Config {
         if self.server.request_timeout_secs == 0 {
             violations.push("server.request_timeout_secs must be greater than zero".to_string());
         }
+        // The membership artifact stores each vector ID length as a u16, so an
+        // ID accepted at ingest under a larger limit would panic background
+        // compaction when it serializes membership. Reject the config instead.
+        if self.server.max_vector_id_length > usize::from(u16::MAX) {
+            violations.push(format!(
+                "server.max_vector_id_length ({}) must be <= {} (membership artifact stores ID lengths as u16)",
+                self.server.max_vector_id_length,
+                u16::MAX
+            ));
+        }
         if self.server.shutdown_timeout_secs == 0 {
             violations.push("server.shutdown_timeout_secs must be greater than zero".to_string());
         }
