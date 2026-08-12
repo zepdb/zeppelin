@@ -1962,7 +1962,7 @@ async fn compaction_loop_with_lifecycle_inner(
                                 ));
                             }
                         }
-                        Err(e) if lifecycle.is_retired() && *shutdown.borrow() => {
+                        Err(_) if lifecycle.is_retired() && *shutdown.borrow() => {
                             // Shutdown can race a periodic tick between its
                             // trigger read and lease reservation. Retirement is
                             // not an operational compaction failure: the

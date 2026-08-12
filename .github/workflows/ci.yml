@@ -65,10 +65,12 @@ jobs:
           chmod +x /usr/local/bin/mc
           mc alias set local http://localhost:9000 minioadmin minioadmin
           mc mb local/zeppelin-test
+          mc mb local/zeppelin-license-test
       - name: Run integration tests
         env:
           TEST_BACKEND: minio
           TEST_S3_BUCKET: zeppelin-test
+          ZEPPELIN_LICENSE_TEST_BUCKET: zeppelin-license-test
           MINIO_ENDPOINT: http://localhost:9000
           MINIO_ACCESS_KEY: minioadmin
           MINIO_SECRET_KEY: minioadmin
@@ -166,10 +168,12 @@ jobs:
           chmod +x /usr/local/bin/mc
           mc alias set local http://localhost:9000 minioadmin minioadmin
           mc mb local/zeppelin-test
+          mc mb local/zeppelin-license-test
       - name: Generate coverage
         env:
           TEST_BACKEND: minio
           TEST_S3_BUCKET: zeppelin-test
+          ZEPPELIN_LICENSE_TEST_BUCKET: zeppelin-license-test
           MINIO_ENDPOINT: http://localhost:9000
           MINIO_ACCESS_KEY: minioadmin
           MINIO_SECRET_KEY: minioadmin

@@ -5050,47 +5050,43 @@ impl Manifest {
         let origins = origins.finish()?;
 
         let mut target = Manifest::new_at(now);
-        target.fragments = fragments
-            .into_iter()
-            .map(|(mut fragment, origin)| {
-                fragment.artifact_origin =
-                    Some(origins.indices.get(&origin).copied().ok_or_else(|| {
-                        BranchError::ArtifactOriginInvalid {
-                            manifest_namespace: target_identity.namespace.to_string(),
-                            manifest_incarnation: Some(target_identity.incarnation.clone()),
-                            descriptor_kind: "fragment",
-                            descriptor_id: fragment.id.to_string(),
-                            offending_index: None,
-                            offending_key: None,
-                            expected_origin: Some(origin),
-                            reason: "canonical fork origin table omitted a visible fragment owner"
+        target.fragments = Vec::with_capacity(fragments.len());
+        for (mut fragment, origin) in fragments {
+            fragment.artifact_origin =
+                Some(origins.indices.get(&origin).copied().ok_or_else(|| {
+                    BranchError::ArtifactOriginInvalid {
+                        manifest_namespace: target_identity.namespace.to_string(),
+                        manifest_incarnation: Some(target_identity.incarnation.clone()),
+                        descriptor_kind: "fragment",
+                        descriptor_id: fragment.id.to_string(),
+                        offending_index: None,
+                        offending_key: None,
+                        expected_origin: Some(origin),
+                        reason: "canonical fork origin table omitted a visible fragment owner"
+                            .to_string(),
+                    }
+                })?);
+            target.fragments.push(fragment);
+        }
+        target.input_fragments = Vec::with_capacity(input_fragments.len());
+        for (mut fragment, origin) in input_fragments {
+            fragment.artifact_origin =
+                Some(origins.indices.get(&origin).copied().ok_or_else(|| {
+                    BranchError::ArtifactOriginInvalid {
+                        manifest_namespace: target_identity.namespace.to_string(),
+                        manifest_incarnation: Some(target_identity.incarnation.clone()),
+                        descriptor_kind: "input-fragment",
+                        descriptor_id: fragment.id.to_string(),
+                        offending_index: None,
+                        offending_key: None,
+                        expected_origin: Some(origin),
+                        reason:
+                            "canonical fork origin table omitted a visible input-fragment owner"
                                 .to_string(),
-                        }
-                    })?);
-                Ok(fragment)
-            })
-            .collect::<std::result::Result<Vec<_>, BranchError>>()?;
-        target.input_fragments = input_fragments
-            .into_iter()
-            .map(|(mut fragment, origin)| {
-                fragment.artifact_origin =
-                    Some(origins.indices.get(&origin).copied().ok_or_else(|| {
-                        BranchError::ArtifactOriginInvalid {
-                            manifest_namespace: target_identity.namespace.to_string(),
-                            manifest_incarnation: Some(target_identity.incarnation.clone()),
-                            descriptor_kind: "input-fragment",
-                            descriptor_id: fragment.id.to_string(),
-                            offending_index: None,
-                            offending_key: None,
-                            expected_origin: Some(origin),
-                            reason:
-                                "canonical fork origin table omitted a visible input-fragment owner"
-                                    .to_string(),
-                        }
-                    })?);
-                Ok(fragment)
-            })
-            .collect::<std::result::Result<Vec<_>, BranchError>>()?;
+                    }
+                })?);
+            target.input_fragments.push(fragment);
+        }
         if let Some((mut segment, origin)) = active {
             segment.artifact_origin =
                 Some(origins.indices.get(&origin).copied().ok_or_else(|| {
