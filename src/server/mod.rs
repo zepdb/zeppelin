@@ -522,7 +522,6 @@ impl AuditRequest {
 ///
 /// Requests for `/v1/namespaces/books` and `/v1/namespaces/movies` are logged
 /// with their concrete paths but share the same route-pattern metric label.
-#[allow(clippy::unwrap_used)]
 pub async fn http_metrics(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     matched_path: Option<MatchedPath>,
@@ -571,12 +570,6 @@ pub async fn http_metrics(
 ///
 /// The downstream response with `x-request-id` inserted or replaced.
 ///
-/// # Panics
-///
-/// Header insertion assumes the chosen ID can be represented as an HTTP header
-/// value. That is guaranteed for a UUID and for a value already accepted by
-/// `HeaderValue::to_str`; a panic would indicate that invariant changed.
-///
 /// # Side Effects
 ///
 /// Generates randomness when no usable ID was supplied and creates an INFO
@@ -593,27 +586,40 @@ pub async fn http_metrics(
 /// `REQUEST_ID.scope` binds data to the async future, and `.instrument` binds a
 /// tracing span to that future. Unlike a Java thread-local or C thread-local,
 /// both remain correct when Tokio polls the future on different worker threads.
-#[allow(clippy::unwrap_used)]
 pub async fn request_id(request: Request<axum::body::Body>, next: Next) -> Response {
-    let id = request
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let rid = id.clone();
+    let (id, echo) = request_id_parts(request.headers());
     // Run downstream inside the REQUEST_ID task-local scope so the error
     // envelope can stamp `request_id` on any error produced below.
     REQUEST_ID
         .scope(id.clone(), async move {
             let mut response = next.run(request).await;
-            response
-                .headers_mut()
-                .insert("x-request-id", rid.parse().unwrap());
+            response.headers_mut().insert("x-request-id", echo);
             response
         })
         .instrument(tracing::info_span!("request", request_id = %id))
         .await
+}
+
+/// Selects the correlation ID string and its response header value together.
+///
+/// A client-supplied `x-request-id` is reused only when `HeaderValue::to_str`
+/// accepts it, and the original header value is echoed back verbatim, so no
+/// re-parse of client input can fail. Otherwise both forms derive from one
+/// generated UUID, whose hyphenated lowercase-hex text is always a valid
+/// header value.
+fn request_id_parts(headers: &axum::http::HeaderMap) -> (String, axum::http::HeaderValue) {
+    if let Some(value) = headers.get("x-request-id") {
+        if let Ok(text) = value.to_str() {
+            return (text.to_string(), value.clone());
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    // A UUID's text form is hyphenated lowercase hex, which is always within
+    // the visible-ASCII range HeaderValue requires.
+    #[allow(clippy::expect_used)]
+    let value = axum::http::HeaderValue::from_str(&id)
+        .expect("hyphenated UUID text is always a valid HTTP header value");
+    (id, value)
 }
 
 /// Correlates a query request without creating the general-purpose trace span.
@@ -632,30 +638,16 @@ pub async fn request_id(request: Request<axum::body::Body>, next: Next) -> Respo
 ///
 /// The downstream response with the chosen `x-request-id` header.
 ///
-/// # Panics
-///
-/// As in [`request_id`], insertion relies on the generated or previously parsed
-/// ID being a valid HTTP header value.
-///
 /// # Examples
 ///
 /// A nearest-neighbor query with no ID gets a generated ID in both a canonical
 /// error envelope and the response header, without a router-level trace span.
-#[allow(clippy::unwrap_used)]
 pub async fn query_request_id(request: Request<axum::body::Body>, next: Next) -> Response {
-    let id = request
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let rid = id.clone();
+    let (id, echo) = request_id_parts(request.headers());
     REQUEST_ID
         .scope(id, async move {
             let mut response = next.run(request).await;
-            response
-                .headers_mut()
-                .insert("x-request-id", rid.parse().unwrap());
+            response.headers_mut().insert("x-request-id", echo);
             response
         })
         .await
