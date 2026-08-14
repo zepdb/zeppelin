@@ -19,7 +19,7 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src/bin benches && \
     echo "fn main() {}" > src/main.rs && \
     echo "" > src/lib.rs && \
-    for b in quant_bakeoff mmli_lab zeppelin_license zeppelin_audit_verify \
+    for b in quant_bakeoff mmli_lab zeppelin_audit_verify \
              zeppelin_advisor recall_eval; do \
         echo "fn main() {}" > "src/bin/$b.rs"; \
     done && \

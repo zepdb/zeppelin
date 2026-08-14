@@ -404,7 +404,7 @@ async fn delayed_stale_batch_takeover_fails_successor_health_and_recovers_eviden
             .await
             .expect("successor must claim the expired production head");
     assert_eq!(successor.node_id(), stream_id);
-    let successor_record = AuditRecord::license_expired_boot(Utc::now(), &stream_id);
+    let successor_record = AuditRecord::open_unsafe_boot(Utc::now(), &stream_id);
     let successor_submitter = successor.clone();
     let first_successor_attempt = successor_record.clone();
     let successor_submission = tokio::spawn(async move {
@@ -539,7 +539,7 @@ async fn invalid_occupied_terminal_slot_fails_health_immediately() {
         .expect("invalid terminal fixture must occupy the deterministic next slot");
 
     let tomorrow = today + chrono::Duration::days(1);
-    let rollover_record = AuditRecord::license_expired_boot(
+    let rollover_record = AuditRecord::open_unsafe_boot(
         tomorrow
             .and_hms_opt(0, 0, 1)
             .expect("tomorrow rollover timestamp must exist")
