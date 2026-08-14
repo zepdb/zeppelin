@@ -54,21 +54,16 @@
 //! because a grant is identified by its principal/scope/actions binding rather
 //! than by a path-addressable ID.
 //!
-//! ## Licensing and registration gates
+//! ## Feature availability
 //!
-//! The paths always exist; only the service behind them changes, so an
-//! unlicensed deployment returns 403 rather than 404.
-//!
-//! - RBAC paths are bound to these handlers only when the boot-time
-//!   entitlement set includes the RBAC feature; otherwise every method is
-//!   bound to a stub returning the unlicensed-feature error (403). The same
-//!   pattern gates `/v1/security/tokens` on the delegation feature and the
-//!   preservation paths on the preservation feature.
-//! - Every **mutating** route additionally carries the
-//!   `enforce_security_management_license` layer, which rejects with
-//!   [`SecurityError::LicenseExpired`](crate::security::SecurityError::LicenseExpired) (403) while management is frozen. That
-//!   check is per-request; the route-selection gate above is evaluated once at
-//!   router build, so a license change requires a restart to remount handlers.
+//! The paths always exist and always bind these handlers; only the composed
+//! services behind them change, so a deployment with a surface disabled by
+//! configuration returns 403 rather than 404. RBAC administration requires
+//! the policy authority (`security.rbac = true`), `/v1/security/tokens`
+//! requires a composed delegation authority (a configured
+//! `security.token_signing_key_path`), and the preservation paths require the
+//! composed preservation service. When a surface is not composed the kernel
+//! rejects with [`SecurityError::FeatureDisabled`](crate::security::SecurityError::FeatureDisabled) (403 `feature_disabled`).
 //!
 //! ## Validation here versus in the kernel
 //!
@@ -98,7 +93,7 @@
 //! | Condition | Status | Code |
 //! | --- | --- | --- |
 //! | Unauthenticated or unknown/expired credential | 401 | authn code |
-//! | Not granted, unlicensed feature, expired license, approval missing | 403 | `forbidden`, the unlicensed-feature and expired-license codes rendered by `SecurityError::status_code`, `approval_required` |
+//! | Not granted, disabled feature, approval missing | 403 | `forbidden`, `feature_disabled`, `approval_required` |
 //! | Stale policy cache (`SecurityStale`) | 403 | fail-closed, never served stale |
 //! | Malformed ID, delegation exceeding parent, already-revoked key | 400 | `invalid_security_request`, `delegation_scope_exceeds_parent` |
 //! | Unknown principal, key, grant, or lock | 404 | `security_entity_not_found`, `preservation_lock_not_found` |
@@ -126,9 +121,6 @@
 //!        |  |-- Approval obligation -------> second approver header or 403
 //!        |  inserts AllowDecision + AuditRequest extensions
 //!        v
-//! license layer (mutations only) -- frozen --> 403 expired license
-//!        |
-//!        v
 //! this handler: decode JSON, parse newtypes -- invalid --> 400
 //!        |
 //!        v
@@ -154,13 +146,12 @@
 //!   by the middleware outside persisted grants, so no administrator can mint a
 //!   one-person release grant. [`release_preservation_lock`](crate::server::handlers::security::release_preservation_lock) must not acquire
 //!   its own approval semantics.
-//! - **Licensing belongs in the kernel, not only in the router.** Delegation
-//!   and preservation operations re-check their feature inside the kernel.
-//!   RBAC administration does not check the RBAC feature directly; its
-//!   independent backstop is that an unlicensed deployment builds a bootstrap
-//!   authority whose administration methods reject with
-//!   [`SecurityError::InvalidPolicyRequest`](crate::security::SecurityError::InvalidPolicyRequest) (400). Prefer adding a kernel-side
-//!   check to relying on route selection — see `src/security/CLAUDE.md`.
+//! - **Feature availability belongs in the kernel, not the router.**
+//!   Delegation and preservation operations check their composed service
+//!   inside the kernel, and RBAC administration rejects on the bootstrap
+//!   authority arm with [`SecurityError::FeatureDisabled`](crate::security::SecurityError::FeatureDisabled) (403). Prefer a
+//!   kernel-side check to relying on route selection — see
+//!   `src/security/CLAUDE.md`.
 //! - **Secrets are returned exactly once.** [`CreateKeyResponse`](crate::server::handlers::security::CreateKeyResponse),
 //!   [`RotateKeyResponse`](crate::server::handlers::security::RotateKeyResponse), and [`MintTokenResponse`](crate::server::handlers::security::MintTokenResponse) carry plaintext material
 //!   that is never retrievable again; the listing views ([`PolicyKeyView`](crate::server::handlers::security::PolicyKeyView)) are

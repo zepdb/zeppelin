@@ -7,25 +7,20 @@ use object_store::path::Path;
 use object_store::prefix::PrefixStore;
 use zeppelin::config::Config;
 use zeppelin::security::{
-    Action, Decision, Entitlements, Feature, PrincipalId, PrincipalKind, RequestContext, Resource,
-    SecurityKernel,
+    Action, Decision, PrincipalId, PrincipalKind, RequestContext, Resource, SecurityKernel,
 };
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::Clock;
 
 use common::counting::{counting_store, ArtifactClass};
 use common::harness::TestHarness;
-use common::server::{test_admin_bearer, test_entitlements};
+use common::server::test_admin_bearer;
 
 fn scoped_store(harness: &TestHarness) -> ZeppelinStore {
     ZeppelinStore::new(Arc::new(PrefixStore::new(
         harness.store.inner(),
         Path::from(harness.prefix.clone()),
     )))
-}
-
-fn full_entitlements() -> Arc<Entitlements> {
-    Arc::new(test_entitlements(Feature::ALL))
 }
 
 fn delegation_signing_key(config: &mut Config) -> tempfile::NamedTempFile {
@@ -50,14 +45,10 @@ async fn warmed_authentication_and_authorization_use_zero_s3_operations() {
     let admin_bearer = test_admin_bearer(&mut config);
     let _delegation_key = delegation_signing_key(&mut config);
     let clock = Clock::system();
-    let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
-        store,
-        &config.security,
-        clock.clone(),
-        full_entitlements(),
-    )
-    .await
-    .expect("security policy must bootstrap over the counting store");
+    config.security.rbac = true;
+    let (kernel, adapter) = SecurityKernel::compose(store, &config.security, clock.clone())
+        .await
+        .expect("security policy must bootstrap over the counting store");
     let authorization = format!("Bearer {admin_bearer}");
 
     let warm_principal = adapter
@@ -121,14 +112,10 @@ async fn policy_refresh_uses_at_most_one_conditional_get_per_window() {
     config.security.policy_refresh_secs = 1;
     let _admin_bearer = test_admin_bearer(&mut config);
     let _delegation_key = delegation_signing_key(&mut config);
-    let (_kernel, _adapter) = SecurityKernel::from_resolved_entitlements(
-        store,
-        &config.security,
-        Clock::system(),
-        full_entitlements(),
-    )
-    .await
-    .expect("security policy must bootstrap over the counting store");
+    config.security.rbac = true;
+    let (_kernel, _adapter) = SecurityKernel::compose(store, &config.security, Clock::system())
+        .await
+        .expect("security policy must bootstrap over the counting store");
 
     counter.reset();
     let head_key = "_security/heads/policy.json";
@@ -171,14 +158,10 @@ async fn policy_mutation_is_one_immutable_put_plus_head_claim_and_cas_put() {
     let _delegation_key = delegation_signing_key(&mut config);
     let clock = Clock::system();
     let now = clock.now();
-    let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
-        store,
-        &config.security,
-        clock,
-        full_entitlements(),
-    )
-    .await
-    .expect("security policy must bootstrap over the counting store");
+    config.security.rbac = true;
+    let (kernel, adapter) = SecurityKernel::compose(store, &config.security, clock)
+        .await
+        .expect("security policy must bootstrap over the counting store");
     let actor = adapter
         .authenticate_bearer(&format!("Bearer {admin_bearer}"), now)
         .expect("bootstrap administrator must authenticate");

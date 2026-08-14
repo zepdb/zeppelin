@@ -23,7 +23,7 @@
 //!   API-key path.
 //! - `kernel.rs` composes `DelegationAuthority` (or the lighter
 //!   `PublishedObjectSigner`, used when audit must be signed but delegation is
-//!   not licensed) at boot, installs it into [`ZeppelinStore`]
+//!   not composed) at boot, installs it into [`ZeppelinStore`]
 //!   as a `dyn ObjectSigner`, and calls `mint` only after it has confirmed the
 //!   parent's current grants cover every action/namespace pair in the request.
 //! - `audit_chain.rs` calls `verify_published_signature` to check audit-anchor
@@ -169,7 +169,7 @@
 //! That is Rust's dynamic dispatch, closest to a Java interface reference: the
 //! storage layer can sign manifest roots and audit anchors without depending on
 //! the security module's concrete types or knowing whether delegation is
-//! licensed at all.
+//! composed at all.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -497,7 +497,7 @@ pub(crate) struct DelegationAuthority {
 }
 
 /// Published node signer used by signed audit anchors when delegation itself
-/// is not licensed (for example enforced audit in `open_unsafe` mode).
+/// is not composed (for example durable audit with no delegation authority).
 pub(crate) struct PublishedObjectSigner {
     signing_key: SigningKey,
     signer_node: String,

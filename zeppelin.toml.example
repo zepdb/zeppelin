@@ -12,9 +12,12 @@
 mode = "enforced"                    # "enforced" or "open_unsafe"
 # readyz_public = false              # false keeps /readyz capability-gated
 # policy_refresh_secs = 5            # must be > 0; phase 3 uses this freshness bound
-# audit_s3 = true                    # required true in enforced mode; durable JSONL under _audit/
+# audit_s3 = false                   # opt-in durable JSONL under _audit/; requires an S3-compatible
+#                                    # backend and token_signing_key_path
 # audit_flush_secs = 2               # must be > 0; max background batch-flush interval
-# license_path = ""                  # signed-license path; branching also requires the "branching" feature
+# rbac = false                       # true selects the S3-authoritative RBAC policy store; requires
+#                                    # mode = "enforced" and a conditional-PUT-capable backend
+# token_signing_key_path = ""        # Ed25519 seed file; enables delegated tokens and audit signing
 # cursor_hmac_key_hex = "..."        # REQUIRED in enforced mode; generate: openssl rand -hex 32
 
 # Generate one 43-character base64url secret and its SHA-256 digest:
@@ -55,7 +58,7 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # to only those proxy CIDRs. X-Forwarded-For is ignored from untrusted peers.
 
 [branching]
-# Branch routes require this switch AND a verified signed-license entitlement.
+# This switch is the sole gate for branch routes.
 # Zeppelin supports forks, not merge/rebase/diff operations.
 # enabled = false
 # max_children_per_namespace = 256   # direct children; valid range 1..=4096

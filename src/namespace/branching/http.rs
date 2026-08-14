@@ -43,19 +43,10 @@
 //!
 //! ## Gating
 //!
-//! Branching is off by default and both routes require **two** independent
-//! things, checked in two different layers:
-//!
-//! 1. `config.branching.enabled` — controls whether the branch route is
-//!    registered at all, and is re-checked inside each handler as defense in
-//!    depth. When false, the handler returns
-//!    `BranchError::BranchingNotReady`.
-//! 2. A valid `crate::security::Feature::Branching` entitlement — enforced by
-//!    the security kernel in `authorize_namespace_fork` and
-//!    `authorize_branch_list`, and again on each fresh re-authorization path.
-//!
-//! Both gates apply to both create and list. A deployment with the config flag
-//! on but no entitlement gets a licensing failure, not a branch.
+//! Branching is off by default; `config.branching.enabled` is the gate. It
+//! controls whether the branch route is registered at all, and is re-checked
+//! inside each handler as defense in depth. When false, the handler returns
+//! `BranchError::BranchingNotReady`.
 //!
 //! ## Redaction and contract invariants
 //!

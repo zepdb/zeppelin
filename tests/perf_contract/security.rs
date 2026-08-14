@@ -1,21 +1,20 @@
 //! Production security hot-path measurement for the frozen secured query.
 
 use std::hint::black_box;
-use std::sync::Arc;
 use std::time::Instant;
 
 use axum::http::Method;
 use serde::Serialize;
 use zeppelin::config::{Config, SecurityMode};
 use zeppelin::security::{
-    classify_route, Action, CredentialAdapter, Decision, DelegationNarrowing, Feature,
-    GrantActions, GrantDefinition, GrantScope, NamespaceId, RequestContext, Resource, RouteClass,
-    SecurityKernel, WriteConstraints,
+    classify_route, Action, CredentialAdapter, Decision, DelegationNarrowing, GrantActions,
+    GrantDefinition, GrantScope, NamespaceId, RequestContext, Resource, RouteClass, SecurityKernel,
+    WriteConstraints,
 };
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::Clock;
 
-use crate::common::server::{bearer_headers, test_entitlements};
+use crate::common::server::bearer_headers;
 
 use super::contract::{load_contract, SecurityAssertionSpec};
 use super::scenario::RepeatCounters;
@@ -161,14 +160,13 @@ pub async fn measure(input: SecurityMeasureInput<'_>) -> SecurityMeasurement {
     // benchmark regardless; the branching census pins it the same way
     // (`branching.rs:204`).
     security_config.policy_refresh_secs = 3_600;
-    let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
-        security_store.clone(),
-        &security_config,
-        clock.clone(),
-        Arc::new(test_entitlements(Feature::ALL)),
-    )
-    .await
-    .unwrap_or_else(|error| panic!("secured performance security authority must load: {error}"));
+    security_config.rbac = true;
+    let (kernel, adapter) =
+        SecurityKernel::compose(security_store.clone(), &security_config, clock.clone())
+            .await
+            .unwrap_or_else(|error| {
+                panic!("secured performance security authority must load: {error}")
+            });
     let headers = bearer_headers(measured_bearer);
     let now = clock.now();
     let context = RequestContext::at("secured-query-perf", now);

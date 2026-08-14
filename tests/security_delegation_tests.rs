@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use zeppelin::config::{Config, SecurityMode};
 use zeppelin::security::{
     canonical_policy_checksum, verify_audit_day, Action, AuditRecord, AuditRuntime,
-    DelegationNarrowing, Feature, NamespaceId, PolicyStore, SecurityKernel,
+    DelegationNarrowing, NamespaceId, PolicyStore, SecurityKernel,
 };
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::{Clock, TimeSource};
@@ -30,9 +30,9 @@ use common::harness::TestHarness;
 use common::server::{
     client_with_bearer, create_ns_api, scoped_test_security_store, start_test_server,
     start_test_server_full, start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer,
-    start_test_server_full_with_entitlements,
+    start_test_server_full_with_security,
     start_test_server_full_without_rate_limit_override_and_admin_bearer, test_admin_bearer,
-    test_entitlements,
+    TestSecurity,
 };
 
 #[derive(Debug)]
@@ -261,8 +261,7 @@ async fn legacy_all_policy_is_cas_migrated_before_serving() {
     let store = scoped_test_security_store(&harness.store, &harness.prefix);
     let mut config = Config::default();
     let _admin_bearer = test_admin_bearer(&mut config);
-    let entitlements = Arc::new(test_entitlements(Feature::ALL));
-    let bootstrap_store = PolicyStore::new(store.clone(), Arc::clone(&entitlements));
+    let bootstrap_store = PolicyStore::new(store.clone(), true);
     let now = chrono::Utc::now();
     let bootstrap = bootstrap_store
         .load_or_bootstrap(&config.security, now)
@@ -299,8 +298,8 @@ async fn legacy_all_policy_is_cas_migrated_before_serving() {
         .await
         .expect("legacy head write");
 
-    let left_store = PolicyStore::new(store.clone(), Arc::clone(&entitlements));
-    let right_store = PolicyStore::new(store.clone(), Arc::clone(&entitlements));
+    let left_store = PolicyStore::new(store.clone(), true);
+    let right_store = PolicyStore::new(store.clone(), true);
     let (left, right) = tokio::join!(
         left_store.load_or_bootstrap(&config.security, now),
         right_store.load_or_bootstrap(&config.security, now)
@@ -340,30 +339,25 @@ async fn legacy_all_policy_is_cas_migrated_before_serving() {
 }
 
 #[tokio::test]
-async fn open_unsafe_with_delegation_entitlement_fails_boot() {
+async fn open_unsafe_with_rbac_config_fails_boot() {
     let harness = TestHarness::new().await;
     let store = scoped_test_security_store(&harness.store, &harness.prefix);
     let mut config = Config::default();
     config.security.mode = SecurityMode::OpenUnsafe;
+    config.security.rbac = true;
     let key = delegation_signing_key(0x31);
     config.security.token_signing_key_path = key.path().to_string_lossy().into_owned();
 
-    let result = SecurityKernel::from_resolved_entitlements(
-        store,
-        &config.security,
-        Clock::system(),
-        Arc::new(test_entitlements([Feature::Rbac, Feature::Delegation])),
-    )
-    .await;
+    let result = SecurityKernel::compose(store, &config.security, Clock::system()).await;
     let error = match result {
-        Ok(_) => panic!("delegation cannot compose without enforced parent authority"),
+        Ok(_) => panic!("rbac policy authority cannot compose under anonymous access"),
         Err(error) => error,
     };
 
     assert!(
         error
             .to_string()
-            .contains("delegation requires security.mode = enforced"),
+            .contains("security.rbac = true requires security.mode = \"enforced\""),
         "{error}"
     );
 }
@@ -373,26 +367,37 @@ async fn delegation_signing_key_contract_fails_loud_at_boot() {
     let harness = TestHarness::new().await;
     let store = scoped_test_security_store(&harness.store, &harness.prefix);
     let mut config = Config::default();
-    let _admin_bearer = test_admin_bearer(&mut config);
-    let entitlements = Arc::new(test_entitlements([Feature::Rbac, Feature::Delegation]));
+    let admin_bearer = test_admin_bearer(&mut config);
+    config.security.rbac = true;
 
-    let missing = SecurityKernel::from_resolved_entitlements(
-        store.clone(),
-        &config.security,
-        Clock::system(),
-        Arc::clone(&entitlements),
+    // An empty signing-key path now means the delegation surface is off, not
+    // misconfigured: boot succeeds and minting reports the disabled feature.
+    let clock = Clock::system();
+    let (keyless_kernel, keyless_adapter) =
+        SecurityKernel::compose(store.clone(), &config.security, clock.clone())
+            .await
+            .expect("keyless boot must compose with delegation disabled");
+    let parent = keyless_adapter
+        .authenticate_bearer(&format!("Bearer {admin_bearer}"), clock.now())
+        .expect("bootstrap administrator must authenticate");
+    let narrowing = DelegationNarrowing::new(
+        vec![Action::NamespaceRead],
+        vec![NamespaceId::new("delegation-disabled-probe".to_string()).unwrap()],
+        None,
+        "delegation disabled probe".to_string(),
     )
-    .await;
-    let missing = match missing {
-        Ok(_) => panic!("delegation boot must reject a missing signing key"),
-        Err(error) => error,
-    };
+    .expect("probe narrowing must be valid");
+    let disabled = keyless_kernel
+        .mint_delegated_token(&parent, narrowing, 60, clock.now())
+        .expect_err("minting must report the disabled delegation surface");
     assert!(
-        missing
+        disabled
             .to_string()
-            .contains("missing required security.token_signing_key_path"),
-        "{missing}"
+            .contains("feature is disabled by server configuration: delegation"),
+        "{disabled}"
     );
+    drop(keyless_kernel);
+    drop(keyless_adapter);
 
     let loose = delegation_signing_key(0x51);
     #[cfg(unix)]
@@ -402,13 +407,8 @@ async fn delegation_signing_key_contract_fails_loud_at_boot() {
     })
     .unwrap();
     config.security.token_signing_key_path = loose.path().to_string_lossy().into_owned();
-    let loose_result = SecurityKernel::from_resolved_entitlements(
-        store.clone(),
-        &config.security,
-        Clock::system(),
-        Arc::clone(&entitlements),
-    )
-    .await;
+    let loose_result =
+        SecurityKernel::compose(store.clone(), &config.security, Clock::system()).await;
     #[cfg(unix)]
     {
         let loose_error = match loose_result {
@@ -426,13 +426,7 @@ async fn delegation_signing_key_contract_fails_loud_at_boot() {
     let invalid = delegation_signing_key(0x52);
     std::fs::write(invalid.path(), "not-a-32-byte-hex-seed").unwrap();
     config.security.token_signing_key_path = invalid.path().to_string_lossy().into_owned();
-    let invalid_result = SecurityKernel::from_resolved_entitlements(
-        store,
-        &config.security,
-        Clock::system(),
-        entitlements,
-    )
-    .await;
+    let invalid_result = SecurityKernel::compose(store, &config.security, Clock::system()).await;
     let invalid_error = match invalid_result {
         Ok(_) => panic!("delegation boot must reject malformed signing material"),
         Err(error) => error,
@@ -454,14 +448,11 @@ async fn direct_kernel_composition_supports_offline_audit_verification_after_roo
     let key = delegation_signing_key(0x53);
     config.security.token_signing_key_path = key.path().to_string_lossy().into_owned();
 
-    let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
-        store.clone(),
-        &config.security,
-        Clock::system(),
-        Arc::new(test_entitlements([Feature::Rbac, Feature::Delegation])),
-    )
-    .await
-    .expect("direct kernel composition must publish a delegation signer");
+    config.security.rbac = true;
+    let (kernel, adapter) =
+        SecurityKernel::compose(store.clone(), &config.security, Clock::system())
+            .await
+            .expect("direct kernel composition must publish a delegation signer");
 
     let (client, runtime) =
         AuditRuntime::start_for_published_signer(store.clone(), StdDuration::from_secs(60))
@@ -505,15 +496,11 @@ async fn split_security_inventory_verifies_raw_audit_after_root_ends() {
     config.security.mode = SecurityMode::OpenUnsafe;
     let key = delegation_signing_key(0x55);
     config.security.token_signing_key_path = key.path().to_string_lossy().into_owned();
-    let entitlements = Arc::new(test_entitlements([Feature::AuditS3]));
-    let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
-        security_store,
-        &config.security,
-        Clock::system(),
-        entitlements,
-    )
-    .await
-    .expect("scoped security kernel must publish its signer inventory");
+    config.security.audit_s3 = true;
+    let (kernel, adapter) =
+        SecurityKernel::compose(security_store, &config.security, Clock::system())
+            .await
+            .expect("scoped security kernel must publish its signer inventory");
     kernel
         .install_object_signer(&app_store)
         .expect("raw application store must receive the scoped signer");
@@ -559,24 +546,16 @@ async fn overlapping_kernel_composition_rebinds_same_node_signer_to_replacement_
     let _admin_bearer = test_admin_bearer(&mut config);
     let key = delegation_signing_key(0x54);
     config.security.token_signing_key_path = key.path().to_string_lossy().into_owned();
-    let entitlements = Arc::new(test_entitlements([Feature::Rbac, Feature::Delegation]));
+    config.security.rbac = true;
 
-    let (old_kernel, old_adapter) = SecurityKernel::from_resolved_entitlements(
-        store.clone(),
-        &config.security,
-        Clock::system(),
-        Arc::clone(&entitlements),
-    )
-    .await
-    .expect("original kernel must install its published signer");
-    let (replacement_kernel, replacement_adapter) = SecurityKernel::from_resolved_entitlements(
-        store.clone(),
-        &config.security,
-        Clock::system(),
-        entitlements,
-    )
-    .await
-    .expect("replacement kernel must compose before the original drops");
+    let (old_kernel, old_adapter) =
+        SecurityKernel::compose(store.clone(), &config.security, Clock::system())
+            .await
+            .expect("original kernel must install its published signer");
+    let (replacement_kernel, replacement_adapter) =
+        SecurityKernel::compose(store.clone(), &config.security, Clock::system())
+            .await
+            .expect("replacement kernel must compose before the original drops");
 
     drop(old_kernel);
     let (_client, runtime) =
@@ -605,36 +584,23 @@ async fn replacement_composition_retries_one_signer_get_but_fails_loud_when_pers
     let _admin_bearer = test_admin_bearer(&mut config);
     let key = delegation_signing_key(0x56);
     config.security.token_signing_key_path = key.path().to_string_lossy().into_owned();
-    let entitlements = Arc::new(test_entitlements([Feature::Rbac, Feature::Delegation]));
+    config.security.rbac = true;
 
-    let (original_kernel, original_adapter) = SecurityKernel::from_resolved_entitlements(
-        store.clone(),
-        &config.security,
-        Clock::system(),
-        Arc::clone(&entitlements),
-    )
-    .await
-    .expect("original kernel must publish signer state before replacement");
+    let (original_kernel, original_adapter) =
+        SecurityKernel::compose(store.clone(), &config.security, Clock::system())
+            .await
+            .expect("original kernel must publish signer state before replacement");
 
     let (one_shot_store, one_shot_injected) = fail_signer_gets(&store, 1);
-    let (replacement_kernel, replacement_adapter) = SecurityKernel::from_resolved_entitlements(
-        one_shot_store,
-        &config.security,
-        Clock::system(),
-        Arc::clone(&entitlements),
-    )
-    .await
-    .expect("one transient signer GET fault must not abort replacement composition");
+    let (replacement_kernel, replacement_adapter) =
+        SecurityKernel::compose(one_shot_store, &config.security, Clock::system())
+            .await
+            .expect("one transient signer GET fault must not abort replacement composition");
     assert_eq!(one_shot_injected.load(Ordering::SeqCst), 1);
 
     let (persistent_store, persistent_injected) = fail_signer_gets(&store, usize::MAX);
-    let persistent = SecurityKernel::from_resolved_entitlements(
-        persistent_store,
-        &config.security,
-        Clock::system(),
-        entitlements,
-    )
-    .await;
+    let persistent =
+        SecurityKernel::compose(persistent_store, &config.security, Clock::system()).await;
     let error = match persistent {
         Ok(_) => panic!("persistent signer GET failure must abort composition"),
         Err(error) => error,
@@ -665,26 +631,18 @@ async fn replacement_composition_avoids_idempotent_signer_writes_but_new_signers
     let _admin_bearer = test_admin_bearer(&mut config);
     let key = delegation_signing_key(0x57);
     config.security.token_signing_key_path = key.path().to_string_lossy().into_owned();
-    let entitlements = Arc::new(test_entitlements([Feature::Rbac, Feature::Delegation]));
+    config.security.rbac = true;
 
-    let (original_kernel, original_adapter) = SecurityKernel::from_resolved_entitlements(
-        store.clone(),
-        &config.security,
-        Clock::system(),
-        Arc::clone(&entitlements),
-    )
-    .await
-    .expect("original kernel must publish signer state before replacement");
+    let (original_kernel, original_adapter) =
+        SecurityKernel::compose(store.clone(), &config.security, Clock::system())
+            .await
+            .expect("original kernel must publish signer state before replacement");
 
     let (write_partitioned_store, _, replacement_puts) = fault_signer_ops(&store, 0, usize::MAX);
-    let (replacement_kernel, replacement_adapter) = SecurityKernel::from_resolved_entitlements(
-        write_partitioned_store,
-        &config.security,
-        Clock::system(),
-        Arc::clone(&entitlements),
-    )
-    .await
-    .expect("replacement must reuse verified signer state during a write partition");
+    let (replacement_kernel, replacement_adapter) =
+        SecurityKernel::compose(write_partitioned_store, &config.security, Clock::system())
+            .await
+            .expect("replacement must reuse verified signer state during a write partition");
     assert_eq!(
         replacement_puts.load(Ordering::SeqCst),
         0,
@@ -694,13 +652,8 @@ async fn replacement_composition_avoids_idempotent_signer_writes_but_new_signers
     let new_key = delegation_signing_key(0x58);
     config.security.token_signing_key_path = new_key.path().to_string_lossy().into_owned();
     let (new_signer_store, _, new_signer_puts) = fault_signer_ops(&store, 0, usize::MAX);
-    let new_signer = SecurityKernel::from_resolved_entitlements(
-        new_signer_store,
-        &config.security,
-        Clock::system(),
-        entitlements,
-    )
-    .await;
+    let new_signer =
+        SecurityKernel::compose(new_signer_store, &config.security, Clock::system()).await;
     let error = match new_signer {
         Ok(_) => panic!("a new signer must not compose without durable publication"),
         Err(error) => error,
@@ -811,7 +764,7 @@ async fn concurrent_signer_registration_enforces_inventory_cap_atomically() {
     let harness = TestHarness::new().await;
     let mut base_config = Config::default();
     let _admin_bearer = test_admin_bearer(&mut base_config);
-    let entitlements = Arc::new(test_entitlements([Feature::Rbac, Feature::Delegation]));
+    base_config.security.rbac = true;
     let signing_keys = (0_u8..34)
         .map(|index| delegation_signing_key(0x60_u8 + index))
         .collect::<Vec<_>>();
@@ -819,11 +772,10 @@ async fn concurrent_signer_registration_enforces_inventory_cap_atomically() {
     for (index, signing_key) in signing_keys.iter().take(31).enumerate() {
         let mut config = base_config.clone();
         config.security.token_signing_key_path = signing_key.path().to_string_lossy().into_owned();
-        SecurityKernel::from_resolved_entitlements(
+        SecurityKernel::compose(
             scoped_test_security_store(&harness.store, &harness.prefix),
             &config.security,
             Clock::system(),
-            Arc::clone(&entitlements),
         )
         .await
         .unwrap_or_else(|error| panic!("signer {index} must register below the cap: {error}"));
@@ -836,17 +788,15 @@ async fn concurrent_signer_registration_enforces_inventory_cap_atomically() {
     right_config.security.token_signing_key_path =
         signing_keys[32].path().to_string_lossy().into_owned();
     let (left, right) = tokio::join!(
-        SecurityKernel::from_resolved_entitlements(
+        SecurityKernel::compose(
             scoped_test_security_store(&harness.store, &harness.prefix),
             &left_config.security,
             Clock::system(),
-            Arc::clone(&entitlements),
         ),
-        SecurityKernel::from_resolved_entitlements(
+        SecurityKernel::compose(
             scoped_test_security_store(&harness.store, &harness.prefix),
             &right_config.security,
             Clock::system(),
-            Arc::clone(&entitlements),
         )
     );
     let successful_registrations = usize::from(left.is_ok()) + usize::from(right.is_ok());
@@ -861,11 +811,10 @@ async fn concurrent_signer_registration_enforces_inventory_cap_atomically() {
     let mut overflow_config = base_config;
     overflow_config.security.token_signing_key_path =
         signing_keys[33].path().to_string_lossy().into_owned();
-    let overflow = SecurityKernel::from_resolved_entitlements(
+    let overflow = SecurityKernel::compose(
         scoped_test_security_store(&harness.store, &harness.prefix),
         &overflow_config.security,
         Clock::system(),
-        entitlements,
     )
     .await;
     let overflow = match overflow {
@@ -1239,12 +1188,12 @@ async fn mint_beyond_parent_400() {
 async fn expired_token_401_and_backward_clock_jump_does_not_resurrect() {
     let harness = TestHarness::new().await;
     let source = Arc::new(AdjustableDelegationClock(Mutex::new(chrono::Utc::now())));
-    let server = start_test_server_full_with_entitlements(
+    let server = start_test_server_full_with_security(
         harness.store.clone(),
         Some(harness.prefix.clone()),
         Config::default(),
         Clock::from_source(source.clone()),
-        test_entitlements(Feature::ALL),
+        TestSecurity::full(),
     )
     .await;
     let admin = client_with_bearer(&server.admin_bearer);

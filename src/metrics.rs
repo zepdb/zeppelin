@@ -359,15 +359,6 @@ mod inner {
         .unwrap()
     });
 
-    /// Seconds until the signed license expires; negative values mean expired.
-    pub static LICENSE_EXPIRY_SECONDS: LazyLock<IntGauge> = LazyLock::new(|| {
-        register_int_gauge!(
-            "zeppelin_license_expiry_seconds",
-            "Seconds until signed license expiry; negative after expiry"
-        )
-        .unwrap()
-    });
-
     /// Authentication failures partitioned only by the bounded failure-reason enum.
     pub static AUTH_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         register_int_counter_vec!(
@@ -614,7 +605,6 @@ pub fn init() {
     std::sync::LazyLock::force(&FTS_QUERIES_TOTAL);
     std::sync::LazyLock::force(&RATE_LIMITED_TOTAL);
     std::sync::LazyLock::force(&SECURITY_MODE);
-    std::sync::LazyLock::force(&LICENSE_EXPIRY_SECONDS);
     std::sync::LazyLock::force(&AUTH_FAILURES_TOTAL);
     std::sync::LazyLock::force(&AUTHZ_DENIALS_TOTAL);
     std::sync::LazyLock::force(&AUDIT_RECORDS_TOTAL);

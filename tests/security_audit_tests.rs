@@ -14,7 +14,6 @@ use zeppelin::config::{ApiKeyConfig, Config, SecurityMode};
 use zeppelin::metrics::{
     AUDIT_FLUSH_FAILURES_TOTAL, AUDIT_RECORDS_TOTAL, AUTHZ_DENIALS_TOTAL, AUTH_FAILURES_TOTAL,
 };
-use zeppelin::security::Feature;
 use zeppelin::security::{
     verify_audit_day, AuthenticationOutcome, AuthnFailure, CredentialAdapter, PolicyVersion,
 };
@@ -26,8 +25,8 @@ use common::fault_injection::{delay_delete_matching, fail_put_once_matching};
 use common::harness::TestHarness;
 use common::server::{
     client_with_bearer, create_ns_api, start_test_server_full,
-    start_test_server_full_with_credential_adapter, start_test_server_full_with_entitlements,
-    test_entitlements,
+    start_test_server_full_with_credential_adapter, start_test_server_full_with_security,
+    TestSecurity,
 };
 
 const READER_KEY_ID: &str = "zpk1_audit_reader";
@@ -569,12 +568,12 @@ async fn open_unsafe_boot_is_audited() {
         .with_ymd_and_hms(2020, 1, 14, 12, 0, 0)
         .single()
         .expect("historical open-unsafe audit timestamp must exist");
-    let server = start_test_server_full_with_entitlements(
+    let server = start_test_server_full_with_security(
         harness.store.clone(),
         Some(harness.prefix.clone()),
         config,
         Clock::from_source(Arc::new(FixedAuditClock(audit_now))),
-        test_entitlements([Feature::AuditS3]),
+        TestSecurity::bootstrap_with_durable_audit(),
     )
     .await;
 

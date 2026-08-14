@@ -126,10 +126,9 @@
 //! - **Lease release is best effort.** Failure is logged and swallowed so a
 //!   process cannot deadlock on a lease it already lost; the lease expiry and
 //!   fencing token remain the real authority.
-//! - **Fail closed on entitlements.** A policy that uses constraints,
-//!   delegation, or preservation without the matching [`Feature`] is rejected
-//!   on both load and publish, so an unlicensed node cannot silently enforce
-//!   less than the authoritative document requires.
+//! - **Fail closed on composition.** A policy that grants delegation features
+//!   on a node with no composed delegation authority is rejected on both load
+//!   and publish, so an ungoverned grant can never outrun the verifier.
 //! - **Legacy wildcard grants must migrate before use.** A snapshot with
 //!   `GrantActions::All` cannot compile; every load path drives a bounded
 //!   migration that publishes a new version. Normal publication refuses to
@@ -164,8 +163,8 @@
 //! ## Rust concepts used here
 //!
 //! [`PolicyStore`] derives `Clone`, but cloning it copies no policy data: the
-//! entitlement set and the publication lease are `Arc`s, so a clone is two
-//! reference-count bumps over the same shared authority. Java's nearest analogy
+//! publication lease is an `Arc`, so a clone is a
+//! reference-count bump over the same shared authority. Java's nearest analogy
 //! is sharing one object reference; the difference is that `Arc` makes the
 //! sharing and its thread-safety explicit in the type.
 //!
@@ -205,11 +204,11 @@ use crate::namespace::branching::ActivationNonce;
 use crate::namespace::BranchId;
 use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, StorageVersion, ZeppelinStore};
 
-use super::{Entitlements, Feature, PolicyHead, PolicySnapshot, SecurityError};
 use super::{
     PendingBranchActivation, PolicyActivationGuardPermit, PolicyPublicationLease,
     PolicyPublicationLeaseClaim, PolicySnapshotMemo,
 };
+use super::{PolicyHead, PolicySnapshot, SecurityError};
 
 const POLICY_ROOT: &str = "_security";
 const POLICY_HEAD_KEY: &str = "_security/heads/policy.json";
@@ -300,7 +299,7 @@ impl LoadedPolicy {
 #[derive(Clone)]
 pub struct PolicyStore {
     store: ZeppelinStore,
-    entitlements: Arc<Entitlements>,
+    delegation_enabled: bool,
     publication_lease: Arc<PolicyPublicationLease>,
 }
 
@@ -331,12 +330,16 @@ pub(crate) enum PolicyPublication {
 
 impl PolicyStore {
     /// Bind policy authority to the exact reserved `_security/` keyspace.
+    ///
+    /// `delegation_enabled` records whether this node composed a delegation
+    /// authority; policies that grant delegation features are rejected when it
+    /// is false, so an ungoverned grant can never outrun the verifier.
     #[must_use]
-    pub fn new(store: ZeppelinStore, entitlements: Arc<Entitlements>) -> Self {
+    pub fn new(store: ZeppelinStore, delegation_enabled: bool) -> Self {
         let publication_lease = Arc::new(PolicyPublicationLease::new(store.clone()));
         Self {
             store,
-            entitlements,
+            delegation_enabled,
             publication_lease,
         }
     }
@@ -363,12 +366,7 @@ impl PolicyStore {
             Err(error) => return Err(error),
         };
         policy = self.ensure_phase_seven_migrated(policy, now).await?;
-        if bootstrap_config_drifted(
-            config,
-            policy.snapshot(),
-            now,
-            self.entitlements.has(Feature::Preservation),
-        )? {
+        if bootstrap_config_drifted(config, policy.snapshot(), now)? {
             tracing::warn!(
                 policy_version = policy.snapshot().version().get(),
                 configured_bootstrap_key_count = config.api_keys.len(),
@@ -912,7 +910,7 @@ impl PolicyStore {
         allow_legacy_head: bool,
     ) -> Result<PolicyPublication> {
         candidate.validate_for_use()?;
-        self.validate_entitlements(&candidate)?;
+        self.validate_composition(&candidate)?;
         let mut memo = None;
         let mut session = match self
             .acquire_claimed_publication_from(
@@ -1065,7 +1063,7 @@ impl PolicyStore {
         } else {
             snapshot.validate_for_use()?;
         }
-        self.validate_entitlements(&snapshot)?;
+        self.validate_composition(&snapshot)?;
         Ok(snapshot)
     }
 
@@ -1085,13 +1083,9 @@ impl PolicyStore {
                 Err(error) => Err(error),
             };
         }
-        let snapshot = PolicySnapshot::from_bootstrap(
-            config,
-            now,
-            self.entitlements.has(super::Feature::Preservation),
-        )?;
+        let snapshot = PolicySnapshot::from_bootstrap(config, now)?;
         snapshot.validate_for_use()?;
-        self.validate_entitlements(&snapshot)?;
+        self.validate_composition(&snapshot)?;
         let mut lease_claim = match self.acquire_bootstrap_publication().await? {
             BootstrapPublicationAuthority::Existing(existing) => return Ok(existing),
             BootstrapPublicationAuthority::Claimed(claim) => claim,
@@ -1179,23 +1173,9 @@ impl PolicyStore {
         }
     }
 
-    fn validate_entitlements(&self, snapshot: &PolicySnapshot) -> Result<()> {
-        if snapshot.has_constraints() && !self.entitlements.has(Feature::Constraints) {
-            return Err(SecurityError::FeatureRequired(Feature::Constraints).into());
-        }
-        if snapshot.has_delegation_features() && !self.entitlements.has(Feature::Delegation) {
-            return Err(SecurityError::FeatureRequired(Feature::Delegation).into());
-        }
-        if snapshot.has_preservation_features() && !self.entitlements.has(Feature::Preservation) {
-            return Err(SecurityError::FeatureRequired(Feature::Preservation).into());
-        }
-        if self
-            .entitlements
-            .limits()
-            .max_principals
-            .is_some_and(|limit| snapshot.principal_count() > limit as usize)
-        {
-            return Err(SecurityError::LicenseLimitExceeded("max_principals").into());
+    fn validate_composition(&self, snapshot: &PolicySnapshot) -> Result<()> {
+        if snapshot.has_delegation_features() && !self.delegation_enabled {
+            return Err(SecurityError::FeatureDisabled("delegation").into());
         }
         Ok(())
     }
@@ -1243,7 +1223,6 @@ fn bootstrap_config_drifted(
     config: &SecurityConfig,
     authoritative: &PolicySnapshot,
     now: DateTime<Utc>,
-    include_preservation: bool,
 ) -> Result<bool> {
     if config.api_keys.is_empty() {
         return Ok(!authoritative.keys().is_empty()
@@ -1257,7 +1236,7 @@ fn bootstrap_config_drifted(
         .map(super::PolicyKey::created_at)
         .min()
         .unwrap_or(now);
-    let configured = PolicySnapshot::from_bootstrap(config, comparison_time, include_preservation)?;
+    let configured = PolicySnapshot::from_bootstrap(config, comparison_time)?;
     Ok(normalized_bootstrap_semantics(&configured)?
         != normalized_bootstrap_semantics(authoritative)?)
 }

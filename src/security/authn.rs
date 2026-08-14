@@ -24,8 +24,8 @@
 //! with a server-derived instant, never a client-supplied one, then inserts the
 //! resolved principal into request extensions for the authorization layer.
 //! [`build_app`](crate::startup::build_app) chooses the concrete adapter:
-//! [`ApiKeyAdapter`] built from boot configuration when RBAC is unlicensed, or
-//! one bound to the live policy cache when it is licensed.
+//! [`ApiKeyAdapter`] built from boot configuration when `security.rbac` is
+//! off, or one bound to the live policy cache when it is on.
 //!
 //! ```text
 //! Authorization header (untrusted)

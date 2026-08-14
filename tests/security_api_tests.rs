@@ -4,11 +4,11 @@ use std::str::FromStr;
 
 use serde_json::json;
 use zeppelin::config::Config;
-use zeppelin::security::{Action, AuditParams, Feature, NamespaceId, RouteClass, ROUTE_ACTIONS};
+use zeppelin::security::{Action, AuditParams, NamespaceId, RouteClass, ROUTE_ACTIONS};
 
 use common::server::{
     start_test_server_with_config, start_test_server_with_config_no_limit_override,
-    start_test_server_with_entitlements, test_entitlements,
+    start_test_server_with_security, TestSecurity,
 };
 
 fn enforced_config() -> Config {
@@ -523,16 +523,11 @@ mode = "open_unsafe"
 "#,
     )
     .unwrap();
-    // Delegation and Preservation deliberately refuse open-unsafe composition
-    // (fail-closed), so this fixture narrows entitlements to keep the
-    // anonymous-access intent under test.
-    let entitlements = test_entitlements(
-        Feature::ALL
-            .into_iter()
-            .filter(|feature| !matches!(feature, Feature::Delegation | Feature::Preservation)),
-    );
+    // RBAC deliberately refuses open-unsafe composition (fail-closed), so
+    // this fixture uses the bootstrap profile to keep the anonymous-access
+    // intent under test.
     let (base_url, _harness, _cache, _cache_dir, _admin_bearer) =
-        start_test_server_with_entitlements(config, entitlements).await;
+        start_test_server_with_security(config, TestSecurity::bootstrap_with_durable_audit()).await;
 
     let response = reqwest::Client::new()
         .get(format!("{base_url}/metrics"))

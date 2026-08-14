@@ -466,8 +466,6 @@ pub enum AuditParams {
     },
     /// The process booted with explicit unsafe-open security mode.
     OpenUnsafeBoot,
-    /// The process booted with a verified but expired license.
-    LicenseExpiredBoot,
 }
 
 impl AuditParams {
@@ -750,25 +748,6 @@ impl AuditRecord {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             AuditOutcome::Success,
             AuditParams::OpenUnsafeBoot,
-            node_id,
-        )
-    }
-
-    /// Build the startup event for an expired verified license.
-    #[must_use]
-    pub fn license_expired_boot(ts: DateTime<Utc>, node_id: impl Into<String>) -> Self {
-        let principal = Principal::anonymous();
-        Self::new(
-            ts,
-            "startup",
-            None,
-            &principal,
-            Action::SystemRead,
-            ResourceRef::System,
-            PolicyVersion::BOOT,
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            AuditOutcome::Success,
-            AuditParams::LicenseExpiredBoot,
             node_id,
         )
     }

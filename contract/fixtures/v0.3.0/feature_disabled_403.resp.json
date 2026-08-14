@@ -1,0 +1,7 @@
+{
+  "code": "feature_disabled",
+  "error": "feature is disabled by server configuration: rbac",
+  "request_id": "contract-feature_disabled_403",
+  "retryable": false,
+  "status": 403
+}

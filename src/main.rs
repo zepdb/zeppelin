@@ -206,10 +206,7 @@ mod tests {
     async fn primary_server_error_still_drains_audit_and_joins_backgrounds() {
         let (_audit, audit_runtime) = AuditRuntime::tracing_only("main-error-test").unwrap();
 
-        let (shutdown_tx, mut observer_rx) = watch::channel(false);
-        let license_observer = tokio::spawn(async move {
-            let _ = observer_rx.changed().await;
-        });
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let joined = Arc::new(AtomicBool::new(false));
         let joined_by_thread = Arc::clone(&joined);
         let background = std::thread::spawn(move || {
@@ -218,7 +215,7 @@ mod tests {
         });
         let primary: Result<(), Box<dyn std::error::Error>> =
             Err(Box::new(std::io::Error::other("primary serve failure")));
-        let backgrounds = BackgroundTasks::from_parts(shutdown_tx, background, license_observer);
+        let backgrounds = BackgroundTasks::from_parts(shutdown_tx, background);
 
         let result = settle_server_and_backgrounds(
             primary,

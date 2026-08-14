@@ -15,8 +15,9 @@
 //!   [`Resource`](crate::security::Resource) is `route_resource` in `src/server/mod.rs`;
 //! - *the decision* — whether the authenticated principal actually holds the
 //!   action is [`SecurityKernel`](crate::security::SecurityKernel)'s job;
-//! - *licensing* — a route naming `Action::NamespaceFork` says nothing about
-//!   whether `Feature::Branching` is entitled; that check belongs in the kernel;
+//! - *feature availability* — a route naming an action says nothing about
+//!   whether the surface behind it is composed; that check belongs in the
+//!   kernel;
 //! - *rate limiting* — `rate_limit_class` in `src/server/mod.rs` classifies
 //!   independently.
 //!

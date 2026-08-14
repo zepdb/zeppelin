@@ -4,7 +4,7 @@
 //! resource, right now?* [`SecurityKernel`] answers it with a typed [`Decision`]
 //! **before** any namespace, WAL, index, or storage work begins. The kernel is
 //! fail-closed in every direction — an unknown credential, an unmapped grant, a
-//! stale policy cache, an unlicensed feature, and a missing approver all produce
+//! stale policy cache, a disabled feature, and a missing approver all produce
 //! a [`Decision::Deny`] or a typed [`SecurityError`], never a permissive default.
 //!
 //! It deliberately does **not** own:
@@ -67,7 +67,7 @@
 //!  Fork and delete take a second pass through this file, because an HTTP-time
 //!  decision is not sufficient authority to mutate the branch graph:
 //!
-//!  authorize_namespace_fork(admission)   -- entitlement + structural checks
+//!  authorize_namespace_fork(admission)   -- structural checks
 //!      |
 //!      v
 //!  AuthorizedForkNamespace -> graph reserves a target
@@ -87,8 +87,8 @@
 //!    branches on whether authority is boot configuration or the S3-backed
 //!    [`PolicyCache`]. Every method is written twice, once per arm.
 //! 2. [`SecurityKernel::from_config`], [`SecurityKernel::from_store`], and
-//!    [`SecurityKernel::from_resolved_entitlements`]: composition. The last one
-//!    holds the licensed-feature dependency rules.
+//!    [`SecurityKernel::compose`]: composition. The last one selects the
+//!    authority from `security.rbac` and rejects contradictory config.
 //! 3. [`SecurityKernel::authorize`] and [`SecurityKernel::authorize_action`]: the
 //!    hot admission path. `authorize_action` exists for routes whose namespace is
 //!    only known after the body is parsed (namespace create).
@@ -139,17 +139,11 @@
 //!   within its freshness bound, every policy-backed decision returns
 //!   [`DenyReason::SecurityStale`]. An old allow is never replayed.
 //! - **Bootstrap authority cannot administer policy.** Every administrative
-//!   method returns `InvalidPolicyRequest` on the `Bootstrap` arm; security
-//!   administration requires the S3 policy authority.
-//! - **Entitlements are checked here, not only at the route.** Branching is
-//!   verified inside [`SecurityKernel::authorize_namespace_fork`],
-//!   [`SecurityKernel::authorize_branch_list`], and again in both fresh
-//!   re-authorization paths, so a new call site cannot reach fork or branch-list
-//!   authority by skipping the handler's config flag. Preservation and delegation
-//!   APIs return `FeatureNotLicensed` when their feature is absent.
-//! - **Licensed features have ordering dependencies.** Composition rejects
-//!   delegation or preservation without RBAC and delegation or preservation in
-//!   `OpenUnsafe` mode.
+//!   method returns `FeatureDisabled("rbac")` on the `Bootstrap` arm; security
+//!   administration requires the S3 policy authority (`security.rbac = true`).
+//! - **Composition is config-driven and fail-closed.** `compose` rejects
+//!   `security.rbac` in `OpenUnsafe` mode. Preservation and delegation APIs
+//!   return `FeatureDisabled` when their service is not composed.
 //! - **Delegation cannot widen.** A delegated token may not be re-delegated, may
 //!   only descend from a human or service principal, and is authorized by
 //!   re-checking *both* the narrowing and the live parent grants for every
@@ -171,8 +165,9 @@
 //!   *reserves* the attempt. The governance adapter re-authorizes against the
 //!   freshly loaded policy head, and `revalidate` refuses to proceed until the
 //!   activation audit record has settled ([`SecurityError::AuditUnavailable`]).
-//! - **Signing capability is fail-closed.** `install_object_signer` errors when
-//!   S3 audit is licensed but no signer was composed.
+//! - **Signing capability follows composition.** `install_object_signer`
+//!   installs the delegation or audit signer when one was composed; durable
+//!   audit configuration guarantees a signer exists on every composed path.
 //!
 //! ## Concurrency
 //!
@@ -251,13 +246,12 @@ use super::{
     delegation::{DelegationAuthority, PublishedObjectSigner},
     policy_cache::PolicyCache,
     Action, AllowDecision, ApiKeyAdapter, AuditClient, AuditOutcome, AuditParams, AuditRecord,
-    Decision, DelegationNarrowing, DenyDecision, DenyReason, Entitlements, GrantActions,
-    GrantDefinition, GrantScope, IssuedApiKey, IssuedDelegatedToken, LoadedPolicy, NamespaceId,
-    Obligation, PolicyActivationGuardPermit, PolicyGrant, PolicyPrincipal, PolicySnapshot,
-    PolicySnapshotMemo, PolicyStore, PreservationLockId, PreservationLockRecord,
-    PreservationService, Principal, PrincipalId, PrincipalKind, RequestContext, Resource,
-    ResourceRef, SecurityError, SecurityOperationError, SecurityOperationResult,
-    MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS,
+    Decision, DelegationNarrowing, DenyDecision, DenyReason, GrantActions, GrantDefinition,
+    GrantScope, IssuedApiKey, IssuedDelegatedToken, LoadedPolicy, NamespaceId, Obligation,
+    PolicyActivationGuardPermit, PolicyGrant, PolicyPrincipal, PolicySnapshot, PolicySnapshotMemo,
+    PolicyStore, PreservationLockId, PreservationLockRecord, PreservationService, Principal,
+    PrincipalId, PrincipalKind, RequestContext, Resource, ResourceRef, SecurityError,
+    SecurityOperationError, SecurityOperationResult, MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS,
 };
 
 const BRANCH_ACTIVATION_GUARD_TTL_SECS: i64 = MAX_PENDING_BRANCH_ACTIVATION_LIFETIME_SECS / 2;
@@ -286,7 +280,6 @@ pub struct SecurityKernel {
     mode: SecurityMode,
     authority: SecurityAuthority,
     cursor_binding_key: super::CursorBindingKey,
-    entitlements: Arc<Entitlements>,
     delegation: Option<Arc<DelegationAuthority>>,
     audit_signer: Option<Arc<PublishedObjectSigner>>,
     preservation: Option<Arc<PreservationService>>,
@@ -369,13 +362,6 @@ struct NamespaceBranchActivationRecovery {
 impl SecurityKernel {
     /// Compile validated boot configuration into typed, immutable grants.
     pub fn from_config(config: &SecurityConfig) -> Result<Self, SecurityError> {
-        Self::from_config_with_entitlements(config, Arc::new(Entitlements::community()))
-    }
-
-    fn from_config_with_entitlements(
-        config: &SecurityConfig,
-        entitlements: Arc<Entitlements>,
-    ) -> Result<Self, SecurityError> {
         let cursor_binding_key = if config.mode == SecurityMode::OpenUnsafe {
             super::CursorBindingKey::default()
         } else {
@@ -392,9 +378,6 @@ impl SecurityKernel {
             let mut actions = HashSet::new();
             if key.actions.iter().any(|action| action == "*") {
                 actions.extend(Action::BOOTSTRAP_ADMIN_V1);
-                if entitlements.has(super::Feature::Preservation) {
-                    actions.extend([Action::PreservationAdmin, Action::PreservationRelease]);
-                }
             } else {
                 for action in &key.actions {
                     actions.insert(Action::from_str(action)?);
@@ -428,49 +411,29 @@ impl SecurityKernel {
             mode: config.mode,
             authority: SecurityAuthority::Bootstrap(grants),
             cursor_binding_key,
-            entitlements,
             delegation: None,
             audit_signer: None,
             preservation: None,
         })
     }
 
-    /// Compose the configured authority selected by verified entitlements.
+    /// Compose the authority selected by boot configuration.
     ///
-    /// Community mode keeps boot-config authentication and namespace grants
-    /// without constructing the licensed S3 policy registry. Licensed RBAC
-    /// selects the S3-authoritative policy store and refresh path.
-    pub async fn from_resolved_entitlements(
+    /// The default keeps boot-config authentication and namespace grants
+    /// without constructing the S3 policy registry. `security.rbac` selects
+    /// the S3-authoritative policy store and refresh path.
+    pub async fn compose(
         store: ZeppelinStore,
         config: &SecurityConfig,
         clock: Clock,
-        entitlements: Arc<Entitlements>,
     ) -> ZeppelinResult<(Arc<Self>, Arc<ApiKeyAdapter>)> {
-        if entitlements.has(super::Feature::Delegation) && !entitlements.has(super::Feature::Rbac) {
+        if config.rbac && config.mode == SecurityMode::OpenUnsafe {
             return Err(crate::error::ZeppelinError::Config(
-                "delegation entitlement requires the rbac entitlement".to_string(),
-            ));
-        }
-        if entitlements.has(super::Feature::Preservation) && !entitlements.has(super::Feature::Rbac)
-        {
-            return Err(crate::error::ZeppelinError::Config(
-                "preservation entitlement requires the rbac entitlement".to_string(),
-            ));
-        }
-        if config.mode == SecurityMode::OpenUnsafe && entitlements.has(super::Feature::Delegation) {
-            return Err(crate::error::ZeppelinError::Config(
-                "delegation requires security.mode = enforced so every token has authoritative parent grants"
+                "security.rbac = true requires security.mode = \"enforced\" so policy authority is never anonymous"
                     .to_string(),
             ));
         }
-        if config.mode == SecurityMode::OpenUnsafe && entitlements.has(super::Feature::Preservation)
-        {
-            return Err(crate::error::ZeppelinError::Config(
-                "preservation requires security.mode = enforced so destruction is centrally authorized"
-                    .to_string(),
-            ));
-        }
-        let (kernel, adapter) = if !entitlements.has(super::Feature::Rbac) {
+        let (kernel, adapter) = if !config.rbac {
             let now = clock.now();
             if config.mode == SecurityMode::Enforced
                 && !config
@@ -480,7 +443,7 @@ impl SecurityKernel {
             {
                 return Err(SecurityError::MissingBootstrapCredentials.into());
             }
-            let audit_signer = if entitlements.has(super::Feature::AuditS3) {
+            let audit_signer = if config.audit_s3 {
                 Some(
                     PublishedObjectSigner::compose(
                         store.signer_detached_clone(),
@@ -491,14 +454,14 @@ impl SecurityKernel {
             } else {
                 None
             };
-            let mut kernel = Self::from_config_with_entitlements(config, entitlements)?;
+            let mut kernel = Self::from_config(config)?;
             kernel.audit_signer = audit_signer;
             (
                 Arc::new(kernel),
                 Arc::new(ApiKeyAdapter::from_config(config)?),
             )
         } else {
-            Self::from_store(store.clone(), config, clock, entitlements).await?
+            Self::from_store(store.clone(), config, clock).await?
         };
 
         // Composition historically leaves the caller's application store ready
@@ -511,39 +474,22 @@ impl SecurityKernel {
     }
 
     /// Build authentication and authorization over one shared policy cache.
+    ///
+    /// Delegated credentials compose exactly when a token signing key is
+    /// configured; an empty `security.token_signing_key_path` means the
+    /// delegation surface is off, not misconfigured.
     pub(crate) async fn from_store(
         store: ZeppelinStore,
         config: &SecurityConfig,
         clock: Clock,
-        entitlements: Arc<Entitlements>,
     ) -> ZeppelinResult<(Arc<Self>, Arc<ApiKeyAdapter>)> {
         // Authority-side caches retain their store view for background refresh.
         // Keep that view detached from the application signing capability; the
         // application's weak signer slot independently prevents disposable
         // store clones from retaining those caches.
         let authority_store = store.signer_detached_clone();
-        if config.mode == SecurityMode::OpenUnsafe {
-            let audit_signer = if entitlements.has(super::Feature::AuditS3) {
-                Some(
-                    PublishedObjectSigner::compose(
-                        authority_store,
-                        PathBuf::from(&config.token_signing_key_path),
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            };
-            let mut kernel =
-                Self::from_config_with_entitlements(config, Arc::clone(&entitlements))?;
-            kernel.audit_signer = audit_signer;
-            return Ok((
-                Arc::new(kernel),
-                Arc::new(ApiKeyAdapter::from_config(config)?),
-            ));
-        }
-
-        let policy_store = PolicyStore::new(authority_store.clone(), Arc::clone(&entitlements));
+        let delegation_enabled = !config.token_signing_key_path.is_empty();
+        let policy_store = PolicyStore::new(authority_store.clone(), delegation_enabled);
         let cursor_binding_key =
             super::CursorBindingKey::from_config_hex(config.cursor_hmac_key_hex())?;
         let loaded = policy_store.load_or_bootstrap(config, clock.now()).await?;
@@ -553,7 +499,7 @@ impl SecurityKernel {
             Duration::from_secs(config.policy_refresh_secs),
             clock.clone(),
         )?;
-        let delegation = if entitlements.has(super::Feature::Delegation) {
+        let delegation = if delegation_enabled {
             Some(
                 DelegationAuthority::compose(
                     authority_store.clone(),
@@ -568,7 +514,7 @@ impl SecurityKernel {
         } else {
             None
         };
-        let audit_signer = if delegation.is_none() && entitlements.has(super::Feature::AuditS3) {
+        let audit_signer = if delegation.is_none() && config.audit_s3 {
             Some(
                 PublishedObjectSigner::compose(
                     authority_store.clone(),
@@ -579,18 +525,14 @@ impl SecurityKernel {
         } else {
             None
         };
-        let preservation = if entitlements.has(super::Feature::Preservation) {
-            Some(
-                PreservationService::start(
-                    authority_store,
-                    clock,
-                    Duration::from_secs(config.policy_refresh_secs),
-                )
-                .await?,
+        let preservation = Some(
+            PreservationService::start(
+                authority_store,
+                clock,
+                Duration::from_secs(config.policy_refresh_secs),
             )
-        } else {
-            None
-        };
+            .await?,
+        );
         let adapter = match &delegation {
             Some(authority) => Arc::new(ApiKeyAdapter::from_policy_cache_with_delegation(
                 Arc::clone(&cache),
@@ -603,19 +545,12 @@ impl SecurityKernel {
                 mode: config.mode,
                 authority: SecurityAuthority::Policy(cache),
                 cursor_binding_key,
-                entitlements,
                 delegation,
                 audit_signer,
                 preservation,
             }),
             adapter,
         ))
-    }
-
-    /// Borrow the boot-resolved feature authority used by composition roots.
-    #[must_use]
-    pub fn entitlements(&self) -> &Entitlements {
-        &self.entitlements
     }
 
     /// Install this kernel's published node signer on another wrapper of the same backend.
@@ -627,9 +562,6 @@ impl SecurityKernel {
         if let Some(audit_signer) = &self.audit_signer {
             let signer: Arc<dyn ObjectSigner> = audit_signer.clone();
             return store.install_object_signer(signer);
-        }
-        if self.entitlements.has(super::Feature::AuditS3) {
-            return Err(super::SecurityError::FeatureRequired(super::Feature::Delegation).into());
         }
         Ok(())
     }
@@ -749,9 +681,6 @@ impl SecurityKernel {
         self: &Arc<Self>,
         admission: NamespaceForkAdmission,
     ) -> ZeppelinResult<AuthorizedForkNamespace> {
-        if !self.entitlements.has(super::Feature::Branching) {
-            return Err(SecurityError::FeatureNotLicensed(super::Feature::Branching).into());
-        }
         validate_namespace_fork_admission(&admission)?;
         let source = admission.source.clone();
         let target = admission.target.clone();
@@ -787,20 +716,12 @@ impl SecurityKernel {
     }
 
     /// Mint a source-authorized branch-list request with per-target disclosure.
-    ///
-    /// Branch listing is part of the same licensed surface as forking, so the
-    /// entitlement is checked here rather than only at the route. A kernel-side
-    /// check cannot be bypassed by a future caller that reaches this seam
-    /// without repeating the handler's configuration guard.
     pub(crate) fn authorize_branch_list(
         self: &Arc<Self>,
         source: NamespaceId,
         principal: Principal,
         context: RequestContext,
     ) -> ZeppelinResult<AuthorizedBranchList> {
-        if !self.entitlements.has(super::Feature::Branching) {
-            return Err(SecurityError::FeatureNotLicensed(super::Feature::Branching).into());
-        }
         Ok(AuthorizedBranchList::new(
             source,
             self.namespace_disclosure_callback(Some((principal, context))),
@@ -877,9 +798,7 @@ impl SecurityKernel {
         self.preservation
             .as_ref()
             .ok_or_else(|| {
-                crate::error::ZeppelinError::from(SecurityError::FeatureNotLicensed(
-                    super::Feature::Preservation,
-                ))
+                crate::error::ZeppelinError::from(SecurityError::FeatureDisabled("preservation"))
             })?
             .create_lock(actor, request)
             .await
@@ -894,9 +813,7 @@ impl SecurityKernel {
         self.preservation
             .as_ref()
             .ok_or_else(|| {
-                crate::error::ZeppelinError::from(SecurityError::FeatureNotLicensed(
-                    super::Feature::Preservation,
-                ))
+                crate::error::ZeppelinError::from(SecurityError::FeatureDisabled("preservation"))
             })?
             .release_lock(lock_id, actor)
             .await
@@ -908,9 +825,7 @@ impl SecurityKernel {
     ) -> std::result::Result<Vec<PreservationLockRecord>, SecurityError> {
         self.preservation
             .as_ref()
-            .ok_or(SecurityError::FeatureNotLicensed(
-                super::Feature::Preservation,
-            ))?
+            .ok_or(SecurityError::FeatureDisabled("preservation"))?
             .list_active()
     }
 
@@ -1197,10 +1112,10 @@ impl SecurityKernel {
             return Err(SecurityError::DelegationPrincipalKindForbidden.into());
         }
         let Some(authority) = &self.delegation else {
-            return Err(SecurityError::FeatureNotLicensed(super::Feature::Delegation).into());
+            return Err(SecurityError::FeatureDisabled("delegation").into());
         };
         let SecurityAuthority::Policy(cache) = &self.authority else {
-            return Err(SecurityError::FeatureRequired(super::Feature::Rbac).into());
+            return Err(SecurityError::FeatureDisabled("rbac").into());
         };
         let cached = cache.current();
         let policy_version = cached.policy.version();
@@ -1329,10 +1244,7 @@ impl SecurityKernel {
                     .create_principal(actor, principal_id, kind, display_name)
                     .await
             }
-            SecurityAuthority::Bootstrap(_) => Err(SecurityError::InvalidPolicyRequest(
-                "security administration requires S3 policy authority".to_string(),
-            )
-            .into()),
+            SecurityAuthority::Bootstrap(_) => Err(SecurityError::FeatureDisabled("rbac").into()),
         }
     }
 
@@ -1350,10 +1262,7 @@ impl SecurityKernel {
                     .create_key(actor, principal_id, name, expires_at)
                     .await
             }
-            SecurityAuthority::Bootstrap(_) => Err(SecurityError::InvalidPolicyRequest(
-                "security administration requires S3 policy authority".to_string(),
-            )
-            .into()),
+            SecurityAuthority::Bootstrap(_) => Err(SecurityError::FeatureDisabled("rbac").into()),
         }
     }
 
@@ -1365,10 +1274,7 @@ impl SecurityKernel {
     ) -> SecurityOperationResult<(AllowDecision, super::PolicyVersion)> {
         match &self.authority {
             SecurityAuthority::Policy(cache) => cache.revoke_key(actor, key_id).await,
-            SecurityAuthority::Bootstrap(_) => Err(SecurityError::InvalidPolicyRequest(
-                "security administration requires S3 policy authority".to_string(),
-            )
-            .into()),
+            SecurityAuthority::Bootstrap(_) => Err(SecurityError::FeatureDisabled("rbac").into()),
         }
     }
 
@@ -1381,10 +1287,7 @@ impl SecurityKernel {
     ) -> SecurityOperationResult<IssuedApiKey> {
         match &self.authority {
             SecurityAuthority::Policy(cache) => cache.rotate_key(actor, key_id, overlap_secs).await,
-            SecurityAuthority::Bootstrap(_) => Err(SecurityError::InvalidPolicyRequest(
-                "security administration requires S3 policy authority".to_string(),
-            )
-            .into()),
+            SecurityAuthority::Bootstrap(_) => Err(SecurityError::FeatureDisabled("rbac").into()),
         }
     }
 
@@ -1396,10 +1299,7 @@ impl SecurityKernel {
     ) -> SecurityOperationResult<(AllowDecision, super::PolicyVersion, PolicyGrant)> {
         match &self.authority {
             SecurityAuthority::Policy(cache) => cache.add_grant(actor, definition).await,
-            SecurityAuthority::Bootstrap(_) => Err(SecurityError::InvalidPolicyRequest(
-                "security administration requires S3 policy authority".to_string(),
-            )
-            .into()),
+            SecurityAuthority::Bootstrap(_) => Err(SecurityError::FeatureDisabled("rbac").into()),
         }
     }
 
@@ -1417,10 +1317,7 @@ impl SecurityKernel {
                     .remove_grant(actor, principal_id, scope, actions)
                     .await
             }
-            SecurityAuthority::Bootstrap(_) => Err(SecurityError::InvalidPolicyRequest(
-                "security administration requires S3 policy authority".to_string(),
-            )
-            .into()),
+            SecurityAuthority::Bootstrap(_) => Err(SecurityError::FeatureDisabled("rbac").into()),
         }
     }
 
@@ -1432,10 +1329,7 @@ impl SecurityKernel {
     ) -> SecurityOperationResult<(AllowDecision, Arc<PolicySnapshot>)> {
         match &self.authority {
             SecurityAuthority::Policy(cache) => cache.authorized_snapshot(actor, now),
-            SecurityAuthority::Bootstrap(_) => Err(SecurityError::InvalidPolicyRequest(
-                "security administration requires S3 policy authority".to_string(),
-            )
-            .into()),
+            SecurityAuthority::Bootstrap(_) => Err(SecurityError::FeatureDisabled("rbac").into()),
         }
     }
 
@@ -1447,10 +1341,7 @@ impl SecurityKernel {
     ) -> SecurityOperationResult<(AllowDecision, super::PolicyHead, Arc<PolicySnapshot>)> {
         match &self.authority {
             SecurityAuthority::Policy(cache) => cache.authorized_policy_view(actor, now),
-            SecurityAuthority::Bootstrap(_) => Err(SecurityError::InvalidPolicyRequest(
-                "security administration requires S3 policy authority".to_string(),
-            )
-            .into()),
+            SecurityAuthority::Bootstrap(_) => Err(SecurityError::FeatureDisabled("rbac").into()),
         }
     }
 
@@ -1577,9 +1468,6 @@ impl SecurityKernel {
         &self,
         admission: &NamespaceForkAdmission,
     ) -> ZeppelinResult<FreshForkAuthorization> {
-        if !self.entitlements.has(super::Feature::Branching) {
-            return Err(SecurityError::FeatureNotLicensed(super::Feature::Branching).into());
-        }
         let authorized_at = admission.clock.now();
         let context = RequestContext::at(admission.context.request_id.clone(), authorized_at);
         let fork = require_allow(self.authorize(
@@ -1625,9 +1513,6 @@ impl SecurityKernel {
                 DenyReason::ActionNotGranted,
                 version,
             )));
-        }
-        if !self.entitlements.has(super::Feature::Branching) {
-            return Err(SecurityError::FeatureNotLicensed(super::Feature::Branching).into());
         }
         let authorized_at = admission.clock.now();
         let compiled = loaded.snapshot().compile()?;

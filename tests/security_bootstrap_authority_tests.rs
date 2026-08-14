@@ -8,12 +8,11 @@ use object_store::path::Path;
 use object_store::prefix::PrefixStore;
 use zeppelin::config::Config;
 use zeppelin::error::ZeppelinError;
-use zeppelin::security::{Feature, PolicyStore, SecurityError};
+use zeppelin::security::{PolicyStore, SecurityError};
 use zeppelin::storage::ZeppelinStore;
 
 use common::fault_injection::observe_create_matching;
 use common::harness::TestHarness;
-use common::server::test_entitlements;
 
 const BOOTSTRAP_CONFIG: &str = r#"
 [security]
@@ -31,7 +30,7 @@ namespaces = ["*"]
 const DRIFTED_DIGEST: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
 fn policy_store(store: ZeppelinStore) -> PolicyStore {
-    PolicyStore::new(store, Arc::new(test_entitlements(Feature::ALL)))
+    PolicyStore::new(store, true)
 }
 
 #[derive(Clone)]

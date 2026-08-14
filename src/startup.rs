@@ -125,10 +125,7 @@ use crate::error::{Result as ZeppelinResult, ZeppelinError};
 use crate::fts::wal_cache::WalFtsCache;
 use crate::namespace::{BranchReadinessObserver, NamespaceManager};
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
-use crate::security::{
-    AuditRecord, AuditRuntime, EntitlementResolver, Entitlements, Feature, FileLicenseResolver,
-    SecurityKernel,
-};
+use crate::security::{AuditRecord, AuditRuntime, SecurityKernel};
 use crate::server::{build_router, AppState, ServerTaskSupervisor};
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
@@ -136,66 +133,11 @@ use crate::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
 /// Maximum duration for each endpoint, LIST, or namespace-scan startup probe.
 const STORAGE_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
-const LICENSE_OBSERVATION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-
-async fn resolve_entitlements(
-    resolver: Arc<dyn EntitlementResolver>,
-) -> Result<Arc<Entitlements>, ZeppelinError> {
-    tokio::task::spawn_blocking(move || resolver.resolve())
-        .await
-        .map_err(|error| {
-            ZeppelinError::Config(format!("license resolver task failed during boot: {error}"))
-        })?
-        .map(Arc::new)
-        .map_err(ZeppelinError::from)
-}
-
-#[allow(clippy::manual_unwrap_or, clippy::manual_unwrap_or_default)]
-fn observe_license_expiry(entitlements: &Entitlements, now: chrono::DateTime<chrono::Utc>) {
-    // `None` is the intentional no-expiry state (community or a test
-    // composition), not a recovery path for an invalid licensed value.
-    let expiry_seconds = match entitlements.expiry_seconds(now) {
-        Some(seconds) => seconds,
-        None => 0,
-    };
-    crate::metrics::LICENSE_EXPIRY_SECONDS.set(expiry_seconds);
-    if expiry_seconds < 0 {
-        tracing::warn!(
-            expiry_seconds,
-            management_frozen = entitlements.management_frozen(now),
-            "verified Zeppelin license is expired; enforcement remains active"
-        );
-    }
-}
-
-fn spawn_license_observer(
-    entitlements: Arc<Entitlements>,
-    clock: Clock,
-    mut shutdown: watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                changed = shutdown.changed() => {
-                    match changed {
-                        Ok(()) if *shutdown.borrow() => return,
-                        Ok(()) => continue,
-                        Err(_) => return,
-                    }
-                }
-                _ = tokio::time::sleep(LICENSE_OBSERVATION_INTERVAL) => {
-                    observe_license_expiry(&entitlements, clock.now());
-                }
-            }
-        }
-    })
-}
 
 /// Unique lifecycle ownership for maintenance and request-spawned authoritative work.
 pub struct BackgroundTasks {
     shutdown_tx: watch::Sender<bool>,
     compaction_handle: std::thread::JoinHandle<()>,
-    license_observer: tokio::task::JoinHandle<()>,
     compaction_lifecycle: CompactionLifecycle,
     server_tasks: Arc<ServerTaskSupervisor>,
     security: Option<Arc<SecurityKernel>>,
@@ -207,12 +149,10 @@ impl BackgroundTasks {
     pub fn from_parts(
         shutdown_tx: watch::Sender<bool>,
         compaction_handle: std::thread::JoinHandle<()>,
-        license_observer: tokio::task::JoinHandle<()>,
     ) -> Self {
         Self {
             shutdown_tx,
             compaction_handle,
-            license_observer,
             compaction_lifecycle: CompactionLifecycle::new(),
             server_tasks: Arc::new(ServerTaskSupervisor::new()),
             security: None,
@@ -384,22 +324,6 @@ pub fn init_logging(config: &Config) {
 /// background-task and audit-runtime owners to `main`; Rust prevents draining
 /// or joining either owner twice.
 pub async fn build_app(config: Config) -> ZeppelinResult<(Router, BackgroundTasks, AuditRuntime)> {
-    let resolver = Arc::new(FileLicenseResolver::new(
-        config.security.license_path.clone(),
-    ));
-    build_app_with_entitlement_resolver(config, resolver).await
-}
-
-/// Build the production process graph with an explicitly selected resolver.
-///
-/// This private seam supports crate-owned unit tests and future managed-service
-/// composition without exposing resolver injection to downstream callers. The
-/// self-hosted server entrypoint always calls [`build_app`], which selects
-/// [`FileLicenseResolver`] and the embedded production verification key.
-async fn build_app_with_entitlement_resolver(
-    config: Config,
-    resolver: Arc<dyn EntitlementResolver>,
-) -> ZeppelinResult<(Router, BackgroundTasks, AuditRuntime)> {
     if let Err(error) = config.validate() {
         tracing::error!(error = %error, "invalid configuration; refusing to boot");
         return Err(error);
@@ -448,9 +372,7 @@ async fn build_app_with_entitlement_resolver(
     }
 
     let clock = Clock::system();
-    let entitlements = resolve_entitlements(resolver).await?;
-    observe_license_expiry(&entitlements, clock.now());
-    let durable_audit_enabled = config.security.audit_s3 && entitlements.has(Feature::AuditS3);
+    let durable_audit_enabled = config.security.audit_s3;
     if durable_audit_enabled && config.storage.backend != StorageBackend::S3 {
         return Err(ZeppelinError::Config(
             "durable audit requires an S3-compatible backend with ETag conditional PUT support"
@@ -507,13 +429,8 @@ async fn build_app_with_entitlement_resolver(
         }
     }
 
-    let (security, credential_adapter) = SecurityKernel::from_resolved_entitlements(
-        store.clone(),
-        &config.security,
-        clock.clone(),
-        Arc::clone(&entitlements),
-    )
-    .await?;
+    let (security, credential_adapter) =
+        SecurityKernel::compose(store.clone(), &config.security, clock.clone()).await?;
     if durable_audit_enabled {
         security.install_object_signer(&store)?;
     }
@@ -532,15 +449,6 @@ async fn build_app_with_entitlement_resolver(
     if config.security.mode == SecurityMode::OpenUnsafe {
         let record = AuditRecord::open_unsafe_boot(audit_now, audit.node_id());
         audit.submit_buffered(record)?;
-    }
-    if entitlements
-        .expiry_seconds(audit_now)
-        .is_some_and(|seconds| seconds < 0)
-    {
-        audit.submit_buffered(AuditRecord::license_expired_boot(
-            audit_now,
-            audit.node_id(),
-        ))?;
     }
 
     // Initialize namespace manager and scan existing namespaces
@@ -737,11 +645,6 @@ async fn build_app_with_entitlement_resolver(
     let trusted_proxies = Arc::from(crate::server::parse_trusted_proxies(
         &config.server.trusted_proxies,
     )?);
-    let license_observer = spawn_license_observer(
-        Arc::clone(&entitlements),
-        clock.clone(),
-        shutdown_tx.subscribe(),
-    );
     let credential_adapter: Arc<dyn crate::security::CredentialAdapter> = credential_adapter;
     let background_security = Arc::clone(&security);
     let server_tasks = Arc::new(ServerTaskSupervisor::new());
@@ -780,8 +683,11 @@ async fn build_app_with_entitlement_resolver(
 
     Ok((
         app,
-        BackgroundTasks::from_parts(shutdown_tx, compaction_handle, license_observer)
-            .with_server_lifecycle(background_security, server_tasks, compaction_lifecycle),
+        BackgroundTasks::from_parts(shutdown_tx, compaction_handle).with_server_lifecycle(
+            background_security,
+            server_tasks,
+            compaction_lifecycle,
+        ),
         audit_runtime,
     ))
 }
@@ -834,14 +740,14 @@ async fn probe_storage(store: &ZeppelinStore) -> ZeppelinResult<()> {
 ///
 /// # Parameters
 ///
-/// - `backgrounds`: Unique compaction and license-observer lifecycle owner.
+/// - `backgrounds`: Unique compaction lifecycle owner.
 /// - `timeout_duration`: One shared graceful-drain budget for request mutation
-///   work and the compaction/license background joins.
+///   work and the compaction background join.
 ///
 /// # Returns
 ///
 /// `Ok(())` only when request-originated authoritative mutations and the
-/// compaction/license observers complete their cooperative drain inside the
+/// compaction thread complete their cooperative drain inside the
 /// configured graceful budget, followed by completed heartbeat and
 /// authority-refresh cancellation barriers. The latter are non-detaching safety
 /// cleanup and may outlast the cooperative budget.
@@ -856,12 +762,12 @@ async fn probe_storage(store: &ZeppelinStore) -> ZeppelinResult<()> {
 /// # Side Effects
 ///
 /// Publishes `true` on the shared watch channel, then drains accepted
-/// request-originated authoritative mutations and joins compaction/license work
+/// request-originated authoritative mutations and joins compaction work
 /// against one absolute deadline. It subsequently closes leased-compaction
 /// admission and joins the heartbeat and authority-refresh cancellation
 /// barriers. Those barriers prove that request-owned mutation, lease-renewal,
 /// publication, and authority-refresh capability cannot survive into a
-/// replacement. If the compaction OS thread or license observer misses the
+/// replacement. If the compaction OS thread misses the
 /// graceful deadline, this function returns a loud error; process exit, rather
 /// than a replacement in the same process, contains that remaining background
 /// work. Hydration remains independently queue-owned.
@@ -885,7 +791,6 @@ pub async fn shutdown_background_tasks(
     let BackgroundTasks {
         shutdown_tx,
         compaction_handle,
-        license_observer,
         compaction_lifecycle,
         server_tasks,
         security,
@@ -902,20 +807,13 @@ pub async fn shutdown_background_tasks(
         .map_err(ZeppelinError::from);
     let join_task = tokio::task::spawn_blocking(move || compaction_handle.join());
 
-    let background_result = match tokio::time::timeout_at(deadline, async {
-        tokio::join!(join_task, license_observer)
-    })
-    .await
-    {
-        Ok((Ok(Ok(())), Ok(()))) => Ok(()),
-        Ok((Ok(Err(_panic)), observer)) => Err(ZeppelinError::Config(format!(
-            "background compaction thread panicked during shutdown; license observer: {observer:?}"
-        ))),
-        Ok((Err(error), observer)) => Err(ZeppelinError::Config(format!(
-            "failed to join background compaction thread: {error}; license observer: {observer:?}"
-        ))),
-        Ok((Ok(Ok(())), Err(error))) => Err(ZeppelinError::Config(format!(
-            "license observer task failed during shutdown: {error}"
+    let background_result = match tokio::time::timeout_at(deadline, join_task).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(_panic))) => Err(ZeppelinError::Config(
+            "background compaction thread panicked during shutdown".to_string(),
+        )),
+        Ok(Err(error)) => Err(ZeppelinError::Config(format!(
+            "failed to join background compaction thread: {error}"
         ))),
         Err(_elapsed) => Err(ZeppelinError::Config(format!(
             "timed out after {}s waiting for background task shutdown",
@@ -952,65 +850,13 @@ mod tests {
 
     use super::*;
     use crate::config::ApiKeyConfig;
-    use crate::security::{canonical_payload_bytes, LicenseLimits, LicensePayload, SignedLicense};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
-    use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
     use std::net::SocketAddr;
-    use std::sync::{Arc, Mutex};
-    use tracing::field::{Field, Visit};
-    use tracing::{Event, Level, Subscriber};
-    use tracing_subscriber::layer::{Context, SubscriberExt};
-    use tracing_subscriber::Layer;
+    use std::sync::Mutex;
 
     static PROCESS_CONFIG_LOCK: Mutex<()> = Mutex::new(());
-    static LICENSE_STARTUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    const TEST_LICENSE_SEED: [u8; 32] = [7_u8; 32];
-
-    #[derive(Clone, Default)]
-    struct CapturedLicenseWarnings(Arc<Mutex<Vec<Option<bool>>>>);
-
-    #[derive(Default)]
-    struct LicenseWarningVisitor {
-        is_license_warning: bool,
-        management_frozen: Option<bool>,
-    }
-
-    impl Visit for LicenseWarningVisitor {
-        fn record_bool(&mut self, field: &Field, value: bool) {
-            if field.name() == "management_frozen" {
-                self.management_frozen = Some(value);
-            }
-        }
-
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message"
-                && format!("{value:?}").contains("verified Zeppelin license is expired")
-            {
-                self.is_license_warning = true;
-            }
-        }
-    }
-
-    impl<S> Layer<S> for CapturedLicenseWarnings
-    where
-        S: Subscriber,
-    {
-        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
-            if *event.metadata().level() != Level::WARN {
-                return;
-            }
-            let mut visitor = LicenseWarningVisitor::default();
-            event.record(&mut visitor);
-            if visitor.is_license_warning {
-                self.0
-                    .lock()
-                    .unwrap_or_else(|_| panic!("license warning capture lock poisoned"))
-                    .push(visitor.management_frozen);
-            }
-        }
-    }
+    static RBAC_STARTUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Builds a local-backend fixture whose compactor stays idle during a test.
     ///
@@ -1034,35 +880,14 @@ mod tests {
         config
     }
 
-    fn signed_license(
-        features: Vec<Feature>,
-        issued_at: chrono::DateTime<Utc>,
-        expires_at: chrono::DateTime<Utc>,
-    ) -> SignedLicense {
-        let payload = LicensePayload {
-            customer_id: "customer:test".to_string(),
-            customer_name: "Test Customer".to_string(),
-            issued_at,
-            expires_at,
-            features,
-            limits: LicenseLimits::default(),
-        };
-        let signing_key = SigningKey::from_bytes(&TEST_LICENSE_SEED);
-        let signature = signing_key.sign(&canonical_payload_bytes(&payload).unwrap());
-        SignedLicense::new(payload, URL_SAFE_NO_PAD.encode(signature.to_bytes()))
-    }
-
-    fn licensed_startup_config(
-        root: &tempfile::TempDir,
-        license_path: &std::path::Path,
-    ) -> (Config, String) {
+    fn rbac_startup_config(root: &tempfile::TempDir) -> (Config, String) {
         let mut config = Config::default();
         let secret = URL_SAFE_NO_PAD.encode([1_u8; 32]);
         let digest = Sha256::digest(secret.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        let key_id = "zpk1_license_startup";
+        let key_id = "zpk1_rbac_startup";
         let token_signing_key_path = root.path().join("token-signing.key");
         std::fs::write(&token_signing_key_path, "11".repeat(32)).unwrap();
         #[cfg(unix)]
@@ -1079,18 +904,17 @@ mod tests {
             token_signing_key_path.to_string_lossy().into_owned();
         config.security.api_keys.push(ApiKeyConfig {
             key_id: key_id.to_string(),
-            name: "license-startup-admin".to_string(),
+            name: "rbac-startup-admin".to_string(),
             sha256_hex: digest,
             actions: vec!["*".to_string()],
             namespaces: vec!["*".to_string()],
             expires_at: None,
         });
-        config.security.license_path = license_path.to_string_lossy().into_owned();
+        config.security.rbac = true;
         if std::env::var("TEST_BACKEND").as_deref() == Ok("minio") {
             config.storage.backend = StorageBackend::S3;
-            config.storage.bucket = std::env::var("ZEPPELIN_LICENSE_TEST_BUCKET").expect(
-                "MinIO signed-startup tests require an isolated ZEPPELIN_LICENSE_TEST_BUCKET",
-            );
+            config.storage.bucket = std::env::var("ZEPPELIN_RBAC_TEST_BUCKET")
+                .expect("MinIO rbac-startup tests require an isolated ZEPPELIN_RBAC_TEST_BUCKET");
             config.storage.s3_region = Some("us-east-1".to_string());
             config.storage.s3_endpoint = Some(
                 std::env::var("MINIO_ENDPOINT")
@@ -1112,7 +936,7 @@ mod tests {
         (config, format!("{key_id}.{secret}"))
     }
 
-    async fn clear_license_startup_store(config: &Config) {
+    async fn clear_rbac_startup_store(config: &Config) {
         let store = ZeppelinStore::from_config(&config.storage).unwrap();
         store.delete_prefix("_security/").await.unwrap();
         store.delete_prefix("_audit/").await.unwrap();
@@ -1166,7 +990,7 @@ mod tests {
     /// Builds the complete local service graph and joins its compaction thread.
     #[tokio::test]
     async fn test_build_app_local_storage() {
-        let _startup_guard = LICENSE_STARTUP_LOCK.lock().await;
+        let _startup_guard = RBAC_STARTUP_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(&tmp);
 
@@ -1184,7 +1008,7 @@ mod tests {
     /// Accepts an empty authoritative local namespace scan during startup.
     #[tokio::test]
     async fn test_build_app_with_namespace_scan() {
-        let _startup_guard = LICENSE_STARTUP_LOCK.lock().await;
+        let _startup_guard = RBAC_STARTUP_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(&tmp);
 
@@ -1202,7 +1026,7 @@ mod tests {
     /// Proves the watch signal and blocking join finish without hanging.
     #[tokio::test]
     async fn test_graceful_shutdown() {
-        let _startup_guard = LICENSE_STARTUP_LOCK.lock().await;
+        let _startup_guard = RBAC_STARTUP_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(&tmp);
 
@@ -1218,33 +1042,23 @@ mod tests {
         drop(router);
     }
 
-    /// A cfg(test)-signed file traverses the real file resolver and production
-    /// graph before exposing licensed RBAC routes.
+    /// A `security.rbac = true` boot traverses the production graph and
+    /// exposes the real RBAC management routes.
     ///
     /// Boot bootstraps the policy head under the global publication lease,
     /// which releases through an ETag compare-and-swap. `LocalFileSystem`
     /// answers `PutMode::Update` with `NotImplemented`, so this case requires
-    /// a backend that actually implements conditional writes.
+    /// a backend that actually implements conditional writes and skips
+    /// otherwise.
     #[tokio::test]
-    async fn licensed_file_boot_enables_rbac_routes() {
+    async fn rbac_config_boot_enables_rbac_routes() {
         if std::env::var("TEST_BACKEND").as_deref() != Ok("minio") {
             return;
         }
-        let _startup_guard = LICENSE_STARTUP_LOCK.lock().await;
+        let _startup_guard = RBAC_STARTUP_LOCK.lock().await;
         let root = tempfile::TempDir::new().unwrap();
-        let license_path = root.path().join("license.json");
-        std::fs::write(
-            &license_path,
-            serde_json::to_vec(&signed_license(
-                vec![Feature::Rbac, Feature::Constraints],
-                Utc::now() - ChronoDuration::days(1),
-                Utc::now() + ChronoDuration::days(30),
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-        let (config, admin_bearer) = licensed_startup_config(&root, &license_path);
-        clear_license_startup_store(&config).await;
+        let (config, admin_bearer) = rbac_startup_config(&root);
+        clear_rbac_startup_store(&config).await;
         let cleanup_config = config.clone();
         let (app, background_tasks, audit_runtime) = build_app(config).await.unwrap();
 
@@ -1277,99 +1091,6 @@ mod tests {
         shutdown_background_tasks(background_tasks, Duration::from_secs(1))
             .await
             .unwrap();
-        clear_license_startup_store(&cleanup_config).await;
-    }
-
-    /// Expired signed startup exports a negative gauge and, on real S3/MinIO,
-    /// retains the licensed durable sink and persists the boot event.
-    ///
-    /// The local filesystem backend does not implement ETag conditional PUT.
-    /// That branch must reject this configuration explicitly instead of
-    /// silently weakening the single-writer audit protocol.
-    #[tokio::test]
-    async fn expired_file_boot_exports_metric_and_durable_audit() {
-        let _startup_guard = LICENSE_STARTUP_LOCK.lock().await;
-        let root = tempfile::TempDir::new().unwrap();
-        let license_path = root.path().join("expired-license.json");
-        std::fs::write(
-            &license_path,
-            serde_json::to_vec(&signed_license(
-                vec![Feature::Rbac, Feature::Constraints, Feature::AuditS3],
-                Utc::now() - ChronoDuration::days(30),
-                Utc::now() - ChronoDuration::days(1),
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-        let (config, _admin_bearer) = licensed_startup_config(&root, &license_path);
-        clear_license_startup_store(&config).await;
-        let storage_config = config.storage.clone();
-        let cleanup_config = config.clone();
-        let startup = build_app(config).await;
-
-        assert!(crate::metrics::LICENSE_EXPIRY_SECONDS.get() < 0);
-        if storage_config.backend != StorageBackend::S3 {
-            let error = match startup {
-                Ok(_) => panic!("local durable-audit startup unexpectedly succeeded"),
-                Err(error) => error,
-            };
-            assert_eq!(
-                error.to_string(),
-                "config error: durable audit requires an S3-compatible backend with ETag conditional PUT support"
-            );
-            clear_license_startup_store(&cleanup_config).await;
-            return;
-        }
-
-        let (router, background_tasks, audit_runtime) = startup.unwrap();
-        drop(router);
-        audit_runtime.shutdown().await.unwrap();
-        shutdown_background_tasks(background_tasks, Duration::from_secs(1))
-            .await
-            .unwrap();
-
-        let store = ZeppelinStore::from_config(&storage_config).unwrap();
-        let keys = store.list_prefix("_audit/").await.unwrap();
-        assert!(!keys.is_empty());
-        let mut found = false;
-        for key in keys {
-            let body = store.get(&key).await.unwrap();
-            for line in body
-                .split(|byte| *byte == b'\n')
-                .filter(|line| !line.is_empty())
-            {
-                let record: serde_json::Value = serde_json::from_slice(line).unwrap();
-                found |= record["params"] == "license_expired_boot";
-            }
-        }
-        assert!(found, "expired signed license boot audit was not durable");
-        clear_license_startup_store(&cleanup_config).await;
-    }
-
-    /// Boot and daily observation both warn while an expired license is still
-    /// inside the management grace window.
-    #[tokio::test]
-    async fn expired_within_grace_warns_on_boot_and_daily_observation() {
-        let _startup_guard = LICENSE_STARTUP_LOCK.lock().await;
-        let expires_at = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
-        let now = expires_at + ChronoDuration::days(1);
-        let entitlements = Entitlements::licensed_for_testing(
-            [Feature::Rbac, Feature::Constraints, Feature::AuditS3],
-            Some(expires_at),
-        );
-        assert!(!entitlements.management_frozen(now));
-
-        let captured = CapturedLicenseWarnings::default();
-        let subscriber = tracing_subscriber::registry().with(captured.clone());
-        tracing::subscriber::with_default(subscriber, || {
-            observe_license_expiry(&entitlements, now);
-            observe_license_expiry(&entitlements, now + ChronoDuration::days(1));
-        });
-
-        let warnings = captured
-            .0
-            .lock()
-            .unwrap_or_else(|_| panic!("license warning capture lock poisoned"));
-        assert_eq!(warnings.as_slice(), [Some(false), Some(false)]);
+        clear_rbac_startup_store(&cleanup_config).await;
     }
 }

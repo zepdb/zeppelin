@@ -17,8 +17,8 @@
 //! - *what must happen* once an action is allowed — obligations, mandatory
 //!   filters, field masks, and write constraints live on
 //!   [`AllowDecision`](crate::security::AllowDecision);
-//! - *whether the feature is licensed* — entitlement checks against
-//!   [`Feature`](crate::security::Feature) happen in the kernel, not here.
+//! - *whether the feature is available* — composed-surface checks happen in
+//!   the kernel, not here.
 //!
 //! ## Reading map
 //!

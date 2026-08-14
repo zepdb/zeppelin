@@ -16,10 +16,10 @@
 //!
 //! ## Where this sits
 //!
-//! Preservation is a licensed feature. When `Feature::Preservation` is not
-//! entitled the security kernel composes no [`PreservationService`] at all and
-//! every guard the kernel hands out is `PreservationGuard::unlocked()` — this
-//! file is then never consulted. Everything below describes the entitled path.
+//! The security kernel composes a [`PreservationService`] only on the RBAC
+//! policy-authority path. On bootstrap-authority boots every guard the kernel
+//! hands out is `PreservationGuard::unlocked()` — this file is then never
+//! consulted. Everything below describes the composed path.
 //!
 //! Two callers enter from different directions, at different costs:
 //!

@@ -23,17 +23,15 @@
 //!   `POLICY_ALL_V1` / `POLICY_SAFE_ALL_V2` / `BOOTSTRAP_ADMIN_V1` sets this file
 //!   expands and migrates against.
 //! - **Admission policy.** `kernel.rs` decides anonymous handling, security mode,
-//!   entitlement gating, staleness, and delegation. This file answers only "what
-//!   do the grants say", returning a [`DenyReason`] rather than a decision.
+//!   feature availability, staleness, and delegation. This file answers only
+//!   "what do the grants say", returning a [`DenyReason`] rather than a decision.
 //! - **Constraint enforcement.** A compiled authorization *reports* a mandatory
 //!   filter, field mask, and write constraints; query and upsert code applies
 //!   them.
-//! - **Entitlement checks.** `policy_store.rs` calls the feature predicates here
-//!   ([`PolicySnapshot::has_constraints`],
-//!   [`PolicySnapshot::has_delegation_features`],
-//!   [`PolicySnapshot::has_preservation_features`],
-//!   [`PolicySnapshot::principal_count`]) to refuse publishing a snapshot the
-//!   license does not cover.
+//! - **Composition checks.** `policy_store.rs` calls
+//!   [`PolicySnapshot::has_delegation_features`] to refuse publishing a
+//!   snapshot that grants delegation on a node with no composed delegation
+//!   authority.
 //!
 //! ## Two representations, one authority
 //!
@@ -1392,7 +1390,6 @@ impl PolicySnapshot {
     pub(crate) fn from_bootstrap(
         config: &SecurityConfig,
         now: DateTime<Utc>,
-        include_preservation: bool,
     ) -> Result<Self, SecurityError> {
         if config.api_keys.is_empty() {
             return Err(SecurityError::MissingBootstrapCredentials);
@@ -1402,8 +1399,7 @@ impl PolicySnapshot {
         let mut keys = Vec::with_capacity(config.api_keys.len());
         let mut grants = Vec::new();
         for configured in &config.api_keys {
-            let (principal, key, mut key_grants) =
-                bootstrap_key(configured, now, include_preservation)?;
+            let (principal, key, mut key_grants) = bootstrap_key(configured, now)?;
             principals.push(principal);
             keys.push(key);
             grants.append(&mut key_grants);
@@ -1990,19 +1986,7 @@ impl PolicySnapshot {
         &self.grants
     }
 
-    /// Return whether any policy binding carries server-owned data constraints.
-    #[must_use]
-    pub fn has_constraints(&self) -> bool {
-        self.grants.iter().any(|grant| {
-            grant.mandatory_filter().is_some()
-                || grant.field_mask().is_some()
-                || grant
-                    .write_constraints()
-                    .is_some_and(|constraints| !constraints.is_empty())
-        })
-    }
-
-    /// Return whether this snapshot activates Phase 7 delegation or approval policy.
+    /// Return whether this snapshot activates delegation or approval policy.
     #[must_use]
     pub fn has_delegation_features(&self) -> bool {
         self.grants.iter().any(|grant| {
@@ -2013,25 +1997,6 @@ impl PolicySnapshot {
                         if actions.contains(&Action::CredentialDelegate)
                 )
         })
-    }
-
-    /// Return whether any grant carries Phase 8 preservation authority.
-    #[must_use]
-    pub fn has_preservation_features(&self) -> bool {
-        self.grants.iter().any(|grant| {
-            matches!(
-                &grant.actions,
-                GrantActions::Selected { actions }
-                    if actions.contains(&Action::PreservationAdmin)
-                        || actions.contains(&Action::PreservationRelease)
-            )
-        })
-    }
-
-    /// Return the number of stable principals in this snapshot.
-    #[must_use]
-    pub fn principal_count(&self) -> usize {
-        self.principals.len()
     }
 }
 
@@ -2105,7 +2070,6 @@ fn grant_scopes_overlap(left: &GrantScope, right: &GrantScope) -> bool {
 fn bootstrap_key(
     configured: &ApiKeyConfig,
     now: DateTime<Utc>,
-    include_preservation: bool,
 ) -> Result<(PolicyPrincipal, PolicyKey, Vec<PolicyGrant>), SecurityError> {
     if configured.actions.iter().any(|action| action == "*") && configured.actions.len() != 1 {
         return Err(SecurityError::InvalidPolicyRequest(
@@ -2140,9 +2104,7 @@ fn bootstrap_key(
 
     let actions = if configured.actions.iter().any(|action| action == "*") {
         let mut actions = Action::BOOTSTRAP_ADMIN_V1.to_vec();
-        if include_preservation {
-            actions.extend([Action::PreservationAdmin, Action::PreservationRelease]);
-        }
+        actions.extend([Action::PreservationAdmin, Action::PreservationRelease]);
         GrantActions::Selected { actions }
     } else {
         let mut actions = configured
@@ -2473,7 +2435,7 @@ namespaces = ["*"]
             "fixed policy time must be valid",
         );
         let mut snapshot = fixture(
-            PolicySnapshot::from_bootstrap(&config.security, now, false),
+            PolicySnapshot::from_bootstrap(&config.security, now),
             "bootstrap snapshot must compile",
         );
         snapshot.grants = grants;

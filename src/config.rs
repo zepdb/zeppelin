@@ -595,12 +595,12 @@ fn matrix_dtype_label(dtype: MatrixDtype) -> String {
 
 /// Base namespace-branching configuration.
 ///
-/// Entitlement and policy checks land in later phases. This switch remains
-/// disabled by default and therefore exposes no public fork path on its own.
+/// This switch is the sole gate for branch routes; it remains disabled by
+/// default and therefore exposes no public fork path on its own.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BranchingConfig {
-    /// Operator opt-in; Phase 08 combines this with licensed entitlement.
+    /// Operator opt-in enabling the branch routes and fork paths.
     #[serde(default)]
     pub enabled: bool,
     /// Maximum number of direct child roots stored in one live manifest.
@@ -681,10 +681,12 @@ pub struct SecurityConfig {
     /// Maximum interval between background audit-batch flushes.
     #[serde(default = "default_security_audit_flush_secs")]
     pub audit_flush_secs: u64,
-    /// Optional signed-license path used by the later entitlement phase.
+    /// Selects the S3-authoritative RBAC policy store instead of bootstrap
+    /// api-key grants. Requires `mode = "enforced"` and a backend with
+    /// conditional-PUT support (S3/MinIO; the Local backend has none).
     #[serde(default)]
-    pub license_path: String,
-    /// Ed25519 seed file used only when delegated credentials are licensed.
+    pub rbac: bool,
+    /// Ed25519 seed file enabling delegated credentials and audit signing.
     #[serde(default)]
     pub token_signing_key_path: String,
     /// Maximum lifetime accepted for one minted delegated token.
@@ -716,7 +718,7 @@ impl std::fmt::Debug for SecurityConfig {
             .field("policy_refresh_secs", &self.policy_refresh_secs)
             .field("audit_s3", &self.audit_s3)
             .field("audit_flush_secs", &self.audit_flush_secs)
-            .field("license_path", &self.license_path)
+            .field("rbac", &self.rbac)
             .field("token_signing_key_path", &self.token_signing_key_path)
             .field(
                 "delegated_token_max_ttl_secs",
@@ -736,7 +738,7 @@ impl Default for SecurityConfig {
             policy_refresh_secs: default_security_policy_refresh_secs(),
             audit_s3: default_security_audit_s3(),
             audit_flush_secs: default_security_audit_flush_secs(),
-            license_path: String::new(),
+            rbac: false,
             token_signing_key_path: String::new(),
             delegated_token_max_ttl_secs: default_delegated_token_max_ttl_secs(),
             cursor_hmac_key_hex: String::new(),
@@ -785,9 +787,11 @@ const fn default_security_policy_refresh_secs() -> u64 {
     5
 }
 
-/// Enables durable S3 audit evidence unless an unsafe development posture opts out.
+/// Durable S3 audit evidence is an explicit opt-in; it needs an S3-class
+/// backend and a configured signing key, so the default keeps tracing-only
+/// audit.
 const fn default_security_audit_s3() -> bool {
-    true
+    false
 }
 
 /// Returns the bounded audit flush interval used when the operator omits it.
@@ -1209,18 +1213,18 @@ mod tests {
 
     /// Pins the durable-audit defaults used by both enforced and unsafe modes.
     #[test]
-    fn security_audit_defaults_are_enabled_and_flush_every_two_seconds() {
+    fn security_audit_defaults_are_opt_in_and_flush_every_two_seconds() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::clear();
 
         let config = load_toml("").unwrap();
 
-        assert!(config.security.audit_s3);
+        assert!(!config.security.audit_s3);
         assert_eq!(config.security.audit_flush_secs, 2);
     }
 
-    /// Branching remains inert until later entitlement/admission phases while
-    /// its manifest and graph bounds are already deterministic and validated.
+    /// Branching remains inert until the operator opts in while its manifest
+    /// and graph bounds are already deterministic and validated.
     #[test]
     fn branching_defaults_and_hard_bounds_are_validated() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -1502,14 +1506,23 @@ mod tests {
         }
     }
 
-    /// Enforced mode cannot boot without durable audit, and every mode needs a live timer.
+    /// Durable audit needs signing material, RBAC needs enforced mode, and
+    /// every mode needs a live flush timer.
     #[test]
     fn security_audit_configuration_fails_loudly_when_unsafe() {
-        let mut disabled = Config::default();
-        disabled.security.audit_s3 = false;
+        let mut keyless_audit = Config::default();
+        keyless_audit.security.audit_s3 = true;
         assert_config_error_contains(
-            disabled.validate().map(|()| disabled),
-            &["security.audit_s3"],
+            keyless_audit.validate().map(|()| keyless_audit),
+            &["security.audit_s3", "security.token_signing_key_path"],
+        );
+
+        let mut unsafe_rbac = Config::default();
+        unsafe_rbac.security.mode = SecurityMode::OpenUnsafe;
+        unsafe_rbac.security.rbac = true;
+        assert_config_error_contains(
+            unsafe_rbac.validate().map(|()| unsafe_rbac),
+            &["security.rbac"],
         );
 
         let mut zero_interval = Config::default();
@@ -3497,9 +3510,12 @@ impl Config {
                 "security.delegated_token_max_ttl_secs must be greater than zero".to_string(),
             );
         }
-        if self.security.mode == SecurityMode::Enforced && !self.security.audit_s3 {
+        if self.security.rbac && self.security.mode != SecurityMode::Enforced {
+            violations.push("security.rbac requires security.mode = \"enforced\"".to_string());
+        }
+        if self.security.audit_s3 && self.security.token_signing_key_path.is_empty() {
             violations
-                .push("security.audit_s3 must be true when security.mode is enforced".to_string());
+                .push("security.audit_s3 requires security.token_signing_key_path".to_string());
         }
         if self.security.mode == SecurityMode::Enforced
             && self.security.cursor_hmac_key_hex.is_empty()

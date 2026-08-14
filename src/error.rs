@@ -456,10 +456,6 @@ pub enum ZeppelinError {
     #[error("compaction lifecycle error: {0}")]
     CompactionLifecycle(#[from] crate::compaction::background::CompactionLifecycleError),
 
-    /// Signed-license parsing or verification failed during composition.
-    #[error("license error: {0}")]
-    License(#[from] crate::security::LicenseError),
-
     // IO errors
     /// A local filesystem I/O error.
     #[error("io error: {0}")]
@@ -802,7 +798,6 @@ impl ZeppelinError {
             ZeppelinError::AuditSink(_) => "INTERNAL_ERROR",
             ZeppelinError::ServerTaskSupervisor(_) => "INTERNAL_ERROR",
             ZeppelinError::CompactionLifecycle(_) => "INTERNAL_ERROR",
-            ZeppelinError::License(_) => "INTERNAL_ERROR",
             ZeppelinError::Io(_) => "INTERNAL_ERROR",
             ZeppelinError::Cache(_) => "INTERNAL_ERROR",
             ZeppelinError::HydrationDisabled => "HYDRATION_DISABLED",
@@ -982,7 +977,6 @@ impl ZeppelinError {
             | ZeppelinError::AuditSink(_)
             | ZeppelinError::ServerTaskSupervisor(_)
             | ZeppelinError::CompactionLifecycle(_)
-            | ZeppelinError::License(_)
             | ZeppelinError::Io(_)
             | ZeppelinError::Cache(_)
             | ZeppelinError::FullTextSearch(_)

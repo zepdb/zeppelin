@@ -27,20 +27,12 @@
       "response": "readyz_gated_401.resp.json"
     },
     {
-      "name": "feature_not_licensed_403",
+      "name": "feature_disabled_403",
       "method": "POST",
       "path": "/v1/security/keys",
       "status": 403,
-      "request": "feature_not_licensed_403.req.json",
-      "response": "feature_not_licensed_403.resp.json"
-    },
-    {
-      "name": "license_expired_403",
-      "method": "POST",
-      "path": "/v1/security/keys",
-      "status": 403,
-      "request": "license_expired_403.req.json",
-      "response": "license_expired_403.resp.json"
+      "request": "feature_disabled_403.req.json",
+      "response": "feature_disabled_403.resp.json"
     },
     {
       "name": "security_create_principal",

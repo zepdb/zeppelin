@@ -1606,9 +1606,10 @@ components:
         The authenticated principal is not authorized for the requested action or
         resource, or the operation violates a server-owned mandatory filter,
         field mask, or write constraint (403). Security-management routes also
-        use this envelope for `feature_not_licensed` when Rbac is absent and
-        `license_expired` when the post-expiry management grace has elapsed.
-        Expiry never disables Rbac, Constraints, or AuditS3 enforcement.
+        use this envelope for `feature_disabled` when the requested surface is
+        not enabled by this server's configuration (for example RBAC
+        administration when `security.rbac` is off, or delegated-token minting
+        with no signing key configured).
       content:
         application/json:
           schema:

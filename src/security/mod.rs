@@ -5,7 +5,7 @@
 //! returns an explicit decision before domain work can begin.
 //!
 //! Everything in this subsystem is **fail-closed**. When state is missing,
-//! stale, unverifiable, or unlicensed, the answer is a typed denial. There are
+//! stale, unverifiable, or disabled, the answer is a typed denial. There are
 //! no permissive defaults and no degraded modes: a policy cache that cannot
 //! revalidate stops authorizing, and an audit writer that cannot durably record
 //! a mutation withholds `/readyz` rather than letting the mutation go
@@ -22,7 +22,6 @@
 //!   [`Obligation`](crate::security::Obligation)) that carry constraints downstream;
 //! - the authoritative policy document in the reserved `_security/` keyspace,
 //!   and its cache;
-//! - licensed feature authority ([`Entitlements`](crate::security::Entitlements), [`Feature`](crate::security::Feature));
 //! - durable, hash-chained audit evidence;
 //! - preservation locks that veto destruction.
 //!
@@ -44,7 +43,7 @@
 //!                 v
 //!  SecurityKernel::authorize_* / guard_*        <-- the admission point
 //!         |                        |
-//!         | Bootstrap authority    | Policy authority (licensed RBAC)
+//!         | Bootstrap authority    | Policy authority (security.rbac)
 //!         | grants compiled from   | compiled from the S3-authoritative
 //!         | boot config            | policy head, revalidated on an interval
 //!         v                        v
@@ -59,11 +58,11 @@
 //!         domain work runs, then durable audit records the outcome
 //! ```
 //!
-//! The two authorities are selected at boot by resolved entitlements. Without
-//! [`Feature::Rbac`](crate::security::Feature::Rbac), the kernel compiles immutable grants from validated boot
-//! configuration and never constructs the object-store policy registry. With
-//! it, the authoritative policy in `_security/` takes over and boot credentials
-//! become advisory only.
+//! The two authorities are selected at boot by `security.rbac`. When it is
+//! false, the kernel compiles immutable grants from validated boot
+//! configuration and never constructs the object-store policy registry. When
+//! true, the authoritative policy in `_security/` takes over and boot
+//! credentials become advisory only.
 //!
 //! ## Persisted artifacts
 //!
@@ -88,8 +87,8 @@
 //!    [`ApiKeyAdapter`](crate::security::ApiKeyAdapter), [`AuthenticationOutcome`](crate::security::AuthenticationOutcome)): credentials to principals,
 //!    digest-only, never retaining secret material.
 //! 4. **The kernel** — `kernel.rs` ([`SecurityKernel`](crate::security::SecurityKernel)): the single admission
-//!    point every protected route passes through, and the place entitlements
-//!    are meant to be enforced.
+//!    point every protected route passes through, and the place feature
+//!    availability is enforced.
 //! 5. **Authoritative policy** — `policy.rs` ([`PolicyHead`](crate::security::PolicyHead),
 //!    [`PolicySnapshot`](crate::security::PolicySnapshot), [`canonical_policy_checksum`](crate::security::canonical_policy_checksum)) for the persisted
 //!    vocabulary, then `policy_store.rs` ([`PolicyStore`](crate::security::PolicyStore), [`LoadedPolicy`](crate::security::LoadedPolicy))
@@ -97,17 +96,13 @@
 //!    disposable read cache and its staleness rule, then
 //!    `policy_publication.rs` ([`PolicyPublicationLease`](crate::security::PolicyPublicationLease)) for the global
 //!    fenced publication lease and branch-activation guards.
-//! 6. **Licensing** — `entitlements.rs` ([`Entitlements`](crate::security::Entitlements), [`Feature`](crate::security::Feature)) and
-//!    `license.rs` ([`SignedLicense`](crate::security::SignedLicense), [`EntitlementResolver`](crate::security::EntitlementResolver),
-//!    [`FileLicenseResolver`](crate::security::FileLicenseResolver)): offline Ed25519 verification of which surfaces
-//!    exist at all.
-//! 7. **Audit** — `audit.rs` ([`AuditRecord`](crate::security::AuditRecord), [`AuditParams`](crate::security::AuditParams)),
+//! 6. **Audit** — `audit.rs` ([`AuditRecord`](crate::security::AuditRecord), [`AuditParams`](crate::security::AuditParams)),
 //!    `audit_sink.rs` ([`AuditClient`](crate::security::AuditClient), [`AuditRuntime`](crate::security::AuditRuntime)), and
 //!    `audit_chain.rs` ([`verify_audit_day`](crate::security::verify_audit_day)).
-//! 8. **Constraint enforcement** — `constraints.rs` ([`apply_field_mask`](crate::security::apply_field_mask),
+//! 7. **Constraint enforcement** — `constraints.rs` ([`apply_field_mask`](crate::security::apply_field_mask),
 //!    [`filter_references_denied_field`](crate::security::filter_references_denied_field)): the server-owned obligations an
 //!    allow decision carries into the query and write paths.
-//! 9. **Licensed surfaces** — `delegation.rs` ([`DelegationContext`](crate::security::DelegationContext),
+//! 8. **Composed surfaces** — `delegation.rs` ([`DelegationContext`](crate::security::DelegationContext),
 //!    [`IssuedDelegatedToken`](crate::security::IssuedDelegatedToken)) for short-lived credentials that can only
 //!    narrow parent authority; `preservation.rs`
 //!    ([`PreservationService`](crate::security::PreservationService), [`PreservationGuard`](crate::security::PreservationGuard)) for legal-hold vetoes
@@ -124,10 +119,9 @@
 //! - **S3 is authoritative for policy.** Once a policy head exists, boot
 //!   configuration is ignored; drift is warned about, never reconciled by
 //!   overwriting.
-//! - **Entitlements belong in the kernel.** A handler-only feature check is
-//!   bypassable from a new call site. [`Feature`](crate::security::Feature) variants have a stable
-//!   bit-assignment order (`Feature::ALL`); append, never reorder, or existing
-//!   signed licenses become invalid.
+//! - **Feature availability belongs in the kernel.** A handler-only feature
+//!   check is bypassable from a new call site; the kernel returns
+//!   [`SecurityError::FeatureDisabled`](crate::security::SecurityError::FeatureDisabled) when a surface is not composed.
 //! - **Audit is not best effort where policy says it must be durable.** A
 //!   failed audit writer withholds readiness deliberately.
 //! - **Errors carry their decision.** [`SecurityOperationError`](crate::security::SecurityOperationError) pairs a
@@ -181,9 +175,7 @@ mod constraints;
 mod context;
 mod decision;
 mod delegation;
-mod entitlements;
 mod kernel;
-mod license;
 mod policy;
 mod policy_cache;
 mod policy_publication;
@@ -214,16 +206,8 @@ pub use decision::{
     PolicyVersion, WriteConstraints,
 };
 pub use delegation::{DelegationContext, DelegationNarrowing, IssuedDelegatedToken};
-pub use entitlements::{CustomerId, EntitlementLimits, EntitlementSource, Entitlements, Feature};
 pub use kernel::SecurityKernel;
 pub(crate) use kernel::{NamespaceDeleteAdmission, NamespaceForkAdmission};
-#[cfg(feature = "managed")]
-pub use license::ControlPlaneResolver;
-pub use license::{
-    canonical_payload_bytes, read_key_file, validate_license_payload, verify_signed_license_bytes,
-    EntitlementResolver, FileLicenseResolver, LicenseError, LicenseLimits, LicensePayload,
-    SignedLicense, LICENSE_PUBKEY,
-};
 pub use policy::{
     canonical_policy_checksum, ApiKeyId, GrantActions, GrantDefinition, GrantScope, IssuedApiKey,
     KeyState, PolicyGrant, PolicyHead, PolicyKey, PolicyPrincipal, PolicySnapshot,
@@ -300,18 +284,9 @@ pub enum SecurityError {
     /// A required mutation completed without durable audit acknowledgement.
     #[error("durable security audit evidence is unavailable")]
     AuditUnavailable,
-    /// The requested surface is not present in the resolved entitlement set.
-    #[error("feature is not licensed: {0}")]
-    FeatureNotLicensed(Feature),
-    /// Security management is frozen after the license-expiry grace period.
-    #[error("security management is frozen because the license expired")]
-    LicenseExpired,
-    /// An authoritative policy requires a missing enforcement capability.
-    #[error("authoritative security policy requires licensed feature: {0}")]
-    FeatureRequired(Feature),
-    /// An authoritative policy exceeds a signed license capacity limit.
-    #[error("authoritative security policy exceeds licensed limit: {0}")]
-    LicenseLimitExceeded(&'static str),
+    /// The requested capability is not enabled by this server's configuration.
+    #[error("feature is disabled by server configuration: {0}")]
+    FeatureDisabled(&'static str),
     /// An authoritative policy object violates its strict schema or invariants.
     #[error("invalid security policy: {0}")]
     InvalidPolicy(String),
@@ -333,7 +308,7 @@ pub enum SecurityError {
     /// A security-policy mutation request is structurally invalid.
     #[error("invalid security policy request: {0}")]
     InvalidPolicyRequest(String),
-    /// Delegation was licensed but no private signing-key path was configured.
+    /// Delegation or audit signing was requested without a signing-key path.
     #[error("missing required security.token_signing_key_path for delegation")]
     MissingDelegationSigningKey,
     /// The delegated-token signing seed is not exactly 32 hexadecimal bytes.
@@ -482,10 +457,7 @@ impl SecurityError {
                 | DenyReason::CredentialExpired
                 | DenyReason::CredentialUnknown,
             ) => 401,
-            Self::Authorization(_)
-            | Self::FeatureNotLicensed(_)
-            | Self::LicenseExpired
-            | Self::LicenseLimitExceeded(_) => 403,
+            Self::Authorization(_) | Self::FeatureDisabled(_) => 403,
             Self::ConstraintViolation => 403,
             Self::DelegationChainingForbidden | Self::DelegationPrincipalKindForbidden => 403,
             Self::ApprovalRequired => 403,
@@ -517,7 +489,6 @@ impl SecurityError {
             | Self::MissingBootstrapCredentials
             | Self::PolicyObjectCollision
             | Self::PolicyVersionOverflow
-            | Self::FeatureRequired(_)
             | Self::MissingDelegationSigningKey
             | Self::InvalidDelegationSigningKey
             | Self::DelegationSigningKeyPermissions
@@ -552,10 +523,7 @@ impl SecurityError {
             Self::PolicyEntityAlreadyExists => "security_entity_exists",
             Self::PolicyEntityNotFound => "security_entity_not_found",
             Self::AuditUnavailable => "audit_unavailable",
-            Self::FeatureNotLicensed(_) => "feature_not_licensed",
-            Self::LicenseExpired => "license_expired",
-            Self::FeatureRequired(_) => "security_internal",
-            Self::LicenseLimitExceeded(_) => "license_limit_exceeded",
+            Self::FeatureDisabled(_) => "feature_disabled",
             Self::UnmappedRoute => "unmapped_route",
             Self::UnknownAction(_)
             | Self::InvalidPrincipalId
@@ -627,14 +595,8 @@ impl SecurityError {
                 "operation may have completed, but durable audit evidence is unavailable"
                     .to_string()
             }
-            Self::FeatureNotLicensed(feature) => {
-                format!("feature is not licensed: {}", feature.as_str())
-            }
-            Self::LicenseExpired => {
-                "security management is frozen because the license expired".to_string()
-            }
-            Self::LicenseLimitExceeded(limit) => {
-                format!("licensed security limit exceeded: {limit}")
+            Self::FeatureDisabled(feature) => {
+                format!("feature is disabled by server configuration: {feature}")
             }
             Self::UnknownAction(_)
             | Self::InvalidPrincipalId
@@ -652,7 +614,6 @@ impl SecurityError {
             | Self::MissingBootstrapCredentials
             | Self::PolicyObjectCollision
             | Self::PolicyVersionOverflow
-            | Self::FeatureRequired(_)
             | Self::MissingDelegationSigningKey
             | Self::InvalidDelegationSigningKey
             | Self::DelegationSigningKeyPermissions

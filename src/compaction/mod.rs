@@ -635,7 +635,7 @@ pub struct Compactor {
     upload_window: Duration,
     /// Explicit wall clock used for manifest stamps and GC orchestration.
     clock: Clock,
-    /// Fresh fail-closed preservation authority, when licensed at boot.
+    /// Fresh fail-closed preservation authority, when composed at boot.
     preservation: Option<Arc<PreservationService>>,
     /// Test-only hook: artificial delay injected after index build and
     /// before the final manifest CAS loop, simulating a compaction whose

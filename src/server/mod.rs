@@ -117,9 +117,8 @@ use crate::namespace::{BranchGraphReadinessSnapshot, NamespaceManager};
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::security::{
     classify_route, Action, AllowDecision, AuditClient, AuditOutcome, AuditParams, AuditRecord,
-    CredentialAdapter, Decision, DenyDecision, DenyReason, Feature, NamespaceId, Principal,
-    PrincipalId, RequestContext, Resource, ResourceRef, RouteClass, SecurityError, SecurityKernel,
-    SnapshotName,
+    CredentialAdapter, Decision, DenyDecision, DenyReason, NamespaceId, Principal, PrincipalId,
+    RequestContext, Resource, ResourceRef, RouteClass, SecurityError, SecurityKernel, SnapshotName,
 };
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
@@ -2358,184 +2357,59 @@ fn secure_route(methods: MethodRouter<AppState>, state: &AppState) -> MethodRout
         ))
 }
 
-async fn feature_not_licensed() -> Result<(), ApiError> {
-    Err(ApiError(
-        SecurityError::FeatureNotLicensed(Feature::Rbac).into(),
-    ))
-}
-
-async fn delegation_not_licensed() -> Result<(), ApiError> {
-    Err(ApiError(
-        SecurityError::FeatureNotLicensed(Feature::Delegation).into(),
-    ))
-}
-
-async fn enforce_security_management_license(
-    State(state): State<AppState>,
-    request: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
-    if state
-        .security
-        .entitlements()
-        .management_frozen(state.clock.now())
-    {
-        return ApiError(SecurityError::LicenseExpired.into()).into_response();
-    }
-    next.run(request).await
-}
-
-fn license_gated_security_mutation(
-    methods: MethodRouter<AppState>,
-    state: &AppState,
-) -> MethodRouter<AppState> {
-    methods.route_layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        enforce_security_management_license,
-    ))
-}
-
 fn security_routes(state: &AppState) -> Router<AppState> {
-    let rbac_routes = if !state.security.entitlements().has(Feature::Rbac) {
-        Router::new()
-            .route(
-                "/v1/security/principals",
-                secure_route(get(feature_not_licensed).post(feature_not_licensed), state),
-            )
-            .route(
-                "/v1/security/keys",
-                secure_route(get(feature_not_licensed).post(feature_not_licensed), state),
-            )
-            .route(
-                "/v1/security/keys/:key_id",
-                secure_route(delete(feature_not_licensed), state),
-            )
-            .route(
-                "/v1/security/keys/:key_id/rotate",
-                secure_route(post(feature_not_licensed), state),
-            )
-            .route(
-                "/v1/security/grants",
-                secure_route(
-                    get(feature_not_licensed)
-                        .post(feature_not_licensed)
-                        .delete(feature_not_licensed),
-                    state,
-                ),
-            )
-            .route(
-                "/v1/security/policy",
-                secure_route(get(feature_not_licensed), state),
-            )
-    } else {
-        Router::new()
-            .route(
-                "/v1/security/principals",
-                secure_route(get(security_handler::list_principals), state).merge(secure_route(
-                    license_gated_security_mutation(
-                        post(security_handler::create_principal),
-                        state,
-                    ),
-                    state,
-                )),
-            )
-            .route(
-                "/v1/security/keys",
-                secure_route(get(security_handler::list_keys), state).merge(secure_route(
-                    license_gated_security_mutation(post(security_handler::create_key), state),
-                    state,
-                )),
-            )
-            .route(
-                "/v1/security/keys/:key_id",
-                secure_route(
-                    license_gated_security_mutation(delete(security_handler::revoke_key), state),
-                    state,
-                ),
-            )
-            .route(
-                "/v1/security/keys/:key_id/rotate",
-                secure_route(
-                    license_gated_security_mutation(post(security_handler::rotate_key), state),
-                    state,
-                ),
-            )
-            .route(
-                "/v1/security/grants",
-                secure_route(get(security_handler::list_grants), state)
-                    .merge(secure_route(
-                        license_gated_security_mutation(
-                            post(security_handler::create_grant),
-                            state,
-                        ),
-                        state,
-                    ))
-                    .merge(secure_route(
-                        license_gated_security_mutation(
-                            delete(security_handler::delete_grant),
-                            state,
-                        ),
-                        state,
-                    )),
-            )
-            .route(
-                "/v1/security/policy",
-                secure_route(get(security_handler::get_policy), state),
-            )
-    };
-
-    let token_routes = if state.security.entitlements().has(Feature::Delegation) {
-        Router::new().route(
-            "/v1/security/tokens",
+    Router::new()
+        .route(
+            "/v1/security/principals",
             secure_route(
-                license_gated_security_mutation(post(security_handler::mint_token), state),
+                get(security_handler::list_principals).post(security_handler::create_principal),
                 state,
             ),
         )
-    } else {
-        Router::new().route(
-            "/v1/security/tokens",
-            secure_route(post(delegation_not_licensed), state),
+        .route(
+            "/v1/security/keys",
+            secure_route(
+                get(security_handler::list_keys).post(security_handler::create_key),
+                state,
+            ),
         )
-    };
-
-    let preservation_routes = if state.security.entitlements().has(Feature::Preservation) {
-        Router::new()
-            .route(
-                "/v1/security/preservation",
-                secure_route(get(security_handler::list_preservation_locks), state).merge(
-                    secure_route(
-                        license_gated_security_mutation(
-                            post(security_handler::create_preservation_lock),
-                            state,
-                        ),
-                        state,
-                    ),
-                ),
-            )
-            .route(
-                "/v1/security/preservation/:lock_id/release",
-                secure_route(
-                    license_gated_security_mutation(
-                        post(security_handler::release_preservation_lock),
-                        state,
-                    ),
-                    state,
-                ),
-            )
-    } else {
-        Router::new()
-            .route(
-                "/v1/security/preservation",
-                secure_route(get(feature_not_licensed).post(feature_not_licensed), state),
-            )
-            .route(
-                "/v1/security/preservation/:lock_id/release",
-                secure_route(post(feature_not_licensed), state),
-            )
-    };
-
-    rbac_routes.merge(token_routes).merge(preservation_routes)
+        .route(
+            "/v1/security/keys/:key_id",
+            secure_route(delete(security_handler::revoke_key), state),
+        )
+        .route(
+            "/v1/security/keys/:key_id/rotate",
+            secure_route(post(security_handler::rotate_key), state),
+        )
+        .route(
+            "/v1/security/grants",
+            secure_route(
+                get(security_handler::list_grants)
+                    .post(security_handler::create_grant)
+                    .delete(security_handler::delete_grant),
+                state,
+            ),
+        )
+        .route(
+            "/v1/security/policy",
+            secure_route(get(security_handler::get_policy), state),
+        )
+        .route(
+            "/v1/security/tokens",
+            secure_route(post(security_handler::mint_token), state),
+        )
+        .route(
+            "/v1/security/preservation",
+            secure_route(
+                get(security_handler::list_preservation_locks)
+                    .post(security_handler::create_preservation_lock),
+                state,
+            ),
+        )
+        .route(
+            "/v1/security/preservation/:lock_id/release",
+            secure_route(post(security_handler::release_preservation_lock), state),
+        )
 }
 
 /// Builds the complete Axum service from initialized Zeppelin dependencies.

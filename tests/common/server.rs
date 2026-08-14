@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use axum::Router;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use object_store::path::Path;
 use object_store::prefix::PrefixStore;
@@ -36,8 +36,7 @@ use zeppelin::namespace::{
 };
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use zeppelin::security::{
-    ApiKeyAdapter, AuditClient, AuditRecord, AuditRuntime, CredentialAdapter, EntitlementLimits,
-    EntitlementSource, Entitlements, Feature, SecurityKernel,
+    ApiKeyAdapter, AuditClient, AuditRecord, AuditRuntime, CredentialAdapter, SecurityKernel,
 };
 use zeppelin::server::{build_router, parse_trusted_proxies, AppState, ServerTaskSupervisor};
 use zeppelin::storage::ZeppelinStore;
@@ -48,65 +47,71 @@ tokio::task_local! {
     static BACKGROUND_COMPACTION_ORIGIN: bool;
 }
 
-/// Construct an integration-only entitlement fixture without adding a safe
-/// production constructor or alternate trust root.
-#[must_use]
-pub fn test_entitlements(features: impl IntoIterator<Item = Feature>) -> Entitlements {
-    test_entitlements_with_expiry(features, None)
+/// Security composition profile for integration servers.
+///
+/// Replaces the old entitlement fixtures: each variant maps one former
+/// entitlement narrowing onto the config switches that now drive kernel
+/// composition (`security.rbac`, `security.audit_s3`, and whether a token
+/// signing key is injected).
+#[derive(Clone, Copy, Debug)]
+pub struct TestSecurity {
+    /// Select the S3-authoritative policy store instead of bootstrap grants.
+    pub rbac: bool,
+    /// Enable the durable S3 audit sink.
+    pub audit_s3: bool,
+    /// Inject a signing key so the delegation authority composes.
+    pub delegation: bool,
 }
 
-/// Construct a fixed expired enforcement fixture for integration composition.
-#[must_use]
-pub fn expired_test_entitlements() -> Entitlements {
-    test_entitlements_with_expiry(
-        [Feature::Rbac, Feature::Constraints, Feature::AuditS3],
-        Some(Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap()),
-    )
-}
-
-fn test_entitlements_with_expiry(
-    features: impl IntoIterator<Item = Feature>,
-    expires_at: Option<chrono::DateTime<Utc>>,
-) -> Entitlements {
-    #[repr(C)]
-    struct TestEntitlementsRepr {
-        source: EntitlementSource,
-        customer: Option<zeppelin::security::CustomerId>,
-        customer_name: Option<String>,
-        issued_at: Option<chrono::DateTime<Utc>>,
-        expires_at: Option<chrono::DateTime<Utc>>,
-        management_freeze_at: Option<chrono::DateTime<Utc>>,
-        feature_bits: u16,
-        limits: EntitlementLimits,
+impl TestSecurity {
+    /// The default profile: policy authority, delegation, durable audit.
+    #[must_use]
+    pub fn full() -> Self {
+        Self {
+            rbac: true,
+            audit_s3: true,
+            delegation: true,
+        }
     }
 
-    let feature_bits = features
-        .into_iter()
-        .fold(0_u16, |bits, feature| bits | (1_u16 << feature as u16));
-    let representation = TestEntitlementsRepr {
-        source: EntitlementSource::FileLicense,
-        customer: None,
-        customer_name: None,
-        issued_at: expires_at.map(|expiry| expiry - ChronoDuration::days(365)),
-        expires_at,
-        management_freeze_at: expires_at.map(|expiry| expiry + ChronoDuration::days(14)),
-        feature_bits,
-        limits: EntitlementLimits::default(),
-    };
-    assert_eq!(
-        std::mem::size_of::<TestEntitlementsRepr>(),
-        std::mem::size_of::<Entitlements>()
-    );
-    assert_eq!(
-        std::mem::align_of::<TestEntitlementsRepr>(),
-        std::mem::align_of::<Entitlements>()
-    );
+    /// Policy authority only: no delegation key, tracing-only audit.
+    #[must_use]
+    pub fn rbac_minimal() -> Self {
+        Self {
+            rbac: true,
+            audit_s3: false,
+            delegation: false,
+        }
+    }
 
-    // SAFETY: both source and mirror are `repr(C)` with the exact same field
-    // types and order. The owned value moves once and is dropped once. This
-    // helper is compiled only into integration-test binaries; no safe release
-    // constructor or alternate verification authority is exposed.
-    unsafe { std::mem::transmute(representation) }
+    /// Bootstrap api-key authority with tracing-only audit.
+    #[must_use]
+    pub fn bootstrap() -> Self {
+        Self {
+            rbac: false,
+            audit_s3: false,
+            delegation: false,
+        }
+    }
+
+    /// Bootstrap api-key authority with the durable S3 audit sink.
+    #[must_use]
+    pub fn bootstrap_with_durable_audit() -> Self {
+        Self {
+            rbac: false,
+            audit_s3: true,
+            delegation: false,
+        }
+    }
+
+    fn apply(self, config: &mut Config) {
+        config.security.rbac = self.rbac;
+        config.security.audit_s3 = self.audit_s3;
+    }
+
+    fn needs_signing_key(self) -> bool {
+        self.delegation || self.audit_s3
+    }
 }
 
 fn test_fragment_cache(config: &Config) -> Arc<WalFragmentCache> {
@@ -182,23 +187,13 @@ pub async fn start_test_audit(
     cleanup_scope: Option<&str>,
     security: &SecurityKernel,
 ) -> (AuditClient, AuditRuntime, String) {
-    let entitlements = test_entitlements(Feature::ALL);
-    start_test_audit_with_entitlements(
-        config,
-        store,
-        cleanup_scope,
-        &entitlements,
-        security,
-        Utc::now(),
-    )
-    .await
+    start_test_audit_at(config, store, cleanup_scope, security, Utc::now()).await
 }
 
-async fn start_test_audit_with_entitlements(
+async fn start_test_audit_at(
     config: &Config,
     store: &ZeppelinStore,
     cleanup_scope: Option<&str>,
-    entitlements: &Entitlements,
     security: &SecurityKernel,
     audit_now: DateTime<Utc>,
 ) -> (AuditClient, AuditRuntime, String) {
@@ -206,7 +201,7 @@ async fn start_test_audit_with_entitlements(
         Some(scope) => format!("test-node-{scope}-{}", uuid::Uuid::new_v4()),
         None => format!("test-node-{}", uuid::Uuid::new_v4()),
     };
-    let durable_audit_enabled = config.security.audit_s3 && entitlements.has(Feature::AuditS3);
+    let durable_audit_enabled = config.security.audit_s3;
     if durable_audit_enabled {
         security
             .install_object_signer(store)
@@ -440,14 +435,7 @@ pub async fn test_security_runtime(
     config: &mut Config,
     clock: &Clock,
 ) -> (Arc<SecurityKernel>, Arc<ApiKeyAdapter>, String) {
-    test_security_runtime_with_admin_bearer(
-        store,
-        config,
-        clock,
-        None,
-        Arc::new(test_entitlements(Feature::ALL)),
-    )
-    .await
+    test_security_runtime_with_admin_bearer(store, config, clock, None, TestSecurity::full()).await
 }
 
 /// Inject a freshly generated administrator into an enforced test config.
@@ -461,11 +449,11 @@ async fn test_security_runtime_with_admin_bearer(
     config: &mut Config,
     clock: &Clock,
     existing_admin_bearer: Option<&str>,
-    entitlements: Arc<Entitlements>,
+    security_profile: TestSecurity,
 ) -> (Arc<SecurityKernel>, Arc<ApiKeyAdapter>, String) {
+    security_profile.apply(config);
     let admin_bearer = inject_test_admin(config, existing_admin_bearer);
-    let delegation_key = if (entitlements.has(Feature::Delegation)
-        || entitlements.has(Feature::AuditS3))
+    let delegation_key = if security_profile.needs_signing_key()
         && config.security.token_signing_key_path.is_empty()
     {
         let file = tempfile::NamedTempFile::new().expect("delegation test key file");
@@ -481,14 +469,10 @@ async fn test_security_runtime_with_admin_bearer(
     } else {
         None
     };
-    let (security, credential_adapter) = SecurityKernel::from_resolved_entitlements(
-        store.clone(),
-        &config.security,
-        clock.clone(),
-        entitlements,
-    )
-    .await
-    .expect("test security authority must compose");
+    let (security, credential_adapter) =
+        SecurityKernel::compose(store.clone(), &config.security, clock.clone())
+            .await
+            .expect("test security authority must compose");
     drop(delegation_key);
     (security, credential_adapter, admin_bearer)
 }
@@ -668,10 +652,10 @@ pub async fn start_test_server_with_config_no_limit_override(
     start_test_server_with_config_inner(config_override, false, None).await
 }
 
-/// Start a test server with an explicit composition-root entitlement set.
-pub async fn start_test_server_with_entitlements(
+/// Start a test server with an explicit security composition profile.
+pub async fn start_test_server_with_security(
     config: Config,
-    entitlements: Entitlements,
+    security: TestSecurity,
 ) -> (
     String,
     TestHarness,
@@ -679,13 +663,13 @@ pub async fn start_test_server_with_entitlements(
     tempfile::TempDir,
     String,
 ) {
-    start_test_server_with_config_inner(Some(config), true, Some(entitlements)).await
+    start_test_server_with_config_inner(Some(config), true, Some(security)).await
 }
 
 async fn start_test_server_with_config_inner(
     config_override: Option<Config>,
     override_rate_limits: bool,
-    entitlements_override: Option<Entitlements>,
+    security_override: Option<TestSecurity>,
 ) -> (
     String,
     TestHarness,
@@ -702,15 +686,14 @@ async fn start_test_server_with_config_inner(
         configure_test_server_limits(&mut config);
     }
     let clock = Clock::system();
-    let entitlements =
-        Arc::new(entitlements_override.unwrap_or_else(|| test_entitlements(Feature::ALL)));
+    let security_profile = security_override.unwrap_or_else(TestSecurity::full);
     let security_store = scoped_test_security_store(&harness.store, &harness.prefix);
     let (security, credential_adapter, admin_bearer) = test_security_runtime_with_admin_bearer(
         &security_store,
         &mut config,
         &clock,
         None,
-        Arc::clone(&entitlements),
+        security_profile,
     )
     .await;
     let cache_dir = tempfile::TempDir::new().unwrap();
@@ -726,11 +709,10 @@ async fn start_test_server_with_config_inner(
     let compactor = compactor(&config, &harness.store, &clock, &security);
     let lease_manager = lease_manager(&config, &harness.store, &clock);
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
-    let (audit, audit_runtime, _audit_node_id) = start_test_audit_with_entitlements(
+    let (audit, audit_runtime, _audit_node_id) = start_test_audit_at(
         &config,
         &harness.store,
         Some(&harness.prefix),
-        &entitlements,
         &security,
         clock.now(),
     )
@@ -845,7 +827,7 @@ pub async fn start_test_server_on_store_with_readiness(
         &mut config,
         &clock,
         Some(&admin_bearer),
-        Arc::new(test_entitlements(Feature::ALL)),
+        TestSecurity::full(),
     )
     .await;
     let cache_dir = tempfile::TempDir::new().unwrap();
@@ -1765,14 +1747,14 @@ pub async fn start_test_server_full_without_rate_limit_override_and_admin_bearer
     .await
 }
 
-/// Starts the full server with an explicit clock and entitlement set.
+/// Starts the full server with an explicit clock and security profile.
 #[allow(clippy::too_many_arguments)]
-pub async fn start_test_server_full_with_entitlements(
+pub async fn start_test_server_full_with_security(
     store: ZeppelinStore,
     namespace_name_prefix: Option<String>,
     config: Config,
     clock: Clock,
-    entitlements: Entitlements,
+    security: TestSecurity,
 ) -> FullTestServer {
     start_test_server_full_with_disk_cache_max_bytes_inner(
         store,
@@ -1783,7 +1765,7 @@ pub async fn start_test_server_full_with_entitlements(
         100 * 1024 * 1024,
         None,
         None,
-        Some(entitlements),
+        Some(security),
         None,
         None,
         true,
@@ -1801,7 +1783,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     disk_cache_max_bytes: u64,
     existing_admin_bearer: Option<&str>,
     credential_adapter_override: Option<Arc<dyn CredentialAdapter>>,
-    entitlements_override: Option<Entitlements>,
+    security_override: Option<TestSecurity>,
     encoder_provider_override: Option<Arc<dyn MultiVectorEncoderProvider>>,
     object_store_counter: Option<GetCounter>,
     override_rate_limits: bool,
@@ -1811,8 +1793,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         configure_test_server_limits(&mut config);
     }
     let clock = clock.unwrap_or_else(Clock::system);
-    let entitlements =
-        Arc::new(entitlements_override.unwrap_or_else(|| test_entitlements(Feature::ALL)));
+    let security_profile = security_override.unwrap_or_else(TestSecurity::full);
     let security_store = namespace_name_prefix.as_deref().map_or_else(
         || store.clone(),
         |scope| scoped_test_security_store(&store, scope),
@@ -1835,7 +1816,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         &mut config,
         &clock,
         existing_admin_bearer,
-        Arc::clone(&entitlements),
+        security_profile,
     )
     .await;
     let credential_adapter: Arc<dyn CredentialAdapter> =
@@ -1915,11 +1896,10 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     let encoder_provider =
         encoder_provider_override.unwrap_or_else(|| test_encoder_provider(&config, &store));
     let shutdown_timeout = Duration::from_secs(config.server.shutdown_timeout_secs);
-    let (audit, audit_runtime, audit_node_id) = start_test_audit_with_entitlements(
+    let (audit, audit_runtime, audit_node_id) = start_test_audit_at(
         &config,
         &store,
         namespace_name_prefix.as_deref(),
-        &entitlements,
         &security,
         clock.now(),
     )
