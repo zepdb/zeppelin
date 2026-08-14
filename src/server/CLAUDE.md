@@ -76,4 +76,4 @@ synchronous delete; tests must poll or drive `resume_delete`.
 ## See also
 
 - `../namespace/CLAUDE.md` — the governed delete state machine
-- `../security/CLAUDE.md` — kernel admission, entitlements, audit
+- `../security/CLAUDE.md` — kernel admission, configured composition, audit

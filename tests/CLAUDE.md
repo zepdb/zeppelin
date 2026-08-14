@@ -26,8 +26,8 @@ mc alias set zeptest http://127.0.0.1:9000 minioadmin minioadmin
 mc mb --ignore-existing zeptest/zeppelin-test
 ```
 
-Signed-license startup tests additionally need an isolated
-`ZEPPELIN_LICENSE_TEST_BUCKET`.
+The rbac startup test additionally needs an isolated
+`ZEPPELIN_RBAC_TEST_BUCKET`.
 
 ## Tests that hard-require MinIO
 
@@ -59,10 +59,11 @@ invocation plus MinIO.
   — fails under full-suite parallel load against a single local MinIO; passes
   in isolation. Reproduced identically on a pre-2026-08-12 baseline, so it is
   load-timing, not a regression.
-- `security::policy_publication::tests::*` (2) and
-  `startup::tests::licensed_file_boot_enables_rbac_routes` — fail under
+- `security::policy_publication::tests::*` (2) — fail under
   `cargo test --lib` without MinIO because the `Local` backend has no ETag
   CAS. See `../src/security/CLAUDE.md`.
+  (`startup::tests::rbac_config_boot_enables_rbac_routes` also needs MinIO
+  but skips rather than fails.)
 
 ## Branching gate
 

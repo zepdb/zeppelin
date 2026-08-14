@@ -50,20 +50,11 @@ locked product decision, not a gap — see
 
 ### Gating
 
-Branching is **off by default** and needs *two* independent things:
-
-1. `config.branching.enabled = true` — controls whether routes are registered
-   at all (`server/mod.rs:2742`);
-2. a valid `Feature::Branching` entitlement.
-
-Both paths enforce both gates. `create_branch` and `list_branches` each check
-`config.branching.enabled` in the handler, and `authorize_namespace_fork` /
-`authorize_branch_list` each check the entitlement in `security/kernel.rs`.
-Keep new branch routes on this shape.
-
-> Corrected 2026-07-24. An earlier revision claimed `list_branches` and
-> `authorize_branch_list` checked only the config flag. That was already false
-> when written: the kernel check landed in `4f8583c`.
+Branching is **off by default**; `config.branching.enabled = true` is the
+gate. It controls whether routes are registered at all (`server/mod.rs`), and
+`create_branch` / `list_branches` each re-check it in the handler as defense
+in depth. Keep new branch routes on this shape. (The former license
+entitlement gate was removed in 2026-08.)
 
 ## `/readyz` reads a snapshot; it does not scan
 

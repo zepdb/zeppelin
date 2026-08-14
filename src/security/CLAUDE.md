@@ -1,4 +1,4 @@
-# src/security — kernel, policy, entitlements, audit
+# src/security — kernel, policy, audit
 
 Everything here is fail-closed by design. When in doubt, deny and return a
 typed error; do not add a permissive default.
@@ -12,52 +12,39 @@ typed error; do not add a permissive default.
   document in `_security/`, its S3-backed head, and the read cache.
 - `policy_publication.rs` — the global publication lease (fencing token +
   ETag CAS). Added by the branching activation work.
-- `entitlements.rs` / `license.rs` — Ed25519-signed licensed features.
 - `preservation.rs` — legal-hold / destruction guards.
 - `audit.rs`, `audit_sink.rs`, `audit_chain.rs` — durable audit.
 - `delegation.rs` — delegated credentials and object signing.
 
-## Entitlements
+## Configured composition
 
-`Feature` has 8 variants in a **stable bit-assignment order** (`Feature::ALL`).
-Append new variants at the end.
+Licensing was removed in 2026-08; no feature is gated behind a license. The
+kernel's composition is driven entirely by config (`SecurityKernel::compose`):
 
-Be precise about what breaks what. A signed license carries feature *names*
-(serde `rename_all = "snake_case"`), and `feature_bits` is recomputed from
-those names on every boot — it is never persisted or signed. So:
+- `security.rbac = true` (requires `mode = "enforced"`) selects the
+  S3-authoritative policy store; false keeps bootstrap api-key grants. The
+  RBAC routes are always registered with real handlers — on a bootstrap boot
+  the kernel's admin methods return `FeatureDisabled("rbac")` → 403
+  `feature_disabled`.
+- Delegation composes exactly when `security.token_signing_key_path` is
+  non-empty on an rbac boot. An empty path means "delegation off", not a boot
+  error; a *bad* key file is still a loud boot failure.
+- Preservation always composes on the rbac path and never under bootstrap
+  authority (bootstrap `*` grants carry the preservation actions, but the
+  service is absent, so guards return unlocked and the endpoints return
+  `FeatureDisabled("preservation")`).
+- Durable S3 audit is gated purely by `security.audit_s3` (config validation
+  requires a signing key with it; startup requires an S3-class backend).
 
-- **Renaming** a variant invalidates every issued license naming that feature.
-- **Reordering** does *not* break signature verification. It silently
-  reassigns every in-memory bit index, and it breaks the `#[repr(C)]` layout
-  mirror that `tests/common/server.rs` transmutes into. Still forbidden — the
-  failure is just quieter than a signature error.
-- The `u16` mask caps the inventory at **16** features.
+Enforce feature availability in the **kernel**, not only in the handler — a
+handler-only check is easy to bypass from a new call site. Delegation and
+preservation check their composed service in the kernel; RBAC administration
+rejects on the `SecurityAuthority::Bootstrap` arm.
 
-> Corrected 2026-07-24. An earlier revision said "reordering invalidates
-> existing licenses." That conflates the two failure modes; renaming is what
-> invalidates a license.
-
-Enforce entitlements in the **kernel**, not only in the handler — a handler-only
-check is easy to bypass from a new call site.
-
-Branching is currently symmetric and kernel-enforced. `Feature::Branching` is
-checked in four `kernel.rs` functions: `authorize_namespace_fork`,
-`authorize_branch_list`, `fresh_current_fork_authorization`, and
-`fresh_loaded_policy_fork_authorization`. The handler-side config flag in
-`server/handlers/namespace.rs` is a second, independent gate — not the only
-one. Keep any new branch-adjacent authority on the same pattern.
-
-Not every feature is kernel-enforced, though. `Feature::Rbac` is gated **only**
-by route selection in `server/mod.rs::security_routes`; the kernel's admin
-methods carry no `Rbac` check. The backstop is indirect: an unlicensed boot
-builds `SecurityAuthority::Bootstrap`, whose admin arms return
-`InvalidPolicyRequest` → 400, not 403 `feature_not_licensed`. Delegation and
-preservation *do* re-check their feature in the kernel.
-
-> Corrected 2026-07-24. An earlier revision of this file claimed
-> `authorize_branch_list` relied on the handler's config flag alone. That was
-> already false when written: the kernel check landed in `4f8583c`. Verify
-> against the code before trusting a gap claim here.
+Branching has no kernel-side gate anymore; `config.branching.enabled` (route
+registration + handler re-check) is the only gate. If a new branch-adjacent
+surface needs authority beyond namespace grants, add a kernel check rather
+than a handler check.
 
 ## The policy publication lease and the `Local` backend
 
@@ -77,7 +64,9 @@ That is why these are red without MinIO:
 
 - `security::policy_publication::tests::missing_acquisition_is_create_only_and_release_keeps_a_cas_record`
 - `security::policy_publication::tests::expired_takeover_increments_token_and_stale_release_cannot_overwrite`
-- `startup::tests::licensed_file_boot_enables_rbac_routes`
+
+(`startup::tests::rbac_config_boot_enables_rbac_routes` needs MinIO too, but
+skips rather than fails on other backends.)
 
 `Local` is documented as development/testing only, so production (S3/MinIO) is
 unaffected — but do not assume `cargo test --lib` being red means your change
@@ -99,8 +88,8 @@ TEST_BACKEND=minio cargo test --test security_branching_tests \
   --test security_policy_tests --test security_preservation_tests
 ```
 
-Signed-license startup tests need an isolated bucket via
-`ZEPPELIN_LICENSE_TEST_BUCKET` when run against MinIO.
+The rbac startup test needs an isolated bucket via
+`ZEPPELIN_RBAC_TEST_BUCKET` when run against MinIO.
 
 ## See also
 

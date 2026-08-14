@@ -38,9 +38,9 @@ QPS.
 - **Late-interaction retrieval** -- Multi-vector MaxSim with asynchronous semantic enrichment and RRF fusion
 - **Bitmap pre-filters** -- RoaringBitmap indexes for sub-millisecond attribute filtering
 - **Write-ahead log** -- Durable writes with compaction into indexed segments
-- **Namespace forks** -- Disabled-by-default, licensed copy-on-write branching; fork only, no merge
+- **Namespace forks** -- Disabled-by-default copy-on-write branching; fork only, no merge
 - **Strong & eventual consistency** -- Choose per-query (see [Consistency semantics](#consistency-semantics))
-- **Licensed security suite** -- Fail-closed authorization kernel, RBAC, durable audit log, delegation tokens, and preservation holds
+- **Security suite** -- Fail-closed authorization kernel, RBAC, durable audit log, delegation tokens, and preservation holds
 - **Object storage** -- S3, MinIO, and S3-compatible backends. GCS and Azure planned
 - **Sizing advisor** -- Ranked hardware recommendations and validated, tuned configs from an embedded cloud pricing catalog (see [Sizing advisor](#sizing-advisor))
 
@@ -51,8 +51,8 @@ Zeppelin is pre-1.0 software under active development:
 - **No on-disk format stability guarantee yet.** Stored artifacts may
   change between pre-1.0 versions without migration tooling. Artifacts are
   immutable within a version.
-- **Namespace branching is disabled by default**, gated behind a signed
-  license, and its release validation gates are not yet complete.
+- **Namespace branching is disabled by default** (`branching.enabled`), and
+  its release validation gates are not yet complete.
 - **GCS and Azure backends are planned, not implemented.** S3 and
   S3-compatible stores are the supported substrates today.
 - Published performance numbers are loopback-MinIO measurements, not
@@ -300,21 +300,22 @@ tables below are a complete index of the served routes.
 
 ### Security
 
-These routes are always registered, but each is gated by a licensed feature and
-returns a not-licensed error without it. Configure via the `[security]`
-section in [`zeppelin.toml.example`](zeppelin.toml.example).
+These routes are always registered; each is backed by a service composed from
+configuration and returns a 403 `feature_disabled` error when its surface is
+not enabled. Configure via the `[security]` section in
+[`zeppelin.toml.example`](zeppelin.toml.example).
 
-| Method             | Path                                            | Entitlement  |
-|--------------------|-------------------------------------------------|--------------|
-| `GET/POST`         | `/v1/security/principals`                       | RBAC         |
-| `GET/POST`         | `/v1/security/keys`                             | RBAC         |
-| `DELETE`           | `/v1/security/keys/:key_id`                     | RBAC         |
-| `POST`             | `/v1/security/keys/:key_id/rotate`              | RBAC         |
-| `GET/POST/DELETE`  | `/v1/security/grants`                           | RBAC         |
-| `GET`              | `/v1/security/policy`                           | RBAC         |
-| `POST`             | `/v1/security/tokens`                           | Delegation   |
-| `GET/POST`         | `/v1/security/preservation`                     | Preservation |
-| `POST`             | `/v1/security/preservation/:lock_id/release`    | Preservation |
+| Method             | Path                                            | Enabled by                              |
+|--------------------|-------------------------------------------------|-----------------------------------------|
+| `GET/POST`         | `/v1/security/principals`                       | `security.rbac`                         |
+| `GET/POST`         | `/v1/security/keys`                             | `security.rbac`                         |
+| `DELETE`           | `/v1/security/keys/:key_id`                     | `security.rbac`                         |
+| `POST`             | `/v1/security/keys/:key_id/rotate`              | `security.rbac`                         |
+| `GET/POST/DELETE`  | `/v1/security/grants`                           | `security.rbac`                         |
+| `GET`              | `/v1/security/policy`                           | `security.rbac`                         |
+| `POST`             | `/v1/security/tokens`                           | `security.rbac` + `token_signing_key_path` |
+| `GET/POST`         | `/v1/security/preservation`                     | `security.rbac`                         |
+| `POST`             | `/v1/security/preservation/:lock_id/release`    | `security.rbac`                         |
 
 ## API Clients
 

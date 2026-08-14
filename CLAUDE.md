@@ -33,7 +33,7 @@ Zeppelin is an S3-native vector search engine. Object storage is the source of t
 - `src/cache/` — local disk cache. LRU eviction, pinned centroids.
 - `src/compaction/` — background WAL → segment compaction.
 - `src/server/` — axum HTTP handlers. Thin layer over domain logic.
-- `src/security/` — kernel, policy, entitlements, audit. Fail-closed.
+- `src/security/` — kernel, policy, audit. Fail-closed.
 - `src/fts/` — BM25 lexical retrieval.
 
 ### Per-module guides
@@ -52,7 +52,7 @@ before you start** — they exist to stop rediscovery of bugs already paid for.
 | [`src/cache/CLAUDE.md`](src/cache/CLAUDE.md) | disposability, hydration's branch-safety contract |
 | [`src/fts/CLAUDE.md`](src/fts/CLAUDE.md) | `bm25_term_score` arg order, the two index shapes, tokenizer rules |
 | [`src/server/CLAUDE.md`](src/server/CLAUDE.md) | axum 0.7 syntax, router split, gated routes |
-| [`src/security/CLAUDE.md`](src/security/CLAUDE.md) | entitlements, the policy publication lease |
+| [`src/security/CLAUDE.md`](src/security/CLAUDE.md) | configured composition, the policy publication lease |
 | [`tests/CLAUDE.md`](tests/CLAUDE.md) | `TEST_BACKEND`, MinIO setup, known-flaky list |
 
 Size hints for orientation: `wal/manifest.rs` (~9.5k), `compaction/gc.rs`
@@ -74,10 +74,11 @@ Most integration tests need real object storage. `TEST_BACKEND` defaults to
 `memory`; use `minio` for anything CAS-, concurrency-, or origin-shaped. MinIO
 runs natively without Docker — see [`tests/CLAUDE.md`](tests/CLAUDE.md).
 
-**`cargo test --lib` is not green without MinIO.** Three tests
-(2× `security::policy_publication`, 1× `startup::licensed_file_boot_enables_rbac_routes`)
-fail with `Storage(NotImplemented)` because the `Local` backend has no ETag
-CAS. Confirm a failure isn't one of these before debugging it.
+**`cargo test --lib` is not green without MinIO.** Two tests
+(2× `security::policy_publication`) fail with `Storage(NotImplemented)`
+because the `Local` backend has no ETag CAS. Confirm a failure isn't one of
+these before debugging it. (`startup::rbac_config_boot_enables_rbac_routes`
+skips instead of failing when `TEST_BACKEND` is not `minio`.)
 
 ## Where the plans live
 
