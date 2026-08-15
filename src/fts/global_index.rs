@@ -83,9 +83,9 @@ use crate::fts::inverted_index::InvertedIndex;
 use crate::index::topk::partial_topk_by;
 
 /// Five-byte artifact discriminator preceding every global FTS payload.
-const ZGFTS_MAGIC: &[u8; 5] = b"ZGFTS";
+pub(crate) const ZGFTS_MAGIC: &[u8; 5] = b"ZGFTS";
 /// Version byte written by the current global FTS encoder.
-const ZGFTS_VERSION: u8 = 1;
+pub(crate) const ZGFTS_VERSION: u8 = 1;
 
 /// Orders global hits by descending score, cluster, and position.
 ///

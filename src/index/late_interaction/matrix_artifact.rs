@@ -20,8 +20,8 @@ use crate::types::VectorId;
 
 use super::matrix::MultiVectorMatrixRef;
 
-const MATRIX_BLOCK_MAGIC: &[u8; 4] = b"ZMB1";
-const MATRIX_BLOCK_VERSION: u8 = 1;
+pub(crate) const MATRIX_BLOCK_MAGIC: &[u8; 4] = b"ZMB1";
+pub(crate) const MATRIX_BLOCK_VERSION: u8 = 1;
 const MATRIX_BLOCK_HEADER_LEN: usize =
     4 + 1 + 1 + size_of::<u16>() + 32 + 32 + 2 * size_of::<u32>() + 3 * size_of::<u64>() + 2 * 32;
 const MATRIX_BLOCK_DIRECTORY_FIXED_LEN: usize =
@@ -470,11 +470,10 @@ pub(crate) fn decode_matrix_block(
     {
         return Err(invalid_block("matrix block size or checksum mismatch"));
     }
+    probe_matrix_block_format(bytes)?;
     let mut reader = BlockReader::new(bytes);
     reader.expect(MATRIX_BLOCK_MAGIC)?;
-    if reader.read_u8()? != MATRIX_BLOCK_VERSION {
-        return Err(invalid_block("unsupported matrix block version"));
-    }
+    reader.read_u8()?;
     let dtype = matrix_dtype_from_header(reader.read_u8()?, reader.read_u16()?)?;
     let semantic_epoch = MultiVectorEpochId::new(reader.read_array()?);
     let fde_generation = FdeGenerationId::new(reader.read_array()?);
@@ -616,6 +615,19 @@ pub(crate) fn decode_matrix_block(
         ));
     }
     Ok(rows)
+}
+
+pub(crate) fn probe_matrix_block_format(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < 5 || &bytes[..4] != MATRIX_BLOCK_MAGIC {
+        return Err(invalid_block("invalid matrix block magic or header"));
+    }
+    let version = bytes[4];
+    if version != MATRIX_BLOCK_VERSION {
+        return Err(invalid_block(format!(
+            "unsupported matrix block version {version}; this binary reads version {MATRIX_BLOCK_VERSION}"
+        )));
+    }
+    Ok(())
 }
 
 fn invalid_block(reason: impl Into<String>) -> ZeppelinError {

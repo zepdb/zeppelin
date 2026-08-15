@@ -41,9 +41,9 @@ use crate::wal::manifest::{CoarsePayloadEncoding, LocatedSegmentRef};
 use crate::wal::Manifest;
 
 const CACHE_KEY_VERSION: &str = "v2";
-const SCOPED_ANN_DESCRIPTOR_VERSION: u32 = 4;
-const SCOPED_FTS_ARTIFACT_VERSION: u32 = 1;
-const SCOPED_FTS_MAGIC: &[u8; 5] = b"ZSFT1";
+pub(crate) const SCOPED_ANN_DESCRIPTOR_VERSION: u32 = 4;
+pub(crate) const SCOPED_FTS_ARTIFACT_VERSION: u32 = 1;
+pub(crate) const SCOPED_FTS_MAGIC: &[u8; 5] = b"ZSFT1";
 
 /// Failures specific to policy-scope retrieval artifact construction and use.
 #[derive(Debug, Error)]
@@ -890,6 +890,22 @@ impl ScopedAnnDescriptor {
     }
 }
 
+pub(crate) fn probe_scoped_ann_descriptor(bytes: &[u8]) -> Result<()> {
+    let descriptor: ScopedAnnDescriptor =
+        serde_json::from_slice(bytes).map_err(RetrievalScopeError::Serialization)?;
+    let scope_cache_key = descriptor.scope_cache_key.clone();
+    let artifact_namespace = descriptor.artifact_namespace.clone();
+    ScopedAnnDescriptor::from_bytes(bytes, &scope_cache_key, &artifact_namespace).map(drop)
+}
+
+#[cfg(test)]
+pub(crate) fn scoped_ann_descriptor_fixture(version: u32) -> Result<Bytes> {
+    let mut descriptor =
+        ScopedAnnDescriptor::empty("format-probe", "format/segments/probe".to_string(), 1);
+    descriptor.version = version;
+    descriptor.to_bytes()
+}
+
 /// Policy-corpus BM25 index whose caller filter only narrows scored candidates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ScopedFtsIndex {
@@ -1116,6 +1132,35 @@ impl ScopedFtsIndex {
             .saturating_add(rows)
             .saturating_add(postings)
     }
+}
+
+pub(crate) fn probe_scoped_fts_artifact(bytes: &[u8]) -> Result<()> {
+    if !bytes.starts_with(SCOPED_FTS_MAGIC) {
+        return Err(scope_integrity("scoped FTS artifact magic mismatch"));
+    }
+    let artifact: ScopedFtsArtifact = serde_json::from_slice(&bytes[SCOPED_FTS_MAGIC.len()..])
+        .map_err(RetrievalScopeError::Serialization)?;
+    ScopedFtsIndex::from_bytes(bytes, &artifact.scope_cache_key).map(drop)
+}
+
+#[cfg(test)]
+pub(crate) fn scoped_fts_artifact_fixture(version: u32) -> Result<Bytes> {
+    let artifact = ScopedFtsArtifact {
+        version,
+        scope_cache_key: "format-probe".to_string(),
+        index: ScopedFtsIndex {
+            rows: Vec::new(),
+            index: InvertedIndex {
+                vector_count: 0,
+                fields: BTreeMap::new(),
+            },
+        },
+    };
+    let json = serde_json::to_vec(&artifact).map_err(RetrievalScopeError::Serialization)?;
+    let mut bytes = Vec::with_capacity(SCOPED_FTS_MAGIC.len() + json.len());
+    bytes.extend_from_slice(SCOPED_FTS_MAGIC);
+    bytes.extend_from_slice(&json);
+    Ok(Bytes::from(bytes))
 }
 
 async fn encode_scoped_fts(

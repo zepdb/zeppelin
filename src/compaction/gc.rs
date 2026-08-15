@@ -141,7 +141,7 @@ use crate::wal::manifest::{
 use crate::wal::Lease;
 
 /// Persisted JSON wrapper version written for new candidate ledgers.
-const GC_CANDIDATE_STORE_VERSION: u32 = 1;
+pub(crate) const GC_CANDIDATE_STORE_VERSION: u32 = 1;
 
 /// Maximum fresh-read/CAS attempts made while pruning `pending_deletes`.
 const GC_MANIFEST_CAS_RETRIES: usize = 10;
@@ -2540,6 +2540,10 @@ fn decode_candidate_ledger(data: &[u8]) -> Result<LoadedCandidateLedger> {
             Err(_) => Err(wrapper_error.into()),
         },
     }
+}
+
+pub(crate) fn probe_gc_candidate_ledger(data: &[u8]) -> Result<()> {
+    decode_candidate_ledger(data).map(drop)
 }
 
 /// Computes the next ledger from LIST output, reachability, and existing marks.

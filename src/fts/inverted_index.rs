@@ -87,7 +87,7 @@ use crate::types::AttributeValue;
 ///
 /// The header lets a decoder reject a different artifact type before asking
 /// Serde to interpret its payload.
-const ZFTS_MAGIC: &[u8; 4] = b"ZFTS";
+pub(crate) const ZFTS_MAGIC: &[u8; 4] = b"ZFTS";
 /// Only cluster-local FTS artifact version accepted by this decoder and by
 /// manifest references to late-segment FTS objects.
 ///

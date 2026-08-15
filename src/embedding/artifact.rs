@@ -19,9 +19,9 @@ use super::{
     MultiVectorEpochId,
 };
 
-const MATRIX_MAGIC: &[u8; 4] = b"ZME1";
-const FDE_MAGIC: &[u8; 4] = b"ZFD1";
-const CENTERING_MAGIC: &[u8; 4] = b"ZCM1";
+pub(crate) const MATRIX_MAGIC: &[u8; 4] = b"ZME1";
+pub(crate) const FDE_MAGIC: &[u8; 4] = b"ZFD1";
+pub(crate) const CENTERING_MAGIC: &[u8; 4] = b"ZCM1";
 const MATRIX_DTYPE_F16: u8 = 1;
 const MATRIX_DTYPE_INT8_SYM_V1: u8 = 2;
 const F32_LE_ENCODING: u8 = 1;
@@ -1312,8 +1312,11 @@ impl<'a> ArtifactReader<'a> {
     }
 
     fn expect_u8(&mut self, expected: u8, reason: &str) -> Result<()> {
-        if self.read_u8()? != expected {
-            return Err(artifact_error(reason.to_string()));
+        let actual = self.read_u8()?;
+        if actual != expected {
+            return Err(artifact_error(format!(
+                "{reason}: expected {expected}, got {actual}"
+            )));
         }
         Ok(())
     }

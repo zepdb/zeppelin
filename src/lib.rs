@@ -213,6 +213,7 @@ pub mod embedding;
 /// namespace, index, and HTTP-facing failures. Callers match variants or use the
 /// response classification helpers rather than parsing error strings.
 pub mod error;
+pub(crate) mod format;
 /// Tokenization, BM25 scoring, rank expressions, immutable inverted indexes, and WAL scans.
 ///
 /// [`fts::FtsFieldConfig`] defines compatible build/query tokenization. Segment

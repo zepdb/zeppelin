@@ -101,5 +101,7 @@ selection and score ordering shared by both implementations.
 
 ## See also
 
+- [`../format.rs`](../format.rs) — the complete persisted-format registry and
+  decoder compatibility matrix
 - `../compaction/CLAUDE.md` — who invokes the builders
 - `tasks/` — recall investigations and quantization plans

@@ -16,8 +16,8 @@ use crate::error::{Result, ZeppelinError};
 use crate::storage::NamespaceObjectFamily;
 use crate::types::{AttributeValue, VectorId};
 
-const INPUT_WAL_MAGIC: &[u8; 4] = b"ZIW1";
-const INPUT_WAL_VERSION: u8 = 1;
+pub(crate) const INPUT_WAL_MAGIC: &[u8; 4] = b"ZIW1";
+pub(crate) const INPUT_WAL_VERSION: u8 = 1;
 
 /// One immutable batch of typed retrieval-unit mutations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

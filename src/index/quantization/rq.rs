@@ -10,8 +10,8 @@ use thiserror::Error;
 use super::rabitq::{self, QueryAdc4, RabitqError, StructuredRotation, TwoBitFactors, BLOCK_DIM};
 use crate::types::DistanceMetric;
 
-const RQ_MAGIC: &[u8; 4] = b"ZRQ1";
-const RQ_VERSION: u8 = 1;
+pub(crate) const RQ_MAGIC: &[u8; 4] = b"ZRQ1";
+pub(crate) const RQ_VERSION: u8 = 1;
 const RQ_HEADER_LEN: usize = RQ_MAGIC.len() + 1 + 2 * std::mem::size_of::<u64>();
 const FACTOR_BYTES: usize = 2 * std::mem::size_of::<f32>();
 

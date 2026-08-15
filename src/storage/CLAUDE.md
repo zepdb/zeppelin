@@ -108,6 +108,8 @@ and `tests/artifact_origin_tests.rs`.
 
 ## See also
 
+- [`../format.rs`](../format.rs) — the complete persisted-format registry and
+  decoder compatibility matrix
 - `capabilities.rs` rustdoc — the full matrix and `canonical_etag`
 - `../wal/CLAUDE.md` — who calls `put_if_match` and why
 - `../namespace/CLAUDE.md` — governed deletion, which drives the paged delete

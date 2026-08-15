@@ -35,3 +35,11 @@ TEST_BACKEND=minio cargo test --tests
 
 Module-level invariants live in per-directory `CLAUDE.md` files (for
 example `src/wal/CLAUDE.md`) — read the one for the module you are editing.
+
+## Format changes
+
+Any persisted-format change must bump the corresponding row in the
+[`src/format.rs` registry](src/format.rs), add an explicit decoder arm for the
+new accepted version, and add or update its golden fixture in the compatibility
+corpus introduced by plan 16. Never reinterpret an unknown version as an older
+layout.

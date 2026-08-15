@@ -25,9 +25,9 @@ use crate::types::{AttributeValue, Filter, VectorId};
 
 use super::matrix_artifact::MatrixBlockLocator;
 
-const BOOTSTRAP_MAGIC: &[u8; 4] = b"ZLB1";
-const CLUSTER_MAGIC: &[u8; 4] = b"ZLC1";
-const CANDIDATE_ARTIFACT_VERSION: u8 = 1;
+pub(crate) const BOOTSTRAP_MAGIC: &[u8; 4] = b"ZLB1";
+pub(crate) const CLUSTER_MAGIC: &[u8; 4] = b"ZLC1";
+pub(crate) const CANDIDATE_ARTIFACT_VERSION: u8 = 1;
 const ENVELOPE_HEADER_LEN: usize = 4 + 1 + size_of::<u64>();
 
 /// Persisted candidate-artifact format version.
@@ -1347,13 +1347,29 @@ fn encode_envelope<T: Serialize>(magic: &[u8; 4], wire: &T, label: &str) -> Resu
     Ok(bytes.freeze())
 }
 
-fn decode_envelope<T: DeserializeOwned>(bytes: &[u8], magic: &[u8; 4], label: &str) -> Result<T> {
+pub(crate) fn probe_candidate_bootstrap_format(bytes: &[u8]) -> Result<()> {
+    validate_envelope_header(bytes, BOOTSTRAP_MAGIC, "candidate bootstrap")
+}
+
+pub(crate) fn probe_candidate_cluster_format(bytes: &[u8]) -> Result<()> {
+    validate_envelope_header(bytes, CLUSTER_MAGIC, "candidate cluster")
+}
+
+fn validate_envelope_header(bytes: &[u8], magic: &[u8; 4], label: &str) -> Result<()> {
     if bytes.len() < ENVELOPE_HEADER_LEN || &bytes[..4] != magic {
         return Err(candidate_error(format!("invalid {label} magic or header")));
     }
-    if bytes[4] != CANDIDATE_ARTIFACT_VERSION {
-        return Err(candidate_error(format!("unsupported {label} version")));
+    let version = bytes[4];
+    if version != CANDIDATE_ARTIFACT_VERSION {
+        return Err(candidate_error(format!(
+            "unsupported {label} version {version}; this binary reads version {CANDIDATE_ARTIFACT_VERSION}"
+        )));
     }
+    Ok(())
+}
+
+fn decode_envelope<T: DeserializeOwned>(bytes: &[u8], magic: &[u8; 4], label: &str) -> Result<T> {
+    validate_envelope_header(bytes, magic, label)?;
     let mut length_bytes = [0_u8; size_of::<u64>()];
     length_bytes.copy_from_slice(&bytes[5..ENVELOPE_HEADER_LEN]);
     let payload_len = usize::try_from(u64::from_le_bytes(length_bytes))

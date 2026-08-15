@@ -28,12 +28,12 @@ use crate::index::late_interaction::{
 use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
 use crate::storage::{CreateOnlyOutcome, NamespaceObjectFamily, NamespaceObjectKey, ZeppelinStore};
 
-const LATE_STATE_MAGIC: &[u8; 4] = b"ZLS1";
-const LATE_STATE_VERSION_V1: u8 = 1;
-const LATE_STATE_VERSION_V2: u8 = 2;
-const LATE_STATE_VERSION_V3: u8 = 3;
-const LATE_STATE_VERSION_V4: u8 = 4;
-const LATE_STATE_VERSION_V5: u8 = 5;
+pub(crate) const LATE_STATE_MAGIC: &[u8; 4] = b"ZLS1";
+pub(crate) const LATE_STATE_VERSION_V1: u8 = 1;
+pub(crate) const LATE_STATE_VERSION_V2: u8 = 2;
+pub(crate) const LATE_STATE_VERSION_V3: u8 = 3;
+pub(crate) const LATE_STATE_VERSION_V4: u8 = 4;
+pub(crate) const LATE_STATE_VERSION_V5: u8 = 5;
 
 /// Persisted section format version carried by root-manifest references.
 pub const LATE_STATE_FORMAT_VERSION: u32 = 5;

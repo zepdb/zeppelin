@@ -168,7 +168,7 @@ fn checksum_hex(checksum: &[u8; 32]) -> String {
 ///
 /// The byte precedes both live manifests and named snapshot pins. Legacy JSON
 /// objects have no prefix and begin with `{`.
-const MANIFEST_FORMAT_MSGPACK: u8 = 0x01;
+pub(crate) const MANIFEST_FORMAT_MSGPACK: u8 = 0x01;
 
 /// Manifest metadata for one immutable WAL fragment in object storage.
 ///

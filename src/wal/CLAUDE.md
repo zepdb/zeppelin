@@ -92,5 +92,7 @@ This looks like dead code and is not; leave it alone.
 
 ## See also
 
+- [`../format.rs`](../format.rs) — the complete persisted-format registry and
+  decoder compatibility matrix
 - `../storage/CLAUDE.md` — CAS mechanics and the `Local`-backend limitation
 - `../compaction/CLAUDE.md` — who replaces fragment refs with segment refs

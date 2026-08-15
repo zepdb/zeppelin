@@ -174,19 +174,19 @@ use super::IvfFlatIndex;
 use crate::index::distance;
 
 /// Four-byte signature for current centroid objects.
-const CENTROIDS_V2_MAGIC: &[u8; 4] = b"ZCT2";
+pub(crate) const CENTROIDS_V2_MAGIC: &[u8; 4] = b"ZCT2";
 /// Four-byte signature for one SQ-and-full-vector cluster section.
-const CLUSTER_V2_MAGIC: &[u8; 4] = b"ZCL2";
+pub(crate) const CLUSTER_V2_MAGIC: &[u8; 4] = b"ZCL2";
 /// Four-byte signature for one RQ-and-full-vector cluster section.
-const CLUSTER_V3_MAGIC: &[u8; 4] = b"ZCL3";
+pub(crate) const CLUSTER_V3_MAGIC: &[u8; 4] = b"ZCL3";
 /// Fixed bytes preceding the SQ and full-vector payloads in a v2 section.
 const CLUSTER_V2_HEADER_LEN: usize = 4 + 8 * 4;
 /// Four-byte signature for grouped objects containing unsplit cluster sections.
-const CLUSTER_DATA_OBJECT_V1_MAGIC: &[u8; 4] = b"ZBP1";
+pub(crate) const CLUSTER_DATA_OBJECT_V1_MAGIC: &[u8; 4] = b"ZBP1";
 /// Shared prefix used to recognize versioned grouped cluster-data objects.
-const CLUSTER_DATA_OBJECT_MAGIC_PREFIX: &[u8; 3] = b"ZBP";
+pub(crate) const CLUSTER_DATA_OBJECT_MAGIC_PREFIX: &[u8; 3] = b"ZBP";
 /// Version byte for grouped objects whose SQ and full blocks are separated.
-const CLUSTER_DATA_OBJECT_V4_VERSION: u8 = 4;
+pub(crate) const CLUSTER_DATA_OBJECT_V4_VERSION: u8 = 4;
 /// Magic/version plus entry-count bytes shared by grouped-object formats.
 const CLUSTER_DATA_OBJECT_HEADER_LEN: usize = 8;
 /// Bytes in one v1 directory tuple: cluster index, offset, and length.
@@ -195,18 +195,18 @@ const CLUSTER_DATA_OBJECT_DIR_ENTRY_LEN: usize = 4 + 8 + 8;
 const CLUSTER_DATA_OBJECT_V4_DIR_ENTRY_LEN: usize = 4 + 8 + 8 + 8 + 8;
 /// Version byte for grouped objects with hoisted ID blocks and fixed-stride
 /// f32 vector blocks.
-const CLUSTER_DATA_OBJECT_V5_VERSION: u8 = 5;
+pub(crate) const CLUSTER_DATA_OBJECT_V5_VERSION: u8 = 5;
 /// Bytes in one v5 tuple: cluster index, row count, and coarse/IDs/vectors
 /// absolute ranges.
 const CLUSTER_DATA_OBJECT_V5_DIR_ENTRY_LEN: usize = 4 + 4 + 8 * 6;
 /// Four-byte signature for a combined segment-bootstrap object.
-const BOOTSTRAP_MAGIC: &[u8; 4] = b"ZBS1";
+pub(crate) const BOOTSTRAP_MAGIC: &[u8; 4] = b"ZBS1";
 /// Legacy bootstrap version containing centroids and resident sketch only.
-const BOOTSTRAP_VERSION_V1: u32 = 1;
+pub(crate) const BOOTSTRAP_VERSION_V1: u32 = 1;
 /// Bootstrap version adding segment-wide complete bitmap fields.
-const BOOTSTRAP_VERSION_V2: u32 = 2;
+pub(crate) const BOOTSTRAP_VERSION_V2: u32 = 2;
 /// Current bootstrap version adding the filter-cardinality summary section.
-const BOOTSTRAP_VERSION: u32 = 3;
+pub(crate) const BOOTSTRAP_VERSION: u32 = 3;
 /// Fixed v1 header size before the first embedded artifact.
 const BOOTSTRAP_V1_HEADER_LEN: usize = 4 + 4 + 2 * 16;
 /// Fixed v2 header size before the first embedded artifact.
@@ -1426,11 +1426,23 @@ pub(crate) fn deserialize_centroids(data: &[u8]) -> Result<(Vec<Vec<f32>>, usize
 ///
 /// # Examples
 ///
-/// Bytes beginning `ZCT2` use the current decoder. Any other prefix is treated
-/// as the historical count-and-dimension header and must satisfy that layout.
+/// Bytes beginning `ZCT2` use the current decoder. Another nonzero `ZCT`
+/// discriminator is rejected as an unsupported future version; all other
+/// prefixes are treated as the historical count-and-dimension header and must
+/// satisfy that layout.
 pub(crate) fn deserialize_centroids_data(data: &[u8]) -> Result<CentroidsData> {
     if data.starts_with(CENTROIDS_V2_MAGIC) {
         return deserialize_centroids_v2(data);
+    }
+    if data.len() >= 4 && &data[..3] == b"ZCT" && data[3] != 0 {
+        let version = if data[3].is_ascii_digit() {
+            data[3] - b'0'
+        } else {
+            data[3]
+        };
+        return Err(ZeppelinError::Index(format!(
+            "unsupported centroid artifact version {version}; this binary reads ZCT2 and the legacy unversioned layout"
+        )));
     }
     deserialize_centroids_legacy(data)
 }

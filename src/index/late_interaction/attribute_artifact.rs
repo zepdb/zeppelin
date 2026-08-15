@@ -15,8 +15,8 @@ use crate::types::{AttributeValue, VectorId};
 
 use super::candidate::AttributeLocator;
 
-const ATTRIBUTE_BLOCK_MAGIC: &[u8; 4] = b"ZAB1";
-const ATTRIBUTE_BLOCK_VERSION: u8 = 1;
+pub(crate) const ATTRIBUTE_BLOCK_MAGIC: &[u8; 4] = b"ZAB1";
+pub(crate) const ATTRIBUTE_BLOCK_VERSION: u8 = 1;
 const ATTRIBUTE_BLOCK_HEADER_LEN: usize =
     4 + 2 * size_of::<u8>() + size_of::<u16>() + size_of::<u32>() + 2 * size_of::<u64>() + 2 * 32;
 const ATTRIBUTE_BLOCK_DIRECTORY_FIXED_LEN: usize = 2 * size_of::<u32>() + 2 * size_of::<u64>() + 32;
@@ -327,11 +327,10 @@ pub(crate) fn decode_attribute_block(
     {
         return Err(invalid_block("attribute block size or checksum mismatch"));
     }
+    probe_attribute_block_format(bytes)?;
     let mut reader = BlockReader::new(bytes);
     reader.expect(ATTRIBUTE_BLOCK_MAGIC)?;
-    if reader.read_u8()? != ATTRIBUTE_BLOCK_VERSION {
-        return Err(invalid_block("unsupported attribute block version"));
-    }
+    reader.read_u8()?;
     if reader.read_u8()? != 0 || reader.read_u16()? != 0 {
         return Err(invalid_block(
             "attribute block reserved header fields are nonzero",
@@ -447,6 +446,19 @@ pub(crate) fn decode_attribute_block(
         ));
     }
     Ok(rows)
+}
+
+pub(crate) fn probe_attribute_block_format(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < 5 || &bytes[..4] != ATTRIBUTE_BLOCK_MAGIC {
+        return Err(invalid_block("invalid attribute block magic or header"));
+    }
+    let version = bytes[4];
+    if version != ATTRIBUTE_BLOCK_VERSION {
+        return Err(invalid_block(format!(
+            "unsupported attribute block version {version}; this binary reads version {ATTRIBUTE_BLOCK_VERSION}"
+        )));
+    }
+    Ok(())
 }
 
 fn decode_canonical_attributes(bytes: &[u8]) -> Result<Option<HashMap<String, AttributeValue>>> {

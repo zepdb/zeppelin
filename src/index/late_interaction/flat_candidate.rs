@@ -30,8 +30,8 @@ use super::candidate::{
 use super::matrix_artifact::MatrixBlockLocator;
 use super::segment_search::filter_matches;
 
-const FLAT_MAGIC: &[u8; 4] = b"ZFQ1";
-const FLAT_ARTIFACT_VERSION: u8 = 1;
+pub(crate) const FLAT_MAGIC: &[u8; 4] = b"ZFQ1";
+pub(crate) const FLAT_ARTIFACT_VERSION: u8 = 1;
 const FLAT_HEADER_LEN: usize = 4 + 1 + size_of::<u64>();
 
 /// Persisted flat-candidate format version carried by manifest references.
@@ -302,12 +302,7 @@ impl ResidentFlatCandidateIndex {
         if ArtifactChecksum::digest(bytes) != reference.checksum {
             return Err(flat_error("flat candidate artifact checksum mismatch"));
         }
-        if bytes.len() < FLAT_HEADER_LEN || &bytes[..4] != FLAT_MAGIC {
-            return Err(flat_error("invalid flat artifact magic or header"));
-        }
-        if bytes[4] != FLAT_ARTIFACT_VERSION {
-            return Err(flat_error("unsupported flat artifact version"));
-        }
+        probe_flat_candidate_format(bytes)?;
         let mut length_bytes = [0_u8; size_of::<u64>()];
         length_bytes.copy_from_slice(&bytes[5..FLAT_HEADER_LEN]);
         let header_len = usize::try_from(u64::from_le_bytes(length_bytes))
@@ -473,6 +468,19 @@ impl ResidentFlatCandidateIndex {
         }
         Ok(candidates)
     }
+}
+
+pub(crate) fn probe_flat_candidate_format(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < FLAT_HEADER_LEN || &bytes[..4] != FLAT_MAGIC {
+        return Err(flat_error("invalid flat artifact magic or header"));
+    }
+    let version = bytes[4];
+    if version != FLAT_ARTIFACT_VERSION {
+        return Err(flat_error(format!(
+            "unsupported flat artifact version {version}; this binary reads version {FLAT_ARTIFACT_VERSION}"
+        )));
+    }
+    Ok(())
 }
 
 /// Minimum rows per scan worker before another thread is worth its spawn cost.

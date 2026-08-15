@@ -93,13 +93,13 @@ use crate::types::{AttributeValue, DistanceMetric};
 use crate::wal::manifest::SketchRef;
 
 /// Four-byte signature for coarse-sketch objects.
-const SKETCH_MAGIC: &[u8; 4] = b"ZSK1";
+pub(crate) const SKETCH_MAGIC: &[u8; 4] = b"ZSK1";
 /// Current write format: two-bit Extended-RaBitQ residual codes.
-const SKETCH_VERSION: u32 = 4;
+pub(crate) const SKETCH_VERSION: u32 = 4;
 /// Legacy readable format using 256 one-byte PQ codes per subquantizer.
-const SKETCH_V3_VERSION: u32 = 3;
+pub(crate) const SKETCH_V3_VERSION: u32 = 3;
 /// Legacy readable format using packed four-bit codes.
-const SKETCH_V2_VERSION: u32 = 2;
+pub(crate) const SKETCH_V2_VERSION: u32 = 2;
 /// Number of codewords in each version-2 subquantizer codebook.
 const SKETCH_V2_K: usize = 16;
 /// Number of codewords in each version-3 subquantizer codebook.
@@ -443,7 +443,6 @@ impl ResidentSketch {
     /// Versions 2 and 3 select their frozen PQ layouts; version 4 selects the
     /// two-plane RaBitQ layout. Appending one unexplained byte to any object
     /// causes an exact-size error instead of being ignored.
-    #[cfg(test)]
     pub(crate) fn from_bytes(data: &[u8]) -> Result<Self> {
         Self::decode(data, None)
     }

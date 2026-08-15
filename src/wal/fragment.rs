@@ -93,7 +93,7 @@ use crate::types::{VectorEntry, VectorId};
 /// are recognized by their opening `{` byte in
 /// [`WalFragment::from_bytes`]. Changing this value would require preserving a
 /// decoder for already persisted objects.
-const WAL_FORMAT_MSGPACK: u8 = 0x01;
+pub(crate) const WAL_FORMAT_MSGPACK: u8 = 0x01;
 
 /// One immutable batch of vector upserts and delete tombstones in the WAL.
 ///

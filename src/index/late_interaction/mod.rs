@@ -37,17 +37,23 @@ pub use search::{
     LateInteractionWaveTrace, ManifestRefresh,
 };
 
-pub(crate) use attribute_artifact::{decode_attribute_block, ATTRIBUTE_BLOCK_FORMAT_VERSION};
+pub(crate) use attribute_artifact::{
+    decode_attribute_block, probe_attribute_block_format, ATTRIBUTE_BLOCK_FORMAT_VERSION,
+    ATTRIBUTE_BLOCK_MAGIC,
+};
 pub(crate) use candidate::{
-    decode_all_candidate_rows, CandidateFdeSource, FetchedLateCandidateCluster,
+    decode_all_candidate_rows, probe_candidate_bootstrap_format, probe_candidate_cluster_format,
+    CandidateFdeSource, FetchedLateCandidateCluster, BOOTSTRAP_MAGIC, CLUSTER_MAGIC,
     LATE_CANDIDATE_FORMAT_VERSION,
 };
-pub(crate) use fde::FDE_TRANSFORM_FORMAT_VERSION;
+pub(crate) use fde::{FDE_TRANSFORM_FORMAT_VERSION, TRANSFORM_MAGIC};
 pub(crate) use flat_candidate::{
-    FlatCalibrationSource, LateFlatCandidateBuildConfig, ResidentFlatCandidateIndex,
-    LATE_FLAT_FORMAT_VERSION,
+    probe_flat_candidate_format, FlatCalibrationSource, LateFlatCandidateBuildConfig,
+    ResidentFlatCandidateIndex, FLAT_MAGIC, LATE_FLAT_FORMAT_VERSION,
 };
-pub(crate) use matrix_artifact::{decode_matrix_block, MATRIX_BLOCK_FORMAT_VERSION};
+pub(crate) use matrix_artifact::{
+    decode_matrix_block, probe_matrix_block_format, MATRIX_BLOCK_FORMAT_VERSION, MATRIX_BLOCK_MAGIC,
+};
 pub(crate) use segment_build::{
     build_late_interaction_segment, LateCandidateBuild, LateRowMatrixSource,
     LateSegmentBuildConfig, LateSegmentBuildRow, PrebuiltLateFtsArtifact,

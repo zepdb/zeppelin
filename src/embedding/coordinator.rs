@@ -31,6 +31,9 @@ use crate::wal::{
 
 use super::priority::QueryPriorityEncoder;
 
+pub(crate) const QUARANTINE_EVIDENCE_MAGIC: &[u8; 4] = b"ZEQ1";
+pub(crate) const QUARANTINE_EVIDENCE_VERSION: u8 = 1;
+
 /// Deterministic identity of one complete enrichment unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct EnrichmentWorkId([u8; 32]);
@@ -1076,8 +1079,8 @@ fn prepare_quarantines(
                 ))
             })?;
             let mut evidence_bytes = Vec::with_capacity(5 + payload.len());
-            evidence_bytes.extend_from_slice(b"ZEQ1");
-            evidence_bytes.push(1);
+            evidence_bytes.extend_from_slice(QUARANTINE_EVIDENCE_MAGIC);
+            evidence_bytes.push(QUARANTINE_EVIDENCE_VERSION);
             evidence_bytes.extend_from_slice(&payload);
             let evidence_bytes = bytes::Bytes::from(evidence_bytes);
             let checksum = ArtifactChecksum::digest(&evidence_bytes);
@@ -1661,6 +1664,23 @@ fn is_transient_failure(error: &ZeppelinError) -> bool {
 
 fn suppress_rediscovery(error: &ZeppelinError) -> bool {
     !is_transient_failure(error)
+}
+
+pub(crate) fn probe_quarantine_evidence_format(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < QUARANTINE_EVIDENCE_MAGIC.len() + 1
+        || !bytes.starts_with(QUARANTINE_EVIDENCE_MAGIC)
+    {
+        return Err(ZeppelinError::Serialization(
+            "semantic quarantine evidence has invalid magic or header".to_string(),
+        ));
+    }
+    let version = bytes[QUARANTINE_EVIDENCE_MAGIC.len()];
+    if version != QUARANTINE_EVIDENCE_VERSION {
+        return Err(ZeppelinError::Serialization(format!(
+            "unsupported semantic quarantine evidence version {version}; this binary reads version {QUARANTINE_EVIDENCE_VERSION}"
+        )));
+    }
+    Ok(())
 }
 
 fn poison_failure_class(error: &ZeppelinError) -> Option<&'static str> {

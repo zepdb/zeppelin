@@ -92,13 +92,13 @@ use crate::types::AttributeValue;
 ///
 /// The prefix fails loudly on the wrong artifact type instead of asking serde to
 /// interpret arbitrary bytes as a bitmap index.
-const BITMAP_MAGIC: &[u8; 4] = b"ZBMP";
+pub(crate) const BITMAP_MAGIC: &[u8; 4] = b"ZBMP";
 
 /// Selects the persisted payload format understood by this implementation.
 ///
 /// Increment this value when a format change cannot be read with the existing
 /// serde defaults. [`ClusterBitmapIndex::from_bytes`] rejects every other value.
-const BITMAP_VERSION: u8 = 1;
+pub(crate) const BITMAP_VERSION: u8 = 1;
 
 /// Maximum distinct encoded values retained for one indexed field.
 ///
