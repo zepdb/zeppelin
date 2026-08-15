@@ -11,7 +11,7 @@ Zeppelin is an S3-native vector search engine. Object storage is the source of t
 
 3. **Immutable artifacts.** WAL fragments and segments are write-once. Never modify them in place. The manifest tracks what exists.
 
-4. **Single writer per namespace.** One process handles a namespace's write path at a time: HTTP vector writes are unfenced and their group-commit state is process-local (`src/wal/writer.rs:404-417, 576-583, 805-842`). Strong reads are not part of this affinity rule because they remotely verify the manifest (`src/query.rs:833-845`; `tests/strong_freshness_tests.rs::strong_query_within_ttl_observes_manifest_advanced_on_s3`). See README "Running more than one node."
+4. **Single writer per namespace.** One process handles a namespace's write path at a time: HTTP vector writes are unfenced, and each `WalWriter` keeps its group-commit queue and committed-manifest memo process-local (`WalWriter::append`, `WalWriter::group`, `WalWriter::commit_pending_group`). Manifest CAS is the cross-process safety boundary, not permission to round-robin writes. Strong reads are not part of this affinity rule because `read_manifest_for_query` remotely verifies the manifest; `strong_query_within_ttl_observes_manifest_advanced_on_s3` covers cross-node freshness. See README "Running more than one node."
 
 5. **Let the compiler help.** Use strong types. Prefer newtypes over raw strings/numbers. Make invalid states unrepresentable.
 
@@ -20,7 +20,9 @@ Zeppelin is an S3-native vector search engine. Object storage is the source of t
 - Use `thiserror` for error types. Every module gets its own error variant in `ZeppelinError`.
 - Use `tracing` for logging. Structured fields, not format strings.
 - Async everywhere — `tokio` runtime. No blocking calls on async threads.
-- Tests hit real object storage (S3 or MinIO). No mocks for storage operations.
+- Storage tests use concrete `object_store` backends, including the default
+  in-memory backend. Use MinIO, GCS, or Azurite when substrate semantics matter;
+  do not replace storage operations with mocks.
 - `#[must_use]` on functions that return values that shouldn't be ignored.
 - Prefer `bytes::Bytes` for data passing between layers.
 
@@ -35,12 +37,15 @@ Zeppelin is an S3-native vector search engine. Object storage is the source of t
 - `src/server/` — axum HTTP handlers. Thin layer over domain logic.
 - `src/security/` — kernel, policy, audit. Fail-closed.
 - `src/fts/` — BM25 lexical retrieval.
+- `src/format.rs` and `src/format/` — persisted-format registry, decoder/version coverage, and golden-corpus fixture generation.
 
 ### Per-module guides
 
-Each of these has its own `CLAUDE.md` with the traps and invariants that
-module's rustdoc doesn't cover. **Read the one for the directory you're editing
-before you start** — they exist to stop rediscovery of bugs already paid for.
+Each listed directory has its own `CLAUDE.md` with the traps and invariants that
+module's rustdoc doesn't cover. The standalone format registry is included
+directly because it is the authority for persisted wire formats. **Read the
+relevant entry before you start** — they exist to stop rediscovery of bugs
+already paid for.
 
 | Module | Read it for |
 | --- | --- |
@@ -53,54 +58,66 @@ before you start** — they exist to stop rediscovery of bugs already paid for.
 | [`src/fts/CLAUDE.md`](src/fts/CLAUDE.md) | `bm25_term_score` arg order, the two index shapes, tokenizer rules |
 | [`src/server/CLAUDE.md`](src/server/CLAUDE.md) | axum 0.7 syntax, router split, gated routes |
 | [`src/security/CLAUDE.md`](src/security/CLAUDE.md) | configured composition, the policy publication lease |
+| [`src/format.rs`](src/format.rs) | persisted families, accepted versions, decoder probes, golden-fixture coverage |
 | [`tests/CLAUDE.md`](tests/CLAUDE.md) | `TEST_BACKEND`, MinIO setup, known-flaky list |
 
-Size hints for orientation: `wal/manifest.rs` (~9.5k), `compaction/gc.rs`
-(~6.8k), `query.rs`, `index/ivf_flat/{search,build}.rs` (~4.7k/4.3k),
-`server/handlers/query.rs` (~5.6k), `namespace/graph.rs` (~5.4k),
-`compaction/mod.rs` (~5.4k) are the large files — read their rustdoc headers
-rather than the whole file.
+Size hints for orientation: `wal/manifest.rs` (~12.5k), `compaction/gc.rs`
+(~7.6k), `index/ivf_flat/{build,search}.rs` (~6.7k/~6.0k),
+`namespace/graph.rs` (~5.9k), `server/handlers/query.rs` and
+`compaction/mod.rs` (~5.8k each), `config.rs` and `query.rs` (~5.3k/~5.2k),
+and the central `format.rs` registry (~1.4k). Read their rustdoc headers before
+opening a large file wholesale.
 
 ## Build and test quickstart
 
 ```bash
 cargo check --tests --features branching-test-support   # ~9 min cold
-cargo test --lib                                        # fast; see known failures below
+cargo test --lib                                        # fast; green on default memory backend
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
-Most integration tests need real object storage. `TEST_BACKEND` defaults to
-`memory`; use `minio` for anything CAS-, concurrency-, or origin-shaped, and
+Integration tests default to the concrete in-memory object store. Use `minio`
+for anything CAS-, concurrency-, or origin-shaped, and
 `gcs` (patched fake-gcs-server) / `azurite` for the non-S3 substrates. MinIO
 and both emulators run natively without Docker — see
 [`tests/CLAUDE.md`](tests/CLAUDE.md) and `scripts/emulators/README.md`.
 
-**`cargo test --lib` is not green without MinIO.** Two tests
-(2× `security::policy_publication`) fail with `Storage(NotImplemented)`
-because the `Local` backend has no ETag CAS. Confirm a failure isn't one of
-these before debugging it. (`startup::rbac_config_boot_enables_rbac_routes`
-skips instead of failing when `TEST_BACKEND` is not `minio`.)
+`cargo test --lib` is green with `TEST_BACKEND` unset. The two
+`security::policy_publication` tests construct their own in-memory CAS store.
+`startup::rbac_config_boot_enables_rbac_routes` still requires MinIO and skips
+when `TEST_BACKEND` is not `minio` because its startup configuration otherwise
+uses the local backend, which has no ETag CAS.
 
 ## Where the plans live
 
-`tasks/` holds executable plan files, not scratch notes. Before designing
-something substantial, check whether a plan already exists there — several
-tracks (tokenizer Analysis-v2, storage-format redesign, memoization, security
-phases) are fully designed and simply unexecuted. The multi-substrate track
-(`tasks/multi-substrate/`) is **executed**: GCS and Azure transports are in,
-gated on emulators, with `08-release-evidence.md` as the evidence ledger.
-`tasks/learnings.md` (gitignored) is the running bug/pattern log — append to it.
+`tasks/` is gitignored and holds local executable plans and evidence, not
+scratch notes. The 2026-08-15 backlog is under `tasks/pending/`: plans 01, 04,
+and 07–19 are archived in `done/`; plans 02, 03, 05, and 06 are explicitly
+deferred until the pinned wikidpr datasets and their dependencies are
+available; plan 20 is the final runnable guide correction in that pass. The
+unexecuted August 12 performance plans live in
+`tasks/optimizations_august_12/`. `tasks/security/` contains phase evidence,
+not phase plans. Do not cite tokenizer, storage-format, or memoization plan
+directories: none exists in this checkout, and no in-repo archive is recorded.
 
-Branching specifically: `tasks/branching/` has 10 phase plans,
-`deletion-unification-design.md` (10 slices), and `10-release-evidence.md`,
-which is an **implementation ledger, not a release approval**. Branching is
-default-disabled and its MinIO/soak/recall/review gates are unrun.
+The multi-substrate track (`tasks/multi-substrate/`) is **executed**: GCS and
+Azure transports are in and gated on emulators, with `08-release-evidence.md`
+as the evidence ledger. `tasks/learnings.md` is the running bug/pattern log —
+append to it.
+
+Branching specifically: `tasks/branching/` currently contains only
+`10-release-evidence.md`, which is an **implementation ledger, not a release
+approval**. Branching is default-disabled. Focused MinIO suites have run, but
+the full fault campaign, deterministic smoke/replay, green performance census,
+both-dataset recall gate, TLA reruns, independent reviews, and soak are not
+complete.
 
 ## Testing
 
-- All tests use `TestHarness` from `tests/common/harness.rs`.
-- Default test backend is real S3 (set `TEST_BACKEND=minio` for MinIO).
+- Integration tests use `TestHarness` from `tests/common/harness.rs`.
+- Default test backend is `memory`; set `TEST_BACKEND=minio` for MinIO.
 - Each test gets a random prefix for isolation.
 - Tests clean up after themselves (drop impl on TestHarness).
 - Use `tests/common/vectors.rs` for generating test data.

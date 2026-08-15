@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Usage:
-#   ./scripts/test.sh                    # all tests (uses TEST_BACKEND from env, default: s3)
+#   ./scripts/test.sh                    # all tests (uses TEST_BACKEND from env, default: memory)
 #   ./scripts/test.sh storage            # only storage tests
 #   ./scripts/test.sh wal                # only WAL tests
 #   ./scripts/test.sh namespace          # only namespace tests
@@ -21,7 +21,7 @@ if [ -f "$PROJECT_ROOT/.env" ]; then
     set +a
 fi
 
-BACKEND="${TEST_BACKEND:-s3}"
+BACKEND="${TEST_BACKEND:-memory}"
 SUBSET="${1:-all}"
 
 echo "=== Zeppelin Test Runner ==="

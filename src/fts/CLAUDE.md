@@ -37,6 +37,6 @@ that was tried and rejected.
 
 ## See also
 
-- `tasks/tokenizer/` — the unexecuted Analysis-v2 plan (universal_v1 profile,
-  golden-corpus stamps, ZGFTS2 weighted impact-ordered postings). Read it
-  before redesigning tokenization; the design work is already done.
+No Analysis-v2 tokenizer plan is present in this checkout, and no in-repo
+archive location is recorded. Treat this module and its tests as the current
+authority; recover or write an explicit plan before redesigning tokenization.

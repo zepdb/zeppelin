@@ -93,11 +93,19 @@ invocation plus MinIO.
   — fails under full-suite parallel load against a single local MinIO; passes
   in isolation. Reproduced identically on a pre-2026-08-12 baseline, so it is
   load-timing, not a regression.
-- `security::policy_publication::tests::*` (2) — fail under
-  `cargo test --lib` without MinIO because the `Local` backend has no ETag
-  CAS. See `../src/security/CLAUDE.md`.
-  (`startup::tests::rbac_config_boot_enables_rbac_routes` also needs MinIO
-  but skips rather than fails.)
+- `perf_contract_tests::branching_census` (`--ignored`) — branch WAL write
+  census observes 2 GETs versus the pinned 3. Verified pre-existing at
+  `3fea5e8`.
+- `perf_contract_tests::contracts` (`--ignored`) — the `secured_query` and
+  `secured_filtered_query` scenarios panic at
+  `tests/perf_contract/security.rs:401` (`performance administrator must
+  authenticate`), aborting the whole `contracts` entry before it reports any
+  scenario. Verified pre-existing at `3fea5e8`; verify affected re-baselines
+  per scenario with `ZEPPELIN_PERF_SCENARIOS=<names>`.
+- `perf_contract::scenario::tests::secured_filtered_query_directly_compares_actual_http_paths`
+  (`--ignored`) — fails. Verified pre-existing at `3fea5e8`.
+- `startup::tests::rbac_config_boot_enables_rbac_routes` needs MinIO but skips
+  rather than fails when `TEST_BACKEND` is not `minio`.
 
 ## Branching gate
 

@@ -16,6 +16,20 @@ formal-verifications/
 
 Property-based tests live in the main test suite as `tests/proptest_*.rs` (see below).
 
+## History
+
+`FAILURES.md` was a 2026-02-10 triage snapshot and was removed in August 2026
+because it no longer described the current product or test status. In
+particular, its leading P0 intra-fragment upsert/delete ordering case is now
+unrepresentable on the write path: `WalFragment::try_new` returns a validation
+error for an ID present in both lists, `WalFragment::new` fails loudly on the
+same caller error, and `WalWriter::append_with_guards` uses the checked
+constructor before object-store publication.
+`tests/invariant_violation_tests.rs::test_intra_fragment_overlap_rejected` pins
+that behavior. The original four TLA+ files below deliberately remain negative
+bug models and are still expected to find counterexamples; the newer passing
+protocols and their results are recorded in the later sections.
+
 ## TLA+ Specifications
 
 ### Prerequisites
