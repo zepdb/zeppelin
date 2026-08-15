@@ -1,0 +1,7 @@
+{
+  "code": "CONFLICT_RETRY",
+  "error": "concurrent write conflict on namespace contract-upsert-conflict; retry",
+  "request_id": "contract-upsert_conflict_retry_409",
+  "retryable": true,
+  "status": 409
+}

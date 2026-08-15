@@ -3,7 +3,7 @@ info:
   title: Zeppelin Vector Search API
   description: S3-native vector search engine with BM25 full-text search support.
   # The API contract is versioned independently of the zeppelin crate.
-  version: 0.2.0
+  version: 0.2.1
   license:
     name: Apache-2.0
 
@@ -193,7 +193,8 @@ paths:
       description: |
         Returns the current runtime-mutable query knobs. The values are the
         effective snapshot used by new queries until a subsequent PATCH or PUT
-        updates the snapshot.
+        updates the snapshot. Runtime query configuration is process-local and
+        does not replicate across nodes.
       tags: [Config]
       responses:
         "401":
@@ -213,7 +214,8 @@ paths:
       description: |
         Partially updates runtime query knobs. Omitted fields are left
         unchanged. `rerank_coalesce_gap_bytes` and `cost_latency_profile` are
-        mutually exclusive in the same request.
+        mutually exclusive in the same request. Runtime query configuration is
+        process-local and does not replicate across nodes.
       tags: [Config]
       requestBody:
         required: true
@@ -244,7 +246,8 @@ paths:
       summary: Patch runtime query configuration
       description: |
         Alias of PATCH with the same partial-update semantics. Omitted fields
-        are left unchanged.
+        are left unchanged. Runtime query configuration is process-local and
+        does not replicate across nodes.
       tags: [Config]
       requestBody:
         required: true
@@ -1313,6 +1316,12 @@ paths:
           $ref: "#/components/responses/ValidationError"
         "404":
           $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictRetry"
+          description: |
+            Manifest CAS contention exhausted server-side retries (409). The
+            canonical error envelope uses code `CONFLICT_RETRY`; retry after
+            the delay in `Retry-After`.
         "410":
           $ref: "#/components/responses/NamespaceDeletingError"
         "413":
@@ -1348,13 +1357,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFoundError"
         "409":
-          $ref: "#/components/responses/PreservationLocked"
-          description: |
-            Vector deletion is blocked by active preservation, or the bounded
-            server-side manifest re-evaluation attempts were exhausted under
-            concurrent writes (409). The canonical error envelope uses code
-            `preservation_locked` or `CONFLICT_RETRY`; `CONFLICT_RETRY` means
-            the server already retried selection against fresh manifests.
+          $ref: "#/components/responses/VectorWriteConflict"
         "410":
           $ref: "#/components/responses/NamespaceDeletingError"
         "413":
@@ -1692,6 +1695,24 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    VectorWriteConflict:
+      description: |
+        Vector deletion is blocked by active preservation, or bounded
+        server-side manifest re-evaluation attempts were exhausted under
+        concurrent writes (409). The canonical error envelope uses code
+        `preservation_locked` or `CONFLICT_RETRY`. A `CONFLICT_RETRY` response
+        means the server already retried selection against fresh manifests and
+        includes `Retry-After`.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+            minimum: 1
+          description: Seconds to wait before retrying after `CONFLICT_RETRY`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/NamespaceDeleteGenericConflictErrorResponse"
     NamespaceDeleteConflict:
       description: |
         Deletion is blocked by active preservation, a retryable lifecycle
@@ -1769,6 +1790,12 @@ components:
       description: |
         Retryable write conflict (409), such as an active namespace lease.
         Canonical error envelope with code `CONFLICT_RETRY`.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+            minimum: 1
+          description: Seconds to wait before retrying the write.
       content:
         application/json:
           schema:
@@ -1800,7 +1827,9 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
     RateLimited:
-      description: Rate limit exceeded (429)
+      description: |
+        Rate limit exceeded (429). Rate-limit buckets are process-local and do
+        not replicate across nodes.
       headers:
         Retry-After:
           schema:

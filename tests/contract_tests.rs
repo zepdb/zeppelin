@@ -5,9 +5,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{TimeZone, Utc};
+use common::fault_injection::toggle_cas_precondition_failure_matching;
+use common::harness::TestHarness;
 use common::server::{
-    cleanup_ns, client_with_bearer, start_test_server_with_config, start_test_server_with_security,
-    TestSecurity,
+    cleanup_ns, client_with_bearer, start_test_server_on_store_with_config,
+    start_test_server_with_security, TestSecurity,
 };
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -102,6 +104,7 @@ const FIXTURE_CASES: &[&str] = &[
     "get_query_config",
     "patch_query_config",
     "upsert_vectors",
+    "upsert_conflict_retry_409",
     "get_vectors",
     "delete_vectors",
     "query_ann",
@@ -302,6 +305,54 @@ fn namespace_delete_conflict_documents_filtered_children_without_an_exact_total(
     assert!(errors.contains("namespace_has_live_branches"));
     assert!(errors.contains("branch_has_live_children"));
     assert!(errors.contains("branch_integrity_error"));
+}
+
+#[test]
+fn openapi_documents_vector_write_conflicts_and_process_local_controls() {
+    let api = include_str!("../api/zeppelin-api.yaml");
+    assert!(api.contains("  version: 0.2.1"));
+
+    let upsert = operation_block(api, "post", "/v1/namespaces/{ns}/vectors");
+    assert!(upsert.contains("#/components/responses/ConflictRetry"));
+    assert!(upsert.contains("Manifest CAS contention exhausted server-side retries"));
+    assert!(upsert.contains("Retry-After"));
+
+    let delete = operation_block(api, "delete", "/v1/namespaces/{ns}/vectors");
+    assert!(delete.contains("#/components/responses/VectorWriteConflict"));
+    assert!(!delete.contains("#/components/responses/PreservationLocked"));
+
+    let vector_conflict = component_schema_block(api, "VectorWriteConflict");
+    assert!(vector_conflict.contains("preservation_locked"));
+    assert!(vector_conflict.contains("CONFLICT_RETRY"));
+    assert!(vector_conflict.contains("Retry-After"));
+    assert!(vector_conflict
+        .contains("#/components/schemas/NamespaceDeleteGenericConflictErrorResponse"));
+
+    let preservation_locked = component_schema_block(api, "PreservationLocked");
+    assert!(preservation_locked.contains("preservation_locked"));
+
+    let conflict_retry = component_schema_block(api, "ConflictRetry");
+    assert!(conflict_retry.contains("CONFLICT_RETRY"));
+    assert!(conflict_retry.contains("Retry-After"));
+
+    const PROCESS_LOCAL_QUERY_CONFIG: &str =
+        "Runtime query configuration is process-local and does not replicate across nodes.";
+    for method in ["get", "patch", "put"] {
+        let operation = operation_block(api, method, "/v1/config/query")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            operation.contains(PROCESS_LOCAL_QUERY_CONFIG),
+            "{method} /v1/config/query must document process-local scope"
+        );
+    }
+    let rate_limited = component_schema_block(api, "RateLimited")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(rate_limited
+        .contains("Rate-limit buckets are process-local and do not replicate across nodes."));
 }
 
 #[test]
@@ -939,24 +990,39 @@ async fn build_contract_fixtures() -> Vec<Fixture> {
         .validate()
         .expect("contract fixture security config must satisfy the boot contract");
 
-    let (base_url, harness, _cache, cache_dir, admin_bearer) =
-        start_test_server_with_config(Some(config)).await;
-    let client = client_with_bearer(&admin_bearer);
-    let unauthenticated_client = reqwest::Client::new();
-    let forbidden_client = client_with_bearer(CONTRACT_FORBIDDEN_BEARER);
-
+    let harness = TestHarness::new().await;
     let main_ns = format!("{}-contract-main", harness.prefix);
     let compact_ns = format!("{}-contract-compact", harness.prefix);
     let delete_ns = format!("{}-contract-delete", harness.prefix);
     let conflict_ns = format!("{}-contract-conflict", harness.prefix);
+    let upsert_conflict_ns = format!("{}-contract-upsert-conflict", harness.prefix);
     let deleting_ns = format!("{}-contract-deleting", harness.prefix);
     let missing_ns = format!("{}-contract-missing", harness.prefix);
+
+    let (store, manifest_conflicts) = toggle_cas_precondition_failure_matching(
+        &harness.store,
+        format!("{upsert_conflict_ns}/manifest.json"),
+    );
+    let (base_url, _cache, cache_dir, admin_bearer) = start_test_server_on_store_with_config(
+        &harness,
+        store,
+        Some(harness.prefix.clone()),
+        config,
+    )
+    .await;
+    let client = client_with_bearer(&admin_bearer);
+    let unauthenticated_client = reqwest::Client::new();
+    let forbidden_client = client_with_bearer(CONTRACT_FORBIDDEN_BEARER);
 
     let replacements = vec![
         (main_ns.clone(), "contract-main".to_string()),
         (compact_ns.clone(), "contract-compact".to_string()),
         (delete_ns.clone(), "contract-delete".to_string()),
         (conflict_ns.clone(), "contract-conflict".to_string()),
+        (
+            upsert_conflict_ns.clone(),
+            "contract-upsert-conflict".to_string(),
+        ),
         (deleting_ns.clone(), "contract-deleting".to_string()),
         (missing_ns.clone(), "contract-missing".to_string()),
     ];
@@ -992,6 +1058,50 @@ async fn build_contract_fixtures() -> Vec<Fixture> {
         )
         .await,
     );
+
+    setup_namespace(
+        &client,
+        &base_url,
+        &upsert_conflict_ns,
+        json!({"dimensions": 2, "distance_metric": "euclidean"}),
+    )
+    .await;
+    let conflict_request = json!({
+        "vectors": [{"id": "conflicted", "values": [0.0, 0.0]}]
+    });
+    manifest_conflicts.enable();
+    let conflict_response = client
+        .post(format!(
+            "{base_url}/v1/namespaces/{upsert_conflict_ns}/vectors"
+        ))
+        .header("x-request-id", "contract-upsert_conflict_retry_409")
+        .json(&conflict_request)
+        .send()
+        .await
+        .expect("bounded upsert conflict fixture must complete");
+    let conflict_status = conflict_response.status().as_u16();
+    let conflict_retry_after = conflict_response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let conflict_body: Value = conflict_response
+        .json()
+        .await
+        .expect("bounded upsert conflict fixture must return JSON");
+    manifest_conflicts.disable();
+    assert_eq!(conflict_status, 409, "unexpected body: {conflict_body}");
+    assert_eq!(conflict_retry_after.as_deref(), Some("1"));
+    assert_eq!(manifest_conflicts.failures_injected(), 8);
+    fixtures.push(fixture_from_response(
+        "upsert_conflict_retry_409",
+        "post",
+        "/v1/namespaces/contract-upsert-conflict/vectors",
+        conflict_status,
+        conflict_request,
+        conflict_body,
+        &replacements,
+    ));
 
     fixtures.push(
         capture_json(
@@ -1262,6 +1372,7 @@ async fn build_contract_fixtures() -> Vec<Fixture> {
         &compact_ns,
         &delete_ns,
         &conflict_ns,
+        &upsert_conflict_ns,
         &deleting_ns,
     ] {
         cleanup_ns(&harness.store, ns).await;
@@ -2840,6 +2951,10 @@ fn assert_response_contract_shape(fixture: &Fixture) {
                 assert_eq!(fixture.response["code"], "cursor_policy_stale");
                 assert_eq!(fixture.response["retryable"], false);
             }
+            "upsert_conflict_retry_409" => {
+                assert_eq!(fixture.response["code"], "CONFLICT_RETRY");
+                assert_eq!(fixture.response["retryable"], true);
+            }
             _ => {}
         }
         return;
@@ -3099,6 +3214,7 @@ impl Fixture {
             .replace("contract-main", "{ns}")
             .replace("contract-compact", "{ns}")
             .replace("contract-delete", "{ns}")
+            .replace("contract-upsert-conflict", "{ns}")
             .replace("contract-deleting", "{ns}")
             .replace("contract-missing", "{ns}")
     }
