@@ -9,13 +9,16 @@ harness gets a random `test-{uuid}` prefix for isolation and cleans up on drop.
 
 | Value | Store | CAS |
 | --- | --- | --- |
-| `memory` (default) | `InMemory` | yes |
-| `minio` | S3 → `http://localhost:9000` | yes |
-| `s3` | real S3 | yes |
+| `memory` (default) | `InMemory` | yes (ETag) |
+| `minio` | S3 → `http://localhost:9000` | yes (ETag) |
+| `s3` | real S3 | yes (ETag) |
+| `gcs` | GCS → patched fake-gcs-server `http://127.0.0.1:4443` | yes (**generation**) |
 | `local` | `LocalFileSystem` in a `TempDir` | **no** |
 
-Anything concurrency-, CAS-, or origin-routing-shaped needs `minio`. A green
-`memory` run is weak evidence for those.
+Anything concurrency-, CAS-, or origin-routing-shaped needs a real store
+(`minio`, or `gcs` for the generation-CAS substrate). A green `memory` run is
+weak evidence for those. Suites gate via
+`TestHarness::require_cas_backend()`, not vendor names.
 
 Bringing up MinIO without Docker:
 
@@ -28,6 +31,22 @@ mc mb --ignore-existing zeptest/zeppelin-test
 
 The rbac startup test additionally needs an isolated
 `ZEPPELIN_RBAC_TEST_BUCKET`.
+
+Bringing up fake-gcs-server (patched — stock cannot serve `object_store`'s
+XML-API writes; build once via `scripts/emulators/build-fake-gcs-server.sh`,
+details in `scripts/emulators/README.md`):
+
+```bash
+fake-gcs-server-zeppelin -scheme http -host 127.0.0.1 -port 4443 \
+  -public-host 127.0.0.1:4443 -backend filesystem -filesystem-root /tmp/fgcsdata &
+```
+
+`-public-host` must equal the dialed host:port or path-style requests 404.
+Env knobs: `GCS_TEST_ENDPOINT` (default `http://127.0.0.1:4443`),
+`TEST_GCS_BUCKET` (default `zeppelin-test`; falls back to `TEST_S3_BUCKET`).
+The harness creates the bucket idempotently; no credential file is needed
+(the storage layer synthesizes the OAuth-disabled service-account JSON from
+`gcs_endpoint`).
 
 ## Tests that hard-require MinIO
 

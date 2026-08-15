@@ -1,5 +1,5 @@
 diff --git a/fakestorage/object.go b/fakestorage/object.go
-index 03c4e07..287dca8 100644
+index 03c4e07..5c25302 100644
 --- a/fakestorage/object.go
 +++ b/fakestorage/object.go
 @@ -14,6 +14,7 @@ import (
@@ -122,6 +122,18 @@ index 03c4e07..287dca8 100644
  func (s *Server) getObject(w http.ResponseWriter, r *http.Request) {
  	if alt := r.URL.Query().Get("alt"); alt == "media" || r.Method == http.MethodHead {
  		s.downloadObject(w, r)
+@@ -1082,7 +1179,10 @@ func (s *Server) downloadObject(w http.ResponseWriter, r *http.Request) {
+ 	w.Header().Set("X-Goog-Generation", strconv.FormatInt(obj.Generation, 10))
+ 	w.Header().Set("X-Goog-Hash", fmt.Sprintf("crc32c=%s,md5=%s", obj.Crc32c, obj.Md5Hash))
+ 	w.Header().Set("X-Goog-Stored-Content-Length", strconv.FormatInt(storedSize, 10))
+-	w.Header().Set("Last-Modified", obj.Updated.Format(http.TimeFormat))
++	// http.TimeFormat pastes a literal "GMT" without converting the zone;
++	// obj.Updated is local time, so serve UTC or clients misparse by the
++	// host's UTC offset (real GCS serves true GMT).
++	w.Header().Set("Last-Modified", obj.Updated.UTC().Format(http.TimeFormat))
+ 	w.Header().Set("ETag", fmt.Sprintf("%q", obj.Etag))
+ 	for name, value := range obj.Metadata {
+ 		w.Header().Set("X-Goog-Meta-"+name, value)
 diff --git a/fakestorage/server.go b/fakestorage/server.go
 index da158fa..e50a53d 100644
 --- a/fakestorage/server.go

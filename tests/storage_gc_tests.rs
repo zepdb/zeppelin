@@ -467,7 +467,13 @@ impl ObjectStore for PublishManifestOnHistoryWriteStore {
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
             {
-                self.inner.delete(&self.concurrent_history_key).await?;
+                // Raw-store delete: absence is success. Substrates where a raw
+                // delete of an absent key reports NotFound (GCS/Azure) must
+                // not abort the intercepted GET the seam would have served.
+                match self.inner.delete(&self.concurrent_history_key).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
         self.inner.get_opts(location, options).await
@@ -999,13 +1005,17 @@ impl ObjectStore for HistoryMetadataControlStore {
                     if index != member {
                         return result;
                     }
-                    result.and_then(|_| {
-                        Err(object_store::Error::Generic {
-                            store: "history_metadata_control",
-                            source: Box::new(std::io::Error::other(
-                                "injected per-key DELETE failure after apply",
-                            )),
-                        })
+                    // Inject regardless of the underlying per-key outcome: on
+                    // substrates where deleting an absent key reports
+                    // NotFound (GCS/Azure), the member's raw result is
+                    // already an Err, and an `and_then` injection would
+                    // silently never fire.
+                    drop(result);
+                    Err(object_store::Error::Generic {
+                        store: "history_metadata_control",
+                        source: Box::new(std::io::Error::other(
+                            "injected per-key DELETE failure after apply",
+                        )),
                     })
                 })
                 .boxed(),

@@ -126,6 +126,7 @@ use crate::namespace::branching::{ArtifactOrigin, BranchError};
 use crate::namespace::manager::{NamespaceIncarnationId, NamespaceMetadata};
 use crate::namespace::{BranchId, BranchRoot, ManifestDigest, ManifestGeneration};
 use crate::security::{NamespaceId, PreservationService};
+use crate::storage::capabilities::canonical_etag;
 use crate::storage::store::DELETE_MANY_MAX_KEYS;
 use crate::storage::{
     ListedObject, NamespaceObjectFamily, NamespaceObjectKey, StorageVersion, ZeppelinStore,
@@ -307,10 +308,28 @@ struct NamespaceInventory {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InventoryFingerprint(BTreeMap<String, InventoryObjectFingerprint>);
 
+/// Per-object identity inside an [`InventoryFingerprint`].
+///
+/// Holds the canonical ETag rather than the whole [`StorageVersion`]: memoized
+/// inventories mix LIST-derived entries with PUT/GET-derived upserts (the
+/// candidate ledger after a durable mark), and only the ETag is comparable
+/// across those observation kinds — GCS carries its generation exclusively on
+/// PUT/GET, so whole-token equality would report every idle cycle as changed
+/// there. An object without an ETag yields no fingerprint (fail-closed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InventoryObjectFingerprint {
     size: u64,
-    version: StorageVersion,
+    etag: String,
+}
+
+impl InventoryObjectFingerprint {
+    fn from_listed(object: &ListedObject) -> Option<Self> {
+        let etag = object.version.as_ref().and_then(StorageVersion::etag)?;
+        Some(Self {
+            size: object.size,
+            etag: canonical_etag(etag).to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -491,17 +510,8 @@ impl InventoryFingerprint {
     fn from_listed<'a>(objects: impl IntoIterator<Item = &'a ListedObject>) -> Option<Self> {
         let mut entries = BTreeMap::new();
         for object in objects {
-            let version = object.version.clone()?;
-            if entries
-                .insert(
-                    object.key.clone(),
-                    InventoryObjectFingerprint {
-                        size: object.size,
-                        version,
-                    },
-                )
-                .is_some()
-            {
+            let fingerprint = InventoryObjectFingerprint::from_listed(object)?;
+            if entries.insert(object.key.clone(), fingerprint).is_some() {
                 return None;
             }
         }
@@ -515,19 +525,11 @@ impl InventoryFingerprint {
     ) -> bool {
         let mut expected = BTreeMap::new();
         for object in listed {
-            let Some(version) = object.version.clone() else {
+            let Some(fingerprint) = InventoryObjectFingerprint::from_listed(object) else {
                 return false;
             };
             if !object.key.starts_with(prefix)
-                || expected
-                    .insert(
-                        object.key.clone(),
-                        InventoryObjectFingerprint {
-                            size: object.size,
-                            version,
-                        },
-                    )
-                    .is_some()
+                || expected.insert(object.key.clone(), fingerprint).is_some()
             {
                 return false;
             }
@@ -555,12 +557,20 @@ fn malformed_control_key(
 }
 
 fn listed_object_identity_matches(before: &ListedObject, after: &ListedObject) -> bool {
+    // One side of this comparison may be PUT/GET-derived (e.g. the candidate
+    // ledger identity recorded after a durable mark) while the other is
+    // LIST-derived. Only the ETag is comparable across those observation
+    // kinds — GCS carries its generation exclusively on PUT/GET, so full
+    // `StorageVersion` equality would declare every cross-kind pair changed
+    // and permanently skip the sweep there. Compare canonical ETags; either
+    // side lacking one means "cannot validate" and stays fail-closed.
     before.size == after.size
         && before
             .version
             .as_ref()
-            .zip(after.version.as_ref())
-            .is_some_and(|(before, after)| before == after)
+            .and_then(StorageVersion::etag)
+            .zip(after.version.as_ref().and_then(StorageVersion::etag))
+            .is_some_and(|(before, after)| canonical_etag(before) == canonical_etag(after))
 }
 
 fn listed_object_horizon_satisfied(

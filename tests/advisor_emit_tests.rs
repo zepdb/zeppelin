@@ -116,18 +116,18 @@ fn every_catalog_instance_cache_security_and_fts_shape_round_trips() {
     assert_eq!(rendered_count, (40 + 21 + 17) * 2 * 2 * 2);
 }
 
-/// GCP and Azure emits pass full validation, carry their per-cloud storage
-/// fields, and pin the transport gap: `ZeppelinStore::from_config` still
-/// rejects the emitted backend until the GCS/Azure transports land
-/// (multi-substrate plans 05/06 flip this assertion to construct-success).
+/// GCP and Azure emits pass full validation and carry their per-cloud
+/// storage fields. The GCS transport has landed, so a `--cloud gcp` emit must
+/// construct a store; Azure still pins the transport gap until
+/// multi-substrate plan 06 lands its arm and flips that half too.
 #[test]
-fn gcp_and_azure_emits_carry_storage_fields_and_pin_transport_gap() {
+fn gcp_and_azure_emits_carry_storage_fields_and_construct_where_supported() {
     let catalog = Catalog::embedded();
     for (cloud, expected_lines, transport_gap) in [
         (
             Cloud::Gcp,
             &["backend = \"gcs\"", "# gcs_service_account_path ="][..],
-            "unsupported storage backend: gcs",
+            None,
         ),
         (
             Cloud::Azure,
@@ -135,7 +135,7 @@ fn gcp_and_azure_emits_carry_storage_fields_and_pin_transport_gap() {
                 "backend = \"azure\"",
                 "azure_account_name = \"REPLACE-WITH-YOUR-STORAGE-ACCOUNT\"",
             ][..],
-            "unsupported storage backend: azure",
+            Some("unsupported storage backend: azure"),
         ),
     ] {
         let instance = catalog
@@ -163,19 +163,23 @@ fn gcp_and_azure_emits_carry_storage_fields_and_pin_transport_gap() {
                 cloud.name()
             );
         }
-        let error = match zeppelin::storage::ZeppelinStore::from_config(&rendered.config().storage)
-        {
-            Ok(_) => panic!(
+        let construction =
+            zeppelin::storage::ZeppelinStore::from_config(&rendered.config().storage);
+        match (transport_gap, construction) {
+            (None, Ok(_)) => {}
+            (None, Err(error)) => {
+                panic!("{} emit must construct a store, got: {error}", cloud.name())
+            }
+            (Some(gap), Err(error)) => assert!(
+                error.to_string().contains(gap),
+                "{} construction error must name the unsupported backend, got: {error}",
+                cloud.name()
+            ),
+            (Some(_), Ok(_)) => panic!(
                 "{} transport arm has not landed yet; construction must fail loudly",
                 cloud.name()
             ),
-            Err(error) => error,
-        };
-        assert!(
-            error.to_string().contains(transport_gap),
-            "{} construction error must name the unsupported backend, got: {error}",
-            cloud.name()
-        );
+        }
     }
 }
 

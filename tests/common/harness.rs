@@ -101,6 +101,22 @@ pub struct TestHarness {
     test_servers: Mutex<Vec<TestServerRuntime>>,
 }
 
+/// Creates the fake-gcs-server test bucket idempotently — the emulator
+/// starts empty, and a 409 means another harness got there first.
+async fn ensure_gcs_bucket(endpoint: &str, bucket: &str) {
+    let response = reqwest::Client::new()
+        .post(format!("{endpoint}/storage/v1/b?project=zeppelin-test"))
+        .json(&serde_json::json!({ "name": bucket }))
+        .send()
+        .await
+        .expect("fake-gcs-server unreachable — see scripts/emulators/README.md");
+    let status = response.status();
+    assert!(
+        status.is_success() || status.as_u16() == 409,
+        "fake-gcs-server bucket create failed: {status}"
+    );
+}
+
 impl TestHarness {
     /// Create a new test harness. Reads config from environment variables.
     /// Each harness gets a unique random prefix for test isolation.
@@ -113,6 +129,9 @@ impl TestHarness {
         };
         let bucket = match temp_dir.as_ref() {
             Some(dir) => dir.path().to_string_lossy().into_owned(),
+            None if backend == "gcs" => std::env::var("TEST_GCS_BUCKET")
+                .or_else(|_| std::env::var("TEST_S3_BUCKET"))
+                .unwrap_or_else(|_| "zeppelin-test".to_string()),
             None => std::env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "zeppelin-test".to_string()),
         };
 
@@ -167,6 +186,24 @@ impl TestHarness {
                             .unwrap_or_else(|_| "minioadmin".to_string()),
                     ),
                     s3_allow_http: true,
+                    fail_fast: true,
+                    ..StorageConfig::default()
+                };
+                ZeppelinStore::from_config(&config).expect("failed to create store from config")
+            }
+            "gcs" => {
+                // Patched fake-gcs-server, run natively —
+                // see scripts/emulators/README.md. The endpoint travels via
+                // the config field; `from_config` synthesizes the
+                // OAuth-disabled service-account JSON internally, so no temp
+                // credential file is needed.
+                let endpoint = std::env::var("GCS_TEST_ENDPOINT")
+                    .unwrap_or_else(|_| "http://127.0.0.1:4443".to_string());
+                ensure_gcs_bucket(&endpoint, &bucket).await;
+                let config = StorageConfig {
+                    backend: StorageBackend::Gcs,
+                    bucket: bucket.clone(),
+                    gcs_endpoint: Some(endpoint),
                     fail_fast: true,
                     ..StorageConfig::default()
                 };

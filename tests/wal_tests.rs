@@ -60,7 +60,13 @@ impl ObjectStore for ManifestGetEtagOverrideStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
         let mut result = self.inner.get_opts(location, options).await?;
         if location.as_ref() == self.manifest_key {
+            // Model "the backend returned no usable version token" on every
+            // substrate: strip the substrate-native version (GCS generation)
+            // together with the ETag, or the scenario is vacuous on
+            // generation-CAS backends. On S3/memory the version is already
+            // absent, so behavior there is unchanged.
             result.meta.e_tag.clone_from(&self.replacement);
+            result.meta.version.clone_from(&self.replacement);
         }
         Ok(result)
     }

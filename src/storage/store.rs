@@ -410,6 +410,14 @@ pub struct ListedObject {
     /// Backend-reported last modification timestamp.
     pub last_modified: DateTime<Utc>,
     /// Non-empty opaque identity, or `None` when this observation is unversioned.
+    ///
+    /// **Revalidation and comparison only — never pass a LIST-derived token
+    /// to `put_if_match*`.** LIST responses carry an ETag but no
+    /// substrate-native version, and on GCS the object generation is the only
+    /// token that authorizes a conditional PUT, so a LIST-derived token would
+    /// die with `MissingVersion` there. Every CAS uses a GET- or PUT-derived
+    /// token (audited across all `put_if_match*` call sites,
+    /// `tasks/multi-substrate/08-release-evidence.md`).
     pub version: Option<StorageVersion>,
 }
 
@@ -533,34 +541,73 @@ impl ZeppelinStore {
                     // Enable atomic create semantics for server-side copy,
                     // used by restore-as-clone materialization.
                     builder = builder.with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
-                    // S3 returns 503 SlowDown and partition-level throttling
-                    // that routinely needs multi-second backoff; a budget of
-                    // two retries inside a two-second window surfaced routine
-                    // throttling to callers as hard errors. Five retries with
-                    // a 5 s backoff ceiling stay well inside the 30 s request
-                    // timeout below.
-                    builder = builder.with_retry(RetryConfig {
-                        backoff: BackoffConfig {
-                            init_backoff: Duration::from_millis(100),
-                            max_backoff: Duration::from_secs(5),
-                            base: 2.0,
-                        },
-                        max_retries: 5,
-                        retry_timeout: Duration::from_secs(15),
-                    });
-
-                    // Connection pool tuning: increase idle connections and timeouts
-                    // to prevent 28% sustained throughput degradation observed in Run-007.
-                    let client_options = ClientOptions::new()
-                        .with_allow_http(config.s3_allow_http)
-                        .with_pool_max_idle_per_host(64)
-                        .with_timeout(std::time::Duration::from_secs(30))
-                        .with_connect_timeout(std::time::Duration::from_secs(2))
-                        .with_pool_idle_timeout(std::time::Duration::from_secs(90));
-                    builder = builder.with_client_options(client_options);
+                    builder = builder
+                        .with_retry(transport_retry_config())
+                        .with_client_options(transport_client_options(config.s3_allow_http));
 
                     Arc::new(builder.build().map_err(|e| {
                         ZeppelinError::Config(format!("failed to build S3 store: {e}"))
+                    })?)
+                }
+                crate::config::StorageBackend::Gcs => {
+                    let mut builder = object_store::gcp::GoogleCloudStorageBuilder::new()
+                        .with_bucket_name(&config.bucket);
+                    let endpoint = config
+                        .gcs_endpoint
+                        .as_deref()
+                        .filter(|value| !value.is_empty());
+                    let account_path = config
+                        .gcs_service_account_path
+                        .as_deref()
+                        .filter(|value| !value.is_empty());
+                    let account_key = config
+                        .gcs_service_account_key
+                        .as_deref()
+                        .filter(|value| !value.is_empty());
+                    // Config validation enforces that path and inline key are
+                    // mutually exclusive. object_store 0.11.2 has no endpoint
+                    // builder knob: a custom endpoint travels as gcs_base_url
+                    // inside the service-account JSON, so an endpoint-bearing
+                    // configuration synthesizes (no credentials — emulator,
+                    // OAuth disabled) or augments (real credentials) that JSON.
+                    match (endpoint, account_path, account_key) {
+                        (None, Some(path), None) => {
+                            builder = builder.with_service_account_path(path);
+                        }
+                        (None, None, Some(key)) => {
+                            builder = builder.with_service_account_key(key);
+                        }
+                        (None, None, None) => {
+                            // Ambient chain: GOOGLE_APPLICATION_CREDENTIALS or
+                            // instance metadata, resolved by object_store at
+                            // request time. Fails loudly there if absent.
+                        }
+                        (Some(endpoint), path, key) => {
+                            let json = gcs_service_account_json_with_endpoint(endpoint, path, key)?;
+                            builder = builder.with_service_account_key(json);
+                        }
+                        (None, Some(_), Some(_)) => {
+                            return Err(ZeppelinError::Config(
+                                "gcs_service_account_path and gcs_service_account_key \
+                                 are mutually exclusive"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    // Conditional PUT needs no opt-in: PutMode::Update maps to
+                    // x-goog-if-generation-match and PutMode::Create to
+                    // generation-match 0; a token without a generation fails
+                    // loudly inside object_store (MissingVersion), which is
+                    // exactly the fail-loud behavior the seam wants.
+                    // copy_if_not_exists is native. Plain HTTP rides on the
+                    // configured endpoint's scheme (emulators only).
+                    let allow_http = endpoint.is_some_and(|e| e.starts_with("http://"));
+                    builder = builder
+                        .with_retry(transport_retry_config())
+                        .with_client_options(transport_client_options(allow_http));
+
+                    Arc::new(builder.build().map_err(|e| {
+                        ZeppelinError::Config(format!("failed to build GCS store: {e}"))
                     })?)
                 }
                 crate::config::StorageBackend::Local => {
@@ -576,7 +623,7 @@ impl ZeppelinStore {
                 }
                 backend => {
                     return Err(ZeppelinError::Config(format!(
-                        "unsupported storage backend: {backend} (gcs/azure not yet implemented)"
+                        "unsupported storage backend: {backend} (azure not yet implemented)"
                     )));
                 }
             };
@@ -2876,11 +2923,91 @@ impl ZeppelinStore {
 fn configured_probe_endpoint(config: &StorageConfig) -> Option<&str> {
     let endpoint = match config.backend {
         crate::config::StorageBackend::S3 => config.s3_endpoint.as_deref(),
-        crate::config::StorageBackend::Gcs
-        | crate::config::StorageBackend::Azure
-        | crate::config::StorageBackend::Local => None,
+        crate::config::StorageBackend::Gcs => config.gcs_endpoint.as_deref(),
+        crate::config::StorageBackend::Azure | crate::config::StorageBackend::Local => None,
     };
     endpoint.filter(|value| !value.is_empty())
+}
+
+/// Tuned retry policy shared by every remote transport.
+///
+/// Origin: S3 returns 503 SlowDown and partition-level throttling that
+/// routinely needs multi-second backoff; a budget of two retries inside a
+/// two-second window surfaced routine throttling to callers as hard errors.
+/// Five retries with a 5 s backoff ceiling stay well inside the 30 s request
+/// timeout. GCS 429/503 behaves comparably and reuses it unchanged;
+/// per-substrate retuning is explicitly a follow-up track.
+fn transport_retry_config() -> RetryConfig {
+    RetryConfig {
+        backoff: BackoffConfig {
+            init_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(5),
+            base: 2.0,
+        },
+        max_retries: 5,
+        retry_timeout: Duration::from_secs(15),
+    }
+}
+
+/// Connection pool tuning shared by every remote transport: increased idle
+/// connections and timeouts prevent the 28% sustained throughput degradation
+/// observed in Run-007.
+fn transport_client_options(allow_http: bool) -> ClientOptions {
+    ClientOptions::new()
+        .with_allow_http(allow_http)
+        .with_pool_max_idle_per_host(64)
+        .with_timeout(std::time::Duration::from_secs(30))
+        .with_connect_timeout(std::time::Duration::from_secs(2))
+        .with_pool_idle_timeout(std::time::Duration::from_secs(90))
+}
+
+/// Builds the service-account JSON that carries a custom GCS endpoint.
+///
+/// `object_store` 0.11.2 reads `gcs_base_url` (and `disable_oauth`) only from
+/// the service-account document — there is no endpoint knob on the builder.
+/// Without credentials this synthesizes the emulator document (OAuth
+/// disabled); with credentials it augments the operator's document with
+/// `gcs_base_url`, leaving authentication untouched.
+fn gcs_service_account_json_with_endpoint(
+    endpoint: &str,
+    account_path: Option<&str>,
+    account_key: Option<&str>,
+) -> Result<String> {
+    let mut document: serde_json::Value = match (account_path, account_key) {
+        (Some(path), _) => {
+            let raw = std::fs::read_to_string(path).map_err(|error| {
+                ZeppelinError::Config(format!(
+                    "failed to read gcs_service_account_path {path}: {error}"
+                ))
+            })?;
+            serde_json::from_str(&raw).map_err(|error| {
+                ZeppelinError::Config(format!(
+                    "gcs_service_account_path {path} is not valid JSON: {error}"
+                ))
+            })?
+        }
+        (None, Some(key)) => serde_json::from_str(key).map_err(|error| {
+            ZeppelinError::Config(format!(
+                "gcs_service_account_key is not valid JSON: {error}"
+            ))
+        })?,
+        (None, None) => serde_json::json!({
+            "disable_oauth": true,
+            "client_email": "",
+            "private_key": "",
+            "private_key_id": "",
+        }),
+    };
+    let Some(map) = document.as_object_mut() else {
+        return Err(ZeppelinError::Config(
+            "GCS service-account document must be a JSON object".to_string(),
+        ));
+    };
+    map.insert(
+        "gcs_base_url".to_string(),
+        serde_json::Value::String(endpoint.to_string()),
+    );
+    Ok(document.to_string())
 }
 
 fn endpoint_host_port(endpoint: &str) -> Result<(String, u16)> {

@@ -534,19 +534,22 @@ async fn test_local_backend_creates_dir() {
     assert!(nested.exists());
 }
 
-/// Test unsupported backend returns Config error (lines 63-67).
+/// Test unsupported backend returns Config error. Azure is the last
+/// transport-less variant; multi-substrate plan 06 retires this test (every
+/// backend then constructs).
 #[test]
 fn test_unsupported_backend_error() {
     let config = StorageConfig {
-        backend: StorageBackend::Gcs,
+        backend: StorageBackend::Azure,
         bucket: "irrelevant".to_string(),
+        azure_use_emulator: true,
         ..Default::default()
     };
     let result = ZeppelinStore::from_config(&config);
     match result {
         Err(zeppelin::error::ZeppelinError::Config(msg)) => {
             assert!(
-                msg.contains("unsupported storage backend: gcs"),
+                msg.contains("unsupported storage backend: azure"),
                 "unexpected message: {msg}"
             );
         }
