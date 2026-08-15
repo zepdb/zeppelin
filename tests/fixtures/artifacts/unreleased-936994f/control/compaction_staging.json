@@ -1,0 +1,7 @@
+{
+  "fencing_token": 7,
+  "keys": [
+    "artifact-corpus/segments/staged/bootstrap.bin",
+    "artifact-corpus/segments/staged/cluster_0.bin"
+  ]
+}

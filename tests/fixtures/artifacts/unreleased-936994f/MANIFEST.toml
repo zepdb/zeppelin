@@ -1,0 +1,539 @@
+[corpus]
+version_directory = "unreleased-936994f"
+release_status = "unreleased current-format snapshot; not v0.2.0"
+crate_version = "0.2.0"
+git_commit = "936994fedbc53a3e78bb7f7a5e44373b6e0ebcd1"
+generated_at = "2026-08-15T12:00:00Z"
+namespace = "artifact-corpus"
+dimensions = 8
+ann_query_vector_id = "vec_0"
+ann_top3 = [
+    "vec_0",
+    "vec_5",
+    "vec_6",
+]
+bm25_query = "zeppelin golden artifact"
+bm25_top3 = [
+    "vec_0",
+    "vec_1",
+    "vec_2",
+]
+
+[[files]]
+path = "control/branch_visibility_marker.json"
+family = "branch_visibility_marker"
+producer = "BranchVisibilityRemovalMarker serde JSON encoder"
+comparison = "structure"
+size_bytes = 546
+sha256 = "75cd84390363a2b347b84c3b36bfa648bfb277f7549c248d52144e827b887cea"
+
+[[files]]
+path = "control/compaction_staging.json"
+family = "compaction_staging"
+producer = "CompactionStaging serde JSON encoder"
+comparison = "structure"
+size_bytes = 146
+sha256 = "cbb0058643a2f874815506194c57b1bb101e1bae6b49f7358ee902429b0c97b7"
+
+[[files]]
+path = "control/gc_candidates.json"
+family = "gc_candidate_ledger"
+producer = "save_gc_candidates"
+comparison = "structure"
+size_bytes = 220
+sha256 = "943e01998af948f35a55771d09ff16b84df6988cf7527c09f726f1f1e8e64426"
+
+[[files]]
+path = "control/namespace_destruction_record.json"
+family = "namespace_destruction_record"
+producer = "NamespaceDestructionRecord::to_bytes"
+comparison = "structure"
+size_bytes = 277
+sha256 = "488c95ab22dcc1dc505ef8e4c3592e387ed6c46f2d46b638cd7f89e70d13e180"
+
+[[files]]
+path = "hierarchical/tree_meta.json"
+family = "hierarchical_tree_metadata"
+producer = "build_hierarchical plus fixed root-ULID normalization"
+comparison = "structure"
+size_bytes = 211
+sha256 = "30860cbab5aac824e8139e38b51558a262f27e8488e6cb51aba669123e049cc3"
+
+[[files]]
+path = "hierarchical/tree_node.bin"
+family = "hierarchical_tree_node"
+producer = "build_hierarchical/serialize_tree_node after fixed root-ULID normalization"
+comparison = "structure"
+size_bytes = 46
+sha256 = "6a0d2ac523a3c3fbc8c0d5e47524dcbf2e2074c09bc28b4bfb92f90742e7749d"
+
+[[files]]
+path = "input_wal.bin"
+family = "input_wal_fragment"
+producer = "EncoderInputWalFragment::try_new/to_bytes with fixed ULID"
+comparison = "bytes"
+size_bytes = 197
+sha256 = "c7565cbb220dd3bc789e054c961ab4fbfebf57d583ffe4efbfc167299376f252"
+
+[[files]]
+path = "late/attribute_block.bin"
+family = "late_attribute_block"
+producer = "build_late_interaction_segment"
+comparison = "structure"
+size_bytes = 365
+sha256 = "075b54e5941612f250cb61dd04b9d0f1b033880e41c6660a748029c53147248b"
+
+[[files]]
+path = "late/candidate_bootstrap.bin"
+family = "late_candidate_bootstrap"
+producer = "build_late_interaction_segment"
+comparison = "structure"
+size_bytes = 892
+sha256 = "0c45968dbb8e9d9e21a1ed44cee6b3531e14a4a24b243bad236f1c635971dc0e"
+
+[[files]]
+path = "late/candidate_cluster_0.bin"
+family = "late_candidate_cluster"
+producer = "build_late_interaction_segment"
+comparison = "structure"
+size_bytes = 1590
+sha256 = "c71a88768114881fcb19be4220b0f6e2d3e04cee250428a443e4f3bca354384e"
+
+[[files]]
+path = "late/candidate_cluster_1.bin"
+family = "late_candidate_cluster"
+producer = "build_late_interaction_segment"
+comparison = "structure"
+size_bytes = 907
+sha256 = "36dafc41cfd9d0eb152a6a2469c497e14d437d4df80bd4ab70e93b8256fe6e27"
+
+[[files]]
+path = "late/centering.bin"
+family = "centering"
+producer = "CenteringArtifact::new/to_bytes"
+comparison = "structure"
+size_bytes = 14
+sha256 = "9eb20382180b0d33710f8e183411d82d88197428653dd9a9bd47a1f35ef8b176"
+
+[[files]]
+path = "late/fde_fragment.bin"
+family = "fde_fragment"
+producer = "FdeTransform::encode_document/FdeArtifact::new/to_bytes"
+comparison = "structure"
+size_bytes = 114
+sha256 = "3c9ab30defc3516ff48bcdd9851b59e63919c9db36bc4e989dc8f83244f07540"
+
+[[files]]
+path = "late/fde_transform.bin"
+family = "fde_transform"
+producer = "FdeTransform::generate with fixed seed/to_bytes"
+comparison = "structure"
+size_bytes = 348
+sha256 = "aa47ba72d5b4497c266c29c43ec0ce71ebb825cb6e4d19a14f325e381988af39"
+
+[[files]]
+path = "late/flat_candidate.bin"
+family = "late_flat_candidate"
+producer = "build_late_interaction_segment"
+comparison = "structure"
+size_bytes = 2052
+sha256 = "bb62a625da08c964434e6621e837bfe0d91edecbe789e4e86cef80e7b5a590f7"
+
+[[files]]
+path = "late/matrix_block.bin"
+family = "late_matrix_block"
+producer = "build_late_interaction_segment"
+comparison = "structure"
+size_bytes = 774
+sha256 = "f0586b3e9f3097a36ceb077c38c1f0aa568434899ea33ad43a310b1ebc048cf0"
+
+[[files]]
+path = "late/matrix_fragment.bin"
+family = "matrix_fragment"
+producer = "DeterministicDev/MatrixArtifact::new/to_bytes"
+comparison = "structure"
+size_bytes = 110
+sha256 = "46540577277b129c06899200d47f811b3aa66bbaaa511c966326d031c089fafa"
+
+[[files]]
+path = "late/quarantine_evidence.bin"
+family = "quarantine_evidence"
+producer = "enrichment quarantine evidence encoder"
+comparison = "structure"
+size_bytes = 279
+sha256 = "7999dfac1b5722ced1b7836d7a8f76d488a24373660dcf2ad85d3812d1e4161d"
+
+[[files]]
+path = "late/state.bin"
+family = "late_state_section"
+producer = "LateStateSection::to_bytes"
+comparison = "bytes"
+size_bytes = 13
+sha256 = "369afcce971993036206c29f5e16aa1a848a066e632d1d75e7bcaf5ae64bee6a"
+object_key = "artifact-corpus/late/state/369afcce971993036206c29f5e16aa1a848a066e632d1d75e7bcaf5ae64bee6a"
+
+[[files]]
+path = "lease.json"
+family = "namespace_lease"
+producer = "Lease serde JSON encoder"
+comparison = "structure"
+size_bytes = 142
+sha256 = "15448544dc0ece125ad81b125e7f494c684afb25fbf22761dc313340815dee3b"
+
+[[files]]
+path = "manifest.bin"
+family = "manifest"
+producer = "Manifest::write/to_bytes"
+comparison = "bytes"
+size_bytes = 936
+sha256 = "9a7f0a64b7a32402ce84db8b96c13c95e3fb65e80fcf0022c2b670e88083954b"
+object_key = "artifact-corpus/manifest.json"
+
+[[files]]
+path = "manifest_legacy_json.json"
+family = "manifest"
+producer = "Manifest serde JSON compatibility encoder"
+comparison = "structure"
+size_bytes = 4676
+sha256 = "c9837393ed5d5d96b0aafbdeb3dddfa62f932f3e887e62ef8e4b9d77ab7b9b66"
+
+[[files]]
+path = "meta.json"
+family = "namespace_metadata"
+producer = "NamespaceMetadata::to_bytes"
+comparison = "structure"
+size_bytes = 836
+sha256 = "3f519ba4809c4d1fffaa3c41c30b6974339fb60afdab34ed35454b695381972a"
+object_key = "artifact-corpus/meta.json"
+
+[[files]]
+path = "quantization/pq_cluster.bin"
+family = "pq_cluster"
+producer = "PqCodebook::encode/serialize_pq_cluster"
+comparison = "structure"
+size_bytes = 52
+sha256 = "45396c79dfc7210a73286f2c6a6acb935da9f2bcf15f388b761364ef7f7c4722"
+
+[[files]]
+path = "quantization/pq_codebook.bin"
+family = "pq_codebook"
+producer = "PqCodebook::train/to_bytes"
+comparison = "structure"
+size_bytes = 8204
+sha256 = "f5ede22f91c1aa586ee977a76b89419104dd067960b871ce7d40234f6bdc062f"
+
+[[files]]
+path = "quantization/sq8_calibration.bin"
+family = "sq8_calibration"
+producer = "SqCalibration::calibrate/to_bytes"
+comparison = "structure"
+size_bytes = 68
+sha256 = "5cd2fbdca49cc7800c603d7ae03dd222ce46d0dbb6225961544b866548329dac"
+
+[[files]]
+path = "quantization/sq8_cluster.bin"
+family = "sq8_cluster"
+producer = "SqCalibration::encode/serialize_sq_cluster"
+comparison = "structure"
+size_bytes = 76
+sha256 = "8735a6be6da2644dacaebb2d58b9fa9d124e96ebeb58503c073cd3898e72a043"
+
+[[files]]
+path = "quantization/sq8_codes_only.bin"
+family = "sq8_codes_only"
+producer = "SqCalibration::encode/serialize_sq_codes_only"
+comparison = "structure"
+size_bytes = 40
+sha256 = "70ebfd1ee82eece735e409536695d893a41a5b1e62eedad8e7f35aedcfe1aa06"
+
+[[files]]
+path = "scoped/ann_descriptor.json"
+family = "scoped_ann_descriptor"
+producer = "ScopedAnnDescriptor::to_bytes"
+comparison = "structure"
+size_bytes = 328
+sha256 = "eb47740dc1624b1c401c4d4b6c11ad291af191472daed12db8406a0c63606d08"
+
+[[files]]
+path = "scoped/fts_index.bin"
+family = "scoped_fts_index"
+producer = "ScopedFtsIndex::to_bytes"
+comparison = "structure"
+size_bytes = 110
+sha256 = "58747377da8dcd9aeeefc9cc7d6297a7471410dffe18a3e125e76560e6316033"
+
+[[files]]
+path = "security/audit_records.jsonl"
+family = "security_audit_jsonl"
+producer = "AuditRecord::open_unsafe_boot/to_json_line"
+comparison = "structure"
+size_bytes = 325
+sha256 = "8ea6ec8236d2a281ea2a6e922879c6c2ad3039c8514aa15baaad5d8bab899b4a"
+
+[[files]]
+path = "security/policy_head.json"
+family = "security_policy_head"
+producer = "PolicyHead::new/production JSON encoder"
+comparison = "structure"
+size_bytes = 243
+sha256 = "a94682e27df8c6ce0d9e96a190aefdf4b0378bae795ff887eaef824486531acc"
+
+[[files]]
+path = "security/policy_snapshot.json"
+family = "security_policy_snapshot"
+producer = "PolicySnapshot::from_bootstrap/production JSON encoder"
+comparison = "structure"
+size_bytes = 1055
+sha256 = "0a5502a8049ff793e7973515f31658749b7fe036ad8f99523f9e2c88bbdf99b8"
+
+[[files]]
+path = "segment/attrs_0.bin"
+family = "cluster_attributes"
+producer = "build_ivf_flat/serialize_attrs"
+comparison = "structure"
+size_bytes = 114
+sha256 = "d4294fdc13af479a50c709c92814543c2ca96fb0cb053d9cfd043cff44f3be35"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/attrs_0.bin"
+
+[[files]]
+path = "segment/attrs_1.bin"
+family = "cluster_attributes"
+producer = "build_ivf_flat/serialize_attrs"
+comparison = "structure"
+size_bytes = 64
+sha256 = "cb6a22b31f66773226a1ef7ca5ec00dc64000ae2388bb7c376f050f41d1ecc6b"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/attrs_1.bin"
+
+[[files]]
+path = "segment/attrs_2.bin"
+family = "cluster_attributes"
+producer = "build_ivf_flat/serialize_attrs"
+comparison = "structure"
+size_bytes = 118
+sha256 = "1255ceb58a6af49af43ed0644b0b1b0ae811e94351dd17a13e347385ad2c2a02"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/attrs_2.bin"
+
+[[files]]
+path = "segment/attrs_3.bin"
+family = "cluster_attributes"
+producer = "build_ivf_flat/serialize_attrs"
+comparison = "structure"
+size_bytes = 173
+sha256 = "051aa4725e1c2b23c8b6342f104b4798894501cb506c4ae55a8db5b267d2ece5"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/attrs_3.bin"
+
+[[files]]
+path = "segment/bitmap_0.bin"
+family = "cluster_bitmap_index"
+producer = "build_ivf_flat/build_cluster_bitmaps"
+comparison = "structure"
+size_bytes = 517
+sha256 = "7dd1c75203c4ed18460bf6be4d8323b87f40229dc2f55cb42d1afcefe061b310"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/bitmap_0.bin"
+
+[[files]]
+path = "segment/bitmap_1.bin"
+family = "cluster_bitmap_index"
+producer = "build_ivf_flat/build_cluster_bitmaps"
+comparison = "structure"
+size_bytes = 391
+sha256 = "5a38a8f1ded7743a104a39a093fbd6642fffa896d48e6ac01e8edcee69ac7f76"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/bitmap_1.bin"
+
+[[files]]
+path = "segment/bitmap_2.bin"
+family = "cluster_bitmap_index"
+producer = "build_ivf_flat/build_cluster_bitmaps"
+comparison = "structure"
+size_bytes = 521
+sha256 = "bd08aaa604073e07bd76cf92070ace5553489653ba91e30dc05c91367b861808"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/bitmap_2.bin"
+
+[[files]]
+path = "segment/bitmap_3.bin"
+family = "cluster_bitmap_index"
+producer = "build_ivf_flat/build_cluster_bitmaps"
+comparison = "structure"
+size_bytes = 607
+sha256 = "6b750bf6a98a7ca1e4bd16c8ffdeabbb4df72d21a2ef378005499a2d761825ad"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/bitmap_3.bin"
+
+[[files]]
+path = "segment/bootstrap.bin"
+family = "ivf_bootstrap"
+producer = "build_ivf_flat/build_bootstrap_artifact"
+comparison = "bytes"
+size_bytes = 1434
+sha256 = "074a594281983bb0e22092abda0d247d9e6e37f2f2afcda777ee42373fa1d617"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/bootstrap.bin"
+
+[[files]]
+path = "segment/centroids.bin"
+family = "ivf_centroids"
+producer = "build_ivf_flat"
+comparison = "structure"
+size_bytes = 148
+sha256 = "d7e613439d746629605b5a4cfa7eb646b27315e957f0d13d89ee42b6494842f1"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/centroids.bin"
+
+[[files]]
+path = "segment/cluster_data_0.bin"
+family = "cluster_data_object"
+producer = "build_ivf_flat/serialize_cluster_data_object_v5"
+comparison = "bytes"
+size_bytes = 1027
+sha256 = "6c85808fa2a8e84c83b58150422a0250d6aeb964b0d1c73db9aad91e721d9a01"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/cluster_group_0.bin"
+
+[[files]]
+path = "segment/cluster_data_1.bin"
+family = "cluster_data_object"
+producer = "build_ivf_flat/serialize_cluster_data_object_v5"
+comparison = "bytes"
+size_bytes = 197
+sha256 = "beb88f30acf85aac122d064f68674c282975044a10014017880ff5e99c63da77"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/cluster_group_1.bin"
+
+[[files]]
+path = "segment/cluster_f32.bin"
+family = "cluster_f32_block"
+producer = "ZBP5 fixed-stride f32 block emitted by build_ivf_flat"
+comparison = "structure"
+size_bytes = 64
+sha256 = "22d6f9a30ae9ac38a241e89cbc971cb35dc19cf434c61b8c976b59f101852da6"
+
+[[files]]
+path = "segment/cluster_ids.bin"
+family = "cluster_id_block"
+producer = "ZBP5 ID block emitted by build_ivf_flat"
+comparison = "structure"
+size_bytes = 22
+sha256 = "4c4429211f7597532abc0179a8a9660d35f489344d4e7e8fb272e1acf81a7823"
+
+[[files]]
+path = "segment/cluster_twobit.bin"
+family = "cluster_vector_section"
+producer = "serialize_colocated_rq_cluster incremental builder"
+comparison = "structure"
+size_bytes = 2301
+sha256 = "d219e5d61456e80f141e64d41372eada81895614c9b9d248b991f2df7fc83164"
+
+[[files]]
+path = "segment/filter_summary.bin"
+family = "filter_cardinality_summary"
+producer = "build_ivf_flat/filter summary embedded in ZBS1 v3"
+comparison = "structure"
+size_bytes = 555
+sha256 = "c5224e442531ee0931a0cb098346ea464e08ac5ed37de757b900fbbeb25c31eb"
+
+[[files]]
+path = "segment/fts_0.bin"
+family = "fts_cluster_index"
+producer = "InvertedIndex::build/to_bytes"
+comparison = "structure"
+size_bytes = 459
+sha256 = "26e1e0a3d351c792750ad684879cf529064e0c00d667653feccd894d0bcd5aa2"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/fts_index_0.bin"
+
+[[files]]
+path = "segment/fts_1.bin"
+family = "fts_cluster_index"
+producer = "InvertedIndex::build/to_bytes"
+comparison = "structure"
+size_bytes = 302
+sha256 = "375821f04c3869185e5bb21540c5b8b199530dabb349e53058e3109e1cf5864c"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/fts_index_1.bin"
+
+[[files]]
+path = "segment/fts_2.bin"
+family = "fts_cluster_index"
+producer = "InvertedIndex::build/to_bytes"
+comparison = "structure"
+size_bytes = 510
+sha256 = "f927d4e2b08432259fb9ab3848ec811d7731bfab1b9bb50d1ee9064adce8d78b"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/fts_index_2.bin"
+
+[[files]]
+path = "segment/fts_3.bin"
+family = "fts_cluster_index"
+producer = "InvertedIndex::build/to_bytes"
+comparison = "structure"
+size_bytes = 671
+sha256 = "954b825e543bbcc65474949ff02c43c3752f2039213509b49c7a0ca37852249f"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/fts_index_3.bin"
+
+[[files]]
+path = "segment/fts_meta.json"
+family = "fts_segment_metadata"
+producer = "FtsSegmentMeta::to_bytes over production indexes"
+comparison = "structure"
+size_bytes = 646
+sha256 = "3e3d5fb2677d80b4f6ea4b3e407804fa3a29de5637f5bbbf997d85748ad94bb7"
+
+[[files]]
+path = "segment/global_fts.bin"
+family = "fts_global_index"
+producer = "GlobalInvertedIndex::build/to_bytes"
+comparison = "structure"
+size_bytes = 368
+sha256 = "c12f88de0362c0fba2aa8beae09768f0d5510858ddff2da92ed4147d459c0a59"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/global_fts.bin"
+
+[[files]]
+path = "segment/membership.bin"
+family = "ivf_membership"
+producer = "build_ivf_flat/build_membership_artifact"
+comparison = "structure"
+size_bytes = 108
+sha256 = "dcbdb1c7cff0b47aa02064a50d273f9151f670bd6301ae7ceccde4212eefe859"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/membership.bin"
+
+[[files]]
+path = "segment/rabitq_cluster.bin"
+family = "rabitq_cluster"
+producer = "RqClusterCodes::encode/to_bytes"
+comparison = "structure"
+size_bytes = 191
+sha256 = "444ecdec3bdda8065c73f5b56477ea932b6e6de19e24c747f66c64898a42a3d8"
+
+[[files]]
+path = "segment/rabitq_codes_only.bin"
+family = "rabitq_codes_only"
+producer = "ZBP5 coarse block emitted by build_ivf_flat"
+comparison = "structure"
+size_bytes = 160
+sha256 = "94af9cd788d33cd2185de5c11edf18b7dc44de243ec07f4ccfdd5b32ba504416"
+
+[[files]]
+path = "segment/sketch.bin"
+family = "resident_sketch"
+producer = "build_ivf_flat/build_resident_sketch with fixed rotation seed"
+comparison = "bytes"
+size_bytes = 637
+sha256 = "1ee563790a9f8f29b9df519c00abb9614c65421327cfcfabaddb1f36c0664577"
+object_key = "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/coarse_sketch.bin"
+
+[[files]]
+path = "snapshot.bin"
+family = "named_snapshot"
+producer = "NamedSnapshot::to_bytes"
+comparison = "structure"
+size_bytes = 24
+sha256 = "abe7f2b5d4ce9ec9c6619a9c7748ded708a7fa9774648d783b7ca855169ea9d8"
+
+[[files]]
+path = "source_payload.bin"
+family = "source_payload"
+producer = "caller-owned source payload"
+comparison = "structure"
+size_bytes = 34
+sha256 = "31e141f1522f873fdc28ac5d98e4c96116ad65d644bd7de8648ca94c720182d2"
+
+[[files]]
+path = "wal_fragment.bin"
+family = "wal_fragment"
+producer = "WalFragment::try_new/to_bytes with fixed ULID"
+comparison = "bytes"
+size_bytes = 421
+sha256 = "d5b430650705c7dcc1bb5e18ff2fc28bc2f98aad9046f2a203a50a02bb66b4b6"
+object_key = "artifact-corpus/wal/01ARZ3NDEKTSV4RRFFQ69G5FAW.wal"

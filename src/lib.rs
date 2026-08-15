@@ -213,7 +213,11 @@ pub mod embedding;
 /// namespace, index, and HTTP-facing failures. Callers match variants or use the
 /// response classification helpers rather than parsing error strings.
 pub mod error;
-pub(crate) mod format;
+/// Static inventory of every persisted artifact codec.
+///
+/// This module is public so release-compatibility tests can enumerate the same
+/// registry the library uses; it is not a storage or query API.
+pub mod format;
 /// Tokenization, BM25 scoring, rank expressions, immutable inverted indexes, and WAL scans.
 ///
 /// [`fts::FtsFieldConfig`] defines compatible build/query tokenization. Segment

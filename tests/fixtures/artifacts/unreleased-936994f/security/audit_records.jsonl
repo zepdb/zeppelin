@@ -1,0 +1,1 @@
+{"ts":"2026-08-15T12:00:00Z","request_id":"startup","decision_id":null,"principal_id":"anonymous","principal_kind":"anonymous","delegation_parent":null,"action":"SystemRead","resource":"system","policy_version":0,"source_ip":"0.0.0.0","outcome":"success","params":"open_unsafe_boot","node_id":"golden-node","prev_hash":null}

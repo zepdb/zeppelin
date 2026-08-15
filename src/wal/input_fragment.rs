@@ -102,12 +102,51 @@ impl EncoderInputWalFragment {
 
     /// Serialize as `[ZIW1][version=1][MessagePack payload]`.
     pub fn to_bytes(&self) -> Result<Bytes> {
+        #[derive(Serialize)]
+        struct CanonicalRetrievalUnitRecord<'a> {
+            id: &'a str,
+            input: &'a crate::embedding::EncoderInputRef,
+            content_hash: crate::embedding::ContentHash,
+            parent_id: Option<&'a String>,
+            unit_ordinal: Option<u32>,
+            attributes: Option<BTreeMap<&'a String, &'a AttributeValue>>,
+        }
+
+        #[derive(Serialize)]
+        struct CanonicalInputFragment<'a> {
+            id: Ulid,
+            upserts: Vec<CanonicalRetrievalUnitRecord<'a>>,
+            deletes: &'a [VectorId],
+            checksum: u64,
+        }
+
+        let upserts = self
+            .upserts
+            .iter()
+            .map(|record| CanonicalRetrievalUnitRecord {
+                id: &record.id,
+                input: &record.input,
+                content_hash: record.content_hash,
+                parent_id: record.parent_id.as_ref(),
+                unit_ordinal: record.unit_ordinal,
+                attributes: record
+                    .attributes
+                    .as_ref()
+                    .map(|attributes| attributes.iter().collect()),
+            })
+            .collect();
+        let canonical = CanonicalInputFragment {
+            id: self.id,
+            upserts,
+            deletes: &self.deletes,
+            checksum: self.checksum,
+        };
         // Serialize directly after the magic and version: one buffer, no
         // second copy of the payload.
         let mut bytes = Vec::with_capacity(INPUT_WAL_MAGIC.len() + 1);
         bytes.extend_from_slice(INPUT_WAL_MAGIC);
         bytes.push(INPUT_WAL_VERSION);
-        rmp_serde::encode::write(&mut bytes, self).map_err(|error| {
+        rmp_serde::encode::write(&mut bytes, &canonical).map_err(|error| {
             ZeppelinError::Serialization(format!("input WAL MessagePack serialize failed: {error}"))
         })?;
         Ok(Bytes::from(bytes))

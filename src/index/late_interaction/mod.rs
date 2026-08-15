@@ -43,8 +43,8 @@ pub(crate) use attribute_artifact::{
 };
 pub(crate) use candidate::{
     decode_all_candidate_rows, probe_candidate_bootstrap_format, probe_candidate_cluster_format,
-    CandidateFdeSource, FetchedLateCandidateCluster, BOOTSTRAP_MAGIC, CLUSTER_MAGIC,
-    LATE_CANDIDATE_FORMAT_VERSION,
+    CandidateFdeSource, FetchedLateCandidateCluster, LateCandidateBuildConfig, BOOTSTRAP_MAGIC,
+    CLUSTER_MAGIC, LATE_CANDIDATE_FORMAT_VERSION,
 };
 pub(crate) use fde::{FDE_TRANSFORM_FORMAT_VERSION, TRANSFORM_MAGIC};
 pub(crate) use flat_candidate::{
@@ -55,8 +55,8 @@ pub(crate) use matrix_artifact::{
     decode_matrix_block, probe_matrix_block_format, MATRIX_BLOCK_FORMAT_VERSION, MATRIX_BLOCK_MAGIC,
 };
 pub(crate) use segment_build::{
-    build_late_interaction_segment, LateCandidateBuild, LateRowMatrixSource,
-    LateSegmentBuildConfig, LateSegmentBuildRow, PrebuiltLateFtsArtifact,
+    build_late_interaction_segment, BuiltLateSegmentArtifact, LateCandidateBuild,
+    LateRowMatrixSource, LateSegmentBuildConfig, LateSegmentBuildRow, PrebuiltLateFtsArtifact,
 };
 
 use thiserror::Error;

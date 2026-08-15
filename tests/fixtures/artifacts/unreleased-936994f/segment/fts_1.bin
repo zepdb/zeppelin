@@ -1,0 +1,1 @@
+ZFTS{"vector_count":1,"fields":{"body":{"avg_doc_length":4.0,"doc_count":1,"postings":{"approxim":{"df":1,"entries":[{"position":0,"tf":1}]},"dens":{"df":1,"entries":[{"position":0,"tf":1}]},"nearest":{"df":1,"entries":[{"position":0,"tf":1}]},"neighbor":{"df":1,"entries":[{"position":0,"tf":1}]}}}}}

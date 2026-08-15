@@ -300,7 +300,17 @@ impl ClusterBitmapIndex {
     /// and lifetime checked. The returned `Bytes` owns the serialized allocation
     /// independently of that borrow.
     pub fn to_bytes(&self) -> crate::error::Result<bytes::Bytes> {
-        let json = serde_json::to_vec(self)?;
+        #[derive(Serialize)]
+        struct CanonicalBitmapIndex<'a> {
+            vector_count: u32,
+            fields: BTreeMap<&'a String, &'a AttributeBitmaps>,
+        }
+
+        let canonical = CanonicalBitmapIndex {
+            vector_count: self.vector_count,
+            fields: self.fields.iter().collect(),
+        };
+        let json = serde_json::to_vec(&canonical)?;
         let mut buf = Vec::with_capacity(5 + json.len());
         buf.extend_from_slice(BITMAP_MAGIC);
         buf.push(BITMAP_VERSION);

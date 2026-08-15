@@ -1,0 +1,227 @@
+{
+  "fragments": [
+    {
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "vector_count": 4,
+      "delete_count": 1,
+      "sequence_number": 0,
+      "size_bytes": 421,
+      "artifact_origin": null
+    }
+  ],
+  "segments": [
+    {
+      "id": "seg_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "vector_count": 8,
+      "cluster_count": 4,
+      "quantization": "two_bit",
+      "hierarchical": false,
+      "bitmap_fields": [
+        "body",
+        "tenant"
+      ],
+      "fts_fields": [
+        "body"
+      ],
+      "has_global_fts": true,
+      "cluster_owners": [],
+      "sketch": {
+        "key": "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/coarse_sketch.bin",
+        "version": 4,
+        "code_dims": 256,
+        "bytes_per_vector": 72,
+        "size_bytes": 637,
+        "rotation_seed": 6504693542496782670
+      },
+      "cluster_objects": [
+        {
+          "key": "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/cluster_group_0.bin",
+          "clusters": [
+            0,
+            2,
+            3
+          ],
+          "live_offset": 0,
+          "live_len": 0,
+          "size_bytes": 1027,
+          "cluster_layout_version": 5,
+          "row_layouts": [
+            {
+              "cluster_idx": 0,
+              "row_count": 2,
+              "coarse_offset": 176,
+              "coarse_len": 160,
+              "ids_offset": 728,
+              "ids_len": 22,
+              "vectors_offset": 803,
+              "vectors_len": 64
+            },
+            {
+              "cluster_idx": 2,
+              "row_count": 2,
+              "coarse_offset": 336,
+              "coarse_len": 160,
+              "ids_offset": 750,
+              "ids_len": 22,
+              "vectors_offset": 867,
+              "vectors_len": 64
+            },
+            {
+              "cluster_idx": 3,
+              "row_count": 3,
+              "coarse_offset": 496,
+              "coarse_len": 232,
+              "ids_offset": 772,
+              "ids_len": 31,
+              "vectors_offset": 931,
+              "vectors_len": 96
+            }
+          ]
+        },
+        {
+          "key": "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/cluster_group_1.bin",
+          "clusters": [
+            1
+          ],
+          "live_offset": 0,
+          "live_len": 0,
+          "size_bytes": 197,
+          "cluster_layout_version": 5,
+          "row_layouts": [
+            {
+              "cluster_idx": 1,
+              "row_count": 1,
+              "coarse_offset": 64,
+              "coarse_len": 88,
+              "ids_offset": 152,
+              "ids_len": 13,
+              "vectors_offset": 165,
+              "vectors_len": 32
+            }
+          ]
+        }
+      ],
+      "bootstrap": {
+        "key": "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/bootstrap.bin",
+        "size_bytes": 1434
+      },
+      "membership": {
+        "key": "artifact-corpus/segments/seg_01ARZ3NDEKTSV4RRFFQ69G5FAV/membership.bin",
+        "size_bytes": 108,
+        "entry_count": 8
+      },
+      "artifact_origin": null
+    }
+  ],
+  "compaction_watermark": null,
+  "active_segment": "seg_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "next_sequence": 1,
+  "pending_deletes": [],
+  "fencing_token": 0,
+  "updated_at": "2026-08-15T12:00:00Z",
+  "version": 1,
+  "namespace": "artifact-corpus",
+  "namespace_incarnation": [
+    17,
+    17,
+    17,
+    17,
+    34,
+    34,
+    51,
+    51,
+    68,
+    68,
+    85,
+    85,
+    85,
+    85,
+    85,
+    85
+  ],
+  "deletion_fence": null,
+  "hierarchical_routing_nodes": {},
+  "manifest_binding_version": "v5_late_state",
+  "artifact_origins": [],
+  "control_state_digest": [
+    201,
+    119,
+    198,
+    31,
+    226,
+    194,
+    47,
+    253,
+    147,
+    105,
+    114,
+    88,
+    26,
+    155,
+    4,
+    112,
+    59,
+    161,
+    223,
+    255,
+    112,
+    154,
+    152,
+    143,
+    241,
+    132,
+    178,
+    72,
+    120,
+    93,
+    172,
+    231
+  ],
+  "branch_roots": {},
+  "branch_lineage": null,
+  "coarse_payload_encodings": {
+    "seg_01ARZ3NDEKTSV4RRFFQ69G5FAV": "two_bit"
+  },
+  "late_state": {
+    "key": "artifact-corpus/late/state/369afcce971993036206c29f5e16aa1a848a066e632d1d75e7bcaf5ae64bee6a",
+    "checksum": [
+      54,
+      154,
+      252,
+      206,
+      151,
+      25,
+      147,
+      3,
+      98,
+      6,
+      194,
+      159,
+      94,
+      22,
+      170,
+      26,
+      132,
+      138,
+      6,
+      110,
+      99,
+      45,
+      29,
+      117,
+      231,
+      188,
+      175,
+      90,
+      230,
+      75,
+      238,
+      106
+    ],
+    "size_bytes": 13,
+    "format_version": 5,
+    "artifact_origin": null
+  },
+  "input_fragments": [],
+  "semantic_coverage": null
+}

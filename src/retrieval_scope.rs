@@ -898,7 +898,6 @@ pub(crate) fn probe_scoped_ann_descriptor(bytes: &[u8]) -> Result<()> {
     ScopedAnnDescriptor::from_bytes(bytes, &scope_cache_key, &artifact_namespace).map(drop)
 }
 
-#[cfg(test)]
 pub(crate) fn scoped_ann_descriptor_fixture(version: u32) -> Result<Bytes> {
     let mut descriptor =
         ScopedAnnDescriptor::empty("format-probe", "format/segments/probe".to_string(), 1);
@@ -1143,7 +1142,6 @@ pub(crate) fn probe_scoped_fts_artifact(bytes: &[u8]) -> Result<()> {
     ScopedFtsIndex::from_bytes(bytes, &artifact.scope_cache_key).map(drop)
 }
 
-#[cfg(test)]
 pub(crate) fn scoped_fts_artifact_fixture(version: u32) -> Result<Bytes> {
     let artifact = ScopedFtsArtifact {
         version,

@@ -1,0 +1,11 @@
+{
+  "domain": "zeppelin.branch-visibility-removed.v1",
+  "branch_id": "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+  "target_namespace": "artifact-corpus",
+  "target_incarnation": "11111111-2222-3333-4444-555555555555",
+  "fenced_generation": 9,
+  "destruction_record_key": "artifact-corpus/_lifecycle/destruction/01ARZ3NDEKTSV4RRFFQ69G5FB0.json",
+  "intent_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "parent_root_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+  "reader_safety_floor_secs": 30
+}

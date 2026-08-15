@@ -78,6 +78,8 @@
 //! Serde derives generate format code at compile time rather than relying on
 //! Java-style runtime reflection.
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -446,10 +448,44 @@ impl WalFragment {
     /// the buffer by incrementing a reference count rather than copying all
     /// bytes, unlike cloning this `WalFragment`.
     pub fn to_bytes(&self) -> Result<Bytes> {
+        #[derive(Serialize)]
+        struct CanonicalVectorEntry<'a> {
+            id: &'a str,
+            values: &'a [f32],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            attributes: Option<BTreeMap<&'a String, &'a crate::types::AttributeValue>>,
+        }
+
+        #[derive(Serialize)]
+        struct CanonicalFragment<'a> {
+            id: Ulid,
+            vectors: Vec<CanonicalVectorEntry<'a>>,
+            deletes: &'a [VectorId],
+            checksum: u64,
+        }
+
+        let vectors = self
+            .vectors
+            .iter()
+            .map(|vector| CanonicalVectorEntry {
+                id: &vector.id,
+                values: &vector.values,
+                attributes: vector
+                    .attributes
+                    .as_ref()
+                    .map(|attributes| attributes.iter().collect()),
+            })
+            .collect();
+        let canonical = CanonicalFragment {
+            id: self.id,
+            vectors,
+            deletes: &self.deletes,
+            checksum: self.checksum,
+        };
         // Serialize directly after the marker byte: one buffer, no second
         // copy of a potentially multi-megabyte fragment.
         let mut data = vec![WAL_FORMAT_MSGPACK];
-        rmp_serde::encode::write(&mut data, self)
+        rmp_serde::encode::write(&mut data, &canonical)
             .map_err(|e| ZeppelinError::Serialization(format!("msgpack serialize: {e}")))?;
         Ok(Bytes::from(data))
     }

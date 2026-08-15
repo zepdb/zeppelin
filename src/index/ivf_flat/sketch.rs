@@ -447,6 +447,74 @@ impl ResidentSketch {
         Self::decode(data, None)
     }
 
+    /// Re-encode a decoded current-format sketch for the golden corpus check.
+    pub(crate) fn to_current_bytes_for_fixture(&self) -> Result<Bytes> {
+        let (code_dims, rotation_seed) = match &self.encoding {
+            ResidentEncoding::Rabitq2 {
+                code_dims,
+                rotation_seed,
+                ..
+            } if self.version == SKETCH_VERSION => (*code_dims, *rotation_seed),
+            _ => {
+                return Err(ZeppelinError::Index(
+                    "golden fixture re-encoding only supports current resident sketches".into(),
+                ));
+            }
+        };
+        let vector_count = self.cluster_offsets.last().map_or(0, |(_, end)| *end);
+        let mut attr_bits = vec![0_u8; bitset_len(self.cluster_count)];
+        for (cluster, has_attrs) in self.cluster_has_attrs.iter().copied().enumerate() {
+            if has_attrs {
+                set_bit(&mut attr_bits, cluster);
+            }
+        }
+        let mut bytes = Vec::with_capacity(self.serialized_size);
+        bytes.extend_from_slice(SKETCH_MAGIC);
+        bytes.extend_from_slice(&SKETCH_VERSION.to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(self.dim)
+                .map_err(|_| ZeppelinError::Index("coarse sketch dim exceeds u32".into()))?
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(
+            &u32::try_from(code_dims)
+                .map_err(|_| ZeppelinError::Index("coarse sketch code dims exceed u32".into()))?
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(
+            &u32::try_from(self.cluster_count)
+                .map_err(|_| ZeppelinError::Index("coarse sketch clusters exceed u32".into()))?
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(
+            &u64::try_from(vector_count)
+                .map_err(|_| ZeppelinError::Index("coarse sketch rows exceed u64".into()))?
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&rotation_seed.to_le_bytes());
+        bytes.extend_from_slice(&SKETCH_ROTATION_SCHEME_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&SKETCH_BIT_WIDTH.to_le_bytes());
+        bytes.extend_from_slice(&attr_bits);
+        for &(start, end) in &self.cluster_offsets {
+            bytes.extend_from_slice(
+                &u32::try_from(end - start)
+                    .map_err(|_| {
+                        ZeppelinError::Index("coarse sketch cluster rows exceed u32".into())
+                    })?
+                    .to_le_bytes(),
+            );
+        }
+        bytes.extend_from_slice(&self.codes);
+        if bytes.len() != self.serialized_size {
+            return Err(ZeppelinError::Index(format!(
+                "re-encoded coarse sketch size mismatch: expected {}, got {}",
+                self.serialized_size,
+                bytes.len()
+            )));
+        }
+        Ok(Bytes::from(bytes))
+    }
+
     /// Decodes an owned object while sharing its immutable row payload bytes.
     pub(crate) fn from_owned_bytes(data: Bytes) -> Result<Self> {
         Self::decode(&data, Some(&data))

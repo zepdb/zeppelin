@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "candidates": [
+    {
+      "key": "artifact-corpus/segments/orphan/cluster_0.bin",
+      "first_seen_unreachable_at": "2026-08-15T12:00:00Z",
+      "unreachable_since_manifest_version": 6
+    }
+  ]
+}

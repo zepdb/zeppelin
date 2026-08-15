@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+pub mod artifact_fixtures;
+#[allow(dead_code)]
 pub mod assertions;
 #[allow(dead_code)]
 pub mod counting;

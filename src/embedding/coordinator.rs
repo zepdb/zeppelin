@@ -34,6 +34,55 @@ use super::priority::QueryPriorityEncoder;
 pub(crate) const QUARANTINE_EVIDENCE_MAGIC: &[u8; 4] = b"ZEQ1";
 pub(crate) const QUARANTINE_EVIDENCE_VERSION: u8 = 1;
 
+#[derive(Serialize)]
+struct QuarantineEvidenceWire<'a> {
+    work_id: [u8; 32],
+    source_key: &'a str,
+    source_id: ulid::Ulid,
+    source_checksum: u64,
+    semantic_epoch: MultiVectorEpochId,
+    fde_generation: crate::embedding::FdeGenerationId,
+    failed_versions: &'a RecordVersionCoverage,
+    failure_class: &'a str,
+}
+
+fn encode_quarantine_evidence(evidence: &QuarantineEvidenceWire<'_>) -> Result<bytes::Bytes> {
+    let payload = rmp_serde::to_vec(evidence).map_err(|error| {
+        ZeppelinError::Serialization(format!(
+            "semantic quarantine evidence serialization failed: {error}"
+        ))
+    })?;
+    let mut evidence = Vec::with_capacity(5 + payload.len());
+    evidence.extend_from_slice(QUARANTINE_EVIDENCE_MAGIC);
+    evidence.push(QUARANTINE_EVIDENCE_VERSION);
+    evidence.extend_from_slice(&payload);
+    Ok(bytes::Bytes::from(evidence))
+}
+
+pub(crate) fn quarantine_evidence_fixture() -> Result<bytes::Bytes> {
+    let failed_versions = RecordVersionCoverage {
+        records: vec![RecordVersionRef {
+            row_ordinal: 0,
+            record_id: "late-source-0".to_string(),
+            content_hash: crate::embedding::ContentHash::new([9; 32]),
+            sequence: 1,
+        }],
+    };
+    let source_id = ulid::Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAX").map_err(|error| {
+        ZeppelinError::Validation(format!("invalid quarantine fixture ULID: {error}"))
+    })?;
+    encode_quarantine_evidence(&QuarantineEvidenceWire {
+        work_id: [7; 32],
+        source_key: "artifact-corpus/_input_wal/01ARZ3NDEKTSV4RRFFQ69G5FAX.bin",
+        source_id,
+        source_checksum: 17,
+        semantic_epoch: MultiVectorEpochId::new([3; 32]),
+        fde_generation: crate::embedding::FdeGenerationId::new([4; 32]),
+        failed_versions: &failed_versions,
+        failure_class: "unsupported_input_modality",
+    })
+}
+
 /// Deterministic identity of one complete enrichment unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct EnrichmentWorkId([u8; 32]);
@@ -1027,18 +1076,6 @@ fn prepare_quarantines(
     work: &EnrichmentWork,
     poisoned: &[PoisonedRow],
 ) -> Result<Vec<PreparedQuarantine>> {
-    #[derive(Serialize)]
-    struct Evidence<'a> {
-        work_id: [u8; 32],
-        source_key: &'a str,
-        source_id: ulid::Ulid,
-        source_checksum: u64,
-        semantic_epoch: MultiVectorEpochId,
-        fde_generation: crate::embedding::FdeGenerationId,
-        failed_versions: &'a RecordVersionCoverage,
-        failure_class: &'static str,
-    }
-
     let mut by_class = BTreeMap::<&'static str, Vec<RecordVersionRef>>::new();
     for row in poisoned {
         by_class
@@ -1063,7 +1100,7 @@ fn prepare_quarantines(
                 &failed_versions,
                 &work.profile,
             );
-            let payload = rmp_serde::to_vec(&Evidence {
+            let evidence_bytes = encode_quarantine_evidence(&QuarantineEvidenceWire {
                 work_id: evidence_work_id.0,
                 source_key: &source_key,
                 source_id: work.source_ref.id,
@@ -1072,17 +1109,7 @@ fn prepare_quarantines(
                 fde_generation: work.profile.fde.generation,
                 failed_versions: &failed_versions,
                 failure_class,
-            })
-            .map_err(|error| {
-                ZeppelinError::Serialization(format!(
-                    "semantic quarantine evidence serialization failed: {error}"
-                ))
             })?;
-            let mut evidence_bytes = Vec::with_capacity(5 + payload.len());
-            evidence_bytes.extend_from_slice(QUARANTINE_EVIDENCE_MAGIC);
-            evidence_bytes.push(QUARANTINE_EVIDENCE_VERSION);
-            evidence_bytes.extend_from_slice(&payload);
-            let evidence_bytes = bytes::Bytes::from(evidence_bytes);
             let checksum = ArtifactChecksum::digest(&evidence_bytes);
             let key = LateStateSection::artifact_s3_key(
                 &work.namespace,

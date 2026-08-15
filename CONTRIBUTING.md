@@ -41,5 +41,6 @@ example `src/wal/CLAUDE.md`) — read the one for the module you are editing.
 Any persisted-format change must bump the corresponding row in the
 [`src/format.rs` registry](src/format.rs), add an explicit decoder arm for the
 new accepted version, and add or update its golden fixture in the compatibility
-corpus introduced by plan 16. Never reinterpret an unknown version as an older
-layout.
+corpus under `tests/fixtures/artifacts/`. Drive the fixture decision from
+`FORMATS`, regenerate it twice, and require byte-identical output before
+submitting. Never reinterpret an unknown version as an older layout.

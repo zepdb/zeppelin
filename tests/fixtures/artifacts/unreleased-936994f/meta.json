@@ -1,0 +1,38 @@
+{
+  "name": "artifact-corpus",
+  "dimensions": 8,
+  "distance_metric": "euclidean",
+  "index_type": "ivf_flat",
+  "vector_count": 12,
+  "created_at": "2026-08-15T12:00:00Z",
+  "updated_at": "2026-08-15T12:00:00Z",
+  "state": "active",
+  "full_text_search": {
+    "body": {
+      "language": "english",
+      "stemming": true,
+      "remove_stopwords": true,
+      "case_sensitive": false,
+      "k1": 1.2,
+      "b": 0.75,
+      "max_token_length": 40
+    }
+  },
+  "index_config": {
+    "nlist": 4,
+    "quantization": "two_bit",
+    "pq_m": 2,
+    "hierarchical": false,
+    "fts_index": true,
+    "bitmap_index": true
+  },
+  "compaction_health": {
+    "last_compaction_at": null,
+    "last_compaction_status": "never",
+    "last_compaction_error": null,
+    "consecutive_failures": 0
+  },
+  "creation_kind": {
+    "kind": "root"
+  }
+}

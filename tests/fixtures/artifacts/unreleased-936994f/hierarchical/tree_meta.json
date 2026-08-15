@@ -1,0 +1,10 @@
+{
+  "num_levels": 1,
+  "branching_factor": 4,
+  "total_vectors": 4,
+  "dim": 8,
+  "root_node_id": "root_01ARZ3NDEKTSV4RRFFQ69G5FAY",
+  "num_leaf_clusters": 1,
+  "quantization": "none",
+  "sq_calibration": null
+}

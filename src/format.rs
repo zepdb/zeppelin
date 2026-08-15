@@ -63,6 +63,13 @@
 //! | `security_audit_jsonl` | — | — | JSON Lines | no |
 //! | `namespace_destruction_record` | — | — | JSON | no |
 
+/// Release-corpus generation and deep validation seams.
+///
+/// Kept here so integration tests enumerate and exercise the registry without
+/// re-declaring persisted wire shapes.
+#[doc(hidden)]
+pub mod fixture;
+
 use crate::compaction::gc::{probe_gc_candidate_ledger, GC_CANDIDATE_STORE_VERSION};
 use crate::embedding::artifact::{CENTERING_MAGIC, FDE_MAGIC, MATRIX_MAGIC};
 use crate::embedding::coordinator::{
@@ -117,7 +124,7 @@ use crate::wal::manifest::{Manifest, NamedSnapshot, MANIFEST_FORMAT_MSGPACK};
 
 /// Serialization vocabulary used by one persisted family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Encoding {
+pub enum Encoding {
     /// Serde JSON object or array.
     Json,
     /// One JSON object per newline-delimited record.
@@ -145,26 +152,26 @@ enum VersionHeader {
 
 /// One persisted artifact family registered against its real decoder.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct FormatFamily {
+pub struct FormatFamily {
     /// Stable registry name used by tests and the future golden corpus.
-    pub(crate) name: &'static str,
+    pub name: &'static str,
     /// Namespace key families where this codec can occur; empty means global.
     pub(crate) key_families: &'static [NamespaceObjectFamily],
     /// Fixed wire magic. An empty slice means versioned framing without magic.
-    pub(crate) magic: Option<&'static [u8]>,
+    pub magic: Option<&'static [u8]>,
     /// Version written by the current encoder, or zero for unversioned formats.
-    pub(crate) current_version: u32,
+    pub current_version: u32,
     /// Numeric versions the current decoder accepts; zero denotes a legacy layout.
-    pub(crate) accepted_versions: &'static [u32],
+    pub accepted_versions: &'static [u32],
     /// Serialization vocabulary used after any discriminator.
-    pub(crate) encoding: Encoding,
+    pub encoding: Encoding,
     /// Whether this family contributes metadata to a manifest binding projection.
-    pub(crate) checksum_input: bool,
+    pub checksum_input: bool,
     /// Production decoder or production-shared version-dispatch probe.
-    pub(crate) decode_probe: fn(&[u8]) -> Result<()>,
+    pub decode_probe: fn(&[u8]) -> Result<()>,
     version_header: VersionHeader,
     /// Why an unversioned family cannot participate in a future-version probe.
-    pub(crate) probe_note: &'static str,
+    pub probe_note: &'static str,
 }
 
 const NONE: &[NamespaceObjectFamily] = &[];
@@ -240,7 +247,7 @@ macro_rules! family {
 
 /// Complete registry of persisted artifact codecs known to this binary.
 #[used]
-pub(crate) static FORMATS: &[FormatFamily] = &[
+pub static FORMATS: &[FormatFamily] = &[
     family!(
         "namespace_metadata",
         METADATA,

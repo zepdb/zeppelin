@@ -152,7 +152,7 @@
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, info};
@@ -4017,7 +4017,15 @@ fn read_u32_usize(data: &[u8], offset: usize, label: &str) -> Result<usize> {
 /// pointer. The self-describing JSON format is required because serde's
 /// untagged enum must inspect value shape during decoding.
 pub(crate) fn serialize_attrs(attrs: &[Option<HashMap<String, AttributeValue>>]) -> Result<Bytes> {
-    let encoded = serde_json::to_vec(attrs)?;
+    let canonical = attrs
+        .iter()
+        .map(|attributes| {
+            attributes
+                .as_ref()
+                .map(|attributes| attributes.iter().collect::<BTreeMap<_, _>>())
+        })
+        .collect::<Vec<_>>();
+    let encoded = serde_json::to_vec(&canonical)?;
     Ok(Bytes::from(encoded))
 }
 
@@ -4426,7 +4434,8 @@ pub async fn build_ivf_flat(
             cluster_bitmap_indexes.push(bitmap_index);
         }
     }
-    let bitmap_fields: Vec<String> = bitmap_fields_set.into_iter().collect();
+    let mut bitmap_fields: Vec<String> = bitmap_fields_set.into_iter().collect();
+    bitmap_fields.sort();
     let bitmap_complete_fields = bitmap_complete_fields.unwrap_or_default();
     let filter_summary = super::filter_summary::build_filter_cardinality_summary(
         &cluster_bitmap_indexes,
