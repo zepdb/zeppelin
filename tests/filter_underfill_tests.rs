@@ -175,6 +175,52 @@ async fn test_sq8_filtered_query_fills_top_k() {
     let body = query_hot(&client, &base_url, &ns).await;
     assert_full_hot_top_k(&body, "SQ8");
 
+    let underfilled = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&json!({
+            "vector": uniform_vec(0.0),
+            "top_k": TOP_K,
+            "nprobe": 1,
+            "consistency": "strong",
+            "filter": { "op": "eq", "field": "tenant", "value": "missing" },
+            "debug": true,
+            "explain": "plan",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(underfilled.status(), 200);
+    let underfilled: Value = underfilled.json().await.unwrap();
+    assert!(underfilled["results"].as_array().unwrap().is_empty());
+    assert_eq!(
+        underfilled["debug"]["underfill_reason"],
+        "filter_selective_probe_exhausted"
+    );
+    let source = &underfilled["explain"]["plan"]["sources"][0];
+    assert_eq!(source["probed_clusters"], 1);
+    assert!(source["cluster_count"].as_u64().unwrap() > 1);
+    assert_eq!(source["filter_mode"], "attributes");
+    assert_eq!(source["filter_survivors"], 0);
+
+    let metrics = client
+        .get(format!("{base_url}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.lines().any(|line| {
+        line.starts_with("zeppelin_query_filtered_total{")
+            && line.contains(&format!("namespace=\"{ns}\""))
+            && line.contains("filter_mode=\"attributes\"")
+    }));
+    assert!(metrics.lines().any(|line| {
+        line.starts_with("zeppelin_query_underfill_total{")
+            && line.contains(&format!("namespace=\"{ns}\""))
+            && line.contains("reason=\"filter_selective_probe_exhausted\"")
+    }));
+
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
 }
@@ -281,6 +327,25 @@ async fn test_bitmap_filtered_query_unaffected() {
 
     let body = query_hot(&client, &base_url, &ns).await;
     assert_full_hot_top_k(&body, "SQ8+bitmap");
+
+    let explained = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&json!({
+            "vector": uniform_vec(0.0),
+            "top_k": TOP_K,
+            "nprobe": NCLUSTERS,
+            "consistency": "strong",
+            "filter": { "op": "eq", "field": "tenant", "value": "hot" },
+            "explain": "plan",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(explained.status(), 200);
+    let explained: Value = explained.json().await.unwrap();
+    let source = &explained["explain"]["plan"]["sources"][0];
+    assert_eq!(source["filter_mode"], "bitmap");
+    assert!(source["filter_survivors"].as_u64().unwrap() >= TOP_K as u64);
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;

@@ -170,8 +170,8 @@ use crate::index::late_interaction::{
 use crate::namespace::manager::NamespaceMetadata;
 use crate::query;
 use crate::query::{
-    QueryDebug, QueryDebugCache, QueryExplain, QueryExplainCursor, QueryExplainFusion,
-    QueryExplainGrouping, QueryExplainMode, QueryExplainPath, QueryExplainPlan,
+    AnnQueryObservability, QueryDebug, QueryDebugCache, QueryExplain, QueryExplainCursor,
+    QueryExplainFusion, QueryExplainGrouping, QueryExplainMode, QueryExplainPath, QueryExplainPlan,
     QueryExplainProjection, QueryExplainRerank, QueryExplainResult, QueryExplainResultSource,
     QueryExplainSource, QueryExplainSourceKind, QueryFacets, QueryResponse, QueryResultGroup,
 };
@@ -717,12 +717,22 @@ struct SourceQueryResponse {
     manifest: Option<Manifest>,
     /// Late-only recipe and snapshot provenance.
     late_provenance: Option<LateInteractionProvenance>,
+    /// ANN-only physical observations, never serialized directly.
+    ann_observability: Option<AnnQueryObservability>,
 }
 
 impl SourceQueryResponse {
     /// Attach execution-selected direction and late provenance to explain metadata.
     fn annotate_explain_source(&self, source: &mut QueryExplainSource) {
         source.score_direction = self.direction;
+        if source.nprobe.is_some() {
+            if let Some(observation) = self.ann_observability {
+                source.probed_clusters = Some(observation.probed_clusters);
+                source.cluster_count = Some(observation.cluster_count);
+                source.filter_mode = Some(observation.filter_mode.as_str().to_string());
+                source.filter_survivors = observation.filter_survivors;
+            }
+        }
         if let Some(provenance) = self.late_provenance.as_ref() {
             source.profile = Some(provenance.profile.clone());
             source.epoch = Some(provenance.epoch);
@@ -2825,6 +2835,10 @@ fn build_explain_accumulator(
     if policy_filter_applied {
         for source in &mut sources {
             source.nprobe = None;
+            source.probed_clusters = None;
+            source.cluster_count = None;
+            source.filter_mode = None;
+            source.filter_survivors = None;
         }
     }
     Some(ExplainAccumulator::new(
@@ -2949,6 +2963,10 @@ fn explain_source_for_ref(
             index,
             kind: QueryExplainSourceKind::Ann,
             nprobe: Some(nprobe),
+            probed_clusters: None,
+            cluster_count: None,
+            filter_mode: None,
+            filter_survivors: None,
             candidate_k,
             score_direction: ScoreDirection::LowerIsBetter,
             profile: None,
@@ -2961,6 +2979,10 @@ fn explain_source_for_ref(
             index,
             kind: QueryExplainSourceKind::Bm25,
             nprobe: None,
+            probed_clusters: None,
+            cluster_count: None,
+            filter_mode: None,
+            filter_survivors: None,
             candidate_k,
             score_direction: ScoreDirection::HigherIsBetter,
             profile: None,
@@ -2973,6 +2995,10 @@ fn explain_source_for_ref(
             index,
             kind: QueryExplainSourceKind::LateInteraction,
             nprobe: None,
+            probed_clusters: None,
+            cluster_count: None,
+            filter_mode: None,
+            filter_survivors: None,
             candidate_k,
             score_direction: ScoreDirection::HigherIsBetter,
             profile: None,
@@ -3005,6 +3031,10 @@ fn explain_source_for_request_source(
             index,
             kind: QueryExplainSourceKind::Ann,
             nprobe: Some(nprobe),
+            probed_clusters: None,
+            cluster_count: None,
+            filter_mode: None,
+            filter_survivors: None,
             candidate_k,
             score_direction: ScoreDirection::LowerIsBetter,
             profile: None,
@@ -3017,6 +3047,10 @@ fn explain_source_for_request_source(
             index,
             kind: QueryExplainSourceKind::Bm25,
             nprobe: None,
+            probed_clusters: None,
+            cluster_count: None,
+            filter_mode: None,
+            filter_survivors: None,
             candidate_k,
             score_direction: ScoreDirection::HigherIsBetter,
             profile: None,
@@ -3029,6 +3063,10 @@ fn explain_source_for_request_source(
             index,
             kind: QueryExplainSourceKind::LateInteraction,
             nprobe: None,
+            probed_clusters: None,
+            cluster_count: None,
+            filter_mode: None,
+            filter_survivors: None,
             candidate_k,
             score_direction: ScoreDirection::HigherIsBetter,
             profile: None,
@@ -4664,6 +4702,7 @@ async fn execute_query_source_with_manifest(
                 response,
                 manifest: Some(supplied_manifest),
                 late_provenance: None,
+                ann_observability: None,
             })
         }
         QuerySourceRef::Ann {
@@ -4714,26 +4753,16 @@ async fn execute_query_source_with_manifest(
                 decoded_artifact_cache: &state.decoded_artifact_cache,
             });
 
-            let response = if emit_debug {
-                query::execute_query_with_manifest_debug(
-                    params,
-                    manifest,
-                    Some(&state.fragment_cache),
-                    scoped_ann,
-                    authoritative_origin,
-                )
-                .await
-            } else {
-                query::execute_query_with_manifest(
-                    params,
-                    manifest,
-                    Some(&state.fragment_cache),
-                    scoped_ann,
-                    authoritative_origin,
-                )
-                .await
-            };
-            let mut response = response?;
+            let observed = query::execute_query_with_manifest_observed(
+                params,
+                manifest,
+                Some(&state.fragment_cache),
+                scoped_ann,
+                authoritative_origin,
+                emit_debug,
+            )
+            .await?;
+            let mut response = observed.response;
             if let Some(exclude_id) = exclude_id {
                 response.results.retain(|result| result.id != exclude_id);
                 response.results.truncate(top_k);
@@ -4744,6 +4773,7 @@ async fn execute_query_source_with_manifest(
                 response,
                 manifest: Some(supplied_manifest),
                 late_provenance: None,
+                ann_observability: observed.observability,
             })
         }
         QuerySourceRef::LateInteraction {
@@ -4859,6 +4889,7 @@ async fn execute_late_interaction_source_with_manifest(
         response,
         manifest: Some(output.manifest),
         late_provenance: Some(output.provenance),
+        ann_observability: None,
     })
 }
 
@@ -4988,6 +5019,7 @@ pub(crate) fn fuse_ann_bm25_for_test_support(
                 response: ann,
                 manifest: None,
                 late_provenance: None,
+                ann_observability: None,
             },
             SourceQueryResponse {
                 kind: QuerySourceKind::Bm25,
@@ -4995,6 +5027,7 @@ pub(crate) fn fuse_ann_bm25_for_test_support(
                 response: bm25,
                 manifest: None,
                 late_provenance: None,
+                ann_observability: None,
             },
         ],
         top_k,
@@ -5049,6 +5082,13 @@ fn aggregate_source_debug(
             .filter_map(|debug| debug.underfill_reason.as_deref())
             .find(|reason| *reason == "eventual_skipped_wal")
             .map(str::to_string)
+            .or_else(|| {
+                source_debugs
+                    .iter()
+                    .filter_map(|debug| debug.underfill_reason.as_deref())
+                    .find(|reason| *reason == "filter_selective_probe_exhausted")
+                    .map(str::to_string)
+            })
             .or_else(|| Some("not_enough_matches".to_string()))
     };
     let truth_planned_requests = source_debugs

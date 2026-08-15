@@ -76,6 +76,24 @@ mod inner {
         register_int_counter_vec!("zeppelin_queries_total", "Total queries", &["namespace"])
             .unwrap()
     });
+    /// Queries returning fewer results than requested, partitioned by stable reason.
+    pub static QUERY_UNDERFILL_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "zeppelin_query_underfill_total",
+            "Queries returning fewer results than requested",
+            &["namespace", "reason"]
+        )
+        .unwrap()
+    });
+    /// ANN queries partitioned by the metadata path used to resolve filtering.
+    pub static QUERY_FILTERED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "zeppelin_query_filtered_total",
+            "ANN queries by filter resolution mode",
+            &["namespace", "filter_mode"]
+        )
+        .unwrap()
+    });
     /// WAL append operations partitioned by namespace.
     pub static WAL_APPENDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         register_int_counter_vec!("zeppelin_wal_appends_total", "WAL appends", &["namespace"])
@@ -573,6 +591,8 @@ pub fn init() {
     std::sync::LazyLock::force(&HTTP_REQUESTS_TOTAL);
     std::sync::LazyLock::force(&QUERY_DURATION);
     std::sync::LazyLock::force(&QUERIES_TOTAL);
+    std::sync::LazyLock::force(&QUERY_UNDERFILL_TOTAL);
+    std::sync::LazyLock::force(&QUERY_FILTERED_TOTAL);
     std::sync::LazyLock::force(&WAL_APPENDS_TOTAL);
     std::sync::LazyLock::force(&SEMANTIC_ENRICHMENT_QUARANTINED_RECORDS_TOTAL);
     std::sync::LazyLock::force(&CACHE_HITS_TOTAL);

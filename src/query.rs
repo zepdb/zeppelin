@@ -148,6 +148,7 @@ use crate::fts::wal_scan::wal_bm25_scan_with_inputs;
 use crate::fts::FtsFieldConfig;
 use crate::index::distance::compute_distance;
 use crate::index::filter::{combine_filters, evaluate_filter_on_optional_attributes};
+use crate::index::ivf_flat::search::QueryFilterMode;
 use crate::index::topk::{partial_topk_by, TopK};
 use crate::index::HierarchicalIndex;
 use crate::index::IvfFlatIndex;
@@ -396,6 +397,18 @@ pub struct QueryExplainSource {
     pub kind: QueryExplainSourceKind,
     /// Effective IVF probe count for ANN, or `None` for BM25.
     pub nprobe: Option<usize>,
+    /// Number of distinct ANN clusters selected by the executed search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probed_clusters: Option<usize>,
+    /// Total cluster count in the ANN artifact that was searched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster_count: Option<usize>,
+    /// Metadata-filter resolution mode used by ANN execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_mode: Option<String>,
+    /// Exact filter survivors observed before final top-k truncation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_survivors: Option<usize>,
     /// Candidate count requested from this source.
     pub candidate_k: usize,
     /// Native score ordering used by this source.
@@ -673,6 +686,22 @@ pub(crate) struct ScopedAnnQuery<'a> {
     pub(crate) decoded_artifact_cache: &'a Arc<DecodedArtifactCache>,
 }
 
+/// Internal ANN execution observations used by metrics and explain output.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AnnQueryObservability {
+    pub(crate) probed_clusters: usize,
+    pub(crate) cluster_count: usize,
+    pub(crate) filter_mode: QueryFilterMode,
+    pub(crate) filter_survivors: Option<usize>,
+    pub(crate) frontier_under_fetch_k: bool,
+}
+
+/// Domain response paired with non-serialized ANN execution observations.
+pub(crate) struct ObservedQueryResponse {
+    pub(crate) response: QueryResponse,
+    pub(crate) observability: Option<AnnQueryObservability>,
+}
+
 /// Orders ANN hits by distance ascending and then by ID ascending.
 ///
 /// # Parameters
@@ -822,38 +851,51 @@ pub(crate) async fn read_manifest_for_query(
 ///
 /// - `results_len`: Number of final ranked hits.
 /// - `top_k`: Requested result count.
-/// - `consistency`: Effective consistency mode.
-/// - `eventual_skipped_wal`: Whether visible uncompacted upserts were omitted.
-/// - `scanned_fragments`: WAL fragment scoring count.
-/// - `scanned_segments`: Active segment search count.
+/// - `context`: Consistency, scanned-source, filter, and ANN frontier state.
 ///
 /// # Returns
 ///
 /// `None` when the result set is full. Otherwise returns one stable reason code:
 /// eventual WAL omission takes precedence, then absence of any candidate source,
-/// then the general `not_enough_matches` condition.
+/// then selective filtered probe exhaustion, then the general
+/// `not_enough_matches` condition.
 ///
 /// # Examples
 ///
 /// Three hits for `top_k = 10` with an eventual skipped WAL returns
 /// `eventual_skipped_wal`; zero hits with no WAL or segment returns
 /// `no_index_or_wal_data`.
-fn query_underfill_reason(
-    results_len: usize,
-    top_k: usize,
+#[derive(Clone, Copy)]
+struct QueryUnderfillContext<'a> {
     consistency: ConsistencyLevel,
     eventual_skipped_wal: bool,
     scanned_fragments: usize,
     scanned_segments: usize,
+    filter_present: bool,
+    ann: Option<&'a AnnQueryObservability>,
+}
+
+fn query_underfill_reason(
+    results_len: usize,
+    top_k: usize,
+    context: QueryUnderfillContext<'_>,
 ) -> Option<String> {
     if results_len >= top_k {
         return None;
     }
-    if consistency == ConsistencyLevel::Eventual && eventual_skipped_wal {
+    if context.consistency == ConsistencyLevel::Eventual && context.eventual_skipped_wal {
         return Some("eventual_skipped_wal".to_string());
     }
-    if scanned_fragments == 0 && scanned_segments == 0 {
+    if context.scanned_fragments == 0 && context.scanned_segments == 0 {
         return Some("no_index_or_wal_data".to_string());
+    }
+    if context.filter_present
+        && context.ann.is_some_and(|observation| {
+            observation.frontier_under_fetch_k
+                && observation.probed_clusters < observation.cluster_count
+        })
+    {
+        return Some("filter_selective_probe_exhausted".to_string());
     }
     Some("not_enough_matches".to_string())
 }
@@ -1166,6 +1208,7 @@ pub async fn execute_query_with_fragment_cache(
 /// A batch handler reads generation 42 once, clones it for three requests, and
 /// calls this function three times. A concurrently published generation 43 is
 /// not mixed into that batch.
+#[cfg(feature = "branching-test-support")]
 pub(crate) async fn execute_query_with_manifest(
     params: QueryParams<'_>,
     manifest: Manifest,
@@ -1209,6 +1252,7 @@ pub(crate) async fn execute_query_with_manifest(
 ///
 /// A debug query whose immutable cluster is already cached reports a cache hit
 /// while returning exactly the same result ordering as the non-debug path.
+#[cfg(feature = "branching-test-support")]
 pub(crate) async fn execute_query_with_manifest_debug(
     params: QueryParams<'_>,
     manifest: Manifest,
@@ -1267,6 +1311,27 @@ async fn execute_query_with_manifest_inner(
     authoritative_origin: Option<ArtifactOrigin>,
     emit_debug: bool,
 ) -> Result<QueryResponse> {
+    Ok(execute_query_with_manifest_observed(
+        params,
+        manifest,
+        fragment_cache,
+        scoped_ann,
+        authoritative_origin,
+        emit_debug,
+    )
+    .await?
+    .response)
+}
+
+/// Executes ANN retrieval while retaining non-serialized probe observations.
+pub(crate) async fn execute_query_with_manifest_observed(
+    params: QueryParams<'_>,
+    manifest: Manifest,
+    fragment_cache: Option<&Arc<WalFragmentCache>>,
+    scoped_ann: Option<ScopedAnnQuery<'_>>,
+    authoritative_origin: Option<ArtifactOrigin>,
+    emit_debug: bool,
+) -> Result<ObservedQueryResponse> {
     if emit_debug {
         let diagnostics = Arc::new(CacheDiagnostics::default());
         return with_cache_diagnostics(Arc::clone(&diagnostics), async move {
@@ -1378,11 +1443,11 @@ async fn execute_query_with_manifest_scoped(
     scoped_ann: Option<ScopedAnnQuery<'_>>,
     authoritative_origin: Option<ArtifactOrigin>,
     cache_diagnostics: Option<Arc<CacheDiagnostics>>,
-) -> Result<QueryResponse> {
+) -> Result<ObservedQueryResponse> {
     let QueryParams {
         store,
         wal_reader,
-        namespace: _,
+        namespace,
         query,
         top_k,
         nprobe,
@@ -1472,7 +1537,7 @@ async fn execute_query_with_manifest_scoped(
 
     let segment_future = async {
         let segment_start = std::time::Instant::now();
-        let (results, scanned, clusters_probed) = if let Some(seg_ref) = segment_ref {
+        let (results, scanned, observability) = if let Some(seg_ref) = segment_ref {
             let output = segment_search(
                 store,
                 seg_ref,
@@ -1489,9 +1554,10 @@ async fn execute_query_with_manifest_scoped(
                 scoped_ann,
             )
             .await?;
-            (output.results, 1, output.clusters_probed)
+            let observability = output.observability();
+            (output.results, 1, Some(observability))
         } else {
-            (Vec::new(), 0, 0)
+            (Vec::new(), 0, None)
         };
         let segment_ms = segment_start.elapsed().as_millis() as u64;
         debug!(
@@ -1499,7 +1565,7 @@ async fn execute_query_with_manifest_scoped(
             segments_scanned = scanned,
             "query phase: segment search"
         );
-        Ok::<_, crate::error::ZeppelinError>((results, scanned, segment_ms, clusters_probed))
+        Ok::<_, crate::error::ZeppelinError>((results, scanned, segment_ms, observability))
     };
 
     let (wal_result, segment_result) = tokio::join!(wal_future, segment_future);
@@ -1512,7 +1578,8 @@ async fn execute_query_with_manifest_scoped(
         },
         wal_ms,
     ) = wal_result?;
-    let (mut segment_results, scanned_segments, mut segment_ms, clusters_probed) = segment_result?;
+    let (mut segment_results, scanned_segments, mut segment_ms, mut observability) =
+        segment_result?;
 
     if let Some(seg_ref) = segment_ref {
         if let Some(refill_top_k) = segment_refill_top_k(
@@ -1540,6 +1607,7 @@ async fn execute_query_with_manifest_scoped(
                 scoped_ann,
             )
             .await?;
+            observability = Some(refill.observability());
             segment_results = refill.results;
             let segment_retry_ms = segment_retry_start.elapsed().as_millis() as u64;
             segment_ms += segment_retry_ms;
@@ -1569,6 +1637,37 @@ async fn execute_query_with_manifest_scoped(
         "query phase: merge"
     );
     let merge_ms = merge_duration.as_millis() as u64;
+    let filter_mode = observability.map_or_else(
+        || {
+            if filter.is_some() {
+                QueryFilterMode::Attributes
+            } else {
+                QueryFilterMode::None
+            }
+        },
+        |observation| observation.filter_mode,
+    );
+    crate::metrics::QUERY_FILTERED_TOTAL
+        .with_label_values(&[namespace, filter_mode.as_str()])
+        .inc();
+    let underfill_reason = query_underfill_reason(
+        results.len(),
+        top_k,
+        QueryUnderfillContext {
+            consistency,
+            eventual_skipped_wal,
+            scanned_fragments,
+            scanned_segments,
+            filter_present: filter.is_some(),
+            ann: observability.as_ref(),
+        },
+    );
+    if let Some(reason) = underfill_reason.as_deref() {
+        crate::metrics::QUERY_UNDERFILL_TOTAL
+            .with_label_values(&[namespace, reason])
+            .inc();
+    }
+    let clusters_probed = observability.map_or(0, |observation| observation.probed_clusters);
     let debug = cache_diagnostics.map(|diagnostics| {
         let cache_snapshot = diagnostics.snapshot();
         QueryDebug {
@@ -1583,28 +1682,24 @@ async fn execute_query_with_manifest_scoped(
                 misses: cache_snapshot.misses,
             },
             consistency_effective: consistency,
-            underfill_reason: query_underfill_reason(
-                results.len(),
-                top_k,
-                consistency,
-                eventual_skipped_wal,
-                scanned_fragments,
-                scanned_segments,
-            ),
+            underfill_reason: underfill_reason.clone(),
             truth_planned_requests: None,
         }
     });
 
-    Ok(QueryResponse {
-        results,
-        scanned_fragments,
-        scanned_segments,
-        debug,
-        next_cursor: None,
-        groups: None,
-        facets: None,
-        explain: None,
-        semantic_coverage: None,
+    Ok(ObservedQueryResponse {
+        response: QueryResponse {
+            results,
+            scanned_fragments,
+            scanned_segments,
+            debug,
+            next_cursor: None,
+            groups: None,
+            facets: None,
+            explain: None,
+            semantic_coverage: None,
+        },
+        observability,
     })
 }
 
@@ -1928,6 +2023,22 @@ async fn wal_scan(
 struct SegmentSearchOutput {
     results: Vec<SearchResult>,
     clusters_probed: usize,
+    cluster_count: usize,
+    filter_mode: QueryFilterMode,
+    filter_survivors: Option<usize>,
+    frontier_under_fetch_k: bool,
+}
+
+impl SegmentSearchOutput {
+    fn observability(&self) -> AnnQueryObservability {
+        AnnQueryObservability {
+            probed_clusters: self.clusters_probed,
+            cluster_count: self.cluster_count,
+            filter_mode: self.filter_mode,
+            filter_survivors: self.filter_survivors,
+            frontier_under_fetch_k: self.frontier_under_fetch_k,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1987,6 +2098,14 @@ async fn segment_search(
         return Ok(SegmentSearchOutput {
             clusters_probed: output.probed_centroids.len(),
             results: output.results,
+            cluster_count: segment_ref.cluster_count,
+            filter_mode: match filter {
+                None => QueryFilterMode::None,
+                Some(_) if segment_ref.bitmap_fields.is_empty() => QueryFilterMode::Attributes,
+                Some(_) => QueryFilterMode::Mixed,
+            },
+            filter_survivors: None,
+            frontier_under_fetch_k: false,
         });
     }
 
@@ -2013,6 +2132,10 @@ async fn segment_search(
     Ok(SegmentSearchOutput {
         clusters_probed: output.probed_centroids.len(),
         results: output.results,
+        cluster_count: output.cluster_count,
+        filter_mode: output.filter_mode,
+        filter_survivors: output.filter_survivors,
+        frontier_under_fetch_k: output.frontier_under_fetch_k,
     })
 }
 
@@ -2081,6 +2204,10 @@ async fn scoped_segment_search(
     Ok(SegmentSearchOutput {
         results: result.results,
         clusters_probed: result.clusters_probed,
+        cluster_count: result.cluster_count,
+        filter_mode: result.filter_mode,
+        filter_survivors: result.filter_survivors,
+        frontier_under_fetch_k: result.frontier_under_fetch_k,
     })
 }
 
@@ -2794,10 +2921,14 @@ async fn execute_bm25_query_with_manifest_scoped(
             underfill_reason: query_underfill_reason(
                 results.len(),
                 top_k,
-                consistency,
-                eventual_skipped_wal,
-                scanned_fragments,
-                scanned_segments,
+                QueryUnderfillContext {
+                    consistency,
+                    eventual_skipped_wal,
+                    scanned_fragments,
+                    scanned_segments,
+                    filter_present: false,
+                    ann: None,
+                },
             ),
             truth_planned_requests: None,
         }
@@ -2951,10 +3082,14 @@ async fn execute_filtered_bm25_query_with_manifest(
             underfill_reason: query_underfill_reason(
                 results.len(),
                 top_k,
-                consistency,
-                eventual_skipped_wal,
-                scanned_fragments,
-                scanned_segments,
+                QueryUnderfillContext {
+                    consistency,
+                    eventual_skipped_wal,
+                    scanned_fragments,
+                    scanned_segments,
+                    filter_present: false,
+                    ann: None,
+                },
             ),
             truth_planned_requests: None,
         }
@@ -4424,6 +4559,82 @@ mod tests {
     //! pre-I/O decisions rather than S3 integration semantics.
 
     use super::*;
+
+    #[test]
+    fn underfill_reason_preserves_precedence_and_classifies_selective_probes() {
+        let selective = AnnQueryObservability {
+            probed_clusters: 1,
+            cluster_count: 16,
+            filter_mode: QueryFilterMode::Attributes,
+            filter_survivors: Some(0),
+            frontier_under_fetch_k: true,
+        };
+
+        assert_eq!(
+            query_underfill_reason(
+                0,
+                10,
+                QueryUnderfillContext {
+                    consistency: ConsistencyLevel::Strong,
+                    eventual_skipped_wal: false,
+                    scanned_fragments: 0,
+                    scanned_segments: 1,
+                    filter_present: true,
+                    ann: Some(&selective),
+                },
+            )
+            .as_deref(),
+            Some("filter_selective_probe_exhausted")
+        );
+        assert_eq!(
+            query_underfill_reason(
+                0,
+                10,
+                QueryUnderfillContext {
+                    consistency: ConsistencyLevel::Eventual,
+                    eventual_skipped_wal: true,
+                    scanned_fragments: 0,
+                    scanned_segments: 1,
+                    filter_present: true,
+                    ann: Some(&selective),
+                },
+            )
+            .as_deref(),
+            Some("eventual_skipped_wal")
+        );
+        assert_eq!(
+            query_underfill_reason(
+                0,
+                10,
+                QueryUnderfillContext {
+                    consistency: ConsistencyLevel::Strong,
+                    eventual_skipped_wal: false,
+                    scanned_fragments: 0,
+                    scanned_segments: 0,
+                    filter_present: true,
+                    ann: Some(&selective),
+                },
+            )
+            .as_deref(),
+            Some("no_index_or_wal_data")
+        );
+        assert_eq!(
+            query_underfill_reason(
+                0,
+                10,
+                QueryUnderfillContext {
+                    consistency: ConsistencyLevel::Strong,
+                    eventual_skipped_wal: false,
+                    scanned_fragments: 0,
+                    scanned_segments: 1,
+                    filter_present: false,
+                    ann: Some(&selective),
+                },
+            )
+            .as_deref(),
+            Some("not_enough_matches")
+        );
+    }
 
     /// Constructs a minimal owned hit for merge-policy tests.
     ///

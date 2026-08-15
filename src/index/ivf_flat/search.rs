@@ -1203,10 +1203,39 @@ pub async fn search_ivf_flat(
     .results)
 }
 
-/// Results plus the exact resident-centroid selection used by one IVF search.
+/// Bounded classification of how one ANN search resolved its metadata filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueryFilterMode {
+    /// No metadata filter was present.
+    None,
+    /// Complete bitmap coverage resolved the filter without row attributes.
+    Bitmap,
+    /// Exact row attributes resolved the filter without bitmap assistance.
+    Attributes,
+    /// Bitmaps prefiltered rows and exact attributes completed evaluation.
+    Mixed,
+}
+
+impl QueryFilterMode {
+    /// Returns the stable Prometheus and explain vocabulary for this mode.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Bitmap => "bitmap",
+            Self::Attributes => "attributes",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
+/// Results plus the exact execution observations used by one IVF search.
 pub(crate) struct IvfFlatSearchOutput {
     pub(crate) results: Vec<SearchResult>,
     pub(crate) probed_centroids: Vec<usize>,
+    pub(crate) cluster_count: usize,
+    pub(crate) filter_mode: QueryFilterMode,
+    pub(crate) filter_survivors: Option<usize>,
+    pub(crate) frontier_under_fetch_k: bool,
 }
 
 /// Execute IVF search while preserving the production centroid-ranking trace.
@@ -1265,14 +1294,26 @@ async fn search_ivf_flat_with_trace_inner(
         });
     }
 
+    let num_clusters = index.centroids.len();
+    let fetch_k = if filter.is_some() {
+        oversampled_k(top_k, oversample_factor)
+    } else {
+        top_k
+    };
+    let filter_metadata_path = select_filter_metadata_path(index, filter);
+    let filter_mode = filter_metadata_path.query_filter_mode(index);
+
     if top_k == 0 {
         return Ok(IvfFlatSearchOutput {
             results: Vec::new(),
             probed_centroids: Vec::new(),
+            cluster_count: num_clusters,
+            filter_mode,
+            filter_survivors: filter.map(|_| 0),
+            frontier_under_fetch_k: false,
         });
     }
 
-    let num_clusters = index.centroids.len();
     let effective_nprobe = nprobe.min(num_clusters);
 
     // --- Step 1: Rank centroids by distance to query ---
@@ -1292,11 +1333,6 @@ async fn search_ivf_flat_with_trace_inner(
         .map(|(idx, _)| *idx)
         .collect();
     // --- Step 2: Determine fetch size (oversample if filtering) ---
-    let fetch_k = if filter.is_some() {
-        oversampled_k(top_k, oversample_factor)
-    } else {
-        top_k
-    };
     let sq_byte_stats = SqSearchByteStats::new_if_enabled(byte_stats_path(index.quantization));
 
     let scan_clusters = select_scan_clusters(
@@ -1315,10 +1351,6 @@ async fn search_ivf_flat_with_trace_inner(
         scan_clusters = ?scan_clusters,
         "probing clusters"
     );
-
-    // Decided once, obeyed by every phase below: which metadata the scan reads,
-    // whether rerank reads attributes, and whether Step 5 post-filters at all.
-    let filter_metadata_path = select_filter_metadata_path(index, filter);
 
     // --- Step 3: Scan selected clusters ---
     // The resident sketch is only allowed to decide which cluster objects to
@@ -1446,51 +1478,44 @@ async fn search_ivf_flat_with_trace_inner(
         filter
     };
 
-    // --- Step 4: Retain candidates by distance ---
+    // --- Step 4: Apply exact filtering and retain candidates by distance ---
     let mut sorted = candidates;
-    if post_filter.is_some() {
+    let filter_survivors = if let Some(filter) = post_filter {
         sorted.sort_by(candidate_distance_cmp);
+        sorted.retain(|candidate| {
+            evaluate_filter_on_optional_attributes(filter, candidate.attributes.as_ref())
+        });
+        Some(sorted.len())
     } else {
+        let survivors = filter.map(|_| sorted.len());
         partial_topk_by(&mut sorted, top_k, candidate_distance_cmp);
-    }
+        survivors
+    };
 
-    // --- Step 5: Apply post-filter if present ---
-    let results: Vec<SearchResult> = if let Some(f) = post_filter {
-        sorted
+    // --- Step 5: Project the final top-k ---
+    let top_candidates: Vec<Candidate> = sorted.into_iter().take(top_k).collect();
+    let results: Vec<SearchResult> = if post_filter.is_none() && include_attributes {
+        enrich_final_results(
+            index,
+            top_candidates,
+            store,
+            cache,
+            sq_byte_stats.as_deref(),
+        )
+        .await?
+    } else {
+        top_candidates
             .into_iter()
-            .filter(|c| evaluate_filter_on_optional_attributes(f, c.attributes.as_ref()))
-            .take(top_k)
-            .map(|c| SearchResult {
-                id: c.id,
-                score: c.score,
+            .map(|candidate| SearchResult {
+                id: candidate.id,
+                score: candidate.score,
                 attributes: if include_attributes {
-                    c.attributes
+                    candidate.attributes
                 } else {
                     None
                 },
             })
             .collect()
-    } else {
-        let top_candidates: Vec<Candidate> = sorted.into_iter().take(top_k).collect();
-        if include_attributes {
-            enrich_final_results(
-                index,
-                top_candidates,
-                store,
-                cache,
-                sq_byte_stats.as_deref(),
-            )
-            .await?
-        } else {
-            top_candidates
-                .into_iter()
-                .map(|candidate| SearchResult {
-                    id: candidate.id,
-                    score: candidate.score,
-                    attributes: None,
-                })
-                .collect()
-        }
     };
 
     debug!(returned = results.len(), top_k = top_k, "search complete");
@@ -1502,6 +1527,10 @@ async fn search_ivf_flat_with_trace_inner(
     Ok(IvfFlatSearchOutput {
         results,
         probed_centroids: probe_clusters,
+        cluster_count: num_clusters,
+        filter_mode,
+        filter_survivors,
+        frontier_under_fetch_k: filter_survivors.is_some_and(|count| count < fetch_k),
     })
 }
 
@@ -4845,6 +4874,16 @@ impl FilterMetadataPath {
     /// reject every row rather than confirm it.
     fn resolves_filter_completely(self) -> bool {
         matches!(self, Self::Unfiltered | Self::BitmapOnly)
+    }
+
+    /// Maps the internal read path to the bounded external observation label.
+    fn query_filter_mode(self, index: &IvfFlatIndex) -> QueryFilterMode {
+        match self {
+            Self::Unfiltered => QueryFilterMode::None,
+            Self::BitmapOnly => QueryFilterMode::Bitmap,
+            Self::BitmapAndAttrs if index.bitmap_fields.is_empty() => QueryFilterMode::Attributes,
+            Self::BitmapAndAttrs => QueryFilterMode::Mixed,
+        }
     }
 }
 

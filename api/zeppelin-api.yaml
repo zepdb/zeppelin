@@ -4534,6 +4534,22 @@ components:
             BM25, late interaction, and mandatory-filter callers, because a
             manifest-derived value would reveal shared namespace topology
             outside their row slice.
+        probed_clusters:
+          type: integer
+          minimum: 0
+          description: Distinct ANN clusters selected by the executed search.
+        cluster_count:
+          type: integer
+          minimum: 0
+          description: Total clusters in the ANN artifact searched by this source.
+        filter_mode:
+          type: string
+          enum: [none, bitmap, attributes, mixed]
+          description: Metadata path used to resolve the ANN source filter.
+        filter_survivors:
+          type: integer
+          minimum: 0
+          description: Exact filter survivors before final top-k truncation.
         candidate_k:
           type: integer
           minimum: 1

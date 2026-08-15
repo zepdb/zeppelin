@@ -29,7 +29,7 @@ use crate::index::filter::evaluate_filter;
 use crate::index::hierarchical::build::build_hierarchical;
 use crate::index::hierarchical::search::search_hierarchical_with_trace;
 use crate::index::ivf_flat::build::build_ivf_flat;
-use crate::index::ivf_flat::search::search_ivf_flat_with_trace;
+use crate::index::ivf_flat::search::{search_ivf_flat_with_trace, QueryFilterMode};
 use crate::index::topk::partial_topk_by;
 use crate::index::{HierarchicalIndex, IvfFlatIndex};
 use crate::namespace::branching::ArtifactOrigin;
@@ -188,6 +188,10 @@ pub(crate) struct ScopedAnnBuildRequest<'a> {
 pub(crate) struct ScopedAnnSearch {
     pub(crate) results: Vec<SearchResult>,
     pub(crate) clusters_probed: usize,
+    pub(crate) cluster_count: usize,
+    pub(crate) filter_mode: QueryFilterMode,
+    pub(crate) filter_survivors: Option<usize>,
+    pub(crate) frontier_under_fetch_k: bool,
 }
 
 impl ScopedAnnIndex {
@@ -299,8 +303,19 @@ impl ScopedAnnIndex {
                 actual: query.len(),
             });
         }
-        let (results, clusters_probed) = match &self.artifact {
-            ScopedAnnArtifact::Empty => (Vec::new(), 0),
+        let output = match &self.artifact {
+            ScopedAnnArtifact::Empty => ScopedAnnSearch {
+                results: Vec::new(),
+                clusters_probed: 0,
+                cluster_count: 0,
+                filter_mode: if filter.is_some() {
+                    QueryFilterMode::Attributes
+                } else {
+                    QueryFilterMode::None
+                },
+                filter_survivors: filter.map(|_| 0),
+                frontier_under_fetch_k: false,
+            },
             ScopedAnnArtifact::Flat(index) => {
                 let output = search_ivf_flat_with_trace(
                     index,
@@ -317,8 +332,14 @@ impl ScopedAnnIndex {
                     rerank_coalesce_gap_bytes,
                 )
                 .await?;
-                let clusters_probed = output.probed_centroids.len();
-                (output.results, clusters_probed)
+                ScopedAnnSearch {
+                    results: output.results,
+                    clusters_probed: output.probed_centroids.len(),
+                    cluster_count: output.cluster_count,
+                    filter_mode: output.filter_mode,
+                    filter_survivors: output.filter_survivors,
+                    frontier_under_fetch_k: output.frontier_under_fetch_k,
+                }
             }
             ScopedAnnArtifact::Hierarchical(index) => {
                 let output = search_hierarchical_with_trace(
@@ -334,14 +355,21 @@ impl ScopedAnnIndex {
                     include_attributes,
                 )
                 .await?;
-                let clusters_probed = output.probed_centroids.len();
-                (output.results, clusters_probed)
+                ScopedAnnSearch {
+                    results: output.results,
+                    clusters_probed: output.probed_centroids.len(),
+                    cluster_count: index.meta.num_leaf_clusters,
+                    filter_mode: match filter {
+                        None => QueryFilterMode::None,
+                        Some(_) if index.bitmap_fields.is_empty() => QueryFilterMode::Attributes,
+                        Some(_) => QueryFilterMode::Mixed,
+                    },
+                    filter_survivors: None,
+                    frontier_under_fetch_k: false,
+                }
             }
         };
-        Ok(ScopedAnnSearch {
-            results,
-            clusters_probed,
-        })
+        Ok(output)
     }
 
     /// Approximates resident routing metadata for bounded-cache accounting.

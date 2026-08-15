@@ -209,6 +209,11 @@ fn openapi_documents_late_interaction_query_contract() {
         "fde_generation:",
         "manifest_generation:",
         "consistency_actual:",
+        "probed_clusters:",
+        "cluster_count:",
+        "filter_mode:",
+        "filter_survivors:",
+        "enum: [none, bitmap, attributes, mixed]",
         "minItems: 32",
         "maxItems: 32",
     ] {

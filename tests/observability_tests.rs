@@ -660,6 +660,12 @@ async fn test_all_metrics_registered() {
         .inc();
     QUERY_DURATION.with_label_values(&["__test__"]).observe(0.0);
     QUERIES_TOTAL.with_label_values(&["__test__"]).inc();
+    QUERY_UNDERFILL_TOTAL
+        .with_label_values(&["__test__", "not_enough_matches"])
+        .inc();
+    QUERY_FILTERED_TOTAL
+        .with_label_values(&["__test__", "none"])
+        .inc();
     WAL_APPENDS_TOTAL.with_label_values(&["__test__"]).inc();
     CACHE_HITS_TOTAL.with_label_values(&["hit"]).inc();
     COMPACTIONS_TOTAL
@@ -710,6 +716,8 @@ async fn test_all_metrics_registered() {
         "zeppelin_http_requests_total",
         "zeppelin_query_duration_seconds",
         "zeppelin_queries_total",
+        "zeppelin_query_underfill_total",
+        "zeppelin_query_filtered_total",
         "zeppelin_wal_appends_total",
         "zeppelin_cache_hits_total",
         "zeppelin_compactions_total",
