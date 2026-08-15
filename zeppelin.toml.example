@@ -69,6 +69,7 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # backend = "s3"                     # STORAGE_BACKEND — "s3", "gcs", "azure", or "local"
 # bucket = "zeppelin"                # S3_BUCKET — bucket (S3/GCS) or container (Azure)
 # fail_fast = true                   # ZEPPELIN_STORAGE_FAIL_FAST; false allows intentionally degraded boot
+# manifest_envelope = 1              # ZEPPELIN_MANIFEST_ENVELOPE — set 2 only after every node can read v2
 
 # Fields from a backend family other than the selected backend are a
 # configuration error, never silently ignored.

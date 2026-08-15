@@ -13,6 +13,7 @@ use ulid::Ulid;
 use crate::compaction::gc::{
     gc_candidate_store_key, save_gc_candidates, CompactionStaging, GcCandidate,
 };
+use crate::config::ManifestEnvelopeVersion;
 use crate::config::{ApiKeyConfig, IndexingConfig, SecurityConfig};
 use crate::embedding::artifact::encode_matrix_payload;
 use crate::embedding::{
@@ -287,6 +288,19 @@ pub fn validate_artifact(family: &str, bytes: &[u8]) -> Result<()> {
 /// Decode a manifest with its namespace binding and checksum projection enforced.
 pub fn validate_manifest_for_namespace(bytes: &[u8], namespace: &str) -> Result<()> {
     Manifest::from_bytes_for_namespace(bytes, namespace).map(drop)
+}
+
+/// Builds an envelope-v2 manifest fixture around caller-supplied payload bytes.
+///
+/// Compatibility tests use the production header encoder so synthetic
+/// minimum-reader probes cannot drift from the actual wire layout.
+pub fn encode_manifest_envelope_v2_fixture(
+    payload: &[u8],
+    min_reader: &str,
+    writer: &str,
+    written_at: i64,
+) -> Result<Bytes> {
+    Manifest::envelope_v2_fixture(payload, min_reader, writer, written_at)
 }
 
 /// Re-encode a current checksum-input artifact through its production encoder.
@@ -771,6 +785,13 @@ pub async fn generate_current_corpus(
         manifest_bytes.clone(),
     ));
     let decoded_manifest = Manifest::from_bytes_for_namespace(&manifest_bytes, FIXTURE_NAMESPACE)?;
+    artifacts.push(artifact(
+        "manifest",
+        "manifest_envelope_v2.bin",
+        None,
+        "Manifest::to_bytes_with_envelope(v2)",
+        decoded_manifest.to_bytes_with_envelope(ManifestEnvelopeVersion::V2)?,
+    ));
     artifacts.push(artifact(
         "manifest",
         "manifest_legacy_json.json",

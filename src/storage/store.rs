@@ -99,7 +99,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 use tracing::{debug, instrument};
 
-use crate::config::StorageConfig;
+use crate::config::{ManifestEnvelopeVersion, StorageConfig};
 use crate::error::{Result, ZeppelinError};
 use crate::storage::capabilities::{canonical_etag, CasTokenKind, StorageCapabilities};
 use crate::storage::{namespace_prefix, NamespaceObjectFamily, NamespaceObjectKey};
@@ -156,6 +156,8 @@ pub struct ZeppelinStore {
     capabilities: StorageCapabilities,
     /// Prefix-cleanup behavior selected when the backend is constructed.
     prefix_delete_mode: PrefixDeleteMode,
+    /// Store-scoped manifest writer format selected by validated boot config.
+    manifest_envelope: ManifestEnvelopeVersion,
     /// Transient hashes of exact bodies accepted by local immutable PUTs.
     content_hashes: Arc<Mutex<ContentHashCache>>,
     /// Signing root and immutable signer-inventory view installed together by
@@ -543,6 +545,7 @@ impl ZeppelinStore {
             inner: store,
             capabilities,
             prefix_delete_mode,
+            manifest_envelope: config.manifest_envelope,
             content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
             object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
         })
@@ -1046,6 +1049,7 @@ impl ZeppelinStore {
             inner: store,
             capabilities,
             prefix_delete_mode,
+            manifest_envelope: ManifestEnvelopeVersion::default(),
             content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
             object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
         }
@@ -1064,6 +1068,7 @@ impl ZeppelinStore {
             inner: Arc::clone(&self.inner),
             capabilities: self.capabilities,
             prefix_delete_mode: self.prefix_delete_mode,
+            manifest_envelope: self.manifest_envelope,
             content_hashes: Arc::clone(&self.content_hashes),
             object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
         }
@@ -1197,6 +1202,39 @@ impl ZeppelinStore {
     /// dangling backend pointer.
     pub fn inner(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.inner)
+    }
+
+    /// Returns the store-scoped manifest envelope selected at boot.
+    #[must_use]
+    pub const fn manifest_envelope(&self) -> ManifestEnvelopeVersion {
+        self.manifest_envelope
+    }
+
+    /// Replaces the raw backend while preserving this gateway's writer format.
+    ///
+    /// Test instrumentation uses this seam so a counting or fault wrapper does
+    /// not accidentally turn an envelope-v2 writer back into a v1 writer.
+    #[must_use]
+    pub fn rewrap(&self, inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            capabilities: self.capabilities,
+            prefix_delete_mode: self.prefix_delete_mode,
+            manifest_envelope: self.manifest_envelope,
+            content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
+            object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
+        }
+    }
+
+    /// Overrides only the manifest writer format on this gateway.
+    ///
+    /// Production construction obtains the value from [`StorageConfig`]. This
+    /// builder exists for focused codec and integration tests over an already
+    /// constructed backend.
+    #[must_use]
+    pub fn with_manifest_envelope(mut self, envelope: ManifestEnvelopeVersion) -> Self {
+        self.manifest_envelope = envelope;
+        self
     }
 
     /// Writes a complete byte payload to an object key.

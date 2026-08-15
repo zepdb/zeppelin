@@ -144,7 +144,9 @@ pub async fn write_current_corpus() -> FixtureManifest {
             .get(artifact.family)
             .expect("generated family must exist in FORMATS");
         let comparison = if format.checksum_input
-            && !(artifact.family == "manifest" && artifact.path.ends_with(".json"))
+            && !(artifact.family == "manifest"
+                && (artifact.path.ends_with(".json")
+                    || artifact.path == "manifest_envelope_v2.bin"))
         {
             "bytes"
         } else {

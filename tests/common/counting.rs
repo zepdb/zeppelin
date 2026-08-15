@@ -515,7 +515,7 @@ impl CountingStore {
 /// backed by the same objects plus the counter handle.
 pub fn counting_store(store: &ZeppelinStore) -> (ZeppelinStore, GetCounter) {
     let (counting, counter) = CountingStore::wrap(store.inner());
-    (ZeppelinStore::new(Arc::new(counting)), counter)
+    (store.rewrap(Arc::new(counting)), counter)
 }
 
 /// Wrap a dedicated performance-harness store while preserving native bulk DELETEs.
@@ -527,7 +527,8 @@ pub fn counting_store(store: &ZeppelinStore) -> (ZeppelinStore, GetCounter) {
 pub fn perf_counting_store(store: &ZeppelinStore) -> (ZeppelinStore, GetCounter) {
     let (counting, counter) = CountingStore::wrap(store.inner());
     (
-        ZeppelinStore::new_with_capabilities(Arc::new(counting), StorageCapabilities::s3()),
+        ZeppelinStore::new_with_capabilities(Arc::new(counting), StorageCapabilities::s3())
+            .with_manifest_envelope(store.manifest_envelope()),
         counter,
     )
 }

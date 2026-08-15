@@ -4662,7 +4662,10 @@ impl NamespaceGraph {
             },
             reservation.created_at,
         )?;
-        let publication = manifest.preseal_generation_one(&target_identity)?;
+        let publication = manifest.preseal_generation_one_with_envelope(
+            &target_identity,
+            self.store.manifest_envelope(),
+        )?;
         let root = BranchRoot {
             branch_id: reservation.branch_id,
             source_generation,

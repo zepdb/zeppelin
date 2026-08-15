@@ -189,7 +189,8 @@ pub fn latency_profile_store(
         ledger: ledger.clone(),
     };
     (
-        ZeppelinStore::new_with_capabilities(Arc::new(latency), StorageCapabilities::s3()),
+        ZeppelinStore::new_with_capabilities(Arc::new(latency), StorageCapabilities::s3())
+            .with_manifest_envelope(store.manifest_envelope()),
         ledger,
     )
 }

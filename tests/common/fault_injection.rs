@@ -63,7 +63,7 @@ pub fn toggle_get_failure_matching(
         failures_injected: Arc::clone(&failures_injected),
     };
     (
-        ZeppelinStore::new(Arc::new(wrapper)),
+        store.rewrap(Arc::new(wrapper)),
         GetFailureHandle {
             enabled,
             failures_injected,
@@ -1364,7 +1364,7 @@ pub fn delay_get_matching(
     needle: impl Into<String>,
     delay: Duration,
 ) -> ZeppelinStore {
-    ZeppelinStore::new(Arc::new(DelayGetStore::wrap(store.inner(), needle, delay)))
+    store.rewrap(Arc::new(DelayGetStore::wrap(store.inner(), needle, delay)))
 }
 
 /// `ObjectStore` decorator that reports one matching PUT as failed only after

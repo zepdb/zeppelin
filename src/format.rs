@@ -9,13 +9,16 @@
 //! A version `0` in an accepted-version list denotes a historical unversioned
 //! layout that the production decoder still recognizes. An em dash denotes a
 //! format with no version discriminator at all.
+//! Manifest envelope v2 also frames named snapshot pins because they retain
+//! manifest generations. WAL fragments deliberately remain at `0x01`: they
+//! are short-lived, independently checksummed, and removed by compaction.
 //!
 //! | Family | Magic | Current / accepted | Encoding | Binding input |
 //! | --- | --- | --- | --- | --- |
 //! | `namespace_metadata` | — | — | JSON | no |
-//! | `manifest` | leading byte | 1 / 1 (+ legacy JSON) | positional MessagePack | yes |
+//! | `manifest` | leading byte | 2 / 1, 2 (+ legacy JSON) | named MessagePack envelope + positional payload | yes |
 //! | `namespace_lease` | — | — | JSON | no |
-//! | `named_snapshot` | leading byte | 1 / 1 (+ legacy JSON) | positional MessagePack | no |
+//! | `named_snapshot` | leading byte | 2 / 1, 2 (+ legacy JSON) | named MessagePack envelope + positional payload | no |
 //! | `wal_fragment` | leading byte | 1 / 1 (+ legacy JSON) | positional MessagePack | yes |
 //! | `input_wal_fragment` | `ZIW1` | 1 / 1 | positional MessagePack | yes |
 //! | `source_payload` | — | — | opaque binary | no |
@@ -120,7 +123,7 @@ use crate::wal::late_section::{
     LateStateSection, LATE_STATE_FORMAT_VERSION, LATE_STATE_MAGIC, LATE_STATE_VERSION_V1,
     LATE_STATE_VERSION_V2, LATE_STATE_VERSION_V3, LATE_STATE_VERSION_V4, LATE_STATE_VERSION_V5,
 };
-use crate::wal::manifest::{Manifest, NamedSnapshot, MANIFEST_FORMAT_MSGPACK};
+use crate::wal::manifest::{Manifest, NamedSnapshot, MANIFEST_FORMAT_ENVELOPE_V2};
 
 /// Serialization vocabulary used by one persisted family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,7 +162,8 @@ pub struct FormatFamily {
     pub(crate) key_families: &'static [NamespaceObjectFamily],
     /// Fixed wire magic. An empty slice means versioned framing without magic.
     pub magic: Option<&'static [u8]>,
-    /// Version written by the current encoder, or zero for unversioned formats.
+    /// Newest version the current encoder can emit, or zero for unversioned
+    /// formats. A rollout gate may temporarily keep the default writer older.
     pub current_version: u32,
     /// Numeric versions the current decoder accepts; zero denotes a legacy layout.
     pub accepted_versions: &'static [u32],
@@ -205,6 +209,7 @@ const BRANCH_VISIBILITY: &[NamespaceObjectFamily] =
 const V1: &[u32] = &[1];
 const V4: &[u32] = &[4];
 const LEGACY_V1: &[u32] = &[0, 1];
+const LEGACY_V1_V2: &[u32] = &[0, 1, 2];
 const BOOTSTRAP_VERSIONS: &[u32] = &[
     BOOTSTRAP_VERSION_V1,
     BOOTSTRAP_VERSION_V2,
@@ -264,8 +269,8 @@ pub static FORMATS: &[FormatFamily] = &[
         "manifest",
         MANIFESTS,
         Some(b""),
-        MANIFEST_FORMAT_MSGPACK as u32,
-        LEGACY_V1,
+        MANIFEST_FORMAT_ENVELOPE_V2 as u32,
+        LEGACY_V1_V2,
         Encoding::MessagePackPositional,
         true,
         probe_manifest,
@@ -288,8 +293,8 @@ pub static FORMATS: &[FormatFamily] = &[
         "named_snapshot",
         SNAPSHOT,
         Some(b""),
-        MANIFEST_FORMAT_MSGPACK as u32,
-        LEGACY_V1,
+        MANIFEST_FORMAT_ENVELOPE_V2 as u32,
+        LEGACY_V1_V2,
         Encoding::MessagePackPositional,
         false,
         probe_named_snapshot,
@@ -967,6 +972,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
+    use crate::config::ManifestEnvelopeVersion;
     use crate::embedding::{
         CenteringArtifact, ContentHash, FdeArtifactRow, MatrixArtifactRow, MultiVectorEmbedding,
     };
@@ -981,6 +987,7 @@ mod tests {
         FdeAlgorithmVersion, FdeParams, FinalProjection, InnerProjection,
     };
     use crate::retrieval_scope::{scoped_ann_descriptor_fixture, scoped_fts_artifact_fixture};
+    use crate::wal::manifest::MANIFEST_FORMAT_MSGPACK;
 
     fn version_probe_bytes(family: &FormatFamily, version: u32) -> Result<Vec<u8>> {
         match family.version_header {
@@ -1181,7 +1188,12 @@ mod tests {
         match family.name {
             "manifest" if version == 0 => serde_json::to_vec(&Manifest::new())
                 .map_err(|error| ZeppelinError::Serialization(error.to_string())),
-            "manifest" => Manifest::new().to_bytes().map(|bytes| bytes.to_vec()),
+            "manifest" if version == MANIFEST_FORMAT_MSGPACK as u32 => {
+                Manifest::new().to_bytes().map(|bytes| bytes.to_vec())
+            }
+            "manifest" => Manifest::new()
+                .to_bytes_with_envelope(ManifestEnvelopeVersion::V2)
+                .map(|bytes| bytes.to_vec()),
             "named_snapshot" => {
                 let snapshot = NamedSnapshot {
                     generation: 1,
@@ -1190,8 +1202,12 @@ mod tests {
                 if version == 0 {
                     serde_json::to_vec(&snapshot)
                         .map_err(|error| ZeppelinError::Serialization(error.to_string()))
-                } else {
+                } else if version == MANIFEST_FORMAT_MSGPACK as u32 {
                     snapshot.to_bytes().map(|bytes| bytes.to_vec())
+                } else {
+                    snapshot
+                        .to_bytes_with_envelope(ManifestEnvelopeVersion::V2)
+                        .map(|bytes| bytes.to_vec())
                 }
             }
             "wal_fragment" => {

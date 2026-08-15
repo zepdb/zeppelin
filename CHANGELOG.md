@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Manifest envelope v2 adds a self-describing MessagePack header with the
+  writing Zeppelin version, minimum reader version, and write timestamp while
+  preserving the existing positional payload byte-for-byte. Readers always
+  accept v2; writers remain on v1 by default behind
+  `storage.manifest_envelope = 2` / `ZEPPELIN_MANIFEST_ENVELOPE=2`.
 - IVF-Flat bootstrap v3 embeds an exact, bounded per-segment filter-cardinality
   summary for bitmap-indexed equality values. The bounds are configured by
   `indexing.filter_summary_max_values_per_field` (default 4096) and
@@ -16,6 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Manifest rolling-upgrade sequence: first upgrade every node to this release,
+  so every reader accepts envelopes v1 and v2; then set
+  `storage.manifest_envelope = 2` on every writer. The default will flip to v2
+  in the next minor release, and the compatibility knob will be removed one
+  minor release later. Enabling v2 before the fleet upgrade makes older nodes
+  refuse the unknown prefix explicitly.
+- Retroactive compatibility warning: rmp-serde positional structs reject an
+  N+1-field payload when decoded as the older N-field struct (`array had
+  incorrect length, expected N`). Earlier manifest additions documented as
+  "must remain trailing" therefore protected new readers of old manifests but
+  were already silent pre-1.0 flag days for old readers of new manifests.
+  Envelope v2 replaces that generic failure with an explicit minimum-reader
+  diagnostic for future changes.
 - A rolling downgrade across this commit cannot read segments compacted by the
   newer binary: older binaries reject the new v3 bootstrap objects. This is a
   pre-1.0 immutable-format compatibility break; v1/v2 objects remain readable

@@ -107,8 +107,9 @@
 //!   is observability metadata, not proof that a fragment was compacted.
 //! - History generations are nonzero and monotonically increasing.
 //! - MessagePack encodes these structs positionally. Persisted fields may only
-//!   be appended at the end with a serde default; reordering fields is a wire
-//!   format break.
+//!   be appended at the end with a serde default so newer readers can decode
+//!   older payloads; older readers still reject the longer positional array.
+//!   Reordering fields is a wire-format break.
 //! - Pending deletion keys remain recorded until deletion succeeds. Dropping a
 //!   key merely to bound metadata would leak its object permanently.
 //!
@@ -137,6 +138,7 @@ use sha2::{Digest, Sha256};
 use std::ops::Range;
 use ulid::Ulid;
 
+use crate::config::ManifestEnvelopeVersion;
 use crate::embedding::{
     EmbeddingProfileRef, ModalityCounts, PhysicalInputFragmentIdentity, RecordVersionRef,
     SemanticCoverageState, SemanticOverlayRef, SemanticState,
@@ -169,6 +171,145 @@ fn checksum_hex(checksum: &[u8; 32]) -> String {
 /// The byte precedes both live manifests and named snapshot pins. Legacy JSON
 /// objects have no prefix and begin with `{`.
 pub(crate) const MANIFEST_FORMAT_MSGPACK: u8 = 0x01;
+/// Envelope carrying compatibility metadata before an unchanged v1 payload.
+pub(crate) const MANIFEST_FORMAT_ENVELOPE_V2: u8 = 0x02;
+
+const ZEPPELIN_BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Self-describing metadata carried by manifest envelope v2.
+///
+/// Unlike the positional payload, this struct is encoded as a MessagePack map.
+/// Unknown keys are deliberately ignored here so future writers can add
+/// advisory header metadata without another envelope version. That tolerance
+/// stops at the header boundary: the manifest and named-snapshot payloads keep
+/// their strict positional decoders and reject unknown trailing fields.
+#[derive(Debug, Serialize, Deserialize)]
+struct ManifestEnvelopeV2Header<'a> {
+    min_reader: &'a str,
+    writer: &'a str,
+    written_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OwnedManifestEnvelopeV2Header {
+    min_reader: String,
+    writer: String,
+    written_at: i64,
+}
+
+fn parse_three_integer_version(value: &str, field: &str) -> Result<(u64, u64, u64)> {
+    let mut components = value.split('.');
+    let mut parse_component = |name: &str| -> Result<u64> {
+        let component = components.next().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "invalid manifest envelope {field} version {value:?}; missing {name} component"
+            ))
+        })?;
+        if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ZeppelinError::Serialization(format!(
+                "invalid manifest envelope {field} version {value:?}; expected MAJOR.MINOR.PATCH"
+            )));
+        }
+        component.parse::<u64>().map_err(|error| {
+            ZeppelinError::Serialization(format!(
+                "invalid manifest envelope {field} version {value:?}; {name} component: {error}"
+            ))
+        })
+    };
+    let version = (
+        parse_component("major")?,
+        parse_component("minor")?,
+        parse_component("patch")?,
+    );
+    if components.next().is_some() {
+        return Err(ZeppelinError::Serialization(format!(
+            "invalid manifest envelope {field} version {value:?}; expected MAJOR.MINOR.PATCH"
+        )));
+    }
+    Ok(version)
+}
+
+fn encode_manifest_envelope_v2(
+    payload: &[u8],
+    min_reader: &str,
+    writer: &str,
+    written_at: i64,
+) -> Result<Bytes> {
+    parse_three_integer_version(min_reader, "min_reader")?;
+    if writer.is_empty() {
+        return Err(ZeppelinError::Serialization(
+            "manifest envelope writer version is empty".to_string(),
+        ));
+    }
+    let header = rmp_serde::to_vec_named(&ManifestEnvelopeV2Header {
+        min_reader,
+        writer,
+        written_at,
+    })
+    .map_err(|error| {
+        ZeppelinError::Serialization(format!(
+            "manifest envelope header msgpack serialize: {error}"
+        ))
+    })?;
+    let header_len = u16::try_from(header.len()).map_err(|_| {
+        ZeppelinError::Serialization(format!(
+            "manifest envelope header is {} bytes; maximum is {}",
+            header.len(),
+            u16::MAX
+        ))
+    })?;
+    let mut bytes = Vec::with_capacity(3 + header.len() + payload.len());
+    bytes.push(MANIFEST_FORMAT_ENVELOPE_V2);
+    bytes.extend_from_slice(&header_len.to_be_bytes());
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(payload);
+    Ok(Bytes::from(bytes))
+}
+
+fn decode_manifest_envelope_v2<'a>(data: &'a [u8], artifact: &str) -> Result<&'a [u8]> {
+    if data.len() < 3 {
+        return Err(ZeppelinError::Serialization(format!(
+            "{artifact} envelope v2 is truncated before the header length"
+        )));
+    }
+    let header_len = usize::from(u16::from_be_bytes([data[1], data[2]]));
+    let header_end = 3_usize.checked_add(header_len).ok_or_else(|| {
+        ZeppelinError::Serialization(format!("{artifact} envelope v2 header length overflow"))
+    })?;
+    if header_end > data.len() {
+        return Err(ZeppelinError::Serialization(format!(
+            "{artifact} envelope v2 declares a {header_len}-byte header but only {} bytes remain",
+            data.len() - 3
+        )));
+    }
+    let header_bytes = &data[3..header_end];
+    if !matches!(header_bytes.first(), Some(0x80..=0x8f | 0xde | 0xdf)) {
+        return Err(ZeppelinError::Serialization(format!(
+            "{artifact} envelope v2 header must be a MessagePack map"
+        )));
+    }
+    let header: OwnedManifestEnvelopeV2Header =
+        rmp_serde::from_slice(header_bytes).map_err(|e| {
+            ZeppelinError::Serialization(format!(
+                "{artifact} envelope v2 header msgpack deserialize: {e}"
+            ))
+        })?;
+    let required = parse_three_integer_version(&header.min_reader, "min_reader")?;
+    let ours = parse_three_integer_version(ZEPPELIN_BINARY_VERSION, "binary")?;
+    if ours < required {
+        return Err(ZeppelinError::Serialization(format!(
+            "{artifact} requires zeppelin >= {}; this binary is {ZEPPELIN_BINARY_VERSION}",
+            header.min_reader
+        )));
+    }
+    if header.writer.is_empty() {
+        return Err(ZeppelinError::Serialization(format!(
+            "{artifact} envelope v2 writer version is empty"
+        )));
+    }
+    let _written_at = header.written_at;
+    Ok(&data[header_end..])
+}
 
 /// Manifest metadata for one immutable WAL fragment in object storage.
 ///
@@ -5281,9 +5422,10 @@ impl Manifest {
     }
 
     /// Finalize an unpublished normalized fork exactly once as generation one.
-    pub(crate) fn preseal_generation_one(
+    pub(crate) fn preseal_generation_one_with_envelope(
         &self,
         target_identity: &ArtifactOrigin,
+        envelope: ManifestEnvelopeVersion,
     ) -> Result<PreparedManifestPublication> {
         if self.version != 0
             || self.namespace.as_deref() != Some(target_identity.namespace.as_str())
@@ -5314,7 +5456,7 @@ impl Manifest {
                 "fork generation one did not select the required manifest binding".to_string(),
             ));
         }
-        let bytes = manifest.to_bytes()?;
+        let bytes = manifest.to_bytes_with_envelope(envelope)?;
         let digest = ManifestDigest::new(Sha256::digest(&bytes).into());
         Ok(PreparedManifestPublication {
             manifest,
@@ -5334,7 +5476,19 @@ impl Manifest {
             || prepared.manifest.namespace.as_deref() != Some(target_identity.namespace.as_str())
             || prepared.manifest.namespace_incarnation()
                 != Some(target_identity.incarnation.as_uuid())
-            || prepared.manifest.to_bytes()? != prepared.bytes
+            || prepared
+                .manifest
+                .to_bytes_with_envelope(match prepared.bytes.first() {
+                    Some(&MANIFEST_FORMAT_MSGPACK) => ManifestEnvelopeVersion::V1,
+                    Some(&MANIFEST_FORMAT_ENVELOPE_V2) => ManifestEnvelopeVersion::V2,
+                    _ => {
+                        return Err(BranchError::ManifestDigestMismatch {
+                            generation: generation_one,
+                        }
+                        .into())
+                    }
+                })?
+                != prepared.bytes
             || ManifestDigest::new(Sha256::digest(&prepared.bytes).into()) != prepared.digest
         {
             return Err(BranchError::ManifestDigestMismatch {
@@ -6029,12 +6183,14 @@ impl Manifest {
         fragment_bytes + segment_bytes + late_section_bytes
     }
 
-    /// Serializes this manifest as version-prefixed MessagePack bytes.
+    /// Serializes this manifest in the historical v1 MessagePack envelope.
     ///
     /// # Returns
     ///
     /// Owned shared bytes in the format `[0x01][MessagePack payload]`.
-    /// Serialization does not mutate the manifest.
+    /// Production object-store publications use the store-scoped
+    /// [`ManifestEnvelopeVersion`] through the private publication helper;
+    /// this method remains the canonical v1 encoder and compatibility baseline.
     ///
     /// # Errors
     ///
@@ -6063,6 +6219,40 @@ impl Manifest {
         Ok(Bytes::from(data))
     }
 
+    /// Serializes this manifest with an explicitly selected envelope version.
+    ///
+    /// Envelope v2 is `[0x02][u16 big-endian header length][named MessagePack
+    /// header][the exact bytes after v1's 0x01 prefix]`. The payload construction
+    /// intentionally delegates to [`Self::to_bytes`] so the v2 body cannot drift
+    /// from the historical v1 encoder.
+    pub fn to_bytes_with_envelope(&self, envelope: ManifestEnvelopeVersion) -> Result<Bytes> {
+        match envelope {
+            ManifestEnvelopeVersion::V1 => self.to_bytes(),
+            ManifestEnvelopeVersion::V2 => {
+                let v1 = self.to_bytes()?;
+                encode_manifest_envelope_v2(
+                    &v1[1..],
+                    ZEPPELIN_BINARY_VERSION,
+                    ZEPPELIN_BINARY_VERSION,
+                    self.updated_at.timestamp(),
+                )
+            }
+        }
+    }
+
+    fn to_bytes_for_store(&self, store: &ZeppelinStore) -> Result<Bytes> {
+        self.to_bytes_with_envelope(store.manifest_envelope())
+    }
+
+    pub(crate) fn envelope_v2_fixture(
+        payload: &[u8],
+        min_reader: &str,
+        writer: &str,
+        written_at: i64,
+    ) -> Result<Bytes> {
+        encode_manifest_envelope_v2(payload, min_reader, writer, written_at)
+    }
+
     /// Decodes a current MessagePack or legacy JSON manifest.
     ///
     /// # Parameters
@@ -6072,8 +6262,9 @@ impl Manifest {
     ///
     /// # Returns
     ///
-    /// An owned manifest. `0x01` selects the current prefixed MessagePack
-    /// format; `{` selects legacy JSON.
+    /// An owned manifest. `0x01` selects the historical prefixed MessagePack
+    /// format, `0x02` selects a named-map compatibility header plus that exact
+    /// payload, and `{` selects legacy JSON.
     ///
     /// # Errors
     ///
@@ -6103,10 +6294,16 @@ impl Manifest {
             MANIFEST_FORMAT_MSGPACK => rmp_serde::from_slice(&data[1..]).map_err(|e| {
                 ZeppelinError::Serialization(format!("manifest msgpack deserialize: {e}"))
             }),
+            MANIFEST_FORMAT_ENVELOPE_V2 => {
+                let payload = decode_manifest_envelope_v2(data, "manifest")?;
+                rmp_serde::from_slice(payload).map_err(|e| {
+                    ZeppelinError::Serialization(format!("manifest msgpack deserialize: {e}"))
+                })
+            }
             // Legacy JSON: starts with '{' (0x7B)
             b'{' => Ok(serde_json::from_slice(data)?),
             prefix => Err(ZeppelinError::Serialization(format!(
-                "unsupported manifest format prefix 0x{prefix:02x}; this binary reads 0x01 (MessagePack) and legacy JSON"
+                "unsupported manifest format prefix 0x{prefix:02x}; this binary reads 0x01, 0x02 (MessagePack), and legacy JSON"
             ))),
         }
     }
@@ -6528,7 +6725,7 @@ impl Manifest {
         committed.version = Self::checked_next_version(base_version)?;
         committed.namespace = Some(namespace.to_string());
         committed.finalize_manifest_binding(namespace)?;
-        let data = committed.to_bytes()?;
+        let data = committed.to_bytes_for_store(store)?;
         match current {
             Some((_, version)) => {
                 let observed = version.require_version(namespace, "manifest recovery write")?;
@@ -6985,7 +7182,7 @@ impl Manifest {
         committed.version = next_version;
         committed.namespace = Some(namespace.to_string());
         committed.finalize_manifest_binding(namespace)?;
-        let data = committed.to_bytes()?;
+        let data = committed.to_bytes_for_store(store)?;
         let published = match &version.version {
             Some(observed) => {
                 store
@@ -7700,7 +7897,7 @@ impl NamedSnapshot {
         Ok(format!("{}{}.msgpack", Self::prefix(namespace), name))
     }
 
-    /// Serializes this pin as version-prefixed MessagePack.
+    /// Serializes this pin in the historical v1 MessagePack envelope.
     ///
     /// # Returns
     ///
@@ -7725,6 +7922,22 @@ impl NamedSnapshot {
         Ok(Bytes::from(data))
     }
 
+    /// Serializes this snapshot with an explicitly selected manifest envelope.
+    pub fn to_bytes_with_envelope(&self, envelope: ManifestEnvelopeVersion) -> Result<Bytes> {
+        match envelope {
+            ManifestEnvelopeVersion::V1 => self.to_bytes(),
+            ManifestEnvelopeVersion::V2 => {
+                let v1 = self.to_bytes()?;
+                encode_manifest_envelope_v2(
+                    &v1[1..],
+                    ZEPPELIN_BINARY_VERSION,
+                    ZEPPELIN_BINARY_VERSION,
+                    self.created_at.timestamp(),
+                )
+            }
+        }
+    }
+
     /// Decodes a current MessagePack or legacy JSON snapshot pin.
     ///
     /// # Parameters
@@ -7733,8 +7946,9 @@ impl NamedSnapshot {
     ///
     /// # Returns
     ///
-    /// An owned pin. `0x01` selects prefixed MessagePack and `{` selects legacy
-    /// JSON.
+    /// An owned pin. `0x01` selects prefixed MessagePack, `0x02` selects the
+    /// named-map compatibility header plus the same payload, and `{` selects
+    /// legacy JSON.
     ///
     /// # Errors
     ///
@@ -7755,9 +7969,15 @@ impl NamedSnapshot {
             MANIFEST_FORMAT_MSGPACK => rmp_serde::from_slice(&data[1..]).map_err(|e| {
                 ZeppelinError::Serialization(format!("snapshot msgpack deserialize: {e}"))
             }),
+            MANIFEST_FORMAT_ENVELOPE_V2 => {
+                let payload = decode_manifest_envelope_v2(data, "named snapshot")?;
+                rmp_serde::from_slice(payload).map_err(|e| {
+                    ZeppelinError::Serialization(format!("snapshot msgpack deserialize: {e}"))
+                })
+            }
             b'{' => Ok(serde_json::from_slice(data)?),
             prefix => Err(ZeppelinError::Serialization(format!(
-                "unsupported named snapshot format prefix 0x{prefix:02x}; this binary reads 0x01 (MessagePack) and legacy JSON"
+                "unsupported named snapshot format prefix 0x{prefix:02x}; this binary reads 0x01, 0x02 (MessagePack), and legacy JSON"
             ))),
         }
     }
@@ -7859,7 +8079,11 @@ impl NamedSnapshot {
             created_at: now,
         };
         match store
-            .put_if_not_exists(&key, snapshot.to_bytes()?, namespace)
+            .put_if_not_exists(
+                &key,
+                snapshot.to_bytes_with_envelope(store.manifest_envelope())?,
+                namespace,
+            )
             .await
         {
             Ok(()) => Ok(NamedSnapshotRef {
@@ -8431,7 +8655,31 @@ mod tests {
     use crate::wal::SourceInventoryRef;
 
     #[test]
-    fn manifest_format_dispatch_accepts_current_msgpack_and_legacy_json() {
+    fn rmp_serde_positional_struct_rejects_trailing_fields() {
+        #[derive(serde::Serialize)]
+        struct NewerShape {
+            generation: u64,
+            trailing_field: bool,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        struct OlderShape {
+            _generation: u64,
+        }
+
+        let encoded = rmp_serde::to_vec(&NewerShape {
+            generation: 7,
+            trailing_field: true,
+        })
+        .expect("N+1-field struct must serialize");
+        let error = rmp_serde::from_slice::<OlderShape>(&encoded)
+            .expect_err("the N-field reader must reject the N+1-field positional shape");
+
+        assert_eq!(error.to_string(), "array had incorrect length, expected 1");
+    }
+
+    #[test]
+    fn manifest_format_dispatch_accepts_both_envelopes_and_legacy_json() {
         let manifest = Manifest::new();
 
         let msgpack = manifest.to_bytes().unwrap();
@@ -8439,6 +8687,21 @@ mod tests {
         let decoded_msgpack = Manifest::from_bytes(&msgpack).unwrap();
         assert_eq!(decoded_msgpack.version, manifest.version);
         assert_eq!(decoded_msgpack.updated_at, manifest.updated_at);
+
+        let envelope = manifest
+            .to_bytes_with_envelope(ManifestEnvelopeVersion::V2)
+            .unwrap();
+        assert_eq!(envelope.first(), Some(&MANIFEST_FORMAT_ENVELOPE_V2));
+        let header_len = usize::from(u16::from_be_bytes([envelope[1], envelope[2]]));
+        assert_eq!(header_len, 47, "measured v0.2.0 header size changed");
+        assert_eq!(
+            &envelope[3 + header_len..],
+            &msgpack[1..],
+            "envelope v2 must carry the byte-identical v1 MessagePack body"
+        );
+        let decoded_envelope = Manifest::from_bytes(&envelope).unwrap();
+        assert_eq!(decoded_envelope.version, manifest.version);
+        assert_eq!(decoded_envelope.updated_at, manifest.updated_at);
 
         let json = serde_json::to_vec(&manifest).unwrap();
         assert_eq!(json.first(), Some(&b'{'));
@@ -8448,16 +8711,75 @@ mod tests {
     }
 
     #[test]
-    fn manifest_format_dispatch_rejects_0x02_with_valid_payload() {
+    fn manifest_format_dispatch_rejects_0x03_with_valid_payload() {
         let mut future_version = Manifest::new().to_bytes().unwrap().to_vec();
-        future_version[0] = 0x02;
+        future_version[0] = 0x03;
 
         let error = Manifest::from_bytes(&future_version).unwrap_err();
         assert!(
             matches!(&error, ZeppelinError::Serialization(message) if
-                message == "unsupported manifest format prefix 0x02; this binary reads 0x01 (MessagePack) and legacy JSON"),
+                message == "unsupported manifest format prefix 0x03; this binary reads 0x01, 0x02 (MessagePack), and legacy JSON"),
             "future manifest format must fail with the exact compatibility error, got {error:?}"
         );
+    }
+
+    #[test]
+    fn manifest_envelope_refuses_too_old_reader_before_payload_decode() {
+        let bytes = encode_manifest_envelope_v2(
+            b"\xc1not valid MessagePack",
+            "99.0.0",
+            "99.0.0",
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let error = Manifest::from_bytes(&bytes).unwrap_err();
+        assert!(
+            matches!(&error, ZeppelinError::Serialization(message) if
+            message == &format!(
+                "manifest requires zeppelin >= 99.0.0; this binary is {ZEPPELIN_BINARY_VERSION}"
+            )),
+            "minimum-reader gate must run before payload decoding, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_envelope_ignores_unknown_header_keys_only() {
+        #[derive(Serialize)]
+        struct FutureHeader<'a> {
+            min_reader: &'a str,
+            writer: &'a str,
+            written_at: i64,
+            future_advisory: &'a str,
+        }
+
+        let manifest = Manifest::new();
+        let v1 = manifest.to_bytes().unwrap();
+        let header = rmp_serde::to_vec_named(&FutureHeader {
+            min_reader: ZEPPELIN_BINARY_VERSION,
+            writer: ZEPPELIN_BINARY_VERSION,
+            written_at: manifest.updated_at.timestamp(),
+            future_advisory: "ignored by this reader",
+        })
+        .unwrap();
+        let mut envelope = vec![MANIFEST_FORMAT_ENVELOPE_V2];
+        envelope.extend_from_slice(&u16::try_from(header.len()).unwrap().to_be_bytes());
+        envelope.extend_from_slice(&header);
+        envelope.extend_from_slice(&v1[1..]);
+
+        Manifest::from_bytes(&envelope).expect("unknown named header keys must remain additive");
+
+        let mut payload_with_unknown_trailing_field = v1[1..].to_vec();
+        payload_with_unknown_trailing_field[0] += 1;
+        let strict_payload = encode_manifest_envelope_v2(
+            &payload_with_unknown_trailing_field,
+            ZEPPELIN_BINARY_VERSION,
+            ZEPPELIN_BINARY_VERSION,
+            manifest.updated_at.timestamp(),
+        )
+        .unwrap();
+        Manifest::from_bytes(&strict_payload)
+            .expect_err("unknown positional payload fields must remain a hard error");
     }
 
     #[test]
@@ -8465,7 +8787,7 @@ mod tests {
         let error = Manifest::from_bytes(b"\x00not a manifest").unwrap_err();
         assert!(
             matches!(&error, ZeppelinError::Serialization(message) if
-                message == "unsupported manifest format prefix 0x00; this binary reads 0x01 (MessagePack) and legacy JSON"),
+                message == "unsupported manifest format prefix 0x00; this binary reads 0x01, 0x02 (MessagePack), and legacy JSON"),
             "unknown manifest format must fail with the exact compatibility error, got {error:?}"
         );
     }
@@ -9323,6 +9645,24 @@ mod tests {
             !segment.contains_key("membership"),
             "write-path-only membership is deliberately outside query execution v1"
         );
+
+        let v1 = manifest.to_bytes().expect("v1 manifest must encode");
+        let v2 = manifest
+            .to_bytes_with_envelope(ManifestEnvelopeVersion::V2)
+            .expect("v2 manifest must encode");
+        let header_len = usize::from(u16::from_be_bytes([v2[1], v2[2]]));
+        assert_eq!(
+            &v2[3 + header_len..],
+            &v1[1..],
+            "the envelope must not alter one byte of the positional payload"
+        );
+        let decoded = Manifest::from_bytes(&v2).expect("v2 manifest must decode");
+        assert_eq!(
+            serde_json::to_value(decoded.execution_binding_v1("stable"))
+                .expect("decoded execution projection must encode"),
+            binding,
+            "no execution/checksum projection may observe the outer envelope"
+        );
     }
 
     #[test]
@@ -9998,7 +10338,7 @@ mod tests {
         .unwrap();
         let parent = parent
             .manifest
-            .preseal_generation_one(&parent_identity)
+            .preseal_generation_one_with_envelope(&parent_identity, ManifestEnvelopeVersion::V1)
             .unwrap();
         let nested = Manifest::prepare_zero_copy_fork(
             parent.manifest(),
@@ -10044,7 +10384,7 @@ mod tests {
             .unwrap();
             let mut parent = parent
                 .manifest
-                .preseal_generation_one(&parent_identity)
+                .preseal_generation_one_with_envelope(&parent_identity, ManifestEnvelopeVersion::V1)
                 .unwrap()
                 .manifest()
                 .clone();
@@ -10121,7 +10461,7 @@ mod tests {
         .unwrap();
         let sealed = prepared
             .manifest
-            .preseal_generation_one(&target_identity)
+            .preseal_generation_one_with_envelope(&target_identity, ManifestEnvelopeVersion::V1)
             .unwrap();
         assert_eq!(
             sealed.manifest().manifest_binding_version(),
@@ -10174,7 +10514,7 @@ mod tests {
         .unwrap();
         let predecessor = prepared
             .manifest
-            .preseal_generation_one(&target_identity)
+            .preseal_generation_one_with_envelope(&target_identity, ManifestEnvelopeVersion::V1)
             .unwrap()
             .manifest()
             .clone();
@@ -10224,7 +10564,7 @@ mod tests {
         .unwrap();
         let sealed = prepared
             .manifest
-            .preseal_generation_one(&target_identity)
+            .preseal_generation_one_with_envelope(&target_identity, ManifestEnvelopeVersion::V1)
             .unwrap();
 
         let first = Manifest::create_or_verify_generation_one(&store, &target_identity, &sealed)
@@ -10772,7 +11112,7 @@ mod tests {
     /// Preserves read compatibility for both current prefixed MessagePack pins
     /// and the legacy JSON representation.
     #[test]
-    fn named_snapshot_decodes_msgpack_and_json() {
+    fn named_snapshot_decodes_both_envelopes_and_json() {
         let snapshot = NamedSnapshot {
             generation: 42,
             created_at: Utc::now(),
@@ -10781,24 +11121,30 @@ mod tests {
         assert_eq!(msgpack.first(), Some(&MANIFEST_FORMAT_MSGPACK));
         assert_eq!(NamedSnapshot::from_bytes(&msgpack).unwrap(), snapshot);
 
+        let envelope = snapshot
+            .to_bytes_with_envelope(ManifestEnvelopeVersion::V2)
+            .unwrap();
+        assert_eq!(envelope.first(), Some(&MANIFEST_FORMAT_ENVELOPE_V2));
+        assert_eq!(NamedSnapshot::from_bytes(&envelope).unwrap(), snapshot);
+
         let json = serde_json::to_vec(&snapshot).unwrap();
         assert_eq!(json.first(), Some(&b'{'));
         assert_eq!(NamedSnapshot::from_bytes(&json).unwrap(), snapshot);
     }
 
     #[test]
-    fn named_snapshot_format_dispatch_rejects_0x02_with_valid_payload() {
+    fn named_snapshot_format_dispatch_rejects_0x03_with_valid_payload() {
         let snapshot = NamedSnapshot {
             generation: 42,
             created_at: Utc::now(),
         };
         let mut future_version = snapshot.to_bytes().unwrap().to_vec();
-        future_version[0] = 0x02;
+        future_version[0] = 0x03;
 
         let error = NamedSnapshot::from_bytes(&future_version).unwrap_err();
         assert!(
             matches!(&error, ZeppelinError::Serialization(message) if
-                message == "unsupported named snapshot format prefix 0x02; this binary reads 0x01 (MessagePack) and legacy JSON"),
+                message == "unsupported named snapshot format prefix 0x03; this binary reads 0x01, 0x02 (MessagePack), and legacy JSON"),
             "future snapshot format must fail with the exact compatibility error, got {error:?}"
         );
     }
@@ -10808,9 +11154,39 @@ mod tests {
         let error = NamedSnapshot::from_bytes(b"\x00not a named snapshot").unwrap_err();
         assert!(
             matches!(&error, ZeppelinError::Serialization(message) if
-                message == "unsupported named snapshot format prefix 0x00; this binary reads 0x01 (MessagePack) and legacy JSON"),
+                message == "unsupported named snapshot format prefix 0x00; this binary reads 0x01, 0x02 (MessagePack), and legacy JSON"),
             "unknown snapshot format must fail with the exact compatibility error, got {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn store_gate_applies_to_live_history_and_named_snapshot_writes() {
+        for (name, envelope, prefix) in [
+            ("v1", ManifestEnvelopeVersion::V1, MANIFEST_FORMAT_MSGPACK),
+            (
+                "v2",
+                ManifestEnvelopeVersion::V2,
+                MANIFEST_FORMAT_ENVELOPE_V2,
+            ),
+        ] {
+            let store =
+                ZeppelinStore::new(Arc::new(InMemory::new())).with_manifest_envelope(envelope);
+            let namespace = format!("store-envelope-{name}");
+            let mut manifest = Manifest::new();
+            manifest.write(&store, &namespace).await.unwrap();
+            NamedSnapshot::create(&store, &namespace, "pin", 1)
+                .await
+                .unwrap();
+
+            for key in [
+                Manifest::object_store_key(&namespace),
+                Manifest::history_key(&namespace, 1),
+                NamedSnapshot::key(&namespace, "pin").unwrap(),
+            ] {
+                let bytes = store.get(&key).await.unwrap();
+                assert_eq!(bytes.first(), Some(&prefix), "{key}");
+            }
+        }
     }
 
     /// Lets namespace-wide inventories reuse the exact snapshot-key grammar

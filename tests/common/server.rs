@@ -175,7 +175,7 @@ fn configure_test_server_limits(config: &mut Config) {
 }
 
 pub fn scoped_test_security_store(store: &ZeppelinStore, scope: &str) -> ZeppelinStore {
-    ZeppelinStore::new(Arc::new(PrefixStore::new(
+    store.rewrap(Arc::new(PrefixStore::new(
         store.inner(),
         Path::from(scope.to_string()),
     )))

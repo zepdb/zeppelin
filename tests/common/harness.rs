@@ -5,7 +5,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zeppelin::compaction::background::CompactionLifecycle;
-use zeppelin::config::{StorageBackend, StorageConfig};
+use zeppelin::config::{ManifestEnvelopeVersion, StorageBackend, StorageConfig};
 use zeppelin::security::{AuditRuntime, SecurityKernel};
 use zeppelin::server::ServerTaskSupervisor;
 use zeppelin::storage::ZeppelinStore;
@@ -193,9 +193,13 @@ impl TestHarness {
                 .unwrap_or_else(|_| "zeppelin-test".to_string()),
             None => std::env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "zeppelin-test".to_string()),
         };
+        let manifest_envelope = std::env::var("ZEPPELIN_MANIFEST_ENVELOPE")
+            .map_or(Ok(ManifestEnvelopeVersion::V1), |value| value.parse())
+            .expect("ZEPPELIN_MANIFEST_ENVELOPE must be 1 or 2");
 
         let store = match backend.as_str() {
-            "memory" => ZeppelinStore::new(Arc::new(InMemory::new())),
+            "memory" => ZeppelinStore::new(Arc::new(InMemory::new()))
+                .with_manifest_envelope(manifest_envelope),
             "local" => {
                 let config = StorageConfig {
                     backend: StorageBackend::Local,
@@ -206,6 +210,7 @@ impl TestHarness {
                     s3_secret_access_key: None,
                     s3_allow_http: false,
                     fail_fast: true,
+                    manifest_envelope,
                     ..StorageConfig::default()
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")
@@ -223,6 +228,7 @@ impl TestHarness {
                         .map(|v| v == "true")
                         .unwrap_or(false),
                     fail_fast: true,
+                    manifest_envelope,
                     ..StorageConfig::default()
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")
@@ -246,6 +252,7 @@ impl TestHarness {
                     ),
                     s3_allow_http: true,
                     fail_fast: true,
+                    manifest_envelope,
                     ..StorageConfig::default()
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")
@@ -264,6 +271,7 @@ impl TestHarness {
                     bucket: bucket.clone(),
                     gcs_endpoint: Some(endpoint),
                     fail_fast: true,
+                    manifest_envelope,
                     ..StorageConfig::default()
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")
@@ -280,6 +288,7 @@ impl TestHarness {
                     azure_use_emulator: true,
                     azure_allow_http: true,
                     fail_fast: true,
+                    manifest_envelope,
                     ..StorageConfig::default()
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")

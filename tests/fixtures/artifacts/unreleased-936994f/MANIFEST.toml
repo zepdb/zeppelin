@@ -190,6 +190,14 @@ sha256 = "9a7f0a64b7a32402ce84db8b96c13c95e3fb65e80fcf0022c2b670e88083954b"
 object_key = "artifact-corpus/manifest.json"
 
 [[files]]
+path = "manifest_envelope_v2.bin"
+family = "manifest"
+producer = "Manifest::to_bytes_with_envelope(v2)"
+comparison = "structure"
+size_bytes = 985
+sha256 = "9ac5db7ff3b5c0bcd250079dfd2111ff50e0a357a3cdf94cce1d6c3e457e06d2"
+
+[[files]]
 path = "manifest_legacy_json.json"
 family = "manifest"
 producer = "Manifest serde JSON compatibility encoder"

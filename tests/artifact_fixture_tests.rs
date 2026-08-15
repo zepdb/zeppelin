@@ -10,7 +10,8 @@ use common::artifact_fixtures::{
 use common::harness::TestHarness;
 use ulid::Ulid;
 use zeppelin::format::fixture::{
-    reencode_checksum_input, validate_artifact, validate_manifest_for_namespace,
+    encode_manifest_envelope_v2_fixture, reencode_checksum_input, validate_artifact,
+    validate_manifest_for_namespace,
 };
 use zeppelin::format::FORMATS;
 use zeppelin::fts::rank_by::RankBy;
@@ -77,7 +78,12 @@ fn every_version_directory_decodes_every_registry_family() {
             assert_eq!(hex_sha256(&bytes), file.sha256, "{}", path.display());
             validate_artifact(&file.family, &bytes)
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            if file.family == "manifest" && file.path == "manifest.bin" {
+            if file.family == "manifest"
+                && matches!(
+                    file.path.as_str(),
+                    "manifest.bin" | "manifest_envelope_v2.bin"
+                )
+            {
                 validate_manifest_for_namespace(&bytes, &manifest.corpus.namespace)
                     .expect("current manifest namespace binding must validate");
             }
@@ -147,6 +153,38 @@ fn wal_fixture_replaces_checksum_stability_properties_with_real_types() {
     let tampered_bytes = tampered.to_bytes().expect("tampered structure encodes");
     WalFragment::from_bytes(&tampered_bytes)
         .expect_err("checked decoder must reject a stale checksum");
+}
+
+#[test]
+fn manifest_envelope_v2_min_reader_99_refusal_precedes_payload_decode() {
+    let root = version_root();
+    let v1 = fs::read(root.join("manifest.bin")).expect("v1 manifest fixture must read");
+    let v2 =
+        fs::read(root.join("manifest_envelope_v2.bin")).expect("v2 manifest fixture must read");
+    let header_len = usize::from(u16::from_be_bytes([v2[1], v2[2]]));
+    assert_eq!(
+        &v2[3 + header_len..],
+        &v1[1..],
+        "golden v2 payload must be byte-identical to the golden v1 body"
+    );
+    Manifest::from_bytes(&v2).expect("golden envelope v2 must decode");
+
+    let synthetic = encode_manifest_envelope_v2_fixture(
+        b"\xc1deliberately invalid payload",
+        "99.0.0",
+        "99.0.0",
+        1_700_000_000,
+    )
+    .expect("synthetic future-reader envelope must encode");
+    let error = Manifest::from_bytes(&synthetic)
+        .expect_err("reader below min_reader must refuse before decoding the payload");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "serialization error: manifest requires zeppelin >= 99.0.0; this binary is {}",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
 }
 
 #[test]

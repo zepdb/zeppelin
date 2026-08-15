@@ -7,16 +7,35 @@ load-bearing file in the repo — read its rustdoc before editing.
 
 ## Serialization rules (these have caused real bugs)
 
-Manifests and WAL fragments use **MessagePack with a leading version byte**:
-`[0x01][MessagePack payload]` (`MANIFEST_FORMAT_MSGPACK = 0x01`,
-`manifest.rs:157`). Decoders auto-detect legacy JSON by sniffing a leading
-`{`, so both formats must keep round-tripping.
+Manifests, named snapshots, and WAL fragments use **MessagePack with a leading
+version byte**. The historical layout is `[0x01][MessagePack payload]`.
+Manifest and named-snapshot readers also accept envelope v2:
+`[0x02][u16 big-endian header length][named MessagePack header][the exact v1
+payload bytes]`. The header keys are `min_reader`, `writer`, and `written_at`.
+It is a named map so future advisory keys are additive and unknown header keys
+are ignored; that tolerance applies to the header only. The payload stays the
+strict positional struct. WAL fragments remain on `0x01` because they are
+short-lived, independently checksummed, and compacted away. Decoders also
+auto-detect legacy JSON by sniffing a leading `{`.
+
+Envelope-v2 reads are always enabled. Writes are selected per
+`ZeppelinStore` by `storage.manifest_envelope` (default `1`, environment
+`ZEPPELIN_MANIFEST_ENVELOPE`). Upgrade every reader before setting every writer
+to `2`; early mixed-fleet enablement makes pre-envelope binaries reject the
+unknown prefix. The default flips in the next minor and the knob is removed one
+minor later.
 
 Decoders reject unknown format prefixes. Adding a format version means adding
 an explicit decoder arm; never guess by skipping an unrecognized prefix or by
 treating the whole object as an unprefixed payload.
 
-Because the format is not fully self-describing:
+Because the payload format is not fully self-describing:
+
+- rmp-serde positional structs reject an N+1-field array when an N-field older
+  reader decodes it. A trailing field with `#[serde(default)]` lets the newer
+  reader decode older bytes; it does not make the older reader accept newer
+  bytes. This is why incompatible payload evolution needs the envelope's
+  explicit `min_reader` gate.
 
 - **Never put `#[serde(untagged)]` or `#[serde(skip_serializing_if)]` on any
   type reachable from `Manifest` or `WalFragment`.** Check nested types, not

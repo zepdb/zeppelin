@@ -1068,6 +1068,7 @@ mod tests {
                 "ZEPPELIN_TRUSTED_PROXIES",
                 "STORAGE_BACKEND",
                 "S3_BUCKET",
+                "ZEPPELIN_MANIFEST_ENVELOPE",
                 "AWS_REGION",
                 "S3_ENDPOINT",
                 "AWS_ACCESS_KEY_ID",
@@ -1987,6 +1988,36 @@ mod tests {
         assert!(azure.storage.azure_allow_http);
     }
 
+    #[test]
+    fn manifest_envelope_defaults_off_and_env_override_is_strict() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        let defaulted = load_toml("").unwrap();
+        assert_eq!(
+            defaulted.storage.manifest_envelope,
+            ManifestEnvelopeVersion::V1
+        );
+
+        let explicit = load_toml("[storage]\nmanifest_envelope = 2").unwrap();
+        assert_eq!(
+            explicit.storage.manifest_envelope,
+            ManifestEnvelopeVersion::V2
+        );
+
+        std::env::set_var("ZEPPELIN_MANIFEST_ENVELOPE", "2");
+        let overridden = load_toml("[storage]\nmanifest_envelope = 1").unwrap();
+        assert_eq!(
+            overridden.storage.manifest_envelope,
+            ManifestEnvelopeVersion::V2
+        );
+
+        std::env::set_var("ZEPPELIN_MANIFEST_ENVELOPE", "3");
+        let error = load_toml("").unwrap_err().to_string();
+        assert!(error.contains("ZEPPELIN_MANIFEST_ENVELOPE=3"));
+        assert!(error.contains("expected 1 or 2"));
+    }
+
     /// A field belonging to a non-selected backend family is a hard error,
     /// never silently ignored.
     #[test]
@@ -2728,6 +2759,58 @@ pub enum StorageBackend {
     Local,
 }
 
+/// Manifest envelope version emitted by object-store publication paths.
+///
+/// Readers always accept every registered manifest envelope. This setting is
+/// deliberately write-only so a rolling upgrade can deploy the reader before
+/// operators enable the newer writer format.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub enum ManifestEnvelopeVersion {
+    /// Emit the historical `[0x01][positional MessagePack payload]` layout.
+    #[default]
+    V1 = 1,
+    /// Emit the self-describing v2 header before the unchanged v1 payload.
+    V2 = 2,
+}
+
+impl TryFrom<u8> for ManifestEnvelopeVersion {
+    type Error = String;
+
+    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
+            _ => Err(format!(
+                "unsupported manifest envelope {value}; expected 1 or 2"
+            )),
+        }
+    }
+}
+
+impl From<ManifestEnvelopeVersion> for u8 {
+    fn from(value: ManifestEnvelopeVersion) -> Self {
+        value as Self
+    }
+}
+
+impl FromStr for ManifestEnvelopeVersion {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        value
+            .parse::<u8>()
+            .map_err(|error| format!("expected integer 1 or 2: {error}"))?
+            .try_into()
+    }
+}
+
+impl std::fmt::Display for ManifestEnvelopeVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", u8::from(*self))
+    }
+}
+
 impl std::fmt::Display for StorageBackend {
     /// Writes the stable lowercase operator-facing name of this backend.
     ///
@@ -2775,6 +2858,12 @@ pub struct StorageConfig {
     /// Bucket (or container) name. Default: `"zeppelin"`.
     #[serde(default = "default_bucket")]
     pub bucket: String,
+    /// Manifest and named-snapshot envelope emitted by writers. Default: `1`.
+    ///
+    /// Version 2 is read-enabled regardless of this value. Set it only after
+    /// every node in the fleet runs a binary whose reader accepts v2.
+    #[serde(default)]
+    pub manifest_envelope: ManifestEnvelopeVersion,
 
     // These settings specialize the S3-compatible transport without exposing
     // object-store implementation details to higher layers.
@@ -3450,6 +3539,7 @@ impl Default for StorageConfig {
         Self {
             backend: StorageBackend::default(),
             bucket: default_bucket(),
+            manifest_envelope: ManifestEnvelopeVersion::default(),
             s3_region: None,
             s3_endpoint: None,
             s3_access_key_id: None,
@@ -4785,6 +4875,9 @@ impl Config {
         }
         if let Some(v) = env_override::<String>("S3_BUCKET")? {
             self.storage.bucket = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_MANIFEST_ENVELOPE")? {
+            self.storage.manifest_envelope = v;
         }
         if let Some(v) = env_override::<String>("AWS_REGION")? {
             self.storage.s3_region = Some(v);

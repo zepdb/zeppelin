@@ -61,6 +61,7 @@ pub fn inject_store(store: &ZeppelinStore, injection: Injection) -> ZeppelinStor
         }),
         StorageCapabilities::s3(),
     )
+    .with_manifest_envelope(store.manifest_envelope())
 }
 
 /// Control and proof handle for one same-owner lease rewrite before CAS retry.

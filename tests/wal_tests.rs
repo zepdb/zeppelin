@@ -16,8 +16,11 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use zeppelin::config::{ManifestEnvelopeVersion, DEFAULT_RERANK_COALESCE_GAP_BYTES};
 use zeppelin::error::ZeppelinError;
+use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::storage::ZeppelinStore;
+use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
 use zeppelin::wal::{Manifest, ManifestAppendGuard, WalFragment, WalReader, WalWriter};
 
 /// Object-store decorator that replaces the ETag on one GET response.
@@ -101,7 +104,7 @@ fn override_manifest_get_etag(
     manifest_key: String,
     replacement: Option<String>,
 ) -> ZeppelinStore {
-    ZeppelinStore::new(Arc::new(ManifestGetEtagOverrideStore {
+    store.rewrap(Arc::new(ManifestGetEtagOverrideStore {
         inner: store.inner(),
         manifest_key,
         replacement,
@@ -121,6 +124,70 @@ async fn test_fragment_serialize_deserialize_roundtrip() {
     assert_eq!(restored.vectors.len(), 5);
     assert_eq!(restored.deletes.len(), 2);
     assert_eq!(restored.checksum, fragment.checksum);
+}
+
+#[test]
+fn manifest_round_trips_both_envelope_versions() {
+    let manifest = Manifest::new();
+    for envelope in [ManifestEnvelopeVersion::V1, ManifestEnvelopeVersion::V2] {
+        let bytes = manifest.to_bytes_with_envelope(envelope).unwrap();
+        let decoded = Manifest::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.version(), manifest.version());
+        assert_eq!(decoded.updated_at, manifest.updated_at);
+    }
+}
+
+#[tokio::test]
+async fn strong_query_reads_manifest_envelope_v2() {
+    let harness = TestHarness::new().await;
+    let store = harness
+        .store
+        .clone()
+        .with_manifest_envelope(ManifestEnvelopeVersion::V2);
+    let namespace = harness.artifact_origin_namespace("manifest-envelope-v2-strong-query");
+    common::seed_active_namespace(&store, &namespace, 4, DistanceMetric::Euclidean).await;
+    WalWriter::new(store.clone())
+        .append(
+            &namespace,
+            vec![VectorEntry {
+                id: "visible-through-v2".to_string(),
+                values: vec![0.0; 4],
+                attributes: None,
+            }],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let raw = store
+        .get(&Manifest::object_store_key(&namespace))
+        .await
+        .unwrap();
+    assert_eq!(raw.first(), Some(&2), "publication must use envelope v2");
+
+    let reader = WalReader::new(store.clone());
+    let response = execute_query(QueryParams {
+        store: &store,
+        wal_reader: &reader,
+        namespace: &namespace,
+        query: &[0.0; 4],
+        top_k: 1,
+        nprobe: 1,
+        filter: None,
+        consistency: ConsistencyLevel::Strong,
+        distance_metric: DistanceMetric::Euclidean,
+        oversample_factor: 1,
+        rerank_coalesce_gap_bytes: DEFAULT_RERANK_COALESCE_GAP_BYTES,
+        cache: None,
+        manifest_cache: None,
+        include_attributes: true,
+    })
+    .await
+    .unwrap();
+    assert_eq!(response.results[0].id, "visible-through-v2");
+    assert_eq!(response.scanned_fragments, 1);
+
+    harness.cleanup().await;
 }
 
 #[tokio::test]
@@ -594,7 +661,9 @@ async fn bound_manifest_read_rejects_missing_or_empty_get_etags_before_any_put()
         manifest.bind_namespace_incarnation(incarnation).unwrap();
         manifest.write(&harness.store, &ns).await.unwrap();
         let expected_generation = manifest.version();
-        let expected_bytes = manifest.to_bytes().unwrap();
+        let expected_bytes = manifest
+            .to_bytes_with_envelope(harness.store.manifest_envelope())
+            .unwrap();
 
         let manifest_key = Manifest::object_store_key(&ns);
         let history_prefix = Manifest::history_prefix(&ns);
@@ -623,7 +692,12 @@ async fn bound_manifest_read_rejects_missing_or_empty_get_etags_before_any_put()
 
         let stored = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
         assert_eq!(stored.version(), expected_generation);
-        assert_eq!(stored.to_bytes().unwrap(), expected_bytes);
+        assert_eq!(
+            stored
+                .to_bytes_with_envelope(harness.store.manifest_envelope())
+                .unwrap(),
+            expected_bytes
+        );
     }
 
     harness.cleanup().await;
@@ -641,7 +715,9 @@ async fn legacy_manifest_migration_rejects_missing_or_empty_get_etags_before_any
         let mut manifest = Manifest::new();
         manifest.write(&harness.store, &ns).await.unwrap();
         let expected_generation = manifest.version();
-        let expected_bytes = manifest.to_bytes().unwrap();
+        let expected_bytes = manifest
+            .to_bytes_with_envelope(harness.store.manifest_envelope())
+            .unwrap();
 
         let manifest_key = Manifest::object_store_key(&ns);
         let history_prefix = Manifest::history_prefix(&ns);
@@ -668,7 +744,12 @@ async fn legacy_manifest_migration_rejects_missing_or_empty_get_etags_before_any
 
         let stored = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
         assert_eq!(stored.version(), expected_generation);
-        assert_eq!(stored.to_bytes().unwrap(), expected_bytes);
+        assert_eq!(
+            stored
+                .to_bytes_with_envelope(harness.store.manifest_envelope())
+                .unwrap(),
+            expected_bytes
+        );
     }
 
     harness.cleanup().await;

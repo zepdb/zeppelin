@@ -10,7 +10,7 @@ needs external shape information.
 
 `unreleased-936994f/` is a snapshot of the current, unreleased writer at git
 commit `936994fedbc53a3e78bb7f7a5e44373b6e0ebcd1`. The crate still reports
-`0.2.0`, but this writer is twelve commits past the `v0.2.0` tag: it writes IVF
+`0.2.0`, but this writer is thirteen commits past the `v0.2.0` tag: it writes IVF
 bootstrap version 3 and ships an OpenAPI 0.2.1 contract. Naming these bytes
 `v0.2.0` would falsely claim they were emitted by the released binary.
 `MANIFEST.toml` records the full git commit, crate version, fixed generation
@@ -47,6 +47,12 @@ The following `checksum_input = true` registry families must decode and
 re-encode byte-identically: `manifest` (current MessagePack only),
 `wal_fragment`, `input_wal_fragment`, `ivf_bootstrap`,
 `cluster_data_object`, `resident_sketch`, and `late_state_section`.
+
+`manifest_envelope_v2.bin` is structure-compared because the write gate remains
+default-off and the ordinary re-encoder intentionally emits v1. Its dedicated
+comparator separately asserts that every payload byte after the v2 header is
+identical to `manifest.bin` after its `0x01` prefix, then exercises a synthetic
+`min_reader = "99.0.0"` refusal before payload decoding.
 
 All other families are structure-compared with their registry probe and typed
 decoder because the registry does not classify their encoding as a manifest

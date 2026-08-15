@@ -684,7 +684,8 @@ pub fn depth_store(store: &ZeppelinStore) -> (ZeppelinStore, DepthTracker) {
         tracker: tracker.clone(),
     };
     (
-        ZeppelinStore::new_with_capabilities(Arc::new(depth), StorageCapabilities::s3()),
+        ZeppelinStore::new_with_capabilities(Arc::new(depth), StorageCapabilities::s3())
+            .with_manifest_envelope(store.manifest_envelope()),
         tracker,
     )
 }
