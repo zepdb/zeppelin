@@ -217,9 +217,10 @@ curl -s -X DELETE http://localhost:8080/v1/namespaces/$NS | jq
 FTS) into ranked hardware options and a production-ready config. It embeds a
 snapshot-dated cloud pricing catalog (AWS/GCP/Azure instances, block storage,
 object storage) and a cost/latency model calibrated against measured
-perf-contract runs. Predictions are calibrated on loopback MinIO and
-S3-intra-region profiles; non-AWS rows are extrapolated and labeled as such
-in the output banner.
+perf-contract runs. Request/byte inputs are contract-gated, while QPS and
+latency are calibrated on loopback MinIO only. The S3 in-region TTFB profile
+is an assumed anchor, not a project measurement, and is labeled as such in the
+output banner; non-AWS rows are extrapolated.
 
 ```bash
 # Rank instance / cache / nprobe combinations for your data shape

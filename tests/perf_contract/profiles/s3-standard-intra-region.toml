@@ -1,6 +1,9 @@
 # AWS S3 Standard us-east-1 pricing anchor: GET $0.40/1M, PUT $5.00/1M,
 # intra-region reads have no egress charge. m6i.xlarge is about $0.192/hour.
 # S3-client internal retries are not modeled and may add a few percent cost.
+# TTFB 15/60 ms and per-connection throughput 80 MB/s are assumed modeling
+# anchors, not project measurements; see phase-3-whatif-model.md, Deliverable 1.
+# provenance = "assumed; see adversarial-perf-runner/phase-3-whatif-model.md, Deliverable 1"
 # Phase-4 on-storage cluster-quantization projection. Production today (Phase 2)
 # quantizes only the resident sketch; 1-bit has no production path. RaBitQ row
 # bytes include two f32 factors and dimensions padded to 256-d blocks.

@@ -27,6 +27,14 @@
 //! and this module can never drift apart: the calibration (fit) still runs
 //! there, against real MinIO measurements, and its tolerances gate any
 //! change to the math here.
+//!
+//! # Calibration provenance
+//!
+//! The request/byte shape inputs come from a MinIO perf-contract snapshot and
+//! are contract-gated against a held-out shape. GT-A and GT-B both select the
+//! local-MinIO profile. Cloud object-store TTFB and per-connection throughput
+//! values are assumed modeling anchors, not measurements made by this project;
+//! the advisor banner calls out the S3 TTFB assumption explicitly.
 
 pub mod advisor;
 pub mod catalog;

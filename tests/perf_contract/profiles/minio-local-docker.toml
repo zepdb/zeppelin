@@ -1,5 +1,6 @@
 # Measured 2026-07-05: raw boto3 reached 377 MB/s with one worker and
 # approximately 410 MB/s at 4-32 workers. Local MinIO has no request cost.
+# provenance = "GT-A (2026-07-05) and GT-B (2026-07-04) both select this local-MinIO profile"
 name = "minio-local-docker"
 
 [storage]

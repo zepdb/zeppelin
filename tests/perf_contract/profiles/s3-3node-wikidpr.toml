@@ -1,4 +1,6 @@
 # AWS S3 Standard us-east-1 pricing and three m6i.xlarge-equivalent nodes.
+# Storage provenance: TTFB 15/60 ms and per-connection throughput 80 MB/s are
+# assumed modeling anchors inherited from s3-standard-intra-region.
 # Phase-4 on-storage cluster-quantization projection. Production today (Phase 2)
 # quantizes only the resident sketch; 1-bit has no production path. RaBitQ row
 # bytes include two f32 factors and dimensions padded to 256-d blocks.

@@ -50,7 +50,7 @@ const EMIT_FLAGS: &[&str] = &[
     "--security-mode",
     "--out",
 ];
-const PREDICTION_BANNER: &str = "PREDICTION — calibrated on minio-local + s3-intra-region (GT-A ≤10%, GT-B ≤20%); non-AWS rows (EXTRAPOLATED)";
+const PREDICTION_BANNER: &str = "PREDICTION — request/byte counts contract-gated; QPS/latency calibrated on loopback MinIO only (GT-A ≤10%, GT-B ≤20%); the s3-intra-region TTFB profile (p50 15 / p99 60 ms) is an ASSUMED anchor, not measured here; non-AWS rows EXTRAPOLATED";
 
 const USAGE: &str = "\
 zeppelin_advisor — deployment sizing and onboarding advisor
@@ -71,6 +71,11 @@ USAGE:
       --quantization <rabitq-2bit|sq8|f32> --nprobe <N> --bucket <name>
       [--cache-device <nvme|ebs:tier:GB>]
       [--security-mode <enforced|open_unsafe>] --out <zeppelin.toml> [--force]
+
+MODEL PROVENANCE:
+  GT-A and GT-B select tests/perf_contract/profiles/minio-local-docker.toml.
+  Cloud TTFB uses tests/perf_contract/profiles/s3-standard-intra-region.toml
+  as an assumed modeling anchor, not a project measurement.
 
 EXIT CODES:
   0  command completed

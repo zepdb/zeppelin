@@ -7,14 +7,10 @@
 # converted to per-1k here. GCS bills storage per GiB (binary) while
 # AWS/Azure bill per GB — a ~7.4% per-byte wedge left as-is.
 #
-# TTFB: no authoritative source differentiates in-region TTFB by region;
-# treat it as region-independent per cloud. AWS p50/p99 = 15/60 ms is the
-# calibrated pair from tests/perf_contract/profiles/s3-standard-intra-region
-# (the anchor the Tier 2 model was validated with; independent benchmarks
-# put S3 p50 at 12-25 ms). GCS and Azure pairs are estimates from public
-# comparisons (GCS equal-to-slightly-higher than S3; Azure Hot ~10-20 ms).
-# per_conn_mbps 80 is the measured S3 figure; GCS/Azure inherit it as an
-# estimate.
+# Latency/throughput provenance: AWS p50/p99 15/60 ms and per_conn_mbps 80
+# are assumed modeling anchors; neither has been measured by this project.
+# GCS and Azure TTFB pairs are estimates, and their per_conn_mbps values reuse
+# the same assumed 80 MB/s anchor.
 [meta]
 snapshot_date = "2026-08-05"
 currency = "USD"
