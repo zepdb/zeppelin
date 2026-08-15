@@ -53,7 +53,7 @@
 //! 3. Read [`crate::namespace::manager::NamespaceManager::get_including_deleting`]
 //!    and [`crate::namespace::manager::NamespaceManager::list`] for cache and S3
 //!    discovery behavior.
-//! 4. Read [`crate::namespace::graph::NamespaceGraph`] for the graph-owned,
+//! 4. Read `crate::namespace::graph::NamespaceGraph` for the graph-owned,
 //!    evidence-producing, resumable governed deletion protocol. The lower-level
 //!    [`crate::namespace::manager::NamespaceManager::start_delete`] helper exists
 //!    only for managers constructed without preservation governance.

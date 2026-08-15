@@ -1,7 +1,8 @@
 //! Explicit wall-clock construction seam.
 //!
-//! Production components use [`Clock::system`]. Tests can provide a custom
-//! [`TimeSource`] at construction time without relying on global mutable state.
+//! Production components use [`crate::time::Clock::system`]. Tests can provide
+//! a custom [`crate::time::TimeSource`] at construction time without relying on
+//! global mutable state.
 
 use std::sync::Arc;
 

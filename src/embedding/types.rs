@@ -437,8 +437,8 @@ pub const INT8_QUALIFICATION_STAMP_VERSION: u32 = 1;
 /// TEXT-lane replay epoch at `int8_sym_v1 { group_size: 32 }` (Anup,
 /// 2026-07-31: text met the ≥99.5% production same-top-1 bar; visual stays
 /// held at 99.25%). The evidence digest is the SHA-256 of the durable
-/// production writer/decoder measurement,
-/// `tasks/MMLI-2/results/int8-production-qualification.json`.
+/// production writer/decoder measurement summarized in the tracked
+/// [INT8 matrix qualification evidence](https://github.com/zepdb/zeppelin/blob/main/docs/evidence/int8-matrix-qualification.md).
 const APPROVED_INT8_QUALIFICATIONS: &[(MultiVectorEpochId, MatrixDtype, ArtifactChecksum)] = &[(
     // Text replay epoch 04643f3cac3e8a07eab78b5b8496c79701613e0dcb3f3ad9470c97b8cbf08749
     MultiVectorEpochId::new([

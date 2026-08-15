@@ -5,8 +5,8 @@
 //! One immutable object carries the production [`SqCalibration`], per-row
 //! locator metadata, and the raw codes; queries never read per-candidate
 //! objects. IVF wave-one routing (`candidate.rs`) is retained only for the
-//! future scale phase. Adopted 2026-07-31 from the measured Phase 9 benchmark
-//! (`tasks/MMLI-2/results/phase9-flat-sq8-benchmark.md`).
+//! future scale phase. The measured Phase 9 comparison adopted this flat path
+//! on 2026-07-31 for the bounded corpus regime described above.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};

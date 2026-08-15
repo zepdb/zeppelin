@@ -4,7 +4,7 @@
 //! by their manifest snapshot. Re-running Unicode segmentation, stop-word
 //! removal, and stemming for the same immutable fragment would waste CPU, so
 //! [`WalFtsCache`] remembers each document's normalized term frequencies and
-//! token count. [`crate::fts::wal_scan::wal_bm25_scan`] is the normal caller.
+//! token count. `crate::fts::wal_scan::wal_bm25_scan` is the normal caller.
 //!
 //! This module performs no object-store reads and does not decide which WAL
 //! fragments are visible. [`crate::query`] first reads an authoritative
@@ -37,9 +37,9 @@
 //!
 //! 1. Start with [`DocTokenData`] for the cached unit of BM25 statistics.
 //! 2. Read [`CachedFragmentFts`] for the fragment-level key space.
-//! 3. Read [`WalFtsCache::get_or_tokenize`] for hit, miss, and concurrency
+//! 3. Read `WalFtsCache::get_or_tokenize` for hit, miss, and concurrency
 //!    behavior.
-//! 4. Finish with [`WalFtsCache::evict_compacted_located`] for manifest-driven
+//! 4. Finish with `WalFtsCache::evict_compacted_located` for manifest-driven
 //!    lifecycle cleanup.
 //!
 //! ## Invariants and cache-key boundary

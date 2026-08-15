@@ -1,8 +1,8 @@
 //! Immutable typed-input WAL fragments for late-interaction namespaces.
 //!
-//! These bytes are deliberately separate from dense [`super::fragment::WalFragment`]
+//! These bytes are deliberately separate from dense [`crate::wal::WalFragment`]
 //! bytes. Uploading an input fragment does not make it visible; only a root
-//! manifest CAS that installs its [`super::manifest::InputFragmentRef`] does.
+//! manifest CAS that installs its [`crate::wal::InputFragmentRef`] does.
 
 use std::collections::{BTreeMap, HashSet};
 

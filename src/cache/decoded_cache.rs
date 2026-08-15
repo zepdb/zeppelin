@@ -1,7 +1,8 @@
 //! Bounded process-local memo for decoded immutable FTS artifacts.
 //!
 //! The authoritative manifest selects an exact, segment-scoped S3 key before
-//! query execution reaches this module. [`DecodedArtifactCache`] only avoids
+//! query execution reaches this module.
+//! [`DecodedArtifactCache`](crate::cache::decoded_cache::DecodedArtifactCache) only avoids
 //! repeatedly decoding the write-once bytes at that key. It never discovers a
 //! segment, decides visibility, or substitutes local state for S3 authority.
 //!

@@ -291,7 +291,7 @@ impl ObjectUserMetadata {
     ///
     /// Logical keys are lowercase ASCII alphanumerics and hyphens only. The
     /// hyphen restriction is what keeps the Azure wire canonicalization
-    /// (hyphen ↔ underscore, see [`Self::to_attributes`]) bijective — a
+    /// (hyphen ↔ underscore, see `Self::to_attributes`) bijective — a
     /// logical key containing an underscore would collide with the wire form
     /// of its hyphenated sibling on read.
     pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
@@ -459,8 +459,8 @@ pub struct ListedObject {
     /// substrate-native version, and on GCS the object generation is the only
     /// token that authorizes a conditional PUT, so a LIST-derived token would
     /// die with `MissingVersion` there. Every CAS uses a GET- or PUT-derived
-    /// token (audited across all `put_if_match*` call sites,
-    /// `tasks/multi-substrate/08-release-evidence.md`).
+    /// token, as recorded by the tracked
+    /// [conditional-write token-origin audit](https://github.com/zepdb/zeppelin/blob/main/docs/evidence/multi-substrate-storage.md#conditional-write-token-origin-audit).
     pub version: Option<StorageVersion>,
 }
 
@@ -725,7 +725,7 @@ impl ZeppelinStore {
     ///
     /// The boot storage probe calls this when `storage.fail_fast` is set. One
     /// probe object is written under the reserved `__zeppelin_probe__/` prefix
-    /// — outside every namespace family, so [`NamespaceObjectKey::classify`]
+    /// — outside every namespace family, so `NamespaceObjectKey::classify`
     /// fails closed on it by construction and GC can never touch it. The
     /// round-trip exercises create-only PUT, conditional PUT with a fresh and
     /// then a deliberately stale token, LIST-vs-GET ETag comparability, and

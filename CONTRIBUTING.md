@@ -35,6 +35,8 @@ TEST_BACKEND=minio cargo test --tests
 
 Module-level invariants live in per-directory `CLAUDE.md` files (for
 example `src/wal/CLAUDE.md`) — read the one for the module you are editing.
+Use the [Rust documentation style guide](docs/rustdoc-style.md) for module
+orientation, item contracts, examples, diagrams, and rustdoc validation.
 
 ## Format changes
 

@@ -1048,9 +1048,9 @@ impl ResidentSketch {
     /// discarding the `(cluster_idx, row_idx)` coordinates. Exposing them so an
     /// unfiltered query could fetch only the winning rows' IDs and exact
     /// vectors — skipping cluster coarse payloads entirely — was built and
-    /// measured as Phase 4 slice 9.3, and **rejected**. See
-    /// `tasks/July10Quant/results/fixed-stride-f32.md`; the implementation is
-    /// recoverable from `212b689`.
+    /// measured as Phase 4 slice 9.3, and **rejected**. See the tracked
+    /// [resident-sketch bypass evidence](https://github.com/zepdb/zeppelin/blob/main/docs/evidence/resident-sketch-bypass.md);
+    /// the implementation is recoverable from `212b689`.
     ///
     /// Two findings, both against the idea rather than that implementation:
     ///

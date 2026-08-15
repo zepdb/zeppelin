@@ -1,8 +1,7 @@
 //! Ignored, production-shaped flat-SQ8 candidate benchmark for MMLI-2 Phase 9.
 //!
-//! Operator-approved next measurement after the routing diagnosis
-//! (`tasks/MMLI-2/results/phase9-routing-review.md` §4). One physical arm at
-//! K=1000 over the pinned Phase 2 text tensors against local MinIO:
+//! This operator-approved measurement exercises one physical arm at K=1000
+//! over the pinned Phase 2 text tensors against local MinIO:
 //!
 //! - persists production matrix truth blocks and attribute blocks;
 //! - persists a prototype flat-SQ8 candidate artifact (`ZFQ1`) built from the

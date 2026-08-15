@@ -268,8 +268,8 @@ pub struct MmliConfig {
     /// the INT8 frontier to K=1200 recovered recall to `0.980703` at `53 ms`.
     /// Those latency profiles used explicit 512/768 KiB read gaps respectively;
     /// the general default remains 64 KiB because large-gap byte amplification
-    /// did not transfer to the sparse 50k-unit shape. Evidence:
-    /// `tasks/LateLatency/results/phase09-scan-int8.md`.
+    /// did not transfer to the sparse 50k-unit shape. See the tracked
+    /// [late-interaction performance evidence](https://github.com/zepdb/zeppelin/blob/main/docs/evidence/late-interaction-performance.md#text-query-profiles).
     #[serde(default)]
     pub text_matrix_dtype: MmliMatrixDtype,
     /// Exact matrix dtype for namespaces accepting image or image-text. Default: `f16`.
@@ -379,7 +379,8 @@ pub struct MmliSegmentConfig {
     /// K=1200 used 768 KiB for 53 ms p50 and f16 K=1000 used 896 KiB for
     /// 52 ms. Configure a large gap only for a qualified high-density latency
     /// profile; the general default stays 64 KiB to bound sparse-workload
-    /// amplification. Evidence: `tasks/LateLatency/results/phase09-scan-int8.md`.
+    /// amplification. See the tracked
+    /// [late-interaction performance evidence](https://github.com/zepdb/zeppelin/blob/main/docs/evidence/late-interaction-performance.md#text-query-profiles).
     pub read_gap_budget_bytes: usize,
     /// Maximum bytes in one physical ranged request. Default: `8388608`
     /// bytes (8 MiB), kept because it never bound in any measured arm and
@@ -399,10 +400,11 @@ pub struct MmliSegmentConfig {
     /// Maximum changed-row fraction (changed ids over the previous segment's
     /// rows) for incremental flat compaction; larger churn or `0.0` forces a
     /// full rebuild with SQ8 recalibration. Mirrors the dense
-    /// `retrain_imbalance_threshold` shape with its own value. Default `0.2`
-    /// per the W10.2 equivalence gate (`tasks/MMLI-2/results/hardening.md`):
-    /// carried codes stay bit-identical to a full rebuild, so the bound
-    /// limits calibration drift, not correctness.
+    /// `retrain_imbalance_threshold` shape with its own value. Default `0.2`;
+    /// the tracked
+    /// [incremental-compaction evidence](https://github.com/zepdb/zeppelin/blob/main/docs/evidence/late-interaction-performance.md#incremental-compaction-equivalence)
+    /// compares incremental and from-scratch query results and verifies that
+    /// carried immutable matrix blocks remain reachable.
     pub incremental_max_changed_fraction: f32,
 }
 

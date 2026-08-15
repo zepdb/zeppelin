@@ -1,11 +1,12 @@
 //! Static per-substrate capability matrix for the storage seam.
 //!
-//! Zeppelin never asks "is this S3?" outside [`super::store::ZeppelinStore`]
+//! Zeppelin never asks "is this S3?" outside [`crate::storage::ZeppelinStore`]
 //! construction — it asks what the configured substrate can do. The matrix
-//! here is declared from verified `object_store` 0.11.2 behavior (see
-//! `tasks/multi-substrate/00-overview.md`) and, when `storage.fail_fast` is
-//! set, verified live at boot by
-//! [`super::store::ZeppelinStore::verify_declared_capabilities`], so a
+//! here is declared from verified `object_store` 0.11.2 behavior; the tracked
+//! [multi-substrate storage evidence](https://github.com/zepdb/zeppelin/blob/main/docs/evidence/multi-substrate-storage.md#declared-capability-matrix)
+//! records the matrix and validation scope. When `storage.fail_fast` is set,
+//! the declaration is verified live at boot by
+//! [`crate::storage::ZeppelinStore::verify_declared_capabilities`], so a
 //! mis-declared or mis-deployed backend refuses to boot instead of silently
 //! degrading a compare-and-swap into an overwrite.
 
@@ -140,7 +141,7 @@ impl StorageCapabilities {
     ///
     /// This is the config-time view (used by `Config::validate` and startup
     /// gates before a store exists); the constructed
-    /// [`super::store::ZeppelinStore`] carries the same value.
+    /// [`crate::storage::ZeppelinStore`] carries the same value.
     #[must_use]
     pub const fn for_backend(backend: StorageBackend) -> Self {
         match backend {

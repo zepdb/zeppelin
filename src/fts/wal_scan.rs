@@ -4,7 +4,7 @@
 //! fragments have not yet been folded into those artifacts. For a **strong**
 //! lexical query, [`crate::query`] reads one authoritative manifest snapshot,
 //! asks [`crate::wal::reader::WalReader`] for its visible uncompacted fragments,
-//! and calls [`wal_bm25_scan`] to score the latest WAL version of each document.
+//! and calls `wal_bm25_scan` to score the latest WAL version of each document.
 //! The query coordinator then merges these results with segment hits, using
 //! [`WalBm25ScanResult::overriding_ids`] and
 //! [`WalBm25ScanResult::deleted_ids`] to suppress stale segment versions.
@@ -41,7 +41,7 @@
 //! ## Reading map
 //!
 //! 1. Read [`WalBm25ScanResult`] to understand the downstream merge contract.
-//! 2. Read [`wal_bm25_scan`] from replay through scoring and bounded selection.
+//! 2. Read `wal_bm25_scan` from replay through scoring and bounded selection.
 //! 3. Read [`crate::fts::wal_cache::WalFtsCache`] for the optional CPU cache and
 //!    its cache-key limitations.
 //! 4. Continue in [`crate::query`] for concurrent segment search and final

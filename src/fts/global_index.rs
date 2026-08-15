@@ -535,7 +535,7 @@ impl GlobalInvertedIndex {
     ///
     /// # Consistency
     ///
-    /// The byte at offset 5 must equal [`ZGFTS_VERSION`]. A future version is
+    /// The byte at offset 5 must equal `ZGFTS_VERSION`. A future version is
     /// rejected before its payload can be mistaken for today's MessagePack
     /// schema.
     ///

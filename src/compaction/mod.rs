@@ -76,25 +76,22 @@
 //! older segment prefix. Prefix age is never proof that an object is dead.
 //! `cluster_owners`, explicit grouped-object references, retained manifest
 //! history, and active staging roots all participate in reachability. The
-//! corresponding formal-model work is described in
-//! `tasks/FormalVerification/04-tla-incremental-artifact-closure.md`; staging
-//! and two-pass GC safety are described in
-//! `tasks/FormalVerification/02-tla-storage-gc-safety.md`.
+//! corresponding tracked formal models are linked below.
 //!
 //! ## Formal models
 //!
-//! - [CompactionSafety](https://github.com/Ghatage/zeppelin/blob/main/formal-verifications/tla/CompactionSafety.tla)
+//! - [CompactionSafety](https://github.com/zepdb/zeppelin/blob/main/formal-verifications/tla/CompactionSafety.tla)
 //!   demonstrates why a stale unconditional manifest write loses a concurrent
 //!   WAL append and motivates the CAS loop.
-//! - [CompactionRetryConvergence](https://github.com/Ghatage/zeppelin/blob/main/formal-verifications/tla/CompactionRetryConvergence.tla)
+//! - [CompactionRetryConvergence](https://github.com/zepdb/zeppelin/blob/main/formal-verifications/tla/CompactionRetryConvergence.tla)
 //!   separates retry exhaustion as a liveness failure from data-loss safety.
-//! - [MultiWriterLease](https://github.com/Ghatage/zeppelin/blob/main/formal-verifications/tla/MultiWriterLease.tla)
+//! - [MultiWriterLease](https://github.com/zepdb/zeppelin/blob/main/formal-verifications/tla/MultiWriterLease.tla)
 //!   models lease acquisition, fencing, CAS, expiry, and stale-writer rejection.
-//! - [IndexAtomicity](https://github.com/Ghatage/zeppelin/blob/main/formal-verifications/tla/IndexAtomicity.tla)
+//! - [IndexAtomicity](https://github.com/zepdb/zeppelin/blob/main/formal-verifications/tla/IndexAtomicity.tla)
 //!   models upload-all-before-manifest publication.
-//! - [IncrementalArtifactClosure](https://github.com/Ghatage/zeppelin/blob/main/formal-verifications/tla/IncrementalArtifactClosure.tla)
+//! - [IncrementalArtifactClosure](https://github.com/zepdb/zeppelin/blob/main/formal-verifications/tla/IncrementalArtifactClosure.tla)
 //!   models carried cluster ownership and exact-key GC reachability.
-//! - [TwoPassGcSafety](https://github.com/Ghatage/zeppelin/blob/main/formal-verifications/tla/TwoPassGcSafety.tla)
+//! - [TwoPassGcSafety](https://github.com/zepdb/zeppelin/blob/main/formal-verifications/tla/TwoPassGcSafety.tla)
 //!   models live/history/staging roots and fresh reachability at sweep time.
 //!
 //! ## CPU, I/O, and async ownership
