@@ -163,7 +163,7 @@ use crate::server::{AppState, AuditRequest};
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, ConsistencyLevel, Filter, VectorEntry, VectorId};
 use crate::wal::manifest::{LocatedFragmentRef, LocatedSegmentRef};
-use crate::wal::writer::cas_backoff;
+use crate::wal::writer::guarded_cas_backoff;
 use crate::wal::{FragmentCachePolicy, Manifest, ManifestAppendGuard, WalFragmentCache, WalReader};
 
 use super::ApiError;
@@ -794,7 +794,7 @@ async fn append_scoped_upserts_with_reevaluation(
                     GuardedWriteKind::ScopedUpsert,
                     GuardedWriteOutcome::ConflictRetry,
                 );
-                tokio::time::sleep(cas_backoff(attempt)).await;
+                tokio::time::sleep(guarded_cas_backoff(attempt)).await;
             }
             Err(error) => return Err(error),
         }
@@ -1620,7 +1620,7 @@ async fn append_guarded_deletes_with_reevaluation(
             }
             Err(ZeppelinError::ManifestConflict { .. }) => {
                 record_guarded_write_attempt(ns, kind, GuardedWriteOutcome::ConflictRetry);
-                tokio::time::sleep(cas_backoff(attempt)).await;
+                tokio::time::sleep(guarded_cas_backoff(attempt)).await;
             }
             Err(error) => return Err(error),
         }
@@ -3062,6 +3062,20 @@ mod tests {
     use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
     use crate::namespace::{NamespaceId, NamespaceIncarnationId};
     use crate::wal::manifest::SegmentRef;
+
+    #[test]
+    fn guarded_handler_retries_keep_plan_09_backoff_schedule() {
+        assert_eq!(GUARDED_DELETE_MAX_ATTEMPTS, 4);
+        for (attempt, base_ms) in [(0, 10), (1, 20), (2, 40), (3, 80)] {
+            let delay_ms = guarded_cas_backoff(attempt).as_millis();
+            assert!(
+                (base_ms..base_ms + 10).contains(&delay_ms),
+                "guarded handler attempt {attempt} delay {delay_ms} ms was outside \
+                 {base_ms}..{} ms",
+                base_ms + 10
+            );
+        }
+    }
 
     fn origin(namespace: &str, incarnation: u128) -> ArtifactOrigin {
         ArtifactOrigin {

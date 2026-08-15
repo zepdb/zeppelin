@@ -234,6 +234,7 @@ pub struct GetCounter {
     puts: Arc<DashMap<String, u64>>,
     create_puts: Arc<DashMap<String, u64>>,
     update_puts: Arc<DashMap<String, u64>>,
+    update_conflicts: Arc<DashMap<String, u64>>,
     conditional_gets: Arc<Mutex<Vec<(String, Instant)>>>,
     heads: Arc<DashMap<String, u64>>,
     lists: Arc<DashMap<String, u64>>,
@@ -308,6 +309,17 @@ impl GetCounter {
     #[must_use]
     pub fn update_puts_matching(&self, substr: &str) -> u64 {
         self.update_puts
+            .iter()
+            .filter(|record| record.key().contains(substr))
+            .map(|record| *record.value())
+            .sum()
+    }
+
+    /// Total ETag-conditional update PUTs rejected by the backend because the
+    /// observed object version no longer matched.
+    #[must_use]
+    pub fn update_conflicts_matching(&self, substr: &str) -> u64 {
+        self.update_conflicts
             .iter()
             .filter(|record| record.key().contains(substr))
             .map(|record| *record.value())
@@ -466,6 +478,7 @@ impl GetCounter {
         self.puts.clear();
         self.create_puts.clear();
         self.update_puts.clear();
+        self.update_conflicts.clear();
         self.conditional_gets
             .lock()
             .unwrap_or_else(|_| panic!("conditional GET counter lock poisoned"))
@@ -538,6 +551,7 @@ impl ObjectStore for CountingStore {
             .entry(location.to_string())
             .and_modify(|v| *v += 1)
             .or_insert(1);
+        let is_update = matches!(&opts.mode, PutMode::Update(_));
         let mode_counter = match &opts.mode {
             PutMode::Create => Some(&self.counter.create_puts),
             PutMode::Update(_) => Some(&self.counter.update_puts),
@@ -554,7 +568,15 @@ impl ObjectStore for CountingStore {
                 .classes
                 .record_put(classify(location.as_ref()), payload.content_length() as u64);
         }
-        self.inner.put_opts(location, payload, opts).await
+        let result = self.inner.put_opts(location, payload, opts).await;
+        if is_update && matches!(&result, Err(object_store::Error::Precondition { .. })) {
+            self.counter
+                .update_conflicts
+                .entry(location.to_string())
+                .and_modify(|value| *value += 1)
+                .or_insert(1);
+        }
+        result
     }
 
     async fn put_multipart_opts(

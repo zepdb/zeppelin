@@ -126,18 +126,20 @@ const MAX_CAS_RETRIES: u32 = 8;
 ///
 /// # Parameters
 ///
-/// - `attempt`: Zero-based attempt that just conflicted. Values at and above six
-///   use the same capped exponential component.
+/// - `attempt`: Zero-based attempt that just conflicted. Attempt zero retries
+///   immediately; values at and above seven use the same capped exponential
+///   component.
 ///
 /// # Returns
 ///
-/// A delay with a `10 * 2^attempt` millisecond base capped at 500 ms, plus
-/// uniformly selected jitter from 0 through 9 ms.
+/// Zero for attempt zero. Later attempts use a `10 * 2^(attempt - 1)`
+/// millisecond base capped at 500 ms, plus uniformly selected jitter from 0
+/// through 9 ms.
 ///
 /// # Examples
 ///
-/// Attempts `0`, `1`, and `2` wait approximately 10, 20, and 40 ms. Later
-/// attempts wait approximately 500 ms rather than growing without bound.
+/// Attempts `0`, `1`, `2`, and `3` wait approximately 0, 10, 20, and 40 ms.
+/// Later attempts wait approximately 500 ms rather than growing without bound.
 ///
 /// # Rust Notes for Java/C Engineers
 ///
@@ -145,6 +147,17 @@ const MAX_CAS_RETRIES: u32 = 8;
 /// bounded shift makes overflow impossible here; Java/C code would need the same
 /// explicit cap to avoid shifting a fixed-width integer too far.
 pub(crate) fn cas_backoff(attempt: u32) -> Duration {
+    if attempt == 0 {
+        return Duration::ZERO;
+    }
+    let base_ms = (10u64 << attempt.saturating_sub(1).min(6)).min(500);
+    let jitter_ms = rand::thread_rng().gen_range(0..10);
+    Duration::from_millis(base_ms + jitter_ms)
+}
+
+/// Retains the plan-09 retry schedule for guarded appends, whose behavior is
+/// deliberately independent of the unguarded memo-seeded optimization.
+pub(crate) fn guarded_cas_backoff(attempt: u32) -> Duration {
     let base_ms = (10u64 << attempt.min(6)).min(500);
     let jitter_ms = rand::thread_rng().gen_range(0..10);
     Duration::from_millis(base_ms + jitter_ms)
@@ -1134,13 +1147,23 @@ impl WalWriter {
                 }
                 Err(ZeppelinError::ManifestConflict { .. }) => {
                     group.clear_committed();
+                    let guarded = expected_manifest.is_some();
+                    let backoff = if guarded {
+                        guarded_cas_backoff(attempt)
+                    } else {
+                        cas_backoff(attempt)
+                    };
                     warn!(
                         attempt,
                         namespace,
                         batched = batch.len(),
-                        "group commit CAS conflict, retrying with backoff"
+                        guarded,
+                        backoff_ms = backoff.as_millis(),
+                        "group commit CAS conflict, retrying"
                     );
-                    tokio::time::sleep(cas_backoff(attempt)).await;
+                    if !backoff.is_zero() {
+                        tokio::time::sleep(backoff).await;
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -1374,6 +1397,26 @@ mod tests {
     //! CAS contention, fencing, and orphan cleanup.
 
     use super::*;
+
+    #[test]
+    fn first_cas_loss_retries_immediately_then_backoff_is_exponential() {
+        assert_eq!(cas_backoff(0), Duration::ZERO);
+
+        for (attempt, base_ms) in [(1, 10), (2, 20), (3, 40), (7, 500), (20, 500)] {
+            let delay_ms = cas_backoff(attempt).as_millis();
+            assert!(
+                (base_ms..base_ms + 10).contains(&delay_ms),
+                "attempt {attempt} delay {delay_ms} ms was outside {base_ms}..{} ms",
+                base_ms + 10
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_cas_retry_keeps_legacy_attempt_zero_backoff() {
+        let delay_ms = guarded_cas_backoff(0).as_millis();
+        assert!((10..20).contains(&delay_ms));
+    }
 
     fn image_source_fixture(
         namespace: &str,

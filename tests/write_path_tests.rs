@@ -14,7 +14,7 @@ mod common;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use common::counting::counting_store;
@@ -385,6 +385,135 @@ async fn test_sequential_group_commit_reuses_committed_manifest_etag() {
 
     let authoritative = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     assert_eq!(authoritative.fragments.len(), rounds as usize);
+
+    harness.cleanup().await;
+}
+
+#[derive(Debug)]
+struct RoundRobinWriteCost {
+    writers: usize,
+    manifest_gets: u64,
+    manifest_put_attempts: u64,
+    cas_conflicts: u64,
+    p50: Duration,
+    p99: Duration,
+}
+
+async fn measure_round_robin_write_cost(
+    store: &zeppelin::storage::ZeppelinStore,
+    counter: &common::counting::GetCounter,
+    namespace: &str,
+    writer_count: usize,
+    rounds: usize,
+) -> RoundRobinWriteCost {
+    common::seed_bound_manifest(store, namespace).await;
+    counter.reset();
+
+    assert!(writer_count > 0, "write-cost measurement needs a writer");
+    let writers = (0..writer_count)
+        .map(|_| WalWriter::new(store.clone()))
+        .collect::<Vec<_>>();
+    let values = random_vectors(1, 8)[0].values.clone();
+    let mut latencies = Vec::with_capacity(rounds);
+    let mut final_manifest = None;
+    for round in 0..rounds {
+        let started = Instant::now();
+        let (_, manifest) = writers[round % writers.len()]
+            .append(
+                namespace,
+                vec![VectorEntry {
+                    id: format!("writer_cost_{writer_count}_{round}"),
+                    values: values.clone(),
+                    attributes: None,
+                }],
+                vec![],
+            )
+            .await
+            .unwrap_or_else(|error| panic!("round-robin append {round} failed: {error}"));
+        latencies.push(started.elapsed());
+        final_manifest = Some(manifest);
+    }
+
+    let manifest_key = format!("{namespace}/manifest.json");
+    let manifest_gets = counter.gets_matching(&manifest_key);
+    let manifest_put_attempts = counter.update_puts_matching(&manifest_key);
+    let cas_conflicts = counter.update_conflicts_matching(&manifest_key);
+    assert_eq!(
+        manifest_put_attempts,
+        rounds as u64 + cas_conflicts,
+        "each measured append must have one successful manifest CAS; every extra attempt must be an observed precondition conflict"
+    );
+    assert_eq!(
+        final_manifest
+            .expect("at least one append round")
+            .fragments
+            .len(),
+        rounds,
+        "every measured append must be visible in the returned manifest"
+    );
+
+    latencies.sort_unstable();
+    let percentile = |percent: usize| {
+        let rank = (latencies.len() * percent).div_ceil(100);
+        latencies[rank.saturating_sub(1)]
+    };
+    RoundRobinWriteCost {
+        writers: writers.len(),
+        manifest_gets,
+        manifest_put_attempts,
+        cas_conflicts,
+        p50: percentile(50),
+        p99: percentile(99),
+    }
+}
+
+/// Measures the first-CAS-loss cost when a hot namespace alternates between
+/// two process-local writer memos. This is intentionally ignored and MinIO-only
+/// because its output is an evidence table, not a routine latency assertion.
+#[tokio::test]
+#[ignore = "MinIO write-cost measurement; run explicitly"]
+async fn multi_node_round_robin_write_cost() {
+    assert_eq!(
+        std::env::var("TEST_BACKEND").as_deref(),
+        Ok("minio"),
+        "multi_node_round_robin_write_cost requires TEST_BACKEND=minio"
+    );
+
+    const ROUNDS: usize = 200;
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let one_writer = measure_round_robin_write_cost(
+        &store,
+        &counter,
+        &harness.artifact_origin_namespace("first-cas-loss-one-writer"),
+        1,
+        ROUNDS,
+    )
+    .await;
+    let two_writers = measure_round_robin_write_cost(
+        &store,
+        &counter,
+        &harness.artifact_origin_namespace("first-cas-loss-two-writers"),
+        2,
+        ROUNDS,
+    )
+    .await;
+
+    println!(
+        "| writers | appends | CAS conflicts | manifest GETs | manifest PUT attempts | p50 append ms | p99 append ms |"
+    );
+    println!("| ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    for measurement in [&one_writer, &two_writers] {
+        println!(
+            "| {} | {ROUNDS} | {} | {} | {} | {:.3} | {:.3} |",
+            measurement.writers,
+            measurement.cas_conflicts,
+            measurement.manifest_gets,
+            measurement.manifest_put_attempts,
+            measurement.p50.as_secs_f64() * 1_000.0,
+            measurement.p99.as_secs_f64() * 1_000.0,
+        );
+    }
 
     harness.cleanup().await;
 }

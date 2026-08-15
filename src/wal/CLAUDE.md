@@ -56,10 +56,17 @@ Group commit and the last-committed manifest/ETag memo are local to one
 unguarded batch may start from that memo (`writer.rs:1047-1056`); when a
 version-reporting backend alternates one namespace's writes between nodes that
 have both committed, the returning node presents a stale ETag, loses its first
-CAS, clears the memo, and requests a 10–19 ms backoff before the fresh-read
-retry (`writer.rs:147-150, 1135-1144`). This is the latency reason to keep a
-namespace's v1 write path sticky to one process even though manifest CAS
-prevents silent lost updates (`writer.rs:565-568`).
+CAS, clears the memo, and immediately fresh-reads before attempt one
+(`writer.rs:147-153, 1138-1151`). The first loss has no explicit backoff;
+exponential delay starts at 10–19 ms only if attempt one also conflicts.
+Guarded appends never use the memo, retain their plan-09 attempt-zero backoff,
+and still reject an expected-manifest mismatch before publication. The scoped
+upsert and guarded-delete re-evaluation loops in `server/handlers/vectors.rs`
+also use this guarded schedule: attempts zero through three retain 10, 20, 40,
+and 80 ms bases plus 0–9 ms jitter. Alternating nodes still pay the extra
+failed PUT and authoritative GET, so keep a namespace's v1 write path sticky
+to one process even though manifest CAS prevents silent lost updates
+(`writer.rs:565-568`).
 
 Lease release is **best-effort**. A process whose lease expired and was taken
 over must handle release gracefully (Ok, or a non-fatal error). It must never
