@@ -120,6 +120,8 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # kmeans_max_iterations = 25
 # kmeans_convergence_epsilon = 0.0001
 # oversample_factor = 3
+# filter_summary_max_values_per_field = 4096 # ZEPPELIN_FILTER_SUMMARY_MAX_VALUES_PER_FIELD; must be > 0
+# filter_summary_max_bytes = 1048576          # ZEPPELIN_FILTER_SUMMARY_MAX_BYTES; 1 MiB, must be > 0
 # Namespace full_text_search field configs are validated on namespace create:
 # k1 must be finite and in (0, 10], b must be finite and in [0, 1],
 # max_token_length must be >= 1.

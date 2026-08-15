@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- IVF-Flat bootstrap v3 embeds an exact, bounded per-segment filter-cardinality
+  summary for bitmap-indexed equality values. The bounds are configured by
+  `indexing.filter_summary_max_values_per_field` (default 4096) and
+  `indexing.filter_summary_max_bytes` (default 1 MiB).
+
+### Changed
+
+- A rolling downgrade across this commit cannot read segments compacted by the
+  newer binary: older binaries reject the new v3 bootstrap objects. This is a
+  pre-1.0 immutable-format compatibility break; v1/v2 objects remain readable
+  by the newer binary.
+
 ## [0.2.0] - 2026-08-15
 
 ### Added

@@ -45,6 +45,11 @@ path = "fuzz_targets/fuzz_bitmap_index.rs"
 doc = false
 
 [[bin]]
+name = "fuzz_filter_summary"
+path = "fuzz_targets/fuzz_filter_summary.rs"
+doc = false
+
+[[bin]]
 name = "fuzz_quantization"
 path = "fuzz_targets/fuzz_quantization.rs"
 doc = false

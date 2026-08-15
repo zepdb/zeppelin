@@ -30,6 +30,23 @@ Current pinned numbers: recall@100 of 0.9688 (1M) / 0.9814 (2M).
 spill or query-side dedup without a new measured plan — this was deliberately
 re-pinned, not left unconsidered.
 
+## Bootstrap v3 filter-cardinality summary
+
+`ZBS1` version 3 adds one `ZFCS` version-1 MessagePack section. It is rebuilt
+from every logical cluster's exact `ClusterBitmapIndex`, including bitmap
+sidecars carried by incremental compaction; deriving it from rewritten clusters
+alone makes segment-level zero/cardinality claims unsound.
+
+- `covered_fields` is exact capability metadata. An absent field means unknown,
+  never zero matches.
+- Only typed equality/`IN` bitmap keys are summarized. Do not infer range or
+  negation support from `field_total_present`.
+- The value-count cap omits a field before encoding. The byte cap removes the
+  highest-cardinality retained fields until the whole versioned `ZFCS` payload
+  fits.
+- Bootstrap v1/v2 decode with no summary. Unknown bootstrap or `ZFCS` versions
+  are hard errors; never reinterpret them as an empty summary.
+
 ## Quantization
 
 - Two-bit is the default (`default_quantization()` → `TwoBit`, flipped

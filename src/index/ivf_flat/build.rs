@@ -199,16 +199,20 @@ const CLUSTER_DATA_OBJECT_V5_VERSION: u8 = 5;
 /// Bytes in one v5 tuple: cluster index, row count, and coarse/IDs/vectors
 /// absolute ranges.
 const CLUSTER_DATA_OBJECT_V5_DIR_ENTRY_LEN: usize = 4 + 4 + 8 * 6;
-/// Four-byte signature for a combined centroid-and-sketch bootstrap object.
+/// Four-byte signature for a combined segment-bootstrap object.
 const BOOTSTRAP_MAGIC: &[u8; 4] = b"ZBS1";
 /// Legacy bootstrap version containing centroids and resident sketch only.
 const BOOTSTRAP_VERSION_V1: u32 = 1;
-/// Current bootstrap version adding segment-wide complete bitmap fields.
-const BOOTSTRAP_VERSION: u32 = 2;
+/// Bootstrap version adding segment-wide complete bitmap fields.
+const BOOTSTRAP_VERSION_V2: u32 = 2;
+/// Current bootstrap version adding the filter-cardinality summary section.
+const BOOTSTRAP_VERSION: u32 = 3;
 /// Fixed v1 header size before the first embedded artifact.
 const BOOTSTRAP_V1_HEADER_LEN: usize = 4 + 4 + 2 * 16;
+/// Fixed v2 header size before the first embedded artifact.
+const BOOTSTRAP_V2_HEADER_LEN: usize = 4 + 4 + 3 * 16;
 /// Fixed current header size before the first embedded artifact.
-const BOOTSTRAP_HEADER_LEN: usize = 4 + 4 + 3 * 16;
+const BOOTSTRAP_HEADER_LEN: usize = 4 + 4 + 4 * 16;
 /// Object-count compromise used when no grouping cap is configured.
 const DEFAULT_MAX_CLUSTERS_PER_OBJECT: usize = 3;
 /// Environment variable overriding the maximum clusters in a grouped object.
@@ -789,8 +793,9 @@ pub(crate) fn build_cluster_object_lookup(
 
 /// Borrowed, validated views into a combined segment bootstrap artifact.
 ///
-/// The views avoid copying the embedded centroid and sketch bytes. Their
+/// The views avoid copying the embedded versioned artifact bytes. Their
 /// lifetime cannot exceed the input buffer passed to `deserialize_bootstrap`.
+#[derive(Debug)]
 pub(crate) struct BootstrapSections<'a> {
     /// Complete encoded centroid artifact, including its own version header.
     pub centroids: &'a [u8],
@@ -800,26 +805,30 @@ pub(crate) struct BootstrapSections<'a> {
     pub sketch_range: Range<usize>,
     /// Fields guaranteed to have a bitmap index in every logical cluster.
     pub bitmap_complete_fields: BTreeSet<String>,
+    /// Versioned filter-cardinality summary bytes, absent from v1/v2 objects.
+    pub filter_summary: Option<&'a [u8]>,
 }
 
 /// Serialize a segment bootstrap artifact from existing artifact bytes.
 ///
-/// The centroid and sketch payloads are embedded verbatim. Their internal
-/// formats remain independently versioned by their existing decoders.
+/// The centroid, sketch, and filter-summary payloads are embedded verbatim.
+/// Their internal formats remain independently versioned by their decoders.
 ///
 /// # Parameters
 ///
 /// - `centroids`: Complete encoded centroid artifact to place first.
 /// - `sketch`: Complete encoded resident-sketch artifact to place second.
+/// - `bitmap_complete_fields`: Complete-field capability set to place third.
+/// - `filter_summary`: Complete encoded cardinality summary to place fourth.
 ///
 /// # Returns
 ///
 /// One owned immutable buffer with a versioned offset/length directory and the
-/// two payloads in that order.
+/// four payloads in that order.
 ///
 /// # Errors
 ///
-/// Returns an index error when either payload is empty or size arithmetic
+/// Returns an index error when a required payload is empty or size arithmetic
 /// overflows. No object-store write occurs.
 ///
 /// # Performance
@@ -841,6 +850,7 @@ pub(crate) fn serialize_bootstrap(
     centroids: &[u8],
     sketch: &[u8],
     bitmap_complete_fields: &BTreeSet<String>,
+    filter_summary: &[u8],
 ) -> Result<Bytes> {
     if centroids.is_empty() {
         return Err(ZeppelinError::Index(
@@ -852,6 +862,11 @@ pub(crate) fn serialize_bootstrap(
             "bootstrap sketch section cannot be empty".into(),
         ));
     }
+    if filter_summary.is_empty() {
+        return Err(ZeppelinError::Index(
+            "bootstrap filter-summary section cannot be empty".into(),
+        ));
+    }
 
     let bitmap_complete_fields = serialize_bitmap_complete_fields(bitmap_complete_fields)?;
     let centroids_offset = BOOTSTRAP_HEADER_LEN;
@@ -861,11 +876,14 @@ pub(crate) fn serialize_bootstrap(
     let bitmap_complete_fields_offset = sketch_offset
         .checked_add(sketch.len())
         .ok_or_else(|| ZeppelinError::Index("bootstrap sketch section overflows".into()))?;
-    let total = bitmap_complete_fields_offset
+    let filter_summary_offset = bitmap_complete_fields_offset
         .checked_add(bitmap_complete_fields.len())
         .ok_or_else(|| {
             ZeppelinError::Index("bootstrap bitmap complete-fields section overflows".into())
         })?;
+    let total = filter_summary_offset
+        .checked_add(filter_summary.len())
+        .ok_or_else(|| ZeppelinError::Index("bootstrap filter-summary section overflows".into()))?;
 
     let mut buf = Vec::with_capacity(total);
     buf.extend_from_slice(BOOTSTRAP_MAGIC);
@@ -876,9 +894,12 @@ pub(crate) fn serialize_bootstrap(
     buf.extend_from_slice(&(sketch.len() as u64).to_le_bytes());
     buf.extend_from_slice(&(bitmap_complete_fields_offset as u64).to_le_bytes());
     buf.extend_from_slice(&(bitmap_complete_fields.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&(filter_summary_offset as u64).to_le_bytes());
+    buf.extend_from_slice(&(filter_summary.len() as u64).to_le_bytes());
     buf.extend_from_slice(centroids);
     buf.extend_from_slice(sketch);
     buf.extend_from_slice(&bitmap_complete_fields);
+    buf.extend_from_slice(filter_summary);
     debug_assert_eq!(buf.len(), total);
 
     Ok(Bytes::from(buf))
@@ -918,8 +939,9 @@ pub(crate) fn build_bootstrap_artifact(
     centroids: &[u8],
     sketch: &[u8],
     bitmap_complete_fields: &BTreeSet<String>,
+    filter_summary: &[u8],
 ) -> Result<(BootstrapRef, Bytes)> {
-    let bytes = serialize_bootstrap(centroids, sketch, bitmap_complete_fields)?;
+    let bytes = serialize_bootstrap(centroids, sketch, bitmap_complete_fields, filter_summary)?;
     let bootstrap_ref = BootstrapRef {
         key: bootstrap_key(namespace, segment_id),
         size_bytes: bytes.len() as u64,
@@ -927,11 +949,11 @@ pub(crate) fn build_bootstrap_artifact(
     Ok((bootstrap_ref, bytes))
 }
 
-/// Validates a bootstrap object and borrows its two embedded artifact sections.
+/// Validates a bootstrap object and borrows its embedded artifact sections.
 ///
 /// Validation requires the current magic/version, exact contiguous section
 /// ordering, non-empty payloads, in-bounds checked ranges, and no trailing
-/// bytes. It does not decode the centroid or sketch formats themselves.
+/// bytes. It does not decode the nested formats themselves.
 ///
 /// # Parameters
 ///
@@ -939,7 +961,8 @@ pub(crate) fn build_bootstrap_artifact(
 ///
 /// # Returns
 ///
-/// Borrowed centroid and sketch slices tied to `data`'s lifetime.
+/// Borrowed artifact slices and decoded complete fields tied to `data`'s
+/// lifetime.
 ///
 /// # Errors
 ///
@@ -949,9 +972,9 @@ pub(crate) fn build_bootstrap_artifact(
 ///
 /// # Examples
 ///
-/// Bytes emitted by `serialize_bootstrap` yield the exact two original
-/// payloads. Changing the sketch length to extend past the object returns an
-/// error before any decoder sees the slice.
+/// Bytes emitted by `serialize_bootstrap` yield the exact original payloads.
+/// Changing the sketch length to extend past the object returns an error before
+/// any decoder sees the slice.
 ///
 /// # Rust Notes for Java/C Engineers
 ///
@@ -973,15 +996,19 @@ pub(crate) fn deserialize_bootstrap(data: &[u8]) -> Result<BootstrapSections<'_>
             .try_into()
             .map_err(|_| ZeppelinError::Index("bootstrap version parse error".into()))?,
     );
-    if version != BOOTSTRAP_VERSION_V1 && version != BOOTSTRAP_VERSION {
+    if version != BOOTSTRAP_VERSION_V1
+        && version != BOOTSTRAP_VERSION_V2
+        && version != BOOTSTRAP_VERSION
+    {
         return Err(ZeppelinError::Index(format!(
             "unsupported bootstrap version: {version}"
         )));
     }
-    let header_len = if version == BOOTSTRAP_VERSION_V1 {
-        BOOTSTRAP_V1_HEADER_LEN
-    } else {
-        BOOTSTRAP_HEADER_LEN
+    let header_len = match version {
+        BOOTSTRAP_VERSION_V1 => BOOTSTRAP_V1_HEADER_LEN,
+        BOOTSTRAP_VERSION_V2 => BOOTSTRAP_V2_HEADER_LEN,
+        BOOTSTRAP_VERSION => BOOTSTRAP_HEADER_LEN,
+        _ => unreachable!("bootstrap version was validated above"),
     };
     if data.len() < header_len {
         return Err(ZeppelinError::Index(
@@ -1021,7 +1048,7 @@ pub(crate) fn deserialize_bootstrap(data: &[u8]) -> Result<BootstrapSections<'_>
             "bootstrap sketch section overflows: offset={sketch_offset}, len={sketch_len}"
         ))
     })?;
-    let (bitmap_complete_fields, expected_end) = if version == BOOTSTRAP_VERSION_V1 {
+    let (bitmap_complete_fields, fields_end) = if version == BOOTSTRAP_VERSION_V1 {
         (BTreeSet::new(), sketch_end)
     } else {
         let fields_offset = read_u64_usize(data, 40, "bootstrap bitmap complete-fields offset")?;
@@ -1048,6 +1075,30 @@ pub(crate) fn deserialize_bootstrap(data: &[u8]) -> Result<BootstrapSections<'_>
             fields_end,
         )
     };
+    let (filter_summary, expected_end) = if version == BOOTSTRAP_VERSION {
+        let summary_offset = read_u64_usize(data, 56, "bootstrap filter-summary offset")?;
+        let summary_len = read_u64_usize(data, 64, "bootstrap filter-summary length")?;
+        if summary_offset != fields_end {
+            return Err(ZeppelinError::Index(format!(
+                "bootstrap filter-summary offset mismatch: expected {fields_end}, got {summary_offset}"
+            )));
+        }
+        validate_bootstrap_section(
+            "filter-summary",
+            summary_offset,
+            summary_len,
+            header_len,
+            data.len(),
+        )?;
+        let summary_end = summary_offset.checked_add(summary_len).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "bootstrap filter-summary section overflows: offset={summary_offset}, len={summary_len}"
+            ))
+        })?;
+        (Some(&data[summary_offset..summary_end]), summary_end)
+    } else {
+        (None, fields_end)
+    };
     if expected_end != data.len() {
         return Err(ZeppelinError::Index(format!(
             "bootstrap blob size mismatch: expected {expected_end}, got {}",
@@ -1060,6 +1111,7 @@ pub(crate) fn deserialize_bootstrap(data: &[u8]) -> Result<BootstrapSections<'_>
         sketch: &data[sketch_offset..sketch_end],
         sketch_range: sketch_offset..sketch_end,
         bitmap_complete_fields,
+        filter_summary,
     })
 }
 
@@ -1304,6 +1356,8 @@ struct LoadedIndexMetadata {
     resident_sketch: Option<Arc<ResidentSketch>>,
     /// Fields with bitmap coverage in every logical cluster.
     bitmap_complete_fields: BTreeSet<String>,
+    /// Decoded exact filter cardinalities, absent for pre-v3 bootstrap objects.
+    filter_summary: Option<Arc<super::filter_summary::FilterCardinalitySummary>>,
 }
 
 /// Cacheable decoded contents of one immutable bootstrap object.
@@ -1326,6 +1380,8 @@ struct DecodedBootstrap {
     resident_sketch: Arc<ResidentSketch>,
     /// Fields with bitmap coverage in every logical cluster.
     bitmap_complete_fields: BTreeSet<String>,
+    /// Decoded exact filter cardinalities from the v3 bootstrap section.
+    filter_summary: Option<Arc<super::filter_summary::FilterCardinalitySummary>>,
 }
 
 /// Decodes centroid rows while discarding optional embedded calibration bytes.
@@ -4249,6 +4305,7 @@ pub async fn build_ivf_flat(
     // CPU phase: pre-serialize all cluster sections and sidecars.
     let mut bitmap_fields_set = std::collections::HashSet::new();
     let mut bitmap_complete_fields: Option<BTreeSet<String>> = None;
+    let mut cluster_bitmap_indexes = Vec::new();
     let mut cluster_sections: Vec<ClusterPayload> = Vec::with_capacity(num_clusters);
     let mut sidecar_payloads: Vec<(String, Bytes)> = Vec::new();
     for i in 0..num_clusters {
@@ -4317,10 +4374,30 @@ pub async fn build_ivf_flat(
             let bitmap_data = bitmap_index.to_bytes()?;
             let bkey = crate::index::bitmap::bitmap_key(namespace, segment_id, i);
             sidecar_payloads.push((bkey, bitmap_data));
+            cluster_bitmap_indexes.push(bitmap_index);
         }
     }
     let bitmap_fields: Vec<String> = bitmap_fields_set.into_iter().collect();
     let bitmap_complete_fields = bitmap_complete_fields.unwrap_or_default();
+    let filter_summary = super::filter_summary::build_filter_cardinality_summary(
+        &cluster_bitmap_indexes,
+        &bitmap_complete_fields,
+        config.filter_summary_max_values_per_field,
+        config.filter_summary_max_bytes,
+    )?;
+    if filter_summary.eligible_fields != bitmap_complete_fields {
+        return Err(ZeppelinError::Index(
+            "filter summary eligible fields disagree with complete bitmap fields".into(),
+        ));
+    }
+    info!(
+        segment_id,
+        encoded_size_bytes = filter_summary.bytes.len(),
+        covered_field_count = filter_summary.summary.covered_fields.len(),
+        skipped_high_cardinality_fields = ?filter_summary.skipped_high_cardinality_fields,
+        dropped_for_size_fields = ?filter_summary.dropped_for_size_fields,
+        "built filter cardinality summary"
+    );
 
     let mut cluster_objects = Vec::new();
     let mut cluster_object_payloads = Vec::new();
@@ -4393,6 +4470,7 @@ pub async fn build_ivf_flat(
         &centroids_data,
         &sketch_data,
         &bitmap_complete_fields,
+        &filter_summary.bytes,
     )?;
     store.put(&bootstrap_ref.key, bootstrap_data).await?;
     info!(
@@ -4471,6 +4549,7 @@ pub async fn build_ivf_flat(
         sq_calibration,
         bitmap_fields,
         bitmap_complete_fields,
+        filter_summary: Some(Arc::new(filter_summary.summary)),
         // Freshly built segment: every cluster owned by this segment.
         cluster_owners: Vec::new(),
         cluster_objects,
@@ -4687,6 +4766,7 @@ async fn load_ivf_flat_from_manifest_routed(
                 sq_calibration,
                 resident_sketch,
                 bitmap_complete_fields: BTreeSet::new(),
+                filter_summary: None,
             }
         }
     };
@@ -4716,6 +4796,7 @@ async fn load_ivf_flat_from_manifest_routed(
         sq_calibration: metadata.sq_calibration,
         bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
         bitmap_complete_fields: metadata.bitmap_complete_fields,
+        filter_summary: metadata.filter_summary,
         cluster_owners,
         cluster_objects,
         cluster_object_by_cluster,
@@ -4840,6 +4921,11 @@ async fn load_bootstrap_artifacts(
 
     let sections = deserialize_bootstrap(&data)?;
     let bitmap_complete_fields = sections.bitmap_complete_fields.clone();
+    let filter_summary = sections
+        .filter_summary
+        .map(super::filter_summary::FilterCardinalitySummary::from_bytes)
+        .transpose()?
+        .map(Arc::new);
     if sketch_ref.size_bytes != sections.sketch.len() as u64 {
         return Err(ZeppelinError::Index(format!(
             "coarse sketch size mismatch inside bootstrap {}: manifest={}, section={}",
@@ -4871,6 +4957,7 @@ async fn load_bootstrap_artifacts(
         sq_calibration: sq_calibration.clone(),
         resident_sketch: Arc::clone(&sketch),
         bitmap_complete_fields: bitmap_complete_fields.clone(),
+        filter_summary: filter_summary.clone(),
     });
     if let Some(c) = cache {
         let cache_key = super::artifact_cache_key(physical_origin, &bootstrap_ref.key);
@@ -4884,6 +4971,7 @@ async fn load_bootstrap_artifacts(
         sq_calibration,
         resident_sketch: Some(sketch),
         bitmap_complete_fields,
+        filter_summary,
     })
 }
 
@@ -4942,6 +5030,7 @@ fn metadata_from_decoded_bootstrap(
         sq_calibration: decoded.sq_calibration.clone(),
         resident_sketch: Some(Arc::clone(&decoded.resident_sketch)),
         bitmap_complete_fields: decoded.bitmap_complete_fields.clone(),
+        filter_summary: decoded.filter_summary.clone(),
     })
 }
 
@@ -5288,6 +5377,7 @@ pub async fn load_ivf_flat(
         sq_calibration,
         bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
         bitmap_complete_fields: BTreeSet::new(),
+        filter_summary: None,
         // Probing loader is used by compaction to read a segment it will fully
         // rewrite, and by tests — legacy single-segment layout.
         cluster_owners: Vec::new(),
@@ -5313,6 +5403,12 @@ mod tests {
     //! failed prerequisite stops the test at the exact setup operation.
 
     use super::*;
+
+    fn empty_filter_summary_bytes() -> Bytes {
+        super::super::filter_summary::FilterCardinalitySummary::default()
+            .to_bytes()
+            .unwrap()
+    }
 
     /// Verifies hostile row counts in tiny payloads are rejected without
     /// reserving row-count-proportional memory.
@@ -5409,11 +5505,15 @@ mod tests {
         let centroids = b"centroid-bytes";
         let sketch = b"sketch-bytes";
         let complete_fields = BTreeSet::from(["color".to_string(), "tenant".to_string()]);
-        let data = serialize_bootstrap(centroids, sketch, &complete_fields).unwrap();
+        let filter_summary = empty_filter_summary_bytes();
+        let data =
+            serialize_bootstrap(centroids, sketch, &complete_fields, &filter_summary).unwrap();
+        assert_eq!(&data[..8], b"ZBS1\x03\x00\x00\x00");
         let sections = deserialize_bootstrap(&data).unwrap();
         assert_eq!(sections.centroids, centroids);
         assert_eq!(sections.sketch, sketch);
         assert_eq!(sections.bitmap_complete_fields, complete_fields);
+        assert_eq!(sections.filter_summary, Some(filter_summary.as_ref()));
 
         let mut v1 = Vec::new();
         let sketch_offset = BOOTSTRAP_V1_HEADER_LEN + centroids.len();
@@ -5425,10 +5525,28 @@ mod tests {
         v1.extend_from_slice(&(sketch.len() as u64).to_le_bytes());
         v1.extend_from_slice(centroids);
         v1.extend_from_slice(sketch);
-        assert!(deserialize_bootstrap(&v1)
-            .unwrap()
-            .bitmap_complete_fields
-            .is_empty());
+        let v1_sections = deserialize_bootstrap(&v1).unwrap();
+        assert!(v1_sections.bitmap_complete_fields.is_empty());
+        assert!(v1_sections.filter_summary.is_none());
+
+        let encoded_fields = serialize_bitmap_complete_fields(&complete_fields).unwrap();
+        let v2_sketch_offset = BOOTSTRAP_V2_HEADER_LEN + centroids.len();
+        let v2_fields_offset = v2_sketch_offset + sketch.len();
+        let mut v2 = Vec::new();
+        v2.extend_from_slice(BOOTSTRAP_MAGIC);
+        v2.extend_from_slice(&BOOTSTRAP_VERSION_V2.to_le_bytes());
+        v2.extend_from_slice(&(BOOTSTRAP_V2_HEADER_LEN as u64).to_le_bytes());
+        v2.extend_from_slice(&(centroids.len() as u64).to_le_bytes());
+        v2.extend_from_slice(&(v2_sketch_offset as u64).to_le_bytes());
+        v2.extend_from_slice(&(sketch.len() as u64).to_le_bytes());
+        v2.extend_from_slice(&(v2_fields_offset as u64).to_le_bytes());
+        v2.extend_from_slice(&(encoded_fields.len() as u64).to_le_bytes());
+        v2.extend_from_slice(centroids);
+        v2.extend_from_slice(sketch);
+        v2.extend_from_slice(&encoded_fields);
+        let v2_sections = deserialize_bootstrap(&v2).unwrap();
+        assert_eq!(v2_sections.bitmap_complete_fields, complete_fields);
+        assert!(v2_sections.filter_summary.is_none());
     }
 
     /// Proves malformed bootstrap identity, version, and bounds fail loudly.
@@ -5437,7 +5555,13 @@ mod tests {
     /// decoder or permit an out-of-bounds slice.
     #[test]
     fn test_deserialize_bootstrap_rejects_malformed_header() {
-        let data = serialize_bootstrap(b"centroids", b"sketch", &BTreeSet::new()).unwrap();
+        let data = serialize_bootstrap(
+            b"centroids",
+            b"sketch",
+            &BTreeSet::new(),
+            &empty_filter_summary_bytes(),
+        )
+        .unwrap();
 
         let mut bad_magic = data.to_vec();
         bad_magic[0] = b'X';
@@ -5445,7 +5569,10 @@ mod tests {
 
         let mut bad_version = data.to_vec();
         bad_version[4..8].copy_from_slice(&99u32.to_le_bytes());
-        assert!(deserialize_bootstrap(&bad_version).is_err());
+        assert_eq!(
+            deserialize_bootstrap(&bad_version).unwrap_err().to_string(),
+            "index error: unsupported bootstrap version: 99"
+        );
 
         let mut bad_bounds = data.to_vec();
         bad_bounds[32..40].copy_from_slice(&999u64.to_le_bytes());
@@ -5754,6 +5881,7 @@ mod tests {
             &centroids_data,
             &sketch_data,
             &BTreeSet::new(),
+            &empty_filter_summary_bytes(),
         )
         .unwrap();
         store.put(&bootstrap_ref.key, bootstrap_data).await.unwrap();
@@ -5775,6 +5903,7 @@ mod tests {
 
         assert_eq!(index.num_clusters(), 2);
         assert!(index.resident_sketch.is_some());
+        assert!(index.filter_summary.is_some());
 
         let second = load_ivf_flat_from_manifest(
             &store,
@@ -5824,6 +5953,7 @@ mod tests {
             &centroids_data,
             &sketch_data,
             &BTreeSet::new(),
+            &empty_filter_summary_bytes(),
         )
         .unwrap();
         store.put(&bootstrap_ref.key, bootstrap_data).await.unwrap();
@@ -5872,6 +6002,10 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(
             first.resident_sketch.as_ref().unwrap(),
             second.resident_sketch.as_ref().unwrap()
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            first.filter_summary.as_ref().unwrap(),
+            second.filter_summary.as_ref().unwrap()
         ));
     }
 

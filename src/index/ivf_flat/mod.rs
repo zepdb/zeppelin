@@ -77,6 +77,7 @@
 //! in an [`IvfFlatIndex`] remain valid after those temporary borrows end.
 
 pub mod build;
+pub mod filter_summary;
 pub mod kmeans;
 pub mod membership;
 pub mod search;
@@ -167,6 +168,11 @@ pub struct IvfFlatIndex {
     /// This is decoded from the resident bootstrap before query I/O. An empty
     /// set disables coarse attribute elision.
     pub(crate) bitmap_complete_fields: BTreeSet<String>,
+    /// Exact bounded segment-wide cardinalities for equality and `IN` filters.
+    ///
+    /// Bootstrap v1/v2 and legacy separately stored metadata leave this absent;
+    /// bootstrap v3 decodes it once with the other resident segment metadata.
+    pub(crate) filter_summary: Option<Arc<filter_summary::FilterCardinalitySummary>>,
     /// Per-cluster owning segment identities for incremental carry-over.
     ///
     /// Entry `i` names the segment under which cluster `i`'s sidecar objects
@@ -201,6 +207,17 @@ pub struct IvfFlatIndex {
 }
 
 impl IvfFlatIndex {
+    /// Returns the decoded exact filter-cardinality summary when bootstrap v3
+    /// supplied one.
+    ///
+    /// Legacy metadata and bootstrap v1/v2 return `None`, which means summary
+    /// knowledge is absent. The returned value is resident metadata and this
+    /// accessor performs no object-store I/O.
+    #[must_use]
+    pub fn filter_summary(&self) -> Option<&filter_summary::FilterCardinalitySummary> {
+        self.filter_summary.as_deref()
+    }
+
     /// Return an incarnation-qualified cache identity while retaining the exact
     /// manifest-selected S3 key for the actual object-store GET.
     #[must_use]

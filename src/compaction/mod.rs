@@ -254,6 +254,8 @@ const MAX_CAS_RETRIES: u32 = 10;
 const COMPACTION_READ_CLASS_CLUSTER: &str = "cluster";
 /// Metrics label for bytes read from per-vector attribute sidecars.
 const COMPACTION_READ_CLASS_ATTRS: &str = "attrs";
+/// Metrics label for per-cluster bitmap sidecars read during summary rebuilds.
+const COMPACTION_READ_CLASS_BITMAP: &str = "bitmap";
 /// Metrics label for bytes read from the segment-global centroid artifact.
 const COMPACTION_READ_CLASS_CENTROIDS: &str = "centroids";
 /// Metrics label for scalar or product quantization calibration data.
@@ -2886,6 +2888,11 @@ impl Compactor {
                     )));
                 }
                 let bootstrap = deserialize_bootstrap(&bootstrap_data)?;
+                if let Some(filter_summary) = bootstrap.filter_summary {
+                    crate::index::ivf_flat::filter_summary::FilterCardinalitySummary::from_bytes(
+                        filter_summary,
+                    )?;
+                }
                 if sketch_ref.size_bytes != bootstrap.sketch.len() as u64 {
                     return Err(ZeppelinError::CoarseSketch(format!(
                         "coarse sketch size mismatch inside bootstrap {}: manifest={}, section={}",
@@ -3475,6 +3482,7 @@ impl Compactor {
         } else {
             None
         };
+        let mut cluster_bitmap_indexes = vec![None; num_clusters];
         let mut payloads: Vec<(String, Bytes)> = vec![(new_ckey, new_centroids_data.clone())];
         let mut cluster_object_sizes: HashMap<String, u64> = HashMap::new();
         let mut cluster_object_layouts: HashMap<String, (u32, Vec<ClusterRowLayoutRef>)> =
@@ -3726,8 +3734,63 @@ impl Compactor {
                 let bitmap_data = bitmap_index.to_bytes()?;
                 let bkey = crate::index::bitmap::bitmap_key(namespace, new_segment_id, i);
                 payloads.push((bkey, bitmap_data));
+                cluster_bitmap_indexes[i] = Some(bitmap_index);
             }
         }
+
+        let summary_complete_fields = bitmap_complete_fields.clone().unwrap_or_default();
+        let filter_summary = if indexing_config.bitmap_index {
+            let carried_reads = (0..num_clusters)
+                .filter(|&cluster_idx| !touched[cluster_idx])
+                .map(|cluster_idx| {
+                    let key = crate::index::bitmap::bitmap_key(
+                        old_physical_namespace,
+                        &cluster_owners[cluster_idx],
+                        cluster_idx,
+                    );
+                    async move {
+                        let bytes = get_compaction_read(
+                            &self.store,
+                            namespace,
+                            &key,
+                            COMPACTION_READ_CLASS_BITMAP,
+                        )
+                        .await?;
+                        Ok::<_, ZeppelinError>((
+                            cluster_idx,
+                            crate::index::bitmap::ClusterBitmapIndex::from_bytes(&bytes)?,
+                        ))
+                    }
+                });
+            for result in futures::future::join_all(carried_reads).await {
+                let (cluster_idx, bitmap_index) = result?;
+                cluster_bitmap_indexes[cluster_idx] = Some(bitmap_index);
+            }
+            let all_bitmap_indexes = cluster_bitmap_indexes
+                .into_iter()
+                .enumerate()
+                .map(|(cluster_idx, index)| {
+                    index.ok_or_else(|| {
+                        ZeppelinError::Index(format!(
+                            "incremental filter summary missing bitmap for cluster {cluster_idx}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            crate::index::ivf_flat::filter_summary::build_filter_cardinality_summary(
+                &all_bitmap_indexes,
+                &summary_complete_fields,
+                indexing_config.filter_summary_max_values_per_field,
+                indexing_config.filter_summary_max_bytes,
+            )?
+        } else {
+            crate::index::ivf_flat::filter_summary::build_filter_cardinality_summary(
+                &[],
+                &summary_complete_fields,
+                indexing_config.filter_summary_max_values_per_field,
+                indexing_config.filter_summary_max_bytes,
+            )?
+        };
 
         // Quantized artifacts. The calibration/codebook is SEGMENT-GLOBAL and
         // MUST be reused (not recomputed): carried clusters' codes were encoded
@@ -3781,12 +3844,27 @@ impl Compactor {
         }
 
         let bitmap_complete_fields = bitmap_complete_fields.unwrap_or_default();
+        if filter_summary.eligible_fields != bitmap_complete_fields {
+            return Err(ZeppelinError::Index(
+                "incremental filter summary eligible fields disagree with complete bitmap fields"
+                    .into(),
+            ));
+        }
+        info!(
+            segment_id = new_segment_id,
+            encoded_size_bytes = filter_summary.bytes.len(),
+            covered_field_count = filter_summary.summary.covered_fields.len(),
+            skipped_high_cardinality_fields = ?filter_summary.skipped_high_cardinality_fields,
+            dropped_for_size_fields = ?filter_summary.dropped_for_size_fields,
+            "built incremental filter cardinality summary"
+        );
         let (bootstrap_ref, bootstrap_data) = build_bootstrap_artifact(
             namespace,
             new_segment_id,
             &new_centroids_data,
             &sketch_data,
             &bitmap_complete_fields,
+            &filter_summary.bytes,
         )?;
         payloads.push((bootstrap_ref.key.clone(), bootstrap_data));
 

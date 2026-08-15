@@ -1093,6 +1093,8 @@ mod tests {
                 "ZEPPELIN_DEFAULT_NPROBE",
                 "ZEPPELIN_QUANTIZATION",
                 "ZEPPELIN_BITMAP_INDEX",
+                "ZEPPELIN_FILTER_SUMMARY_MAX_VALUES_PER_FIELD",
+                "ZEPPELIN_FILTER_SUMMARY_MAX_BYTES",
                 "ZEPPELIN_FTS_INDEX",
                 "ZEPPELIN_BM25_MAX_FULL_SCAN_CLUSTERS",
                 "ZEPPELIN_BM25_MAX_FULL_SCAN_VECTORS",
@@ -1834,6 +1836,8 @@ mod tests {
         assert_eq!(config.indexing.default_probe_fraction, 3.0 / 16.0);
         assert_eq!(config.indexing.balance_max_ratio, 4.0);
         assert_eq!(config.indexing.balance_repair_rounds, 8);
+        assert_eq!(config.indexing.filter_summary_max_values_per_field, 4_096);
+        assert_eq!(config.indexing.filter_summary_max_bytes, 1024 * 1024);
 
         assert_eq!(config.indexing.effective_num_centroids(100), 100);
         assert_eq!(config.indexing.effective_num_centroids(1_000_000), 334);
@@ -1847,6 +1851,47 @@ mod tests {
         assert_eq!(
             config.indexing.effective_default_nprobe_with_floor(334, 80),
             80
+        );
+    }
+
+    /// Pins both filter-summary bounds through TOML, environment overrides, and
+    /// aggregate validation.
+    #[test]
+    fn filter_summary_bounds_are_configurable_and_nonzero() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        let explicit = load_toml(
+            r#"
+            [indexing]
+            filter_summary_max_values_per_field = 123
+            filter_summary_max_bytes = 456
+            "#,
+        )
+        .unwrap();
+        assert_eq!(explicit.indexing.filter_summary_max_values_per_field, 123);
+        assert_eq!(explicit.indexing.filter_summary_max_bytes, 456);
+
+        std::env::set_var("ZEPPELIN_FILTER_SUMMARY_MAX_VALUES_PER_FIELD", "789");
+        std::env::set_var("ZEPPELIN_FILTER_SUMMARY_MAX_BYTES", "987");
+        let overridden = load_toml("").unwrap();
+        assert_eq!(overridden.indexing.filter_summary_max_values_per_field, 789);
+        assert_eq!(overridden.indexing.filter_summary_max_bytes, 987);
+
+        std::env::remove_var("ZEPPELIN_FILTER_SUMMARY_MAX_VALUES_PER_FIELD");
+        std::env::remove_var("ZEPPELIN_FILTER_SUMMARY_MAX_BYTES");
+        assert_config_error_contains(
+            load_toml(
+                r#"
+                [indexing]
+                filter_summary_max_values_per_field = 0
+                filter_summary_max_bytes = 0
+                "#,
+            ),
+            &[
+                "indexing.filter_summary_max_values_per_field",
+                "indexing.filter_summary_max_bytes",
+            ],
         );
     }
 
@@ -2949,6 +2994,15 @@ pub struct IndexingConfig {
     /// enabling filter evaluation before distance computation.
     #[serde(default = "default_bitmap_index")]
     pub bitmap_index: bool,
+    /// Maximum distinct typed values retained for one field in the segment-wide
+    /// filter-cardinality summary. Default: `4096`.
+    #[serde(default = "default_filter_summary_max_values_per_field")]
+    pub filter_summary_max_values_per_field: usize,
+    /// Maximum encoded bytes for one segment-wide filter-cardinality summary.
+    /// Fields are removed by descending cardinality until this bound is met.
+    /// Default: `1048576` (1 MiB).
+    #[serde(default = "default_filter_summary_max_bytes")]
+    pub filter_summary_max_bytes: usize,
     /// Whether to build FTS inverted indexes during compaction.
     #[serde(default)]
     pub fts_index: bool,
@@ -3275,6 +3329,14 @@ fn default_quantization() -> crate::index::quantization::QuantizationType {
 fn default_bitmap_index() -> bool {
     true
 }
+/// Returns the maximum distinct values retained per summary field.
+fn default_filter_summary_max_values_per_field() -> usize {
+    4_096
+}
+/// Returns the maximum encoded filter-cardinality summary size in bytes.
+fn default_filter_summary_max_bytes() -> usize {
+    1024 * 1024
+}
 /// Returns the default interval between background compaction checks in seconds.
 fn default_compaction_interval() -> u64 {
     30
@@ -3453,6 +3515,8 @@ impl Default for IndexingConfig {
             hierarchical: false,
             leaf_size: None,
             bitmap_index: default_bitmap_index(),
+            filter_summary_max_values_per_field: default_filter_summary_max_values_per_field(),
+            filter_summary_max_bytes: default_filter_summary_max_bytes(),
             fts_index: false,
             bm25_max_full_scan_clusters: default_bm25_max_full_scan_clusters(),
             bm25_max_full_scan_vectors: default_bm25_max_full_scan_vectors(),
@@ -4118,6 +4182,16 @@ impl Config {
                 "indexing.default_nprobe ({}) must be <= indexing.max_nprobe ({})",
                 self.indexing.default_nprobe, self.indexing.max_nprobe
             ));
+        }
+        if self.indexing.filter_summary_max_values_per_field == 0 {
+            violations.push(
+                "indexing.filter_summary_max_values_per_field must be greater than zero"
+                    .to_string(),
+            );
+        }
+        if self.indexing.filter_summary_max_bytes == 0 {
+            violations
+                .push("indexing.filter_summary_max_bytes must be greater than zero".to_string());
         }
 
         if self.compaction.max_wal_age_before_compact_secs == 0 {
@@ -4827,6 +4901,12 @@ impl Config {
         }
         if let Some(v) = env_override("ZEPPELIN_BITMAP_INDEX")? {
             self.indexing.bitmap_index = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_FILTER_SUMMARY_MAX_VALUES_PER_FIELD")? {
+            self.indexing.filter_summary_max_values_per_field = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_FILTER_SUMMARY_MAX_BYTES")? {
+            self.indexing.filter_summary_max_bytes = v;
         }
         if let Some(v) = env_override("ZEPPELIN_FTS_INDEX")? {
             self.indexing.fts_index = v;

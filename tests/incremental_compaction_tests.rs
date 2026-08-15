@@ -19,7 +19,7 @@ use bytes::Bytes;
 use common::counting::{counting_store, ArtifactClass};
 use common::harness::TestHarness;
 use common::vectors::clustered_vectors;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
 use zeppelin::compaction::Compactor;
@@ -288,7 +288,7 @@ fn read_u64(data: &[u8], offset: usize) -> u64 {
 
 fn bootstrap_complete_fields(data: &[u8]) -> Vec<String> {
     assert!(data.starts_with(b"ZBS1"));
-    assert_eq!(read_u32(data, 4), 2);
+    assert_eq!(read_u32(data, 4), 3);
     let offset = read_u64(data, 40) as usize;
     let len = read_u64(data, 48) as usize;
     let section = &data[offset..offset + len];
@@ -307,6 +307,19 @@ fn bootstrap_complete_fields(data: &[u8]) -> Vec<String> {
     }
     assert_eq!(cursor, section.len());
     fields
+}
+
+fn bootstrap_filter_summary(
+    data: &[u8],
+) -> zeppelin::index::ivf_flat::filter_summary::FilterCardinalitySummary {
+    assert!(data.starts_with(b"ZBS1"));
+    assert_eq!(read_u32(data, 4), 3);
+    let offset = read_u64(data, 56) as usize;
+    let len = read_u64(data, 64) as usize;
+    zeppelin::index::ivf_flat::filter_summary::FilterCardinalitySummary::from_bytes(
+        &data[offset..offset + len],
+    )
+    .unwrap()
 }
 
 fn read_f32(data: &[u8], offset: usize) -> f32 {
@@ -1129,9 +1142,14 @@ async fn bitmap_complete_fields_intersect_rewritten_and_carried_clusters() {
 
         let old_segment = active_segment_ref(&harness.store, &ns).await;
         let old_bootstrap = old_segment.bootstrap.as_ref().unwrap();
+        let old_bootstrap_bytes = harness.store.get(&old_bootstrap.key).await.unwrap();
         assert_eq!(
-            bootstrap_complete_fields(&harness.store.get(&old_bootstrap.key).await.unwrap()),
+            bootstrap_complete_fields(&old_bootstrap_bytes),
             vec!["common".to_string(), "old_only".to_string()]
+        );
+        assert_eq!(
+            bootstrap_filter_summary(&old_bootstrap_bytes).covered_fields,
+            BTreeSet::from(["common".to_string(), "old_only".to_string()])
         );
         let (_, membership) =
             decoded_membership(&harness.store, old_segment.membership.as_ref().unwrap()).await;
@@ -1194,14 +1212,31 @@ async fn bitmap_complete_fields_intersect_rewritten_and_carried_clusters() {
             "fixture must carry at least one old cluster"
         );
         let new_bootstrap = new_segment.bootstrap.as_ref().unwrap();
-        let actual =
-            bootstrap_complete_fields(&harness.store.get(&new_bootstrap.key).await.unwrap());
+        let new_bootstrap_bytes = harness.store.get(&new_bootstrap.key).await.unwrap();
+        let actual = bootstrap_complete_fields(&new_bootstrap_bytes);
         let expected = if coverage_less_old_bootstrap {
             Vec::new()
         } else {
             vec!["common".to_string()]
         };
         assert_eq!(actual, expected);
+        let summary = bootstrap_filter_summary(&new_bootstrap_bytes);
+        assert_eq!(
+            summary.covered_fields,
+            expected.into_iter().collect::<BTreeSet<_>>()
+        );
+        if !coverage_less_old_bootstrap {
+            assert_eq!(
+                summary.fields["common"].field_total_present, new_segment.vector_count as u32,
+                "summary must include rows from rewritten and carried clusters"
+            );
+            assert_eq!(
+                summary.fields["common"].values
+                    [&zeppelin::index::bitmap::BitmapKey("s:yes".to_string())]
+                    .total,
+                new_segment.vector_count as u32
+            );
+        }
 
         harness.cleanup().await;
     }

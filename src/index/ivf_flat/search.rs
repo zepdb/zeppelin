@@ -5274,6 +5274,7 @@ mod tests {
             sq_calibration: None,
             bitmap_fields: Vec::new(),
             bitmap_complete_fields: BTreeSet::new(),
+            filter_summary: None,
             cluster_owners: Vec::new(),
             cluster_objects: Vec::new(),
             cluster_object_by_cluster: Vec::new(),
