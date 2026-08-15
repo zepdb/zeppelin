@@ -14,6 +14,7 @@ use crate::embedding::{
     MultiVectorEmbedding, MultiVectorEpochId,
 };
 use crate::error::{Result, ZeppelinError};
+use crate::fts::inverted_index::FTS_INDEX_FORMAT_VERSION;
 use crate::namespace::branching::ArtifactOriginIndex;
 use crate::storage::{NamespaceObjectFamily, NamespaceObjectKey};
 use crate::types::{AttributeValue, VectorId};
@@ -556,7 +557,7 @@ fn validate_fts_artifacts(config: &LateSegmentBuildConfig) -> Result<()> {
         if owned.family() != NamespaceObjectFamily::LateSegment
             || reference.key != expected_key
             || reference.size_bytes == 0
-            || reference.format_version == 0
+            || reference.format_version != u32::from(FTS_INDEX_FORMAT_VERSION)
             || u64::try_from(artifact.bytes.len()).ok() != Some(reference.size_bytes)
             || ArtifactChecksum::digest(&artifact.bytes) != reference.checksum
             || !keys.insert(reference.key.clone())
@@ -1074,6 +1075,14 @@ mod tests {
         unregistered.reference.key = "target/late/segments/segment/notes.bin".to_string();
         assert!(build_late_interaction_segment(
             config(vec![unregistered]),
+            vec![row("a", 1, 1.0), row("b", 2, 2.0)]
+        )
+        .is_err());
+
+        let mut unsupported = fts_artifact();
+        unsupported.reference.format_version = 2;
+        assert!(build_late_interaction_segment(
+            config(vec![unsupported]),
             vec![row("a", 1, 1.0), row("b", 2, 2.0)]
         )
         .is_err());

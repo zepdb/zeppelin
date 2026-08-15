@@ -2216,7 +2216,7 @@ pub(crate) fn deserialize_colocated_coarse_cluster(
     data: &[u8],
     encoding: CoarsePayloadEncoding,
 ) -> Result<Option<CoarseClusterData>> {
-    let section_encoding = cluster_section_encoding(data);
+    let section_encoding = cluster_section_encoding(data)?;
     match (encoding, section_encoding) {
         (CoarsePayloadEncoding::Sq8, Some(CoarsePayloadEncoding::Sq8)) => {
             let sections = colocated_cluster_sections(data)?;
@@ -2550,14 +2550,15 @@ pub(crate) fn cluster_object_header_range_len(entry_count: usize) -> Result<usiz
 ///
 /// # Returns
 ///
-/// `Some` parsed v1/v4 layout or `None` when the bytes do not carry a supported
+/// `Some` parsed v1/v4 layout or `None` when the bytes carry no plausible
 /// grouped-object signature. `None` identifies a legacy standalone cluster,
-/// not a malformed recognized grouped object.
+/// not a malformed or unsupported recognized grouped object.
 ///
 /// # Errors
 ///
-/// Returns an index error for a recognized but truncated/malformed directory,
-/// duplicate cluster indexes, invalid relationships, or size overflow.
+/// Returns an index error for an unsupported grouped-object version, a
+/// recognized but truncated/malformed directory, duplicate cluster indexes,
+/// invalid relationships, or size overflow.
 ///
 /// A `ZBP5` object is an error, never `None`. Its coarse/ID/vector regions are
 /// not the coarse/full section pair this directory describes, and returning
@@ -2583,7 +2584,29 @@ pub(crate) fn cluster_object_layout(data: &[u8]) -> Result<Option<ClusterObjectL
                 .into(),
         ));
     }
+    if let Some(version) = plausible_cluster_data_object_version(data) {
+        return Err(ZeppelinError::Index(format!(
+            "unsupported cluster data object version {version}; this binary reads ZBP1, ZBP4, ZBP5, and legacy standalone clusters"
+        )));
+    }
     Ok(None)
+}
+
+/// Returns an unrecognized `ZBP` version while preserving true legacy rows.
+///
+/// Legacy row counts are little-endian and can begin with the three bytes
+/// `ZBP`. A fourth zero byte still denotes an ordinary row count, not a
+/// versioned object. Every real or plausible grouped-object version is
+/// nonzero; ASCII digits are normalized for a readable diagnostic.
+fn plausible_cluster_data_object_version(data: &[u8]) -> Option<u8> {
+    if data.len() < 4 || &data[..3] != CLUSTER_DATA_OBJECT_MAGIC_PREFIX || data[3] == 0 {
+        return None;
+    }
+    Some(if data[3].is_ascii_digit() {
+        data[3] - b'0'
+    } else {
+        data[3]
+    })
 }
 
 /// Return all full-vector sections in a grouped cluster-data object.
@@ -3676,20 +3699,34 @@ fn validate_range_in_object(range: &Range<usize>, object_len: usize, label: &str
 /// Returns an index error when a recognized quantized header has invalid
 /// offsets or size.
 fn full_cluster_section(data: &[u8]) -> Result<&[u8]> {
-    if cluster_section_encoding(data).is_none() {
+    if cluster_section_encoding(data)?.is_none() {
         return Ok(data);
     }
     Ok(colocated_cluster_sections(data)?.full)
 }
 
 /// Returns the coarse encoding named by a recognized cluster-section magic.
-fn cluster_section_encoding(data: &[u8]) -> Option<CoarsePayloadEncoding> {
+///
+/// A nonzero fourth byte after `ZCL` is a version discriminator. Unknown
+/// versions fail before their payload can be mistaken for a legacy cluster;
+/// `ZCL\0` remains eligible for legacy decoding because little-endian row
+/// counts can collide with the three-byte prefix.
+fn cluster_section_encoding(data: &[u8]) -> Result<Option<CoarsePayloadEncoding>> {
     if data.starts_with(CLUSTER_V2_MAGIC) {
-        Some(CoarsePayloadEncoding::Sq8)
+        Ok(Some(CoarsePayloadEncoding::Sq8))
     } else if data.starts_with(CLUSTER_V3_MAGIC) {
-        Some(CoarsePayloadEncoding::TwoBit)
+        Ok(Some(CoarsePayloadEncoding::TwoBit))
+    } else if data.len() >= 4 && &data[..3] == b"ZCL" && data[3] != 0 {
+        let version = if data[3].is_ascii_digit() {
+            data[3] - b'0'
+        } else {
+            data[3]
+        };
+        Err(ZeppelinError::Index(format!(
+            "unsupported cluster section version ZCL{version}; this binary reads ZCL2, ZCL3, and legacy standalone clusters"
+        )))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -3848,7 +3885,7 @@ fn colocated_cluster_sections(data: &[u8]) -> Result<ColocatedClusterSections<'_
             "quantized cluster blob too small for header".into(),
         ));
     }
-    if cluster_section_encoding(data).is_none() {
+    if cluster_section_encoding(data)?.is_none() {
         return Err(ZeppelinError::Index(
             "unrecognized quantized cluster magic".into(),
         ));
@@ -5320,7 +5357,7 @@ pub async fn load_ivf_flat(
             let cluster_data = store.get(&cvec_key).await?;
             merge_detected_encoding(
                 &mut detected_encoding,
-                cluster_section_encoding(&cluster_data),
+                cluster_section_encoding(&cluster_data)?,
             )?;
             let cluster = deserialize_cluster(&cluster_data)?;
             num_vectors += cluster.ids.len();
@@ -5591,6 +5628,63 @@ mod tests {
         let cluster = deserialize_cluster(&data).unwrap();
         assert_eq!(cluster.ids, ids);
         assert_eq!(cluster.vectors, vecs);
+    }
+
+    #[test]
+    fn legacy_cluster_row_count_prefix_collision_remains_legacy() {
+        let ids = (0..usize::from(b'Z'))
+            .map(|row| format!("legacy-{row}"))
+            .collect::<Vec<_>>();
+        let vectors = (0..ids.len())
+            .map(|row| vec![row as f32])
+            .collect::<Vec<_>>();
+        let legacy = serialize_cluster(&ids, &vectors, 1).unwrap();
+        assert_eq!(&legacy[..4], &[b'Z', 0, 0, 0]);
+        assert!(cluster_object_layout(&legacy).unwrap().is_none());
+        assert_eq!(deserialize_cluster(&legacy).unwrap().ids, ids);
+
+        // A larger little-endian row count can spell the complete three-byte
+        // `ZBP` prefix. Its zero high byte is not a plausible format version,
+        // so the grouped-object dispatcher must still leave it to the legacy
+        // decoder instead of claiming it as an unsupported version.
+        let zbp_collision_header = [b'Z', b'B', b'P', 0, 1, 0, 0, 0];
+        assert!(cluster_object_layout(&zbp_collision_header)
+            .unwrap()
+            .is_none());
+
+        let zcl_collision_header = [b'Z', b'C', b'L', 0, 1, 0, 0, 0];
+        assert!(cluster_section_encoding(&zcl_collision_header)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn cluster_object_layout_rejects_unknown_version() {
+        let future = b"ZBP\x06current-shaped-payload";
+        let error = cluster_object_layout(future).unwrap_err();
+        assert!(
+            matches!(&error, ZeppelinError::Index(message) if
+                message == "unsupported cluster data object version 6; this binary reads ZBP1, ZBP4, ZBP5, and legacy standalone clusters"),
+            "future cluster object version must fail with the exact compatibility error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn cluster_section_dispatch_rejects_unknown_version() {
+        let ids = vec!["future".to_string()];
+        let vectors = vec![vec![1.0, 2.0]];
+        let codes = vec![vec![1, 2]];
+        let mut future = serialize_colocated_sq_cluster(&ids, &vectors, &codes, 2)
+            .unwrap()
+            .to_vec();
+        future[3] = b'4';
+
+        let error = deserialize_cluster(&future).unwrap_err();
+        assert!(
+            matches!(&error, ZeppelinError::Index(message) if
+                message == "unsupported cluster section version ZCL4; this binary reads ZCL2, ZCL3, and legacy standalone clusters"),
+            "future cluster section version must fail with the exact compatibility error, got {error:?}"
+        );
     }
 
     /// Proves a ZCL3 section preserves its two-bit rows and exact vectors.

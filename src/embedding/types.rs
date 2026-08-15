@@ -7,9 +7,11 @@ use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::error::{Result, ZeppelinError};
-use crate::index::late_interaction::FdeParams;
+use crate::index::late_interaction::{FdeParams, FDE_TRANSFORM_FORMAT_VERSION};
 use crate::namespace::branching::ArtifactOriginIndex;
 use crate::types::{AttributeValue, VectorId};
+
+use super::artifact::CENTERING_ARTIFACT_FORMAT_VERSION;
 
 /// SHA-256 identity of one canonical typed encoder input.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -853,9 +855,15 @@ impl FdeRecipe {
                 actual: self.params.input_dimension as usize,
             });
         }
-        if self.transform_artifact.size_bytes == 0 || self.transform_artifact.format_version == 0 {
+        if self.transform_artifact.format_version != u32::from(FDE_TRANSFORM_FORMAT_VERSION) {
+            return Err(ZeppelinError::Validation(format!(
+                "unsupported FDE transform artifact format version {}; this binary reads version {}",
+                self.transform_artifact.format_version, FDE_TRANSFORM_FORMAT_VERSION
+            )));
+        }
+        if self.transform_artifact.size_bytes == 0 {
             return Err(ZeppelinError::Validation(
-                "FDE transform artifact size and format version must be positive".to_string(),
+                "FDE transform artifact size must be positive".to_string(),
             ));
         }
         if let Some(mean) = self.candidate_vector_transform.mean() {
@@ -1055,7 +1063,13 @@ fn validate_mean_shape(mean: &MeanVectorRef, expected_dimension: u32) -> Result<
         });
     }
     let payload_size = u64::from(expected_dimension) * 4;
-    if mean.format_version == 0 || mean.size_bytes <= payload_size {
+    if mean.format_version != u32::from(CENTERING_ARTIFACT_FORMAT_VERSION) {
+        return Err(ZeppelinError::Validation(format!(
+            "unsupported centering artifact format version {}; this binary reads version {}",
+            mean.format_version, CENTERING_ARTIFACT_FORMAT_VERSION
+        )));
+    }
+    if mean.size_bytes <= payload_size {
         return Err(ZeppelinError::Validation(
             "centering mean must be one versioned little-endian f32 vector".to_string(),
         ));

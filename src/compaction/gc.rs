@@ -1369,9 +1369,6 @@ pub struct GcCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GcCandidateStore {
     /// Wrapper schema marker written with new ledgers.
-    ///
-    /// The decoder accepts other numeric values so old data remains readable;
-    /// the next successful mark rewrites any noncurrent value canonically.
     version: u32,
     /// Complete candidate ledger replacing the previous object contents.
     candidates: Vec<GcCandidate>,
@@ -2502,7 +2499,8 @@ fn pending_delete_horizon_satisfied(
 /// # Errors
 ///
 /// If neither JSON shape decodes, returns the versioned-wrapper decode error.
-/// The current wrapper's numeric `version` field is recorded but not validated.
+/// A wrapper with an unsupported numeric `version` is rejected before its
+/// candidates can be mistaken for the current schema.
 ///
 /// # Examples
 ///
@@ -2522,10 +2520,18 @@ fn decode_candidate_ledger(data: &[u8]) -> Result<LoadedCandidateLedger> {
         });
     }
     match serde_json::from_slice::<GcCandidateStore>(data) {
-        Ok(store) => Ok(LoadedCandidateLedger {
-            candidates: store.candidates,
-            encoding: CandidateLedgerEncoding::Versioned(store.version),
-        }),
+        Ok(store) => {
+            if store.version != GC_CANDIDATE_STORE_VERSION {
+                return Err(ZeppelinError::Serialization(format!(
+                    "unsupported GC candidate ledger version {}; this binary reads wrapper version {GC_CANDIDATE_STORE_VERSION} and the legacy bare-array format",
+                    store.version
+                )));
+            }
+            Ok(LoadedCandidateLedger {
+                candidates: store.candidates,
+                encoding: CandidateLedgerEncoding::Versioned(store.version),
+            })
+        }
         Err(wrapper_error) => match serde_json::from_slice::<Vec<GcCandidate>>(data) {
             Ok(candidates) => Ok(LoadedCandidateLedger {
                 candidates,
@@ -7425,6 +7431,22 @@ mod tests {
         let legacy = decode_candidate_ledger(&legacy).unwrap();
         assert_eq!(legacy.candidates, vec![candidate]);
         assert_eq!(legacy.encoding, CandidateLedgerEncoding::LegacyArray);
+    }
+
+    #[test]
+    fn candidate_store_rejects_unknown_wrapper_version() {
+        let bytes = serde_json::to_vec(&GcCandidateStore {
+            version: 2,
+            candidates: Vec::new(),
+        })
+        .unwrap();
+
+        let error = decode_candidate_ledger(&bytes).unwrap_err();
+        assert!(
+            matches!(&error, ZeppelinError::Serialization(message) if
+                message == "unsupported GC candidate ledger version 2; this binary reads wrapper version 1 and the legacy bare-array format"),
+            "future GC ledger version must fail with the exact compatibility error, got {error:?}"
+        );
     }
 
     /// Verifies pre-generation candidate records default to generation zero.

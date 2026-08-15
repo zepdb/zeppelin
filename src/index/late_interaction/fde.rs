@@ -7,7 +7,7 @@ use crate::error::Result;
 use super::{LateInteractionError, MultiVectorMatrixRef};
 
 const TRANSFORM_MAGIC: &[u8; 4] = b"ZFT1";
-const TRANSFORM_FORMAT_VERSION: u8 = 1;
+pub(crate) const FDE_TRANSFORM_FORMAT_VERSION: u8 = 1;
 
 /// Versioned FDE construction semantics.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,7 +189,7 @@ impl FdeTransform {
             + self.final_indices.len() * (size_of::<u32>() + size_of::<f32>());
         let mut bytes = BytesMut::with_capacity(capacity);
         bytes.extend_from_slice(TRANSFORM_MAGIC);
-        bytes.put_u8(TRANSFORM_FORMAT_VERSION);
+        bytes.put_u8(FDE_TRANSFORM_FORMAT_VERSION);
         bytes.put_u8(match self.params.algorithm {
             FdeAlgorithmVersion::PaperV1 => 1,
             FdeAlgorithmVersion::ReferenceV1 => 2,
@@ -241,7 +241,7 @@ impl FdeTransform {
         if reader.read_exact(TRANSFORM_MAGIC.len())? != TRANSFORM_MAGIC {
             return Err(invalid_transform("bad transform magic"));
         }
-        if reader.read_u8()? != TRANSFORM_FORMAT_VERSION {
+        if reader.read_u8()? != FDE_TRANSFORM_FORMAT_VERSION {
             return Err(invalid_transform("unsupported transform format version"));
         }
         let algorithm = match reader.read_u8()? {

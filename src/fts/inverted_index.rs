@@ -88,10 +88,11 @@ use crate::types::AttributeValue;
 /// The header lets a decoder reject a different artifact type before asking
 /// Serde to interpret its payload.
 const ZFTS_MAGIC: &[u8; 4] = b"ZFTS";
-/// Only cluster-local FTS artifact version accepted by this decoder.
+/// Only cluster-local FTS artifact version accepted by this decoder and by
+/// manifest references to late-segment FTS objects.
 ///
 /// Version 1 stores a compact JSON payload immediately after the version byte.
-const ZFTS_VERSION: u8 = 1;
+pub(crate) const FTS_INDEX_FORMAT_VERSION: u8 = 1;
 
 /// Orders cluster-local hits by descending BM25 score, then ascending position.
 ///
@@ -421,7 +422,7 @@ impl InvertedIndex {
         let json = serde_json::to_vec(self)?;
         let mut buf = Vec::with_capacity(5 + json.len());
         buf.extend_from_slice(ZFTS_MAGIC);
-        buf.push(ZFTS_VERSION);
+        buf.push(FTS_INDEX_FORMAT_VERSION);
         buf.extend_from_slice(&json);
         Ok(Bytes::from(buf))
     }
@@ -469,7 +470,7 @@ impl InvertedIndex {
             )));
         }
         let version = data[4];
-        if version != ZFTS_VERSION {
+        if version != FTS_INDEX_FORMAT_VERSION {
             return Err(ZeppelinError::Index(format!(
                 "unsupported FTS index version: {version}"
             )));

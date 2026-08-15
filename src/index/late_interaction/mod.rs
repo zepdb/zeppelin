@@ -37,14 +37,17 @@ pub use search::{
     LateInteractionWaveTrace, ManifestRefresh,
 };
 
-pub(crate) use attribute_artifact::decode_attribute_block;
+pub(crate) use attribute_artifact::{decode_attribute_block, ATTRIBUTE_BLOCK_FORMAT_VERSION};
 pub(crate) use candidate::{
     decode_all_candidate_rows, CandidateFdeSource, FetchedLateCandidateCluster,
+    LATE_CANDIDATE_FORMAT_VERSION,
 };
+pub(crate) use fde::FDE_TRANSFORM_FORMAT_VERSION;
 pub(crate) use flat_candidate::{
     FlatCalibrationSource, LateFlatCandidateBuildConfig, ResidentFlatCandidateIndex,
+    LATE_FLAT_FORMAT_VERSION,
 };
-pub(crate) use matrix_artifact::decode_matrix_block;
+pub(crate) use matrix_artifact::{decode_matrix_block, MATRIX_BLOCK_FORMAT_VERSION};
 pub(crate) use segment_build::{
     build_late_interaction_segment, LateCandidateBuild, LateRowMatrixSource,
     LateSegmentBuildConfig, LateSegmentBuildRow, PrebuiltLateFtsArtifact,

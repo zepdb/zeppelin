@@ -15,11 +15,15 @@ use sha2::{Digest, Sha256};
 use crate::embedding::{
     ArtifactChecksum, CenteringArtifact, ContentHash, EmbeddingProfileId, EmbeddingProfileRef,
     FdeGenerationId, MatrixDtype, MultiVectorEpochId, PhysicalInputFragmentIdentity,
-    RecordVersionCoverage, SemanticOverlayRef,
+    RecordVersionCoverage, SemanticOverlayRef, FDE_ARTIFACT_FORMAT_VERSION,
+    MATRIX_ARTIFACT_FORMAT_VERSION,
 };
 use crate::error::{Result, ZeppelinError};
+use crate::fts::inverted_index::FTS_INDEX_FORMAT_VERSION;
 use crate::index::late_interaction::{
     AttributeBlockRef, FdeTransform, LateCandidateIndexRef, LateFlatCandidateRef, MatrixBlockRef,
+    ATTRIBUTE_BLOCK_FORMAT_VERSION, LATE_CANDIDATE_FORMAT_VERSION, LATE_FLAT_FORMAT_VERSION,
+    MATRIX_BLOCK_FORMAT_VERSION,
 };
 use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
 use crate::storage::{CreateOnlyOutcome, NamespaceObjectFamily, NamespaceObjectKey, ZeppelinStore};
@@ -42,6 +46,15 @@ pub const fn is_supported_late_state_format_version(version: u32) -> bool {
         || version == 3
         || version == 4
         || version == LATE_STATE_FORMAT_VERSION
+}
+
+fn validate_artifact_format_version(label: &str, actual: u32, supported: u32) -> Result<()> {
+    if actual != supported {
+        return Err(ZeppelinError::Serialization(format!(
+            "unsupported {label} format version {actual}; this binary reads version {supported}"
+        )));
+    }
+    Ok(())
 }
 
 /// Root-manifest reference to one immutable late-state section object.
@@ -1127,13 +1140,19 @@ impl LateStateSection {
                     "semantic overlay persisted shapes do not match the active profile".to_string(),
                 ));
             }
-            if overlay.embeddings.format_version == 0
-                || overlay.fde_vectors.format_version == 0
-                || overlay.embeddings.size_bytes == 0
-                || overlay.fde_vectors.size_bytes == 0
-            {
+            validate_artifact_format_version(
+                "semantic overlay matrix artifact",
+                overlay.embeddings.format_version,
+                u32::from(MATRIX_ARTIFACT_FORMAT_VERSION),
+            )?;
+            validate_artifact_format_version(
+                "semantic overlay FDE artifact",
+                overlay.fde_vectors.format_version,
+                u32::from(FDE_ARTIFACT_FORMAT_VERSION),
+            )?;
+            if overlay.embeddings.size_bytes == 0 || overlay.fde_vectors.size_bytes == 0 {
                 return Err(ZeppelinError::Serialization(
-                    "semantic overlay artifact versions and sizes must be positive".to_string(),
+                    "semantic overlay artifact sizes must be positive".to_string(),
                 ));
             }
             let expected_input_suffix = format!("{}.wal", overlay.source_fragment.id);
@@ -1276,8 +1295,12 @@ impl LateStateSection {
                         )
                     })?;
                     let bootstrap = &candidate.bootstrap;
+                    validate_artifact_format_version(
+                        "late candidate bootstrap",
+                        bootstrap.format_version,
+                        LATE_CANDIDATE_FORMAT_VERSION,
+                    )?;
                     if bootstrap.size_bytes == 0
-                        || bootstrap.format_version == 0
                         || bootstrap.row_count == 0
                         || bootstrap.recipe.fde_dimension == 0
                         || bootstrap.recipe.nlist == 0
@@ -1309,8 +1332,12 @@ impl LateStateSection {
                     let mut cluster_shards = BTreeSet::new();
                     let mut cluster_ids = BTreeSet::new();
                     for cluster in &candidate.clusters {
+                        validate_artifact_format_version(
+                            "late candidate cluster",
+                            cluster.format_version,
+                            LATE_CANDIDATE_FORMAT_VERSION,
+                        )?;
                         if cluster.size_bytes == 0
-                            || cluster.format_version == 0
                             || cluster.row_count == 0
                             || cluster.cluster_id >= bootstrap.recipe.nlist
                         {
@@ -1357,8 +1384,12 @@ impl LateStateSection {
                             "late flat segment requires a flat candidate artifact".to_string(),
                         )
                     })?;
+                    validate_artifact_format_version(
+                        "late flat candidate artifact",
+                        flat.format_version,
+                        LATE_FLAT_FORMAT_VERSION,
+                    )?;
                     if flat.size_bytes == 0
-                        || flat.format_version == 0
                         || flat.row_count == 0
                         || flat.recipe.fde_dimension == 0
                         || flat.recipe.candidate_k == 0
@@ -1386,8 +1417,12 @@ impl LateStateSection {
             let mut matrix_rows = 0_u64;
             let mut matrix_vectors = 0_u64;
             for matrix in &segment.matrix_objects {
+                validate_artifact_format_version(
+                    "late matrix block",
+                    matrix.format_version,
+                    MATRIX_BLOCK_FORMAT_VERSION,
+                )?;
                 if matrix.size_bytes == 0
-                    || matrix.format_version == 0
                     || matrix.row_count == 0
                     || matrix.total_vectors == 0
                     || matrix.vector_dimension == 0
@@ -1429,7 +1464,12 @@ impl LateStateSection {
 
             let mut attribute_rows = 0_u64;
             for object in &segment.attribute_objects {
-                if object.size_bytes == 0 || object.format_version == 0 || object.row_count == 0 {
+                validate_artifact_format_version(
+                    "late attribute block",
+                    object.format_version,
+                    ATTRIBUTE_BLOCK_FORMAT_VERSION,
+                )?;
+                if object.size_bytes == 0 || object.row_count == 0 {
                     return Err(ZeppelinError::Serialization(
                         "late attribute block metadata must be positive".to_string(),
                     ));
@@ -1454,10 +1494,14 @@ impl LateStateSection {
             }
 
             for object in &segment.fts_objects {
-                if object.size_bytes == 0 || object.format_version == 0 {
+                validate_artifact_format_version(
+                    "late segment FTS object",
+                    object.format_version,
+                    u32::from(FTS_INDEX_FORMAT_VERSION),
+                )?;
+                if object.size_bytes == 0 {
                     return Err(ZeppelinError::Serialization(
-                        "late segment FTS object size and format version must be positive"
-                            .to_string(),
+                        "late segment FTS object size must be positive".to_string(),
                     ));
                 }
                 insert_unique_segment_key(&mut artifact_keys, object.key.as_str(), "FTS object")?;
@@ -1591,6 +1635,7 @@ mod tests {
         PhysicalInputFragmentIdentity, RecordVersionCoverage, RecordVersionRef, SemanticOverlayRef,
         VectorTransformRecipe,
     };
+    use crate::error::ZeppelinError;
     use crate::index::late_interaction::{
         AttributeBlockRef, FdeAlgorithmVersion, FdeParams, FdeTransform, FinalProjection,
         InnerProjection, LateCandidateBootstrapRef, LateCandidateClusterRef, LateCandidateIndexRef,
@@ -1602,8 +1647,27 @@ mod tests {
 
     use super::{
         LateCandidateKind, LateInteractionSegmentRef, LateSegmentObjectRef, LateStateSection,
-        SourceInventoryRef, LATE_STATE_FORMAT_VERSION, LATE_STATE_MAGIC,
+        SourceInventoryRef, LATE_STATE_FORMAT_VERSION, LATE_STATE_MAGIC, LATE_STATE_VERSION_V5,
     };
+
+    fn encode_without_validation(section: &LateStateSection) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(LATE_STATE_MAGIC);
+        bytes.push(LATE_STATE_VERSION_V5);
+        rmp_serde::encode::write(&mut bytes, section).expect("test section must encode");
+        bytes
+    }
+
+    fn assert_decode_rejects_with(section: &LateStateSection, expected: &str) {
+        let error = LateStateSection::from_bytes(&encode_without_validation(section))
+            .expect_err("unknown nested artifact version must fail during section decode");
+        match error {
+            ZeppelinError::Serialization(message) | ZeppelinError::Validation(message) => {
+                assert_eq!(message, expected);
+            }
+            other => panic!("unexpected late-state decoder error: {other:?}"),
+        }
+    }
 
     #[test]
     fn legacy_empty_sections_decode_with_current_defaults() {
@@ -1825,6 +1889,73 @@ mod tests {
         segment
     }
 
+    fn section_with_segment(
+        profile: EmbeddingProfileRef,
+        segment: LateInteractionSegmentRef,
+    ) -> LateStateSection {
+        LateStateSection {
+            active_profile: Some(profile),
+            active_late_segment: Some(segment.id.clone()),
+            late_interaction_segments: vec![segment],
+            ..LateStateSection::new()
+        }
+    }
+
+    fn semantic_overlay_fixture(profile: &EmbeddingProfileRef) -> SemanticOverlayRef {
+        let input_id = Ulid::from(1_u128);
+        let embedding_checksum = ArtifactChecksum::new([5; 32]);
+        SemanticOverlayRef {
+            source_fragment: PhysicalInputFragmentIdentity {
+                key: format!("catalog/input-wal/{input_id}.wal"),
+                id: input_id,
+                checksum: 7,
+                size_bytes: 16,
+                artifact_origin: None,
+            },
+            semantic_epoch: profile.epoch.id,
+            fde_generation: profile.fde.generation,
+            embeddings: MultiVectorEmbeddingFragmentRef {
+                key: format!(
+                    "catalog/late/matrix-fragments/{}",
+                    embedding_checksum.to_hex()
+                ),
+                checksum: embedding_checksum,
+                source_fragment_checksum: 7,
+                semantic_epoch: profile.epoch.id,
+                row_count: 1,
+                total_vectors: 2,
+                vector_dimension: 2,
+                dtype: MatrixDtype::F16,
+                format_version: 1,
+                size_bytes: 24,
+                artifact_origin: None,
+            },
+            fde_vectors: FdeFragmentRef {
+                key: format!(
+                    "catalog/late/fde-fragments/{}",
+                    ArtifactChecksum::new([6; 32]).to_hex()
+                ),
+                checksum: ArtifactChecksum::new([6; 32]),
+                embedding_fragment_checksum: embedding_checksum,
+                generation: profile.fde.generation,
+                row_count: 1,
+                fde_dimension: 2,
+                format_version: 1,
+                size_bytes: 24,
+                artifact_origin: None,
+            },
+            covered_versions: RecordVersionCoverage {
+                records: vec![RecordVersionRef {
+                    row_ordinal: 0,
+                    record_id: "row".to_string(),
+                    content_hash: ContentHash::new([7; 32]),
+                    sequence: 1,
+                }],
+            },
+            published_at_generation: 3,
+        }
+    }
+
     #[test]
     fn v4_segment_round_trips_and_walks_every_owned_object() {
         let profile = profile_fixture();
@@ -1966,60 +2097,9 @@ mod tests {
     #[test]
     fn v4_profile_and_overlay_round_trip() {
         let profile = profile_fixture();
-        let input_id = Ulid::from(1_u128);
-        let embedding_checksum = ArtifactChecksum::new([5; 32]);
         let section = LateStateSection {
             active_profile: Some(profile.clone()),
-            semantic_overlays: vec![SemanticOverlayRef {
-                source_fragment: PhysicalInputFragmentIdentity {
-                    key: format!("catalog/input-wal/{input_id}.wal"),
-                    id: input_id,
-                    checksum: 7,
-                    size_bytes: 16,
-                    artifact_origin: None,
-                },
-                semantic_epoch: profile.epoch.id,
-                fde_generation: profile.fde.generation,
-                embeddings: MultiVectorEmbeddingFragmentRef {
-                    key: format!(
-                        "catalog/late/matrix-fragments/{}",
-                        embedding_checksum.to_hex()
-                    ),
-                    checksum: embedding_checksum,
-                    source_fragment_checksum: 7,
-                    semantic_epoch: profile.epoch.id,
-                    row_count: 1,
-                    total_vectors: 2,
-                    vector_dimension: 2,
-                    dtype: MatrixDtype::F16,
-                    format_version: 1,
-                    size_bytes: 24,
-                    artifact_origin: None,
-                },
-                fde_vectors: FdeFragmentRef {
-                    key: format!(
-                        "catalog/late/fde-fragments/{}",
-                        ArtifactChecksum::new([6; 32]).to_hex()
-                    ),
-                    checksum: ArtifactChecksum::new([6; 32]),
-                    embedding_fragment_checksum: embedding_checksum,
-                    generation: profile.fde.generation,
-                    row_count: 1,
-                    fde_dimension: 2,
-                    format_version: 1,
-                    size_bytes: 24,
-                    artifact_origin: None,
-                },
-                covered_versions: RecordVersionCoverage {
-                    records: vec![RecordVersionRef {
-                        row_ordinal: 0,
-                        record_id: "row".to_string(),
-                        content_hash: ContentHash::new([7; 32]),
-                        sequence: 1,
-                    }],
-                },
-                published_at_generation: 3,
-            }],
+            semantic_overlays: vec![semantic_overlay_fixture(&profile)],
             ..LateStateSection::new()
         };
 
@@ -2028,6 +2108,121 @@ mod tests {
         assert_eq!(
             LateStateSection::from_bytes(&bytes).expect("v4 section must decode"),
             section
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_unknown_profile_artifact_versions() {
+        let mut profile = profile_fixture();
+        profile.fde.transform_artifact.format_version = 2;
+        assert_decode_rejects_with(
+            &LateStateSection {
+                active_profile: Some(profile),
+                ..LateStateSection::new()
+            },
+            "unsupported FDE transform artifact format version 2; this binary reads version 1",
+        );
+
+        let mut profile = profile_fixture();
+        profile
+            .fde
+            .candidate_vector_transform
+            .mean_mut()
+            .expect("profile fixture must use centering")
+            .format_version = 2;
+        assert_decode_rejects_with(
+            &LateStateSection {
+                active_profile: Some(profile),
+                ..LateStateSection::new()
+            },
+            "unsupported centering artifact format version 2; this binary reads version 1",
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_unknown_overlay_artifact_versions() {
+        let profile = profile_fixture();
+        let mut overlay = semantic_overlay_fixture(&profile);
+        overlay.embeddings.format_version = 2;
+        assert_decode_rejects_with(
+            &LateStateSection {
+                active_profile: Some(profile.clone()),
+                semantic_overlays: vec![overlay],
+                ..LateStateSection::new()
+            },
+            "unsupported semantic overlay matrix artifact format version 2; this binary reads version 1",
+        );
+
+        let mut overlay = semantic_overlay_fixture(&profile);
+        overlay.fde_vectors.format_version = 2;
+        assert_decode_rejects_with(
+            &LateStateSection {
+                active_profile: Some(profile),
+                semantic_overlays: vec![overlay],
+                ..LateStateSection::new()
+            },
+            "unsupported semantic overlay FDE artifact format version 2; this binary reads version 1",
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_unknown_segment_artifact_versions() {
+        let profile = profile_fixture();
+
+        let mut segment = segment_fixture(&profile, "catalog");
+        segment
+            .candidate_index
+            .as_mut()
+            .expect("IVF fixture must carry a candidate index")
+            .bootstrap
+            .format_version = 2;
+        assert_decode_rejects_with(
+            &section_with_segment(profile.clone(), segment),
+            "unsupported late candidate bootstrap format version 2; this binary reads version 1",
+        );
+
+        let mut segment = segment_fixture(&profile, "catalog");
+        segment
+            .candidate_index
+            .as_mut()
+            .expect("IVF fixture must carry a candidate index")
+            .clusters[0]
+            .format_version = 2;
+        assert_decode_rejects_with(
+            &section_with_segment(profile.clone(), segment),
+            "unsupported late candidate cluster format version 2; this binary reads version 1",
+        );
+
+        let mut segment = flat_segment_fixture(&profile, "catalog");
+        segment
+            .flat_candidate
+            .as_mut()
+            .expect("flat fixture must carry a flat candidate")
+            .format_version = 2;
+        assert_decode_rejects_with(
+            &section_with_segment(profile.clone(), segment),
+            "unsupported late flat candidate artifact format version 2; this binary reads version 1",
+        );
+
+        let mut segment = segment_fixture(&profile, "catalog");
+        segment.matrix_objects[0].format_version = 2;
+        assert_decode_rejects_with(
+            &section_with_segment(profile.clone(), segment),
+            "unsupported late matrix block format version 2; this binary reads version 1",
+        );
+
+        let mut segment = segment_fixture(&profile, "catalog");
+        segment.attribute_objects[0].format_version = 2;
+        assert_decode_rejects_with(
+            &section_with_segment(profile.clone(), segment),
+            "unsupported late attribute block format version 2; this binary reads version 1",
+        );
+
+        let mut segment = segment_fixture(&profile, "catalog");
+        segment.fts_objects[0].format_version = 2;
+        assert_decode_rejects_with(
+            &section_with_segment(profile, segment),
+            "unsupported late segment FTS object format version 2; this binary reads version 1",
         );
     }
 

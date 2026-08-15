@@ -26,7 +26,7 @@ use crate::embedding::{
 };
 use crate::embedding::{MatrixDtype, VectorTransformRecipe};
 use crate::error::{Result, ZeppelinError};
-use crate::fts::inverted_index::InvertedIndex;
+use crate::fts::inverted_index::{InvertedIndex, FTS_INDEX_FORMAT_VERSION};
 use crate::fts::FtsFieldConfig;
 use crate::index::late_interaction::{
     build_late_interaction_segment, decode_all_candidate_rows, decode_attribute_block,
@@ -48,8 +48,6 @@ use super::{
     validate_deferred_deletes_are_local, CompactionResult, Compactor, NamespaceIncarnationId,
     NamespaceMetadata, NamespaceState, MAX_CAS_RETRIES, NAMESPACE_INCARNATION_METADATA_KEY,
 };
-
-const LATE_FTS_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone)]
 struct SnapshottedInput {
@@ -1569,7 +1567,7 @@ async fn build_global_fts(
             size_bytes: u64::try_from(bytes.len()).map_err(|_| {
                 ZeppelinError::Serialization("late FTS size exceeds u64".to_string())
             })?,
-            format_version: LATE_FTS_FORMAT_VERSION,
+            format_version: u32::from(FTS_INDEX_FORMAT_VERSION),
         },
         bytes,
     }])

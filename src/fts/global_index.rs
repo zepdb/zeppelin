@@ -85,10 +85,6 @@ use crate::index::topk::partial_topk_by;
 /// Five-byte artifact discriminator preceding every global FTS payload.
 const ZGFTS_MAGIC: &[u8; 5] = b"ZGFTS";
 /// Version byte written by the current global FTS encoder.
-///
-/// The current decoder skips this byte after checking the magic and attempts to
-/// decode the payload with the current schema; it does not reject another
-/// version value.
 const ZGFTS_VERSION: u8 = 1;
 
 /// Orders global hits by descending score, cluster, and position.
@@ -533,15 +529,15 @@ impl GlobalInvertedIndex {
     /// # Errors
     ///
     /// Returns a serialization error when fewer than six bytes are present, the
-    /// `ZGFTS` magic is wrong, or the payload cannot decode as the current
-    /// struct shape. The decoder does not silently return an empty index.
+    /// `ZGFTS` magic is wrong, the version is unsupported, or the payload cannot
+    /// decode as the current struct shape. The decoder does not silently return
+    /// an empty index.
     ///
     /// # Consistency
     ///
-    /// The byte at offset 5 is currently skipped rather than compared with
-    /// `ZGFTS_VERSION`. Consequently an unfamiliar version is accepted only
-    /// if the remaining bytes happen to decode with today's MessagePack schema;
-    /// the byte is not a negotiated forward-compatibility mechanism.
+    /// The byte at offset 5 must equal [`ZGFTS_VERSION`]. A future version is
+    /// rejected before its payload can be mistaken for today's MessagePack
+    /// schema.
     ///
     /// # Examples
     ///
@@ -566,9 +562,12 @@ impl GlobalInvertedIndex {
                 "invalid global FTS magic bytes".into(),
             ));
         }
-        // Preserve the current wire contract: byte 5 is reserved as a version
-        // marker, but compatibility is decided by whether today's schema can
-        // decode the payload.
+        let version = data[5];
+        if version != ZGFTS_VERSION {
+            return Err(ZeppelinError::Serialization(format!(
+                "unsupported global FTS index version {version}; this binary reads ZGFTS version {ZGFTS_VERSION}"
+            )));
+        }
         rmp_serde::from_slice(&data[6..])
             .map_err(|e| ZeppelinError::Serialization(format!("global FTS index deserialize: {e}")))
     }
@@ -730,6 +729,22 @@ mod tests {
 
         assert_eq!(restored.total_docs, global.total_docs);
         assert_eq!(restored.fields.len(), global.fields.len());
+    }
+
+    #[test]
+    /// Ensures a future version cannot be decoded with today's MessagePack schema.
+    fn test_unknown_version_rejected_before_payload_decode() {
+        let idx0 = make_cluster_index(3, "title", &[("hello", vec![(0, 1), (2, 2)])]);
+        let global = GlobalInvertedIndex::build(&[(0, &idx0)]);
+        let mut bytes = global.to_bytes().unwrap().to_vec();
+        bytes[5] = 2;
+
+        let error = GlobalInvertedIndex::from_bytes(&bytes).unwrap_err();
+        assert!(
+            matches!(&error, ZeppelinError::Serialization(message) if
+                message == "unsupported global FTS index version 2; this binary reads ZGFTS version 1"),
+            "future global FTS version must fail with the exact compatibility error, got {error:?}"
+        );
     }
 
     #[test]
