@@ -18,12 +18,15 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use common::counting::counting_store;
+use common::fault_injection::pause_repeatedly_after_get_matching;
 use common::harness::TestHarness;
+use common::server::{cleanup_ns, client_with_bearer, start_test_server_on_store};
 use common::vectors::random_vectors;
 
 use zeppelin::error::ZeppelinError;
+use zeppelin::namespace::NamespaceManager;
 use zeppelin::time::{Clock, TimeSource};
-use zeppelin::types::VectorEntry;
+use zeppelin::types::{DistanceMetric, VectorEntry};
 use zeppelin::wal::{LeaseManager, Manifest, WalWriter};
 
 #[derive(Debug)]
@@ -647,5 +650,237 @@ async fn test_group_commit_manifest_memo_namespace_recreate_is_cold() {
     let authoritative = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     assert_eq!(authoritative.fragments.len(), 1);
 
+    harness.cleanup().await;
+}
+
+async fn upsert_guarded_delete_fixture_row(
+    client: &reqwest::Client,
+    base_url: &str,
+    namespace: &str,
+    id: &str,
+) {
+    let response = client
+        .post(format!("{base_url}/v1/namespaces/{namespace}/vectors"))
+        .json(&serde_json::json!({
+            "vectors": [{
+                "id": id,
+                "values": [1.0, 0.0],
+                "attributes": {"guarded_delete_group": "target"}
+            }]
+        }))
+        .send()
+        .await
+        .expect("competing upsert request must complete");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+}
+
+async fn fetch_guarded_delete_fixture_rows(
+    client: &reqwest::Client,
+    base_url: &str,
+    namespace: &str,
+    ids: &[String],
+) -> serde_json::Value {
+    let response = client
+        .post(format!("{base_url}/v1/namespaces/{namespace}/vectors/get"))
+        .json(&serde_json::json!({
+            "ids": ids,
+            "include_vector": false,
+            "include_attributes": false,
+            "consistency": "strong"
+        }))
+        .send()
+        .await
+        .expect("strong fixture fetch must complete");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response
+        .json()
+        .await
+        .expect("strong fixture fetch response must be JSON")
+}
+
+/// Three competing publications invalidate three guarded selections. The
+/// fourth attempt must select from the newest manifest and tombstone every row,
+/// including rows that did not exist in the first attempt's ID set.
+#[tokio::test]
+async fn test_guarded_filter_delete_reevaluates_and_succeeds_within_bound() {
+    let harness = TestHarness::new().await;
+    TestHarness::require_cas_backend();
+    let namespace = harness.artifact_origin_namespace("guarded-delete-reevaluate");
+    NamespaceManager::new(harness.store.clone())
+        .create(&namespace, 2, DistanceMetric::Euclidean)
+        .await
+        .expect("guarded-delete fixture namespace creation must succeed");
+
+    let (writer_url, _writer_cache, _writer_cache_dir, writer_bearer) = start_test_server_on_store(
+        &harness,
+        harness.store.clone(),
+        Some(harness.prefix.clone()),
+    )
+    .await;
+    let writer_client = client_with_bearer(&writer_bearer);
+    upsert_guarded_delete_fixture_row(&writer_client, &writer_url, &namespace, "matching-initial")
+        .await;
+
+    let (barrier_store, manifest_barrier) =
+        pause_repeatedly_after_get_matching(&harness.store, format!("{namespace}/manifest.json"));
+    let (delete_url, _delete_cache, _delete_cache_dir, delete_bearer) =
+        start_test_server_on_store(&harness, barrier_store, Some(harness.prefix.clone())).await;
+    let delete_client = client_with_bearer(&delete_bearer);
+    manifest_barrier.enable();
+
+    let delete_task = tokio::spawn({
+        let delete_client = delete_client.clone();
+        let delete_url = delete_url.clone();
+        let namespace = namespace.clone();
+        async move {
+            delete_client
+                .delete(format!("{delete_url}/v1/namespaces/{namespace}/vectors"))
+                .json(&serde_json::json!({
+                    "filter": {
+                        "op": "eq",
+                        "field": "guarded_delete_group",
+                        "value": "target"
+                    }
+                }))
+                .send()
+                .await
+        }
+    });
+
+    let mut ids = vec!["matching-initial".to_string()];
+    for attempt in 0..4 {
+        manifest_barrier.wait_until_arrivals(attempt * 2 + 1).await;
+        if attempt < 3 {
+            let id = format!("matching-concurrent-{attempt}");
+            upsert_guarded_delete_fixture_row(&writer_client, &writer_url, &namespace, &id).await;
+            ids.push(id);
+        }
+        manifest_barrier.release_next();
+
+        manifest_barrier.wait_until_arrivals(attempt * 2 + 2).await;
+        manifest_barrier.release_next();
+    }
+
+    let response = delete_task
+        .await
+        .expect("guarded delete task must join")
+        .expect("guarded delete request must complete");
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(manifest_barrier.arrivals(), 8);
+    manifest_barrier.disable();
+
+    let fetched =
+        fetch_guarded_delete_fixture_rows(&writer_client, &writer_url, &namespace, &ids).await;
+    assert_eq!(fetched["results"].as_array().map(Vec::len), Some(0));
+    assert_eq!(fetched["missing"].as_array().map(Vec::len), Some(ids.len()));
+    assert_eq!(
+        zeppelin::metrics::GUARDED_WRITE_ATTEMPTS_TOTAL
+            .with_label_values(&[&namespace, "filter_delete", "conflict_retry"])
+            .get(),
+        3
+    );
+    assert_eq!(
+        zeppelin::metrics::GUARDED_WRITE_ATTEMPTS_TOTAL
+            .with_label_values(&[&namespace, "filter_delete", "committed"])
+            .get(),
+        1
+    );
+
+    cleanup_ns(&harness.store, &namespace).await;
+    harness.cleanup().await;
+}
+
+/// A newer manifest is published after all four selection snapshots. Every
+/// guarded append must reject its own stale guard, and the HTTP boundary must
+/// preserve the existing canonical retryable 409 after the bound is exhausted.
+#[tokio::test]
+async fn test_guarded_filter_delete_exhaustion_returns_409() {
+    let harness = TestHarness::new().await;
+    TestHarness::require_cas_backend();
+    let namespace = harness.artifact_origin_namespace("guarded-delete-exhaustion");
+    NamespaceManager::new(harness.store.clone())
+        .create(&namespace, 2, DistanceMetric::Euclidean)
+        .await
+        .expect("guarded-delete fixture namespace creation must succeed");
+
+    let (writer_url, _writer_cache, _writer_cache_dir, writer_bearer) = start_test_server_on_store(
+        &harness,
+        harness.store.clone(),
+        Some(harness.prefix.clone()),
+    )
+    .await;
+    let writer_client = client_with_bearer(&writer_bearer);
+    upsert_guarded_delete_fixture_row(&writer_client, &writer_url, &namespace, "matching-initial")
+        .await;
+
+    let (barrier_store, manifest_barrier) =
+        pause_repeatedly_after_get_matching(&harness.store, format!("{namespace}/manifest.json"));
+    let (delete_url, _delete_cache, _delete_cache_dir, delete_bearer) =
+        start_test_server_on_store(&harness, barrier_store, Some(harness.prefix.clone())).await;
+    let delete_client = client_with_bearer(&delete_bearer);
+    manifest_barrier.enable();
+
+    let delete_task = tokio::spawn({
+        let delete_client = delete_client.clone();
+        let delete_url = delete_url.clone();
+        let namespace = namespace.clone();
+        async move {
+            delete_client
+                .delete(format!("{delete_url}/v1/namespaces/{namespace}/vectors"))
+                .json(&serde_json::json!({
+                    "filter": {
+                        "op": "eq",
+                        "field": "guarded_delete_group",
+                        "value": "target"
+                    }
+                }))
+                .send()
+                .await
+        }
+    });
+
+    let mut ids = vec!["matching-initial".to_string()];
+    for attempt in 0..4 {
+        manifest_barrier.wait_until_arrivals(attempt * 2 + 1).await;
+        let id = format!("matching-concurrent-{attempt}");
+        upsert_guarded_delete_fixture_row(&writer_client, &writer_url, &namespace, &id).await;
+        ids.push(id);
+        manifest_barrier.release_next();
+
+        manifest_barrier.wait_until_arrivals(attempt * 2 + 2).await;
+        manifest_barrier.release_next();
+    }
+
+    let response = delete_task
+        .await
+        .expect("guarded delete task must join")
+        .expect("guarded delete request must complete");
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .expect("guarded delete conflict response must be JSON");
+    assert_eq!(body["code"], "CONFLICT_RETRY");
+    assert_eq!(manifest_barrier.arrivals(), 8);
+    manifest_barrier.disable();
+
+    let fetched =
+        fetch_guarded_delete_fixture_rows(&writer_client, &writer_url, &namespace, &ids).await;
+    assert_eq!(fetched["results"].as_array().map(Vec::len), Some(ids.len()));
+    assert_eq!(fetched["missing"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        zeppelin::metrics::GUARDED_WRITE_ATTEMPTS_TOTAL
+            .with_label_values(&[&namespace, "filter_delete", "conflict_retry"])
+            .get(),
+        3
+    );
+    assert_eq!(
+        zeppelin::metrics::GUARDED_WRITE_ATTEMPTS_TOTAL
+            .with_label_values(&[&namespace, "filter_delete", "conflict_exhausted"])
+            .get(),
+        1
+    );
+
+    cleanup_ns(&harness.store, &namespace).await;
     harness.cleanup().await;
 }

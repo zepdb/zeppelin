@@ -99,6 +99,15 @@ mod inner {
         register_int_counter_vec!("zeppelin_wal_appends_total", "WAL appends", &["namespace"])
             .unwrap()
     });
+    /// Guarded derived-write attempts partitioned by operation and terminal step outcome.
+    pub static GUARDED_WRITE_ATTEMPTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "zeppelin_guarded_write_attempts_total",
+            "Guarded derived-write attempts by operation and outcome",
+            &["namespace", "kind", "outcome"]
+        )
+        .unwrap()
+    });
     /// Records durably quarantined after deterministic semantic-enrichment rejection.
     pub static SEMANTIC_ENRICHMENT_QUARANTINED_RECORDS_TOTAL: LazyLock<IntCounterVec> =
         LazyLock::new(|| {
@@ -611,6 +620,7 @@ pub fn init() {
     std::sync::LazyLock::force(&QUERY_UNDERFILL_TOTAL);
     std::sync::LazyLock::force(&QUERY_FILTERED_TOTAL);
     std::sync::LazyLock::force(&WAL_APPENDS_TOTAL);
+    std::sync::LazyLock::force(&GUARDED_WRITE_ATTEMPTS_TOTAL);
     std::sync::LazyLock::force(&SEMANTIC_ENRICHMENT_QUARANTINED_RECORDS_TOTAL);
     std::sync::LazyLock::force(&CACHE_HITS_TOTAL);
     std::sync::LazyLock::force(&COMPACTIONS_TOTAL);

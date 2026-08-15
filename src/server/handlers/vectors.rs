@@ -163,9 +163,57 @@ use crate::server::{AppState, AuditRequest};
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, ConsistencyLevel, Filter, VectorEntry, VectorId};
 use crate::wal::manifest::{LocatedFragmentRef, LocatedSegmentRef};
+use crate::wal::writer::cas_backoff;
 use crate::wal::{FragmentCachePolicy, Manifest, ManifestAppendGuard, WalFragmentCache, WalReader};
 
 use super::ApiError;
+
+/// Maximum number of fresh snapshot-selection-publication attempts for one guarded write.
+const GUARDED_DELETE_MAX_ATTEMPTS: u32 = 4;
+
+#[derive(Clone, Copy)]
+enum GuardedWriteKind {
+    FilterDelete,
+    ConstrainedDelete,
+    ScopedUpsert,
+}
+
+impl GuardedWriteKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FilterDelete => "filter_delete",
+            Self::ConstrainedDelete => "constrained_delete",
+            Self::ScopedUpsert => "scoped_upsert",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GuardedWriteOutcome {
+    Committed,
+    ConflictRetry,
+    ConflictExhausted,
+}
+
+impl GuardedWriteOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::ConflictRetry => "conflict_retry",
+            Self::ConflictExhausted => "conflict_exhausted",
+        }
+    }
+}
+
+fn record_guarded_write_attempt(
+    namespace: &str,
+    kind: GuardedWriteKind,
+    outcome: GuardedWriteOutcome,
+) {
+    crate::metrics::GUARDED_WRITE_ATTEMPTS_TOTAL
+        .with_label_values(&[namespace, kind.as_str(), outcome.as_str()])
+        .inc();
+}
 
 /// Row-oriented request body for inserting or replacing vectors by ID.
 ///
@@ -609,7 +657,8 @@ pub async fn upsert_vectors(
     // Derived-row security checks require metadata from authoritative S3, not
     // a disposable registry snapshot. This also performs the one-time CAS
     // migration for namespaces created before incarnation metadata existed.
-    let meta = if upsert_requires_existing_rows(&decision) {
+    let scoped_upsert = upsert_requires_existing_rows(&decision);
+    let meta = if scoped_upsert {
         state
             .namespace_manager
             .get_active_metadata_for_guarded_write(&ns)
@@ -638,28 +687,39 @@ pub async fn upsert_vectors(
         }
     }
 
-    let manifest_guard = apply_upsert_security_constraints(
-        &state,
-        &ns,
-        &meta,
-        &mut vectors,
-        &server_owned_ids,
-        &decision,
-    )
-    .await
-    .map_err(ApiError::from)?;
-
     // WalWriter::append now does group commit internally (concurrent appends to
     // one namespace coalesce into a shared manifest CAS), so there is no
     // separate batch-writer path.
-    let (_, manifest) = match manifest_guard {
-        Some(guard) => {
-            state
-                .wal_writer
-                .append_upserts_if_manifest_unchanged(&ns, vectors, guard)
-                .await
+    let manifest = if scoped_upsert {
+        append_scoped_upserts_with_reevaluation(
+            &state,
+            &ns,
+            &meta,
+            &vectors,
+            &server_owned_ids,
+            &decision,
+        )
+        .await
+    } else {
+        let manifest_guard = apply_upsert_security_constraints(
+            &state,
+            &ns,
+            &meta,
+            &mut vectors,
+            &server_owned_ids,
+            &decision,
+        )
+        .await?;
+        if manifest_guard.is_some() {
+            return Err(ApiError(ZeppelinError::Index(
+                "unscoped upsert unexpectedly produced a manifest guard".into(),
+            )));
         }
-        None => state.wal_writer.append(&ns, vectors, vec![]).await,
+        state
+            .wal_writer
+            .append(&ns, vectors, vec![])
+            .await
+            .map(|(_, manifest)| manifest)
     }
     .map_err(ApiError::from)?;
 
@@ -673,6 +733,75 @@ pub async fn upsert_vectors(
             upserted: count,
             generated_ids,
         }),
+    ))
+}
+
+/// Re-evaluates a scoped upsert against a fresh authoritative manifest per attempt.
+///
+/// Existing-row checks can read segment attributes plus the uncompacted WAL
+/// tail. A conflict discards the derived replacement rows, backs off, and
+/// repeats the whole read/check/guard sequence; it never retries the same
+/// evaluated batch against a newer manifest.
+async fn append_scoped_upserts_with_reevaluation(
+    state: &AppState,
+    ns: &str,
+    meta: &NamespaceMetadata,
+    vectors: &[VectorEntry],
+    server_owned_ids: &BTreeSet<VectorId>,
+    decision: &AllowDecision,
+) -> Result<Manifest, ZeppelinError> {
+    for attempt in 0..GUARDED_DELETE_MAX_ATTEMPTS {
+        let mut evaluated_vectors = vectors.to_vec();
+        let guard = apply_upsert_security_constraints(
+            state,
+            ns,
+            meta,
+            &mut evaluated_vectors,
+            server_owned_ids,
+            decision,
+        )
+        .await?
+        .ok_or_else(|| {
+            ZeppelinError::Index("scoped upsert did not produce a manifest guard".into())
+        })?;
+
+        match state
+            .wal_writer
+            .append_upserts_if_manifest_unchanged(ns, evaluated_vectors, guard)
+            .await
+        {
+            Ok((_, manifest)) => {
+                record_guarded_write_attempt(
+                    ns,
+                    GuardedWriteKind::ScopedUpsert,
+                    GuardedWriteOutcome::Committed,
+                );
+                return Ok(manifest);
+            }
+            Err(error @ ZeppelinError::ManifestConflict { .. })
+                if attempt + 1 == GUARDED_DELETE_MAX_ATTEMPTS =>
+            {
+                record_guarded_write_attempt(
+                    ns,
+                    GuardedWriteKind::ScopedUpsert,
+                    GuardedWriteOutcome::ConflictExhausted,
+                );
+                return Err(error);
+            }
+            Err(ZeppelinError::ManifestConflict { .. }) => {
+                record_guarded_write_attempt(
+                    ns,
+                    GuardedWriteKind::ScopedUpsert,
+                    GuardedWriteOutcome::ConflictRetry,
+                );
+                tokio::time::sleep(cas_backoff(attempt)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(ZeppelinError::Index(
+        "guarded scoped-upsert attempt loop terminated without an outcome".into(),
     ))
 }
 
@@ -1236,10 +1365,11 @@ where
 ///
 /// # Performance
 ///
-/// JSON parsing and fragment construction are linear in ID bytes. Publication
-/// performs one fragment PUT plus manifest read/CAS work, which may be shared
-/// with concurrent same-process appends through group commit. The handler does
-/// not read cluster or attribute objects.
+/// JSON parsing and fragment construction are linear in ID bytes. An unguarded
+/// ID delete performs one fragment PUT plus manifest read/CAS work. Each
+/// guarded attempt re-runs selection across the active segment plus uncompacted
+/// WAL tail before uploading a new fragment, so the four-attempt bound also
+/// bounds repeated scan and object-store cost.
 ///
 /// # Examples
 ///
@@ -1314,90 +1444,75 @@ pub async fn delete_vectors(
     }
 
     let authoritative_origin = meta.artifact_origin().map_err(ApiError::from)?;
-    let (delete_ids, guard) = match selection {
-        DeleteSelection::Ids(ids) if decision.mandatory_filter.is_none() => (ids, None),
-        DeleteSelection::Ids(ids) => {
-            let expected_incarnation =
-                required_namespace_incarnation(&meta, &ns).map_err(ApiError::from)?;
-            let (manifest, storage_version) = Manifest::read_versioned_required_for_incarnation(
-                &state.store,
-                &ns,
-                expected_incarnation,
-            )
-            .await
-            .map_err(ApiError::from)?;
-            let guard = ManifestAppendGuard::new(&ns, &manifest, storage_version)
+    let (count, manifest) = match &selection {
+        DeleteSelection::Ids(ids) if decision.mandatory_filter.is_none() => {
+            let count = ids.len();
+            audit.set_params(AuditParams::vector_delete(namespace_id.clone(), ids));
+            info!(count, "deleting vectors");
+            let (_, manifest) = state
+                .wal_writer
+                .append(&ns, vec![], ids.clone())
+                .await
                 .map_err(ApiError::from)?;
+            (count, manifest)
+        }
+        DeleteSelection::Ids(ids) => {
             let filter = decision.mandatory_filter.as_ref().ok_or_else(|| {
                 ApiError(ZeppelinError::Index(
                     "constrained ID delete lost its mandatory filter".into(),
                 ))
             })?;
-            let ids = select_requested_ids_matching_filter(
+            match append_guarded_deletes_with_reevaluation(
                 &state,
                 &ns,
-                &ids,
-                filter,
-                manifest,
-                authoritative_origin.clone(),
+                &meta,
+                authoritative_origin,
+                GuardedDeleteSelection::RequestedIds { ids, filter },
+                &audit,
+                &namespace_id,
             )
             .await
-            .map_err(ApiError::from)?;
-            (ids, Some(guard))
+            .map_err(ApiError::from)?
+            {
+                None => {
+                    info!(deleted = 0, "no scoped vectors matched delete request");
+                    return Ok(StatusCode::NO_CONTENT);
+                }
+                Some((delete_ids, manifest)) => (delete_ids.len(), manifest),
+            }
         }
         DeleteSelection::Filter(caller_filter) => {
-            let expected_incarnation =
-                required_namespace_incarnation(&meta, &ns).map_err(ApiError::from)?;
-            let (manifest, storage_version) = Manifest::read_versioned_required_for_incarnation(
-                &state.store,
-                &ns,
-                expected_incarnation,
+            let effective_filter = combine_filters(
+                decision.mandatory_filter.clone(),
+                Some(caller_filter.clone()),
             )
-            .await
-            .map_err(ApiError::from)?;
-            let guard = ManifestAppendGuard::new(&ns, &manifest, storage_version)
-                .map_err(ApiError::from)?;
-            let effective_filter =
-                combine_filters(decision.mandatory_filter.clone(), Some(caller_filter))
-                    .ok_or_else(|| {
-                        ApiError(ZeppelinError::Index(
-                            "filter delete did not produce an effective filter".into(),
-                        ))
-                    })?;
-            let ids = select_all_ids_matching_filter(
+            .ok_or_else(|| {
+                ApiError(ZeppelinError::Index(
+                    "filter delete did not produce an effective filter".into(),
+                ))
+            })?;
+            match append_guarded_deletes_with_reevaluation(
                 &state,
                 &ns,
-                &effective_filter,
-                manifest,
+                &meta,
                 authoritative_origin,
+                GuardedDeleteSelection::AllMatching {
+                    filter: &effective_filter,
+                },
+                &audit,
+                &namespace_id,
             )
             .await
-            .map_err(ApiError::from)?;
-            (ids, Some(guard))
+            .map_err(ApiError::from)?
+            {
+                None => {
+                    info!(deleted = 0, "no scoped vectors matched delete request");
+                    return Ok(StatusCode::NO_CONTENT);
+                }
+                Some((delete_ids, manifest)) => (delete_ids.len(), manifest),
+            }
         }
     };
-
-    let count = delete_ids.len();
-    audit.set_params(AuditParams::vector_delete(
-        NamespaceId::new(ns.clone()).map_err(ZeppelinError::from)?,
-        &delete_ids,
-    ));
-    if delete_ids.is_empty() {
-        info!(deleted = 0, "no scoped vectors matched delete request");
-        return Ok(StatusCode::NO_CONTENT);
-    }
-
-    info!(count, "deleting vectors");
-    let (_, manifest) = match guard {
-        Some(guard) => {
-            state
-                .wal_writer
-                .append_deletes_if_manifest_unchanged(&ns, delete_ids, guard)
-                .await
-        }
-        None => state.wal_writer.append(&ns, vec![], delete_ids).await,
-    }
-    .map_err(ApiError::from)?;
 
     // Write-through: insert fresh manifest so next query skips S3 GET.
     state.manifest_cache.insert(&ns, manifest);
@@ -1409,6 +1524,111 @@ pub async fn delete_vectors(
 enum DeleteSelection {
     Ids(Vec<VectorId>),
     Filter(Filter),
+}
+
+enum GuardedDeleteSelection<'a> {
+    RequestedIds {
+        ids: &'a [VectorId],
+        filter: &'a Filter,
+    },
+    AllMatching {
+        filter: &'a Filter,
+    },
+}
+
+impl GuardedDeleteSelection<'_> {
+    const fn kind(&self) -> GuardedWriteKind {
+        match self {
+            Self::RequestedIds { .. } => GuardedWriteKind::ConstrainedDelete,
+            Self::AllMatching { .. } => GuardedWriteKind::FilterDelete,
+        }
+    }
+}
+
+/// Selects and publishes guarded tombstones from the same fresh manifest snapshot.
+///
+/// Each attempt reads authoritative manifest identity, builds its guard, and
+/// recomputes the complete ID set from that manifest. A conflict discards those
+/// IDs before backoff. Selection scans the active segment membership and
+/// uncompacted WAL tail, then resolves live attributes, so the attempt bound
+/// also bounds repeated object-store work.
+async fn append_guarded_deletes_with_reevaluation(
+    state: &AppState,
+    ns: &str,
+    meta: &NamespaceMetadata,
+    authoritative_origin: Option<ArtifactOrigin>,
+    selection: GuardedDeleteSelection<'_>,
+    audit: &AuditRequest,
+    namespace_id: &NamespaceId,
+) -> Result<Option<(Vec<VectorId>, Manifest)>, ZeppelinError> {
+    let expected_incarnation = required_namespace_incarnation(meta, ns)?;
+    let kind = selection.kind();
+    for attempt in 0..GUARDED_DELETE_MAX_ATTEMPTS {
+        let (manifest, storage_version) = Manifest::read_versioned_required_for_incarnation(
+            &state.store,
+            ns,
+            expected_incarnation,
+        )
+        .await?;
+        let guard = ManifestAppendGuard::new(ns, &manifest, storage_version)?;
+        let delete_ids = match &selection {
+            GuardedDeleteSelection::RequestedIds { ids, filter } => {
+                select_requested_ids_matching_filter(
+                    state,
+                    ns,
+                    ids,
+                    filter,
+                    manifest,
+                    authoritative_origin.clone(),
+                )
+                .await?
+            }
+            GuardedDeleteSelection::AllMatching { filter } => {
+                select_all_ids_matching_filter(
+                    state,
+                    ns,
+                    filter,
+                    manifest,
+                    authoritative_origin.clone(),
+                )
+                .await?
+            }
+        };
+        audit.set_params(AuditParams::vector_delete(
+            namespace_id.clone(),
+            &delete_ids,
+        ));
+        if delete_ids.is_empty() {
+            record_guarded_write_attempt(ns, kind, GuardedWriteOutcome::Committed);
+            return Ok(None);
+        }
+
+        match state
+            .wal_writer
+            .append_deletes_if_manifest_unchanged(ns, delete_ids.clone(), guard)
+            .await
+        {
+            Ok((_, manifest)) => {
+                record_guarded_write_attempt(ns, kind, GuardedWriteOutcome::Committed);
+                return Ok(Some((delete_ids, manifest)));
+            }
+            Err(error @ ZeppelinError::ManifestConflict { .. })
+                if attempt + 1 == GUARDED_DELETE_MAX_ATTEMPTS =>
+            {
+                record_guarded_write_attempt(ns, kind, GuardedWriteOutcome::ConflictExhausted);
+                return Err(error);
+            }
+            Err(ZeppelinError::ManifestConflict { .. }) => {
+                record_guarded_write_attempt(ns, kind, GuardedWriteOutcome::ConflictRetry);
+                tokio::time::sleep(cas_backoff(attempt)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(ZeppelinError::Index(
+        "guarded delete attempt loop terminated without an outcome".into(),
+    ))
 }
 
 fn validate_delete_vectors_request(

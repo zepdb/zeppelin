@@ -80,6 +80,21 @@ the governed state machine through `NamespaceGraph::delete`, then spawns
 `spawn_namespace_delete_cleanup` to continue in the background. It is not a
 synchronous delete; tests must poll or drive `resume_delete`.
 
+## Guarded vector writes
+
+Filter deletes, mandatory-scope ID deletes, and scoped upserts derive their WAL
+payload from one authoritative manifest snapshot. A manifest conflict must
+restart the whole sequence—fresh manifest read, fresh selection/preflight, and
+fresh `ManifestAppendGuard`—before publication. Never retry the same derived ID
+or row set against a newer manifest. The handler bounds this re-evaluation at
+four attempts and uses the WAL CAS backoff between conflicts; exhaustion remains
+the canonical 409 `CONFLICT_RETRY` response.
+
+The vector preservation guard is intentionally outside that loop. It depends on
+preservation authority plus the namespace/caller filter, not on vector-manifest
+contents, so one request evaluates it once while every derived write attempt is
+still re-guarded against its own manifest.
+
 ## See also
 
 - `../namespace/CLAUDE.md` — the governed delete state machine

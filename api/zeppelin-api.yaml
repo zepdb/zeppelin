@@ -1349,6 +1349,12 @@ paths:
           $ref: "#/components/responses/NotFoundError"
         "409":
           $ref: "#/components/responses/PreservationLocked"
+          description: |
+            Vector deletion is blocked by active preservation, or the bounded
+            server-side manifest re-evaluation attempts were exhausted under
+            concurrent writes (409). The canonical error envelope uses code
+            `preservation_locked` or `CONFLICT_RETRY`; `CONFLICT_RETRY` means
+            the server already retried selection against fresh manifests.
         "410":
           $ref: "#/components/responses/NamespaceDeletingError"
         "413":

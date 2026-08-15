@@ -144,7 +144,7 @@ const MAX_CAS_RETRIES: u32 = 8;
 /// [`Duration`] is a value type returned by move with no heap allocation. The
 /// bounded shift makes overflow impossible here; Java/C code would need the same
 /// explicit cap to avoid shifting a fixed-width integer too far.
-fn cas_backoff(attempt: u32) -> Duration {
+pub(crate) fn cas_backoff(attempt: u32) -> Duration {
     let base_ms = (10u64 << attempt.min(6)).min(500);
     let jitter_ms = rand::thread_rng().gen_range(0..10);
     Duration::from_millis(base_ms + jitter_ms)

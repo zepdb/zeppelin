@@ -277,6 +277,60 @@ pub struct PauseAfterGetStore {
     release: Arc<tokio::sync::Semaphore>,
 }
 
+/// Controller for a repeatedly armed pause after matching GETs snapshot storage.
+#[derive(Clone, Debug)]
+pub struct RepeatedPauseAfterGetHandle {
+    enabled: Arc<AtomicBool>,
+    arrivals: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl RepeatedPauseAfterGetHandle {
+    /// Begin pausing every matching GET after it has captured its result.
+    pub fn enable(&self) {
+        self.enabled.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop pausing new matching GETs.
+    pub fn disable(&self) {
+        self.enabled.store(false, Ordering::SeqCst);
+    }
+
+    /// Wait until at least `expected` matching GET snapshots are paused.
+    pub async fn wait_until_arrivals(&self, expected: usize) {
+        loop {
+            let notified = self.entered.notified();
+            if self.arrivals.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Release one paused matching GET.
+    pub fn release_next(&self) {
+        self.release.add_permits(1);
+    }
+
+    /// Return the exact number of matching GET snapshots paused so far.
+    #[must_use]
+    pub fn arrivals(&self) -> usize {
+        self.arrivals.load(Ordering::SeqCst)
+    }
+}
+
+/// Object-store decorator that repeatedly pauses after matching GETs snapshot storage.
+#[derive(Debug)]
+pub struct RepeatedPauseAfterGetStore {
+    inner: Arc<dyn ObjectStore>,
+    needle: String,
+    enabled: Arc<AtomicBool>,
+    arrivals: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
 /// Controller for an explicitly armed one-shot matching GET pause.
 ///
 /// Unlike [`PauseGetHandle`], this starts disarmed so a test can complete
@@ -729,6 +783,38 @@ pub fn pause_first_after_get_matching(
     (
         ZeppelinStore::new(Arc::new(wrapper)),
         PauseGetHandle {
+            arrivals,
+            entered,
+            release,
+        },
+    )
+}
+
+/// Wrap a store with a disabled repeatable pause after matching GET snapshots.
+///
+/// Tests can deterministically publish a newer object while a caller retains
+/// the older returned bytes, then release that exact stale observation without
+/// timing sleeps.
+pub fn pause_repeatedly_after_get_matching(
+    store: &ZeppelinStore,
+    needle: impl Into<String>,
+) -> (ZeppelinStore, RepeatedPauseAfterGetHandle) {
+    let enabled = Arc::new(AtomicBool::new(false));
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let wrapper = RepeatedPauseAfterGetStore {
+        inner: store.inner(),
+        needle: needle.into(),
+        enabled: Arc::clone(&enabled),
+        arrivals: Arc::clone(&arrivals),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    (
+        ZeppelinStore::new(Arc::new(wrapper)),
+        RepeatedPauseAfterGetHandle {
+            enabled,
             arrivals,
             entered,
             release,
@@ -1781,6 +1867,12 @@ impl fmt::Display for PauseAfterGetStore {
     }
 }
 
+impl fmt::Display for RepeatedPauseAfterGetStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RepeatedPauseAfterGetStore({})", self.inner)
+    }
+}
+
 impl fmt::Display for ArmedPauseGetStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ArmedPauseGetStore({})", self.inner)
@@ -1957,6 +2049,67 @@ impl ObjectStore for PauseAfterGetStore {
                 .acquire()
                 .await
                 .expect("pause-after GET semaphore must remain open");
+            permit.forget();
+        }
+        result
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for RepeatedPauseAfterGetStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        let should_pause =
+            self.enabled.load(Ordering::SeqCst) && location.as_ref().contains(&self.needle);
+        let result = self.inner.get_opts(location, options).await;
+        if should_pause {
+            self.arrivals.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_waiters();
+            let permit = self
+                .release
+                .acquire()
+                .await
+                .expect("repeated pause-after GET semaphore must remain open");
             permit.forget();
         }
         result
