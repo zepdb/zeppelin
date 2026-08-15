@@ -54,10 +54,10 @@ Zeppelin is pre-1.0 software under active development:
 - **Namespace branching is disabled by default** (`branching.enabled`), and
   its release validation gates are not yet complete.
 - **GCS and Azure Blob backends are implemented with emulator-backed test
-  gates** (patched fake-gcs-server, Azurite) — no gate has run against real
-  GCS or Azure yet, a deliberate emulators-only decision. S3 and
-  S3-compatible stores remain the battle-tested substrates; see
-  `tasks/multi-substrate/08-release-evidence.md` for exactly what was run.
+  gates** (patched fake-gcs-server, Azurite — see `scripts/emulators/`) —
+  no gate has run against real GCS or Azure yet, a deliberate emulators-only
+  decision, and per-substrate performance is unmeasured. S3 and
+  S3-compatible stores remain the battle-tested substrates.
 - Published performance numbers are loopback-MinIO measurements, not
   cloud-S3 latency claims — see [Performance](#performance) for exactly
   what was measured.
@@ -254,6 +254,21 @@ documents the commonly tuned knobs with their defaults and env-var names.
 For a hardware-tuned config validated through the real loader, use
 `zeppelin_advisor emit-config` (above).
 
+Object storage is selected by `[storage] backend`:
+
+| `backend` | Fields | Notes |
+| --- | --- | --- |
+| `s3` (default) | `s3_region`, `s3_endpoint`, `s3_access_key_id`, `s3_secret_access_key`, `s3_allow_http` | AWS S3, MinIO, R2, any S3-compatible store |
+| `gcs` | `gcs_service_account_path` **or** `gcs_service_account_key`, `gcs_endpoint` (emulator only) | conditional writes key on the object generation |
+| `azure` | `azure_account_name`, `azure_access_key`, `azure_endpoint`, `azure_use_emulator`, `azure_allow_http` | `bucket` names the container |
+| `local` | — | development/testing only; no conditional PUT |
+
+Fields from a backend family other than the selected one are a
+configuration error, never silently ignored. With `fail_fast = true`
+(default) every boot verifies the substrate's declared capabilities live —
+conditional PUT with fresh and stale tokens, LIST/GET identity, delete of
+an absent key — and refuses to start if the store cannot enforce them.
+
 ## API Reference
 
 The canonical definition is the [OpenAPI 3.1 spec](api/zeppelin-api.yaml). The
@@ -361,6 +376,10 @@ MINIO_ACCESS_KEY=minioadmin \
 MINIO_SECRET_KEY=minioadmin \
 cargo test --tests
 ```
+
+`TEST_BACKEND=gcs` (patched fake-gcs-server) and `TEST_BACKEND=azurite`
+(Azurite) run the same suites against the emulated non-S3 substrates; setup
+and pinned versions are in [`scripts/emulators/`](scripts/emulators/README.md).
 
 ### Run locally against MinIO
 

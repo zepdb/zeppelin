@@ -7,8 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-15
+
+### Added
+
+- **Google Cloud Storage and Azure Blob Storage backends**, selected by
+  `[storage] backend = "gcs" | "azure"` beside the existing `s3` and
+  `local`. New flat config fields with env overrides: `gcs_service_account_path`
+  / `gcs_service_account_key` / `gcs_endpoint` (`GCS_SERVICE_ACCOUNT_PATH`,
+  `GCS_SERVICE_ACCOUNT_KEY`, `GCS_ENDPOINT`) and `azure_account_name` /
+  `azure_access_key` / `azure_endpoint` / `azure_use_emulator` /
+  `azure_allow_http` (`AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCESS_KEY`,
+  `AZURE_ENDPOINT`, `AZURE_USE_EMULATOR`, `AZURE_ALLOW_HTTP`). GCS conditional
+  writes key on the object generation, Azure on the ETag; both ride the same
+  `StorageVersion` seam as S3.
+- **Storage capability model** (`StorageCapabilities`): the engine asks what
+  the configured substrate can do — conditional PUT and its token kind,
+  native batch delete, delete-of-absent semantics, metadata naming rules —
+  instead of comparing backend identity. Under `storage.fail_fast = true`
+  every boot now verifies the declared capabilities live (create-only PUT,
+  fresh and stale conditional PUT, LIST-vs-GET ETag identity, delete of an
+  absent key) on a reserved `__zeppelin_probe__/` prefix and refuses to
+  start if the substrate cannot enforce them — the flagship catch is an
+  S3-compatible store without conditional-PUT support, where every
+  compare-and-swap would otherwise silently become an overwrite.
+- `zeppelin_advisor emit-config --cloud gcp|azure` now emits configs that
+  pass validation and construct a store (previously they died at boot).
+- Substrate parity test suite (`tests/substrate_contract_tests.rs`),
+  emulator fidelity probes (`tests/emulator_fidelity_probe.rs`), and native
+  emulator setup for fake-gcs-server and Azurite in `scripts/emulators/`.
+
 ### Changed
 
+- Config validation is stricter about storage: fields from a non-selected
+  backend family (for example `gcs_*` with `backend = "s3"`) are a hard
+  error, `gcs_service_account_path` and `gcs_service_account_key` are
+  mutually exclusive, and `backend = "azure"` requires an account name
+  unless `azure_use_emulator = true`. `security.audit_s3` and `security.rbac`
+  are rejected at config-parse time on a backend without conditional PUT
+  (`local`) instead of failing mid-boot with a raw storage error.
+- Deleting an absent object is success on every backend (S3 already reported
+  success; GCS/Azure/local NotFound is normalized at the storage seam so
+  garbage-collection drain idempotency holds identically everywhere).
+- LIST-vs-GET ETag comparisons use a canonical (quote-stripped) form: Azure
+  lists ETags unquoted and returns them quoted on GET, so byte comparison
+  would have permanently disabled garbage collection there. S3 behavior is
+  unchanged.
+- Object user-metadata names are canonicalized per substrate at the seam:
+  Azure requires C#-identifier names, so hyphenated logical keys are written
+  with underscores there and normalized back on read; S3 and GCS keep the
+  hyphenated wire form.
+- Storage-gateway tracing strings say `object-store <op>` instead of
+  `s3 <op>`, key constructors are `object_store_key()` instead of
+  `s3_key()`, and endpoint-parse errors name object-store URLs. Metrics keep
+  their `zeppelin_storage_*` names; `s3_*` config fields keep theirs.
+- `ZeppelinStore::head()` returns the seam's `ListedObject` (with a
+  `StorageVersion`) rather than a raw `object_store::ObjectMeta`.
 - Removed licensing entirely: no feature is gated behind a signed license
   anymore. The RBAC policy authority is now selected by the new
   `security.rbac` config flag (default `false`, preserving the previous
@@ -22,6 +76,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the post-expiry management freeze, the `max_principals` limit, the
   `zeppelin_license_expiry_seconds` metric, and the `zeppelin_license` CLI
   are gone.
+
+### Removed
+
+- The `zeppelin_license` CLI and every license-gated code path (see Changed).
+- `ZeppelinStore::new_with_native_batch_delete`; use
+  `new_with_capabilities` with the matching `StorageCapabilities` row.
+
+### Known limitations
+
+- Pre-1.0: no on-disk format stability guarantee between versions.
+- **GCS and Azure gates ran against emulators only** — a patched
+  fake-gcs-server (stock cannot serve `object_store`'s XML-API writes) and
+  stock Azurite 3.36.0. No gate has run against real GCS or real Azure, and
+  per-substrate performance is unmeasured. Treat both as implemented but not
+  yet production-validated; S3 and S3-compatible stores remain the
+  battle-tested substrates.
+- Namespace branching is disabled by default and its release validation
+  gates are not complete.
+- Published performance numbers are loopback-MinIO measurements, not
+  cloud-S3 latency claims.
 
 ## [0.1.0] - 2026-08-12
 
@@ -59,10 +133,10 @@ Initial release.
 - Pre-1.0: no on-disk format stability guarantee between versions.
 - Namespace branching is disabled by default and its release validation
   gates are not complete.
-- GCS and Azure Blob backends are implemented behind `[storage] backend`
-  with emulator-backed test gates (patched fake-gcs-server, Azurite); no
-  gate has run against real GCS/Azure yet.
+- GCS and Azure backends are planned, not implemented.
 - Published performance numbers are loopback-MinIO measurements, not
   cloud-S3 latency claims.
 
+[Unreleased]: https://github.com/zepdb/zeppelin/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/zepdb/zeppelin/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/zepdb/zeppelin/releases/tag/v0.1.0
