@@ -457,10 +457,8 @@ impl WalFragment {
     /// Decodes a current or legacy fragment and verifies its payload checksum.
     ///
     /// A leading `0x01` selects versioned MessagePack. A leading `{` selects
-    /// legacy unprefixed JSON. For any other first byte, compatibility decoding
-    /// tries MessagePack after skipping that byte and then tries the entire
-    /// slice as unprefixed MessagePack. The unknown-prefix branch does **not**
-    /// attempt JSON.
+    /// legacy unprefixed JSON. Any other first byte is rejected as an
+    /// unsupported format prefix.
     ///
     /// # Parameters
     ///
@@ -474,11 +472,11 @@ impl WalFragment {
     ///
     /// # Errors
     ///
-    /// Returns [`ZeppelinError::Serialization`] for empty input or malformed
-    /// MessagePack, a JSON error for malformed recognized legacy JSON, or
-    /// [`ZeppelinError::ChecksumMismatch`] for a structurally valid fragment
-    /// whose payload no longer matches its stored checksum. No partial fragment
-    /// is returned.
+    /// Returns [`ZeppelinError::Serialization`] for empty input, an unsupported
+    /// prefix, or malformed MessagePack; a JSON error for malformed recognized
+    /// legacy JSON; or [`ZeppelinError::ChecksumMismatch`] for a structurally
+    /// valid fragment whose payload no longer matches its stored checksum. No
+    /// partial fragment is returned.
     ///
     /// # Consistency
     ///
@@ -521,10 +519,11 @@ impl WalFragment {
                 .map_err(|e| ZeppelinError::Serialization(format!("msgpack deserialize: {e}")))?,
             // Legacy JSON has no version byte, so preserve the full slice.
             b'{' => serde_json::from_slice(data)?,
-            // Compatibility path for unknown or absent MessagePack markers.
-            _ => rmp_serde::from_slice(&data[1..])
-                .or_else(|_| rmp_serde::from_slice(data))
-                .map_err(|e| ZeppelinError::Serialization(format!("msgpack deserialize: {e}")))?,
+            prefix => {
+                return Err(ZeppelinError::Serialization(format!(
+                    "unsupported WAL fragment format prefix 0x{prefix:02x}; this binary reads 0x01 (MessagePack) and legacy JSON"
+                )))
+            }
         };
         fragment.validate_checksum()?;
         Ok(fragment)
@@ -551,9 +550,10 @@ impl WalFragment {
     ///
     /// # Errors
     ///
-    /// Returns [`ZeppelinError::Serialization`] for empty or malformed
-    /// MessagePack and a JSON error for malformed recognized legacy JSON.
-    /// Structurally valid corruption is not an error here.
+    /// Returns [`ZeppelinError::Serialization`] for empty input, an unsupported
+    /// prefix, or malformed MessagePack, and a JSON error for malformed
+    /// recognized legacy JSON. Structurally valid corruption is not an error
+    /// here.
     ///
     /// # Consistency
     ///
@@ -592,9 +592,11 @@ impl WalFragment {
             WAL_FORMAT_MSGPACK => rmp_serde::from_slice(&data[1..])
                 .map_err(|e| ZeppelinError::Serialization(format!("msgpack deserialize: {e}")))?,
             b'{' => serde_json::from_slice(data)?,
-            _ => rmp_serde::from_slice(&data[1..])
-                .or_else(|_| rmp_serde::from_slice(data))
-                .map_err(|e| ZeppelinError::Serialization(format!("msgpack deserialize: {e}")))?,
+            prefix => {
+                return Err(ZeppelinError::Serialization(format!(
+                    "unsupported WAL fragment format prefix 0x{prefix:02x}; this binary reads 0x01 (MessagePack) and legacy JSON"
+                )))
+            }
         };
         Ok(fragment)
     }
@@ -654,5 +656,66 @@ impl WalFragment {
     /// operations, even if two upserts use the same vector ID.
     pub fn operation_count(&self) -> usize {
         self.vectors.len() + self.deletes.len()
+    }
+}
+
+#[allow(clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_fragment_identity(actual: &WalFragment, expected: &WalFragment) {
+        assert_eq!(actual.id, expected.id);
+        assert_eq!(actual.vectors.len(), expected.vectors.len());
+        assert_eq!(actual.deletes, expected.deletes);
+        assert_eq!(actual.checksum, expected.checksum);
+    }
+
+    fn assert_unsupported_prefix(result: Result<WalFragment>, expected: &str) {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, ZeppelinError::Serialization(message) if message == expected),
+            "unknown WAL format must fail with the exact compatibility error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn wal_fragment_format_dispatch_accepts_current_msgpack_and_legacy_json() {
+        let fragment = WalFragment::new(Vec::new(), vec!["deleted-id".to_string()]);
+
+        let msgpack = fragment.to_bytes().unwrap();
+        assert_fragment_identity(&WalFragment::from_bytes(&msgpack).unwrap(), &fragment);
+        assert_fragment_identity(
+            &WalFragment::from_bytes_unchecked(&msgpack).unwrap(),
+            &fragment,
+        );
+
+        let json = serde_json::to_vec(&fragment).unwrap();
+        assert_eq!(json.first(), Some(&b'{'));
+        assert_fragment_identity(&WalFragment::from_bytes(&json).unwrap(), &fragment);
+        assert_fragment_identity(
+            &WalFragment::from_bytes_unchecked(&json).unwrap(),
+            &fragment,
+        );
+    }
+
+    #[test]
+    fn wal_fragment_format_dispatch_rejects_0x02_with_valid_payload() {
+        let fragment = WalFragment::new(Vec::new(), vec!["deleted-id".to_string()]);
+        let mut future_version = fragment.to_bytes().unwrap().to_vec();
+        future_version[0] = 0x02;
+        let expected = "unsupported WAL fragment format prefix 0x02; this binary reads 0x01 (MessagePack) and legacy JSON";
+
+        assert_unsupported_prefix(WalFragment::from_bytes(&future_version), expected);
+        assert_unsupported_prefix(WalFragment::from_bytes_unchecked(&future_version), expected);
+    }
+
+    #[test]
+    fn wal_fragment_format_dispatch_rejects_0x00_with_garbage() {
+        let garbage = b"\x00not a WAL fragment";
+        let expected = "unsupported WAL fragment format prefix 0x00; this binary reads 0x01 (MessagePack) and legacy JSON";
+
+        assert_unsupported_prefix(WalFragment::from_bytes(garbage), expected);
+        assert_unsupported_prefix(WalFragment::from_bytes_unchecked(garbage), expected);
     }
 }

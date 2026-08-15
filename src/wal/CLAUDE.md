@@ -12,6 +12,10 @@ Manifests and WAL fragments use **MessagePack with a leading version byte**:
 `manifest.rs:157`). Decoders auto-detect legacy JSON by sniffing a leading
 `{`, so both formats must keep round-tripping.
 
+Decoders reject unknown format prefixes. Adding a format version means adding
+an explicit decoder arm; never guess by skipping an unrecognized prefix or by
+treating the whole object as an unprefixed payload.
+
 Because the format is not fully self-describing:
 
 - **Never put `#[serde(untagged)]` or `#[serde(skip_serializing_if)]` on any

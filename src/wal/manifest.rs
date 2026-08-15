@@ -6072,16 +6072,14 @@ impl Manifest {
     ///
     /// # Returns
     ///
-    /// An owned manifest. An empty object decodes as [`Manifest::new`] for
-    /// compatibility. `0x01` selects the current prefixed MessagePack format;
-    /// `{` selects legacy JSON. Other leading bytes are tried as an unknown
-    /// one-byte prefix and then as unprefixed MessagePack.
+    /// An owned manifest. `0x01` selects the current prefixed MessagePack
+    /// format; `{` selects legacy JSON.
     ///
     /// # Errors
     ///
-    /// Returns a serialization error when the selected format is malformed or
-    /// incompatible. It does not silently substitute a default for non-empty
-    /// corrupt data.
+    /// Returns a serialization error when the object is empty, the format
+    /// prefix is unsupported, or the selected format is malformed or
+    /// incompatible. It never silently substitutes a default manifest.
     ///
     /// # Examples
     ///
@@ -6097,7 +6095,9 @@ impl Manifest {
     /// success value unless the [`Result`] is `Ok`.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
-            return Ok(Self::new());
+            return Err(ZeppelinError::Serialization(
+                "manifest object is empty".to_string(),
+            ));
         }
         match data[0] {
             MANIFEST_FORMAT_MSGPACK => rmp_serde::from_slice(&data[1..]).map_err(|e| {
@@ -6105,14 +6105,9 @@ impl Manifest {
             }),
             // Legacy JSON: starts with '{' (0x7B)
             b'{' => Ok(serde_json::from_slice(data)?),
-            _ => {
-                // Try msgpack (skip version byte), fall back to JSON
-                rmp_serde::from_slice(&data[1..])
-                    .or_else(|_| rmp_serde::from_slice(data))
-                    .map_err(|e| {
-                        ZeppelinError::Serialization(format!("manifest msgpack deserialize: {e}"))
-                    })
-            }
+            prefix => Err(ZeppelinError::Serialization(format!(
+                "unsupported manifest format prefix 0x{prefix:02x}; this binary reads 0x01 (MessagePack) and legacy JSON"
+            ))),
         }
     }
 
@@ -7738,14 +7733,13 @@ impl NamedSnapshot {
     ///
     /// # Returns
     ///
-    /// An owned pin. `0x01` selects prefixed MessagePack, `{` selects legacy
-    /// JSON, and other prefixes are tried as prefixed then unprefixed MessagePack.
+    /// An owned pin. `0x01` selects prefixed MessagePack and `{` selects legacy
+    /// JSON.
     ///
     /// # Errors
     ///
-    /// Rejects empty objects and malformed or incompatible encodings with a
-    /// serialization error. Unlike [`Manifest::from_bytes`], an empty pin never
-    /// means a valid default.
+    /// Rejects empty objects, unsupported format prefixes, and malformed or
+    /// incompatible encodings with a serialization error.
     ///
     /// # Examples
     ///
@@ -7762,11 +7756,9 @@ impl NamedSnapshot {
                 ZeppelinError::Serialization(format!("snapshot msgpack deserialize: {e}"))
             }),
             b'{' => Ok(serde_json::from_slice(data)?),
-            _ => rmp_serde::from_slice(&data[1..])
-                .or_else(|_| rmp_serde::from_slice(data))
-                .map_err(|e| {
-                    ZeppelinError::Serialization(format!("snapshot msgpack deserialize: {e}"))
-                }),
+            prefix => Err(ZeppelinError::Serialization(format!(
+                "unsupported named snapshot format prefix 0x{prefix:02x}; this binary reads 0x01 (MessagePack) and legacy JSON"
+            ))),
         }
     }
 
@@ -8437,6 +8429,56 @@ mod tests {
 
     use crate::storage::ZeppelinStore;
     use crate::wal::SourceInventoryRef;
+
+    #[test]
+    fn manifest_format_dispatch_accepts_current_msgpack_and_legacy_json() {
+        let manifest = Manifest::new();
+
+        let msgpack = manifest.to_bytes().unwrap();
+        assert_eq!(msgpack.first(), Some(&MANIFEST_FORMAT_MSGPACK));
+        let decoded_msgpack = Manifest::from_bytes(&msgpack).unwrap();
+        assert_eq!(decoded_msgpack.version, manifest.version);
+        assert_eq!(decoded_msgpack.updated_at, manifest.updated_at);
+
+        let json = serde_json::to_vec(&manifest).unwrap();
+        assert_eq!(json.first(), Some(&b'{'));
+        let decoded_json = Manifest::from_bytes(&json).unwrap();
+        assert_eq!(decoded_json.version, manifest.version);
+        assert_eq!(decoded_json.updated_at, manifest.updated_at);
+    }
+
+    #[test]
+    fn manifest_format_dispatch_rejects_0x02_with_valid_payload() {
+        let mut future_version = Manifest::new().to_bytes().unwrap().to_vec();
+        future_version[0] = 0x02;
+
+        let error = Manifest::from_bytes(&future_version).unwrap_err();
+        assert!(
+            matches!(&error, ZeppelinError::Serialization(message) if
+                message == "unsupported manifest format prefix 0x02; this binary reads 0x01 (MessagePack) and legacy JSON"),
+            "future manifest format must fail with the exact compatibility error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_format_dispatch_rejects_0x00_with_garbage() {
+        let error = Manifest::from_bytes(b"\x00not a manifest").unwrap_err();
+        assert!(
+            matches!(&error, ZeppelinError::Serialization(message) if
+                message == "unsupported manifest format prefix 0x00; this binary reads 0x01 (MessagePack) and legacy JSON"),
+            "unknown manifest format must fail with the exact compatibility error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_format_dispatch_rejects_empty_object() {
+        let error = Manifest::from_bytes(&[]).unwrap_err();
+        assert!(
+            matches!(&error, ZeppelinError::Serialization(message) if
+                message == "manifest object is empty"),
+            "empty manifest objects must fail loud, got {error:?}"
+        );
+    }
 
     /// Builds a minimal legacy-layout segment descriptor for state-model tests.
     ///
@@ -10736,10 +10778,39 @@ mod tests {
             created_at: Utc::now(),
         };
         let msgpack = snapshot.to_bytes().unwrap();
+        assert_eq!(msgpack.first(), Some(&MANIFEST_FORMAT_MSGPACK));
         assert_eq!(NamedSnapshot::from_bytes(&msgpack).unwrap(), snapshot);
 
         let json = serde_json::to_vec(&snapshot).unwrap();
+        assert_eq!(json.first(), Some(&b'{'));
         assert_eq!(NamedSnapshot::from_bytes(&json).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn named_snapshot_format_dispatch_rejects_0x02_with_valid_payload() {
+        let snapshot = NamedSnapshot {
+            generation: 42,
+            created_at: Utc::now(),
+        };
+        let mut future_version = snapshot.to_bytes().unwrap().to_vec();
+        future_version[0] = 0x02;
+
+        let error = NamedSnapshot::from_bytes(&future_version).unwrap_err();
+        assert!(
+            matches!(&error, ZeppelinError::Serialization(message) if
+                message == "unsupported named snapshot format prefix 0x02; this binary reads 0x01 (MessagePack) and legacy JSON"),
+            "future snapshot format must fail with the exact compatibility error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn named_snapshot_format_dispatch_rejects_0x00_with_garbage() {
+        let error = NamedSnapshot::from_bytes(b"\x00not a named snapshot").unwrap_err();
+        assert!(
+            matches!(&error, ZeppelinError::Serialization(message) if
+                message == "unsupported named snapshot format prefix 0x00; this binary reads 0x01 (MessagePack) and legacy JSON"),
+            "unknown snapshot format must fail with the exact compatibility error, got {error:?}"
+        );
     }
 
     /// Lets namespace-wide inventories reuse the exact snapshot-key grammar
