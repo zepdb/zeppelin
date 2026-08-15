@@ -25,11 +25,7 @@ use common::server::{
 };
 
 fn require_minio() {
-    assert_eq!(
-        std::env::var("TEST_BACKEND").as_deref(),
-        Ok("minio"),
-        "typed ingest lifecycle tests require TEST_BACKEND=minio"
-    );
+    TestHarness::require_cas_backend();
 }
 
 async fn create_late_namespace(

@@ -193,11 +193,7 @@ async fn create_configured_namespace(
 
 #[tokio::test]
 async fn synthetic_target_queries_foreign_flat_segment_without_opening_admission() {
-    assert_eq!(
-        std::env::var("TEST_BACKEND").as_deref(),
-        Ok("minio"),
-        "artifact-origin routing requires real MinIO"
-    );
+    TestHarness::require_cas_backend();
 
     let harness = TestHarness::new().await;
     let source = harness.artifact_origin_namespace("source");
@@ -275,7 +271,7 @@ async fn synthetic_target_queries_foreign_flat_segment_without_opening_admission
 
 #[tokio::test]
 async fn synthetic_target_routes_flat_sq_bitmap_attrs_bm25_cache_and_reachability() {
-    assert_eq!(std::env::var("TEST_BACKEND").as_deref(), Ok("minio"));
+    TestHarness::require_cas_backend();
 
     let harness = TestHarness::new().await;
     let source = harness.artifact_origin_namespace("indexed-source");
@@ -438,7 +434,7 @@ async fn synthetic_target_routes_flat_sq_bitmap_attrs_bm25_cache_and_reachabilit
 
 #[tokio::test]
 async fn synthetic_target_hybrid_batch_shares_foreign_snapshot_and_isolates_entry_errors() {
-    assert_eq!(std::env::var("TEST_BACKEND").as_deref(), Ok("minio"));
+    TestHarness::require_cas_backend();
 
     let harness = TestHarness::new().await;
     let source = harness.artifact_origin_namespace("hybrid-source");
@@ -513,7 +509,7 @@ async fn synthetic_target_hybrid_batch_shares_foreign_snapshot_and_isolates_entr
 
 #[tokio::test]
 async fn synthetic_target_routes_hierarchical_pq_tree_nodes_and_codebooks() {
-    assert_eq!(std::env::var("TEST_BACKEND").as_deref(), Ok("minio"));
+    TestHarness::require_cas_backend();
 
     let harness = TestHarness::new().await;
     let source = harness.artifact_origin_namespace("hierarchical-source");
@@ -558,7 +554,7 @@ async fn synthetic_target_routes_hierarchical_pq_tree_nodes_and_codebooks() {
 
 #[tokio::test]
 async fn activated_branch_hydrates_physical_source_keys_under_logical_target_identity() {
-    assert_eq!(std::env::var("TEST_BACKEND").as_deref(), Ok("minio"));
+    TestHarness::require_cas_backend();
 
     let harness = TestHarness::new().await;
     let (source, _target, hydration_target) =
@@ -602,7 +598,7 @@ async fn activated_branch_hydrates_physical_source_keys_under_logical_target_ide
 
 #[tokio::test]
 async fn queued_branch_hydration_fenced_before_authority_read_never_touches_source() {
-    assert_eq!(std::env::var("TEST_BACKEND").as_deref(), Ok("minio"));
+    TestHarness::require_cas_backend();
     zeppelin::metrics::init();
 
     let harness = TestHarness::new().await;
@@ -678,7 +674,7 @@ async fn queued_branch_hydration_fenced_before_authority_read_never_touches_sour
 
 #[tokio::test]
 async fn branch_hydration_cancels_a_blocked_foreign_get_at_the_job_deadline() {
-    assert_eq!(std::env::var("TEST_BACKEND").as_deref(), Ok("minio"));
+    TestHarness::require_cas_backend();
     zeppelin::metrics::init();
 
     let harness = TestHarness::new().await;
@@ -739,7 +735,7 @@ async fn branch_hydration_cancels_a_blocked_foreign_get_at_the_job_deadline() {
 
 #[tokio::test]
 async fn hydration_retry_revalidates_fenced_branch_before_second_physical_attempt() {
-    assert_eq!(std::env::var("TEST_BACKEND").as_deref(), Ok("minio"));
+    TestHarness::require_cas_backend();
     zeppelin::metrics::init();
 
     let harness = TestHarness::new().await;
@@ -841,7 +837,7 @@ async fn hydration_retry_revalidates_fenced_branch_before_second_physical_attemp
 
 #[tokio::test]
 async fn synthetic_target_merges_foreign_and_local_wal_and_applies_local_tombstones() {
-    assert_eq!(std::env::var("TEST_BACKEND").as_deref(), Ok("minio"));
+    TestHarness::require_cas_backend();
 
     let harness = TestHarness::new().await;
     let source = harness.artifact_origin_namespace("mixed-source");

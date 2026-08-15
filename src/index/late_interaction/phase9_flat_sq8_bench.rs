@@ -1480,34 +1480,33 @@ fn decode_flat_artifact(bytes: &[u8]) -> BenchResult<ResidentFlatIndex> {
 }
 
 fn counting_minio_store() -> BenchResult<CountingStoreSetup> {
-    use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
-    use object_store::ClientOptions;
-
-    let bucket = env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "zeppelin-test".to_string());
-    let endpoint =
-        env::var("MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string());
-    let access_key = env::var("MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string());
-    let secret_key = env::var("MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string());
-    let inner = AmazonS3Builder::new()
-        .with_bucket_name(&bucket)
-        .with_region("us-east-1")
-        .with_endpoint(&endpoint)
-        .with_virtual_hosted_style_request(false)
-        .with_access_key_id(&access_key)
-        .with_secret_access_key(&secret_key)
-        .with_conditional_put(S3ConditionalPut::ETagMatch)
-        .with_client_options(
-            ClientOptions::new()
-                .with_allow_http(true)
-                .with_pool_max_idle_per_host(64),
-        )
-        .build()
+    // Route through the production transport constructor so this bench
+    // measures the exact client `from_config` builds — no second hand-built
+    // S3 store (multi-substrate invariant: src/storage/ is the only
+    // object_store importer).
+    let config = crate::config::StorageConfig {
+        backend: crate::config::StorageBackend::S3,
+        bucket: env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "zeppelin-test".to_string()),
+        s3_region: Some("us-east-1".to_string()),
+        s3_endpoint: Some(
+            env::var("MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string()),
+        ),
+        s3_access_key_id: Some(
+            env::var("MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string()),
+        ),
+        s3_secret_access_key: Some(
+            env::var("MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string()),
+        ),
+        s3_allow_http: true,
+        ..crate::config::StorageConfig::default()
+    };
+    let inner = ZeppelinStore::raw_backend_from_config(&config)
         .map_err(|error| format!("cannot build MinIO store: {error}"))?;
     let get_requests = Arc::new(AtomicU64::new(0));
     let put_requests = Arc::new(AtomicU64::new(0));
     let get_latency_ms = Arc::new(Mutex::new(Vec::new()));
     let counting = CountingStore {
-        inner: Arc::new(inner),
+        inner,
         get_requests: Arc::clone(&get_requests),
         put_requests: Arc::clone(&put_requests),
         get_latency_ms: Arc::clone(&get_latency_ms),

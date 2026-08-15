@@ -200,6 +200,23 @@ impl TestHarness {
         format!("{}/{}", self.prefix, suffix)
     }
 
+    /// Panics unless `TEST_BACKEND` names a CAS-capable real object store.
+    ///
+    /// Suites whose coverage is CAS-, concurrency-, or origin-shaped call
+    /// this instead of asserting a vendor name: under `minio` behavior is
+    /// unchanged, and the same coverage runs against the GCS/Azurite
+    /// emulators once their transports land. Fail-loud on a default run is
+    /// deliberate (see `tests/CLAUDE.md`) — do not convert this to a skip.
+    pub fn require_cas_backend() {
+        const CAS_BACKENDS: &[&str] = &["minio", "s3", "gcs", "azurite"];
+        let backend = std::env::var("TEST_BACKEND").unwrap_or_else(|_| "memory".to_string());
+        assert!(
+            CAS_BACKENDS.contains(&backend.as_str()),
+            "this suite requires a CAS-capable real object store; set TEST_BACKEND \
+             to one of {CAS_BACKENDS:?} (got {backend:?})"
+        );
+    }
+
     /// Build a URL-safe namespace owned by this fixture's random identity.
     pub fn artifact_origin_namespace(&self, suffix: &str) -> String {
         format!("{}-{suffix}", self.prefix)

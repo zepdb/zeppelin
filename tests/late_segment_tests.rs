@@ -81,11 +81,7 @@ impl TimeSource for AdjustableWallClock {
 }
 
 fn require_minio() {
-    assert_eq!(
-        std::env::var("TEST_BACKEND").as_deref(),
-        Ok("minio"),
-        "Phase 9 late-segment lifecycle requires TEST_BACKEND=minio"
-    );
+    TestHarness::require_cas_backend();
 }
 
 fn text_record(id: &str, text: &str, color: &str) -> RetrievalUnitRecord {

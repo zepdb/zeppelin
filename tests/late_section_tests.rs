@@ -12,11 +12,7 @@ use common::assertions::{assert_s3_object_exists, assert_s3_object_not_exists};
 use common::harness::TestHarness;
 
 fn require_minio() {
-    assert_eq!(
-        std::env::var("TEST_BACKEND").as_deref(),
-        Ok("minio"),
-        "late-section CAS and GC coverage requires TEST_BACKEND=minio"
-    );
+    TestHarness::require_cas_backend();
 }
 
 fn unsafe_short_gc(horizon_secs: u64) -> GcConfig {

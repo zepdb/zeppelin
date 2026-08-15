@@ -3045,6 +3045,37 @@ mod tests {
 
     use super::toggle_cas_precondition_failure_matching;
 
+    /// The CAS matchers key on `PutMode::Update(_)`, not on which token field
+    /// is populated — a generation-style token (backend version, no ETag)
+    /// must trigger injection exactly like an ETag token, or GCS-substrate
+    /// fault tests would silently stop injecting.
+    #[tokio::test]
+    async fn cas_matchers_trigger_for_backend_version_tokens() {
+        let base = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let key = "catalog/manifest.json";
+        base.put(key, Bytes::from_static(b"v1"))
+            .await
+            .expect("seed CAS object");
+        let (faulted, handle) = toggle_cas_precondition_failure_matching(&base, "catalog/");
+        handle.enable();
+
+        let generation_token =
+            zeppelin::storage::StorageVersion::from_parts(None, Some("12345".to_string()))
+                .expect("a backend-version-only token is constructible");
+        assert_eq!(
+            faulted
+                .put_if_match_outcome(key, Bytes::from_static(b"v2"), &generation_token)
+                .await
+                .expect("injected precondition must be a typed CAS conflict"),
+            ConditionalPutOutcome::Conflict
+        );
+        assert_eq!(handle.failures_injected(), 1);
+        assert_eq!(
+            faulted.get(key).await.expect("read after conflict"),
+            b"v1"[..]
+        );
+    }
+
     #[tokio::test]
     async fn matching_cas_precondition_failure_can_be_enabled_and_recovered() {
         let base = ZeppelinStore::new(Arc::new(InMemory::new()));

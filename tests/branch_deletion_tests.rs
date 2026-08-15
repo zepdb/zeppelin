@@ -14,6 +14,7 @@ use common::fault_injection::{
     fail_put_once_matching, pause_next_cas_matching, pause_next_get_matching,
     record_delete_operations,
 };
+use common::harness::TestHarness;
 use common::server::{
     client_with_bearer, scoped_test_security_store, start_test_server_full,
     start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer,
@@ -317,7 +318,7 @@ async fn assert_parent_delete_is_blocked(client: &reqwest::Client, base_url: &st
 
 #[tokio::test]
 async fn queued_branch_hydration_stops_at_deletion_fence_and_delete_resumes() {
-    assert_eq!(std::env::var("TEST_BACKEND").as_deref(), Ok("minio"));
+    TestHarness::require_cas_backend();
     zeppelin::metrics::init();
 
     let harness = common::harness::TestHarness::new().await;

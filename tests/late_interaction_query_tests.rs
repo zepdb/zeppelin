@@ -36,11 +36,7 @@ use common::server::{client_with_bearer, start_test_server_on_store_with_config}
 const TEXT_MODALITIES: &[InputModality] = &[InputModality::Text];
 
 fn require_minio() {
-    assert_eq!(
-        std::env::var("TEST_BACKEND").as_deref(),
-        Ok("minio"),
-        "Phase 7 query tests require TEST_BACKEND=minio"
-    );
+    TestHarness::require_cas_backend();
 }
 
 fn text_record(

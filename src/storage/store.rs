@@ -483,6 +483,29 @@ impl ZeppelinStore {
     /// builder call consumes and returns the builder, so rebinding `builder`
     /// models a checked construction pipeline without shared mutable state.
     pub fn from_config(config: &StorageConfig) -> Result<Self> {
+        let store = Self::raw_backend_from_config(config)?;
+        let capabilities = StorageCapabilities::for_backend(config.backend);
+        let prefix_delete_mode = if capabilities.native_batch_delete {
+            PrefixDeleteMode::NativeBatch
+        } else {
+            PrefixDeleteMode::LegacyPerKeyUnordered32
+        };
+        Ok(Self {
+            inner: store,
+            capabilities,
+            prefix_delete_mode,
+            content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
+            object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
+        })
+    }
+
+    /// Builds the raw `object_store` backend for a configuration.
+    ///
+    /// Crate-internal so instrumented test harnesses (the phase-9 counting
+    /// bench) can wrap the exact production transport instead of carrying a
+    /// second hand-built S3 client — `src/storage/` stays the only
+    /// `object_store` importer.
+    pub(crate) fn raw_backend_from_config(config: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
         let store: Arc<dyn ObjectStore> =
             match config.backend {
                 crate::config::StorageBackend::S3 => {
@@ -557,20 +580,7 @@ impl ZeppelinStore {
                     )));
                 }
             };
-
-        let capabilities = StorageCapabilities::for_backend(config.backend);
-        let prefix_delete_mode = if capabilities.native_batch_delete {
-            PrefixDeleteMode::NativeBatch
-        } else {
-            PrefixDeleteMode::LegacyPerKeyUnordered32
-        };
-        Ok(Self {
-            inner: store,
-            capabilities,
-            prefix_delete_mode,
-            content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
-            object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
-        })
+        Ok(store)
     }
 
     /// Returns the declared capability matrix for the constructed substrate.
@@ -2160,7 +2170,14 @@ impl ZeppelinStore {
                     });
                 }
                 Err(object_store::Error::NotFound { path, .. })
-                    if expected_path.is_some_and(|expected| expected.as_ref() == path) => {}
+                    if expected_path.is_some_and(|expected| {
+                        // LocalFileSystem reports the absolute filesystem
+                        // path rather than the object key; anchor the suffix
+                        // on a separator so one key cannot satisfy another
+                        // key's absence. Remote backends match exactly.
+                        let expected = expected.as_ref();
+                        path == expected || path.ends_with(&format!("/{expected}"))
+                    }) => {}
                 Err(object_store::Error::NotFound { path, source }) => {
                     first_error.get_or_insert(object_store::Error::NotFound { path, source });
                 }

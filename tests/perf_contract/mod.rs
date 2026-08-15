@@ -176,18 +176,29 @@ pub(crate) fn require_minio() {
     }
 }
 
+/// CAS-capable real object stores the performance contracts may run against.
+/// Baselines were calibrated on MinIO; emulator runs exercise the same
+/// contract shape (op-count censuses are substrate-neutral).
+const CAS_BACKENDS: &[&str] = &["minio", "s3", "gcs", "azurite"];
+
 fn validate_minio_environment(
     backend: Option<&str>,
     grouping_override: Option<&str>,
 ) -> Result<(), String> {
     match backend {
-        Some("minio") => {}
+        Some(backend) if CAS_BACKENDS.contains(&backend) => {}
         Some(backend) => {
             return Err(format!(
-                "performance contracts require TEST_BACKEND=minio, got {backend:?}"
+                "performance contracts require a CAS-capable real store \
+                 (TEST_BACKEND one of {CAS_BACKENDS:?}), got {backend:?}"
             ));
         }
-        None => return Err("performance contracts require TEST_BACKEND=minio".to_string()),
+        None => {
+            return Err(format!(
+                "performance contracts require a CAS-capable real store \
+                 (TEST_BACKEND one of {CAS_BACKENDS:?})"
+            ))
+        }
     }
     if let Some(value) = grouping_override {
         return Err(format!(
