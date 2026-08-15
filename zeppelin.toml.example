@@ -65,9 +65,12 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # max_depth = 16                     # ancestry depth; valid range 1..=64
 
 [storage]
-# backend = "s3"                     # STORAGE_BACKEND — "s3" or "local" (gcs/azure planned)
-# bucket = "zeppelin"                # S3_BUCKET
+# backend = "s3"                     # STORAGE_BACKEND — "s3", "gcs", "azure", or "local"
+# bucket = "zeppelin"                # S3_BUCKET — bucket (S3/GCS) or container (Azure)
 # fail_fast = true                   # ZEPPELIN_STORAGE_FAIL_FAST; false allows intentionally degraded boot
+
+# Fields from a backend family other than the selected backend are a
+# configuration error, never silently ignored.
 
 # S3 / MinIO / R2
 # s3_region = "us-east-1"            # AWS_REGION
@@ -75,6 +78,18 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # s3_access_key_id = ""              # AWS_ACCESS_KEY_ID
 # s3_secret_access_key = ""          # AWS_SECRET_ACCESS_KEY
 # s3_allow_http = false              # S3_ALLOW_HTTP — "true" for local MinIO
+
+# GCS
+# gcs_service_account_path = ""      # GCS_SERVICE_ACCOUNT_PATH — service-account JSON file
+# gcs_service_account_key = ""       # GCS_SERVICE_ACCOUNT_KEY — inline JSON (exclusive with the path)
+# gcs_endpoint = ""                  # GCS_ENDPOINT — emulator only (fake-gcs-server); http:// implies allow-http
+
+# Azure Blob
+# azure_account_name = ""            # AZURE_STORAGE_ACCOUNT_NAME
+# azure_access_key = ""              # AZURE_STORAGE_ACCESS_KEY
+# azure_endpoint = ""                # AZURE_ENDPOINT — emulator / private endpoint
+# azure_use_emulator = false         # AZURE_USE_EMULATOR — Azurite well-known dev account
+# azure_allow_http = false           # AZURE_ALLOW_HTTP
 
 [cache]
 # dir = "/var/cache/zeppelin"        # ZEPPELIN_CACHE_DIR

@@ -128,6 +128,7 @@ impl TestHarness {
                     s3_secret_access_key: None,
                     s3_allow_http: false,
                     fail_fast: true,
+                    ..StorageConfig::default()
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")
             }
@@ -144,6 +145,7 @@ impl TestHarness {
                         .map(|v| v == "true")
                         .unwrap_or(false),
                     fail_fast: true,
+                    ..StorageConfig::default()
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")
             }
@@ -166,6 +168,7 @@ impl TestHarness {
                     ),
                     s3_allow_http: true,
                     fail_fast: true,
+                    ..StorageConfig::default()
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")
             }

@@ -1353,6 +1353,7 @@ fn minio_storage_config() -> Result<StorageConfig> {
         ),
         s3_allow_http: true,
         fail_fast: true,
+        ..StorageConfig::default()
     })
 }
 

@@ -121,16 +121,46 @@ pub fn render_toml(knobs: &TunedKnobs) -> String {
         &mut output,
         &format!("bucket = {}", toml_quote(&knobs.bucket)),
     );
-    if knobs.cloud == Cloud::Aws {
-        push_line(
-            &mut output,
-            &format!("s3_region = {}", toml_quote(&knobs.region)),
-        );
-    } else {
-        push_line(
-            &mut output,
-            "# Region is a placement/pricing choice; this backend obtains it from provider configuration.",
-        );
+    match knobs.cloud {
+        Cloud::Aws => {
+            push_line(
+                &mut output,
+                &format!("s3_region = {}", toml_quote(&knobs.region)),
+            );
+        }
+        Cloud::Gcp => {
+            push_line(
+                &mut output,
+                "# Region is a placement/pricing choice; this backend obtains it from provider configuration.",
+            );
+            push_line(
+                &mut output,
+                "# Fill in the service-account credential before boot (GCS_SERVICE_ACCOUNT_PATH):",
+            );
+            push_line(
+                &mut output,
+                "# gcs_service_account_path = \"/etc/zeppelin/gcs-service-account.json\"",
+            );
+        }
+        Cloud::Azure => {
+            push_line(
+                &mut output,
+                "# Region is a placement/pricing choice; this backend obtains it from provider configuration.",
+            );
+            push_line(
+                &mut output,
+                "# Replace with the real storage account before boot (AZURE_STORAGE_ACCOUNT_NAME /",
+            );
+            push_line(
+                &mut output,
+                "# AZURE_STORAGE_ACCESS_KEY). An unedited placeholder fails the fail_fast boot probe.",
+            );
+            push_line(
+                &mut output,
+                "azure_account_name = \"REPLACE-WITH-YOUR-STORAGE-ACCOUNT\"",
+            );
+            push_line(&mut output, "# azure_access_key = \"\"");
+        }
     }
     push_line(&mut output, "fail_fast = true");
     push_line(&mut output, "");
@@ -326,7 +356,7 @@ pub fn render_toml(knobs: &TunedKnobs) -> String {
     push_line(&mut output, "# Not tunable without a code change:");
     push_line(
         &mut output,
-        "# - S3 retries=2, request timeout=30s, connection pool=64",
+        "# - object-store retries=5 (100ms..5s backoff), request timeout=30s, connection pool=64",
     );
     push_line(
         &mut output,

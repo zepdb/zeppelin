@@ -1073,6 +1073,14 @@ mod tests {
                 "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY",
                 "S3_ALLOW_HTTP",
+                "GCS_SERVICE_ACCOUNT_PATH",
+                "GCS_SERVICE_ACCOUNT_KEY",
+                "GCS_ENDPOINT",
+                "AZURE_STORAGE_ACCOUNT_NAME",
+                "AZURE_STORAGE_ACCESS_KEY",
+                "AZURE_ENDPOINT",
+                "AZURE_USE_EMULATOR",
+                "AZURE_ALLOW_HTTP",
                 "ZEPPELIN_STORAGE_FAIL_FAST",
                 "ZEPPELIN_CACHE_DIR",
                 "ZEPPELIN_CACHE_MAX_SIZE_GB",
@@ -1888,6 +1896,222 @@ mod tests {
         assert!(config.query.cost_latency_profile.is_none());
     }
 
+    /// Each non-S3 backend block parses through the real loader.
+    #[test]
+    fn storage_backend_blocks_parse_for_gcs_and_azure() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+        let gcs = Config::load_from_str(
+            r#"
+            [security]
+            mode = "open_unsafe"
+
+            [storage]
+            backend = "gcs"
+            bucket = "zeppelin-gcs"
+            gcs_service_account_path = "/etc/zeppelin/gcs.json"
+            gcs_endpoint = "http://127.0.0.1:4443"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(gcs.storage.backend, StorageBackend::Gcs);
+        assert_eq!(
+            gcs.storage.gcs_service_account_path.as_deref(),
+            Some("/etc/zeppelin/gcs.json")
+        );
+        assert_eq!(
+            gcs.storage.gcs_endpoint.as_deref(),
+            Some("http://127.0.0.1:4443")
+        );
+
+        let azure = Config::load_from_str(
+            r#"
+            [security]
+            mode = "open_unsafe"
+
+            [storage]
+            backend = "azure"
+            bucket = "zeppelin-container"
+            azure_use_emulator = true
+            azure_allow_http = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(azure.storage.backend, StorageBackend::Azure);
+        assert!(azure.storage.azure_use_emulator);
+        assert!(azure.storage.azure_allow_http);
+    }
+
+    /// A field belonging to a non-selected backend family is a hard error,
+    /// never silently ignored.
+    #[test]
+    fn storage_foreign_backend_fields_are_rejected() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+        let cases = [
+            (
+                r#"
+                [security]
+                mode = "open_unsafe"
+
+                [storage]
+                backend = "s3"
+                gcs_service_account_path = "/etc/zeppelin/gcs.json"
+                "#,
+                "storage.gcs_service_account_path",
+            ),
+            (
+                r#"
+                [security]
+                mode = "open_unsafe"
+
+                [storage]
+                backend = "gcs"
+                s3_endpoint = "http://127.0.0.1:9000"
+                "#,
+                "storage.s3_endpoint",
+            ),
+            (
+                r#"
+                [security]
+                mode = "open_unsafe"
+
+                [storage]
+                backend = "local"
+                bucket = "/tmp/zeppelin-test"
+                azure_use_emulator = true
+                "#,
+                "storage.azure_use_emulator",
+            ),
+        ];
+        for (toml, expected_field) in cases {
+            let message = Config::load_from_str(toml).unwrap_err().to_string();
+            assert!(
+                message.contains(expected_field),
+                "expected violation naming {expected_field}, got: {message}"
+            );
+        }
+    }
+
+    /// GCS credentials must come from exactly one source.
+    #[test]
+    fn gcs_credential_sources_are_mutually_exclusive() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+        let message = Config::load_from_str(
+            r#"
+            [security]
+            mode = "open_unsafe"
+
+            [storage]
+            backend = "gcs"
+            gcs_service_account_path = "/etc/zeppelin/gcs.json"
+            gcs_service_account_key = "{}"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("mutually exclusive"),
+            "expected mutual-exclusion violation, got: {message}"
+        );
+    }
+
+    /// Azure needs a storage account unless the Azurite emulator is selected.
+    #[test]
+    fn azure_without_account_name_requires_emulator() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+        let message = Config::load_from_str(
+            r#"
+            [security]
+            mode = "open_unsafe"
+
+            [storage]
+            backend = "azure"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("azure_account_name"),
+            "expected the account-name requirement, got: {message}"
+        );
+
+        Config::load_from_str(
+            r#"
+            [security]
+            mode = "open_unsafe"
+
+            [storage]
+            backend = "azure"
+            azure_use_emulator = true
+            "#,
+        )
+        .expect("emulator mode needs no account name");
+    }
+
+    /// The new storage env overrides replace file values.
+    #[test]
+    fn storage_env_overrides_replace_file_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        std::env::set_var("GCS_SERVICE_ACCOUNT_PATH", "/env/gcs.json");
+        std::env::set_var("GCS_ENDPOINT", "http://127.0.0.1:5555");
+        let mut gcs = Config::load_from_str(
+            r#"
+            [security]
+            mode = "open_unsafe"
+
+            [storage]
+            backend = "gcs"
+            gcs_service_account_path = "/file/gcs.json"
+            gcs_endpoint = "http://127.0.0.1:4443"
+            "#,
+        )
+        .unwrap();
+        gcs.apply_env_overrides().unwrap();
+        assert_eq!(
+            gcs.storage.gcs_service_account_path.as_deref(),
+            Some("/env/gcs.json")
+        );
+        assert_eq!(
+            gcs.storage.gcs_endpoint.as_deref(),
+            Some("http://127.0.0.1:5555")
+        );
+        std::env::remove_var("GCS_SERVICE_ACCOUNT_PATH");
+        std::env::remove_var("GCS_ENDPOINT");
+
+        std::env::set_var("AZURE_STORAGE_ACCOUNT_NAME", "envaccount");
+        std::env::set_var("AZURE_STORAGE_ACCESS_KEY", "envkey");
+        std::env::set_var("AZURE_USE_EMULATOR", "true");
+        std::env::set_var("AZURE_ALLOW_HTTP", "true");
+        let mut azure = Config::load_from_str(
+            r#"
+            [security]
+            mode = "open_unsafe"
+
+            [storage]
+            backend = "azure"
+            azure_account_name = "fileaccount"
+            "#,
+        )
+        .unwrap();
+        azure.apply_env_overrides().unwrap();
+        assert_eq!(
+            azure.storage.azure_account_name.as_deref(),
+            Some("envaccount")
+        );
+        assert_eq!(azure.storage.azure_access_key.as_deref(), Some("envkey"));
+        assert!(azure.storage.azure_use_emulator);
+        assert!(azure.storage.azure_allow_http);
+        std::env::remove_var("AZURE_STORAGE_ACCOUNT_NAME");
+        std::env::remove_var("AZURE_STORAGE_ACCESS_KEY");
+        std::env::remove_var("AZURE_USE_EMULATOR");
+        std::env::remove_var("AZURE_ALLOW_HTTP");
+    }
+
     /// Pins each named query profile to its intended concrete byte gap.
     #[test]
     fn cost_latency_profiles_map_to_expected_gaps() {
@@ -2524,6 +2748,40 @@ pub struct StorageConfig {
     /// Allow plain HTTP (non-TLS) connections to S3. Default: `false`.
     #[serde(default)]
     pub s3_allow_http: bool,
+
+    // GCS transport settings (env override in parentheses).
+    /// Path to a GCS service-account JSON file (`GCS_SERVICE_ACCOUNT_PATH`).
+    #[serde(default)]
+    pub gcs_service_account_path: Option<String>,
+    /// Inline GCS service-account JSON, mutually exclusive with the path
+    /// (`GCS_SERVICE_ACCOUNT_KEY`).
+    #[serde(default)]
+    pub gcs_service_account_key: Option<String>,
+    /// Custom GCS endpoint for emulator deployments (`GCS_ENDPOINT`). Plain
+    /// HTTP is allowed exactly when this URL's scheme is `http://`.
+    #[serde(default)]
+    pub gcs_endpoint: Option<String>,
+
+    // Azure Blob transport settings (env override in parentheses).
+    /// Azure storage account name (`AZURE_STORAGE_ACCOUNT_NAME`).
+    #[serde(default)]
+    pub azure_account_name: Option<String>,
+    /// Azure storage account access key (`AZURE_STORAGE_ACCESS_KEY`).
+    #[serde(default)]
+    pub azure_access_key: Option<String>,
+    /// Custom Azure endpoint for emulator or private deployments
+    /// (`AZURE_ENDPOINT`).
+    #[serde(default)]
+    pub azure_endpoint: Option<String>,
+    /// Use the Azurite emulator's well-known dev account and endpoint
+    /// (`AZURE_USE_EMULATOR`). Default: `false`.
+    #[serde(default)]
+    pub azure_use_emulator: bool,
+    /// Allow plain HTTP (non-TLS) connections to Azure (`AZURE_ALLOW_HTTP`).
+    /// Default: `false`.
+    #[serde(default)]
+    pub azure_allow_http: bool,
+
     /// Probe storage during boot and refuse to serve if it is unavailable. Default: `true`.
     #[serde(default = "default_storage_fail_fast")]
     pub fail_fast: bool,
@@ -3135,6 +3393,14 @@ impl Default for StorageConfig {
             s3_access_key_id: None,
             s3_secret_access_key: None,
             s3_allow_http: false,
+            gcs_service_account_path: None,
+            gcs_service_account_key: None,
+            gcs_endpoint: None,
+            azure_account_name: None,
+            azure_access_key: None,
+            azure_endpoint: None,
+            azure_use_emulator: false,
+            azure_allow_http: false,
             fail_fast: default_storage_fail_fast(),
         }
     }
@@ -3535,6 +3801,86 @@ impl Config {
                  policy publication; backend '{}' cannot provide it",
                 self.storage.backend
             ));
+        }
+
+        // Storage backend/field coherence: a field belonging to a non-selected
+        // backend family is configuration drift and is never silently ignored.
+        let non_empty =
+            |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
+        let mut set_storage_fields: Vec<(&str, &str)> = Vec::new();
+        if non_empty(&self.storage.s3_region) {
+            set_storage_fields.push(("s3", "s3_region"));
+        }
+        if non_empty(&self.storage.s3_endpoint) {
+            set_storage_fields.push(("s3", "s3_endpoint"));
+        }
+        if non_empty(&self.storage.s3_access_key_id) {
+            set_storage_fields.push(("s3", "s3_access_key_id"));
+        }
+        if non_empty(&self.storage.s3_secret_access_key) {
+            set_storage_fields.push(("s3", "s3_secret_access_key"));
+        }
+        if self.storage.s3_allow_http {
+            set_storage_fields.push(("s3", "s3_allow_http"));
+        }
+        if non_empty(&self.storage.gcs_service_account_path) {
+            set_storage_fields.push(("gcs", "gcs_service_account_path"));
+        }
+        if non_empty(&self.storage.gcs_service_account_key) {
+            set_storage_fields.push(("gcs", "gcs_service_account_key"));
+        }
+        if non_empty(&self.storage.gcs_endpoint) {
+            set_storage_fields.push(("gcs", "gcs_endpoint"));
+        }
+        if non_empty(&self.storage.azure_account_name) {
+            set_storage_fields.push(("azure", "azure_account_name"));
+        }
+        if non_empty(&self.storage.azure_access_key) {
+            set_storage_fields.push(("azure", "azure_access_key"));
+        }
+        if non_empty(&self.storage.azure_endpoint) {
+            set_storage_fields.push(("azure", "azure_endpoint"));
+        }
+        if self.storage.azure_use_emulator {
+            set_storage_fields.push(("azure", "azure_use_emulator"));
+        }
+        if self.storage.azure_allow_http {
+            set_storage_fields.push(("azure", "azure_allow_http"));
+        }
+        let selected_family = match self.storage.backend {
+            StorageBackend::S3 => Some("s3"),
+            StorageBackend::Gcs => Some("gcs"),
+            StorageBackend::Azure => Some("azure"),
+            StorageBackend::Local => None,
+        };
+        for (family, field) in set_storage_fields {
+            if Some(family) != selected_family {
+                violations.push(format!(
+                    "storage.{field} is set but storage.backend = \"{}\"; remove the \
+                     {family}_* fields or select the matching backend",
+                    self.storage.backend
+                ));
+            }
+        }
+        if matches!(self.storage.backend, StorageBackend::Gcs)
+            && non_empty(&self.storage.gcs_service_account_path)
+            && non_empty(&self.storage.gcs_service_account_key)
+        {
+            violations.push(
+                "storage.gcs_service_account_path and storage.gcs_service_account_key \
+                 are mutually exclusive; configure exactly one credential source"
+                    .to_string(),
+            );
+        }
+        if matches!(self.storage.backend, StorageBackend::Azure)
+            && !self.storage.azure_use_emulator
+            && !non_empty(&self.storage.azure_account_name)
+        {
+            violations.push(
+                "storage.backend = \"azure\" requires storage.azure_account_name \
+                 (or storage.azure_use_emulator = true for Azurite)"
+                    .to_string(),
+            );
         }
         if self.security.mode == SecurityMode::Enforced
             && self.security.cursor_hmac_key_hex.is_empty()
@@ -4380,6 +4726,30 @@ impl Config {
         }
         if let Some(v) = env_override("S3_ALLOW_HTTP")? {
             self.storage.s3_allow_http = v;
+        }
+        if let Some(v) = env_override::<String>("GCS_SERVICE_ACCOUNT_PATH")? {
+            self.storage.gcs_service_account_path = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Some(v) = env_override::<String>("GCS_SERVICE_ACCOUNT_KEY")? {
+            self.storage.gcs_service_account_key = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Some(v) = env_override::<String>("GCS_ENDPOINT")? {
+            self.storage.gcs_endpoint = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Some(v) = env_override::<String>("AZURE_STORAGE_ACCOUNT_NAME")? {
+            self.storage.azure_account_name = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Some(v) = env_override::<String>("AZURE_STORAGE_ACCESS_KEY")? {
+            self.storage.azure_access_key = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Some(v) = env_override::<String>("AZURE_ENDPOINT")? {
+            self.storage.azure_endpoint = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Some(v) = env_override("AZURE_USE_EMULATOR")? {
+            self.storage.azure_use_emulator = v;
+        }
+        if let Some(v) = env_override("AZURE_ALLOW_HTTP")? {
+            self.storage.azure_allow_http = v;
         }
         if let Some(v) = env_override("ZEPPELIN_STORAGE_FAIL_FAST")? {
             self.storage.fail_fast = v;

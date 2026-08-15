@@ -116,6 +116,69 @@ fn every_catalog_instance_cache_security_and_fts_shape_round_trips() {
     assert_eq!(rendered_count, (40 + 21 + 17) * 2 * 2 * 2);
 }
 
+/// GCP and Azure emits pass full validation, carry their per-cloud storage
+/// fields, and pin the transport gap: `ZeppelinStore::from_config` still
+/// rejects the emitted backend until the GCS/Azure transports land
+/// (multi-substrate plans 05/06 flip this assertion to construct-success).
+#[test]
+fn gcp_and_azure_emits_carry_storage_fields_and_pin_transport_gap() {
+    let catalog = Catalog::embedded();
+    for (cloud, expected_lines, transport_gap) in [
+        (
+            Cloud::Gcp,
+            &["backend = \"gcs\"", "# gcs_service_account_path ="][..],
+            "unsupported storage backend: gcs",
+        ),
+        (
+            Cloud::Azure,
+            &[
+                "backend = \"azure\"",
+                "azure_account_name = \"REPLACE-WITH-YOUR-STORAGE-ACCOUNT\"",
+            ][..],
+            "unsupported storage backend: azure",
+        ),
+    ] {
+        let instance = catalog
+            .clouds
+            .get(&cloud)
+            .and_then(|cloud_catalog| cloud_catalog.instances.first())
+            .unwrap_or_else(|| panic!("catalog has no {} instances", cloud.name()));
+        let knobs = tune_fixture(
+            cloud,
+            instance,
+            CacheSelection::Block {
+                tier: "gp3".to_string(),
+                volume_gb: 750,
+            },
+            SecurityChoice::OpenUnsafe,
+            false,
+            SafetyIntervals::default(),
+        );
+        let rendered = render_and_validate(&knobs)
+            .unwrap_or_else(|error| panic!("{} emit failed validation: {error}", cloud.name()));
+        for line in expected_lines {
+            assert!(
+                rendered.text().contains(line),
+                "{} emit must contain {line:?}",
+                cloud.name()
+            );
+        }
+        let error = match zeppelin::storage::ZeppelinStore::from_config(&rendered.config().storage)
+        {
+            Ok(_) => panic!(
+                "{} transport arm has not landed yet; construction must fail loudly",
+                cloud.name()
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(transport_gap),
+            "{} construction error must name the unsupported backend, got: {error}",
+            cloud.name()
+        );
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 64,
