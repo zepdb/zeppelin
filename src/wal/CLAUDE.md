@@ -57,6 +57,11 @@ block or deadlock. Two-layer defense for distributed writes is deliberate:
 fencing check **and** CAS. Fencing alone has a TOCTOU gap; CAS alone does not
 detect a stale token. Do not remove either layer.
 
+First lease acquisition is a create-only PUT, relying on the capability that
+every substrate declares and the boot probe verifies. A create collision must
+re-read the authoritative lease within the bounded five-attempt acquisition
+loop; never fall back to an unconditional PUT.
+
 ## Manifest pruning
 
 `prune()` caps **old segments only** (default 10). `pending_deletes` is

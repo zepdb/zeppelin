@@ -160,7 +160,8 @@ ClockExpireLease ==
 \* Writer w1 Protocol
 \* ==========================================================================
 
-\* Step 1: Acquire lease. Succeeds only if no one holds it, or lease expired.
+\* Step 1: Acquire lease. The create-only/CAS implementation matches this
+\* atomic step. Succeeds only if no one holds it, or lease expired.
 W1_AcquireLease ==
     /\ w1_pc = "idle"
     /\ \/ lease_holder = "none"                  \* No one holds lease

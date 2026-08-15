@@ -48,9 +48,10 @@
 //!   process takes over; release is deliberately best-effort.
 //! - Wall-clock expiry and holder identity are necessary coordination signals,
 //!   but correctness-sensitive writes still require fencing plus manifest CAS.
-//! - Initial creation is an unconditional PUT and relies on Zeppelin's v1
-//!   single-writer-per-namespace operating rule. Expired-object takeover and
-//!   renewal use ETag CAS. Renewal treats the returned ETag as an optimistic
+//! - Initial creation uses create-only PUT, a capability declared for and
+//!   boot-verified on every supported substrate. A collision is re-read within
+//!   the bounded acquisition loop. Expired-object takeover and renewal use
+//!   version CAS. Renewal treats the returned version as an optimistic
 //!   precondition; one authoritative read classifies a conflict before one
 //!   bounded retry.
 //!
@@ -74,8 +75,10 @@ use std::time::Duration;
 use tracing::{debug, instrument, warn};
 
 use crate::error::{Result, ZeppelinError};
-use crate::storage::{StorageVersion, ZeppelinStore};
+use crate::storage::{CreateOnlyOutcome, StorageVersion, ZeppelinStore};
 use crate::time::Clock;
+
+const LEASE_ACQUIRE_ATTEMPTS: usize = 5;
 
 /// A process's snapshot of the time-bounded write lease for one namespace.
 ///
@@ -249,27 +252,28 @@ impl LeaseManager {
     ///
     /// Returns storage or JSON errors when the authoritative object cannot be
     /// read, written, or decoded. Returns [`ZeppelinError::LeaseHeld`] when an
-    /// unexpired holder exists or when expired-lease CAS loses a takeover race.
+    /// unexpired holder exists, when expired-lease CAS loses a takeover race,
+    /// or when repeated create-only collisions exhaust the acquisition bound.
     /// Returns [`ZeppelinError::MissingVersionToken`] when takeover reads an
     /// expired lease the backend reports no identity for, because the CAS that
     /// would replace it has nothing to compare against.
     ///
     /// # Side Effects
     ///
-    /// Performs one GET first. First acquisition then performs one unconditional
-    /// PUT; takeover performs one conditional PUT. Neither confirms with a
-    /// follow-up read. It also emits structured acquisition diagnostics.
+    /// Performs one GET first. First acquisition then performs one create-only
+    /// PUT; a collision restarts the read within a five-attempt bound. Takeover
+    /// performs one conditional PUT. A successful write is not confirmed with
+    /// a follow-up read. It also emits structured acquisition diagnostics.
     ///
     /// # Consistency
     ///
-    /// Expired takeover uses CAS, so two contenders based on the same observed
-    /// identity cannot both replace it. Initial creation is not conditional and
-    /// therefore relies on Zeppelin's v1 single-writer-per-namespace operating
-    /// rule; a lost creation race leaves this caller holding an identity that is
-    /// no longer current, and its first renewal CAS fails rather than
-    /// overwriting the winner. The returned token still must be used with fenced
-    /// manifest CAS; lease acquisition by itself does not publish or protect
-    /// data artifacts.
+    /// Initial creation uses the create-only capability declared for and
+    /// boot-verified on every supported substrate, so concurrent missing-object
+    /// acquisitions cannot both succeed. A collision re-reads authoritative
+    /// state. Expired takeover uses CAS, so two contenders based on the same
+    /// observed identity cannot both replace it. The returned token still must
+    /// be used with fenced manifest CAS; lease acquisition by itself does not
+    /// publish or protect data artifacts.
     ///
     /// # Performance
     ///
@@ -279,7 +283,8 @@ impl LeaseManager {
     /// # Examples
     ///
     /// ```text
-    /// no lease object       -> PUT token 1, keeping the identity it returns
+    /// no lease object       -> CREATE token 1, keeping the identity it returns
+    /// creation race lost    -> re-read the winner within the attempt bound
     /// live token 4          -> LeaseHeld; object unchanged
     /// expired token 4, v20  -> PUT-if-v20 token 5, keeping the new identity
     /// expired token 4 race  -> loser maps the CAS conflict to LeaseHeld
@@ -288,54 +293,68 @@ impl LeaseManager {
     pub async fn acquire(&self, namespace: &str) -> Result<Lease> {
         let key = lease_key(namespace);
 
-        match self.store.get_with_meta(&key).await {
-            Err(ZeppelinError::NotFound { .. }) => {
-                // No existing lease — create the first one. The PUT reports the
-                // identity it created, so no confirming read is needed.
-                let mut lease = self.build_lease(1);
-                let data = serde_json::to_vec_pretty(&lease)?;
-                lease.version = self.store.put_with_version(&key, Bytes::from(data)).await?;
-                debug!(fencing_token = lease.fencing_token, "lease acquired (new)");
-                Ok(lease)
-            }
-            Ok((data, version)) => {
-                let existing: Lease = serde_json::from_slice(&data)?;
-
-                if existing.expires_at > self.clock.now() {
-                    // Lease is still valid — reject.
-                    return Err(ZeppelinError::LeaseHeld {
-                        namespace: namespace.to_string(),
-                        holder: existing.holder_id,
-                    });
+        for _attempt in 0..LEASE_ACQUIRE_ATTEMPTS {
+            match self.store.get_with_meta(&key).await {
+                Err(ZeppelinError::NotFound { .. }) => {
+                    // No existing lease — atomically create the first one. The
+                    // PUT reports the identity it created, so no confirming
+                    // read is needed. A collision means another creator won
+                    // after this GET missed; re-read its authoritative record.
+                    let mut lease = self.build_lease(1);
+                    let data = Bytes::from(serde_json::to_vec_pretty(&lease)?);
+                    match self.store.put_create_outcome(&key, data).await? {
+                        CreateOnlyOutcome::Created { version } => {
+                            lease.version = version;
+                            debug!(fencing_token = lease.fencing_token, "lease acquired (new)");
+                            return Ok(lease);
+                        }
+                        CreateOnlyOutcome::AlreadyExists => continue,
+                    }
                 }
+                Ok((data, version)) => {
+                    let existing: Lease = serde_json::from_slice(&data)?;
 
-                // Lease expired — takeover via CAS against the observed identity.
-                let new_token = existing.fencing_token + 1;
-                let mut lease = self.build_lease(new_token);
-                let data = Bytes::from(serde_json::to_vec_pretty(&lease)?);
-                let observed = StorageVersion::require(version.as_ref(), &key)?;
-
-                // The conditional PUT reports the identity it installed, so the
-                // takeover needs no confirming read.
-                lease.version = self
-                    .store
-                    .put_if_match(&key, data, observed, namespace)
-                    .await
-                    .map_err(|e| match e {
-                        ZeppelinError::ManifestConflict { .. } => ZeppelinError::LeaseHeld {
+                    if existing.expires_at > self.clock.now() {
+                        // Lease is still valid — reject.
+                        return Err(ZeppelinError::LeaseHeld {
                             namespace: namespace.to_string(),
-                            holder: "unknown (race)".to_string(),
-                        },
-                        other => other,
-                    })?;
-                debug!(
-                    fencing_token = lease.fencing_token,
-                    "lease acquired (takeover)"
-                );
-                Ok(lease)
+                            holder: existing.holder_id,
+                        });
+                    }
+
+                    // Lease expired — takeover via CAS against the observed identity.
+                    let new_token = existing.fencing_token + 1;
+                    let mut lease = self.build_lease(new_token);
+                    let data = Bytes::from(serde_json::to_vec_pretty(&lease)?);
+                    let observed = StorageVersion::require(version.as_ref(), &key)?;
+
+                    // The conditional PUT reports the identity it installed, so the
+                    // takeover needs no confirming read.
+                    lease.version = self
+                        .store
+                        .put_if_match(&key, data, observed, namespace)
+                        .await
+                        .map_err(|e| match e {
+                            ZeppelinError::ManifestConflict { .. } => ZeppelinError::LeaseHeld {
+                                namespace: namespace.to_string(),
+                                holder: "unknown (race)".to_string(),
+                            },
+                            other => other,
+                        })?;
+                    debug!(
+                        fencing_token = lease.fencing_token,
+                        "lease acquired (takeover)"
+                    );
+                    return Ok(lease);
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
+
+        Err(ZeppelinError::LeaseHeld {
+            namespace: namespace.to_string(),
+            holder: "unknown (race)".to_string(),
+        })
     }
 
     /// Replaces a still-owned lease record with the same token and a fresh expiry.

@@ -74,6 +74,59 @@ async fn test_lease_acquire_and_release() {
     harness.cleanup().await;
 }
 
+/// Concurrent first acquisition linearizes at the create-only PUT.
+///
+/// The first manager is paused after its GET misses but before its create
+/// reaches storage. The second manager therefore observes the same miss and
+/// wins the create; releasing the barrier makes the first create collide and
+/// forces it to re-read the winner as a held lease.
+#[tokio::test]
+async fn concurrent_first_lease_acquisition_is_create_only() {
+    let harness = TestHarness::new().await;
+    let ns = harness.artifact_origin_namespace("lease-first-create-race");
+    let lease_key = format!("{ns}/lease.json");
+    let (barrier_store, create_barrier) =
+        common::fault_injection::pause_first_create_matching(&harness.store, &lease_key);
+
+    let first_manager = LeaseManager::new(
+        barrier_store.clone(),
+        "node-first-paused".to_string(),
+        Duration::from_secs(30),
+    );
+    let second_manager = LeaseManager::new(
+        barrier_store,
+        "node-second-winner".to_string(),
+        Duration::from_secs(30),
+    );
+
+    let first_ns = ns.clone();
+    let first = tokio::spawn(async move { first_manager.acquire(&first_ns).await });
+    create_barrier.wait_until_paused().await;
+
+    let second_result = second_manager.acquire(&ns).await;
+    create_barrier.release();
+    let first_result = first.await.expect("first acquisition task must join");
+
+    let (winner, loser) = match (first_result, second_result) {
+        (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+        outcomes => panic!("exactly one first acquisition must win: {outcomes:?}"),
+    };
+    assert_eq!(winner.holder_id, "node-second-winner");
+    assert_eq!(winner.fencing_token, 1);
+    assert!(
+        matches!(
+            loser,
+            ZeppelinError::LeaseHeld {
+                namespace: ref held_namespace,
+                holder: ref held_by,
+            } if held_namespace == &ns && held_by == "node-second-winner"
+        ),
+        "the create loser must re-read the winning held lease, got {loser:?}"
+    );
+
+    harness.cleanup().await;
+}
+
 /// Test 2: Double acquire is rejected.
 /// Two managers for the same namespace — first acquires, second gets LeaseHeld.
 #[tokio::test]
