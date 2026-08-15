@@ -51,6 +51,16 @@ copy-on-write branch has visible refs whose physical origin points at the
 — destructure both. Returning the manifest is what enables write-through
 manifest caching; do not discard it.
 
+Group commit and the last-committed manifest/ETag memo are local to one
+`WalWriter` instance/process (`writer.rs:404-417`). Attempt zero for an
+unguarded batch may start from that memo (`writer.rs:1047-1056`); when a
+version-reporting backend alternates one namespace's writes between nodes that
+have both committed, the returning node presents a stale ETag, loses its first
+CAS, clears the memo, and requests a 10–19 ms backoff before the fresh-read
+retry (`writer.rs:147-150, 1135-1144`). This is the latency reason to keep a
+namespace's v1 write path sticky to one process even though manifest CAS
+prevents silent lost updates (`writer.rs:565-568`).
+
 Lease release is **best-effort**. A process whose lease expired and was taken
 over must handle release gracefully (Ok, or a non-fatal error). It must never
 block or deadlock. Two-layer defense for distributed writes is deliberate:

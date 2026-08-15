@@ -48,6 +48,7 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # max_retrieval_image_height = 32768  # ZEPPELIN_MAX_RETRIEVAL_IMAGE_HEIGHT; declared pixels
 # max_retrieval_units_per_request = 1000 # ZEPPELIN_MAX_RETRIEVAL_UNITS_PER_REQUEST; upserts + deletes
 # retrieval_image_media_types = ["image/jpeg", "image/png", "image/webp"] # ZEPPELIN_RETRIEVAL_IMAGE_MEDIA_TYPES
+# Rate-limit buckets are per process; nodes do not share quota state (src/server/mod.rs:343-344).
 # rate_limit_rps = 100               # ZEPPELIN_RATE_LIMIT_RPS; read/query rps per client, 0 disables reads
 # rate_limit_burst = 200             # ZEPPELIN_RATE_LIMIT_BURST; read/query burst, must be >= 1 when read limiting is enabled
 # write_rate_limit_rps = 50          # ZEPPELIN_WRITE_RATE_LIMIT_RPS; write/admin rps per client, 0 disables writes
@@ -163,7 +164,10 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 #                                          # compact when total uncompacted WAL bytes
 #                                          # exceed this threshold (64 MB)
 # retrain_imbalance_threshold = 5.0
-# lease_duration_secs = 300          # per-namespace compaction lease (multi-node); must be > 0
+# lease_duration_secs = 300          # per-namespace compaction lease; must be > 0
+#                                    # (src/config.rs:3151-3157, 4211-4212). First acquire is create-only
+#                                    # (src/wal/lease.rs:293-312). GC runs outside this lease
+#                                    # (src/compaction/background.rs:2036-2041, 2071-2087).
 
 [mmli]
 # Exact truth-matrix storage for NEW text namespace epochs. Default: "f16".

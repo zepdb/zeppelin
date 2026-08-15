@@ -451,28 +451,149 @@ changes to this policy.
 
 Consistency is selected per-query via the `consistency` field:
 
-- **`strong`** scans un-compacted WAL fragments in addition to indexed
-  segments, so it always reflects writes committed to S3 — with one caveat:
-  each node caches the namespace manifest for up to 500 ms. A write through
-  node A is immediately visible to strong queries on node A (write-through
-  cache), but a strong query on node B may miss it for up to the cache TTL.
-  In other words: **same-node read-your-writes; cross-node bounded staleness
-  (≤ 500 ms)**. Single-node deployments get true strong consistency. If you
-  need cross-node read-your-writes, sticky-route each client to one node.
-- **`eventual`** reads indexed segments and applies delete tombstones from
-  un-compacted WAL fragments, but skips WAL vector/BM25 scoring. Deletes are
-  hidden immediately on the same node after the delete returns. Recent upserts
-  and updates can still be stale until the next compaction cycle, so use it
-  when write freshness within one compaction interval does not matter.
+- **`strong`** remotely verifies the manifest instead of trusting its cache
+  age, then searches the active segment and scores uncompacted WAL data
+  ([`src/query.rs:833-845`](src/query.rs#L833-L845),
+  [`src/query.rs:1485-1505`](src/query.rs#L1485-L1505)). A committed write is
+  therefore visible to a strong query on the same node or another node: the
+  `strong_query_within_ttl_observes_manifest_advanced_on_s3` test primes a
+  60-second stale cache, advances S3 through an independent writer, and asserts
+  that the next strong query sees the new WAL vector
+  ([`tests/strong_freshness_tests.rs:176-215`](tests/strong_freshness_tests.rs#L176-L215)).
+  When the manifest is unchanged, the normal cost is one conditional manifest
+  GET with no body bytes; concurrent readers may reuse a verification completed
+  after their own request began
+  (`strong_query_with_unchanged_manifest_uses_one_bodyless_freshness_get`,
+  [`tests/strong_freshness_tests.rs:247-290`](tests/strong_freshness_tests.rs#L247-L290);
+  [`src/cache/manifest_cache.rs:694-732`](src/cache/manifest_cache.rs#L694-L732)).
+- **`eventual`** may reuse a manifest cached within the configured TTL, which
+  defaults to 500 ms
+  ([`src/cache/manifest_cache.rs:590-633`](src/cache/manifest_cache.rs#L590-L633),
+  [`src/config.rs:2865-2867`](src/config.rs#L2865-L2867)). It skips WAL
+  vector/BM25 scoring but still applies WAL tombstones from the selected
+  manifest, so its recent upserts wait for compaction while its deletes remain
+  suppressed
+  ([`src/query.rs:1485-1519`](src/query.rs#L1485-L1519)). Another node may keep
+  its previous manifest until that TTL expires; the writing node installs the
+  returned manifest in its local cache
+  (`eventual_query_within_ttl_keeps_zero_manifest_get_fast_path`,
+  [`tests/strong_freshness_tests.rs:217-245`](tests/strong_freshness_tests.rs#L217-L245);
+  [`src/server/handlers/vectors.rs:726-727`](src/server/handlers/vectors.rs#L726-L727),
+  [`src/server/handlers/vectors.rs:1517-1518`](src/server/handlers/vectors.rs#L1517-L1518)).
 
-### Multi-node coordination
+### Running more than one node
 
-Writes are safe under concurrency without any coordinator: every manifest
-commit is an ETag-guarded compare-and-swap, so concurrent upserts from
-multiple nodes serialize correctly. Background compaction additionally
-acquires a per-namespace lease (`compaction.lease_duration_secs`, default
-300 s) so only one node compacts a namespace at a time; a fencing token +
-CAS make even an expired-lease holder unable to commit stale state.
+#### Reads
+
+Read requests need no node affinity: strong reads verify object-storage state,
+and eventual reads use the receiving node's TTL-bounded cache
+([`src/query.rs:833-845`](src/query.rs#L833-L845)). In particular, sticky
+routing is not required for cross-node strong read-your-writes; that path is
+covered by `strong_query_within_ttl_observes_manifest_advanced_on_s3`
+([`tests/strong_freshness_tests.rs:176-215`](tests/strong_freshness_tests.rs#L176-L215)).
+
+#### Writes
+
+HTTP vector writes do not acquire the compaction lease: ordinary upserts and
+deletes call `WalWriter::append`, while guarded variants also pass no fencing
+token. Each writer's group-commit queue and last-committed manifest/ETag memo
+are process-local
+([`src/server/handlers/vectors.rs:690-723`](src/server/handlers/vectors.rs#L690-L723),
+[`src/server/handlers/vectors.rs:1446-1474`](src/server/handlers/vectors.rs#L1446-L1474),
+[`src/wal/writer.rs:404-417`](src/wal/writer.rs#L404-L417),
+[`src/wal/writer.rs:576-583`](src/wal/writer.rs#L576-L583),
+[`src/wal/writer.rs:805-842`](src/wal/writer.rs#L805-L842)). Manifest ETag CAS
+prevents a stale writer from silently overwriting a newer manifest; under
+moderate contention, `test_concurrent_writers_backoff_absorbs_conflicts` uses
+three independent writers and verifies that all 24 successful fragments remain
+referenced
+([`tests/write_path_tests.rs:197-250`](tests/write_path_tests.rs#L197-L250)).
+
+Contention is nevertheless visible in latency and can reach clients. An
+ordinary unguarded batch makes at most eight manifest-CAS attempts, backing off
+from a 10 ms base after each conflict; exhaustion returns a manifest conflict
+([`src/wal/writer.rs:113-150`](src/wal/writer.rs#L113-L150),
+[`src/wal/writer.rs:1047-1056`](src/wal/writer.rs#L1047-L1056),
+[`src/wal/writer.rs:1233-1240`](src/wal/writer.rs#L1233-L1240)). Guarded filter
+deletes, constrained ID deletes, and scoped upserts instead recompute their
+selection against a fresh manifest up to four times and return a retryable 409
+only after all four guard attempts conflict
+([`src/server/handlers/vectors.rs:172`](src/server/handlers/vectors.rs#L172),
+[`src/server/handlers/vectors.rs:739-800`](src/server/handlers/vectors.rs#L739-L800),
+[`src/server/handlers/vectors.rs:1548-1626`](src/server/handlers/vectors.rs#L1548-L1626);
+`test_guarded_filter_delete_reevaluates_and_succeeds_within_bound` and
+`test_guarded_filter_delete_exhaustion_returns_409`,
+[`tests/write_path_tests.rs:701-886`](tests/write_path_tests.rs#L701-L886)).
+OpenAPI 0.2.1 publishes the 409 `CONFLICT_RETRY` plus `Retry-After` contract for
+both [`upsertVectors` (`api/zeppelin-api.yaml:1275-1324`)](api/zeppelin-api.yaml#L1275-L1324)
+and [`deleteVectors` (`api/zeppelin-api.yaml:1330-1360`)](api/zeppelin-api.yaml#L1330-L1360)
+([`api/zeppelin-api.yaml:6`](api/zeppelin-api.yaml#L6),
+[`api/zeppelin-api.yaml:1698-1715`](api/zeppelin-api.yaml#L1698-L1715),
+`openapi_documents_vector_write_conflicts_and_process_local_controls`,
+[`tests/contract_tests.rs:310-356`](tests/contract_tests.rs#L310-L356)).
+
+The v1 operating rule is therefore **one writer process per namespace**. When
+possible, route namespace-scoped data mutations whose URL contains
+`/v1/namespaces/{ns}/...` to the same node—for example, hash that path at the
+load balancer—while leaving reads free to use any ready node. On a backend that
+reports version identities, this preserves process-local batching and avoids
+the stale-memo conflict that strict round-robin routing creates on attempt zero
+([`src/server/mod.rs:2557-2614`](src/server/mod.rs#L2557-L2614),
+[`src/wal/writer.rs:975-989`](src/wal/writer.rs#L975-L989),
+[`src/wal/writer.rs:1047-1056`](src/wal/writer.rs#L1047-L1056)).
+
+#### Compaction and GC
+
+Compaction acquires a per-namespace lease (300 seconds by default), renews it,
+and carries its fencing token into manifest publication
+([`src/config.rs:3151-3157`](src/config.rs#L3151-L3157),
+[`src/compaction/background.rs:1148-1168`](src/compaction/background.rs#L1148-L1168),
+[`src/compaction/background.rs:1191-1234`](src/compaction/background.rs#L1191-L1234)).
+The first acquisition of a missing lease uses a create-only PUT; a creation
+collision re-reads the authoritative lease within a five-attempt bound
+([`src/wal/lease.rs:81`](src/wal/lease.rs#L81),
+[`src/wal/lease.rs:293-357`](src/wal/lease.rs#L293-L357)).
+
+GC is not covered by that lease. Its deletion path still requires candidates to
+survive the configured horizon and a fresh reachability check; deleting an
+already absent artifact is an idempotent completion
+([`src/compaction/gc.rs:67-85`](src/compaction/gc.rs#L67-L85)). Every process
+starts its own background loop, and that loop invokes its `GcRunner` before the
+separately leased compaction branch
+([`src/startup.rs:600-618`](src/startup.rs#L600-L618),
+[`src/compaction/background.rs:2036-2041`](src/compaction/background.rs#L2036-L2041),
+[`src/compaction/background.rs:2071-2087`](src/compaction/background.rs#L2071-L2087)).
+A warm runner performs a namespace inventory LIST before it can skip an
+unchanged, not-yet-due full cycle, so that inventory traffic scales with node
+count and full-cycle work is repeated when due
+([`src/compaction/gc.rs:2791-2856`](src/compaction/gc.rs#L2791-L2856)).
+A dead compaction loop withholds readiness: the
+`compaction_loop_death_withholds_readiness` test aborts the loop and verifies
+that `/readyz` changes from 200 to 503
+([`tests/compaction_liveness_tests.rs:12-78`](tests/compaction_liveness_tests.rs#L12-L78)).
+
+#### Per-process state
+
+`GET`/`PATCH`/`PUT /v1/config/query` read or replace only the receiving process's
+snapshot; updates neither write object storage nor survive restart
+([`src/runtime_config.rs:1-12`](src/runtime_config.rs#L1-L12),
+[`src/server/mod.rs:2541-2550`](src/server/mod.rs#L2541-L2550)). Fan out an
+operational query-config change to every node that should serve it.
+
+Rate-limit buckets are also process-local. A client that is balanced across N
+nodes can consume a separate configured quota at each node
+([`src/server/mod.rs:343-344`](src/server/mod.rs#L343-L344),
+[`src/server/mod.rs:2138-2188`](src/server/mod.rs#L2138-L2188);
+`openapi_documents_vector_write_conflicts_and_process_local_controls`,
+[`tests/contract_tests.rs:338-356`](tests/contract_tests.rs#L338-L356)).
+
+There is no operator `node_id` field in the boot configuration
+([`src/config.rs:217-253`](src/config.rs#L217-L253)). Startup takes the lease
+holder ID from the audit runtime: tracing-only mode generates a fresh
+`zeppelin-{UUID}`, while durable-audit mode uses the authoritative signer-scoped
+audit stream ID
+([`src/startup.rs:457-467`](src/startup.rs#L457-L467),
+[`src/security/audit_sink.rs:551-585`](src/security/audit_sink.rs#L551-L585)).
 
 ### Full-text search (opt-in)
 

@@ -11,7 +11,7 @@ Zeppelin is an S3-native vector search engine. Object storage is the source of t
 
 3. **Immutable artifacts.** WAL fragments and segments are write-once. Never modify them in place. The manifest tracks what exists.
 
-4. **Single writer per namespace.** No distributed coordination for v1. One process writes to a namespace at a time. S3 read-after-write consistency handles the rest.
+4. **Single writer per namespace.** One process handles a namespace's write path at a time: HTTP vector writes are unfenced and their group-commit state is process-local (`src/wal/writer.rs:404-417, 576-583, 805-842`). Strong reads are not part of this affinity rule because they remotely verify the manifest (`src/query.rs:833-845`; `tests/strong_freshness_tests.rs::strong_query_within_ttl_observes_manifest_advanced_on_s3`). See README "Running more than one node."
 
 5. **Let the compiler help.** Use strong types. Prefer newtypes over raw strings/numbers. Make invalid states unrepresentable.
 
