@@ -77,3 +77,7 @@ AUDIT.md
 # Local worktrees and session artifacts
 .ext-worktrees/
 .tokensave/
+
+# Fuzz corpora are run artifacts; the intentional seeds are already tracked
+# and tracked files are never ignored.
+fuzz/corpus/
