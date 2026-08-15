@@ -58,7 +58,7 @@ tower-http = { version = "0.5", features = ["trace", "cors", "timeout", "limit"]
 tokio = { version = "1", features = ["full"] }
 
 # Storage
-object_store = { version = "0.11", features = ["aws"] }
+object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,138 @@
+diff --git a/fakestorage/object.go b/fakestorage/object.go
+index 03c4e07..287dca8 100644
+--- a/fakestorage/object.go
++++ b/fakestorage/object.go
+@@ -14,6 +14,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"net/url"
+ 	"slices"
+ 	"sort"
+ 	"strconv"
+@@ -728,7 +729,9 @@ func (s *Server) xmlListObjects(r *http.Request) xmlResponse {
+ 			Generation:   obj.Generation,
+ 			Size:         obj.Size,
+ 			LastModified: obj.Updated.Format(time.RFC3339),
+-			ETag:         ETag{Value: obj.Etag},
++			// Real GCS (like S3) includes the surrounding quotes in the
++			// list ETag element, byte-equal to the GET/upload ETag header.
++			ETag:         ETag{Value: fmt.Sprintf("%q", obj.Etag)},
+ 		})
+ 	}
+ 
+@@ -746,6 +749,100 @@ func (s *Server) xmlListObjects(r *http.Request) xmlResponse {
+ 	}
+ }
+ 
++// xmlPutObject implements the XML API object upload and copy operations:
++// https://cloud.google.com/storage/docs/xml-api/put-object-upload
++// https://cloud.google.com/storage/docs/xml-api/put-object-copy
++//
++// Unlike the signed-URL upload path, it honours the
++// x-goog-if-generation-match precondition (the header form of the JSON API's
++// ifGenerationMatch, which the JSON handlers already enforce via
++// generationCondition) and returns the ETag and x-goog-generation headers
++// real GCS sends on uploads.
++func (s *Server) xmlPutObject(r *http.Request) xmlResponse {
++	vars := unescapeMuxVars(mux.Vars(r))
++	defer r.Body.Close()
++
++	if _, err := s.backend.GetBucket(vars["bucketName"]); err != nil {
++		return xmlResponse{status: http.StatusNotFound}
++	}
++
++	conditions := generationCondition{}
++	if match := r.Header.Get("x-goog-if-generation-match"); match != "" {
++		gen, err := strconv.ParseInt(match, 10, 64)
++		if err != nil {
++			return xmlResponse{status: http.StatusBadRequest, errorMessage: err.Error()}
++		}
++		conditions.ifGenerationMatch = &gen
++	}
++
++	metaData := make(map[string]string)
++	for key := range r.Header {
++		lowerKey := strings.ToLower(key)
++		if metaDataKey := strings.TrimPrefix(lowerKey, "x-goog-meta-"); metaDataKey != lowerKey {
++			metaData[metaDataKey] = r.Header.Get(key)
++		}
++	}
++
++	obj := StreamingObject{
++		ObjectAttrs: ObjectAttrs{
++			BucketName:      vars["bucketName"],
++			Name:            vars["objectName"],
++			ContentType:     r.Header.Get(contentTypeHeader),
++			ContentEncoding: r.Header.Get("Content-Encoding"),
++			Metadata:        metaData,
++		},
++	}
++	if source := r.Header.Get("x-goog-copy-source"); source != "" {
++		unescaped, err := url.PathUnescape(source)
++		if err != nil {
++			return xmlResponse{status: http.StatusBadRequest}
++		}
++		split := strings.SplitN(unescaped, "/", 2)
++		if len(split) != 2 {
++			return xmlResponse{status: http.StatusBadRequest}
++		}
++		sourceObject, err := s.GetObjectStreaming(split[0], split[1])
++		if err != nil {
++			return xmlResponse{status: http.StatusNotFound}
++		}
++		defer sourceObject.Close()
++		obj.Content = sourceObject.Content
++		obj.ContentType = sourceObject.ContentType
++		obj.ContentEncoding = sourceObject.ContentEncoding
++		if len(metaData) == 0 {
++			obj.Metadata = sourceObject.Metadata
++		}
++	} else {
++		obj.Content = notImplementedSeeker{r.Body}
++	}
++
++	obj, err := s.createObject(obj, conditions)
++	if err != nil {
++		if errors.Is(err, backend.PreConditionFailed) {
++			return xmlResponse{status: http.StatusPreconditionFailed, errorMessage: err.Error()}
++		}
++		return xmlResponse{status: http.StatusInternalServerError, errorMessage: err.Error()}
++	}
++	defer obj.Close()
++
++	// Real GCS quotes the ETag in upload responses, matching downloadObject.
++	header := make(http.Header)
++	header.Set("ETag", fmt.Sprintf("%q", obj.Etag))
++	header.Set("x-goog-generation", strconv.FormatInt(obj.Generation, 10))
++	return xmlResponse{status: http.StatusOK, header: header}
++}
++
++// xmlDeleteObject implements the XML API object delete operation, reusing the
++// JSON handler's semantics (404 on absent objects, like real GCS).
++func (s *Server) xmlDeleteObject(r *http.Request) xmlResponse {
++	resp := s.deleteObject(r)
++	return xmlResponse{
++		status:       resp.status,
++		errorMessage: resp.errorMessage,
++		header:       resp.header,
++	}
++}
++
+ func (s *Server) getObject(w http.ResponseWriter, r *http.Request) {
+ 	if alt := r.URL.Query().Get("alt"); alt == "media" || r.Method == http.MethodHead {
+ 		s.downloadObject(w, r)
+diff --git a/fakestorage/server.go b/fakestorage/server.go
+index da158fa..e50a53d 100644
+--- a/fakestorage/server.go
++++ b/fakestorage/server.go
+@@ -311,6 +311,9 @@ func (s *Server) buildMuxer() {
+ 	for _, r := range xmlApiRouters {
+ 		r.Path("/").Methods(http.MethodGet).HandlerFunc(xmlToHTTPHandler(s.xmlListObjects))
+ 		r.Path("").Methods(http.MethodGet).HandlerFunc(xmlToHTTPHandler(s.xmlListObjects))
++		r.Path("/{objectName:.+}").Methods(http.MethodPut).HandlerFunc(xmlToHTTPHandler(s.xmlPutObject))
++		r.Path("/{objectName:.+}").Methods(http.MethodGet, http.MethodHead).HandlerFunc(s.downloadObject)
++		r.Path("/{objectName:.+}").Methods(http.MethodDelete).HandlerFunc(xmlToHTTPHandler(s.xmlDeleteObject))
+ 	}
+ 
+ 	bucketHost := fmt.Sprintf("{bucketName}.%s", s.publicHost)
