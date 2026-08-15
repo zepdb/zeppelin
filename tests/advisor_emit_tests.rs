@@ -116,10 +116,8 @@ fn every_catalog_instance_cache_security_and_fts_shape_round_trips() {
     assert_eq!(rendered_count, (40 + 21 + 17) * 2 * 2 * 2);
 }
 
-/// GCP and Azure emits pass full validation and carry their per-cloud
-/// storage fields. The GCS transport has landed, so a `--cloud gcp` emit must
-/// construct a store; Azure still pins the transport gap until
-/// multi-substrate plan 06 lands its arm and flips that half too.
+/// GCP and Azure emits pass full validation, carry their per-cloud storage
+/// fields, and construct a store — both transports have landed.
 #[test]
 fn gcp_and_azure_emits_carry_storage_fields_and_construct_where_supported() {
     let catalog = Catalog::embedded();
@@ -127,7 +125,7 @@ fn gcp_and_azure_emits_carry_storage_fields_and_construct_where_supported() {
         (
             Cloud::Gcp,
             &["backend = \"gcs\"", "# gcs_service_account_path ="][..],
-            None,
+            None::<&str>,
         ),
         (
             Cloud::Azure,
@@ -135,7 +133,7 @@ fn gcp_and_azure_emits_carry_storage_fields_and_construct_where_supported() {
                 "backend = \"azure\"",
                 "azure_account_name = \"REPLACE-WITH-YOUR-STORAGE-ACCOUNT\"",
             ][..],
-            Some("unsupported storage backend: azure"),
+            None,
         ),
     ] {
         let instance = catalog

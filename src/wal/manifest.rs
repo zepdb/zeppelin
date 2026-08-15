@@ -149,6 +149,7 @@ use crate::namespace::{
     BranchId, BranchRoot, ForkViewDigest, ManifestDigest, ManifestGeneration, NamespaceId,
     NamespaceIncarnationId, SourceDataPlaneConfigDigest,
 };
+use crate::storage::capabilities::canonical_etag;
 use crate::storage::store::DELETE_MANY_MAX_KEYS;
 use crate::storage::{
     CreateOnlyOutcome, ListedObject, NamespaceObjectKey, StorageVersion, ZeppelinStore,
@@ -8028,7 +8029,7 @@ impl NamedSnapshot {
         let (data, get_version) = store.get_with_meta(&object.key).await?;
         if let Some(list_etag) = object.version.as_ref().and_then(StorageVersion::etag) {
             let get_etag = get_version.as_ref().and_then(StorageVersion::etag);
-            if get_etag != Some(list_etag) {
+            if get_etag.map(canonical_etag) != Some(canonical_etag(list_etag)) {
                 return Err(ZeppelinError::Serialization(format!(
                     "snapshot pin {} changed between LIST ETag {:?} and GET ETag {:?}",
                     object.key, list_etag, get_etag

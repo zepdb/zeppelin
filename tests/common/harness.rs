@@ -101,6 +101,65 @@ pub struct TestHarness {
     test_servers: Mutex<Vec<TestServerRuntime>>,
 }
 
+/// RFC 2104 HMAC-SHA256 from `sha2` (already a dependency) — used only to
+/// sign the Azurite container-create request; Azurite has no unauthenticated
+/// management surface.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let ipad: Vec<u8> = block.iter().map(|b| b ^ 0x36).collect();
+    let opad: Vec<u8> = block.iter().map(|b| b ^ 0x5c).collect();
+    let inner = Sha256::digest([ipad.as_slice(), msg].concat());
+    let outer = Sha256::digest([opad.as_slice(), inner.as_slice()].concat());
+    outer.into()
+}
+
+/// Creates the Azurite test container idempotently with a SharedKey-signed
+/// request against the well-known dev account. 201 = created, 409 = another
+/// harness got there first.
+async fn ensure_azurite_container(container: &str) {
+    use base64::Engine as _;
+    const ACCOUNT: &str = "devstoreaccount1";
+    const ACCOUNT_KEY: &str =
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+    let base = std::env::var("AZURITE_BLOB_STORAGE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:10000".to_string());
+    let date = chrono::Utc::now()
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    let version = "2021-08-06";
+    // Full SharedKey string-to-sign: VERB, 11 empty standard-header slots
+    // (Content-Length is empty when 0), canonicalized x-ms-* headers,
+    // canonicalized resource with query params as name:value lines.
+    let string_to_sign = format!(
+        "PUT\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:{date}\nx-ms-version:{version}\n/{ACCOUNT}/{ACCOUNT}/{container}\nrestype:container"
+    );
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(ACCOUNT_KEY)
+        .expect("well-known emulator key decodes");
+    let signature = base64::engine::general_purpose::STANDARD
+        .encode(hmac_sha256(&key, string_to_sign.as_bytes()));
+    let response = reqwest::Client::new()
+        .put(format!("{base}/{ACCOUNT}/{container}?restype=container"))
+        .header("x-ms-date", &date)
+        .header("x-ms-version", version)
+        .header("Authorization", format!("SharedKey {ACCOUNT}:{signature}"))
+        .header("Content-Length", "0")
+        .send()
+        .await
+        .expect("azurite unreachable — see scripts/emulators/README.md");
+    let status = response.status().as_u16();
+    assert!(
+        status == 201 || status == 409,
+        "azurite container create failed: {status}"
+    );
+}
+
 /// Creates the fake-gcs-server test bucket idempotently — the emulator
 /// starts empty, and a 409 means another harness got there first.
 async fn ensure_gcs_bucket(endpoint: &str, bucket: &str) {
@@ -204,6 +263,22 @@ impl TestHarness {
                     backend: StorageBackend::Gcs,
                     bucket: bucket.clone(),
                     gcs_endpoint: Some(endpoint),
+                    fail_fast: true,
+                    ..StorageConfig::default()
+                };
+                ZeppelinStore::from_config(&config).expect("failed to create store from config")
+            }
+            "azurite" => {
+                // Stock Azurite (npm), well-known dev account — see
+                // scripts/emulators/README.md. `use_emulator` resolves the
+                // account, key, and endpoint (AZURITE_BLOB_STORAGE_URL
+                // overrides the default http://127.0.0.1:10000).
+                ensure_azurite_container(&bucket).await;
+                let config = StorageConfig {
+                    backend: StorageBackend::Azure,
+                    bucket: bucket.clone(),
+                    azure_use_emulator: true,
+                    azure_allow_http: true,
                     fail_fast: true,
                     ..StorageConfig::default()
                 };

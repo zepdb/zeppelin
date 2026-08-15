@@ -281,8 +281,22 @@ impl ObjectUserMetadata {
     }
 
     /// Inserts one owned user-metadata value.
+    ///
+    /// Logical keys are lowercase ASCII alphanumerics and hyphens only. The
+    /// hyphen restriction is what keeps the Azure wire canonicalization
+    /// (hyphen ↔ underscore, see [`Self::to_attributes`]) bijective — a
+    /// logical key containing an underscore would collide with the wire form
+    /// of its hyphenated sibling on read.
     pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        let _ = self.0.insert(key.into(), value.into());
+        let key = key.into();
+        debug_assert!(
+            !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+            "user-metadata keys must be lowercase ASCII alphanumerics and hyphens, got {key:?}"
+        );
+        let _ = self.0.insert(key, value.into());
     }
 
     /// Returns one user-metadata value by its unprefixed key.
@@ -291,23 +305,45 @@ impl ObjectUserMetadata {
         self.0.get(key).map(String::as_str)
     }
 
+    /// Reads wire attributes back into logical keys.
+    ///
+    /// Wire underscores normalize to logical hyphens on every substrate: the
+    /// identifier-only substrates (Azure) write the underscore form, and the
+    /// [`Self::insert`] key alphabet (no underscores in logical keys) makes
+    /// the mapping bijective, so hyphen-native substrates are unaffected.
     fn from_attributes(attributes: &Attributes) -> Self {
         let values = attributes
             .iter()
             .filter_map(|(attribute, value)| match attribute {
-                Attribute::Metadata(key) => Some((key.to_string(), value.as_ref().to_string())),
+                Attribute::Metadata(key) => {
+                    Some((key.replace('_', "-"), value.as_ref().to_string()))
+                }
                 _ => None,
             })
             .collect();
         Self(values)
     }
 
-    fn to_attributes(&self) -> Attributes {
+    /// Lowers logical keys to their substrate wire form.
+    ///
+    /// Azure metadata names must be valid C# identifiers — hyphens are
+    /// illegal — so identifier-only substrates get the underscore form
+    /// (`zeppelin-namespace-incarnation` → `zeppelin_namespace_incarnation`).
+    /// Every other substrate writes the native hyphenated form unchanged:
+    /// a single global wire form would break existing S3/GCS objects that
+    /// already carry hyphenated names. Azure has no pre-canonicalization
+    /// deployments, so no migration is needed there.
+    fn to_attributes(&self, identifier_wire_names: bool) -> Attributes {
         self.0
             .iter()
             .map(|(key, value)| {
+                let wire_key = if identifier_wire_names {
+                    key.replace('-', "_")
+                } else {
+                    key.clone()
+                };
                 (
-                    Attribute::Metadata(key.clone().into()),
+                    Attribute::Metadata(wire_key.into()),
                     AttributeValue::from(value.clone()),
                 )
             })
@@ -621,10 +657,47 @@ impl ZeppelinStore {
                         )?,
                     )
                 }
-                backend => {
-                    return Err(ZeppelinError::Config(format!(
-                        "unsupported storage backend: {backend} (azure not yet implemented)"
-                    )));
+                crate::config::StorageBackend::Azure => {
+                    let mut builder = object_store::azure::MicrosoftAzureBuilder::new()
+                        .with_container_name(&config.bucket);
+                    if config.azure_use_emulator {
+                        // Azurite's well-known dev account and key; the
+                        // endpoint defaults to http://127.0.0.1:10000 and can
+                        // be overridden with AZURITE_BLOB_STORAGE_URL.
+                        builder = builder.with_use_emulator(true);
+                    }
+                    if let Some(account) = config
+                        .azure_account_name
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                    {
+                        builder = builder.with_account(account);
+                    }
+                    if let Some(key) = config
+                        .azure_access_key
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                    {
+                        builder = builder.with_access_key(key);
+                    }
+                    if let Some(endpoint) = config
+                        .azure_endpoint
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                    {
+                        builder = builder.with_endpoint(endpoint.to_string());
+                    }
+                    // Conditional put needs no opt-in: PutMode::Update maps to
+                    // If-Match and PutMode::Create to If-None-Match: *; a
+                    // token without an ETag fails loudly inside object_store
+                    // (MissingETag). copy_if_not_exists is native.
+                    builder = builder
+                        .with_retry(transport_retry_config())
+                        .with_client_options(transport_client_options(config.azure_allow_http));
+
+                    Arc::new(builder.build().map_err(|e| {
+                        ZeppelinError::Config(format!("failed to build Azure store: {e}"))
+                    })?)
                 }
             };
         Ok(store)
@@ -1919,7 +1992,8 @@ impl ZeppelinStore {
         let path = Path::parse(key)?;
         let options = PutOptions {
             mode: PutMode::Update(version.to_update_version()),
-            attributes: user_metadata.to_attributes(),
+            attributes: user_metadata
+                .to_attributes(self.capabilities.user_metadata_identifier_names),
             ..PutOptions::default()
         };
         let result = self
@@ -2005,7 +2079,8 @@ impl ZeppelinStore {
         let path = Path::parse(key)?;
         let options = PutOptions {
             mode: PutMode::Create,
-            attributes: user_metadata.to_attributes(),
+            attributes: user_metadata
+                .to_attributes(self.capabilities.user_metadata_identifier_names),
             ..PutOptions::default()
         };
         self.inner
@@ -2924,7 +2999,8 @@ fn configured_probe_endpoint(config: &StorageConfig) -> Option<&str> {
     let endpoint = match config.backend {
         crate::config::StorageBackend::S3 => config.s3_endpoint.as_deref(),
         crate::config::StorageBackend::Gcs => config.gcs_endpoint.as_deref(),
-        crate::config::StorageBackend::Azure | crate::config::StorageBackend::Local => None,
+        crate::config::StorageBackend::Azure => config.azure_endpoint.as_deref(),
+        crate::config::StorageBackend::Local => None,
     };
     endpoint.filter(|value| !value.is_empty())
 }
@@ -3081,6 +3157,38 @@ fn parse_endpoint_port(port: &str) -> Result<u16> {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+
+    /// The Azure metadata-name canonicalization is bijective: logical
+    /// hyphenated keys lower to underscore wire names on identifier-only
+    /// substrates and read back unchanged, while hyphen-native substrates
+    /// round-trip the native form. Pinned at the seam so the incarnation key
+    /// can never silently change shape.
+    #[test]
+    fn user_metadata_wire_names_canonicalize_per_substrate() {
+        let mut metadata = ObjectUserMetadata::new();
+        metadata.insert("zeppelin-namespace-incarnation", "incarnation-07");
+
+        let native = metadata.to_attributes(false);
+        assert!(native
+            .get(&Attribute::Metadata(
+                "zeppelin-namespace-incarnation".into()
+            ))
+            .is_some());
+        assert_eq!(ObjectUserMetadata::from_attributes(&native), metadata);
+
+        let identifier = metadata.to_attributes(true);
+        assert!(identifier
+            .get(&Attribute::Metadata(
+                "zeppelin_namespace_incarnation".into()
+            ))
+            .is_some());
+        assert!(identifier
+            .get(&Attribute::Metadata(
+                "zeppelin-namespace-incarnation".into()
+            ))
+            .is_none());
+        assert_eq!(ObjectUserMetadata::from_attributes(&identifier), metadata);
+    }
 
     struct TestObjectSigner {
         signer_node: String,

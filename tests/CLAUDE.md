@@ -13,6 +13,7 @@ harness gets a random `test-{uuid}` prefix for isolation and cleans up on drop.
 | `minio` | S3 → `http://localhost:9000` | yes (ETag) |
 | `s3` | real S3 | yes (ETag) |
 | `gcs` | GCS → patched fake-gcs-server `http://127.0.0.1:4443` | yes (**generation**) |
+| `azurite` | Azure Blob → stock Azurite `http://127.0.0.1:10000` | yes (ETag) |
 | `local` | `LocalFileSystem` in a `TempDir` | **no** |
 
 Anything concurrency-, CAS-, or origin-routing-shaped needs a real store
@@ -47,6 +48,20 @@ Env knobs: `GCS_TEST_ENDPOINT` (default `http://127.0.0.1:4443`),
 The harness creates the bucket idempotently; no credential file is needed
 (the storage layer synthesizes the OAuth-disabled service-account JSON from
 `gcs_endpoint`).
+
+Bringing up Azurite (stock, pinned 3.36.0 via npm):
+
+```bash
+npm install -g azurite@3.36.0
+azurite-blob --blobHost 127.0.0.1 --blobPort 10000 --location /tmp/azuritedata &
+```
+
+`object_store`'s `use_emulator` resolves the well-known dev account and the
+default endpoint; `AZURITE_BLOB_STORAGE_URL` overrides the endpoint. The
+container comes from `TEST_S3_BUCKET` (default `zeppelin-test`) and the
+harness creates it idempotently with a SharedKey-signed request. Note the
+metadata-name canonicalization: Azure wire names replace hyphens with
+underscores at the seam; logical keys inside Zeppelin stay hyphenated.
 
 ## Tests that hard-require MinIO
 

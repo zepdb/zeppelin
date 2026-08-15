@@ -465,7 +465,8 @@ impl LiveRootIdentity {
             .object(&Manifest::s3_key(namespace))
             .and_then(|object| object.version.as_ref())
             .and_then(StorageVersion::etag)
-            == Some(self.storage_etag.as_str())
+            .map(canonical_etag)
+            == Some(canonical_etag(&self.storage_etag))
     }
 }
 
@@ -2960,7 +2961,7 @@ async fn load_history_observation_owned(
     let cacheable = match listed_version.and_then(StorageVersion::etag) {
         Some(list_etag) => {
             let get_etag = get_version.as_ref().and_then(StorageVersion::etag);
-            if get_etag != Some(list_etag) {
+            if get_etag.map(canonical_etag) != Some(canonical_etag(list_etag)) {
                 return Err(ZeppelinError::Serialization(format!(
                     "manifest history {} changed between LIST ETag {:?} and GET ETag {:?}",
                     observation.history.key, list_etag, get_etag
@@ -3535,7 +3536,7 @@ async fn read_inventory_object(
             match object.version.as_ref().and_then(StorageVersion::etag) {
                 Some(list_etag) => {
                     let get_etag = get_version.as_ref().and_then(StorageVersion::etag);
-                    if get_etag != Some(list_etag) {
+                    if get_etag.map(canonical_etag) != Some(canonical_etag(list_etag)) {
                         return Err(ZeppelinError::Serialization(format!(
                             "object {key} changed between LIST ETag {list_etag:?} and GET ETag {get_etag:?}"
                         )));
@@ -3588,7 +3589,7 @@ async fn read_versioned_manifest_from_inventory(
                 )));
             };
             let get_etag = get_version.as_ref().and_then(StorageVersion::etag);
-            if get_etag != Some(list_etag) {
+            if get_etag.map(canonical_etag) != Some(canonical_etag(list_etag)) {
                 return Err(ZeppelinError::Serialization(format!(
                     "manifest {key} changed between LIST ETag {list_etag:?} and GET ETag {get_etag:?}"
                 )));

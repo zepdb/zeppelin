@@ -49,6 +49,11 @@ pub struct StorageCapabilities {
     pub delete_absent_is_ok: bool,
     /// User metadata attributes survive conditional puts.
     pub user_metadata: bool,
+    /// Metadata wire names must be valid identifiers — no hyphens (Azure's
+    /// C#-identifier rule). The seam canonicalizes hyphens to underscores on
+    /// write and back on read for such substrates; logical keys inside
+    /// Zeppelin never change.
+    pub user_metadata_identifier_names: bool,
 }
 
 impl StorageCapabilities {
@@ -64,6 +69,7 @@ impl StorageCapabilities {
             copy_if_not_exists: true,
             delete_absent_is_ok: true,
             user_metadata: true,
+            user_metadata_identifier_names: false,
         }
     }
 
@@ -79,6 +85,7 @@ impl StorageCapabilities {
             copy_if_not_exists: true,
             delete_absent_is_ok: false,
             user_metadata: true,
+            user_metadata_identifier_names: false,
         }
     }
 
@@ -94,6 +101,7 @@ impl StorageCapabilities {
             copy_if_not_exists: true,
             delete_absent_is_ok: false,
             user_metadata: true,
+            user_metadata_identifier_names: true,
         }
     }
 
@@ -109,6 +117,7 @@ impl StorageCapabilities {
             copy_if_not_exists: true,
             delete_absent_is_ok: false,
             user_metadata: false,
+            user_metadata_identifier_names: false,
         }
     }
 
@@ -123,6 +132,7 @@ impl StorageCapabilities {
             copy_if_not_exists: true,
             delete_absent_is_ok: false,
             user_metadata: true,
+            user_metadata_identifier_names: false,
         }
     }
 
@@ -210,6 +220,19 @@ mod tests {
         ] {
             assert_eq!(caps.native_batch_delete, is_s3);
             assert_eq!(caps.delete_absent_is_ok, is_s3);
+        }
+    }
+
+    #[test]
+    fn only_azure_requires_identifier_metadata_names() {
+        for (caps, requires) in [
+            (StorageCapabilities::s3(), false),
+            (StorageCapabilities::gcs(), false),
+            (StorageCapabilities::azure(), true),
+            (StorageCapabilities::local(), false),
+            (StorageCapabilities::in_memory(), false),
+        ] {
+            assert_eq!(caps.user_metadata_identifier_names, requires);
         }
     }
 

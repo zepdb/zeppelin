@@ -246,9 +246,11 @@ async fn c5_conditional_get_revalidation_contract() {
 
 /// C6: LIST-reported ETag identifies the same version GET reports, including
 /// after an overwrite. Protects GC's LIST-vs-GET fail-closed checks (without
-/// this, GC refuses deletions and storage grows without bound). Raw byte
-/// equality is asserted alongside the canonical form because GC's comparisons
-/// are byte-level today; the Azure transport (plan 06) revisits both together.
+/// this, GC refuses deletions and storage grows without bound). Equality is
+/// asserted in the canonical form, which is exactly what every production
+/// comparison uses (`canonical_etag`): Azure lists ETags unquoted while GETs
+/// quote them, so byte-level comparison is not a cross-substrate contract —
+/// the per-substrate raw shapes are pinned by the plan-01 emulator probe P5.
 #[tokio::test]
 async fn c6_list_etag_identifies_get_version() {
     let harness = TestHarness::new().await;
@@ -285,13 +287,13 @@ async fn c6_list_etag_identifies_get_version() {
             .and_then(StorageVersion::etag)
             .unwrap_or_else(|| panic!("C6: LIST must carry an ETag ({round})"));
         assert_eq!(
-            listed_etag, get_etag,
-            "C6: LIST ETag must byte-equal GET ETag ({round})"
-        );
-        assert_eq!(
             canonical_etag(listed_etag),
             canonical_etag(&get_etag),
-            "C6: canonical forms must agree ({round})"
+            "C6: canonical LIST ETag must identify the GET version ({round})"
+        );
+        assert!(
+            !canonical_etag(listed_etag).is_empty(),
+            "C6: canonical ETag must be non-empty ({round})"
         );
     }
     harness.cleanup().await;
