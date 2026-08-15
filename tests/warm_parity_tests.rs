@@ -121,6 +121,9 @@ async fn start_parity_server(mut config: Config) -> ParityServer {
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
+        compaction_loop_health: Arc::new(
+            zeppelin::compaction::background::CompactionLoopHealth::new(clock.now()),
+        ),
         security: Arc::clone(&security),
         audit,
         credential_adapter,

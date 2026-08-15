@@ -53,12 +53,19 @@ depth — keep that belt-and-suspenders check when adding gated routes.
 
 ## `/readyz` is cheap — it reads a snapshot
 
-`readiness_check` reads a published `BranchGraphReadinessSnapshot` and issues
-no object-store work of its own. The O(namespaces) scan
+`readiness_check` first checks the durable-audit latch and the compaction-loop
+heartbeat, then performs the existing storage reachability probe and reads a
+published `BranchGraphReadinessSnapshot`. Compaction liveness is exactly two
+atomic loads; it performs no object-store work. The O(namespaces) graph scan
 (`NamespaceGraph::inspect_readiness`) runs only on the budgeted background
 maintenance pass, and not at all when `branching.enabled = false`. An
 aggressive load-balancer health check is fine here. See
 `../namespace/CLAUDE.md` for the lag/threshold trade.
+
+The compaction condition fails with 503 when its exit guard reports dead or
+when `now - last_tick > 3 * compaction.interval_secs + 60 seconds`. It runs
+after the audit check and before the storage probe, so a dead maintenance loop
+is reported without another backend request.
 
 > Corrected 2026-07-24. An earlier revision said the scan ran on every probe,
 > unbudgeted. That was true when written and was fixed in `4f8583c`.

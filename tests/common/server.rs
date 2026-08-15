@@ -24,8 +24,8 @@ use zeppelin::cache::hydration::{heat_policy_from_config, HydrationConfig, Segme
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::{
-    compaction_loop_with_governed_deletion, CompactionLifecycle, CompactionLoopOptions,
-    GovernedDeletionWorker,
+    compaction_loop_with_governed_deletion_and_health, CompactionLifecycle, CompactionLoopHealth,
+    CompactionLoopOptions, GovernedDeletionWorker,
 };
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{ApiKeyConfig, Config, SecurityMode};
@@ -719,6 +719,7 @@ async fn start_test_server_with_config_inner(
     .await;
     let server_tasks = Arc::new(ServerTaskSupervisor::new());
     let compaction_lifecycle = CompactionLifecycle::new();
+    let compaction_loop_health = Arc::new(CompactionLoopHealth::new(clock.now()));
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
@@ -734,6 +735,7 @@ async fn start_test_server_with_config_inner(
         compactor,
         lease_manager,
         compaction_lifecycle: compaction_lifecycle.clone(),
+        compaction_loop_health,
         server_tasks: Arc::clone(&server_tasks),
         fragment_cache: test_fragment_cache(&config),
         decoded_artifact_cache: test_decoded_artifact_cache(&config),
@@ -847,6 +849,7 @@ pub async fn start_test_server_on_store_with_readiness(
         start_test_audit(&config, &store, Some(&harness.prefix), &security).await;
     let server_tasks = Arc::new(ServerTaskSupervisor::new());
     let compaction_lifecycle = CompactionLifecycle::new();
+    let compaction_loop_health = Arc::new(CompactionLoopHealth::new(clock.now()));
     let manifest_cache_for_readiness = Arc::new(ManifestCache::new(Duration::from_millis(
         config.cache.manifest_cache_ttl_ms,
     )));
@@ -877,6 +880,7 @@ pub async fn start_test_server_on_store_with_readiness(
         compactor,
         lease_manager,
         compaction_lifecycle: compaction_lifecycle.clone(),
+        compaction_loop_health,
         server_tasks: Arc::clone(&server_tasks),
         fragment_cache: test_fragment_cache(&config),
         decoded_artifact_cache: test_decoded_artifact_cache(&config),
@@ -946,6 +950,7 @@ pub async fn start_test_server_with_compactor(
         start_test_audit(&config, &harness.store, Some(&harness.prefix), &security).await;
     let server_tasks = Arc::new(ServerTaskSupervisor::new());
     let compaction_lifecycle = CompactionLifecycle::new();
+    let compaction_loop_health = Arc::new(CompactionLoopHealth::new(clock.now()));
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
@@ -961,6 +966,7 @@ pub async fn start_test_server_with_compactor(
         compactor: compactor.clone(),
         lease_manager,
         compaction_lifecycle: compaction_lifecycle.clone(),
+        compaction_loop_health,
         server_tasks: Arc::clone(&server_tasks),
         fragment_cache: test_fragment_cache(&config),
         decoded_artifact_cache: test_decoded_artifact_cache(&config),
@@ -1025,6 +1031,7 @@ pub async fn start_test_server_with_compaction(
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(500)));
     let lease_manager = lease_manager(&config, &harness.store, &clock);
     let compaction_lifecycle = CompactionLifecycle::new();
+    let compaction_loop_health = Arc::new(CompactionLoopHealth::new(clock.now()));
     let branch_readiness = BranchReadinessObserver::scoped(Some(harness.prefix.clone()));
     let deletion_worker = GovernedDeletionWorker::new(
         harness.store.clone(),
@@ -1045,9 +1052,10 @@ pub async fn start_test_server_with_compaction(
         let lease_manager = lease_manager.clone();
         let cache = cache.clone();
         let compaction_lifecycle = compaction_lifecycle.clone();
+        let compaction_loop_health = Arc::clone(&compaction_loop_health);
         let namespace_prefix = Some(harness.prefix.clone());
         tokio::spawn(with_background_compaction_origin(async move {
-            compaction_loop_with_governed_deletion(
+            compaction_loop_with_governed_deletion_and_health(
                 compactor,
                 namespace_manager,
                 shutdown_rx,
@@ -1060,6 +1068,7 @@ pub async fn start_test_server_with_compaction(
                 },
                 deletion_worker,
                 &compaction_lifecycle,
+                compaction_loop_health,
             )
             .await;
         }));
@@ -1089,6 +1098,7 @@ pub async fn start_test_server_with_compaction(
         compactor,
         lease_manager,
         compaction_lifecycle: compaction_lifecycle.clone(),
+        compaction_loop_health,
         server_tasks: Arc::clone(&server_tasks),
         fragment_cache: test_fragment_cache(&config),
         decoded_artifact_cache: test_decoded_artifact_cache(&config),
@@ -1300,6 +1310,7 @@ pub struct FullTestServer {
     pub cache: Arc<DiskCache>,
     pub cache_dir: tempfile::TempDir,
     pub compactor: Arc<Compactor>,
+    pub compaction_loop_health: Arc<CompactionLoopHealth>,
     pub lease_manager: Arc<LeaseManager>,
     pub manifest_cache: Arc<ManifestCache>,
     pub audit: AuditClient,
@@ -1832,6 +1843,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     let compactor = compactor(&config, &store, &clock, &security);
     let lease_manager = lease_manager(&config, &store, &clock);
     let compaction_lifecycle = CompactionLifecycle::new();
+    let compaction_loop_health = Arc::new(CompactionLoopHealth::new(clock.now()));
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(
         config.cache.manifest_cache_ttl_ms,
     )));
@@ -1858,10 +1870,11 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
             let lease_manager = lease_manager.clone();
             let cache = cache.clone();
             let compaction_lifecycle = compaction_lifecycle.clone();
+            let compaction_loop_health = Arc::clone(&compaction_loop_health);
             let namespace_prefix = namespace_name_prefix.clone();
             compaction_loop_task = Some(tokio::spawn(with_background_compaction_origin(
                 async move {
-                    compaction_loop_with_governed_deletion(
+                    compaction_loop_with_governed_deletion_and_health(
                         compactor,
                         namespace_manager,
                         shutdown_rx,
@@ -1874,6 +1887,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
                         },
                         deletion_worker,
                         &compaction_lifecycle,
+                        compaction_loop_health,
                     )
                     .await;
                 },
@@ -1922,6 +1936,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         compactor: compactor.clone(),
         lease_manager: lease_manager.clone(),
         compaction_lifecycle: compaction_lifecycle.clone(),
+        compaction_loop_health: Arc::clone(&compaction_loop_health),
         server_tasks: Arc::clone(&server_tasks),
         fragment_cache: Arc::clone(&fragment_cache),
         decoded_artifact_cache: Arc::clone(&decoded_artifact_cache),
@@ -1963,6 +1978,7 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         cache,
         cache_dir,
         compactor,
+        compaction_loop_health,
         lease_manager,
         manifest_cache,
         audit,

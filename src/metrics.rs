@@ -209,6 +209,23 @@ mod inner {
         )
         .unwrap()
     });
+    /// Unix timestamp of the most recent compaction-loop tick boundary.
+    pub static COMPACTION_LOOP_LAST_TICK_TIMESTAMP_SECONDS: LazyLock<IntGauge> =
+        LazyLock::new(|| {
+            register_int_gauge!(
+                "zeppelin_compaction_loop_last_tick_timestamp_seconds",
+                "Unix timestamp of the most recent compaction-loop tick boundary"
+            )
+            .unwrap()
+        });
+    /// Whether the compaction-loop supervisor has not exited (1) or has exited (0).
+    pub static COMPACTION_LOOP_ALIVE: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "zeppelin_compaction_loop_alive",
+            "Whether the compaction-loop supervisor is alive"
+        )
+        .unwrap()
+    });
     /// Current number of entries tracked by the disk cache.
     pub static CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
         register_int_gauge!("zeppelin_cache_entries", "Number of entries in disk cache").unwrap()
@@ -605,6 +622,8 @@ pub fn init() {
     std::sync::LazyLock::force(&STORAGE_OPERATION_DURATION);
     std::sync::LazyLock::force(&STORAGE_ERRORS_TOTAL);
     std::sync::LazyLock::force(&COMPACTION_DURATION);
+    std::sync::LazyLock::force(&COMPACTION_LOOP_LAST_TICK_TIMESTAMP_SECONDS);
+    std::sync::LazyLock::force(&COMPACTION_LOOP_ALIVE);
     std::sync::LazyLock::force(&CACHE_ENTRIES);
     std::sync::LazyLock::force(&CACHE_EVICTIONS_TOTAL);
     std::sync::LazyLock::force(&ACTIVE_QUERIES);
@@ -646,5 +665,28 @@ pub fn init() {
         {
             BRANCH_INTENTS_STALLED.with_label_values(&[state]).set(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use prometheus::core::Collector;
+
+    use super::{init, COMPACTION_LOOP_ALIVE, COMPACTION_LOOP_LAST_TICK_TIMESTAMP_SECONDS};
+
+    #[test]
+    fn compaction_loop_metrics_are_registered_integer_gauges() {
+        init();
+
+        let _: &prometheus::IntGauge = &COMPACTION_LOOP_LAST_TICK_TIMESTAMP_SECONDS;
+        let _: &prometheus::IntGauge = &COMPACTION_LOOP_ALIVE;
+        assert_eq!(
+            COMPACTION_LOOP_LAST_TICK_TIMESTAMP_SECONDS.desc()[0].fq_name,
+            "zeppelin_compaction_loop_last_tick_timestamp_seconds"
+        );
+        assert_eq!(
+            COMPACTION_LOOP_ALIVE.desc()[0].fq_name,
+            "zeppelin_compaction_loop_alive"
+        );
     }
 }

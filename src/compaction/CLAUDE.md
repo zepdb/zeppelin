@@ -48,6 +48,21 @@ Compaction is capped at `(cpus/4).max(1)` and runs on a dedicated runtime so it
 cannot starve the query path. Raising this trades query latency for compaction
 throughput; measure before changing.
 
+## Liveness
+
+The supervisor publishes `zeppelin_compaction_loop_last_tick_timestamp_seconds`
+and the 0/1 gauge `zeppelin_compaction_loop_alive`. `/readyz` withholds readiness
+when the exit guard has cleared `alive`, or when
+`now - last_tick > 3 * compaction.interval_secs + 60 seconds`; the extra minute
+covers the tick's maintenance budget. The check reads only the two heartbeat
+atomics and never scans object storage or the namespace graph.
+
+The recorded policy is **503, not process abort**: removing a failed node from
+the load balancer preserves its logs and permits rolling replacement without a
+shared tick bug crashing every node simultaneously. Aborting the stateless
+process remains the alternative operator policy and would be a small follow-up
+change, but it is intentionally not the behavior implemented here.
+
 ## Local benchmark gotcha (macOS)
 
 Compaction's ~1000-way parallel GET burst exhausts the macOS ~1 GB mbuf pool at

@@ -133,10 +133,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -168,6 +169,124 @@ use super::gc::{GcNamespaceIncarnation, GcRunner};
 use super::{CompactionResult, Compactor};
 
 const NAMESPACE_DISCOVERY_REFRESH_TICKS: u64 = 12;
+const COMPACTION_LOOP_TICK_BUDGET_SECS: u64 = 60;
+
+/// Process-local heartbeat shared by the compaction supervisor and readiness.
+///
+/// The timestamp records progress at both boundaries of a maintenance tick.
+/// `alive` is cleared by an unwind-safe guard when the supervisor exits. The
+/// readiness path derives staleness from exactly one load of each atomic; its
+/// mutex only suppresses duplicate error logs across concurrent probes.
+#[derive(Debug)]
+pub struct CompactionLoopHealth {
+    last_tick_unix_secs: AtomicU64,
+    alive: AtomicBool,
+    last_readiness_healthy: Mutex<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompactionLoopReadiness {
+    pub(crate) healthy: bool,
+    pub(crate) thread_alive: bool,
+    pub(crate) stale: bool,
+    pub(crate) last_tick_unix_secs: u64,
+    pub(crate) log_unhealthy_transition: bool,
+}
+
+struct CompactionLoopExitGuard {
+    health: Arc<CompactionLoopHealth>,
+}
+
+impl CompactionLoopHealth {
+    /// Creates a live heartbeat initialized to the supplied wall-clock instant.
+    #[must_use]
+    pub fn new(now: DateTime<Utc>) -> Self {
+        let last_tick_unix_secs = unix_timestamp_secs(now);
+        crate::metrics::COMPACTION_LOOP_LAST_TICK_TIMESTAMP_SECONDS.set(now.timestamp());
+        crate::metrics::COMPACTION_LOOP_ALIVE.set(1);
+        Self {
+            last_tick_unix_secs: AtomicU64::new(last_tick_unix_secs),
+            alive: AtomicBool::new(true),
+            last_readiness_healthy: Mutex::new(true),
+        }
+    }
+
+    /// Returns whether the supervisor exit guard still considers the loop live.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
+    /// Returns the most recent tick boundary as whole Unix seconds.
+    #[must_use]
+    pub fn last_tick_unix_secs(&self) -> u64 {
+        self.last_tick_unix_secs.load(Ordering::SeqCst)
+    }
+
+    fn record_tick(&self, now: DateTime<Utc>) {
+        let unix_secs = unix_timestamp_secs(now);
+        self.last_tick_unix_secs.store(unix_secs, Ordering::SeqCst);
+        crate::metrics::COMPACTION_LOOP_LAST_TICK_TIMESTAMP_SECONDS.set(now.timestamp());
+        *self
+            .last_readiness_healthy
+            .lock()
+            .unwrap_or_else(|_| panic!("compaction-loop readiness transition lock poisoned")) =
+            true;
+    }
+
+    #[must_use]
+    pub(crate) fn readiness_at(
+        &self,
+        now: DateTime<Utc>,
+        interval_secs: u64,
+    ) -> CompactionLoopReadiness {
+        // Keep this snapshot to exactly two atomic loads. In particular,
+        // readiness must never replace these with an object-store probe.
+        let thread_alive = self.alive.load(Ordering::SeqCst);
+        let last_tick_unix_secs = self.last_tick_unix_secs.load(Ordering::SeqCst);
+        let now_unix_secs = unix_timestamp_secs(now);
+        let elapsed_secs = now_unix_secs.checked_sub(last_tick_unix_secs);
+        let threshold_secs =
+            u128::from(interval_secs) * 3 + u128::from(COMPACTION_LOOP_TICK_BUDGET_SECS);
+        let stale = elapsed_secs.is_some_and(|elapsed| u128::from(elapsed) > threshold_secs);
+        let healthy = thread_alive && !stale;
+
+        let mut last_readiness_healthy = self
+            .last_readiness_healthy
+            .lock()
+            .unwrap_or_else(|_| panic!("compaction-loop readiness transition lock poisoned"));
+        let log_unhealthy_transition = *last_readiness_healthy && !healthy;
+        *last_readiness_healthy = healthy;
+
+        CompactionLoopReadiness {
+            healthy,
+            thread_alive,
+            stale,
+            last_tick_unix_secs,
+            log_unhealthy_transition,
+        }
+    }
+}
+
+impl CompactionLoopExitGuard {
+    fn new(health: Arc<CompactionLoopHealth>) -> Self {
+        Self { health }
+    }
+}
+
+impl Drop for CompactionLoopExitGuard {
+    fn drop(&mut self) {
+        self.health.alive.store(false, Ordering::SeqCst);
+        crate::metrics::COMPACTION_LOOP_ALIVE.set(0);
+    }
+}
+
+fn unix_timestamp_secs(now: DateTime<Utc>) -> u64 {
+    let Ok(unix_secs) = u64::try_from(now.timestamp()) else {
+        panic!("compaction-loop clock precedes the Unix epoch");
+    };
+    unix_secs
+}
 
 /// Failure while admitting or retiring leased-compaction heartbeat work.
 #[derive(Debug, Error)]
@@ -1256,6 +1375,7 @@ async fn warm_segment_index_meta(store: ZeppelinStore, cache: Arc<DiskCache>, na
 ///   successful deletion or compaction.
 /// - `lease_manager`: Shared holder used for all namespace compaction leases.
 /// - `cache`: Shared tiered object cache used for post-publication metadata warm.
+/// - `health`: Shared process-local heartbeat observed by HTTP readiness.
 /// - `options`: Worker allocation and fixed GC policy for this runtime.
 ///
 /// # Returns
@@ -1322,6 +1442,7 @@ pub fn start_compaction_thread(
     deletion_worker: GovernedDeletionWorker,
     encoder_provider: Arc<dyn MultiVectorEncoderProvider>,
     lifecycle: CompactionLifecycle,
+    health: Arc<CompactionLoopHealth>,
     options: CompactionThreadOptions,
 ) -> std::thread::JoinHandle<()> {
     let compaction_workers = options.compaction_workers;
@@ -1331,6 +1452,7 @@ pub fn start_compaction_thread(
     std::thread::Builder::new()
         .name("compaction-runtime".to_string())
         .spawn(move || {
+            let _exit_guard = CompactionLoopExitGuard::new(Arc::clone(&health));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(compaction_workers)
                 .thread_name("compaction-worker")
@@ -1368,6 +1490,7 @@ pub fn start_compaction_thread(
                         },
                         Some(&deletion_worker),
                         Some(enrichment_maintenance),
+                        Some(health.as_ref()),
                         &lifecycle,
                     ) => {}
                     failure = enrichment.wait_for_executor_failure() => {
@@ -1595,6 +1718,7 @@ pub async fn compaction_loop_with_lifecycle(
         options,
         None,
         None,
+        None,
         lifecycle,
     )
     .await;
@@ -1629,6 +1753,44 @@ pub async fn compaction_loop_with_governed_deletion(
         options,
         Some(&deletion_worker),
         None,
+        None,
+        lifecycle,
+    )
+    .await;
+}
+
+/// Run governed maintenance while publishing a shared liveness heartbeat.
+///
+/// This is the production-shaped asynchronous seam used by test servers that
+/// own the loop as a Tokio task instead of an OS thread. Dropping or aborting
+/// the future clears `health.alive` through the same guard shape as production.
+// Dependency wiring: every argument is a distinct collaborator passed
+// once. A params struct would rename the same fields, not reduce them.
+#[allow(clippy::too_many_arguments)]
+pub async fn compaction_loop_with_governed_deletion_and_health(
+    compactor: Arc<Compactor>,
+    namespace_manager: Arc<NamespaceManager>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    manifest_cache: Arc<ManifestCache>,
+    lease_manager: Arc<LeaseManager>,
+    cache: Arc<DiskCache>,
+    options: CompactionLoopOptions,
+    deletion_worker: GovernedDeletionWorker,
+    lifecycle: &CompactionLifecycle,
+    health: Arc<CompactionLoopHealth>,
+) {
+    let _exit_guard = CompactionLoopExitGuard::new(Arc::clone(&health));
+    compaction_loop_with_lifecycle_inner(
+        compactor,
+        namespace_manager,
+        shutdown,
+        manifest_cache,
+        lease_manager,
+        cache,
+        options,
+        Some(&deletion_worker),
+        None,
+        Some(health.as_ref()),
         lifecycle,
     )
     .await;
@@ -1647,6 +1809,7 @@ async fn compaction_loop_with_lifecycle_inner(
     options: CompactionLoopOptions,
     deletion_worker: Option<&GovernedDeletionWorker>,
     enrichment: Option<EnrichmentMaintenance<'_>>,
+    health: Option<&CompactionLoopHealth>,
     lifecycle: &CompactionLifecycle,
 ) {
     let CompactionLoopOptions {
@@ -1676,6 +1839,9 @@ async fn compaction_loop_with_lifecycle_inner(
     let mut tick: u64 = 0;
 
     loop {
+        if let Some(health) = health {
+            health.record_tick(compactor.clock().now());
+        }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(compactor.config().interval_secs)) => {},
             _ = shutdown.changed() => {
@@ -2054,18 +2220,109 @@ async fn compaction_loop_with_lifecycle_inner(
                 );
             }
         }
+        if let Some(health) = health {
+            health.record_tick(compactor.clock().now());
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
 
     use chrono::{DateTime, Utc};
 
-    use super::{changed_namespace_names, is_fresh_namespace_discovery_tick};
+    use super::{
+        changed_namespace_names, is_fresh_namespace_discovery_tick, CompactionLoopExitGuard,
+        CompactionLoopHealth,
+    };
     use crate::compaction::gc::GcNamespaceIncarnation;
     use crate::namespace::manager::NamespaceIncarnationId;
+    use crate::time::{Clock, TimeSource};
+
+    #[derive(Debug)]
+    struct AdjustableTimeSource {
+        unix_secs: AtomicI64,
+    }
+
+    impl AdjustableTimeSource {
+        fn new(unix_secs: i64) -> Self {
+            Self {
+                unix_secs: AtomicI64::new(unix_secs),
+            }
+        }
+
+        fn set(&self, unix_secs: i64) {
+            self.unix_secs.store(unix_secs, Ordering::SeqCst);
+        }
+    }
+
+    impl TimeSource for AdjustableTimeSource {
+        fn now(&self) -> DateTime<Utc> {
+            DateTime::from_timestamp(self.unix_secs.load(Ordering::SeqCst), 0)
+                .unwrap_or_else(|| panic!("test compaction-loop timestamp must be representable"))
+        }
+    }
+
+    #[test]
+    fn compaction_loop_exit_guard_clears_alive_on_unwind() {
+        let health = Arc::new(CompactionLoopHealth::new(
+            DateTime::from_timestamp(1_700_000_000, 0)
+                .unwrap_or_else(|| panic!("test timestamp must be representable")),
+        ));
+        let thread_health = Arc::clone(&health);
+
+        let result = std::thread::spawn(move || {
+            let _exit_guard = CompactionLoopExitGuard::new(thread_health);
+            panic!("intentional compaction-loop unwind");
+        })
+        .join();
+
+        assert!(result.is_err(), "sentinel fixture must unwind");
+        assert!(!health.is_alive(), "unwind sentinel must clear alive");
+    }
+
+    #[test]
+    fn compaction_loop_staleness_uses_injected_clock_and_exact_threshold() {
+        const INITIAL: i64 = 1_700_000_000;
+        const INTERVAL_SECS: u64 = 10;
+        let source = Arc::new(AdjustableTimeSource::new(INITIAL));
+        let clock = Clock::from_source(source.clone());
+        let health = CompactionLoopHealth::new(clock.now());
+
+        // 3 * 10 + 60 = 90: the strict comparison stays healthy at 90.
+        source.set(INITIAL + 90);
+        let boundary = health.readiness_at(clock.now(), INTERVAL_SECS);
+        assert!(boundary.healthy);
+        assert!(!boundary.stale);
+
+        source.set(INITIAL + 91);
+        let stale = health.readiness_at(clock.now(), INTERVAL_SECS);
+        assert!(!stale.healthy);
+        assert!(stale.stale);
+        assert!(stale.log_unhealthy_transition);
+        assert!(
+            !health
+                .readiness_at(clock.now(), INTERVAL_SECS)
+                .log_unhealthy_transition,
+            "repeated probes must not repeat the transition log"
+        );
+
+        health.record_tick(clock.now());
+        let recovered = health.readiness_at(clock.now(), INTERVAL_SECS);
+        assert!(recovered.healthy);
+        assert!(!recovered.stale);
+
+        source.set(INITIAL + 182);
+        assert!(
+            health
+                .readiness_at(clock.now(), INTERVAL_SECS)
+                .log_unhealthy_transition,
+            "a tick recovery must re-arm the next unhealthy transition log"
+        );
+    }
 
     #[test]
     fn namespace_discovery_refreshes_on_first_and_every_twelfth_tick() {

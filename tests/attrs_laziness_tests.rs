@@ -100,6 +100,9 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
     let app = build_router(AppState {
         store: store.clone(),
         clock: clock.clone(),
+        compaction_loop_health: Arc::new(
+            zeppelin::compaction::background::CompactionLoopHealth::new(clock.now()),
+        ),
         security: Arc::clone(&security),
         audit,
         credential_adapter,

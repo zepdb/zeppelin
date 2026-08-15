@@ -105,7 +105,7 @@ use crate::cache::decoded_cache::DecodedArtifactCache;
 use crate::cache::hydration::SegmentHydrator;
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
-use crate::compaction::background::CompactionLifecycle;
+use crate::compaction::background::{CompactionLifecycle, CompactionLoopHealth};
 use crate::compaction::Compactor;
 use crate::config::Config;
 use crate::embedding::MultiVectorEncoderProvider;
@@ -314,6 +314,8 @@ pub struct AppState {
     pub lease_manager: Arc<LeaseManager>,
     /// Shared owner for periodic and manual leased-compaction heartbeats.
     pub compaction_lifecycle: CompactionLifecycle,
+    /// Process-local compaction supervisor heartbeat consumed by readiness.
+    pub compaction_loop_health: Arc<CompactionLoopHealth>,
     /// Owner for request-spawned authoritative mutation tasks.
     pub server_tasks: Arc<ServerTaskSupervisor>,
     /// Immutable boot-time server, storage, indexing, and compaction settings.

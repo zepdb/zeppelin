@@ -116,7 +116,8 @@ use crate::cache::{
     DiskCache,
 };
 use crate::compaction::background::{
-    start_compaction_thread, CompactionLifecycle, CompactionThreadOptions, GovernedDeletionWorker,
+    start_compaction_thread, CompactionLifecycle, CompactionLoopHealth, CompactionThreadOptions,
+    GovernedDeletionWorker,
 };
 use crate::compaction::Compactor;
 use crate::config::{Config, CpuBudget, SecurityMode};
@@ -580,6 +581,7 @@ pub async fn build_app(config: Config) -> ZeppelinResult<(Router, BackgroundTask
         clock.clone(),
     ));
     let compaction_lifecycle = CompactionLifecycle::new();
+    let compaction_loop_health = Arc::new(CompactionLoopHealth::new(clock.now()));
     // One snapshot shared by the scanning worker and the readiness handler.
     let branch_readiness = BranchReadinessObserver::unscoped();
     let deletion_worker = GovernedDeletionWorker::new(
@@ -607,6 +609,7 @@ pub async fn build_app(config: Config) -> ZeppelinResult<(Router, BackgroundTask
         deletion_worker,
         Arc::clone(&encoder_provider),
         compaction_lifecycle.clone(),
+        Arc::clone(&compaction_loop_health),
         CompactionThreadOptions {
             compaction_workers: cpu_budget.compaction_workers,
             gc_config: config.gc.clone(),
@@ -681,6 +684,7 @@ pub async fn build_app(config: Config) -> ZeppelinResult<(Router, BackgroundTask
         compactor,
         lease_manager,
         compaction_lifecycle: compaction_lifecycle.clone(),
+        compaction_loop_health,
         server_tasks: Arc::clone(&server_tasks),
         config: Arc::new(config),
         trusted_proxies,

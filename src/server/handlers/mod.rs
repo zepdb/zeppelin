@@ -24,7 +24,8 @@
 //! ```
 //!
 //! Operational endpoints have narrower contracts. `/healthz` proves only that
-//! the process can answer; `/readyz` performs object-store and branch-graph scans;
+//! the process can answer; `/readyz` checks process-local latches and one
+//! object-store reachability probe while reading the branch-graph snapshot;
 //! `/metrics` exports process metrics; and the feature-gated profiling route
 //! performs blocking CPU sampling off the Tokio worker pool. Their success and
 //! failure bodies are not all canonical domain-error envelopes, so callers
@@ -485,33 +486,33 @@ pub async fn health_check() -> Json<Value> {
 /// # Returns
 ///
 /// `Ok` with JSON `{"status":"ready","s3_connected":true}` and status 200
-/// when listing and graph inspection succeed. Returns a direct `(503, JSON)`
-/// rejection with `s3_connected:false` when the reachability probe fails. An
-/// branch-graph failure returns `s3_connected:true` plus aggregate lifecycle
-/// counts and, for orphan roots, a bounded identities-and-digests operator
-/// repair summary. This operational body is intentionally distinct from the
-/// canonical domain-error envelope.
+/// when every readiness condition succeeds. Returns a direct `(503, JSON)`
+/// rejection when the audit writer or compaction loop is unhealthy, or with
+/// `s3_connected:false` when the reachability probe fails. A branch-graph
+/// failure returns `s3_connected:true` plus aggregate lifecycle counts and, for
+/// orphan roots, a bounded identities-and-digests operator repair summary. This
+/// operational body is intentionally distinct from the canonical domain-error
+/// envelope.
 ///
 /// # Errors
 ///
-/// The error return represents an unavailable durable audit actor, an
-/// unreachable storage backend, or an unhealthy branch graph. No raw backend
-/// diagnostic is returned, and no partial mutation can occur because both
-/// storage checks are read-only.
+/// The error return represents an unavailable durable audit actor, a dead or
+/// stale compaction loop, an unreachable storage backend, or an unhealthy
+/// branch graph. No raw backend diagnostic is returned, and no mutation occurs.
 ///
 /// # Side Effects
 ///
-/// Checks the process-local durable-audit health latch, performs the existing
-/// object-store list request, then strongly reads namespace metadata and
-/// manifests, then refreshes the bounded branch lifecycle and total-root
-/// gauges. It logs full failures and `/readyz` bypasses rate-limit charging.
+/// Checks the process-local durable-audit latch, reads the compaction heartbeat's
+/// two atomics, performs the existing object-store list request, then reads the
+/// process-local branch-readiness snapshot. It logs full failures and `/readyz`
+/// bypasses rate-limit charging.
 ///
 /// # Consistency
 ///
-/// Success means the audit actor has not failed, S3 is reachable, and the
-/// completed graph scan found no authoritative orphan root or stalled branch
-/// lifecycle intent at that instant. It is not a promise that a later request
-/// cannot fail.
+/// Success means the audit actor has not failed, the compaction loop is live
+/// and recent, S3 is reachable, and the most recently published graph scan found
+/// no authoritative orphan root or stalled branch lifecycle intent. It is not a
+/// promise that a later request cannot fail.
 ///
 /// # Examples
 ///
@@ -530,6 +531,28 @@ pub async fn readiness_check(
                 "s3_connected": true,
                 "audit_writer_healthy": false,
                 "error": "durable audit writer is unavailable",
+            })),
+        ));
+    }
+    let compaction_readiness = state
+        .compaction_loop_health
+        .readiness_at(state.clock.now(), state.config.compaction.interval_secs);
+    if !compaction_readiness.healthy {
+        if compaction_readiness.log_unhealthy_transition {
+            tracing::error!(
+                thread_alive = compaction_readiness.thread_alive,
+                stale = compaction_readiness.stale,
+                last_tick_unix_secs = compaction_readiness.last_tick_unix_secs,
+                interval_secs = state.config.compaction.interval_secs,
+                "readiness check failed: background compaction loop is not running"
+            );
+        }
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not_ready",
+                "compaction_loop_alive": false,
+                "error": "background compaction loop is not running",
             })),
         ));
     }

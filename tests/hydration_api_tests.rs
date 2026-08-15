@@ -131,6 +131,9 @@ async fn start_api_server(mut config: Config) -> ApiServer {
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
+        compaction_loop_health: Arc::new(
+            zeppelin::compaction::background::CompactionLoopHealth::new(clock.now()),
+        ),
         security: Arc::clone(&security),
         audit,
         credential_adapter,
