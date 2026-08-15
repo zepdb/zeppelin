@@ -597,6 +597,50 @@ async fn test_put_if_match_storage_error() {
     }
 }
 
+/// Capability-flavored sibling of [`test_put_if_match_storage_error`]: the
+/// `NotImplemented` above is not an accident — the Local backend *declares*
+/// no conditional-PUT capability, and the boot-time verification honors that
+/// declaration (skipping CAS while still proving create-only PUT, LIST ETag
+/// comparability, and delete-of-absent semantics live).
+#[tokio::test]
+async fn test_local_backend_declares_no_conditional_put_and_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StorageConfig {
+        backend: StorageBackend::Local,
+        bucket: dir.path().to_str().unwrap().to_string(),
+        ..Default::default()
+    };
+    let store = ZeppelinStore::from_config(&config).unwrap();
+
+    let caps = store.capabilities();
+    assert_eq!(
+        caps,
+        zeppelin::storage::StorageCapabilities::local(),
+        "Local store must carry the Local matrix row"
+    );
+    assert!(caps.conditional_put.is_none());
+    assert!(!caps.delete_absent_is_ok);
+
+    store
+        .verify_declared_capabilities()
+        .await
+        .expect("the Local matrix row must verify against live behavior");
+}
+
+/// The harness backend (memory by default, MinIO/S3 under `TEST_BACKEND`)
+/// must pass live verification of its declared capability matrix — the same
+/// round-trip `storage.fail_fast` boots run. A backend that fails here would
+/// let every CAS test pass vacuously.
+#[tokio::test]
+async fn test_declared_capabilities_verify_against_live_backend() {
+    let harness = TestHarness::new().await;
+    harness
+        .store
+        .verify_declared_capabilities()
+        .await
+        .expect("declared capability matrix must match live substrate behavior");
+}
+
 /// Test head() generic storage error mapping (lines 264-265).
 /// Uses local backend with a path conflict to trigger a non-NotFound OS error.
 #[tokio::test]

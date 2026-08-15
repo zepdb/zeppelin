@@ -101,6 +101,7 @@ use tracing::{debug, instrument};
 
 use crate::config::StorageConfig;
 use crate::error::{Result, ZeppelinError};
+use crate::storage::capabilities::{canonical_etag, CasTokenKind, StorageCapabilities};
 use crate::storage::{namespace_prefix, NamespaceObjectFamily, NamespaceObjectKey};
 
 /// Maximum number of exact keys accepted by one S3 DeleteObjects request.
@@ -146,6 +147,8 @@ impl ContentHashCache {
 pub struct ZeppelinStore {
     /// Runtime-selected backend shared by all clones of this gateway.
     inner: Arc<dyn ObjectStore>,
+    /// Declared capability matrix for the constructed substrate.
+    capabilities: StorageCapabilities,
     /// Prefix-cleanup behavior selected when the backend is constructed.
     prefix_delete_mode: PrefixDeleteMode,
     /// Transient hashes of exact bodies accepted by local immutable PUTs.
@@ -555,23 +558,215 @@ impl ZeppelinStore {
                 }
             };
 
-        let prefix_delete_mode = if config.backend == crate::config::StorageBackend::S3 {
+        let capabilities = StorageCapabilities::for_backend(config.backend);
+        let prefix_delete_mode = if capabilities.native_batch_delete {
             PrefixDeleteMode::NativeBatch
         } else {
             PrefixDeleteMode::LegacyPerKeyUnordered32
         };
         Ok(Self {
             inner: store,
+            capabilities,
             prefix_delete_mode,
             content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
             object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
         })
     }
 
-    /// Fails startup early when an explicit S3-compatible endpoint is not reachable.
+    /// Returns the declared capability matrix for the constructed substrate.
     ///
-    /// The probe applies only to S3 configurations with a non-empty custom
-    /// endpoint. Hostnames are tested with an asynchronous TCP connection under
+    /// Callers gate on capabilities, never on backend identity: "does this
+    /// store support conditional PUT?" is answerable here without knowing or
+    /// caring which vendor provides it.
+    #[must_use]
+    pub fn capabilities(&self) -> StorageCapabilities {
+        self.capabilities
+    }
+
+    /// Verifies the declared capability matrix against live substrate behavior.
+    ///
+    /// The boot storage probe calls this when `storage.fail_fast` is set. One
+    /// probe object is written under the reserved `__zeppelin_probe__/` prefix
+    /// — outside every namespace family, so [`NamespaceObjectKey::classify`]
+    /// fails closed on it by construction and GC can never touch it. The
+    /// round-trip exercises create-only PUT, conditional PUT with a fresh and
+    /// then a deliberately stale token, LIST-vs-GET ETag comparability, and
+    /// delete-of-absent semantics, then removes the object.
+    ///
+    /// # Errors
+    ///
+    /// [`ZeppelinError::Config`] naming the capability whose observed behavior
+    /// contradicts the declaration. A stale-token CAS that succeeds is the
+    /// most important refusal: it is the mis-deployed-backend case (for
+    /// example MinIO without conditional-PUT support) where every
+    /// compare-and-swap in the system would silently become an overwrite.
+    pub async fn verify_declared_capabilities(&self) -> Result<()> {
+        let caps = self.capabilities;
+        let probe_prefix = "__zeppelin_probe__";
+        let key = format!("{probe_prefix}/{}", uuid::Uuid::new_v4());
+        let mismatch = |capability: &str, detail: String| {
+            ZeppelinError::Config(format!(
+                "storage capability verification failed: declared {capability} \
+                 but the substrate behaved otherwise ({detail})"
+            ))
+        };
+
+        let created = self
+            .put_create_outcome(&key, Bytes::from_static(b"zeppelin-capability-probe-1"))
+            .await?;
+        let CreateOnlyOutcome::Created { version } = created else {
+            return Err(mismatch(
+                "create_only_put",
+                format!("probe key {key} already existed"),
+            ));
+        };
+        if caps.create_only_put {
+            let conflict = self
+                .put_create_outcome(&key, Bytes::from_static(b"zeppelin-capability-probe-dup"))
+                .await?;
+            if conflict != CreateOnlyOutcome::AlreadyExists {
+                return Err(mismatch(
+                    "create_only_put",
+                    "second create-only PUT overwrote the probe object".to_string(),
+                ));
+            }
+        }
+
+        let mut last_version = version;
+        if let Some(token_kind) = caps.conditional_put {
+            let token = last_version.clone().ok_or_else(|| {
+                mismatch(
+                    "conditional_put",
+                    "create returned no version token".to_string(),
+                )
+            })?;
+            match token_kind {
+                CasTokenKind::ETag if token.etag().is_none() => {
+                    return Err(mismatch(
+                        "conditional_put = ETag",
+                        "create returned a token without an ETag".to_string(),
+                    ));
+                }
+                CasTokenKind::BackendVersion if token.backend_version().is_none() => {
+                    return Err(mismatch(
+                        "conditional_put = BackendVersion",
+                        "create returned a token without a backend version".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+
+            let updated = self
+                .put_if_match_outcome(
+                    &key,
+                    Bytes::from_static(b"zeppelin-capability-probe-2"),
+                    &token,
+                )
+                .await?;
+            let fresh = match updated {
+                ConditionalPutOutcome::Updated {
+                    version: Some(fresh),
+                } if fresh != token => fresh,
+                ConditionalPutOutcome::Updated { version } => {
+                    return Err(mismatch(
+                        "conditional_put",
+                        format!(
+                            "CAS with the current token returned no fresh identity \
+                             (got {version:?})"
+                        ),
+                    ));
+                }
+                ConditionalPutOutcome::Conflict => {
+                    return Err(mismatch(
+                        "conditional_put",
+                        "CAS with the current token was rejected".to_string(),
+                    ));
+                }
+            };
+
+            let stale = self
+                .put_if_match_outcome(
+                    &key,
+                    Bytes::from_static(b"zeppelin-capability-probe-3"),
+                    &token,
+                )
+                .await?;
+            if stale != ConditionalPutOutcome::Conflict {
+                return Err(mismatch(
+                    "conditional_put",
+                    "CAS with a STALE token succeeded — conditional preconditions \
+                     are not enforced by this deployment"
+                        .to_string(),
+                ));
+            }
+            last_version = Some(fresh);
+        }
+
+        if caps.list_etag_comparable {
+            let get_etag = match last_version.as_ref().and_then(StorageVersion::etag) {
+                Some(etag) => etag.to_string(),
+                None => {
+                    let (_, read_version) = self.get_with_meta(&key).await?;
+                    read_version
+                        .as_ref()
+                        .and_then(StorageVersion::etag)
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            mismatch(
+                                "list_etag_comparable",
+                                "GET returned no ETag to compare against".to_string(),
+                            )
+                        })?
+                }
+            };
+            // Prefixes are path-segment based, so list the reserved parent
+            // and find this boot's probe key among (possibly concurrent or
+            // crash-leaked) siblings.
+            let listed = self.list_prefix_meta(probe_prefix).await?;
+            let listed_etag = listed
+                .iter()
+                .find(|object| object.key == key)
+                .and_then(|object| object.version.as_ref())
+                .and_then(StorageVersion::etag)
+                .ok_or_else(|| {
+                    mismatch(
+                        "list_etag_comparable",
+                        "LIST returned no ETag for the probe object".to_string(),
+                    )
+                })?;
+            if canonical_etag(listed_etag) != canonical_etag(&get_etag) {
+                return Err(mismatch(
+                    "list_etag_comparable",
+                    format!(
+                        "LIST ETag {listed_etag:?} does not identify the version \
+                         written last ({get_etag:?})"
+                    ),
+                ));
+            }
+        }
+
+        self.delete(&key).await?;
+        let raw_absent_delete = self.inner.delete(&Path::parse(&key)?).await;
+        match (caps.delete_absent_is_ok, raw_absent_delete) {
+            (true, Ok(())) => {}
+            (false, Err(object_store::Error::NotFound { .. })) => {}
+            (declared, observed) => {
+                return Err(mismatch(
+                    "delete_absent_is_ok",
+                    format!("declared {declared}, observed {observed:?}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fails startup early when an explicitly configured storage endpoint is not reachable.
+    ///
+    /// The probe applies only to configurations that name a custom endpoint
+    /// for their backend (today `s3_endpoint`; the GCS/Azure endpoint fields
+    /// join it with their transports). No endpoint configured means nothing
+    /// to probe — real-cloud DNS is exercised by the object-store-level boot
+    /// probe instead. Hostnames are tested with an asynchronous TCP connection under
     /// a Tokio timeout. Numeric IPs use `connect_timeout` in a blocking worker;
     /// for loopback IPs, an occupied port is accepted after a bind check without
     /// verifying that the listener is an object store. This is a transport
@@ -626,14 +821,7 @@ impl ZeppelinStore {
         config: &StorageConfig,
         timeout_duration: Duration,
     ) -> Result<()> {
-        if config.backend != crate::config::StorageBackend::S3 {
-            return Ok(());
-        }
-        let Some(endpoint) = config
-            .s3_endpoint
-            .as_deref()
-            .filter(|value| !value.is_empty())
-        else {
+        let Some(endpoint) = configured_probe_endpoint(config) else {
             return Ok(());
         };
         let (host, port) = endpoint_host_port(endpoint)?;
@@ -699,11 +887,30 @@ impl ZeppelinStore {
     ///
     /// An integration test can wrap an in-memory store in a GET-counting
     /// implementation and pass its `Arc<dyn ObjectStore>` here. Production code
-    /// normally uses [`Self::from_config`] instead.
+    /// normally uses [`Self::from_config`] instead; this constructor declares
+    /// the `InMemory` capability column, which is what its test callers wrap.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self::new_with_capabilities(store, StorageCapabilities::in_memory())
+    }
+
+    /// Wraps an already constructed backend under an explicit capability matrix.
+    ///
+    /// For wrappers around a non-`InMemory` backend (an instrumented MinIO
+    /// store, a fault decorator over a real substrate) whose declared
+    /// capabilities must match what the wrapped backend actually does.
+    pub fn new_with_capabilities(
+        store: Arc<dyn ObjectStore>,
+        capabilities: StorageCapabilities,
+    ) -> Self {
+        let prefix_delete_mode = if capabilities.native_batch_delete {
+            PrefixDeleteMode::NativeBatch
+        } else {
+            PrefixDeleteMode::LegacyPerKeyUnordered32
+        };
         Self {
             inner: store,
-            prefix_delete_mode: PrefixDeleteMode::LegacyPerKeyUnordered32,
+            capabilities,
+            prefix_delete_mode,
             content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
             object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
         }
@@ -715,14 +922,11 @@ impl ZeppelinStore {
     /// fault decorators use [`Self::new`] so their established per-key failure
     /// scheduling remains unchanged; the perf harness explicitly opts into this
     /// constructor after installing transparent forwarding decorators.
+    /// Deprecated-for-removal in the multi-substrate naming sweep: callers
+    /// should migrate to [`Self::new_with_capabilities`] with the S3 column.
     #[doc(hidden)]
     pub fn new_with_native_batch_delete(store: Arc<dyn ObjectStore>) -> Self {
-        Self {
-            inner: store,
-            prefix_delete_mode: PrefixDeleteMode::NativeBatch,
-            content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
-            object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
-        }
+        Self::new_with_capabilities(store, StorageCapabilities::s3())
     }
 
     /// Clone this gateway for authority-side reads without inheriting application signing.
@@ -736,6 +940,7 @@ impl ZeppelinStore {
     pub(crate) fn signer_detached_clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            capabilities: self.capabilities,
             prefix_delete_mode: self.prefix_delete_mode,
             content_hashes: Arc::clone(&self.content_hashes),
             object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
@@ -1850,9 +2055,13 @@ impl ZeppelinStore {
     ///
     /// # Errors
     ///
-    /// A backend that reports an absent object produces
-    /// [`ZeppelinError::NotFound`]. Invalid keys and other delete failures remain
-    /// errors. Different backends may treat deletion of an absent key differently.
+    /// Invalid keys and delete failures are errors. Deleting an absent key is
+    /// **success on every backend**: S3 reports success natively, and the seam
+    /// normalizes the `NotFound` that GCS, Azure, Local, and InMemory report
+    /// (per `StorageCapabilities::delete_absent_is_ok`) so GC's drain
+    /// idempotency holds identically on all substrates. This is a single
+    /// documented contract, not a fallback; the raw substrate behavior is
+    /// still verified at boot by [`Self::verify_declared_capabilities`].
     ///
     /// # Side Effects
     ///
@@ -1873,12 +2082,20 @@ impl ZeppelinStore {
     pub async fn delete(&self, key: &str) -> Result<()> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
-        self.inner.delete(&path).await.map_err(|e| match e {
-            object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
-                key: path.to_string(),
-            },
-            other => ZeppelinError::Storage(other),
-        })?;
+        match self.inner.delete(&path).await {
+            Ok(()) => {}
+            // Absence-is-success normalization: only backends whose
+            // capability row says deletes of absent keys surface NotFound
+            // reach this arm; S3 never does, so its behavior is unchanged.
+            Err(object_store::Error::NotFound { .. }) if !self.capabilities.delete_absent_is_ok => {
+            }
+            Err(object_store::Error::NotFound { path, .. }) => {
+                return Err(ZeppelinError::NotFound {
+                    key: path.to_string(),
+                })
+            }
+            Err(other) => return Err(ZeppelinError::Storage(other)),
+        }
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 delete");
         crate::metrics::STORAGE_OPERATION_DURATION
@@ -2631,6 +2848,24 @@ impl ZeppelinStore {
 /// `split_once`, and `transpose` combine `Option` and `Result` without nullable
 /// pointers or out-parameters: absence can choose a default, while invalid text
 /// still returns an error.
+/// Returns the explicitly configured substrate endpoint eligible for the TCP
+/// boot probe, if any.
+///
+/// This is config-shape dispatch (which field names the endpoint for the
+/// selected backend), not a capability question. Backends without an endpoint
+/// field configured have nothing to TCP-probe; real-cloud reachability is
+/// exercised by the object-store-level boot probe instead. The GCS and Azure
+/// endpoint fields join this match together with their transports.
+fn configured_probe_endpoint(config: &StorageConfig) -> Option<&str> {
+    let endpoint = match config.backend {
+        crate::config::StorageBackend::S3 => config.s3_endpoint.as_deref(),
+        crate::config::StorageBackend::Gcs
+        | crate::config::StorageBackend::Azure
+        | crate::config::StorageBackend::Local => None,
+    };
+    endpoint.filter(|value| !value.is_empty())
+}
+
 fn endpoint_host_port(endpoint: &str) -> Result<(String, u16)> {
     let (default_port, without_scheme) = if let Some(rest) = endpoint.strip_prefix("http://") {
         (80, rest)

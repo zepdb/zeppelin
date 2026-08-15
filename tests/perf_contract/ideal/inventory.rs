@@ -19,6 +19,7 @@ pub(crate) struct StorageMethodInventory {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StoreMethod {
     ProbeConfiguredEndpoint,
+    VerifyDeclaredCapabilities,
     Put,
     PutCreate,
     PutCreateOutcome,
@@ -51,6 +52,14 @@ const STORAGE_METHOD_INVENTORY: &[StorageMethodInventory] = &[
         name: "probe_configured_endpoint",
         disposition: StorageMethodDisposition::ExcludedNonS3 {
             reason: "TCP/config reachability probe; it does not call ObjectStore",
+        },
+    },
+    StorageMethodInventory {
+        method: StoreMethod::VerifyDeclaredCapabilities,
+        name: "verify_declared_capabilities",
+        disposition: StorageMethodDisposition::ExcludedNonS3 {
+            reason: "boot-only capability verification under storage.fail_fast; \
+                     bounded round-trip on a reserved prefix, never on a serving path",
         },
     },
     object_store_method(StoreMethod::Put, "put"),

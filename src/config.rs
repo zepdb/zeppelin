@@ -3517,6 +3517,25 @@ impl Config {
             violations
                 .push("security.audit_s3 requires security.token_signing_key_path".to_string());
         }
+        // Static half of the storage capability gates: misconfiguration fails
+        // at parse time, before any store exists. The live half runs at boot
+        // under storage.fail_fast.
+        let declared_storage =
+            crate::storage::StorageCapabilities::for_backend(self.storage.backend);
+        if self.security.audit_s3 && declared_storage.conditional_put.is_none() {
+            violations.push(format!(
+                "security.audit_s3 requires a storage backend with conditional PUT; \
+                 backend '{}' cannot provide it",
+                self.storage.backend
+            ));
+        }
+        if self.security.rbac && declared_storage.conditional_put.is_none() {
+            violations.push(format!(
+                "security.rbac requires a storage backend with conditional PUT for \
+                 policy publication; backend '{}' cannot provide it",
+                self.storage.backend
+            ));
+        }
         if self.security.mode == SecurityMode::Enforced
             && self.security.cursor_hmac_key_hex.is_empty()
         {

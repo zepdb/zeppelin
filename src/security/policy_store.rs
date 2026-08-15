@@ -140,16 +140,22 @@
 //!
 //! ## Backend requirement
 //!
-//! Publication requires ETag compare-and-swap, which
-//! `object_store`'s `LocalFileSystem` does not implement. Acquiring the
+//! Publication requires conditional PUT (compare-and-swap), which
+//! `object_store`'s `LocalFileSystem` does not implement
+//! (`StorageCapabilities::local().conditional_put` is `None`). Acquiring the
 //! publication lease is create-only and succeeds on any backend, but renewing
 //! and releasing it are conditional PUTs. On `StorageBackend::Local` the first
 //! such PUT fails with `Storage(NotImplemented)`, so **first boot against a
-//! `Local`-backed store currently fails outright** — `bootstrap` cannot renew
-//! the lease it just acquired. This is a known and accepted limitation:
-//! `Local` is documented as development/testing only, and S3/MinIO are
-//! unaffected. See `src/security/CLAUDE.md` and `src/storage/CLAUDE.md`; three
-//! `cargo test --lib` tests are red for exactly this reason.
+//! `Local`-backed store fails** — `bootstrap` cannot renew the lease it just
+//! acquired. Since the multi-substrate capability model, production boot
+//! refuses this combination up front: `Config::validate` and the startup
+//! pre-flight reject `security.rbac` on a backend without conditional PUT
+//! before this module ever runs, converting the mid-boot
+//! `Storage(NotImplemented)` into an explicit configuration error. `Local`
+//! remains development/testing only; CAS-capable substrates are unaffected.
+//! See `src/security/CLAUDE.md` and `src/storage/CLAUDE.md`; the direct
+//! `cargo test --lib` lease tests remain red without a CAS-capable backend
+//! for exactly this reason.
 //!
 //! ## Cost
 //!

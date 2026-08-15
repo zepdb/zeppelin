@@ -34,6 +34,9 @@
 /// Implements backend construction and normalized storage operations.
 pub mod store;
 
+/// Declares the static per-substrate capability matrix.
+pub mod capabilities;
+
 /// Classifies exact namespace-owned object keys into production families.
 mod namespace_key;
 /// Plans bounded coalesced range reads across immutable objects.
@@ -42,6 +45,7 @@ pub mod read_plan;
 pub(crate) use namespace_key::{namespace_prefix, NamespaceObjectFamily, NamespaceObjectKey};
 
 /// Re-exports the storage gateway and its domain-facing result types.
+pub use capabilities::{CasTokenKind, StorageCapabilities};
 pub use store::{
     ConditionalPutOutcome, CreateOnlyOutcome, DeletePrefixOutcome, ListedObject,
     ObjectReadMetadata, ObjectUserMetadata, StorageVersion, ZeppelinStore,

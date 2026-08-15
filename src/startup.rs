@@ -119,7 +119,7 @@ use crate::compaction::background::{
     start_compaction_thread, CompactionLifecycle, CompactionThreadOptions, GovernedDeletionWorker,
 };
 use crate::compaction::Compactor;
-use crate::config::{Config, CpuBudget, SecurityMode, StorageBackend};
+use crate::config::{Config, CpuBudget, SecurityMode};
 use crate::embedding::{ConfiguredEncoderProvider, MultiVectorEncoderProvider};
 use crate::error::{Result as ZeppelinResult, ZeppelinError};
 use crate::fts::wal_cache::WalFtsCache;
@@ -127,12 +127,16 @@ use crate::namespace::{BranchReadinessObserver, NamespaceManager};
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::security::{AuditRecord, AuditRuntime, SecurityKernel};
 use crate::server::{build_router, AppState, ServerTaskSupervisor};
-use crate::storage::ZeppelinStore;
+use crate::storage::{StorageCapabilities, ZeppelinStore};
 use crate::time::Clock;
 use crate::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
 /// Maximum duration for each endpoint, LIST, or namespace-scan startup probe.
 const STORAGE_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Budget for the boot capability round-trip: several sequential writes and
+/// one LIST against possibly real-cloud latency.
+const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Unique lifecycle ownership for maintenance and request-spawned authoritative work.
 pub struct BackgroundTasks {
@@ -373,11 +377,25 @@ pub async fn build_app(config: Config) -> ZeppelinResult<(Router, BackgroundTask
 
     let clock = Clock::system();
     let durable_audit_enabled = config.security.audit_s3;
-    if durable_audit_enabled && config.storage.backend != StorageBackend::S3 {
-        return Err(ZeppelinError::Config(
-            "durable audit requires an S3-compatible backend with ETag conditional PUT support"
-                .to_string(),
-        ));
+    // Capability gates, not vendor gates: ask the declared matrix what the
+    // configured substrate can do. The live half of this check runs in
+    // `probe_storage` under `storage.fail_fast`.
+    let declared_capabilities = StorageCapabilities::for_backend(config.storage.backend);
+    if durable_audit_enabled && declared_capabilities.conditional_put.is_none() {
+        return Err(ZeppelinError::Config(format!(
+            "durable audit requires a storage backend with conditional PUT; \
+             configured backend '{}' cannot provide it",
+            config.storage.backend
+        )));
+    }
+    if config.security.rbac && declared_capabilities.conditional_put.is_none() {
+        // Without this pre-flight, PolicyStore::bootstrap discovers the
+        // missing CAS mid-boot as a raw Storage(NotImplemented).
+        return Err(ZeppelinError::Config(format!(
+            "security.rbac requires a storage backend with conditional PUT for \
+             policy publication; configured backend '{}' cannot provide it",
+            config.storage.backend
+        )));
     }
 
     let mut storage_available = true;
@@ -692,11 +710,17 @@ pub async fn build_app(config: Config) -> ZeppelinResult<(Router, BackgroundTask
     ))
 }
 
-/// Verifies a constructed store by listing top-level common prefixes.
+/// Verifies a constructed store by listing top-level common prefixes, then
+/// verifying the declared capability matrix against live behavior.
 ///
 /// The earlier configured-endpoint probe checks network/backend reachability;
 /// this second probe exercises the actual [`ZeppelinStore`] instance used by
-/// higher layers.
+/// higher layers: one read-only LIST, then the capability round-trip of
+/// [`ZeppelinStore::verify_declared_capabilities`] (create-only PUT, fresh and
+/// stale conditional PUT, LIST-vs-GET ETag comparability, delete-of-absent),
+/// which refuses boot when a declared capability is not actually provided —
+/// for example a MinIO deployment without conditional-PUT support, where every
+/// CAS would silently become an overwrite.
 ///
 /// # Parameters
 ///
@@ -704,29 +728,52 @@ pub async fn build_app(config: Config) -> ZeppelinResult<(Router, BackgroundTask
 ///
 /// # Returns
 ///
-/// `Ok(())` when the empty-prefix LIST completes within two seconds.
+/// `Ok(())` when the LIST completes within two seconds and the capability
+/// round-trip completes within its own budget.
 ///
 /// # Errors
 ///
 /// Maps storage LIST failure or timeout into [`ZeppelinError::Config`] with
-/// startup context.
+/// startup context; capability mismatches surface as the explicit
+/// configuration errors produced by the verification round-trip.
 ///
 /// # Side Effects
 ///
-/// Performs one read-only object-store LIST request.
+/// Performs one read-only LIST plus the capability round-trip's bounded
+/// writes under the reserved `__zeppelin_probe__/` prefix (invisible to
+/// namespace discovery, untouchable by GC).
 ///
 /// # Examples
 ///
 /// An empty bucket still succeeds because the operation need not find a
-/// namespace. A credential error or stalled endpoint fails the probe.
+/// namespace. A credential error, stalled endpoint, or substrate that fails
+/// to enforce a declared capability fails the probe.
 async fn probe_storage(store: &ZeppelinStore) -> ZeppelinResult<()> {
     match tokio::time::timeout(STORAGE_STARTUP_TIMEOUT, store.list_common_prefixes("")).await {
         Ok(result) => result.map(|_| ()).map_err(|error| {
             ZeppelinError::Config(format!("storage health probe failed: {error}"))
-        }),
+        })?,
+        Err(_elapsed) => {
+            return Err(ZeppelinError::Config(format!(
+                "storage health probe timed out after {}s",
+                STORAGE_STARTUP_TIMEOUT.as_secs()
+            )))
+        }
+    }
+    match tokio::time::timeout(
+        CAPABILITY_PROBE_TIMEOUT,
+        store.verify_declared_capabilities(),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error @ ZeppelinError::Config(_))) => Err(error),
+        Ok(Err(error)) => Err(ZeppelinError::Config(format!(
+            "storage capability probe failed: {error}"
+        ))),
         Err(_elapsed) => Err(ZeppelinError::Config(format!(
-            "storage health probe timed out after {}s",
-            STORAGE_STARTUP_TIMEOUT.as_secs()
+            "storage capability probe timed out after {}s",
+            CAPABILITY_PROBE_TIMEOUT.as_secs()
         ))),
     }
 }
@@ -849,7 +896,7 @@ mod tests {
     //! restores the previous values for later tests.
 
     use super::*;
-    use crate::config::ApiKeyConfig;
+    use crate::config::{ApiKeyConfig, StorageBackend};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use sha2::{Digest, Sha256};
     use std::net::SocketAddr;
