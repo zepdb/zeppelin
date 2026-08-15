@@ -276,7 +276,7 @@ impl WalReader {
         namespace: &str,
         fragment_id: &Ulid,
     ) -> Result<EncoderInputWalFragment> {
-        let key = EncoderInputWalFragment::s3_key(namespace, fragment_id);
+        let key = EncoderInputWalFragment::object_store_key(namespace, fragment_id);
         let bytes = self.store.get(&key).await?;
         let fragment = EncoderInputWalFragment::from_bytes(&bytes)?;
         if fragment.id != *fragment_id {
@@ -670,11 +670,14 @@ impl WalReader {
         located: LocatedFragmentRef<'_>,
         cache_policy: FragmentCachePolicy<'_>,
     ) -> Result<WalFragment> {
-        let s3_key = WalFragment::s3_key(located.physical_origin.namespace(), &located.fragment.id);
-        let cache_key = located.cache_key(&s3_key);
+        let object_store_key = WalFragment::object_store_key(
+            located.physical_origin.namespace(),
+            &located.fragment.id,
+        );
+        let cache_key = located.cache_key(&object_store_key);
         let data = self
             .read_fragment_bytes_at(
-                &s3_key,
+                &object_store_key,
                 &cache_key,
                 located.logical_namespace,
                 &located.fragment.id,
@@ -847,22 +850,28 @@ impl WalReader {
         fragment_id: &Ulid,
         cache_policy: FragmentCachePolicy<'_>,
     ) -> Result<bytes::Bytes> {
-        let s3_key = WalFragment::s3_key(namespace, fragment_id);
+        let object_store_key = WalFragment::object_store_key(namespace, fragment_id);
         let cache_key = Self::fragment_cache_key(fragment_id);
-        self.read_fragment_bytes_at(&s3_key, &cache_key, namespace, fragment_id, cache_policy)
-            .await
+        self.read_fragment_bytes_at(
+            &object_store_key,
+            &cache_key,
+            namespace,
+            fragment_id,
+            cache_policy,
+        )
+        .await
     }
 
     async fn read_fragment_bytes_at(
         &self,
-        s3_key: &str,
+        object_store_key: &str,
         cache_key: &str,
         logical_namespace: &str,
         fragment_id: &Ulid,
         cache_policy: FragmentCachePolicy<'_>,
     ) -> Result<bytes::Bytes> {
         let (cache, populate_on_miss) = match cache_policy {
-            FragmentCachePolicy::Bypass => return self.store.get(s3_key).await,
+            FragmentCachePolicy::Bypass => return self.store.get(object_store_key).await,
             FragmentCachePolicy::ReadWrite(cache) => (cache, true),
             FragmentCachePolicy::ReadOnly(cache) => (cache, false),
         };
@@ -876,7 +885,7 @@ impl WalReader {
         if let Some(data) = cache.get(cache_key).await {
             return Ok(data);
         }
-        let data = self.store.get(s3_key).await?;
+        let data = self.store.get(object_store_key).await?;
         if populate_on_miss {
             if let Err(e) = cache.put(cache_key, &data).await {
                 warn!(
@@ -1171,7 +1180,7 @@ mod tests {
             .expect("captured fixture origins must resolve")
             .uncompacted_located_fragments()
             .expect("captured fixture refs must locate");
-        let expected_key = WalFragment::s3_key(namespace, &missing_id);
+        let expected_key = WalFragment::object_store_key(namespace, &missing_id);
 
         let error = reader
             .read_located_fragments_strict(&located, FragmentCachePolicy::Bypass)
@@ -1202,14 +1211,14 @@ mod tests {
         let from_b = fragment_body(shared_id, "row-from-b");
         store
             .put(
-                &WalFragment::s3_key(origin_a.namespace.as_str(), &shared_id),
+                &WalFragment::object_store_key(origin_a.namespace.as_str(), &shared_id),
                 from_a.to_bytes().expect("origin-a fragment must encode"),
             )
             .await
             .expect("origin-a fragment must upload");
         store
             .put(
-                &WalFragment::s3_key(origin_b.namespace.as_str(), &shared_id),
+                &WalFragment::object_store_key(origin_b.namespace.as_str(), &shared_id),
                 from_b.to_bytes().expect("origin-b fragment must encode"),
             )
             .await

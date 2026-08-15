@@ -33,8 +33,10 @@ kernel's composition is driven entirely by config (`SecurityKernel::compose`):
   authority (bootstrap `*` grants carry the preservation actions, but the
   service is absent, so guards return unlocked and the endpoints return
   `FeatureDisabled("preservation")`).
-- Durable S3 audit is gated purely by `security.audit_s3` (config validation
-  requires a signing key with it; startup requires an S3-class backend).
+- Durable audit is gated purely by `security.audit_s3` (config validation
+  requires a signing key with it; startup requires a backend whose declared
+  `StorageCapabilities` include conditional PUT — S3/MinIO, GCS, and Azure
+  qualify, `Local` does not).
 
 Enforce feature availability in the **kernel**, not only in the handler — a
 handler-only check is easy to bypass from a new call site. Delegation and

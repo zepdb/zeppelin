@@ -101,7 +101,7 @@ mod tests {
         let mut checksum = [0_u8; 32];
         checksum[..8].copy_from_slice(&(index as u64).to_le_bytes());
         ManifestSectionRef {
-            key: LateStateSection::s3_key("ns", &checksum),
+            key: LateStateSection::object_store_key("ns", &checksum),
             checksum,
             size_bytes: 6,
             format_version: 1,

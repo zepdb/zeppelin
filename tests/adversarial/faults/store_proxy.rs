@@ -3323,8 +3323,7 @@ mod tests {
             .head("ns/manifest.json")
             .await
             .unwrap()
-            .e_tag
-            .and_then(|etag| zeppelin::storage::StorageVersion::from_parts(Some(etag), None))
+            .version
             .expect("in-memory object must expose an etag");
         let scheduler = FaultScheduler::from_schedule(FaultSchedule {
             profile: FaultProfile::Semantic,
@@ -3373,8 +3372,7 @@ mod tests {
             .head("ns/manifest.json")
             .await
             .unwrap()
-            .e_tag
-            .and_then(|etag| zeppelin::storage::StorageVersion::from_parts(Some(etag), None))
+            .version
             .expect("in-memory object must expose an etag");
         inner
             .put_if_match(

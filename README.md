@@ -41,7 +41,7 @@ QPS.
 - **Namespace forks** -- Disabled-by-default copy-on-write branching; fork only, no merge
 - **Strong & eventual consistency** -- Choose per-query (see [Consistency semantics](#consistency-semantics))
 - **Security suite** -- Fail-closed authorization kernel, RBAC, durable audit log, delegation tokens, and preservation holds
-- **Object storage** -- S3, MinIO, and S3-compatible backends. GCS and Azure planned
+- **Object storage** -- S3, MinIO, and S3-compatible backends; GCS and Azure Blob, selected by `[storage] backend`
 - **Sizing advisor** -- Ranked hardware recommendations and validated, tuned configs from an embedded cloud pricing catalog (see [Sizing advisor](#sizing-advisor))
 
 ## Status
@@ -53,8 +53,11 @@ Zeppelin is pre-1.0 software under active development:
   immutable within a version.
 - **Namespace branching is disabled by default** (`branching.enabled`), and
   its release validation gates are not yet complete.
-- **GCS and Azure backends are planned, not implemented.** S3 and
-  S3-compatible stores are the supported substrates today.
+- **GCS and Azure Blob backends are implemented with emulator-backed test
+  gates** (patched fake-gcs-server, Azurite) — no gate has run against real
+  GCS or Azure yet, a deliberate emulators-only decision. S3 and
+  S3-compatible stores remain the battle-tested substrates; see
+  `tasks/multi-substrate/08-release-evidence.md` for exactly what was run.
 - Published performance numbers are loopback-MinIO measurements, not
   cloud-S3 latency claims — see [Performance](#performance) for exactly
   what was measured.

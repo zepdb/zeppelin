@@ -209,7 +209,7 @@ impl LateInteractionSegmentRef {
 impl SourceInventoryRef {
     /// Build the checksum-addressed local source key.
     #[must_use]
-    pub fn s3_key(namespace: &str, content_hash: ContentHash) -> String {
+    pub fn object_store_key(namespace: &str, content_hash: ContentHash) -> String {
         format!(
             "{}{}",
             NamespaceObjectFamily::Source.namespace_prefix(namespace),
@@ -355,7 +355,7 @@ impl LateStateSection {
 
     /// Derive the content-addressed key for canonical section bytes.
     #[must_use]
-    pub fn s3_key(namespace: &str, checksum: &[u8; 32]) -> String {
+    pub fn object_store_key(namespace: &str, checksum: &[u8; 32]) -> String {
         let checksum_hex = checksum
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -1529,7 +1529,7 @@ impl LateStateSection {
             )
         })?;
         Ok(ManifestSectionRef {
-            key: Self::s3_key(namespace, &checksum),
+            key: Self::object_store_key(namespace, &checksum),
             checksum,
             size_bytes,
             format_version: LATE_STATE_FORMAT_VERSION,
@@ -1633,7 +1633,7 @@ mod tests {
         .expect("origin fixture");
         let mut section = LateStateSection {
             source_inventory: vec![SourceInventoryRef {
-                key: SourceInventoryRef::s3_key("source", ContentHash::new([3; 32])),
+                key: SourceInventoryRef::object_store_key("source", ContentHash::new([3; 32])),
                 checksum: ArtifactChecksum::new([4; 32]),
                 size_bytes: 12,
                 media_type: "image/png".to_string(),

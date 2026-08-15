@@ -227,7 +227,7 @@ async fn all_forged_cursor_batch_stops_before_namespace_storage_io() {
     forged.push(if final_byte == '0' { '1' } else { '0' });
 
     let missing_ns = format!("{}-forged-batch-missing", harness.prefix);
-    let missing_meta_key = NamespaceMetadata::s3_key(&missing_ns);
+    let missing_meta_key = NamespaceMetadata::object_store_key(&missing_ns);
     counter.reset();
     let response = client
         .post(format!("{base_url}/v1/namespaces/{missing_ns}/query/batch"))

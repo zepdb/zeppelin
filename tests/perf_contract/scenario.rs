@@ -1322,7 +1322,7 @@ async fn post_prime_setup(
             .iter()
             .filter(|fragment| fragment.delete_count > 0)
             .map(|fragment| {
-                let store_key = WalFragment::s3_key(namespace, &fragment.id);
+                let store_key = WalFragment::object_store_key(namespace, &fragment.id);
                 manifest
                     .fragment_artifact_cache_key(fragment, &store_key)
                     .unwrap_or_else(|error| {
@@ -1396,7 +1396,7 @@ async fn clone_namespace_for_cold(
     target: &str,
     source_manifest: &Manifest,
 ) {
-    let source_meta_key = NamespaceMetadata::s3_key(source);
+    let source_meta_key = NamespaceMetadata::object_store_key(source);
     let mut metadata = NamespaceMetadata::from_bytes(
         &server
             .store
@@ -1406,7 +1406,7 @@ async fn clone_namespace_for_cold(
     )
     .unwrap_or_else(|error| panic!("failed to decode cold source metadata: {error}"));
     metadata.name = target.to_string();
-    let target_meta_key = NamespaceMetadata::s3_key(target);
+    let target_meta_key = NamespaceMetadata::object_store_key(target);
     server
         .store
         .put(

@@ -362,8 +362,9 @@ fn target_owned_old_segment_prefix(located: LocatedSegmentRef<'_>) -> Option<Str
 /// Classifies one retired WAL fragment as a target-owned deletion candidate.
 #[must_use]
 fn target_owned_fragment_deletion_key(located: LocatedFragmentRef<'_>) -> Option<String> {
-    (located.physical_origin.as_origin() == located.logical_origin.as_origin())
-        .then(|| WalFragment::s3_key(located.physical_origin.namespace(), &located.fragment.id))
+    (located.physical_origin.as_origin() == located.logical_origin.as_origin()).then(|| {
+        WalFragment::object_store_key(located.physical_origin.namespace(), &located.fragment.id)
+    })
 }
 
 /// Reports whether the active segment's physical layout differs from config.
@@ -882,7 +883,7 @@ impl Compactor {
         target_identity: &ArtifactOrigin,
     ) -> Result<(IndexingConfig, HashMap<String, FtsFieldConfig>)> {
         let target_namespace = target_identity.namespace.as_str();
-        let key = NamespaceMetadata::s3_key(target_namespace);
+        let key = NamespaceMetadata::object_store_key(target_namespace);
         let (data, object_metadata) = match self.store.get_with_object_metadata(&key).await {
             Ok(value) => value,
             Err(ZeppelinError::NotFound { .. }) => {
@@ -1796,7 +1797,7 @@ impl Compactor {
                 },
                 error => error,
             })?;
-        let metadata_key = NamespaceMetadata::s3_key(namespace);
+        let metadata_key = NamespaceMetadata::object_store_key(namespace);
         let namespace_metadata = match self.store.get(&metadata_key).await {
             Ok(bytes) => NamespaceMetadata::from_bytes(&bytes)?,
             Err(ZeppelinError::NotFound { .. }) => {

@@ -153,7 +153,7 @@ fn image_record(
         },
     };
     let content_hash = input.content_hash().expect("fixture image input must hash");
-    let key = SourceInventoryRef::s3_key(namespace, content_hash);
+    let key = SourceInventoryRef::object_store_key(namespace, content_hash);
     if let EncoderInputRef::Image { image } = &mut input {
         image.key = key.clone();
     }
@@ -458,7 +458,7 @@ async fn typed_sources_obey_gc_and_snapshot_roots() {
         .await
         .expect("second root generation must publish");
 
-    let orphan_key = SourceInventoryRef::s3_key(
+    let orphan_key = SourceInventoryRef::object_store_key(
         &namespace,
         zeppelin::embedding::ContentHash::new([0xee; 32]),
     );
@@ -467,7 +467,7 @@ async fn typed_sources_obey_gc_and_snapshot_roots() {
         .put(&orphan_key, Bytes::from_static(b"crash orphan"))
         .await
         .expect("orphan source upload must succeed");
-    let pending_source_key = SourceInventoryRef::s3_key(
+    let pending_source_key = SourceInventoryRef::object_store_key(
         &namespace,
         zeppelin::embedding::ContentHash::new([0xdd; 32]),
     );
@@ -657,11 +657,11 @@ async fn typed_branch_reads_inherited_input_zero_copy_and_blocks_release() {
             .is_some(),
         "the inherited late section must carry its physical origin"
     );
-    let source_fragment_key = zeppelin::wal::EncoderInputWalFragment::s3_key(
+    let source_fragment_key = zeppelin::wal::EncoderInputWalFragment::object_store_key(
         &source,
         &source_manifest.input_fragments[0].id,
     );
-    let target_fragment_key = zeppelin::wal::EncoderInputWalFragment::s3_key(
+    let target_fragment_key = zeppelin::wal::EncoderInputWalFragment::object_store_key(
         &target,
         &target_manifest.input_fragments[0].id,
     );
@@ -958,7 +958,8 @@ async fn full_clone_rejects_input_wal_with_mismatched_embedded_id() {
         .expect("source manifest read must succeed")
         .expect("source manifest must exist");
     let reference = &source_manifest.input_fragments[0];
-    let source_key = zeppelin::wal::EncoderInputWalFragment::s3_key(&source, &reference.id);
+    let source_key =
+        zeppelin::wal::EncoderInputWalFragment::object_store_key(&source, &reference.id);
     let mut corrupted = WalReader::new(harness.store.clone())
         .read_input_fragment(&source, &reference.id)
         .await

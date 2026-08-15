@@ -465,7 +465,7 @@ async fn read_metadata(harness: &TestHarness, namespace: &str) -> NamespaceMetad
     NamespaceMetadata::from_bytes(
         &harness
             .store
-            .get(&NamespaceMetadata::s3_key(namespace))
+            .get(&NamespaceMetadata::object_store_key(namespace))
             .await
             .expect("namespace metadata oracle read failed"),
     )

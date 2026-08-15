@@ -857,7 +857,10 @@ async fn bounded_discovery_skips_settled_history_without_input_wal_gets() {
             )
             .await
             .expect("historical append must succeed");
-        settled_keys.push(EncoderInputWalFragment::s3_key(&namespace, &fragment.id));
+        settled_keys.push(EncoderInputWalFragment::object_store_key(
+            &namespace,
+            &fragment.id,
+        ));
         let report = historical_coordinator
             .discover_and_admit(&namespace, incarnation, Some(TEXT_MODALITIES), 1, 1_000_000)
             .await
@@ -882,7 +885,7 @@ async fn bounded_discovery_skips_settled_history_without_input_wal_gets() {
         )
         .await
         .expect("tail append must succeed");
-    let tail_key = EncoderInputWalFragment::s3_key(&namespace, &tail.id);
+    let tail_key = EncoderInputWalFragment::object_store_key(&namespace, &tail.id);
     let (counted_store, counter) = counting_store(&harness.store);
     let entered = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));

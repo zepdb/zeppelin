@@ -1082,7 +1082,7 @@ mod smoke {
         store: &zeppelin::storage::ZeppelinStore,
         target: &str,
     ) -> Result<DateTime<Utc>, String> {
-        let key = NamespaceMetadata::s3_key(target);
+        let key = NamespaceMetadata::object_store_key(target);
         let bytes = store
             .get(&key)
             .await

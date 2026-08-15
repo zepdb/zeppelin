@@ -2200,7 +2200,10 @@ async fn materialize_clone_manifest(
         }
     }
     for reference in &manifest.input_fragments {
-        copies.remove(&EncoderInputWalFragment::s3_key(source, &reference.id));
+        copies.remove(&EncoderInputWalFragment::object_store_key(
+            source,
+            &reference.id,
+        ));
     }
     manifest.normalize_copy_clone_artifact_ownership()?;
     rewrite_manifest_stored_keys(source, target, &mut manifest)?;
@@ -2237,7 +2240,7 @@ async fn rewrite_clone_input_fragments(
     manifest: &mut Manifest,
 ) -> Result<(), ZeppelinError> {
     for reference in &mut manifest.input_fragments {
-        let source_key = EncoderInputWalFragment::s3_key(source, &reference.id);
+        let source_key = EncoderInputWalFragment::object_store_key(source, &reference.id);
         let source_bytes = store.get(&source_key).await?;
         let mut source_fragment = EncoderInputWalFragment::from_bytes(&source_bytes)?;
         if source_fragment.id != reference.id {
@@ -2265,7 +2268,7 @@ async fn rewrite_clone_input_fragments(
                 "cloned input WAL fragment size does not fit persisted u64".to_string(),
             )
         })?;
-        let target_key = EncoderInputWalFragment::s3_key(target, &reference.id);
+        let target_key = EncoderInputWalFragment::object_store_key(target, &reference.id);
         match store
             .put_create_outcome(&target_key, target_bytes.clone())
             .await?

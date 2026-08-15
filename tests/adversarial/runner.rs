@@ -9589,7 +9589,7 @@ async fn tainted_aware_authoritative_generation(
 }
 
 fn durable_manifest_corruption_recorded(scheduler: &FaultScheduler, ns: &str) -> bool {
-    let manifest_key = Manifest::s3_key(ns);
+    let manifest_key = Manifest::object_store_key(ns);
     scheduler.timeline().into_iter().any(|event| {
         event.observed == ObservedResult::Corrupted
             && durable_content_corruption(&event)
@@ -9633,7 +9633,7 @@ async fn periodic_server_lineage_status(
     ns: &str,
     durably_tainted_keys: &BTreeSet<String>,
 ) -> serde_json::Value {
-    let manifest_key = Manifest::s3_key(ns);
+    let manifest_key = Manifest::object_store_key(ns);
     if !durably_tainted_keys.contains(&manifest_key) {
         return compact_status(client, base_url, ns).await;
     }
@@ -9941,7 +9941,7 @@ fn accept_loud_durable_manifest_resolution(
     namespace: &str,
     durably_tainted_keys: Option<&BTreeSet<String>>,
 ) -> bool {
-    let manifest_key = Manifest::s3_key(namespace);
+    let manifest_key = Manifest::object_store_key(namespace);
     if !durably_tainted_keys.is_some_and(|keys| keys.contains(&manifest_key)) {
         return false;
     }
@@ -9987,7 +9987,7 @@ async fn inject_dual_writer_fencing_mutation(
     winner.fencing_token = stale_fencing_token
         .checked_add(1)
         .expect("dual-writer winner fencing token overflowed");
-    let key = Manifest::s3_key(namespace);
+    let key = Manifest::object_store_key(namespace);
     winner
         .write_conditional(store, namespace, &stale_version)
         .await
@@ -13294,7 +13294,7 @@ mod outcome_tests {
     #[tokio::test]
     async fn periodic_s3_oracle_classifies_corrupt_manifest_without_panicking() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
-        let manifest_key = Manifest::s3_key("ns");
+        let manifest_key = Manifest::object_store_key("ns");
         store
             .put(&manifest_key, bytes::Bytes::from_static(b"truncated"))
             .await
@@ -13438,7 +13438,7 @@ mod outcome_tests {
             &json!({}),
             None,
         );
-        let manifest_key = Manifest::s3_key(&namespace);
+        let manifest_key = Manifest::object_store_key(&namespace);
         server
             .store
             .put(&manifest_key, bytes::Bytes::from_static(b"truncated"))
@@ -14763,7 +14763,7 @@ mod outcome_tests {
         assert_eq!(create.status(), StatusCode::CREATED);
         setup_server.shutdown().await;
 
-        let manifest_key = Manifest::s3_key(&namespace);
+        let manifest_key = Manifest::object_store_key(&namespace);
         let scheduler = FaultScheduler::from_schedule(FaultSchedule {
             profile: FaultProfile::Content,
             events: vec![FaultEvent {
@@ -15773,9 +15773,9 @@ mod outcome_tests {
             "retryable": false,
             "status": 500,
         });
-        let exact_manifest = BTreeSet::from([Manifest::s3_key(namespace)]);
+        let exact_manifest = BTreeSet::from([Manifest::object_store_key(namespace)]);
         let unrelated_key = BTreeSet::from([format!("{namespace}/wal/tainted.wal")]);
-        let other_manifest = BTreeSet::from([Manifest::s3_key("other")]);
+        let other_manifest = BTreeSet::from([Manifest::object_store_key("other")]);
 
         assert!(accept_loud_durable_manifest_resolution(
             500,
@@ -15834,7 +15834,7 @@ mod outcome_tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let exact_manifest = BTreeSet::from([Manifest::s3_key("ns")]);
+        let exact_manifest = BTreeSet::from([Manifest::object_store_key("ns")]);
 
         let status = quiescent_s3_oracle_status(
             &raw_adversarial_client(),
@@ -16015,7 +16015,7 @@ mod outcome_tests {
         let store = harness.store.clone();
         let namespace = harness.artifact_origin_namespace("fenced");
         Manifest::new().write(&store, &namespace).await.unwrap();
-        let key = Manifest::s3_key(&namespace);
+        let key = Manifest::object_store_key(&namespace);
         let original = store.get(&key).await.unwrap();
         let original_manifest = Manifest::from_bytes(&original).unwrap();
         assert_eq!(original_manifest.fencing_token, 0);

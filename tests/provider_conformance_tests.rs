@@ -9,7 +9,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use common::harness::TestHarness;
 use zeppelin::error::ZeppelinError;
-use zeppelin::storage::ObjectUserMetadata;
+use zeppelin::storage::{ObjectUserMetadata, StorageVersion};
 
 #[tokio::test]
 async fn list_metadata_preserves_version_token() {
@@ -43,7 +43,10 @@ async fn list_metadata_preserves_version_token() {
         .unwrap()
         .is_none());
     let head = harness.store.head(&key).await.unwrap();
-    assert_eq!(head.e_tag.as_deref(), Some(first_etag));
+    assert_eq!(
+        head.version.as_ref().and_then(StorageVersion::etag),
+        Some(first_etag)
+    );
 
     harness.store.put(&key, second.clone()).await.unwrap();
     let relisted = harness
@@ -86,8 +89,11 @@ async fn supported_backend_honors_exact_atomic_strong_object_semantics() {
     let (old_body, old_etag) = store.get_with_meta(&key).await.unwrap();
     let old_etag = old_etag.expect("supported backend must return an object version token");
     let old_head = store.head(&key).await.unwrap();
-    assert_eq!(old_head.size, old_body.len());
-    assert_eq!(old_head.e_tag.as_deref(), old_etag.etag());
+    assert_eq!(old_head.size, old_body.len() as u64);
+    assert_eq!(
+        old_head.version.as_ref().and_then(StorageVersion::etag),
+        old_etag.etag()
+    );
 
     store.put(&key, new.clone()).await.unwrap();
     let (new_body, new_etag) = store.get_with_meta(&key).await.unwrap();
@@ -103,8 +109,11 @@ async fn supported_backend_honors_exact_atomic_strong_object_semantics() {
         .unwrap()
         .is_none());
     let new_head = store.head(&key).await.unwrap();
-    assert_eq!(new_head.size, new.len());
-    assert_eq!(new_head.e_tag.as_deref(), new_etag.etag());
+    assert_eq!(new_head.size, new.len() as u64);
+    assert_eq!(
+        new_head.version.as_ref().and_then(StorageVersion::etag),
+        new_etag.etag()
+    );
 
     let stale = store
         .put_if_match(&key, Bytes::from_static(b"stale"), &old_etag, &prefix)

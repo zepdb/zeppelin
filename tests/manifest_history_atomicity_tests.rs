@@ -130,7 +130,8 @@ async fn failed_live_put_does_not_reserve_the_candidate_history_generation() {
     assert_eq!(manifest.version(), 1);
     manifest.add_fragment(fragment(3, 7));
 
-    let (failing_store, failures) = fail_put_once_matching(&harness.store, Manifest::s3_key(&ns));
+    let (failing_store, failures) =
+        fail_put_once_matching(&harness.store, Manifest::object_store_key(&ns));
     let err = manifest
         .write_conditional(&failing_store, &ns, &version)
         .await
@@ -205,7 +206,8 @@ async fn competing_candidates_share_predecessor_history_and_one_wins_live_cas() 
 
     let base = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     let predecessor_key = Manifest::history_key(&ns, 1);
-    let (race_store, cas) = synchronize_cas_pair_matching(&harness.store, Manifest::s3_key(&ns));
+    let (race_store, cas) =
+        synchronize_cas_pair_matching(&harness.store, Manifest::object_store_key(&ns));
     cas.enable();
     let winner_store = race_store.clone();
     let stale_store = race_store;
@@ -307,7 +309,10 @@ async fn successful_manifest_write_keeps_candidate_namespace_bound() {
 
     harness
         .store
-        .put(&Manifest::s3_key(&target), manifest.to_bytes().unwrap())
+        .put(
+            &Manifest::object_store_key(&target),
+            manifest.to_bytes().unwrap(),
+        )
         .await
         .unwrap();
     let result = Manifest::read(&harness.store, &target).await;
@@ -328,10 +333,14 @@ async fn live_manifest_rejects_bytes_bound_to_another_namespace() {
     common::seed_bound_manifest(&harness.store, &source).await;
     common::seed_bound_manifest(&harness.store, &target).await;
 
-    let wrong = harness.store.get(&Manifest::s3_key(&source)).await.unwrap();
+    let wrong = harness
+        .store
+        .get(&Manifest::object_store_key(&source))
+        .await
+        .unwrap();
     harness
         .store
-        .put(&Manifest::s3_key(&target), wrong)
+        .put(&Manifest::object_store_key(&target), wrong)
         .await
         .unwrap();
 

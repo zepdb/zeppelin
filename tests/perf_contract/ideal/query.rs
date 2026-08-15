@@ -936,7 +936,7 @@ async fn verify_clone_target(
     let metadata = NamespaceMetadata::from_bytes(
         &harness
             .store
-            .get(&NamespaceMetadata::s3_key(target))
+            .get(&NamespaceMetadata::object_store_key(target))
             .await
             .expect("clone target metadata read failed"),
     )

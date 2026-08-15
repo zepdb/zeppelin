@@ -448,8 +448,10 @@ impl EnrichmentCoordinator {
                 continue;
             }
             let source_origin = manifest.input_fragment_origin(source_ref)?;
-            let source_key =
-                EncoderInputWalFragment::s3_key(source_origin.namespace.as_str(), &source_ref.id);
+            let source_key = EncoderInputWalFragment::object_store_key(
+                source_origin.namespace.as_str(),
+                &source_ref.id,
+            );
             if fragment_is_fast_complete(&section, &source_key, source_ref, profile) {
                 continue;
             }
@@ -962,7 +964,10 @@ fn prepare_encoded_work(
     })?;
     let overlay = SemanticOverlayRef {
         source_fragment: PhysicalInputFragmentIdentity {
-            key: EncoderInputWalFragment::s3_key(work.source_origin.namespace.as_str(), &source.id),
+            key: EncoderInputWalFragment::object_store_key(
+                work.source_origin.namespace.as_str(),
+                &source.id,
+            ),
             id: source.id,
             checksum: source.checksum,
             size_bytes: work.source_ref.size_bytes,
@@ -1039,8 +1044,10 @@ fn prepare_quarantines(
             .push(row.version.clone());
     }
 
-    let source_key =
-        EncoderInputWalFragment::s3_key(work.source_origin.namespace.as_str(), &work.source_ref.id);
+    let source_key = EncoderInputWalFragment::object_store_key(
+        work.source_origin.namespace.as_str(),
+        &work.source_ref.id,
+    );
     by_class
         .into_iter()
         .map(|(failure_class, records)| {
@@ -1573,7 +1580,7 @@ async fn read_input_fragment_checked(
     reference: &InputFragmentRef,
     origin: &ArtifactOrigin,
 ) -> Result<EncoderInputWalFragment> {
-    let key = EncoderInputWalFragment::s3_key(origin.namespace.as_str(), &reference.id);
+    let key = EncoderInputWalFragment::object_store_key(origin.namespace.as_str(), &reference.id);
     let bytes = store.get(&key).await?;
     if u64::try_from(bytes.len()).ok() != Some(reference.size_bytes) {
         return Err(ZeppelinError::Serialization(format!(

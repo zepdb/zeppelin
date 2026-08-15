@@ -223,7 +223,7 @@ pub async fn append_retrieval_units(
             build_encoder_input(&state, &namespace, input.input).map_err(ApiError::from)?;
         let content_hash = encoder_input.content_hash().map_err(ApiError::from)?;
         if let Some((mut source, bytes)) = source {
-            let key = SourceInventoryRef::s3_key(&namespace, content_hash);
+            let key = SourceInventoryRef::object_store_key(&namespace, content_hash);
             set_image_key(&mut source.0, &key);
             source.1.key = key.clone();
             match source_uploads.get(&key) {

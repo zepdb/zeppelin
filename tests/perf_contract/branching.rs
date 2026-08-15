@@ -571,10 +571,9 @@ async fn measure_query_contract(
         "branch query must read the same physical artifact keys as the source"
     );
     assert!(
-        branch_product
-            .spans
-            .iter()
-            .all(|span| { !(span.kind == SpanKind::Get && span.key == Manifest::s3_key(source)) }),
+        branch_product.spans.iter().all(|span| {
+            !(span.kind == SpanKind::Get && span.key == Manifest::object_store_key(source))
+        }),
         "branch query must not reread its ancestry manifest"
     );
 

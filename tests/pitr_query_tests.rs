@@ -326,7 +326,8 @@ async fn query_as_of_failed_live_put_never_exposes_candidate_generation() {
     pending.add_fragment(fragment(1));
     let orphan_generation = live_version + 1;
 
-    let (failing_store, failures) = fail_put_once_matching(&harness.store, Manifest::s3_key(&ns));
+    let (failing_store, failures) =
+        fail_put_once_matching(&harness.store, Manifest::object_store_key(&ns));
     pending
         .write_conditional(&failing_store, &ns, &version)
         .await

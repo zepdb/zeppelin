@@ -1664,7 +1664,7 @@ async fn constrained_write_migrates_a_legacy_namespace_and_manifest_once() {
     let namespace = create_namespace(&admin, &base_url).await;
     upsert(&admin, &base_url, &namespace, corpus()).await;
 
-    let metadata_key = NamespaceMetadata::s3_key(&namespace);
+    let metadata_key = NamespaceMetadata::object_store_key(&namespace);
     let (metadata_body, metadata_object) = harness
         .store
         .get_with_object_metadata(&metadata_key)
@@ -1703,7 +1703,7 @@ async fn constrained_write_migrates_a_legacy_namespace_and_manifest_once() {
     harness
         .store
         .put(
-            &Manifest::s3_key(&namespace),
+            &Manifest::object_store_key(&namespace),
             Bytes::from(serde_json::to_vec(&legacy_value).unwrap()),
         )
         .await

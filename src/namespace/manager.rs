@@ -834,7 +834,7 @@ impl NamespaceMetadata {
     /// # Examples
     ///
     /// Namespace `catalog` maps to `catalog/meta.json`.
-    pub fn s3_key(namespace: &str) -> String {
+    pub fn object_store_key(namespace: &str) -> String {
         format!("{namespace}/meta.json")
     }
 
@@ -1452,7 +1452,7 @@ impl NamespaceManager {
         // Uses S3 `If-None-Match: *` (PutMode::Create) to prevent TOCTOU races
         // where two concurrent creators both pass an exists() check and silently
         // overwrite each other's configuration.
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
 
         let now = self.clock.now();
         let meta = NamespaceMetadata {
@@ -1692,7 +1692,7 @@ impl NamespaceManager {
     /// Re-reading metadata on every retry preserves a concurrent deletion, and
     /// observing `active` makes the operation idempotent after a lost response.
     async fn activate_created_namespace(&self, name: &str) -> Result<NamespaceMetadata> {
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
         for _ in 0..10 {
             let (mut meta, etag) = self.read_metadata_versioned(name).await?;
             match meta.state {
@@ -1751,7 +1751,7 @@ impl NamespaceManager {
         nonce: ActivationNonce,
     ) -> Result<NamespaceMetadata> {
         let name = target.as_str();
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
         for _ in 0..10 {
             let (mut metadata, etag) = self.read_metadata_versioned(name).await?;
             let changed = begin_branch_activation_metadata(
@@ -1792,7 +1792,7 @@ impl NamespaceManager {
         evidence: BranchActivationEvidence,
     ) -> Result<NamespaceMetadata> {
         let name = target.as_str();
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
         for _ in 0..10 {
             let (mut metadata, etag) = self.read_metadata_versioned(name).await?;
             let changed = commit_branch_activation_metadata(
@@ -1833,7 +1833,7 @@ impl NamespaceManager {
         nonce: ActivationNonce,
     ) -> Result<BranchActivationRevocationOutcome> {
         let name = target.as_str();
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
         for _ in 0..10 {
             let (mut metadata, etag) = self.read_metadata_versioned(name).await?;
             match revoke_branch_activation_metadata(
@@ -1874,7 +1874,7 @@ impl NamespaceManager {
             )));
         }
         meta.validate_creation_lifecycle()?;
-        let key = NamespaceMetadata::s3_key(&meta.name);
+        let key = NamespaceMetadata::object_store_key(&meta.name);
         let user_metadata = meta.user_metadata();
         match self
             .store
@@ -1911,7 +1911,8 @@ impl NamespaceManager {
             })?;
             return Err(BranchError::TargetAlreadyExists { target }.into());
         }
-        let observed = StorageVersion::require(etag.as_ref(), &NamespaceMetadata::s3_key(name))?;
+        let observed =
+            StorageVersion::require(etag.as_ref(), &NamespaceMetadata::object_store_key(name))?;
         Ok((meta, observed.clone()))
     }
 
@@ -1930,7 +1931,7 @@ impl NamespaceManager {
             )));
         }
         meta.validate_creation_lifecycle()?;
-        let key = NamespaceMetadata::s3_key(&meta.name);
+        let key = NamespaceMetadata::object_store_key(&meta.name);
         let next = self
             .put_metadata_if_match(&key, meta, version, &meta.name)
             .await?;
@@ -2135,7 +2136,7 @@ impl NamespaceManager {
     /// namespace creation recover a legacy record without turning ordinary
     /// active reads into migration writes.
     async fn read_or_migrate_namespace_incarnation(&self, name: &str) -> Result<NamespaceMetadata> {
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
 
         for _ in 0..MAX_NAMESPACE_INCARNATION_MIGRATION_ATTEMPTS {
             let (body, object_metadata) = match self.store.get_with_object_metadata(&key).await {
@@ -2266,7 +2267,7 @@ impl NamespaceManager {
     /// Listing discovers a `catalog/` prefix, loads `catalog/meta.json`, and
     /// registers the decoded namespace for later maintenance scans.
     async fn read_metadata_from_s3(&self, name: &str) -> Result<NamespaceMetadata> {
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
         match self.store.get_with_object_metadata(&key).await {
             Ok((data, object_metadata)) => {
                 let meta = NamespaceMetadata::from_bytes(&data)?
@@ -2310,7 +2311,7 @@ impl NamespaceManager {
         &self,
         name: &str,
     ) -> Result<(NamespaceMetadata, Option<StorageVersion>)> {
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
         match self.store.get_with_object_metadata(&key).await {
             Ok((data, object_metadata)) => {
                 let meta = NamespaceMetadata::from_bytes(&data)?
@@ -2334,7 +2335,7 @@ impl NamespaceManager {
         for _attempt in 0..8 {
             let (mut meta, etag) = self.read_metadata_versioned(name).await?;
             let observed =
-                StorageVersion::require(etag.as_ref(), &NamespaceMetadata::s3_key(name))?;
+                StorageVersion::require(etag.as_ref(), &NamespaceMetadata::object_store_key(name))?;
             let intent = meta.deletion_intent.as_mut().ok_or_else(|| {
                 ZeppelinError::Validation(format!(
                     "namespace {name} has no deletion intent for visibility removal"
@@ -2356,7 +2357,12 @@ impl NamespaceManager {
             intent.visibility = Some(visibility.clone());
             meta.updated_at = self.clock.now();
             match self
-                .put_metadata_if_match(&NamespaceMetadata::s3_key(name), &meta, observed, name)
+                .put_metadata_if_match(
+                    &NamespaceMetadata::object_store_key(name),
+                    &meta,
+                    observed,
+                    name,
+                )
                 .await
             {
                 Ok(_) => return Ok(()),
@@ -2433,7 +2439,7 @@ impl NamespaceManager {
         updated.updated_at = self.clock.now();
         match self
             .put_metadata_if_match(
-                &NamespaceMetadata::s3_key(name),
+                &NamespaceMetadata::object_store_key(name),
                 &updated,
                 expected_version,
                 name,
@@ -2814,7 +2820,7 @@ impl NamespaceManager {
         decision_evidence_ref: String,
         parent_root: Option<BranchRoot>,
     ) -> Result<NamespaceMetadata> {
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
         for _ in 0..8 {
             let (mut meta, etag) = self.read_metadata_versioned(name).await?;
             if meta.incarnation_id.is_none() {
@@ -2883,7 +2889,7 @@ impl NamespaceManager {
         name: &str,
         decision_evidence_ref: &str,
     ) -> Result<NamespaceMetadata> {
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
         for _ in 0..8 {
             let (mut meta, etag) = self.read_metadata_versioned(name).await?;
             let Some(intent) = meta.deletion_intent.as_ref() else {
@@ -2934,7 +2940,7 @@ impl NamespaceManager {
         decision_evidence_ref: &str,
         generation: u64,
     ) -> Result<NamespaceMetadata> {
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
         for _ in 0..8 {
             let (mut meta, etag) = self.read_metadata_versioned(name).await?;
             let intent = meta.deletion_intent.as_mut().ok_or_else(|| {
@@ -2981,7 +2987,7 @@ impl NamespaceManager {
         name: &str,
         decision_evidence_ref: &str,
     ) -> Result<NamespaceMetadata> {
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
         for _ in 0..8 {
             let (mut meta, etag) = self.read_metadata_versioned(name).await?;
             let intent = meta.deletion_intent.as_ref().ok_or_else(|| {
@@ -3033,7 +3039,7 @@ impl NamespaceManager {
     }
 
     async fn remove_live_manifest(&self, name: &str) -> Result<()> {
-        let manifest_key = crate::wal::Manifest::s3_key(name);
+        let manifest_key = crate::wal::Manifest::object_store_key(name);
         match self.store.delete(&manifest_key).await {
             Ok(()) | Err(ZeppelinError::NotFound { .. }) => Ok(()),
             Err(error) => Err(error),
@@ -3212,7 +3218,7 @@ impl NamespaceManager {
     }
 
     async fn remove_metadata_after_cleanup(&self, name: &str) -> Result<()> {
-        let meta_key = NamespaceMetadata::s3_key(name);
+        let meta_key = NamespaceMetadata::object_store_key(name);
         let remaining = self.store.list_namespace_objects(name).await?;
         let non_meta_remaining = remaining
             .iter()
@@ -3474,7 +3480,7 @@ impl NamespaceManager {
     ) -> Result<NamespaceMetadata> {
         let mut lease = lease_manager.acquire(name).await?;
         let result = async {
-            let key = NamespaceMetadata::s3_key(name);
+            let key = NamespaceMetadata::object_store_key(name);
             for _ in 0..10 {
                 let (mut meta, etag) = self.read_metadata_versioned(name).await?;
                 let meta_name = meta.name.clone();
@@ -3642,7 +3648,7 @@ impl NamespaceManager {
         name: &str,
         update: impl Fn(&mut CompactionHealth),
     ) -> Result<NamespaceMetadata> {
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
         for _ in 0..10 {
             let (mut meta, etag) = self.read_metadata_versioned(name).await?;
             let meta_name = meta.name.clone();
@@ -3705,7 +3711,7 @@ impl NamespaceManager {
         name: &str,
         manifest: Option<&crate::wal::Manifest>,
     ) -> Result<NamespaceMetadata> {
-        let key = NamespaceMetadata::s3_key(name);
+        let key = NamespaceMetadata::object_store_key(name);
         for _ in 0..8 {
             let (mut meta, etag) = self.read_metadata_versioned(name).await?;
             if let Some(manifest) = manifest {

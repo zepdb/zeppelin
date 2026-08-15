@@ -342,7 +342,7 @@ fn validate_source_uploads(
             EncoderInputRef::Text { .. } => continue,
             EncoderInputRef::Image { image } | EncoderInputRef::ImageText { image, .. } => image,
         };
-        let expected_key = SourceInventoryRef::s3_key(namespace, record.content_hash);
+        let expected_key = SourceInventoryRef::object_store_key(namespace, record.content_hash);
         if image.key != expected_key {
             return Err(ZeppelinError::Validation(format!(
                 "retrieval-unit {} image key does not match its content hash",
@@ -652,7 +652,7 @@ impl WalWriter {
                 "input WAL fragment size does not fit persisted u64".to_string(),
             )
         })?;
-        let fragment_key = EncoderInputWalFragment::s3_key(namespace, &fragment.id);
+        let fragment_key = EncoderInputWalFragment::object_store_key(namespace, &fragment.id);
         self.store.put(&fragment_key, fragment_bytes).await?;
         let input_ref = InputFragmentRef {
             id: fragment.id,
@@ -857,7 +857,7 @@ impl WalWriter {
 
         // 1. Write the fragment to S3 — OUTSIDE any manifest critical section,
         //    so concurrent appends' PUTs run in parallel (I1).
-        let key = WalFragment::s3_key(namespace, &fragment.id);
+        let key = WalFragment::object_store_key(namespace, &fragment.id);
         let data = fragment.to_bytes()?;
         let size_bytes = data.len() as u64;
         self.store.put(&key, data).await?;
@@ -1291,7 +1291,7 @@ impl WalWriter {
         make_err: impl Fn(&PendingCommit) -> ZeppelinError,
     ) {
         for item in &batch {
-            let key = WalFragment::s3_key(namespace, &item.fref.id);
+            let key = WalFragment::object_store_key(namespace, &item.fref.id);
             self.cleanup_orphan_fragment(namespace, &key).await;
         }
         Self::reply_batch_error(batch, make_err);
@@ -1391,7 +1391,7 @@ mod tests {
             },
         };
         let content_hash = input.content_hash().unwrap();
-        let key = SourceInventoryRef::s3_key(namespace, content_hash);
+        let key = SourceInventoryRef::object_store_key(namespace, content_hash);
         if let EncoderInputRef::Image { image } = &mut input {
             image.key = key.clone();
         }
@@ -1441,7 +1441,10 @@ mod tests {
             EncoderInputWalFragment::try_new(vec![record], Vec::new()).expect("valid input hash");
         let extra_bytes = bytes::Bytes::from_static(b"extra");
         let extra = SourceInventoryRef {
-            key: SourceInventoryRef::s3_key(NAMESPACE, crate::embedding::ContentHash::new([9; 32])),
+            key: SourceInventoryRef::object_store_key(
+                NAMESPACE,
+                crate::embedding::ContentHash::new([9; 32]),
+            ),
             checksum: ArtifactChecksum::digest(&extra_bytes),
             size_bytes: extra_bytes.len() as u64,
             media_type: "image/png".to_string(),

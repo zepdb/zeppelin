@@ -462,7 +462,7 @@ impl LiveRootObservation {
 impl LiveRootIdentity {
     fn matches_inventory(&self, namespace: &str, inventory: &NamespaceInventory) -> bool {
         inventory
-            .object(&Manifest::s3_key(namespace))
+            .object(&Manifest::object_store_key(namespace))
             .and_then(|object| object.version.as_ref())
             .and_then(StorageVersion::etag)
             .map(canonical_etag)
@@ -1016,7 +1016,10 @@ pub fn reachable_keys_with_staging(
                             .namespace(),
                         None => namespace,
                     };
-                    keys.insert(WalFragment::s3_key(physical_namespace, &fragment.id));
+                    keys.insert(WalFragment::object_store_key(
+                        physical_namespace,
+                        &fragment.id,
+                    ));
                 }
             }
             NamespaceObjectFamily::InputWal => {
@@ -1028,7 +1031,7 @@ pub fn reachable_keys_with_staging(
                             .physical_namespace(),
                         None => namespace,
                     };
-                    keys.insert(EncoderInputWalFragment::s3_key(
+                    keys.insert(EncoderInputWalFragment::object_store_key(
                         physical_namespace,
                         &fragment.id,
                     ));
@@ -2272,7 +2275,7 @@ async fn drain_pending_deletes_with_inventory_authority_from(
                 {
                     return Err(ZeppelinError::Serialization(format!(
                         "manifest {} has no ETag after pending-delete CAS conflict",
-                        Manifest::s3_key(namespace)
+                        Manifest::object_store_key(namespace)
                     )));
                 }
             }
@@ -2372,7 +2375,7 @@ async fn prepare_warm_pending_delete_drain(
     let observed = read_versioned_manifest_from_inventory(store, namespace, &predelete_inventory)
         .await?
         .ok_or_else(|| ZeppelinError::NotFound {
-            key: Manifest::s3_key(namespace),
+            key: Manifest::object_store_key(namespace),
         })?;
     let outcome = drain_pending_deletes_with_inventory_authority_from(
         store,
@@ -3574,7 +3577,7 @@ async fn read_versioned_manifest_from_inventory(
     namespace: &str,
     inventory: &NamespaceInventory,
 ) -> Result<Option<(Manifest, ManifestVersion)>> {
-    let key = Manifest::s3_key(namespace);
+    let key = Manifest::object_store_key(namespace);
     let listed = inventory.object(&key);
     match store.get_with_meta(&key).await {
         Ok((bytes, get_version)) => {
@@ -4996,7 +4999,7 @@ fn known_reclaimable_sizes(namespace: &str, manifest: &Manifest) -> Result<BTree
             None => namespace,
         };
         sizes.insert(
-            WalFragment::s3_key(physical_namespace, &fragment.id),
+            WalFragment::object_store_key(physical_namespace, &fragment.id),
             fragment.size_bytes,
         );
     }
@@ -6359,8 +6362,8 @@ mod tests {
                 name: "fragments",
                 manifest: fragments_manifest,
                 present: vec![
-                    WalFragment::s3_key(NS, &frag_a),
-                    WalFragment::s3_key(NS, &frag_b),
+                    WalFragment::object_store_key(NS, &frag_a),
+                    WalFragment::object_store_key(NS, &frag_b),
                 ],
                 absent: Vec::new(),
             },
@@ -6490,7 +6493,7 @@ mod tests {
 
         let reachable = reachable_keys(NS, &manifest).unwrap();
 
-        assert!(reachable.contains(&WalFragment::s3_key(SOURCE, &fragment_id)));
+        assert!(reachable.contains(&WalFragment::object_store_key(SOURCE, &fragment_id)));
         assert!(reachable.contains(&centroids_key(SOURCE, "seg_foreign")));
         assert!(reachable.contains(&cluster_key(SOURCE, "seg_foreign", 0)));
         assert!(reachable.contains(&attrs_key(SOURCE, "seg_foreign", 0)));
@@ -6506,7 +6509,7 @@ mod tests {
         assert!(reachable.contains(&tree_node_key(SOURCE, "seg_foreign_tree", &tree_node,)));
         assert!(reachable.contains(&sq_cluster_key(SOURCE, "seg_foreign_tree", 0)));
         assert!(reachable.contains(&sq_calibration_key(SOURCE, "seg_foreign_tree")));
-        assert!(!reachable.contains(&WalFragment::s3_key(NS, &fragment_id)));
+        assert!(!reachable.contains(&WalFragment::object_store_key(NS, &fragment_id)));
         assert!(!reachable.contains(&centroids_key(NS, "seg_foreign")));
     }
 
@@ -6592,7 +6595,7 @@ mod tests {
         assert_eq!(
             candidate_keys(&candidates),
             BTreeSet::from([
-                WalFragment::s3_key(NS, &compacted_fragment),
+                WalFragment::object_store_key(NS, &compacted_fragment),
                 centroids_key(NS, "seg_old"),
                 cluster_key(NS, "seg_old", 1),
                 attrs_key(NS, "seg_old", 1),
@@ -6611,7 +6614,8 @@ mod tests {
             "every delta candidate must be stamped with the manifest commit time"
         );
         assert!(
-            !candidate_keys(&candidates).contains(&WalFragment::s3_key(NS, &new_fragment)),
+            !candidate_keys(&candidates)
+                .contains(&WalFragment::object_store_key(NS, &new_fragment)),
             "keys added by the new manifest are not orphan candidates"
         );
         assert!(
@@ -6892,7 +6896,7 @@ mod tests {
 
     #[test]
     fn late_section_gc_grammar_accepts_only_canonical_content_address() {
-        let key = crate::wal::LateStateSection::s3_key(NS, &[0xab; 32]);
+        let key = crate::wal::LateStateSection::object_store_key(NS, &[0xab; 32]);
         assert_eq!(
             parse_gc_artifact_key(NS, &key),
             Some(ParsedGcArtifact::LateSection)
@@ -6943,7 +6947,7 @@ mod tests {
     #[test]
     fn late_section_horizons_use_authoritative_list_metadata() {
         let now = Utc::now();
-        let key = crate::wal::LateStateSection::s3_key(NS, &[0xcd; 32]);
+        let key = crate::wal::LateStateSection::object_store_key(NS, &[0xcd; 32]);
         let candidate = GcCandidate {
             key: key.clone(),
             first_seen_unreachable_at: now - chrono::Duration::seconds(30),
@@ -6981,7 +6985,7 @@ mod tests {
         ));
         assert!(!pending_delete_horizon_satisfied(NS, &key, now, 5, None));
 
-        let source_key = crate::wal::SourceInventoryRef::s3_key(
+        let source_key = crate::wal::SourceInventoryRef::object_store_key(
             NS,
             crate::embedding::ContentHash::new([0xef; 32]),
         );
@@ -7159,7 +7163,7 @@ mod tests {
     fn pending_delete_horizon_uses_key_ulid_age_not_manifest_update_time() {
         let now = Utc::now();
         let old_id = ulid_seconds_ago(30, 201);
-        let key = WalFragment::s3_key(NS, &old_id);
+        let key = WalFragment::object_store_key(NS, &old_id);
 
         assert!(
             pending_delete_horizon_satisfied(NS, &key, now, 5, None),
@@ -7174,7 +7178,7 @@ mod tests {
     fn pending_delete_horizon_retains_young_key_even_with_old_manifest_update_time() {
         let now = Utc::now();
         let young_id = ulid_seconds_ago(1, 202);
-        let key = WalFragment::s3_key(NS, &young_id);
+        let key = WalFragment::object_store_key(NS, &young_id);
 
         assert!(
             !pending_delete_horizon_satisfied(NS, &key, now, 5, None),
@@ -7220,7 +7224,7 @@ mod tests {
     fn delete_predicate_table_is_fail_closed() {
         let now = Utc::now();
         let old_id = ulid_seconds_ago(30, 91);
-        let old_key = WalFragment::s3_key(NS, &old_id);
+        let old_key = WalFragment::object_store_key(NS, &old_id);
         let candidate = GcCandidate {
             key: old_key.clone(),
             first_seen_unreachable_at: now - chrono::Duration::seconds(10),
@@ -7289,7 +7293,7 @@ mod tests {
         let now = Utc::now();
         let young_id = ulid_seconds_ago(1, 92);
         let young_candidate = GcCandidate {
-            key: WalFragment::s3_key(NS, &young_id),
+            key: WalFragment::object_store_key(NS, &young_id),
             first_seen_unreachable_at: now - chrono::Duration::seconds(10),
             unreachable_since_manifest_version: 2,
         };
@@ -7306,7 +7310,7 @@ mod tests {
         let newer_than_inflight = ulid_seconds_ago(10, 93);
         let oldest_inflight = ulid_seconds_ago(20, 94);
         let candidate = GcCandidate {
-            key: WalFragment::s3_key(NS, &newer_than_inflight),
+            key: WalFragment::object_store_key(NS, &newer_than_inflight),
             first_seen_unreachable_at: now - chrono::Duration::seconds(30),
             unreachable_since_manifest_version: 2,
         };
@@ -7332,7 +7336,7 @@ mod tests {
     fn delete_predicate_epoch_guard_is_additional_to_time_horizon() {
         let now = Utc::now();
         let old_id = ulid_seconds_ago(30, 190);
-        let key = WalFragment::s3_key(NS, &old_id);
+        let key = WalFragment::object_store_key(NS, &old_id);
 
         let time_and_epoch_ok = GcCandidate {
             key: key.clone(),
@@ -7401,7 +7405,7 @@ mod tests {
         assert_eq!(empty.encoding, CandidateLedgerEncoding::EmptyBody);
 
         let candidate = GcCandidate {
-            key: WalFragment::s3_key(NS, &ulid_seconds_ago(30, 95)),
+            key: WalFragment::object_store_key(NS, &ulid_seconds_ago(30, 95)),
             first_seen_unreachable_at: Utc::now(),
             unreachable_since_manifest_version: 42,
         };
@@ -7447,7 +7451,7 @@ mod tests {
             first_seen_unreachable_at: DateTime<Utc>,
         }
 
-        let key = WalFragment::s3_key(NS, &ulid_seconds_ago(30, 191));
+        let key = WalFragment::object_store_key(NS, &ulid_seconds_ago(30, 191));
         let first_seen_unreachable_at = Utc::now() - chrono::Duration::seconds(60);
         let legacy = serde_json::to_vec(&LegacyCandidateStore {
             version: GC_CANDIDATE_STORE_VERSION,
@@ -7478,7 +7482,7 @@ mod tests {
     async fn candidate_store_round_trips_on_storage() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         let candidate = GcCandidate {
-            key: WalFragment::s3_key(NS, &ulid_seconds_ago(30, 96)),
+            key: WalFragment::object_store_key(NS, &ulid_seconds_ago(30, 96)),
             first_seen_unreachable_at: Utc::now(),
             unreachable_since_manifest_version: 42,
         };
@@ -7504,7 +7508,7 @@ mod tests {
         manifest.write(&store, NS).await.unwrap();
         let old_ms =
             u64::try_from((now - chrono::Duration::seconds(60)).timestamp_millis()).unwrap();
-        let orphan = WalFragment::s3_key(NS, &Ulid::from_parts(old_ms, 101));
+        let orphan = WalFragment::object_store_key(NS, &Ulid::from_parts(old_ms, 101));
         store
             .put(&orphan, Bytes::from_static(b"orphan"))
             .await
@@ -7536,8 +7540,8 @@ mod tests {
     #[test]
     fn mark_pass_drops_candidate_that_became_reachable_again() {
         let now = Utc::now();
-        let resurrected = WalFragment::s3_key(NS, &ulid_seconds_ago(30, 97));
-        let still_dead = WalFragment::s3_key(NS, &ulid_seconds_ago(30, 98));
+        let resurrected = WalFragment::object_store_key(NS, &ulid_seconds_ago(30, 97));
+        let still_dead = WalFragment::object_store_key(NS, &ulid_seconds_ago(30, 98));
         let existing = vec![
             GcCandidate {
                 key: resurrected.clone(),
@@ -7566,7 +7570,7 @@ mod tests {
     #[test]
     fn mark_pass_stamps_new_candidates_with_manifest_version() {
         let now = Utc::now();
-        let newly_dead = WalFragment::s3_key(NS, &ulid_seconds_ago(30, 99));
+        let newly_dead = WalFragment::object_store_key(NS, &ulid_seconds_ago(30, 99));
         let listed = BTreeSet::from([newly_dead.clone()]);
 
         let marked = mark_gc_candidates(NS, &listed, &BTreeSet::new(), &[], now, 12);

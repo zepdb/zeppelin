@@ -2585,7 +2585,10 @@ async fn seed_deleting_namespace(store: &zeppelin::storage::ZeppelinStore, ns: &
         incarnation_id: None,
     };
     store
-        .put(&NamespaceMetadata::s3_key(ns), meta.to_bytes().unwrap())
+        .put(
+            &NamespaceMetadata::object_store_key(ns),
+            meta.to_bytes().unwrap(),
+        )
         .await
         .unwrap();
     common::seed_bound_manifest(store, ns).await;

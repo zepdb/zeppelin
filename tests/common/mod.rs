@@ -106,7 +106,7 @@ pub async fn write_active_namespace_metadata_for_incarnation(
     let user_metadata = metadata.user_metadata();
     match store
         .put_if_not_exists_with_user_metadata(
-            &zeppelin::namespace::manager::NamespaceMetadata::s3_key(namespace),
+            &zeppelin::namespace::manager::NamespaceMetadata::object_store_key(namespace),
             metadata.to_bytes().unwrap(),
             namespace,
             &user_metadata,

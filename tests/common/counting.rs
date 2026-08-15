@@ -29,7 +29,7 @@ use object_store::{
     PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 use serde::Serialize;
-use zeppelin::storage::ZeppelinStore;
+use zeppelin::storage::{StorageCapabilities, ZeppelinStore};
 
 use super::server::background_compaction_origin_active;
 
@@ -514,7 +514,7 @@ pub fn counting_store(store: &ZeppelinStore) -> (ZeppelinStore, GetCounter) {
 pub fn perf_counting_store(store: &ZeppelinStore) -> (ZeppelinStore, GetCounter) {
     let (counting, counter) = CountingStore::wrap(store.inner());
     (
-        ZeppelinStore::new_with_native_batch_delete(Arc::new(counting)),
+        ZeppelinStore::new_with_capabilities(Arc::new(counting), StorageCapabilities::s3()),
         counter,
     )
 }

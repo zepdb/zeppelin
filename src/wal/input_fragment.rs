@@ -143,7 +143,7 @@ impl EncoderInputWalFragment {
 
     /// Build the immutable object key for this input fragment.
     #[must_use]
-    pub fn s3_key(namespace: &str, id: &Ulid) -> String {
+    pub fn object_store_key(namespace: &str, id: &Ulid) -> String {
         format!(
             "{}{id}.wal",
             NamespaceObjectFamily::InputWal.namespace_prefix(namespace)

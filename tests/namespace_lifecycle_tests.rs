@@ -117,7 +117,7 @@ async fn write_deleting_meta(harness: &TestHarness, ns: &str) {
     harness
         .store
         .put(
-            &NamespaceMetadata::s3_key(ns),
+            &NamespaceMetadata::object_store_key(ns),
             Bytes::from(serde_json::to_vec_pretty(&meta).unwrap()),
         )
         .await
@@ -180,7 +180,7 @@ async fn old_format_governed_intent_and_evidence_resume_to_completion() {
         .to_string();
     let destruction_record_key =
         format!("_audit/destruction/{}.json", incarnation.replace('-', ""));
-    let metadata_key = NamespaceMetadata::s3_key(&name);
+    let metadata_key = NamespaceMetadata::object_store_key(&name);
 
     harness
         .store
@@ -279,7 +279,7 @@ async fn old_format_governed_intent_and_evidence_resume_to_completion() {
         .unwrap();
     harness
         .store
-        .delete(&Manifest::s3_key(&name))
+        .delete(&Manifest::object_store_key(&name))
         .await
         .unwrap();
 
@@ -350,7 +350,7 @@ async fn old_format_branch_intent_and_evidence_resume_through_grace() {
         .to_string();
     let destruction_record_key =
         format!("_audit/destruction/{}.json", incarnation.replace('-', ""));
-    let metadata_key = NamespaceMetadata::s3_key(&target);
+    let metadata_key = NamespaceMetadata::object_store_key(&target);
     let sentinel_key = format!("{target}/wal/legacy-left-behind.wal");
     harness
         .store
@@ -558,7 +558,7 @@ async fn graph_delete_retry_converges_when_cleanup_removes_metadata_between_read
         .unwrap();
     manager.start_delete(&name).await.unwrap();
 
-    let metadata_key = NamespaceMetadata::s3_key(&name);
+    let metadata_key = NamespaceMetadata::object_store_key(&name);
     let (paused_store, first_metadata_read) =
         pause_first_after_get_matching(&harness.store, metadata_key.clone());
     let request_name = name.clone();

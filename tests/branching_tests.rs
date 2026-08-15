@@ -706,7 +706,7 @@ async fn acknowledged_target_write_before_clone_base_capture_is_not_adopted() {
     let branch = harness.artifact_origin_namespace("phase10-prebase-branch");
     let clone = harness.artifact_origin_namespace("phase10-prebase-clone");
     let (store, target_base_read) =
-        pause_next_get_matching(&harness.store, Manifest::s3_key(&clone));
+        pause_next_get_matching(&harness.store, Manifest::object_store_key(&clone));
     let (store, target_activation) = pause_next_cas_matching(&store, format!("{clone}/meta.json"));
     let mut config = Config::default();
     config.branching.enabled = true;

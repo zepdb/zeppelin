@@ -94,7 +94,7 @@ impl S3Tracker {
                 )];
             }
             Err(error) => {
-                let manifest_key = Manifest::s3_key(namespace);
+                let manifest_key = Manifest::object_store_key(namespace);
                 if known_tainted_keys.contains(&manifest_key) {
                     eprintln!(
                         "accepted manifest read failure for exact durable taint \
@@ -1309,7 +1309,7 @@ mod tests {
     async fn replacing_unreferenced_history_is_a_fork() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         Manifest::new().write(&store, "ns").await.unwrap();
-        let live_one = store.get(&Manifest::s3_key("ns")).await.unwrap();
+        let live_one = store.get(&Manifest::object_store_key("ns")).await.unwrap();
         let (mut generation_two, version) = Manifest::read_versioned(&store, "ns")
             .await
             .unwrap()
@@ -1324,7 +1324,10 @@ mod tests {
             .put(&history_key, generation_two.to_bytes().unwrap())
             .await
             .unwrap();
-        store.put(&Manifest::s3_key("ns"), live_one).await.unwrap();
+        store
+            .put(&Manifest::object_store_key("ns"), live_one)
+            .await
+            .unwrap();
 
         let mut tracker = S3Tracker::default();
         let before_replacement = tracker

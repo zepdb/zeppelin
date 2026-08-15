@@ -166,7 +166,7 @@ async fn active_required_reads_accept_published_legacy_generation_zero_manifest(
     .unwrap();
     harness
         .store
-        .put(&Manifest::s3_key(&namespace), Bytes::from(legacy))
+        .put(&Manifest::object_store_key(&namespace), Bytes::from(legacy))
         .await
         .unwrap();
 
@@ -242,7 +242,7 @@ async fn lifecycle_reads_accept_generation_zero_manifest() {
     harness
         .store
         .put(
-            &Manifest::s3_key(&namespace),
+            &Manifest::object_store_key(&namespace),
             Manifest::new().to_bytes().unwrap(),
         )
         .await
@@ -274,7 +274,7 @@ async fn lifecycle_strong_read_accepts_deleted_manifest_after_warm_cache() {
 
     harness
         .store
-        .delete(&Manifest::s3_key(&namespace))
+        .delete(&Manifest::object_store_key(&namespace))
         .await
         .unwrap();
     let deleting = cache
@@ -317,7 +317,7 @@ async fn active_namespace_missing_manifest_fails_fetch_loudly() {
 
     harness
         .store
-        .delete(&Manifest::s3_key(&namespace))
+        .delete(&Manifest::object_store_key(&namespace))
         .await
         .unwrap();
 
@@ -360,7 +360,7 @@ async fn active_namespace_missing_manifest_fails_pitr_boundary_loudly() {
     .await;
     harness
         .store
-        .delete(&Manifest::s3_key(&namespace))
+        .delete(&Manifest::object_store_key(&namespace))
         .await
         .unwrap();
 
@@ -402,7 +402,7 @@ async fn active_namespace_stale_manifest_body_fails_fetch_loudly() {
         }),
     )
     .await;
-    let manifest_key = Manifest::s3_key(&namespace);
+    let manifest_key = Manifest::object_store_key(&namespace);
     let stale_bytes = harness.store.get(&manifest_key).await.unwrap();
 
     let upsert = client

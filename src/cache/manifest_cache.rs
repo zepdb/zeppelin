@@ -793,7 +793,7 @@ impl ManifestCache {
                 .await;
         };
 
-        let key = Manifest::s3_key(namespace);
+        let key = Manifest::object_store_key(namespace);
         #[cfg(test)]
         self.wait_before_remote_read().await;
         let conditional = match store.get_if_none_match(&key, &cached_identity).await {
@@ -1171,7 +1171,7 @@ mod tests {
         let cache = Arc::new(ManifestCache::new(Duration::from_secs(60)));
         cache.insert(namespace, floor.clone());
         store
-            .put(&Manifest::s3_key(namespace), stale_bytes)
+            .put(&Manifest::object_store_key(namespace), stale_bytes)
             .await
             .unwrap();
 
@@ -1218,7 +1218,10 @@ mod tests {
         let mut lower = Manifest::new();
         lower.next_sequence = 3;
         store
-            .put(&Manifest::s3_key(namespace), lower.to_bytes().unwrap())
+            .put(
+                &Manifest::object_store_key(namespace),
+                lower.to_bytes().unwrap(),
+            )
             .await
             .unwrap();
 
@@ -1236,7 +1239,10 @@ mod tests {
         let mut higher = Manifest::new();
         higher.next_sequence = 4;
         store
-            .put(&Manifest::s3_key(namespace), higher.to_bytes().unwrap())
+            .put(
+                &Manifest::object_store_key(namespace),
+                higher.to_bytes().unwrap(),
+            )
             .await
             .unwrap();
         cache.insert(namespace, higher.clone());

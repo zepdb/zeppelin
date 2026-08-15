@@ -546,7 +546,7 @@ async fn clone_publication_rejects_a_concurrently_changed_target() {
     let harness = TestHarness::new().await;
     let target = api_ns(&harness, "clone-cas-target");
     let (barrier_store, barrier) =
-        BlockingManifestCasStore::wrap(&harness.store, Manifest::s3_key(&target));
+        BlockingManifestCasStore::wrap(&harness.store, Manifest::object_store_key(&target));
     let (base_url, _cache, _cache_dir, admin_bearer) =
         start_test_server_on_store(&harness, barrier_store, Some(harness.prefix.clone())).await;
     let admin = client_with_bearer(&admin_bearer);

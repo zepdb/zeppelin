@@ -1155,7 +1155,7 @@ async fn seed_pending_delete_manifest(
     gc_manifest_at(now).write(store, namespace).await.unwrap();
     let keys = (0..count)
         .map(|index| {
-            WalFragment::s3_key(
+            WalFragment::object_store_key(
                 namespace,
                 &ulid_at(
                     now - chrono::Duration::seconds(120),
@@ -1298,7 +1298,7 @@ async fn gc_cycle_deletes_then_prunes_pending_deletes() {
     let ns = harness.artifact_origin_namespace("storage-gc-pending");
     let store = harness.store.clone();
     let pending_id = old_ulid(60, 19);
-    let pending_key = WalFragment::s3_key(&ns, &pending_id);
+    let pending_key = WalFragment::object_store_key(&ns, &pending_id);
 
     store
         .put(&pending_key, Bytes::from_static(b"pending delete body"))
@@ -1358,7 +1358,7 @@ async fn gc_cycle_retains_pending_deletes_inside_horizon() {
     let ns = harness.artifact_origin_namespace("storage-gc-pending-horizon");
     let store = harness.store.clone();
     let pending_id = old_ulid(60, 39);
-    let pending_key = WalFragment::s3_key(&ns, &pending_id);
+    let pending_key = WalFragment::object_store_key(&ns, &pending_id);
 
     store
         .put(&pending_key, Bytes::from_static(b"pending delete body"))
@@ -1630,8 +1630,8 @@ async fn standalone_pending_delete_validates_every_live_overlap_before_batching(
     let now = Utc::now();
     let safe_id = ulid_at(now - chrono::Duration::seconds(120), 1);
     let live_id = ulid_at(now - chrono::Duration::seconds(120), 2);
-    let safe_key = WalFragment::s3_key(&namespace, &safe_id);
-    let live_key = WalFragment::s3_key(&namespace, &live_id);
+    let safe_key = WalFragment::object_store_key(&namespace, &safe_id);
+    let live_key = WalFragment::object_store_key(&namespace, &live_id);
 
     gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     for key in [&safe_key, &live_key] {
@@ -1686,8 +1686,8 @@ async fn warm_pending_delete_validates_every_live_overlap_before_batching() {
     let now = Utc::now();
     let safe_id = ulid_at(now - chrono::Duration::seconds(120), 1);
     let live_id = ulid_at(now - chrono::Duration::seconds(120), 2);
-    let safe_key = WalFragment::s3_key(&namespace, &safe_id);
-    let live_key = WalFragment::s3_key(&namespace, &live_id);
+    let safe_key = WalFragment::object_store_key(&namespace, &safe_id);
+    let live_key = WalFragment::object_store_key(&namespace, &live_id);
 
     gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     let (controlled_store, control) =
@@ -1751,7 +1751,7 @@ async fn gc_cycle_retains_objects_referenced_only_by_manifest_history() {
     let ns = harness.artifact_origin_namespace("storage-gc-history-mark-sweep");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 49);
-    let old_key = WalFragment::s3_key(&ns, &old_id);
+    let old_key = WalFragment::object_store_key(&ns, &old_id);
 
     store
         .put(&old_key, Bytes::from_static(b"history-only fragment body"))
@@ -1802,7 +1802,7 @@ async fn gc_sweep_rereads_retained_history_before_deleting_candidate() {
     let ns = harness.artifact_origin_namespace("storage-gc-history-sweep-race");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 129);
-    let old_key = WalFragment::s3_key(&ns, &old_id);
+    let old_key = WalFragment::object_store_key(&ns, &old_id);
 
     store
         .put(&old_key, Bytes::from_static(b"history race fragment body"))
@@ -1839,7 +1839,7 @@ async fn gc_sweep_rereads_retained_history_before_deleting_candidate() {
         manifest_json_bytes_with_version(&history_manifest, injected_history_version);
     let (injecting_store, injection) = PutOnNthManifestReadStore::wrap(
         store.inner(),
-        Manifest::s3_key(&ns),
+        Manifest::object_store_key(&ns),
         injected_history_key,
         injected_history,
         3,
@@ -1878,7 +1878,7 @@ async fn gc_pending_delete_drain_rereads_retained_history_before_deleting() {
     let ns = harness.artifact_origin_namespace("storage-gc-history-drain-race");
     let store = harness.store.clone();
     let pending_id = old_ulid(60, 139);
-    let pending_key = WalFragment::s3_key(&ns, &pending_id);
+    let pending_key = WalFragment::object_store_key(&ns, &pending_id);
 
     store
         .put(
@@ -1961,7 +1961,7 @@ async fn gc_pitr_time_retention_keeps_old_generation_and_artifacts() {
     let ns = harness.artifact_origin_namespace("storage-gc-pitr-time");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 89);
-    let old_key = WalFragment::s3_key(&ns, &old_id);
+    let old_key = WalFragment::object_store_key(&ns, &old_id);
 
     store
         .put(&old_key, Bytes::from_static(b"time retained body"))
@@ -2029,7 +2029,7 @@ async fn gc_prunes_expired_history_and_collects_artifacts_after_horizon() {
     let ns = harness.artifact_origin_namespace("storage-gc-pitr-expired");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 99);
-    let old_key = WalFragment::s3_key(&ns, &old_id);
+    let old_key = WalFragment::object_store_key(&ns, &old_id);
 
     store
         .put(&old_key, Bytes::from_static(b"expired history body"))
@@ -2084,7 +2084,7 @@ async fn gc_named_snapshot_pin_keeps_generation_until_released() {
     let ns = harness.artifact_origin_namespace("storage-gc-pitr-pin");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 109);
-    let old_key = WalFragment::s3_key(&ns, &old_id);
+    let old_key = WalFragment::object_store_key(&ns, &old_id);
 
     store
         .put(&old_key, Bytes::from_static(b"snapshot pinned body"))
@@ -2149,7 +2149,7 @@ async fn gc_snapshot_pin_does_not_retain_unreferenced_pending_delete() {
     let ns = harness.artifact_origin_namespace("storage-gc-pitr-pin-pending");
     let store = harness.store.clone();
     let pending_id = old_ulid(60, 119);
-    let pending_key = WalFragment::s3_key(&ns, &pending_id);
+    let pending_key = WalFragment::object_store_key(&ns, &pending_id);
 
     store
         .put(
@@ -2200,7 +2200,7 @@ async fn gc_cycle_retains_pending_deletes_referenced_by_manifest_history() {
     let ns = harness.artifact_origin_namespace("storage-gc-history-pending");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 59);
-    let old_key = WalFragment::s3_key(&ns, &old_id);
+    let old_key = WalFragment::object_store_key(&ns, &old_id);
 
     store
         .put(&old_key, Bytes::from_static(b"history pending-delete body"))
@@ -2248,9 +2248,9 @@ async fn gc_cycle_rereads_retained_manifest_history_before_sweep() {
     let history_snapshots = 4;
     let history_prefix = Manifest::history_prefix(&ns);
     let old_id = old_ulid(60, 69);
-    let old_key = WalFragment::s3_key(&ns, &old_id);
+    let old_key = WalFragment::object_store_key(&ns, &old_id);
     let orphan_id = old_ulid(60, 79);
-    let orphan_key = WalFragment::s3_key(&ns, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&ns, &orphan_id);
 
     store
         .put(&old_key, Bytes::from_static(b"history reachable body"))
@@ -2507,7 +2507,7 @@ async fn gc_runner_warm_all_young_pending_reuses_prune_history_roots() {
     seed_manifest_history(&store, &namespace, 3).await;
 
     let pending_id = ulid_at(now, 201);
-    let pending_key = WalFragment::s3_key(&namespace, &pending_id);
+    let pending_key = WalFragment::object_store_key(&namespace, &pending_id);
     store
         .put(&pending_key, Bytes::from_static(b"young pending delete"))
         .await
@@ -2575,7 +2575,7 @@ async fn gc_runner_warm_prune_roots_protect_every_pending_delete_without_refresh
     let history_prefix = Manifest::history_prefix(&namespace);
     let now = Utc::now();
     let pending_id = ulid_at(now - chrono::Duration::seconds(60), 202);
-    let pending_key = WalFragment::s3_key(&namespace, &pending_id);
+    let pending_key = WalFragment::object_store_key(&namespace, &pending_id);
     store
         .put(
             &pending_key,
@@ -2650,7 +2650,7 @@ async fn gc_runner_warm_eligible_pending_refresh_sees_new_history_root_before_de
     let history_prefix = Manifest::history_prefix(&namespace);
     let now = Utc::now();
     let pending_id = ulid_at(now - chrono::Duration::seconds(60), 203);
-    let pending_key = WalFragment::s3_key(&namespace, &pending_id);
+    let pending_key = WalFragment::object_store_key(&namespace, &pending_id);
     seed_manifest_history(&store, &namespace, 2).await;
 
     let mut injected_history = gc_manifest_at(now);
@@ -2755,7 +2755,7 @@ async fn gc_runner_warm_prune_root_reuse_keeps_final_sweep_history_fresh() {
     let history_prefix = Manifest::history_prefix(&namespace);
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 204);
-    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&namespace, &orphan_id);
     seed_manifest_history(&store, &namespace, 1).await;
 
     let mut injected_history = gc_manifest_at(now);
@@ -2827,7 +2827,7 @@ async fn gc_runner_failed_eligible_pending_history_refresh_cannot_authorize_idle
     let history_prefix = Manifest::history_prefix(&namespace);
     let now = Utc::now();
     let pending_id = ulid_at(now - chrono::Duration::seconds(60), 205);
-    let pending_key = WalFragment::s3_key(&namespace, &pending_id);
+    let pending_key = WalFragment::object_store_key(&namespace, &pending_id);
     seed_manifest_history(&store, &namespace, 2).await;
 
     let mut injected_history = gc_manifest_at(now);
@@ -2928,9 +2928,9 @@ async fn gc_runner_pending_cas_retry_refreshes_history_and_invalidates_idle_on_t
     let history_prefix = Manifest::history_prefix(&namespace);
     let now = Utc::now();
     let first_id = ulid_at(now - chrono::Duration::seconds(120), 206);
-    let first_key = WalFragment::s3_key(&namespace, &first_id);
+    let first_key = WalFragment::object_store_key(&namespace, &first_id);
     let concurrent_id = ulid_at(now - chrono::Duration::seconds(120), 207);
-    let concurrent_key = WalFragment::s3_key(&namespace, &concurrent_id);
+    let concurrent_key = WalFragment::object_store_key(&namespace, &concurrent_id);
     seed_manifest_history(&store, &namespace, 2).await;
 
     let mut concurrent = gc_manifest_at(now);
@@ -2942,7 +2942,7 @@ async fn gc_runner_pending_cas_retry_refreshes_history_and_invalidates_idle_on_t
         store.inner(),
         missing_predecessor_history,
         history_four.clone(),
-        Manifest::s3_key(&namespace),
+        Manifest::object_store_key(&namespace),
         concurrent_body.clone(),
         concurrent_body,
         true,
@@ -3062,8 +3062,8 @@ async fn gc_runner_pending_cas_retry_skips_history_refresh_for_empty_or_young_qu
             harness.artifact_origin_namespace(&format!("storage-gc-runner-pending-cas-{suffix}"));
         let history_prefix = Manifest::history_prefix(&namespace);
         let first_id = ulid_at(now - chrono::Duration::seconds(120), entropy);
-        let first_key = WalFragment::s3_key(&namespace, &first_id);
-        let young_key = WalFragment::s3_key(&namespace, &ulid_at(now, entropy + 10));
+        let first_key = WalFragment::object_store_key(&namespace, &first_id);
+        let young_key = WalFragment::object_store_key(&namespace, &ulid_at(now, entropy + 10));
         seed_manifest_history(&store, &namespace, 2).await;
 
         let mut concurrent = gc_manifest_at(now);
@@ -3075,7 +3075,7 @@ async fn gc_runner_pending_cas_retry_skips_history_refresh_for_empty_or_young_qu
             store.inner(),
             Manifest::history_key(&namespace, 3),
             Manifest::history_key(&namespace, 4),
-            Manifest::s3_key(&namespace),
+            Manifest::object_store_key(&namespace),
             concurrent_body.clone(),
             concurrent_body,
             false,
@@ -3645,7 +3645,7 @@ async fn gc_runner_warm_due_non_delete_uses_one_full_namespace_inventory() {
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 301);
-    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&namespace, &orphan_id);
 
     gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
@@ -3711,7 +3711,7 @@ async fn gc_runner_mature_candidate_delete_uses_two_full_namespace_inventories()
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 302);
-    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&namespace, &orphan_id);
 
     gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
@@ -3771,7 +3771,7 @@ async fn gc_sweep_retains_every_candidate_when_batch_response_is_lost() {
     let now = Utc::now();
     let orphan_keys = (0..3)
         .map(|index| {
-            WalFragment::s3_key(
+            WalFragment::object_store_key(
                 &namespace,
                 &ulid_at(now - chrono::Duration::seconds(60), 400 + index),
             )
@@ -3845,7 +3845,7 @@ async fn gc_runner_changed_candidate_ledger_after_mark_prevents_sweep() {
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 318);
-    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&namespace, &orphan_id);
     let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
 
     gc_manifest_at(now).write(&store, &namespace).await.unwrap();
@@ -3918,7 +3918,7 @@ async fn gc_runner_warm_new_immature_candidate_is_persisted_once_and_survives() 
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 314);
-    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&namespace, &orphan_id);
     let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
 
     gc_manifest_at(now).write(&store, &namespace).await.unwrap();
@@ -3981,7 +3981,7 @@ async fn gc_runner_warm_equal_legacy_candidate_ledger_migrates_once() {
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(120), 315);
-    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&namespace, &orphan_id);
     let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
     let candidate = GcCandidate {
         key: orphan_key.clone(),
@@ -4055,7 +4055,7 @@ async fn gc_runner_required_mark_put_failure_prevents_candidate_delete() {
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 316);
-    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&namespace, &orphan_id);
     let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
 
     gc_manifest_at(now).write(&store, &namespace).await.unwrap();
@@ -4141,7 +4141,7 @@ async fn gc_runner_unversioned_sibling_cannot_hide_candidate_replacement_before_
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 306);
-    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&namespace, &orphan_id);
     let unversioned_sibling_key =
         format!("{namespace}/segments/ordinary-unversioned-inventory-probe.bin");
 
@@ -4229,9 +4229,9 @@ async fn gc_runner_pending_predelete_inventory_cannot_hide_candidate_replacement
     let store = harness.store.clone();
     let now = Utc::now();
     let candidate_id = ulid_at(now - chrono::Duration::seconds(60), 311);
-    let candidate_key = WalFragment::s3_key(&namespace, &candidate_id);
+    let candidate_key = WalFragment::object_store_key(&namespace, &candidate_id);
     let pending_id = ulid_at(now - chrono::Duration::seconds(60), 312);
-    let pending_key = WalFragment::s3_key(&namespace, &pending_id);
+    let pending_key = WalFragment::object_store_key(&namespace, &pending_id);
 
     gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
@@ -4368,7 +4368,7 @@ async fn gc_runner_replacement_horizon_survives_candidate_cleanup_put_failure() 
     let store = harness.store.clone();
     let now = Utc::now() - chrono::Duration::seconds(30);
     let candidate_id = ulid_at(now - chrono::Duration::seconds(60), 313);
-    let candidate_key = WalFragment::s3_key(&namespace, &candidate_id);
+    let candidate_key = WalFragment::object_store_key(&namespace, &candidate_id);
     let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
 
     gc_manifest_at(now).write(&store, &namespace).await.unwrap();
@@ -4443,7 +4443,7 @@ async fn cold_and_stateless_candidate_replacement_requires_fresh_predelete_inven
     for (suffix, use_runner, entropy) in [("runner", true, 316), ("stateless", false, 317)] {
         let namespace =
             harness.artifact_origin_namespace(&format!("storage-gc-cold-replacement-{suffix}"));
-        let candidate_key = WalFragment::s3_key(
+        let candidate_key = WalFragment::object_store_key(
             &namespace,
             &ulid_at(now - chrono::Duration::seconds(60), entropy),
         );
@@ -4511,7 +4511,7 @@ async fn gc_runner_malformed_reserved_inventory_key_aborts_before_delete() {
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 303);
-    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&namespace, &orphan_id);
 
     gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
@@ -4790,7 +4790,7 @@ async fn malformed_reserved_inventory_key_precedes_cold_pending_delete() {
     for (suffix, use_runner, entropy) in [("runner", true, 314), ("stateless", false, 315)] {
         let namespace = harness
             .artifact_origin_namespace(&format!("storage-gc-cold-pending-malformed-{suffix}"));
-        let pending_key = WalFragment::s3_key(
+        let pending_key = WalFragment::object_store_key(
             &namespace,
             &ulid_at(now - chrono::Duration::seconds(60), entropy),
         );
@@ -4897,7 +4897,7 @@ async fn gc_runner_second_namespace_inventory_sees_new_history_root_before_delet
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 304);
-    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&namespace, &orphan_id);
 
     gc_manifest_at(now).write(&store, &namespace).await.unwrap();
     store
@@ -4973,7 +4973,7 @@ async fn gc_runner_same_token_staging_published_after_predelete_list_protects_ca
     let store = harness.store.clone();
     let now = Utc::now();
     let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 305);
-    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&namespace, &orphan_id);
     let lease_key = format!("{namespace}/lease.json");
     let fencing_token = 57;
     let staging_key = format!("{namespace}/_staging/{fencing_token}.json");
@@ -5061,7 +5061,7 @@ async fn gc_runner_eligible_pending_delete_requires_history_and_manifest_list_et
         let namespace =
             harness.artifact_origin_namespace(&format!("storage-gc-runner-pending-{case}-etag"));
         let pending_id = ulid_at(now, if strip_history { 306 } else { 307 });
-        let pending_key = WalFragment::s3_key(&namespace, &pending_id);
+        let pending_key = WalFragment::object_store_key(&namespace, &pending_id);
         store
             .put(
                 &pending_key,
@@ -5103,7 +5103,7 @@ async fn gc_runner_eligible_pending_delete_requires_history_and_manifest_list_et
         let stripped_key = if strip_history {
             Manifest::history_key(&namespace, 1)
         } else {
-            Manifest::s3_key(&namespace)
+            Manifest::object_store_key(&namespace)
         };
         control.set_strip_list_version_for_key(&stripped_key, true);
         let due = run_observed_gc_cycle(
@@ -5170,7 +5170,7 @@ async fn gc_runner_candidate_phase_progresses_during_pending_delete_churn() {
     let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
     run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
 
-    let first_pending_key = WalFragment::s3_key(
+    let first_pending_key = WalFragment::object_store_key(
         &namespace,
         &ulid_at(now - chrono::Duration::seconds(60), 308),
     );
@@ -5207,11 +5207,11 @@ async fn gc_runner_candidate_phase_progresses_during_pending_delete_churn() {
     assert_eq!(mutated.pending_deletes_pruned, 1);
     assert_s3_object_not_exists(&store, &first_pending_key).await;
 
-    let second_pending_key = WalFragment::s3_key(
+    let second_pending_key = WalFragment::object_store_key(
         &namespace,
         &ulid_at(now - chrono::Duration::seconds(60), 309),
     );
-    let orphan_key = WalFragment::s3_key(
+    let orphan_key = WalFragment::object_store_key(
         &namespace,
         &ulid_at(now - chrono::Duration::seconds(60), 310),
     );
@@ -5531,7 +5531,7 @@ async fn gc_runner_idle_gate_reconciles_mature_pending_delete_published_after_co
     let history_prefix = Manifest::history_prefix(&namespace);
     let now = Utc::now();
     let pending_id = old_ulid(60, 151);
-    let pending_key = WalFragment::s3_key(&namespace, &pending_id);
+    let pending_key = WalFragment::object_store_key(&namespace, &pending_id);
     store
         .put(
             &pending_key,
@@ -5548,7 +5548,7 @@ async fn gc_runner_idle_gate_reconciles_mature_pending_delete_published_after_co
     let (controlled_store, control) = HistoryMetadataControlStore::wrap(&store, history_prefix);
     control.put_on_nth_get(
         &format!("{namespace}/_gc/candidates.json"),
-        &Manifest::s3_key(&namespace),
+        &Manifest::object_store_key(&namespace),
         manifest_json_bytes_with_version(&late_manifest, 2),
         1,
     );
@@ -5663,7 +5663,7 @@ async fn gc_runner_idle_gate_wakes_at_candidate_pending_pitr_and_lease_deadlines
         .write(&store, &candidate_namespace)
         .await
         .unwrap();
-    let candidate_key = WalFragment::s3_key(
+    let candidate_key = WalFragment::object_store_key(
         &candidate_namespace,
         &ulid_at(now - chrono::Duration::seconds(60), 101),
     );
@@ -5732,7 +5732,7 @@ async fn gc_runner_idle_gate_wakes_at_candidate_pending_pitr_and_lease_deadlines
 
     let pending_namespace =
         harness.artifact_origin_namespace("storage-gc-runner-idle-pending-deadline");
-    let pending_key = WalFragment::s3_key(&pending_namespace, &ulid_at(now, 102));
+    let pending_key = WalFragment::object_store_key(&pending_namespace, &ulid_at(now, 102));
     store
         .put(&pending_key, Bytes::from_static(b"pending deadline"))
         .await
@@ -5851,7 +5851,7 @@ async fn gc_runner_idle_gate_wakes_at_candidate_pending_pitr_and_lease_deadlines
         .write(&store, &lease_namespace)
         .await
         .unwrap();
-    let staged_key = WalFragment::s3_key(
+    let staged_key = WalFragment::object_store_key(
         &lease_namespace,
         &ulid_at(now - chrono::Duration::seconds(60), 103),
     );
@@ -6097,7 +6097,7 @@ async fn background_loop_runs_gc_for_active_namespaces() {
         .unwrap();
 
     let orphan_id = old_ulid(60, 29);
-    let orphan_key = WalFragment::s3_key(&ns, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&ns, &orphan_id);
     store
         .put(&orphan_key, Bytes::from_static(b"orphan fragment body"))
         .await

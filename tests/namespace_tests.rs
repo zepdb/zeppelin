@@ -45,11 +45,11 @@ async fn test_create_namespace() {
     assert_eq!(meta.vector_count, 0);
 
     // Verify meta.json exists on S3
-    let meta_key = NamespaceMetadata::s3_key(&name);
+    let meta_key = NamespaceMetadata::object_store_key(&name);
     assert_s3_object_exists(&harness.store, &meta_key).await;
 
     // Verify manifest.json exists on S3
-    let manifest_key = Manifest::s3_key(&name);
+    let manifest_key = Manifest::object_store_key(&name);
     assert_s3_object_exists(&harness.store, &manifest_key).await;
 
     cleanup_ns(&harness.store, &name).await;
@@ -60,7 +60,7 @@ async fn test_create_namespace() {
 async fn test_stale_namespace_bootstrap_cannot_overwrite_recovered_wal() {
     let harness = TestHarness::new().await;
     let name = ns(&harness, "stale-bootstrap-recovered-wal");
-    let manifest_key = Manifest::s3_key(&name);
+    let manifest_key = Manifest::object_store_key(&name);
     let (paused_store, bootstrap_pause) = pause_first_create_matching(&harness.store, manifest_key);
 
     let creator_name = name.clone();
@@ -234,7 +234,7 @@ async fn test_index_config_update_waits_for_the_namespace_writer_lease() {
 async fn test_legacy_namespace_incarnation_migrates_once_without_changing_body() {
     let harness = TestHarness::new().await;
     let name = ns(&harness, "legacy-incarnation-migration");
-    let key = NamespaceMetadata::s3_key(&name);
+    let key = NamespaceMetadata::object_store_key(&name);
     let creator = NamespaceManager::new(harness.store.clone());
     let created = creator
         .create(&name, 16, DistanceMetric::Euclidean)
@@ -381,7 +381,7 @@ async fn test_legacy_namespace_incarnation_migrates_once_without_changing_body()
 async fn test_legacy_creating_namespace_recovers_manifest_incarnation() {
     let harness = TestHarness::new().await;
     let name = ns(&harness, "legacy-creating-incarnation");
-    let key = NamespaceMetadata::s3_key(&name);
+    let key = NamespaceMetadata::object_store_key(&name);
     let creator = NamespaceManager::new(harness.store.clone());
     let created = creator
         .create(&name, 16, DistanceMetric::Euclidean)
@@ -429,8 +429,8 @@ async fn test_legacy_creating_namespace_recovers_manifest_incarnation() {
 async fn test_legacy_creating_namespace_without_manifest_mints_incarnation() {
     let harness = TestHarness::new().await;
     let name = ns(&harness, "legacy-creating-missing-manifest");
-    let metadata_key = NamespaceMetadata::s3_key(&name);
-    let manifest_key = Manifest::s3_key(&name);
+    let metadata_key = NamespaceMetadata::object_store_key(&name);
+    let manifest_key = Manifest::object_store_key(&name);
     let creator = NamespaceManager::new(harness.store.clone());
     let mut legacy_creating = creator
         .create(&name, 16, DistanceMetric::Euclidean)
@@ -475,8 +475,8 @@ async fn test_legacy_creating_namespace_without_manifest_mints_incarnation() {
 async fn test_legacy_creating_namespace_resumes_after_manifest_binding_crash() {
     let harness = TestHarness::new().await;
     let name = ns(&harness, "legacy-creating-post-bind-crash");
-    let metadata_key = NamespaceMetadata::s3_key(&name);
-    let manifest_key = Manifest::s3_key(&name);
+    let metadata_key = NamespaceMetadata::object_store_key(&name);
+    let manifest_key = Manifest::object_store_key(&name);
     let creator = NamespaceManager::new(harness.store.clone());
     let created = creator
         .create(&name, 16, DistanceMetric::Euclidean)
@@ -555,8 +555,8 @@ async fn test_legacy_creating_namespace_resumes_after_manifest_binding_crash() {
 async fn test_active_legacy_metadata_without_manifest_fails_before_migration() {
     let harness = TestHarness::new().await;
     let name = ns(&harness, "active-legacy-missing-manifest");
-    let metadata_key = NamespaceMetadata::s3_key(&name);
-    let manifest_key = Manifest::s3_key(&name);
+    let metadata_key = NamespaceMetadata::object_store_key(&name);
+    let manifest_key = Manifest::object_store_key(&name);
     let creator = NamespaceManager::new(harness.store.clone());
     creator
         .create(&name, 16, DistanceMetric::Euclidean)
@@ -675,7 +675,7 @@ async fn test_list_namespaces_ignores_nested_meta_objects() {
     let harness = TestHarness::new().await;
     let valid_ns = ns(&harness, "ns-list-delimited");
     let nested_ns = format!("{}/segments/seg_cruft", harness.prefix);
-    let nested_meta_key = NamespaceMetadata::s3_key(&nested_ns);
+    let nested_meta_key = NamespaceMetadata::object_store_key(&nested_ns);
 
     let manager = NamespaceManager::new(harness.store.clone());
     manager
@@ -742,7 +742,7 @@ async fn test_delete_namespace() {
     manager.delete(&name).await.unwrap();
 
     // Verify meta.json is gone
-    let meta_key = NamespaceMetadata::s3_key(&name);
+    let meta_key = NamespaceMetadata::object_store_key(&name);
     assert_s3_object_not_exists(&harness.store, &meta_key).await;
 
     // Verify get fails

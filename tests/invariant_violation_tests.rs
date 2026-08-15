@@ -151,7 +151,7 @@ async fn test_query_read_consistency_deferred_deletion() {
 
     // 4. FIX VERIFIED: Fragment files still exist (deferred deletion)
     for fref in &fragment_refs {
-        let key = WalFragment::s3_key(&ns, &fref.id);
+        let key = WalFragment::object_store_key(&ns, &fref.id);
         assert_s3_object_exists(store, &key).await;
     }
 
@@ -207,9 +207,9 @@ async fn test_namespace_deletion_leaves_zero_keys() {
         .unwrap();
 
     // 2. Verify all objects exist
-    let manifest_key = Manifest::s3_key(&ns);
-    let f1_key = WalFragment::s3_key(&ns, &f1.id);
-    let f2_key = WalFragment::s3_key(&ns, &f2.id);
+    let manifest_key = Manifest::object_store_key(&ns);
+    let f1_key = WalFragment::object_store_key(&ns, &f1.id);
+    let f2_key = WalFragment::object_store_key(&ns, &f2.id);
     assert_s3_object_exists(store, &manifest_key).await;
     assert_s3_object_exists(store, &f1_key).await;
     assert_s3_object_exists(store, &f2_key).await;
@@ -275,8 +275,8 @@ async fn test_sequence_numbers_override_ulid_ordering() {
     frag_b.id = later_ulid;
 
     // 2. Write both fragments to S3
-    let key_a = WalFragment::s3_key(&ns, &frag_a.id);
-    let key_b = WalFragment::s3_key(&ns, &frag_b.id);
+    let key_a = WalFragment::object_store_key(&ns, &frag_a.id);
+    let key_b = WalFragment::object_store_key(&ns, &frag_b.id);
     store.put(&key_a, frag_a.to_bytes().unwrap()).await.unwrap();
     store.put(&key_b, frag_b.to_bytes().unwrap()).await.unwrap();
 

@@ -333,7 +333,8 @@ async fn test_failed_live_manifest_put_does_not_wedge_a_divergent_compaction_ret
 
     let base = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     let candidate_version = base.version() + 1;
-    let (faulted_store, failure) = fail_put_once_matching(&harness.store, Manifest::s3_key(&ns));
+    let (faulted_store, failure) =
+        fail_put_once_matching(&harness.store, Manifest::object_store_key(&ns));
     let first = test_compactor(&faulted_store).compact(&ns).await;
     assert!(first.is_err(), "the injected live PUT must fail loudly");
     assert_eq!(failure.failures_injected(), 1);
@@ -406,7 +407,7 @@ async fn test_compact_multiple_fragments() {
     // Record fragment keys
     let frag_keys: Vec<String> = [&f1, &f2, &f3]
         .iter()
-        .map(|f| WalFragment::s3_key(&ns, &f.id))
+        .map(|f| WalFragment::object_store_key(&ns, &f.id))
         .collect();
 
     let compactor = test_compactor(store);
@@ -599,7 +600,7 @@ async fn test_compact_cleans_up_fragments() {
 
     let keys: Vec<String> = [&f1, &f2, &f3]
         .iter()
-        .map(|f| WalFragment::s3_key(&ns, &f.id))
+        .map(|f| WalFragment::object_store_key(&ns, &f.id))
         .collect();
 
     // Verify they exist before compaction
@@ -653,7 +654,7 @@ async fn test_compact_preserves_new_fragments() {
         .unwrap();
 
     // Fragment B should exist on S3
-    let b_key = WalFragment::s3_key(&ns, &frag_b.id);
+    let b_key = WalFragment::object_store_key(&ns, &frag_b.id);
     assert_s3_object_exists(store, &b_key).await;
 
     // Manifest should have 1 fragment (B) and watermark == A.id
@@ -1025,7 +1026,10 @@ async fn test_compact_rejects_missing_manifest_for_active_namespace() {
         .create(&ns, 16, DistanceMetric::Euclidean)
         .await
         .unwrap();
-    store.delete(&Manifest::s3_key(&ns)).await.unwrap();
+    store
+        .delete(&Manifest::object_store_key(&ns))
+        .await
+        .unwrap();
 
     let error = test_compactor(store)
         .compact(&ns)
@@ -1040,7 +1044,10 @@ async fn test_compact_rejects_missing_manifest_for_active_namespace() {
         "missing active manifest must return ManifestNotFound, got {error:?}"
     );
     assert!(
-        !store.exists(&Manifest::s3_key(&ns)).await.unwrap(),
+        !store
+            .exists(&Manifest::object_store_key(&ns))
+            .await
+            .unwrap(),
         "failed compaction must not recreate the missing manifest"
     );
 
@@ -1065,7 +1072,11 @@ async fn test_trigger_refresh_rejects_missing_manifest_instead_of_using_cached_s
             .await
             .unwrap()
     );
-    harness.store.delete(&Manifest::s3_key(&ns)).await.unwrap();
+    harness
+        .store
+        .delete(&Manifest::object_store_key(&ns))
+        .await
+        .unwrap();
 
     for _ in 0..2 {
         let error = evaluate_compaction_trigger(&compactor, &manifest_cache, &metadata)
@@ -1109,7 +1120,7 @@ async fn test_trigger_refresh_rejects_corrupt_manifest_instead_of_using_cached_s
     harness
         .store
         .put(
-            &Manifest::s3_key(&ns),
+            &Manifest::object_store_key(&ns),
             bytes::Bytes::from_static(b"\x01not-a-valid-manifest"),
         )
         .await
@@ -1149,7 +1160,7 @@ async fn test_leased_compaction_rejects_missing_authoritative_metadata() {
     let before = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     harness
         .store
-        .delete(&NamespaceMetadata::s3_key(&ns))
+        .delete(&NamespaceMetadata::object_store_key(&ns))
         .await
         .unwrap();
     let lease_manager = Arc::new(LeaseManager::new(
@@ -1285,8 +1296,8 @@ async fn test_idle_namespace_untouched_across_intervals() {
 
     common::seed_active_namespace(store, &ns, 16, DistanceMetric::Euclidean).await;
 
-    let manifest_key = Manifest::s3_key(&ns);
-    let etag_before = store.head(&manifest_key).await.unwrap().e_tag;
+    let manifest_key = Manifest::object_store_key(&ns);
+    let etag_before = store.head(&manifest_key).await.unwrap().version;
 
     let wal_reader = WalReader::new(store.clone());
     let compaction_config = CompactionConfig {
@@ -1319,7 +1330,7 @@ async fn test_idle_namespace_untouched_across_intervals() {
         );
     }
 
-    let etag_after = store.head(&manifest_key).await.unwrap().e_tag;
+    let etag_after = store.head(&manifest_key).await.unwrap().version;
     assert_eq!(
         etag_before, etag_after,
         "idle namespace manifest must not be rewritten across intervals"
@@ -1885,7 +1896,10 @@ async fn test_background_compaction_records_missing_active_manifest_failure() {
         .create(&ns, 16, DistanceMetric::Euclidean)
         .await
         .unwrap();
-    store.delete(&Manifest::s3_key(&ns)).await.unwrap();
+    store
+        .delete(&Manifest::object_store_key(&ns))
+        .await
+        .unwrap();
 
     let compaction_config = CompactionConfig {
         interval_secs: 1,
@@ -1961,7 +1975,10 @@ async fn test_background_compaction_records_missing_active_manifest_failure() {
         Some(format!("manifest not found for namespace: {ns}").as_str())
     );
     assert!(
-        !store.exists(&Manifest::s3_key(&ns)).await.unwrap(),
+        !store
+            .exists(&Manifest::object_store_key(&ns))
+            .await
+            .unwrap(),
         "background failure handling must not recreate the manifest"
     );
 
@@ -2024,7 +2041,7 @@ async fn test_background_first_discovery_preserves_prewarmed_manifest_cache() {
         .create(&ns, 16, DistanceMetric::Euclidean)
         .await
         .unwrap();
-    let manifest_key = Manifest::s3_key(&ns);
+    let manifest_key = Manifest::object_store_key(&ns);
     let manifest_bytes = store.get(&manifest_key).await.unwrap().len() as u64;
 
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_secs(3_600)));
@@ -2245,7 +2262,10 @@ async fn test_background_compaction_accepts_missing_manifest_while_deleting() {
         .await
         .unwrap();
     namespace_manager.start_delete(&ns).await.unwrap();
-    assert!(!store.exists(&Manifest::s3_key(&ns)).await.unwrap());
+    assert!(!store
+        .exists(&Manifest::object_store_key(&ns))
+        .await
+        .unwrap());
 
     let compaction_config = CompactionConfig {
         interval_secs: 1,
@@ -2315,7 +2335,7 @@ async fn test_background_compaction_accepts_missing_manifest_while_deleting() {
     });
 
     tokio::time::timeout(BACKGROUND_LOOP_WAIT, async {
-        let metadata_key = zeppelin::namespace::manager::NamespaceMetadata::s3_key(&ns);
+        let metadata_key = zeppelin::namespace::manager::NamespaceMetadata::object_store_key(&ns);
         while store.exists(&metadata_key).await.unwrap() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -2349,7 +2369,7 @@ async fn test_background_compaction_resumes_active_governed_deletion_intent() {
     // installed its metadata intent. This models a process crash in the exact
     // pre-tombstone state that a stateless maintenance worker must discover.
     let (crashed_store, fence_failure) =
-        fail_put_once_matching(&isolated_store, Manifest::s3_key(&ns));
+        fail_put_once_matching(&isolated_store, Manifest::object_store_key(&ns));
     let config = zeppelin::config::Config::default();
     zeppelin::namespace::branching::test_support::delete_namespace_for_test(
         crashed_store,
@@ -2361,7 +2381,7 @@ async fn test_background_compaction_resumes_active_governed_deletion_intent() {
     .expect_err("crash fixture must fail before publishing the deletion fence");
     assert_eq!(fence_failure.failures_injected(), 1);
 
-    let metadata_key = NamespaceMetadata::s3_key(&ns);
+    let metadata_key = NamespaceMetadata::object_store_key(&ns);
     let interrupted = NamespaceMetadata::from_bytes(
         &isolated_store
             .get(&metadata_key)

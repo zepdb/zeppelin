@@ -34,7 +34,7 @@ use zeppelin::fts::FtsFieldConfig;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::namespace::manager::{NamespaceIndexConfig, NamespaceManager};
 use zeppelin::query::{execute_query, QueryParams};
-use zeppelin::storage::ZeppelinStore;
+use zeppelin::storage::{StorageCapabilities, ZeppelinStore};
 use zeppelin::time::{Clock, TimeSource};
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, VectorEntry};
 use zeppelin::wal::fragment::WalFragment;
@@ -1439,7 +1439,7 @@ async fn execute_idle_pending_delete_maturity(case: &IdealCase) -> IdealSample {
     world
         .store
         .put(
-            &Manifest::s3_key(&namespace),
+            &Manifest::object_store_key(&namespace),
             manifest
                 .to_bytes()
                 .expect("ideal idle pending-delete manifest encode failed"),
@@ -1896,7 +1896,7 @@ async fn execute_prune_reuse_eligible_pending_refresh(case: &IdealCase) -> Ideal
     world
         .store
         .put(
-            &Manifest::s3_key(&namespace),
+            &Manifest::object_store_key(&namespace),
             manifest
                 .to_bytes()
                 .expect("ideal prune-reuse pending manifest encode failed"),
@@ -2076,7 +2076,7 @@ async fn execute_history_memo_unpublished_orphan_overwrite(case: &IdealCase) -> 
     world
         .store
         .put(
-            &Manifest::s3_key(&namespace),
+            &Manifest::object_store_key(&namespace),
             authoritative
                 .to_bytes()
                 .expect("ideal GC orphan authoritative manifest serialization failed"),
@@ -2092,7 +2092,7 @@ async fn execute_history_memo_unpublished_orphan_overwrite(case: &IdealCase) -> 
         (world.now - ChronoDuration::seconds(60)).timestamp_millis() as u64,
         0xA11CE,
     );
-    let protected_key = WalFragment::s3_key(&namespace, &protected_id);
+    let protected_key = WalFragment::object_store_key(&namespace, &protected_id);
     world
         .store
         .put(&protected_key, Bytes::from_static(b"orphan-history-root"))
@@ -2279,7 +2279,7 @@ fn history_observation_fault_store(
         control: Arc::clone(&control),
     };
     (
-        ZeppelinStore::new_with_native_batch_delete(Arc::new(store)),
+        ZeppelinStore::new_with_capabilities(Arc::new(store), StorageCapabilities::s3()),
         control,
     )
 }
@@ -2408,7 +2408,7 @@ async fn seed_gc_cycle_sized_history(world: &MaintenanceWorld, namespace: &str) 
     world
         .store
         .put(
-            &Manifest::s3_key(namespace),
+            &Manifest::object_store_key(namespace),
             manifest
                 .to_bytes()
                 .expect("ideal GC sized-history live manifest encode failed"),
@@ -2564,7 +2564,7 @@ async fn execute_pending_delete(case: &IdealCase, shape: PendingShape) -> IdealS
         PendingShape::Young | PendingShape::Eligible => world
             .store
             .put(
-                &Manifest::s3_key(&namespace),
+                &Manifest::object_store_key(&namespace),
                 manifest
                     .to_bytes()
                     .expect("ideal pending-delete manifest serialization failed"),

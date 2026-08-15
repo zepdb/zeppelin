@@ -59,7 +59,9 @@ Initial release.
 - Pre-1.0: no on-disk format stability guarantee between versions.
 - Namespace branching is disabled by default and its release validation
   gates are not complete.
-- GCS and Azure backends are planned, not implemented.
+- GCS and Azure Blob backends are implemented behind `[storage] backend`
+  with emulator-backed test gates (patched fake-gcs-server, Azurite); no
+  gate has run against real GCS/Azure yet.
 - Published performance numbers are loopback-MinIO measurements, not
   cloud-S3 latency claims.
 

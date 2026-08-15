@@ -114,7 +114,7 @@ async fn readyz_reports_bounded_orphan_root_repair_identity_without_storage_or_p
 
     harness
         .store
-        .delete(&NamespaceMetadata::s3_key(&target))
+        .delete(&NamespaceMetadata::object_store_key(&target))
         .await
         .expect("fixture must remove only the exact child metadata object");
 

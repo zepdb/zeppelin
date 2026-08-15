@@ -324,7 +324,7 @@ async fn test_eventual_query_gets_only_delete_fragments_not_vector_wal_fragments
         )
         .await
         .unwrap();
-    let vector_fragment_key = WalFragment::s3_key(&ns, &vector_fragment.id);
+    let vector_fragment_key = WalFragment::object_store_key(&ns, &vector_fragment.id);
 
     counter.reset();
     let without_deletes = execute_query(QueryParams {
@@ -360,7 +360,7 @@ async fn test_eventual_query_gets_only_delete_fragments_not_vector_wal_fragments
         .append(&ns, vec![], vec![target_id.to_string()])
         .await
         .unwrap();
-    let delete_fragment_key = WalFragment::s3_key(&ns, &delete_fragment.id);
+    let delete_fragment_key = WalFragment::object_store_key(&ns, &delete_fragment.id);
 
     counter.reset();
     let after_delete = execute_query(QueryParams {

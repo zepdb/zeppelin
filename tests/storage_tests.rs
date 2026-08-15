@@ -43,7 +43,11 @@ async fn test_s3_put_get_delete() {
 
     // HEAD
     let meta = harness.store.head(&key).await.expect("head should succeed");
-    assert_eq!(meta.size, data.len(), "head size should match data length");
+    assert_eq!(
+        meta.size,
+        data.len() as u64,
+        "head size should match data length"
+    );
 
     // DELETE
     harness

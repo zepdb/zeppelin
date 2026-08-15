@@ -1768,7 +1768,7 @@ impl NamespaceGraph {
                     || !manifest.branch_roots().is_empty()
                     || self
                         .store
-                        .get(&Manifest::s3_key(namespace.as_str()))
+                        .get(&Manifest::object_store_key(namespace.as_str()))
                         .await?
                         != *candidate.publication.exact_bytes()
                 {
@@ -2041,7 +2041,7 @@ impl NamespaceGraph {
         let candidate = self.rebuild_candidate_from_root(&metadata, root).await?;
         if self
             .store
-            .get(&Manifest::s3_key(namespace.as_str()))
+            .get(&Manifest::object_store_key(namespace.as_str()))
             .await?
             != *candidate.publication.exact_bytes()
         {
@@ -2050,7 +2050,7 @@ impl NamespaceGraph {
             }
             .into());
         }
-        let manifest_key = Manifest::s3_key(namespace.as_str());
+        let manifest_key = Manifest::object_store_key(namespace.as_str());
         if let Err(delete_error) = self.store.delete(&manifest_key).await {
             match Manifest::read_versioned(&self.store, namespace.as_str()).await {
                 Ok(None) => {}
@@ -3487,7 +3487,7 @@ impl NamespaceGraph {
                     .await?;
                 let current_target_etag = StorageVersion::require(
                     current_target_etag.as_ref(),
-                    &NamespaceMetadata::s3_key(namespace.as_str()),
+                    &NamespaceMetadata::object_store_key(namespace.as_str()),
                 )?
                 .clone();
                 let current_intent = current_target.deletion_intent.as_ref().ok_or_else(|| {
@@ -5029,7 +5029,7 @@ impl NamespaceGraph {
         // On the failure path both objects are now fetched where the live
         // mismatch used to short-circuit the history read. That costs one
         // speculative GET only when a fork is already failing.
-        let live_key = Manifest::s3_key(&target.name);
+        let live_key = Manifest::object_store_key(&target.name);
         let history_key = Manifest::history_key(&target.name, identity.target_generation.get());
         let (live_bytes, history_bytes) =
             tokio::try_join!(self.store.get(&live_key), self.store.get(&history_key))?;

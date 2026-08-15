@@ -207,7 +207,7 @@ async fn test_fencing_rejects_zombie_writer() {
     // Zombie writes a fragment to S3 (this always succeeds — unconditional PUT)
     let vectors = random_vectors(3, 16);
     let fragment = WalFragment::new(vectors, vec![]);
-    let frag_key = WalFragment::s3_key(&ns, &fragment.id);
+    let frag_key = WalFragment::object_store_key(&ns, &fragment.id);
     let frag_data = fragment.to_bytes().unwrap();
     harness.store.put(&frag_key, frag_data).await.unwrap();
 
@@ -340,7 +340,7 @@ async fn test_fragment_orphan_on_lease_expiry() {
     // before it could update the manifest)
     let vectors = random_vectors(5, 16);
     let fragment = WalFragment::new(vectors, vec![]);
-    let frag_key = WalFragment::s3_key(&ns, &fragment.id);
+    let frag_key = WalFragment::object_store_key(&ns, &fragment.id);
     let frag_data = fragment.to_bytes().unwrap();
     harness.store.put(&frag_key, frag_data).await.unwrap();
 
@@ -661,14 +661,14 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
     // Write fragment data to S3
     store
         .put(
-            &WalFragment::s3_key(&ns, &frag1.id),
+            &WalFragment::object_store_key(&ns, &frag1.id),
             frag1.to_bytes().unwrap(),
         )
         .await
         .unwrap();
     store
         .put(
-            &WalFragment::s3_key(&ns, &frag2.id),
+            &WalFragment::object_store_key(&ns, &frag2.id),
             frag2.to_bytes().unwrap(),
         )
         .await
@@ -708,7 +708,7 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
     let frag3 = WalFragment::new(vectors_3, vec![]);
     store
         .put(
-            &WalFragment::s3_key(&ns, &frag3.id),
+            &WalFragment::object_store_key(&ns, &frag3.id),
             frag3.to_bytes().unwrap(),
         )
         .await
@@ -737,7 +737,7 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
     let frag4 = WalFragment::new(vectors_4, vec![]);
     store
         .put(
-            &WalFragment::s3_key(&ns, &frag4.id),
+            &WalFragment::object_store_key(&ns, &frag4.id),
             frag4.to_bytes().unwrap(),
         )
         .await
@@ -807,7 +807,7 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
     // But W1's fragment data still exists on S3 (orphan, not data loss)
     assert!(
         store
-            .exists(&WalFragment::s3_key(&ns, &frag3.id))
+            .exists(&WalFragment::object_store_key(&ns, &frag3.id))
             .await
             .unwrap(),
         "Orphaned fragment data should still exist on S3"

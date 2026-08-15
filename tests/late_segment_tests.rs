@@ -142,7 +142,7 @@ fn image_record(
         },
     };
     let content_hash = input.content_hash().expect("image fixture must hash");
-    let key = SourceInventoryRef::s3_key(namespace, content_hash);
+    let key = SourceInventoryRef::object_store_key(namespace, content_hash);
     if let EncoderInputRef::Image { image } = &mut input {
         image.key.clone_from(&key);
     }

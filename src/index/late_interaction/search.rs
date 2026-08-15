@@ -352,7 +352,8 @@ async fn replay_snapshot(
     for reference in references {
         let origin = snapshot.manifest.input_fragment_origin(reference)?;
         let fragment = Manifest::read_input_fragment_checked(store, reference, &origin).await?;
-        let source_key = EncoderInputWalFragment::s3_key(origin.namespace.as_str(), &reference.id);
+        let source_key =
+            EncoderInputWalFragment::object_store_key(origin.namespace.as_str(), &reference.id);
         for (row_index, record) in fragment.upserts.iter().enumerate() {
             touched_ids.insert(record.id.clone());
             let row_ordinal = u32::try_from(row_index)

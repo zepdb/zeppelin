@@ -1084,7 +1084,7 @@ impl ManifestNamespaceIncarnation {
 /// Authoritative inventory of the data visible in one namespace.
 ///
 /// A value in memory is only a candidate view. It becomes authoritative when
-/// its encoded bytes are published at [`Manifest::s3_key`]. The manifest tracks
+/// its encoded bytes are published at [`Manifest::object_store_key`]. The manifest tracks
 /// uncompacted WAL fragments, immutable search segments, deferred deletion
 /// work, the writer's fencing token, and its persisted generation.
 ///
@@ -2504,8 +2504,10 @@ impl Manifest {
         source: &EncoderInputWalFragment,
         source_origin: &ArtifactOrigin,
     ) -> Result<()> {
-        let expected_key =
-            EncoderInputWalFragment::s3_key(source_origin.namespace.as_str(), &source_ref.id);
+        let expected_key = EncoderInputWalFragment::object_store_key(
+            source_origin.namespace.as_str(),
+            &source_ref.id,
+        );
         if overlay.source_fragment
             != (PhysicalInputFragmentIdentity {
                 key: expected_key,
@@ -2570,7 +2572,8 @@ impl Manifest {
         reference: &InputFragmentRef,
         origin: &ArtifactOrigin,
     ) -> Result<EncoderInputWalFragment> {
-        let key = EncoderInputWalFragment::s3_key(origin.namespace.as_str(), &reference.id);
+        let key =
+            EncoderInputWalFragment::object_store_key(origin.namespace.as_str(), &reference.id);
         let bytes = store.get(&key).await?;
         if u64::try_from(bytes.len()).ok() != Some(reference.size_bytes) {
             return Err(ZeppelinError::Serialization(format!(
@@ -2614,7 +2617,7 @@ impl Manifest {
             let origin = self.input_fragment_origin(reference)?;
             let source = Self::read_input_fragment_checked(store, reference, &origin).await?;
             let source_key =
-                EncoderInputWalFragment::s3_key(origin.namespace.as_str(), &reference.id);
+                EncoderInputWalFragment::object_store_key(origin.namespace.as_str(), &reference.id);
             for (ordinal, record) in source.upserts.iter().enumerate() {
                 live.insert(
                     record.id.clone(),
@@ -3509,7 +3512,8 @@ impl Manifest {
                 .as_str(),
             None => namespace,
         };
-        let expected_key = LateStateSection::s3_key(physical_namespace, &reference.checksum);
+        let expected_key =
+            LateStateSection::object_store_key(physical_namespace, &reference.checksum);
         if reference.key != expected_key {
             let expected_origin = reference.artifact_origin.and_then(|index| {
                 self.indexed_artifact_origin_ref("late-section", &reference.key, index)
@@ -3948,7 +3952,7 @@ impl Manifest {
     ///
     /// `<namespace>/manifest.json`. The suffix is legacy naming; newly written
     /// contents are version-prefixed MessagePack, not JSON.
-    pub fn s3_key(namespace: &str) -> String {
+    pub fn object_store_key(namespace: &str) -> String {
         format!("{namespace}/manifest.json")
     }
 
@@ -5348,7 +5352,7 @@ impl Manifest {
         }
         decoded.validate_initial_fork_view()?;
 
-        let live_key = Self::s3_key(target_identity.namespace.as_str());
+        let live_key = Self::object_store_key(target_identity.namespace.as_str());
         match store
             .put_create_outcome(&live_key, prepared.bytes.clone())
             .await?
@@ -6438,7 +6442,7 @@ impl Manifest {
     /// Reading a newly created namespace returns generation 1. Reading a deleted
     /// namespace returns `None`; it does not recreate the manifest.
     pub async fn read(store: &ZeppelinStore, namespace: &str) -> Result<Option<Self>> {
-        let key = Self::s3_key(namespace);
+        let key = Self::object_store_key(namespace);
         match store.get(&key).await {
             Ok(data) => Ok(Some(Self::from_bytes_for_namespace(&data, namespace)?)),
             Err(crate::error::ZeppelinError::NotFound { .. }) => Ok(None),
@@ -6500,7 +6504,7 @@ impl Manifest {
                 namespace: namespace.to_string(),
             });
         }
-        let key = Self::s3_key(namespace);
+        let key = Self::object_store_key(namespace);
         let current = Self::read_versioned(store, namespace).await?;
         if current
             .as_ref()
@@ -6736,7 +6740,7 @@ impl Manifest {
         store: &ZeppelinStore,
         namespace: &str,
     ) -> Result<Option<(Self, ManifestVersion)>> {
-        let key = Self::s3_key(namespace);
+        let key = Self::object_store_key(namespace);
         match store.get_with_meta(&key).await {
             Ok((data, observed)) => {
                 let manifest = Self::from_bytes_for_namespace(&data, namespace)?;
@@ -6758,7 +6762,7 @@ impl Manifest {
         store: &ZeppelinStore,
         namespace: &str,
     ) -> Result<(Self, ManifestVersion)> {
-        let key = Self::s3_key(namespace);
+        let key = Self::object_store_key(namespace);
         let (data, observed) = store.get_with_meta(&key).await?;
         let manifest = Self::from_bytes_for_namespace(&data, namespace)?;
         let version = ManifestVersion::for_manifest(observed, &manifest, data, false);
@@ -6956,7 +6960,7 @@ impl Manifest {
         namespace: &str,
         version: &ManifestVersion,
     ) -> Result<(ManifestVersion, bool)> {
-        let key = Self::s3_key(namespace);
+        let key = Self::object_store_key(namespace);
         if version.has_version() {
             let predecessor_bytes = version.exact_manifest_bytes()?;
             let predecessor = Self::from_bytes_for_namespace(&predecessor_bytes, namespace)?;
@@ -9879,7 +9883,10 @@ mod tests {
         let fork = |checksum: [u8; 32]| {
             let mut source = bound_manifest(&source_identity, 7);
             source.late_state = Some(ManifestSectionRef {
-                key: LateStateSection::s3_key(source_identity.namespace.as_str(), &checksum),
+                key: LateStateSection::object_store_key(
+                    source_identity.namespace.as_str(),
+                    &checksum,
+                ),
                 checksum,
                 size_bytes: 6,
                 format_version: LATE_STATE_FORMAT_VERSION,
@@ -10188,7 +10195,7 @@ mod tests {
         assert_eq!(retry.to_bytes().unwrap(), *sealed.exact_bytes());
         assert_eq!(
             store
-                .get(&Manifest::s3_key("publish-target"))
+                .get(&Manifest::object_store_key("publish-target"))
                 .await
                 .unwrap(),
             *sealed.exact_bytes()
@@ -11855,7 +11862,7 @@ mod tests {
         let mut manifest = bound_manifest(&identity, 4);
         let checksum = [0x44; 32];
         let reference = ManifestSectionRef {
-            key: LateStateSection::s3_key(identity.namespace.as_str(), &checksum),
+            key: LateStateSection::object_store_key(identity.namespace.as_str(), &checksum),
             checksum,
             size_bytes: 6,
             format_version: LATE_STATE_FORMAT_VERSION,
@@ -11894,7 +11901,7 @@ mod tests {
         manifest.artifact_origins = vec![source.clone()];
         let checksum = [0x55; 32];
         manifest.late_state = Some(ManifestSectionRef {
-            key: LateStateSection::s3_key(source.namespace.as_str(), &checksum),
+            key: LateStateSection::object_store_key(source.namespace.as_str(), &checksum),
             checksum,
             size_bytes: 6,
             format_version: LATE_STATE_FORMAT_VERSION,
@@ -11913,7 +11920,7 @@ mod tests {
         let mut manifest = bound_manifest(&target, 1);
         let checksum = [0x66; 32];
         manifest.late_state = Some(ManifestSectionRef {
-            key: LateStateSection::s3_key(target.namespace.as_str(), &checksum),
+            key: LateStateSection::object_store_key(target.namespace.as_str(), &checksum),
             checksum,
             size_bytes: 6,
             format_version: LATE_STATE_FORMAT_VERSION,
@@ -11921,7 +11928,7 @@ mod tests {
         });
         let section = LateStateSection {
             source_inventory: vec![SourceInventoryRef {
-                key: SourceInventoryRef::s3_key(
+                key: SourceInventoryRef::object_store_key(
                     source.namespace.as_str(),
                     crate::embedding::ContentHash::new([0x77; 32]),
                 ),
@@ -11956,7 +11963,7 @@ mod tests {
             .unwrap();
 
         let source = SourceInventoryRef {
-            key: SourceInventoryRef::s3_key(
+            key: SourceInventoryRef::object_store_key(
                 namespace,
                 crate::embedding::ContentHash::new([0x21; 32]),
             ),
@@ -12029,7 +12036,7 @@ mod tests {
         let bytes = section.to_bytes().unwrap();
         let checksum = LateStateSection::checksum(&bytes);
         manifest.late_state = Some(ManifestSectionRef {
-            key: LateStateSection::s3_key(local.namespace.as_str(), &checksum),
+            key: LateStateSection::object_store_key(local.namespace.as_str(), &checksum),
             checksum,
             size_bytes: bytes.len() as u64,
             format_version: LATE_STATE_FORMAT_VERSION,

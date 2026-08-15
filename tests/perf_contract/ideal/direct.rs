@@ -967,7 +967,7 @@ async fn execute_manifest_cache(case: &IdealCase, operation: ManifestCacheCase) 
                 .expect("ideal optional-cache prime failed");
             world
                 .store
-                .delete(&Manifest::s3_key(&namespace))
+                .delete(&Manifest::object_store_key(&namespace))
                 .await
                 .expect("ideal optional-cache setup delete failed");
             world.begin_measurement().await;

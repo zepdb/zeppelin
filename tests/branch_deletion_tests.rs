@@ -206,7 +206,7 @@ fn assert_final_root_release(metadata: &NamespaceMetadata, converged: bool) {
 
 async fn read_namespace_metadata(store: &ZeppelinStore, namespace: &str) -> NamespaceMetadata {
     let bytes = store
-        .get(&NamespaceMetadata::s3_key(namespace))
+        .get(&NamespaceMetadata::object_store_key(namespace))
         .await
         .expect("namespace metadata must remain authoritative");
     NamespaceMetadata::from_bytes(&bytes).expect("namespace metadata must decode")
@@ -399,7 +399,7 @@ async fn queued_branch_hydration_stops_at_deletion_fence_and_delete_resumes() {
 
     let (counted_store, operations) = counting_store(&harness.store);
     let (paused_store, authority_read) =
-        pause_next_get_matching(&counted_store, Manifest::s3_key(&target));
+        pause_next_get_matching(&counted_store, Manifest::object_store_key(&target));
     let (crash_store, evidence_lost_reply) =
         fail_after_put_once_matching(&paused_store, "_audit/destruction/");
     authority_read.arm();
@@ -512,7 +512,7 @@ async fn branch_cleanup_rejects_foreign_pending_delete_without_source_delete() {
         .expect("source namespace must be created");
     activate_branch(recording_store.clone(), &source, &target, &config).await;
 
-    let foreign_key = WalFragment::s3_key(&source, &ulid::Ulid::new());
+    let foreign_key = WalFragment::object_store_key(&source, &ulid::Ulid::new());
     recording_store
         .put(
             &foreign_key,
@@ -568,7 +568,7 @@ async fn branch_cleanup_rejects_foreign_pending_delete_without_source_delete() {
     );
     assert!(
         recording_store
-            .get(&NamespaceMetadata::s3_key(&target))
+            .get(&NamespaceMetadata::object_store_key(&target))
             .await
             .is_ok(),
         "cleanup corruption must retain target metadata as its recovery handle"
@@ -611,7 +611,7 @@ async fn successful_branch_cleanup_deletes_only_target_inventory() {
         .into_iter()
         .collect::<BTreeSet<_>>();
     assert!(
-        expected_target_deletes.contains(&NamespaceMetadata::s3_key(&target)),
+        expected_target_deletes.contains(&NamespaceMetadata::object_store_key(&target)),
         "the cleanup inventory must include metadata for the final DELETE"
     );
 
@@ -837,7 +837,7 @@ namespaces = ["{source}", "{visible}"]
 
     harness
         .store
-        .delete(&NamespaceMetadata::s3_key(&hidden))
+        .delete(&NamespaceMetadata::object_store_key(&hidden))
         .await
         .expect("denied child corruption fixture must be installed");
 
@@ -911,7 +911,7 @@ async fn readable_child_corruption_fails_branch_listing_with_a_generic_integrity
 
     harness
         .store
-        .delete(&NamespaceMetadata::s3_key(&target))
+        .delete(&NamespaceMetadata::object_store_key(&target))
         .await
         .expect("target metadata corruption fixture must be installed");
     let listing = client
@@ -1619,7 +1619,10 @@ async fn slice_five_crash_before_parent_root_cas_retains_root_and_retry_complete
         "retry must remove the exact retained parent root"
     );
     assert!(matches!(
-        harness.store.get(&NamespaceMetadata::s3_key(&target)).await,
+        harness
+            .store
+            .get(&NamespaceMetadata::object_store_key(&target))
+            .await,
         Err(zeppelin::error::ZeppelinError::NotFound { .. })
     ));
 
@@ -1693,7 +1696,10 @@ async fn slice_five_lost_parent_root_cas_reply_converges_before_final_cleanup() 
     );
     final_server.shutdown().await;
     assert!(matches!(
-        harness.store.get(&NamespaceMetadata::s3_key(&target)).await,
+        harness
+            .store
+            .get(&NamespaceMetadata::object_store_key(&target))
+            .await,
         Err(zeppelin::error::ZeppelinError::NotFound { .. })
     ));
 
@@ -1849,7 +1855,7 @@ async fn slice_five_retry_after_marker_cleanup_does_not_recreate_visibility() {
     let fixture = establish_branch_grace(&harness, &source, &target).await;
     fixture.wall_clock.set(fixture.visibility.not_before);
 
-    let meta_key = NamespaceMetadata::s3_key(&target);
+    let meta_key = NamespaceMetadata::object_store_key(&target);
     let (metadata_failure_store, metadata_delete_failure) =
         fail_delete_once_matching(&harness.store, meta_key.clone());
     let interrupted_server =
@@ -1962,7 +1968,10 @@ async fn concurrent_stale_resume_after_marker_cleanup_converges_without_recreati
         Err(zeppelin::error::ZeppelinError::NotFound { .. })
     ));
     assert!(matches!(
-        harness.store.get(&NamespaceMetadata::s3_key(&target)).await,
+        harness
+            .store
+            .get(&NamespaceMetadata::object_store_key(&target))
+            .await,
         Err(zeppelin::error::ZeppelinError::NotFound { .. })
     ));
 
@@ -2173,7 +2182,10 @@ async fn slice_five_lost_root_reply_can_converge_after_parent_is_fully_deleted()
     );
     final_server.shutdown().await;
     assert!(matches!(
-        harness.store.get(&NamespaceMetadata::s3_key(&target)).await,
+        harness
+            .store
+            .get(&NamespaceMetadata::object_store_key(&target))
+            .await,
         Err(zeppelin::error::ZeppelinError::NotFound { .. })
     ));
 
@@ -2353,7 +2365,7 @@ fn run_slice_six_maintain_recovery_row(
                 .await
                 .expect("unfenced crash fixture namespace must be created");
             let (crashed_store, fence_failure) =
-                fail_put_once_matching(&store, Manifest::s3_key(&namespace));
+                fail_put_once_matching(&store, Manifest::object_store_key(&namespace));
             let crashed_server = start_test_server_full(
                 crashed_store,
                 Some(harness.prefix.clone()),
@@ -2407,7 +2419,9 @@ fn run_slice_six_maintain_recovery_row(
                 },
             );
             assert!(matches!(
-                store.get(&NamespaceMetadata::s3_key(&namespace)).await,
+                store
+                    .get(&NamespaceMetadata::object_store_key(&namespace))
+                    .await,
                 Err(zeppelin::error::ZeppelinError::NotFound { .. })
             ));
             assert!(
@@ -2497,7 +2511,9 @@ fn run_slice_six_maintain_recovery_row(
                 },
             );
             assert!(matches!(
-                store.get(&NamespaceMetadata::s3_key(&namespace)).await,
+                store
+                    .get(&NamespaceMetadata::object_store_key(&namespace))
+                    .await,
                 Err(zeppelin::error::ZeppelinError::NotFound { .. })
             ));
             assert!(
@@ -2523,7 +2539,7 @@ fn run_slice_six_maintain_recovery_row(
                 .await
                 .expect("root-won source fixture must be created");
             let (crashed_store, fence_failure) =
-                fail_put_once_matching(&store, Manifest::s3_key(&source));
+                fail_put_once_matching(&store, Manifest::object_store_key(&source));
             let crashed_server = start_test_server_full(
                 crashed_store,
                 Some(harness.prefix.clone()),
@@ -2620,7 +2636,7 @@ fn run_slice_six_maintain_recovery_row(
                 .await
                 .expect("fenced-live fixture namespace must be created");
             let (crashed_store, visibility_delete_failure) =
-                fail_delete_once_matching(&store, Manifest::s3_key(&namespace));
+                fail_delete_once_matching(&store, Manifest::object_store_key(&namespace));
             let crashed_server = start_test_server_full(
                 crashed_store,
                 Some(harness.prefix.clone()),
@@ -2673,7 +2689,9 @@ fn run_slice_six_maintain_recovery_row(
                 },
             );
             assert!(matches!(
-                store.get(&NamespaceMetadata::s3_key(&namespace)).await,
+                store
+                    .get(&NamespaceMetadata::object_store_key(&namespace))
+                    .await,
                 Err(zeppelin::error::ZeppelinError::NotFound { .. })
             ));
             server.shutdown().await;
@@ -2795,7 +2813,9 @@ fn run_slice_six_maintain_recovery_row(
                 },
             );
             assert!(matches!(
-                store.get(&NamespaceMetadata::s3_key(&target)).await,
+                store
+                    .get(&NamespaceMetadata::object_store_key(&target))
+                    .await,
                 Err(zeppelin::error::ZeppelinError::NotFound { .. })
             ));
             completed_server.shutdown().await;
@@ -2887,7 +2907,9 @@ fn run_slice_six_maintain_recovery_row(
                 "elapsed maintenance must remove the exact parent root"
             );
             assert!(matches!(
-                store.get(&NamespaceMetadata::s3_key(&target)).await,
+                store
+                    .get(&NamespaceMetadata::object_store_key(&target))
+                    .await,
                 Err(zeppelin::error::ZeppelinError::NotFound { .. })
             ));
             server.shutdown().await;
@@ -3004,7 +3026,9 @@ fn run_slice_six_maintain_recovery_row(
                 },
             );
             assert!(matches!(
-                store.get(&NamespaceMetadata::s3_key(&target)).await,
+                store
+                    .get(&NamespaceMetadata::object_store_key(&target))
+                    .await,
                 Err(zeppelin::error::ZeppelinError::NotFound { .. })
             ));
             server.shutdown().await;
@@ -3018,7 +3042,7 @@ fn run_slice_six_maintain_recovery_row(
             let fixture =
                 establish_branch_grace_on_store(&harness, store.clone(), &source, &target).await;
             fixture.wall_clock.set(fixture.visibility.not_before);
-            let target_meta_key = NamespaceMetadata::s3_key(&target);
+            let target_meta_key = NamespaceMetadata::object_store_key(&target);
             let (partial_store, metadata_delete_failure) =
                 fail_delete_once_matching(&store, target_meta_key.clone());
             let interrupted = start_branch_recovery_server(&harness, partial_store, &fixture).await;
@@ -3090,22 +3114,22 @@ fn run_slice_six_maintain_recovery_row(
             );
             let source_metadata_before = server
                 .store
-                .get(&NamespaceMetadata::s3_key(&source))
+                .get(&NamespaceMetadata::object_store_key(&source))
                 .await
                 .expect("source metadata bytes must be readable before maintenance");
             let target_metadata_before = server
                 .store
-                .get(&NamespaceMetadata::s3_key(&target))
+                .get(&NamespaceMetadata::object_store_key(&target))
                 .await
                 .expect("target metadata bytes must be readable before maintenance");
             let source_manifest_before = server
                 .store
-                .get(&Manifest::s3_key(&source))
+                .get(&Manifest::object_store_key(&source))
                 .await
                 .expect("source live manifest must be readable before maintenance");
             let target_manifest_before = server
                 .store
-                .get(&Manifest::s3_key(&target))
+                .get(&Manifest::object_store_key(&target))
                 .await
                 .expect("target live manifest must be readable before maintenance");
 
@@ -3134,7 +3158,7 @@ fn run_slice_six_maintain_recovery_row(
             assert_eq!(
                 server
                     .store
-                    .get(&NamespaceMetadata::s3_key(&source))
+                    .get(&NamespaceMetadata::object_store_key(&source))
                     .await
                     .expect("source metadata bytes must remain readable"),
                 source_metadata_before
@@ -3142,7 +3166,7 @@ fn run_slice_six_maintain_recovery_row(
             assert_eq!(
                 server
                     .store
-                    .get(&NamespaceMetadata::s3_key(&target))
+                    .get(&NamespaceMetadata::object_store_key(&target))
                     .await
                     .expect("target metadata bytes must remain readable"),
                 target_metadata_before
@@ -3150,7 +3174,7 @@ fn run_slice_six_maintain_recovery_row(
             assert_eq!(
                 server
                     .store
-                    .get(&Manifest::s3_key(&source))
+                    .get(&Manifest::object_store_key(&source))
                     .await
                     .expect("source live manifest must remain readable"),
                 source_manifest_before
@@ -3158,7 +3182,7 @@ fn run_slice_six_maintain_recovery_row(
             assert_eq!(
                 server
                     .store
-                    .get(&Manifest::s3_key(&target))
+                    .get(&Manifest::object_store_key(&target))
                     .await
                     .expect("target live manifest must remain readable"),
                 target_manifest_before
@@ -3328,7 +3352,9 @@ fn run_slice_six_maintain_recovery_row(
                 },
             );
             assert!(matches!(
-                store.get(&NamespaceMetadata::s3_key(&namespace)).await,
+                store
+                    .get(&NamespaceMetadata::object_store_key(&namespace))
+                    .await,
                 Err(zeppelin::error::ZeppelinError::NotFound { .. })
             ));
             server.shutdown().await;
@@ -3351,7 +3377,7 @@ fn run_slice_six_maintain_recovery_row(
             establish_ordinary_governed_deleting(&store, &namespace, &config).await;
             setup_server.shutdown().await;
 
-            let metadata_key = NamespaceMetadata::s3_key(&namespace);
+            let metadata_key = NamespaceMetadata::object_store_key(&namespace);
             let (lost_reply_store, lost_reply) =
                 fail_after_delete_once_matching(&store, metadata_key.clone());
             let lost_reply_server = start_test_server_full(
@@ -3476,7 +3502,9 @@ async fn slice_six_maintain_fails_closed_on_orphan_parent_root() {
         .await
         .expect("test must simulate target metadata disappearing before root release");
     assert!(matches!(
-        store.get(&NamespaceMetadata::s3_key(&target)).await,
+        store
+            .get(&NamespaceMetadata::object_store_key(&target))
+            .await,
         Err(zeppelin::error::ZeppelinError::NotFound { .. })
     ));
 

@@ -161,7 +161,7 @@ async fn clone_as_of_ignores_history_generation_ahead_of_live_manifest() {
     let orphan_generation = live_version + 1;
 
     let (failing_store, failures) =
-        fail_put_once_matching(&harness.store, Manifest::s3_key(&source));
+        fail_put_once_matching(&harness.store, Manifest::object_store_key(&source));
     pending
         .write_conditional(&failing_store, &source, &version)
         .await

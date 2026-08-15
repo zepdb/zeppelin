@@ -348,7 +348,7 @@ async fn deleting_namespace_resumes_within_one_maturity_period() {
             fixture
                 .harness
                 .store
-                .get(&NamespaceMetadata::s3_key(&fixture.namespace))
+                .get(&NamespaceMetadata::object_store_key(&fixture.namespace))
                 .await,
             Err(zeppelin::error::ZeppelinError::NotFound { .. })
         ),
@@ -404,7 +404,7 @@ async fn errored_pass_does_not_publish_a_warm_memo() {
     create_namespace(&harness.store, &namespace).await;
     let (counted, counter) = counting_store(&harness.store);
     let (faulted, fault) =
-        toggle_get_failure_matching(&counted, NamespaceMetadata::s3_key(&namespace));
+        toggle_get_failure_matching(&counted, NamespaceMetadata::object_store_key(&namespace));
     let mut runner = BranchMaintenanceRunnerForTest::new_scoped(
         faulted,
         &config,
@@ -532,7 +532,7 @@ async fn non_branching_warm_runner_resumes_delete_within_one_maturity_period() {
             fixture
                 .harness
                 .store
-                .get(&NamespaceMetadata::s3_key(&fixture.namespace))
+                .get(&NamespaceMetadata::object_store_key(&fixture.namespace))
                 .await,
             Err(zeppelin::error::ZeppelinError::NotFound { .. })
         ),
@@ -568,7 +568,7 @@ async fn unbound_manifest_is_migrated_within_one_maturity_period() {
 
     harness
         .store
-        .delete(&Manifest::s3_key(&namespace))
+        .delete(&Manifest::object_store_key(&namespace))
         .await
         .unwrap();
     harness

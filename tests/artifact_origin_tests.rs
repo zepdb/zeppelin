@@ -618,7 +618,7 @@ async fn queued_branch_hydration_fenced_before_authority_read_never_touches_sour
 
     let (counted_store, counter) = counting_store(&harness.store);
     let (paused_store, manifest_read) =
-        pause_next_get_matching(&counted_store, Manifest::s3_key(&target));
+        pause_next_get_matching(&counted_store, Manifest::object_store_key(&target));
     manifest_read.arm();
     let cache_dir = tempfile::tempdir().unwrap();
     let cache = Arc::new(

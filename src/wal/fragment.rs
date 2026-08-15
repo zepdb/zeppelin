@@ -435,7 +435,7 @@ impl WalFragment {
     /// # Examples
     ///
     /// A fragment with two upserts becomes one byte string whose first byte is
-    /// `0x01`. The writer can PUT those bytes under [`WalFragment::s3_key`], but
+    /// `0x01`. The writer can PUT those bytes under [`WalFragment::object_store_key`], but
     /// readers still ignore the object until a manifest publication succeeds.
     ///
     /// # Rust Notes for Java/C Engineers
@@ -632,7 +632,7 @@ impl WalFragment {
     /// takes ownership of the ULID. The returned `String` owns its allocation,
     /// like a newly created Java `String`; unlike a C formatting buffer, its
     /// length and cleanup remain automatic.
-    pub fn s3_key(namespace: &str, id: &Ulid) -> String {
+    pub fn object_store_key(namespace: &str, id: &Ulid) -> String {
         format!("{namespace}/wal/{id}.wal")
     }
 

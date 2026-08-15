@@ -104,7 +104,12 @@ use crate::error::{Result, ZeppelinError};
 use crate::storage::capabilities::{canonical_etag, CasTokenKind, StorageCapabilities};
 use crate::storage::{namespace_prefix, NamespaceObjectFamily, NamespaceObjectKey};
 
-/// Maximum number of exact keys accepted by one S3 DeleteObjects request.
+/// Maximum number of exact keys accepted by one `delete_many` call.
+///
+/// The bound originates from S3's DeleteObjects request limit, and the seam
+/// applies it as its chunk size on every substrate so batch shape, retry, and
+/// progress semantics stay identical regardless of whether the backend
+/// batches natively.
 pub(crate) const DELETE_MANY_MAX_KEYS: usize = 1_000;
 
 /// Hard process bound for transient successful-PUT hashes awaiting publication.
@@ -1046,19 +1051,6 @@ impl ZeppelinStore {
         }
     }
 
-    /// Wraps an instrumented backend whose `delete_stream` preserves native S3 batches.
-    ///
-    /// This constructor exists for the dedicated performance harness. Generic
-    /// fault decorators use [`Self::new`] so their established per-key failure
-    /// scheduling remains unchanged; the perf harness explicitly opts into this
-    /// constructor after installing transparent forwarding decorators.
-    /// Deprecated-for-removal in the multi-substrate naming sweep: callers
-    /// should migrate to [`Self::new_with_capabilities`] with the S3 column.
-    #[doc(hidden)]
-    pub fn new_with_native_batch_delete(store: Arc<dyn ObjectStore>) -> Self {
-        Self::new_with_capabilities(store, StorageCapabilities::s3())
-    }
-
     /// Clone this gateway for authority-side reads without inheriting application signing.
     ///
     /// Long-lived policy, signer, and preservation caches need the same authoritative
@@ -1317,7 +1309,7 @@ impl ZeppelinStore {
                 ZeppelinError::Storage(error)
             })?;
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), "s3 put_create");
+        debug!(elapsed_ms = elapsed.as_millis(), "object-store put_create");
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
@@ -1355,7 +1347,10 @@ impl ZeppelinStore {
             }
         };
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), "s3 put_create_outcome");
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            "object-store put_create_outcome"
+        );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
@@ -1383,7 +1378,7 @@ impl ZeppelinStore {
         let path = Path::parse(key)?;
         let result = self.inner.put(&path, PutPayload::from(data)).await?;
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), "s3 put");
+        debug!(elapsed_ms = elapsed.as_millis(), "object-store put");
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
@@ -1451,7 +1446,7 @@ impl ZeppelinStore {
         debug!(
             elapsed_ms = elapsed.as_millis(),
             size = bytes.len(),
-            "s3 get"
+            "object-store get"
         );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["get"])
@@ -1524,7 +1519,7 @@ impl ZeppelinStore {
         debug!(
             elapsed_ms = elapsed.as_millis(),
             size = result.len(),
-            "s3 get_range"
+            "object-store get_range"
         );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["get"])
@@ -1601,7 +1596,7 @@ impl ZeppelinStore {
             elapsed_ms = elapsed.as_millis(),
             size,
             ranges = ranges.len(),
-            "s3 get_ranges"
+            "object-store get_ranges"
         );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["get"])
@@ -1686,7 +1681,7 @@ impl ZeppelinStore {
             elapsed_ms = elapsed.as_millis(),
             size = bytes.len(),
             version = ?version,
-            "s3 get_with_meta"
+            "object-store get_with_meta"
         );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["get"])
@@ -1796,7 +1791,7 @@ impl ZeppelinStore {
                 debug!(
                     elapsed_ms = elapsed.as_millis(),
                     etag = %etag,
-                    "s3 get_if_none_match not modified"
+                    "object-store get_if_none_match not modified"
                 );
                 crate::metrics::STORAGE_OPERATION_DURATION
                     .with_label_values(&["get"])
@@ -1824,7 +1819,7 @@ impl ZeppelinStore {
             elapsed_ms = elapsed.as_millis(),
             size = bytes.len(),
             version = ?next_version,
-            "s3 get_if_none_match modified"
+            "object-store get_if_none_match modified"
         );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["get"])
@@ -1968,7 +1963,10 @@ impl ZeppelinStore {
             }
         };
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), "s3 put_if_match_outcome");
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            "object-store put_if_match_outcome"
+        );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
@@ -2012,7 +2010,10 @@ impl ZeppelinStore {
                 }
             })?;
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), "s3 put_if_match");
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            "object-store put_if_match"
+        );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
@@ -2101,7 +2102,10 @@ impl ZeppelinStore {
                 }
             })?;
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), "s3 put_if_not_exists");
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            "object-store put_if_not_exists"
+        );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
@@ -2164,7 +2168,10 @@ impl ZeppelinStore {
                 ZeppelinError::Storage(e)
             })?;
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), "s3 copy_if_not_exists");
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            "object-store copy_if_not_exists"
+        );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["copy"])
             .observe(elapsed.as_secs_f64());
@@ -2229,7 +2236,7 @@ impl ZeppelinStore {
             Err(other) => return Err(ZeppelinError::Storage(other)),
         }
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), "s3 delete");
+        debug!(elapsed_ms = elapsed.as_millis(), "object-store delete");
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["delete"])
             .observe(elapsed.as_secs_f64());
@@ -2331,7 +2338,7 @@ impl ZeppelinStore {
         debug!(
             elapsed_ms = elapsed.as_millis(),
             count = expected,
-            "s3 delete_many"
+            "object-store delete_many"
         );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["delete_many"])
@@ -2460,7 +2467,7 @@ impl ZeppelinStore {
         debug!(
             elapsed_ms = elapsed.as_millis(),
             count = objects.len(),
-            "s3 list_prefix"
+            "object-store list_prefix"
         );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["list_prefix"])
@@ -2537,7 +2544,7 @@ impl ZeppelinStore {
         debug!(
             elapsed_ms = elapsed.as_millis(),
             count = prefixes.len(),
-            "s3 list_common_prefixes"
+            "object-store list_common_prefixes"
         );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["list_common_prefixes"])
@@ -2590,7 +2597,7 @@ impl ZeppelinStore {
             }
         };
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), "s3 exists");
+        debug!(elapsed_ms = elapsed.as_millis(), "object-store exists");
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["exists"])
             .observe(elapsed.as_secs_f64());
@@ -2627,7 +2634,7 @@ impl ZeppelinStore {
     /// Cache hydration can inspect a segment's size before scheduling a download.
     /// It receives metadata only; the segment bytes remain in object storage.
     #[instrument(skip(self), fields(key = key))]
-    pub async fn head(&self, key: &str) -> Result<object_store::ObjectMeta> {
+    pub async fn head(&self, key: &str) -> Result<ListedObject> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let meta = self.inner.head(&path).await.map_err(|e| {
@@ -2642,11 +2649,22 @@ impl ZeppelinStore {
             }
         })?;
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), "s3 head");
+        debug!(elapsed_ms = elapsed.as_millis(), "object-store head");
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["head"])
             .observe(elapsed.as_secs_f64());
-        Ok(meta)
+        let size = u64::try_from(meta.size).map_err(|_| {
+            ZeppelinError::Validation(format!(
+                "object {key} size does not fit in u64: {}",
+                meta.size
+            ))
+        })?;
+        Ok(ListedObject {
+            key: meta.location.to_string(),
+            size,
+            last_modified: meta.last_modified,
+            version: StorageVersion::from_parts(meta.e_tag, meta.version),
+        })
     }
 
     /// Deletes every object recursively under a non-empty prefix.
@@ -2839,7 +2857,7 @@ impl ZeppelinStore {
             elapsed_ms = elapsed.as_millis(),
             count = deleted,
             complete,
-            "s3 delete_prefix"
+            "object-store delete_prefix"
         );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["delete_prefix"])
@@ -2904,7 +2922,7 @@ impl ZeppelinStore {
             elapsed_ms = elapsed.as_millis(),
             count = deleted,
             complete,
-            "s3 delete namespace objects"
+            "object-store delete namespace objects"
         );
         crate::metrics::STORAGE_OPERATION_DURATION
             .with_label_values(&["delete_prefix"])
@@ -3098,7 +3116,9 @@ fn endpoint_host_port(endpoint: &str) -> Result<(String, u16)> {
         .split('/')
         .next()
         .filter(|authority| !authority.is_empty())
-        .ok_or_else(|| ZeppelinError::Config(format!("invalid S3 endpoint URL: {endpoint}")))?;
+        .ok_or_else(|| {
+            ZeppelinError::Config(format!("invalid object-store endpoint URL: {endpoint}"))
+        })?;
     let authority = authority.rsplit('@').next().unwrap_or(authority);
 
     if let Some(rest) = authority.strip_prefix('[') {
@@ -3119,7 +3139,7 @@ fn endpoint_host_port(endpoint: &str) -> Result<(String, u16)> {
         Some((host, port)) if !host.is_empty() => (host, parse_endpoint_port(port)?),
         Some((_host, _port)) => {
             return Err(ZeppelinError::Config(format!(
-                "invalid S3 endpoint host: {endpoint}"
+                "invalid object-store endpoint host: {endpoint}"
             )));
         }
         None => (authority, default_port),
@@ -3148,8 +3168,11 @@ fn endpoint_host_port(endpoint: &str) -> Result<(String, u16)> {
 /// `"9000"` returns `9000`; `"70000"` and `"minio"` return configuration
 /// errors before any socket is opened.
 fn parse_endpoint_port(port: &str) -> Result<u16> {
-    port.parse::<u16>()
-        .map_err(|error| ZeppelinError::Config(format!("invalid S3 endpoint port {port}: {error}")))
+    port.parse::<u16>().map_err(|error| {
+        ZeppelinError::Config(format!(
+            "invalid object-store endpoint port {port}: {error}"
+        ))
+    })
 }
 
 #[cfg(test)]

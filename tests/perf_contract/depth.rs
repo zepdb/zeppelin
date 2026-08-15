@@ -23,7 +23,7 @@ use object_store::{
     ObjectStore, PutMode, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 use serde::Serialize;
-use zeppelin::storage::ZeppelinStore;
+use zeppelin::storage::{StorageCapabilities, ZeppelinStore};
 
 use crate::common::counting::{classify, is_audit_key, ArtifactClass};
 
@@ -684,7 +684,7 @@ pub fn depth_store(store: &ZeppelinStore) -> (ZeppelinStore, DepthTracker) {
         tracker: tracker.clone(),
     };
     (
-        ZeppelinStore::new_with_native_batch_delete(Arc::new(depth)),
+        ZeppelinStore::new_with_capabilities(Arc::new(depth), StorageCapabilities::s3()),
         tracker,
     )
 }

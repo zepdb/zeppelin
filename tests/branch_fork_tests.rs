@@ -410,7 +410,7 @@ async fn raw_namespace_metadata_from_store(
     namespace: &str,
 ) -> NamespaceMetadata {
     let bytes = store
-        .get(&NamespaceMetadata::s3_key(namespace))
+        .get(&NamespaceMetadata::object_store_key(namespace))
         .await
         .unwrap();
     NamespaceMetadata::from_bytes(&bytes).unwrap()
@@ -544,7 +544,11 @@ async fn empty_source_prepares_an_empty_view_and_retry_is_byte_exact() {
             panic!("the first empty-source prepare must advance durable state")
         }
     };
-    let live_before = harness.store.get(&Manifest::s3_key(&target)).await.unwrap();
+    let live_before = harness
+        .store
+        .get(&Manifest::object_store_key(&target))
+        .await
+        .unwrap();
     let history_before = harness
         .store
         .get(&Manifest::history_key(&target, 1))
@@ -581,7 +585,11 @@ async fn empty_source_prepares_an_empty_view_and_retry_is_byte_exact() {
     }
 
     assert_eq!(
-        harness.store.get(&Manifest::s3_key(&target)).await.unwrap(),
+        harness
+            .store
+            .get(&Manifest::object_store_key(&target))
+            .await
+            .unwrap(),
         live_before
     );
     assert_eq!(
@@ -695,7 +703,7 @@ async fn prepare_rejects_same_name_depth_and_conflicting_target_intents() {
     ));
     assert!(!harness
         .store
-        .exists(&NamespaceMetadata::s3_key(&depth_target))
+        .exists(&NamespaceMetadata::object_store_key(&depth_target))
         .await
         .unwrap());
     assert!(NamespaceId::new("invalid@branch-target".to_string()).is_err());
@@ -1235,7 +1243,7 @@ async fn prepare_never_active_stage(
         }
         NeverActiveStage::Rooted => {
             let (faulted_store, manifest_failure) =
-                fail_put_once_matching(&store, Manifest::s3_key(target));
+                fail_put_once_matching(&store, Manifest::object_store_key(target));
             prepare_fork_for_test(
                 faulted_store,
                 source.clone(),
@@ -1304,7 +1312,7 @@ async fn assert_never_active_stage_cancels(stage: NeverActiveStage) {
                 .find(|root| root.branch_id == reservation.branch_id)
                 .expect("rooted cancellation fixture must retain its exact parent root");
             let (paused_store, root_removal) =
-                pause_next_cas_matching(&store, Manifest::s3_key(&source));
+                pause_next_cas_matching(&store, Manifest::object_store_key(&source));
             root_removal.arm();
             let cancel_target =
                 NamespaceId::new(target.clone()).expect("target namespace must be valid");
@@ -1633,7 +1641,7 @@ async fn maintenance_reports_but_never_executes_an_authorized_cancellation_inten
     assert!(interrupted.is_err());
     assert_eq!(evidence_failure.failures_injected(), 1);
     let metadata_before = store
-        .get(&NamespaceMetadata::s3_key(&target))
+        .get(&NamespaceMetadata::object_store_key(&target))
         .await
         .expect("interrupted cancellation metadata must be readable");
     let roots_before = branch_control_snapshot(&store, &source)
@@ -1650,7 +1658,7 @@ async fn maintenance_reports_but_never_executes_an_authorized_cancellation_inten
     .await
     .expect("maintenance must report an authorized cancellation intent");
     let metadata_after = store
-        .get(&NamespaceMetadata::s3_key(&target))
+        .get(&NamespaceMetadata::object_store_key(&target))
         .await
         .expect("maintenance must retain cancellation metadata");
     let roots_after = branch_control_snapshot(&store, &source)
@@ -1734,7 +1742,9 @@ async fn maintenance_resumes_an_activation_cancelled_fork() {
         .await
         .expect("source branch control must remain readable")
         .roots;
-    let metadata_after = store.get(&NamespaceMetadata::s3_key(&target)).await;
+    let metadata_after = store
+        .get(&NamespaceMetadata::object_store_key(&target))
+        .await;
     harness.cleanup().await;
 
     assert_eq!(report.awaiting_authorized_cancellation, 0);
@@ -1772,8 +1782,10 @@ async fn maintenance_stale_reserved_read_cannot_advance_a_cancellation_intent() 
         reservation.target_incarnation.to_string().replace('-', "")
     );
     let (faulted_store, evidence_failure) = fail_put_once_matching(&store, evidence_key);
-    let (race_store, maintenance_stale_read) =
-        pause_first_after_get_matching(&faulted_store, NamespaceMetadata::s3_key(&target));
+    let (race_store, maintenance_stale_read) = pause_first_after_get_matching(
+        &faulted_store,
+        NamespaceMetadata::object_store_key(&target),
+    );
     let maintenance_store = race_store.clone();
     let mut maintenance = tokio::spawn(async move {
         maintain_branches_for_test(
@@ -1802,7 +1814,7 @@ async fn maintenance_stale_reserved_read_cannot_advance_a_cancellation_intent() 
     assert!(cancellation.is_err());
     assert_eq!(evidence_failure.failures_injected(), 1);
     let metadata_before = store
-        .get(&NamespaceMetadata::s3_key(&target))
+        .get(&NamespaceMetadata::object_store_key(&target))
         .await
         .expect("interrupted cancellation metadata must be readable");
     let roots_before = branch_control_snapshot(&store, &source)
@@ -1815,7 +1827,7 @@ async fn maintenance_stale_reserved_read_cannot_advance_a_cancellation_intent() 
         .await
         .expect("maintenance race task must not panic");
     let metadata_after = store
-        .get(&NamespaceMetadata::s3_key(&target))
+        .get(&NamespaceMetadata::object_store_key(&target))
         .await
         .expect("stale maintenance must retain cancellation metadata");
     let roots_after = branch_control_snapshot(&store, &source)
@@ -1898,7 +1910,7 @@ async fn assert_unavailable_parent_cancellation_skips_lease(parent: UnavailableP
                 .expect("parent manifest absence must be readable")
                 .is_none());
             assert!(!store
-                .exists(&NamespaceMetadata::s3_key(&source))
+                .exists(&NamespaceMetadata::object_store_key(&source))
                 .await
                 .expect("parent metadata absence must be readable"));
         }
@@ -2077,8 +2089,10 @@ async fn concurrent_no_lease_cancellation_uses_the_winning_durable_decision() {
     );
     let (evidence_store, evidence_pause) =
         pause_first_create_matching(&store, evidence_key.clone());
-    let (race_store, first_intent_pause) =
-        pause_next_cas_matching(&evidence_store, NamespaceMetadata::s3_key(&target));
+    let (race_store, first_intent_pause) = pause_next_cas_matching(
+        &evidence_store,
+        NamespaceMetadata::object_store_key(&target),
+    );
     first_intent_pause.arm();
 
     let first_store = race_store.clone();
@@ -2185,16 +2199,16 @@ async fn assert_ambiguous_parent_fails_closed(parent: AmbiguousParent) {
     .await;
     match parent {
         AmbiguousParent::ManifestWithoutMetadata => store
-            .delete(&NamespaceMetadata::s3_key(&source))
+            .delete(&NamespaceMetadata::object_store_key(&source))
             .await
             .expect("fixture must remove only parent metadata"),
         AmbiguousParent::MetadataWithoutManifest => store
-            .delete(&Manifest::s3_key(&source))
+            .delete(&Manifest::object_store_key(&source))
             .await
             .expect("fixture must remove only parent manifest"),
     }
     let target_before = store
-        .get(&NamespaceMetadata::s3_key(&target))
+        .get(&NamespaceMetadata::object_store_key(&target))
         .await
         .expect("ambiguous-parent target metadata must be readable");
 
@@ -2206,7 +2220,7 @@ async fn assert_ambiguous_parent_fails_closed(parent: AmbiguousParent) {
     )
     .await;
     let target_after = store
-        .get(&NamespaceMetadata::s3_key(&target))
+        .get(&NamespaceMetadata::object_store_key(&target))
         .await
         .expect("failed cancellation must retain target metadata");
     let evidence = store
@@ -2253,7 +2267,7 @@ async fn never_active_cancellation_loses_when_publisher_holds_parent_lease() {
         .reservation;
 
     let (paused_store, root_publication) =
-        pause_next_cas_matching(&store, Manifest::s3_key(&source));
+        pause_next_cas_matching(&store, Manifest::object_store_key(&source));
     root_publication.arm();
     let publisher_store = paused_store.clone();
     let publisher_source =
@@ -2343,7 +2357,7 @@ async fn never_active_cancellation_wins_when_canceller_holds_parent_lease() {
     .await;
 
     let (paused_store, cancellation_intent) =
-        pause_next_cas_matching(&store, NamespaceMetadata::s3_key(&target));
+        pause_next_cas_matching(&store, NamespaceMetadata::object_store_key(&target));
     cancellation_intent.arm();
     let cancel_store = paused_store.clone();
     let cancel_target = NamespaceId::new(target.clone()).expect("target namespace must be valid");

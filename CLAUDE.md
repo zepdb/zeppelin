@@ -71,8 +71,10 @@ cargo fmt --all -- --check
 ```
 
 Most integration tests need real object storage. `TEST_BACKEND` defaults to
-`memory`; use `minio` for anything CAS-, concurrency-, or origin-shaped. MinIO
-runs natively without Docker — see [`tests/CLAUDE.md`](tests/CLAUDE.md).
+`memory`; use `minio` for anything CAS-, concurrency-, or origin-shaped, and
+`gcs` (patched fake-gcs-server) / `azurite` for the non-S3 substrates. MinIO
+and both emulators run natively without Docker — see
+[`tests/CLAUDE.md`](tests/CLAUDE.md) and `scripts/emulators/README.md`.
 
 **`cargo test --lib` is not green without MinIO.** Two tests
 (2× `security::policy_publication`) fail with `Storage(NotImplemented)`
@@ -85,7 +87,9 @@ skips instead of failing when `TEST_BACKEND` is not `minio`.)
 `tasks/` holds executable plan files, not scratch notes. Before designing
 something substantial, check whether a plan already exists there — several
 tracks (tokenizer Analysis-v2, storage-format redesign, memoization, security
-phases, multi-substrate) are fully designed and simply unexecuted.
+phases) are fully designed and simply unexecuted. The multi-substrate track
+(`tasks/multi-substrate/`) is **executed**: GCS and Azure transports are in,
+gated on emulators, with `08-release-evidence.md` as the evidence ledger.
 `tasks/learnings.md` (gitignored) is the running bug/pattern log — append to it.
 
 Branching specifically: `tasks/branching/` has 10 phase plans,
@@ -112,7 +116,7 @@ See `tasks/learnings.md` (local, gitignored) for the full list of bugs encounter
 
 1. **No bincode with `#[serde(untagged)]` or `#[serde(skip_serializing_if)]`.** Any type in the serialization tree with these attributes must use a self-describing format (JSON, MessagePack, CBOR). Check nested types, not just top-level structs.
 2. **Check framework syntax against the pinned version.** Axum 0.7 uses `:param`, axum 0.8 uses `{param}`. If parameterized routes 404 but static routes work, suspect syntax mismatch.
-3. **S3 keys and URL paths have different rules.** S3 keys allow `/`; URL `:param` segments do not. Use separate helpers (`key()` for S3, `api_ns()` for URLs) and consider validating namespace names at creation time.
+3. **S3 keys and URL paths have different rules.** S3 keys allow `/`; URL `:param` segments do not. Use separate helpers (`object_store_key()` for storage, `api_ns()` for URLs) and consider validating namespace names at creation time.
 4. **Never compute checksums from non-deterministic serialization.** `HashMap` iteration order is not stable across JSON round-trips. Canonicalize via `BTreeMap` before hashing.
 5. **`random_vectors()` reuses IDs across calls.** When testing dedup/merge, use unique ID prefixes per fragment.
 6. **Keep `TempDir` alive for the lifetime of anything using its path.** `TempDir::drop()` deletes the directory. Return it from setup functions so callers hold the handle.

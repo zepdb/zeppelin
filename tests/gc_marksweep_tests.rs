@@ -217,7 +217,7 @@ async fn gc_reclaims_orphaned_fragment_from_failed_write_cas() {
     common::seed_bound_manifest(&store, &ns).await;
 
     let orphan_id = old_ulid(60, 42);
-    let orphan_key = WalFragment::s3_key(&ns, &orphan_id);
+    let orphan_key = WalFragment::object_store_key(&ns, &orphan_id);
     store
         .put(&orphan_key, Bytes::from_static(b"orphan fragment bytes"))
         .await
@@ -242,7 +242,7 @@ async fn old_fragment_that_just_left_manifest_is_not_collected_before_horizon() 
     let ns = harness.artifact_origin_namespace("gc-19d-break-a");
     let store = harness.store.clone();
     let old_id = old_ulid(60, 77);
-    let old_key = WalFragment::s3_key(&ns, &old_id);
+    let old_key = WalFragment::object_store_key(&ns, &old_id);
 
     store
         .put(

@@ -179,7 +179,7 @@ async fn test_wal_writer_append_single_fragment() {
     let (fragment, _) = writer.append(&ns, vectors, vec![]).await.unwrap();
 
     // Verify fragment exists on S3
-    let frag_key = WalFragment::s3_key(&ns, &fragment.id);
+    let frag_key = WalFragment::object_store_key(&ns, &fragment.id);
     assert!(harness.store.exists(&frag_key).await.unwrap());
 
     // Verify manifest has the fragment
@@ -490,7 +490,11 @@ async fn scoped_delete_append_rejects_recreated_namespace_incarnation() {
         ManifestAppendGuard::new(&ns, &observed_manifest, observed_storage_version.clone())
             .expect("MinIO manifest reads must provide an ETag");
 
-    harness.store.delete(&Manifest::s3_key(&ns)).await.unwrap();
+    harness
+        .store
+        .delete(&Manifest::object_store_key(&ns))
+        .await
+        .unwrap();
     harness
         .store
         .delete(&Manifest::history_key(&ns, observed_manifest.version()))
@@ -592,7 +596,7 @@ async fn bound_manifest_read_rejects_missing_or_empty_get_etags_before_any_put()
         let expected_generation = manifest.version();
         let expected_bytes = manifest.to_bytes().unwrap();
 
-        let manifest_key = Manifest::s3_key(&ns);
+        let manifest_key = Manifest::object_store_key(&ns);
         let history_prefix = Manifest::history_prefix(&ns);
         let (counted_store, counter) = counting_store(&harness.store);
         let faulted_store =
@@ -639,7 +643,7 @@ async fn legacy_manifest_migration_rejects_missing_or_empty_get_etags_before_any
         let expected_generation = manifest.version();
         let expected_bytes = manifest.to_bytes().unwrap();
 
-        let manifest_key = Manifest::s3_key(&ns);
+        let manifest_key = Manifest::object_store_key(&ns);
         let history_prefix = Manifest::history_prefix(&ns);
         let (counted_store, counter) = counting_store(&harness.store);
         let faulted_store =
@@ -687,7 +691,7 @@ async fn guarded_appends_from_one_snapshot_never_coalesce() {
     let guard = ManifestAppendGuard::new(&ns, &observed_manifest, observed_storage_version)
         .expect("MinIO manifest reads must provide an ETag");
 
-    let manifest_key = Manifest::s3_key(&ns);
+    let manifest_key = Manifest::object_store_key(&ns);
     let (failing_store, failure) =
         toggle_get_failure_matching(&harness.store, manifest_key.clone());
     let delayed_store = delay_get_matching(&failing_store, manifest_key, Duration::from_secs(2));

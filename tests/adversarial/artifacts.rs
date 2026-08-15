@@ -654,7 +654,7 @@ async fn capture_head_only(
     match store.head(key).await {
         Ok(meta) => S3ObjectMeta {
             key: key.to_string(),
-            size: Some(meta.size as u64),
+            size: Some(meta.size),
             captured: false,
             missing: false,
             error: None,

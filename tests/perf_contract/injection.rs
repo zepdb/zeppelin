@@ -11,7 +11,7 @@ use object_store::{
     GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMode, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
-use zeppelin::storage::ZeppelinStore;
+use zeppelin::storage::{StorageCapabilities, ZeppelinStore};
 
 /// One mechanical regression injected outside the counting and depth layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,11 +53,14 @@ struct InjectionStore {
 /// operation is measured like a production operation.
 #[must_use]
 pub fn inject_store(store: &ZeppelinStore, injection: Injection) -> ZeppelinStore {
-    ZeppelinStore::new_with_native_batch_delete(Arc::new(InjectionStore {
-        inner: store.inner(),
-        injection,
-        cluster_get: tokio::sync::Mutex::new(()),
-    }))
+    ZeppelinStore::new_with_capabilities(
+        Arc::new(InjectionStore {
+            inner: store.inner(),
+            injection,
+            cluster_get: tokio::sync::Mutex::new(()),
+        }),
+        StorageCapabilities::s3(),
+    )
 }
 
 /// Control and proof handle for one same-owner lease rewrite before CAS retry.
@@ -111,7 +114,7 @@ pub(crate) fn inject_lease_retry_conflict(
         injections: Arc::clone(&injections),
     };
     (
-        ZeppelinStore::new_with_native_batch_delete(Arc::new(wrapped)),
+        ZeppelinStore::new_with_capabilities(Arc::new(wrapped), StorageCapabilities::s3()),
         LeaseRetryConflictHandle {
             armed,
             conditional_puts,
@@ -230,7 +233,7 @@ pub(crate) fn inject_missing_lease_put_etag(
         stripped: Arc::clone(&stripped),
     };
     (
-        ZeppelinStore::new_with_native_batch_delete(Arc::new(wrapped)),
+        ZeppelinStore::new_with_capabilities(Arc::new(wrapped), StorageCapabilities::s3()),
         MissingLeasePutEtagHandle { stripped },
     )
 }
@@ -266,7 +269,7 @@ pub(crate) fn inject_missing_manifest_put_etag(
         stripped: Arc::clone(&stripped),
     };
     (
-        ZeppelinStore::new_with_native_batch_delete(Arc::new(wrapped)),
+        ZeppelinStore::new_with_capabilities(Arc::new(wrapped), StorageCapabilities::s3()),
         MissingManifestPutEtagHandle { stripped },
     )
 }

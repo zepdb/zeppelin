@@ -158,7 +158,7 @@ async fn test_patch_index_config_forces_next_compaction_rewrite() {
     let metadata = NamespaceMetadata::from_bytes(
         &harness
             .store
-            .get(&NamespaceMetadata::s3_key(&ns))
+            .get(&NamespaceMetadata::object_store_key(&ns))
             .await
             .unwrap(),
     )
@@ -224,7 +224,7 @@ async fn test_stale_layout_trigger_cannot_override_fresh_compaction_metadata() {
     let stale_metadata = NamespaceMetadata::from_bytes(
         &harness
             .store
-            .get(&NamespaceMetadata::s3_key(&ns))
+            .get(&NamespaceMetadata::object_store_key(&ns))
             .await
             .unwrap(),
     )

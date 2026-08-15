@@ -221,7 +221,7 @@ async fn execute_creating_recovery(case: &IdealCase, manifest_present: bool) -> 
         world
             .store
             .put(
-                &NamespaceMetadata::s3_key(&namespace),
+                &NamespaceMetadata::object_store_key(&namespace),
                 meta.to_bytes().expect("encode creating metadata"),
             )
             .await
@@ -235,7 +235,7 @@ async fn execute_creating_recovery(case: &IdealCase, manifest_present: bool) -> 
         world
             .store
             .put(
-                &NamespaceMetadata::s3_key(&namespace),
+                &NamespaceMetadata::object_store_key(&namespace),
                 meta.to_bytes().expect("encode creating metadata"),
             )
             .await
@@ -263,7 +263,7 @@ async fn execute_creating_recovery(case: &IdealCase, manifest_present: bool) -> 
         &world
             .harness
             .store
-            .get(&NamespaceMetadata::s3_key(&namespace))
+            .get(&NamespaceMetadata::object_store_key(&namespace))
             .await
             .expect("read recovered metadata"),
     )
@@ -308,7 +308,7 @@ async fn execute_delete_publish(case: &IdealCase) -> IdealSample {
         &world
             .harness
             .store
-            .get(&NamespaceMetadata::s3_key(&namespace))
+            .get(&NamespaceMetadata::object_store_key(&namespace))
             .await
             .expect("read deletion tombstone"),
     )
@@ -398,7 +398,7 @@ async fn execute_delete_cleanup(case: &IdealCase, complete: bool) -> IdealSample
         assert!(remaining.is_empty());
     } else {
         assert_eq!(remaining.len(), 2, "one object plus tombstone must remain");
-        assert!(remaining.contains(&NamespaceMetadata::s3_key(&namespace)));
+        assert!(remaining.contains(&NamespaceMetadata::object_store_key(&namespace)));
         let final_outcome = manager
             .finish_delete(&namespace, Duration::MAX)
             .await

@@ -30,7 +30,7 @@ use object_store::{
 };
 use serde::Serialize;
 use xxhash_rust::xxh3::xxh3_64;
-use zeppelin::storage::ZeppelinStore;
+use zeppelin::storage::{StorageCapabilities, ZeppelinStore};
 
 use super::contract::{check_contract, load_contract, CostViolation};
 use super::predict::{model_input_from_repeat, predict, Prediction};
@@ -189,7 +189,7 @@ pub fn latency_profile_store(
         ledger: ledger.clone(),
     };
     (
-        ZeppelinStore::new_with_native_batch_delete(Arc::new(latency)),
+        ZeppelinStore::new_with_capabilities(Arc::new(latency), StorageCapabilities::s3()),
         ledger,
     )
 }

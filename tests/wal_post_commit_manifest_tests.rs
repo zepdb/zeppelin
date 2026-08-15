@@ -14,7 +14,7 @@ async fn lost_manifest_cas_acknowledgement_keeps_reachable_fragment() {
     common::seed_bound_manifest(&harness.store, &namespace).await;
 
     let (faulted_store, failure) =
-        fail_after_put_once_matching(&harness.store, Manifest::s3_key(&namespace));
+        fail_after_put_once_matching(&harness.store, Manifest::object_store_key(&namespace));
     let (faulted_store, counter) = counting_store(&faulted_store);
     let writer = WalWriter::new(faulted_store);
     let result = writer
@@ -35,7 +35,7 @@ async fn lost_manifest_cas_acknowledgement_keeps_reachable_fragment() {
         .unwrap()
         .unwrap();
     assert_eq!(live.fragments.len(), 1);
-    let reachable_key = WalFragment::s3_key(&namespace, &live.fragments[0].id);
+    let reachable_key = WalFragment::object_store_key(&namespace, &live.fragments[0].id);
     assert!(
         harness.store.exists(&reachable_key).await.unwrap(),
         "a live manifest must never reference a deleted WAL fragment"
@@ -166,7 +166,7 @@ async fn failed_live_manifest_put_does_not_wedge_a_divergent_wal_retry() {
     common::seed_bound_manifest(&harness.store, &namespace).await;
 
     let (faulted_store, failure) =
-        fail_put_once_matching(&harness.store, Manifest::s3_key(&namespace));
+        fail_put_once_matching(&harness.store, Manifest::object_store_key(&namespace));
     let writer = WalWriter::new(faulted_store);
     let first = writer
         .append(

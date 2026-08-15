@@ -28,7 +28,7 @@ fn unsafe_short_gc(horizon_secs: u64) -> GcConfig {
 fn reference(namespace: &str, bytes: &[u8]) -> ManifestSectionRef {
     let checksum = LateStateSection::checksum(bytes);
     ManifestSectionRef {
-        key: LateStateSection::s3_key(namespace, &checksum),
+        key: LateStateSection::object_store_key(namespace, &checksum),
         checksum,
         size_bytes: bytes.len() as u64,
         format_version: 1,

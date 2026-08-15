@@ -544,7 +544,7 @@ async fn destruction_record_is_durable_before_namespace_removal() {
 
     let meta_bytes = harness
         .store
-        .get(&NamespaceMetadata::s3_key(&namespace))
+        .get(&NamespaceMetadata::object_store_key(&namespace))
         .await
         .unwrap();
     let meta = NamespaceMetadata::from_bytes(&meta_bytes).unwrap();
@@ -625,7 +625,7 @@ async fn governed_delete_migrates_legacy_incarnation_before_binding_evidence() {
     .await;
     let admin = client_with_bearer(&server.admin_bearer);
     let namespace = create_ns_api(&admin, &server.base_url, 2).await;
-    let metadata_key = NamespaceMetadata::s3_key(&namespace);
+    let metadata_key = NamespaceMetadata::object_store_key(&namespace);
     let (body, object_metadata) = harness
         .store
         .get_with_object_metadata(&metadata_key)
@@ -758,7 +758,7 @@ async fn destruction_evidence_survives_failure_after_record_before_manifest_remo
     let namespace_id = NamespaceId::new(namespace.clone()).unwrap();
     let (_, namespace_object_metadata) = harness
         .store
-        .get_with_object_metadata(&NamespaceMetadata::s3_key(&namespace))
+        .get_with_object_metadata(&NamespaceMetadata::object_store_key(&namespace))
         .await
         .unwrap();
     let expected_incarnation = namespace_object_metadata
@@ -790,7 +790,7 @@ async fn destruction_evidence_survives_failure_after_record_before_manifest_remo
 
     let meta_bytes = harness
         .store
-        .get(&NamespaceMetadata::s3_key(&namespace))
+        .get(&NamespaceMetadata::object_store_key(&namespace))
         .await
         .unwrap();
     let meta = NamespaceMetadata::from_bytes(&meta_bytes).unwrap();
@@ -1050,7 +1050,7 @@ async fn lock_created_after_tombstone_blocks_resumed_physical_cleanup() {
         .expect("blocked cleanup must retain the manifest");
     harness
         .store
-        .get(&NamespaceMetadata::s3_key(&namespace))
+        .get(&NamespaceMetadata::object_store_key(&namespace))
         .await
         .expect("blocked cleanup must retain the deletion tombstone");
     let deferrals = harness
@@ -1276,7 +1276,7 @@ async fn gc_defers_before_listing_or_deleting_locked_namespace() {
     let lock = create_namespace_lock(&admin, &server.base_url, &namespace).await;
     let lock_id = lock["lock_id"].as_str().unwrap();
 
-    let garbage_key = WalFragment::s3_key(&namespace, &Ulid::from_parts(1, 1));
+    let garbage_key = WalFragment::object_store_key(&namespace, &Ulid::from_parts(1, 1));
     server
         .store
         .put_create(&garbage_key, Bytes::from_static(b"preserved"))

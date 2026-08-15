@@ -213,7 +213,7 @@ async fn branch_root_and_deletion_fence_race_has_exactly_one_cas_winner() {
     .unwrap();
 
     let (racing_store, barrier) =
-        synchronize_cas_pair_matching(&harness.store, Manifest::s3_key(&source));
+        synchronize_cas_pair_matching(&harness.store, Manifest::object_store_key(&source));
     barrier.enable();
     let destruction_record_key =
         format!("_audit/destruction/{}.json", uuid::Uuid::new_v4().simple());
@@ -582,7 +582,7 @@ async fn root_is_query_inert_and_survives_normal_manifest_publishers() {
         (Utc::now() - chrono::Duration::minutes(10)).timestamp_millis() as u64,
         0x95,
     );
-    let gc_delete_key = WalFragment::s3_key(&source, &gc_delete_id);
+    let gc_delete_key = WalFragment::object_store_key(&source, &gc_delete_id);
     harness
         .store
         .put(
@@ -663,7 +663,7 @@ async fn root_growth_between_gc_mark_and_sweep_prevents_physical_delete() {
         (Utc::now() - chrono::Duration::minutes(10)).timestamp_millis() as u64,
         0x92,
     );
-    let orphan_key = WalFragment::s3_key(&source, &old_id);
+    let orphan_key = WalFragment::object_store_key(&source, &old_id);
     harness
         .store
         .put(

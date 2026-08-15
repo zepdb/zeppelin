@@ -235,7 +235,7 @@ async fn test_wal_fragment_notfound_tolerated_only_after_manifest_reread_and_met
         "new manifest must confirm the old fragment was compacted away"
     );
 
-    let frag_key = WalFragment::s3_key(&ns, &old_refs[0].id);
+    let frag_key = WalFragment::object_store_key(&ns, &old_refs[0].id);
     harness.store.delete(&frag_key).await.unwrap();
 
     let before = gc_race_metric_value(&ns);
@@ -293,7 +293,7 @@ async fn test_wal_fragment_notfound_still_referenced_is_error_not_skip() {
     assert_eq!(refs.len(), 1);
 
     // Delete the fragment blob out from under the still-live manifest ref.
-    let frag_key = WalFragment::s3_key(&ns, &refs[0].id);
+    let frag_key = WalFragment::object_store_key(&ns, &refs[0].id);
     harness.store.delete(&frag_key).await.unwrap();
 
     let before = gc_race_metric_value(&ns);
@@ -351,7 +351,7 @@ async fn test_consumed_wal_read_rejects_checksum_mismatch() {
     let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     let refs = manifest.uncompacted_fragments().to_vec();
     assert_eq!(refs.len(), 1);
-    let key = WalFragment::s3_key(&ns, &refs[0].id);
+    let key = WalFragment::object_store_key(&ns, &refs[0].id);
     let mut corrupted = harness.store.get(&key).await.unwrap().to_vec();
     let needle = b"checksum_target";
     let offset = corrupted
@@ -402,7 +402,7 @@ async fn test_consumed_wal_read_rejects_payload_id_mismatch() {
         .unwrap();
     let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     let refs = manifest.uncompacted_fragments().to_vec();
-    let key = WalFragment::s3_key(&ns, &refs[0].id);
+    let key = WalFragment::object_store_key(&ns, &refs[0].id);
     let bytes = harness.store.get(&key).await.unwrap();
     let mut fragment = WalFragment::from_bytes(&bytes).unwrap();
     fragment.id = ulid::Ulid::new();
@@ -445,7 +445,7 @@ async fn test_checksum_failure_evicts_poisoned_wal_cache_entry() {
         .unwrap();
     let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     let refs = manifest.uncompacted_fragments().to_vec();
-    let key = WalFragment::s3_key(&ns, &refs[0].id);
+    let key = WalFragment::object_store_key(&ns, &refs[0].id);
     let correct = harness.store.get(&key).await.unwrap();
     let mut corrupted = correct.to_vec();
     let needle = b"cache_target";

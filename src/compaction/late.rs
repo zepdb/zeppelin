@@ -385,7 +385,7 @@ impl Compactor {
     }
 
     async fn snapshot_late_build(&self, namespace: &str) -> Result<LateBuildSnapshot> {
-        let metadata_key = NamespaceMetadata::s3_key(namespace);
+        let metadata_key = NamespaceMetadata::object_store_key(namespace);
         let (metadata_bytes, object_metadata) = self
             .store
             .get_with_object_metadata(&metadata_key)
@@ -898,7 +898,8 @@ async fn load_snapshotted_inputs(
             )));
         }
         let origin = manifest.input_fragment_origin(reference)?;
-        let key = EncoderInputWalFragment::s3_key(origin.namespace.as_str(), &reference.id);
+        let key =
+            EncoderInputWalFragment::object_store_key(origin.namespace.as_str(), &reference.id);
         let fragment = Manifest::read_input_fragment_checked(store, reference, &origin).await?;
         if fragment.referenced_content_bytes()? != reference.referenced_content_bytes
             || fragment.modality_counts() != reference.modality_counts
@@ -1781,7 +1782,10 @@ mod tests {
             artifact_origin: None,
         };
         let input = SnapshottedInput {
-            key: EncoderInputWalFragment::s3_key(origin.namespace.as_str(), &reference.id),
+            key: EncoderInputWalFragment::object_store_key(
+                origin.namespace.as_str(),
+                &reference.id,
+            ),
             reference,
             origin,
             fragment,
@@ -1829,7 +1833,7 @@ mod tests {
         };
         let origin = origin("local", 4);
         let input = SnapshottedInput {
-            key: EncoderInputWalFragment::s3_key(origin.namespace.as_str(), &fragment.id),
+            key: EncoderInputWalFragment::object_store_key(origin.namespace.as_str(), &fragment.id),
             reference: InputFragmentRef {
                 id: fragment.id,
                 upsert_count: 1,

@@ -76,7 +76,7 @@ async fn test_tla_concurrent_namespace_create() {
     let ns = "tla-ns-create";
 
     // Verify namespace doesn't exist yet
-    let meta_key = NamespaceMetadata::s3_key(ns);
+    let meta_key = NamespaceMetadata::object_store_key(ns);
     assert!(
         !store.exists(&meta_key).await.unwrap(),
         "precondition: namespace should not exist"
@@ -185,8 +185,8 @@ async fn test_tla_namespace_delete_upsert_zombie() {
     let (_initial_frag, _) = writer.append(ns, vectors, vec![]).await.unwrap();
 
     // Verify healthy state: both meta.json and manifest.json exist
-    let meta_key = NamespaceMetadata::s3_key(ns);
-    let manifest_key = Manifest::s3_key(ns);
+    let meta_key = NamespaceMetadata::object_store_key(ns);
+    let manifest_key = Manifest::object_store_key(ns);
     assert!(
         store.exists(&meta_key).await.unwrap(),
         "meta.json should exist"
@@ -281,8 +281,8 @@ async fn test_tla_namespace_delete_compaction_zombie() {
         .unwrap();
 
     // Delete the namespace: manifest first, then meta (production order)
-    let manifest_key = Manifest::s3_key(ns);
-    let meta_key = NamespaceMetadata::s3_key(ns);
+    let manifest_key = Manifest::object_store_key(ns);
+    let meta_key = NamespaceMetadata::object_store_key(ns);
     store.delete(&manifest_key).await.unwrap();
     store.delete(&meta_key).await.unwrap();
 
@@ -332,8 +332,8 @@ async fn test_tla_namespace_delete_group_append_zombie() {
         .await
         .unwrap();
 
-    let manifest_key = Manifest::s3_key(ns);
-    let meta_key = NamespaceMetadata::s3_key(ns);
+    let manifest_key = Manifest::object_store_key(ns);
+    let meta_key = NamespaceMetadata::object_store_key(ns);
     store.delete(&manifest_key).await.unwrap();
     store.delete(&meta_key).await.unwrap();
 
