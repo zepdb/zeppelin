@@ -13302,7 +13302,27 @@ mod outcome_tests {
 
         let status = periodic_s3_oracle_status(&store, "ns").await;
         assert_eq!(status["manifest_generation"], serde_json::Value::Null);
-        assert!(status["manifest_read_error"]
+        assert_eq!(
+            status["manifest_read_error"].as_str(),
+            Some(
+                "serialization error: unsupported manifest format prefix 0x74; this binary reads 0x01, 0x02 (MessagePack), and legacy JSON"
+            )
+        );
+
+        let truncated_msgpack_key = Manifest::object_store_key("truncated-msgpack");
+        let encoded_manifest = Manifest::new().to_bytes().unwrap();
+        let truncated_msgpack = encoded_manifest.slice(..1);
+        store
+            .put(&truncated_msgpack_key, truncated_msgpack)
+            .await
+            .unwrap();
+
+        let truncated_msgpack_status = periodic_s3_oracle_status(&store, "truncated-msgpack").await;
+        assert_eq!(
+            truncated_msgpack_status["manifest_generation"],
+            serde_json::Value::Null
+        );
+        assert!(truncated_msgpack_status["manifest_read_error"]
             .as_str()
             .is_some_and(|error| error.contains("manifest msgpack deserialize")));
 

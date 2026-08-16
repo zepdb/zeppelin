@@ -88,7 +88,9 @@ and both emulators run natively without Docker — see
 `security::policy_publication` tests construct their own in-memory CAS store.
 `startup::rbac_config_boot_enables_rbac_routes` still requires MinIO and skips
 when `TEST_BACKEND` is not `minio` because its startup configuration otherwise
-uses the local backend, which has no ETag CAS.
+uses the local backend, which has no ETag CAS. With `TEST_BACKEND=minio`, export
+an isolated existing bucket such as
+`ZEPPELIN_RBAC_TEST_BUCKET=zeppelin-rbac-test` or the test panics.
 
 ## Where the plans live
 

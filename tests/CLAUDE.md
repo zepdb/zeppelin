@@ -28,10 +28,11 @@ MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
   minio server /tmp/miniodata --address 127.0.0.1:9000 &
 mc alias set zeptest http://127.0.0.1:9000 minioadmin minioadmin
 mc mb --ignore-existing zeptest/zeppelin-test
+mc mb --ignore-existing zeptest/zeppelin-rbac-test
 ```
 
-The rbac startup test additionally needs an isolated
-`ZEPPELIN_RBAC_TEST_BUCKET`.
+The rbac startup test additionally needs an isolated bucket, distinct from the
+main test bucket: `export ZEPPELIN_RBAC_TEST_BUCKET=zeppelin-rbac-test`.
 
 Bringing up fake-gcs-server (patched — stock cannot serve `object_store`'s
 XML-API writes; build once via `scripts/emulators/build-fake-gcs-server.sh`,
@@ -104,8 +105,24 @@ invocation plus MinIO.
   per scenario with `ZEPPELIN_PERF_SCENARIOS=<names>`.
 - `perf_contract::scenario::tests::secured_filtered_query_directly_compares_actual_http_paths`
   (`--ignored`) — fails. Verified pre-existing at `3fea5e8`.
-- `startup::tests::rbac_config_boot_enables_rbac_routes` needs MinIO but skips
-  rather than fails when `TEST_BACKEND` is not `minio`.
+- `startup::tests::rbac_config_boot_enables_rbac_routes` skips when
+  `TEST_BACKEND` is not `minio`. With `TEST_BACKEND=minio`, it panics unless
+  `ZEPPELIN_RBAC_TEST_BUCKET` names an isolated existing bucket (for the setup
+  above, export `ZEPPELIN_RBAC_TEST_BUCKET=zeppelin-rbac-test`).
+- `namespace_tests::test_list_namespaces` and
+  `namespace_tests::test_scan_and_register` — both were observed failing in a
+  full `--tests --no-fail-fast` MinIO sweep at `tests/namespace_tests.rs:663`
+  and `:813` by unwrapping `NamespaceNotFound` for a different test's
+  `test-<uuid>-legacy-creating-post-bind-crash` namespace while that test
+  (`test_legacy_creating_namespace_resumes_after_manifest_binding_crash`)
+  deliberately deleted and re-created manifest/metadata objects.
+  `NamespaceManager::list` and `scan_and_register` enumerate the whole shared
+  bucket rather than the calling harness's random prefix, so concurrent test
+  binaries can observe another namespace mid-teardown. The `namespace_tests`
+  binary passes in isolation (30 passed, 0 failed), and the enumeration code
+  path is unchanged by this backlog (`3fea5e8..HEAD` changes only a rustdoc
+  intra-doc link in `src/namespace/manager.rs`). This is a shared-bucket,
+  full-suite-load isolation race.
 
 ## Branching gate
 
