@@ -262,14 +262,14 @@ pub struct Config {
 pub struct MmliConfig {
     /// Exact matrix dtype for text-only namespaces. Default: `f16`.
     ///
-    /// Post-optimization loopback-MinIO replay: the general f16 K=1000
-    /// profile retained recall@10 `0.980072` at p50 `72 ms`. A speed-biased
-    /// INT8-G32 K=1000 profile measured recall `0.974662` at `48 ms`. Widening
-    /// the INT8 frontier to K=1200 recovered recall to `0.980703` at `53 ms`.
-    /// Those latency profiles used explicit 512/768 KiB read gaps respectively;
-    /// the general default remains 64 KiB because large-gap byte amplification
-    /// did not transfer to the sparse 50k-unit shape. See the tracked
-    /// [late-interaction performance evidence](https://github.com/zepdb/zeppelin/blob/main/docs/evidence/late-interaction-performance.md#text-query-profiles).
+    /// Release-build replay of 1,109 text queries on an Apple M3 Max against
+    /// loopback MinIO: the general f16 K=1000 profile retained recall@10
+    /// `0.980072` at p50 `72 ms`. A speed-biased INT8-G32 K=1000 profile
+    /// measured recall `0.974662` at `48 ms`. Widening the INT8 frontier to
+    /// K=1200 recovered recall to `0.980703` at `53 ms`. Those INT8 profiles
+    /// used explicit 512/768 KiB read gaps respectively; the general default
+    /// remains 64 KiB because a 256 KiB gap on the sparse 50k-unit shape
+    /// removed only 7.4% of GETs while adding 83% planned bytes.
     #[serde(default)]
     pub text_matrix_dtype: MmliMatrixDtype,
     /// Exact matrix dtype for namespaces accepting image or image-text. Default: `f16`.
@@ -376,11 +376,10 @@ pub struct MmliSegmentConfig {
     /// at 50k units, 256 KiB removed only 7.4% of GETs while adding 83%
     /// planned bytes. After streamed/parallel scoring, the dense 5,183-row
     /// replay instead reached its latency knee at 512–896 KiB: INT8-G32
-    /// K=1200 used 768 KiB for 53 ms p50 and f16 K=1000 used 896 KiB for
-    /// 52 ms. Configure a large gap only for a qualified high-density latency
-    /// profile; the general default stays 64 KiB to bound sparse-workload
-    /// amplification. See the tracked
-    /// [late-interaction performance evidence](https://github.com/zepdb/zeppelin/blob/main/docs/evidence/late-interaction-performance.md#text-query-profiles).
+    /// K=1200 used 768 KiB for 53 ms p50, 142 GETs, and 127.2 MB planned;
+    /// f16 K=1000 used 896 KiB for 52 ms, 211 GETs, and 188.3 MB planned.
+    /// Configure a large gap only for a qualified high-density latency profile;
+    /// the general default stays 64 KiB to bound sparse-workload amplification.
     pub read_gap_budget_bytes: usize,
     /// Maximum bytes in one physical ranged request. Default: `8388608`
     /// bytes (8 MiB), kept because it never bound in any measured arm and
@@ -400,11 +399,11 @@ pub struct MmliSegmentConfig {
     /// Maximum changed-row fraction (changed ids over the previous segment's
     /// rows) for incremental flat compaction; larger churn or `0.0` forces a
     /// full rebuild with SQ8 recalibration. Mirrors the dense
-    /// `retrain_imbalance_threshold` shape with its own value. Default `0.2`;
-    /// the tracked
-    /// [incremental-compaction evidence](https://github.com/zepdb/zeppelin/blob/main/docs/evidence/late-interaction-performance.md#incremental-compaction-equivalence)
-    /// compares incremental and from-scratch query results and verifies that
-    /// carried immutable matrix blocks remain reachable.
+    /// `retrain_imbalance_threshold` shape with its own value. Default `0.2`.
+    /// In the MinIO-backed equivalence gate, incremental and forced full
+    /// rebuilds returned identical rankings for four full-frontier queries;
+    /// carried immutable matrix blocks remained readable after publication,
+    /// and a later forced full rebuild preserved the same results.
     pub incremental_max_changed_fraction: f32,
 }
 

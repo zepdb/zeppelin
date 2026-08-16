@@ -274,8 +274,7 @@ an absent key — and refuses to start if the store cannot enforce them.
 
 The canonical definition is the [OpenAPI 3.1 spec](api/zeppelin-api.yaml). The
 tables below are a complete index of the served routes. Before exposing them in
-production, configure the `[security]` section using the
-[security deployment guide](docs/security-deployment.md) and the annotated
+production, configure the `[security]` section using the annotated
 [`zeppelin.toml.example`](zeppelin.toml.example).
 
 ### Operational
@@ -347,17 +346,6 @@ Use the HTTP API directly or generate a client from the canonical [OpenAPI 3.1 s
 
 - [OpenAPI 3.1 spec](api/zeppelin-api.yaml) — the canonical API contract
   (versioned independently of the crate; see the spec's `info.version`)
-- [Security deployment guide](docs/security-deployment.md) — ingress,
-  credentials, audit durability, object-storage policy, and host controls
-- [Namespace branching operations](docs/branching-operations.md) — enabling,
-  retaining, deleting, and materializing copy-on-write forks
-- [Compliance control mapping](docs/compliance-mapping.md) — implementation
-  mechanisms mapped to common control families, without certification claims
-- [Late-interaction retrieval](docs/late-interaction.md) — MaxSim query,
-  semantic-coverage, explain, and measured-performance semantics
-- [Rust documentation style](docs/rustdoc-style.md) — contributor conventions
-  for module and item documentation
-- [Documentation index](docs/README.md) — guide scope and tracked evidence
 
 ## Development
 

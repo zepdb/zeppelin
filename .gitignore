@@ -38,6 +38,9 @@ build/
 # Task tracking (session state)
 tasks/
 
+# Design docs (session state)
+docs/
+
 # Test artifacts
 tests/fixtures/tmp/
 *.proptest-regressions

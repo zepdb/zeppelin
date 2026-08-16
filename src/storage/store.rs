@@ -459,8 +459,8 @@ pub struct ListedObject {
     /// substrate-native version, and on GCS the object generation is the only
     /// token that authorizes a conditional PUT, so a LIST-derived token would
     /// die with `MissingVersion` there. Every CAS uses a GET- or PUT-derived
-    /// token, as recorded by the tracked
-    /// [conditional-write token-origin audit](https://github.com/zepdb/zeppelin/blob/main/docs/evidence/multi-substrate-storage.md#conditional-write-token-origin-audit).
+    /// token: a 2026-08-15 audit found zero LIST-derived tokens across 21 direct
+    /// conditional-write sites and 14 namespace/branch funnel callers.
     pub version: Option<StorageVersion>,
 }
 

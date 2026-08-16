@@ -2,13 +2,15 @@
 //!
 //! Zeppelin never asks "is this S3?" outside [`crate::storage::ZeppelinStore`]
 //! construction — it asks what the configured substrate can do. The matrix
-//! here is declared from verified `object_store` 0.11.2 behavior; the tracked
-//! [multi-substrate storage evidence](https://github.com/zepdb/zeppelin/blob/main/docs/evidence/multi-substrate-storage.md#declared-capability-matrix)
-//! records the matrix and validation scope. When `storage.fail_fast` is set,
-//! the declaration is verified live at boot by
-//! [`crate::storage::ZeppelinStore::verify_declared_capabilities`], so a
-//! mis-declared or mis-deployed backend refuses to boot instead of silently
-//! degrading a compare-and-swap into an overwrite.
+//! here is declared from verified `object_store` 0.11.2 behavior and was
+//! validated on 2026-08-14 and 2026-08-15 against MinIO, patched
+//! fake-gcs-server 1.55.1, Azurite 3.36.0, the local filesystem, and the
+//! in-memory test backend. The MinIO, patched-GCS, and Azurite substrate
+//! contract suites each passed 23 checks; no gate has run against real GCS or
+//! Azure. When `storage.fail_fast` is set, the declaration is verified live
+//! at boot by [`crate::storage::ZeppelinStore::verify_declared_capabilities`],
+//! so a mis-declared or mis-deployed backend refuses to boot instead of
+//! silently degrading a compare-and-swap into an overwrite.
 
 use crate::config::StorageBackend;
 
